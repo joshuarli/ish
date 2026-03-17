@@ -1,0 +1,888 @@
+mod alias;
+mod builtin;
+mod complete;
+mod config;
+mod error;
+mod exec;
+mod expand;
+mod history;
+mod input;
+mod job;
+mod line;
+mod ls;
+mod parse;
+mod prompt;
+mod render;
+mod signal;
+mod term;
+
+use alias::AliasMap;
+use complete::CompletionState;
+use history::FuzzyMatch;
+use input::{InputEvent, InputReader, Key, KeyEvent};
+use job::Job;
+use line::LineBuffer;
+use std::collections::HashMap;
+use std::os::fd::RawFd;
+use std::path::PathBuf;
+use term::TermWriter;
+
+struct Shell {
+    aliases: AliasMap,
+    last_status: i32,
+    prev_dir: Option<String>,
+    rows: u16,
+    cols: u16,
+    history: history::History,
+    prompt: prompt::Prompt,
+    job: Option<Job>,
+    path_cache: HashMap<String, PathBuf>,
+    exit_warned: bool,
+    orig_termios: libc::termios,
+    signal_fd: RawFd,
+    home: String,
+    session_log: String,
+}
+
+enum ReadResult {
+    Line(String),
+    Exit,
+    Empty,
+}
+
+enum Mode {
+    Normal,
+    Completion(CompletionState),
+    HistorySearch {
+        query: String,
+        matches: Vec<FuzzyMatch>,
+        selected: usize,
+        saved_line: String,
+    },
+}
+
+fn main() {
+    // Refuse script mode
+    if std::env::args().len() > 1 {
+        eprintln!("ish: this shell is interactive-only and does not run scripts");
+        std::process::exit(1);
+    }
+
+    // Save original termios
+    let orig_termios = match term::save_termios() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("ish: cannot get terminal settings: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Set shell as its own process group, take foreground
+    unsafe {
+        let pid = libc::getpid();
+        let _ = libc::setpgid(pid, pid);
+        let _ = libc::tcsetpgrp(0, libc::getpgrp());
+    }
+
+    // Initialize signals
+    let signal_fd = signal::init();
+
+    let (rows, cols) = term::term_size();
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    let mut shell = Shell {
+        aliases: AliasMap::new(),
+        last_status: 0,
+        prev_dir: None,
+        rows,
+        cols,
+        history: history::History::load(),
+        prompt: prompt::Prompt::new(),
+        job: None,
+        path_cache: HashMap::new(),
+        exit_warned: false,
+        orig_termios,
+        signal_fd,
+        home: home.clone(),
+        session_log: String::new(),
+    };
+
+    // Build initial PATH cache
+    exec::rebuild_path_cache(&mut shell.path_cache);
+
+    // Load config
+    config::load(&mut shell.aliases);
+
+    // Main loop
+    loop {
+        match read_line(&mut shell) {
+            ReadResult::Line(line) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                shell.exit_warned = false;
+                shell.history.add(&line);
+
+                // Log for session transcript
+                shell.session_log.push_str(&line);
+                shell.session_log.push('\n');
+
+                match parse::parse(&line) {
+                    Ok(cmdline) => {
+                        // Handle alias builtin specially
+                        if cmdline.segments.len() == 1
+                            && cmdline.segments[0].0.commands.len() == 1
+                        {
+                            let cmd = &cmdline.segments[0].0.commands[0].cmd;
+                            let first = parse::unescape(cmd.argv.first().map(|s| s.as_str()).unwrap_or(""));
+                            if first == "source" || first == "." {
+                                eprintln!("ish: {first}: sourcing is not supported");
+                                shell.last_status = 1;
+                                continue;
+                            }
+
+                            if first == "alias" {
+                                let args: Vec<String> = cmd.argv[1..]
+                                    .iter()
+                                    .map(|s| parse::unescape(s))
+                                    .collect();
+                                if args.len() >= 2 {
+                                    let name = args[0].clone();
+                                    let expansion = args[1..].to_vec();
+                                    shell.aliases.set(name, expansion);
+                                    shell.last_status = 0;
+                                } else if args.len() == 1 {
+                                    // Show alias
+                                    if let Some(exp) = shell.aliases.get(&args[0]) {
+                                        println!("alias {} {}", args[0], exp.join(" "));
+                                    } else {
+                                        eprintln!("ish: alias: not found: {}", args[0]);
+                                        shell.last_status = 1;
+                                    }
+                                } else {
+                                    // List all aliases
+                                    for (name, exp) in shell.aliases.iter() {
+                                        println!("alias {name} {}", exp.join(" "));
+                                    }
+                                    shell.last_status = 0;
+                                }
+                                continue;
+                            }
+
+                            // Handle `exit` with exit_warned logic
+                            if first == "exit" {
+                                if shell.job.is_some() {
+                                    if shell.exit_warned {
+                                        if let Some(job) = shell.job.take() {
+                                            unsafe { libc::killpg(job.pgid, libc::SIGTERM); }
+                                        }
+                                        break;
+                                    } else {
+                                        eprintln!("ish: there is a suspended job. Exit again to force quit.");
+                                        shell.exit_warned = true;
+                                        shell.last_status = 1;
+                                        continue;
+                                    }
+                                }
+                                let code: i32 = cmd.argv.get(1)
+                                    .map(|s| parse::unescape(s))
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0);
+                                std::process::exit(code);
+                            }
+
+                            // Handle `copy-scrollback` — OSC 52 clipboard
+                            if first == "copy-scrollback" {
+                                use std::io::Write;
+                                let encoded = base64_encode(shell.session_log.as_bytes());
+                                let osc = format!("\x1b]52;c;{encoded}\x07");
+                                let _ = std::io::stdout().write_all(osc.as_bytes());
+                                let _ = std::io::stdout().flush();
+                                shell.last_status = 0;
+                                continue;
+                            }
+
+                            // Handle `w` with alias awareness
+                            if first == "w" {
+                                let args: Vec<String> = cmd.argv[1..]
+                                    .iter()
+                                    .map(|s| parse::unescape(s))
+                                    .collect();
+                                if let Some(name) = args.first() {
+                                    if let Some(exp) = shell.aliases.get(name.as_str()) {
+                                        println!("alias: {} {}", name, exp.join(" "));
+                                        shell.last_status = 0;
+                                        continue;
+                                    }
+                                }
+                                // Fall through to normal exec for builtin/PATH check
+                            }
+                        }
+
+                        // Handle cd specially to invalidate prompt git cache
+                        let is_cd = cmdline.segments.len() == 1
+                            && cmdline.segments[0].0.commands.len() == 1
+                            && parse::unescape(
+                                cmdline.segments[0].0.commands[0]
+                                    .cmd
+                                    .argv
+                                    .first()
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(""),
+                            ) == "cd";
+
+                        shell.last_status = exec::execute(
+                            &cmdline,
+                            &shell.aliases,
+                            &mut shell.job,
+                            &shell.orig_termios,
+                            &shell.home,
+                            &mut shell.prev_dir,
+                            &mut shell.path_cache,
+                            &mut shell.session_log,
+                        );
+
+                        if is_cd {
+                            shell.prompt.invalidate_git();
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("ish: {e}");
+                        shell.last_status = 1;
+                    }
+                }
+            }
+            ReadResult::Exit => break,
+            ReadResult::Empty => {}
+        }
+    }
+}
+
+fn read_line(shell: &mut Shell) -> ReadResult {
+    let _raw = match term::RawMode::enable() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("ish: raw mode: {e}");
+            return ReadResult::Exit;
+        }
+    };
+
+    let mut tw = TermWriter::new();
+    let mut reader = InputReader::new(shell.signal_fd);
+    let mut full_input = String::new();
+    let mut line = LineBuffer::new();
+    let mut mode = Mode::Normal;
+    let mut history_idx: Option<usize> = None;
+    let mut saved_line = String::new();
+
+    // Render prompt
+    let prompt_str = shell.prompt.render(shell.last_status);
+    let prompt_display_len = shell.prompt.display_len(&prompt_str);
+
+    render::render_line(&mut tw, &prompt_str, prompt_display_len, &line, shell.cols);
+    let _ = tw.flush_to_stdout();
+
+    loop {
+        let event = reader.read_event();
+        match event {
+            InputEvent::Signal(sig) => {
+                if sig == libc::SIGWINCH {
+                    let (rows, cols) = term::term_size();
+                    shell.rows = rows;
+                    shell.cols = cols;
+                }
+                // Re-render
+                if let Mode::Normal = &mode {
+                    let p = current_prompt(&prompt_str, &full_input);
+                    let pdl = current_prompt_len(prompt_display_len, &full_input);
+                    render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                }
+                let _ = tw.flush_to_stdout();
+                continue;
+            }
+            InputEvent::Key(key) => {
+                match &mut mode {
+                    Mode::Normal => {
+                        match handle_normal_key(
+                            key,
+                            &mut line,
+                            &mut history_idx,
+                            &mut saved_line,
+                            shell,
+                            &full_input,
+                        ) {
+                            KeyAction::Continue => {}
+                            KeyAction::Execute(text) => {
+                                tw.write_str("\r\n");
+                                let _ = tw.flush_to_stdout();
+                                if full_input.is_empty() {
+                                    return if text.is_empty() {
+                                        ReadResult::Empty
+                                    } else {
+                                        ReadResult::Line(text)
+                                    };
+                                } else {
+                                    full_input.push(' ');
+                                    full_input.push_str(&text);
+                                    return ReadResult::Line(full_input);
+                                }
+                            }
+                            KeyAction::Continuation(text) => {
+                                if full_input.is_empty() {
+                                    full_input = text;
+                                } else {
+                                    full_input.push(' ');
+                                    full_input.push_str(&text);
+                                }
+                                line = LineBuffer::new();
+                                history_idx = None;
+                                tw.write_str("\r\n");
+                                render::render_line(&mut tw, "  ", 2, &line, shell.cols);
+                                let _ = tw.flush_to_stdout();
+                                continue;
+                            }
+                            KeyAction::Cancel => {
+                                tw.write_str("^C\r\n");
+                                let _ = tw.flush_to_stdout();
+                                return ReadResult::Empty;
+                            }
+                            KeyAction::Exit => {
+                                tw.write_str("\r\n");
+                                let _ = tw.flush_to_stdout();
+                                return handle_exit(shell);
+                            }
+                            KeyAction::ClearScreen => {
+                                tw.clear_screen();
+                            }
+                            KeyAction::StartHistorySearch => {
+                                saved_line = line.text().to_string();
+                                let matches = shell.history.fuzzy_search("");
+                                mode = Mode::HistorySearch {
+                                    query: String::new(),
+                                    matches,
+                                    selected: 0,
+                                    saved_line: saved_line.clone(),
+                                };
+                                render_history_mode(&mut tw, &mode, shell);
+                                let _ = tw.flush_to_stdout();
+                                continue;
+                            }
+                            KeyAction::StartCompletion => {
+                                let comp_state = start_completion(&line, shell.cols);
+                                match comp_state {
+                                    Some(cs) if cs.entries.len() == 1 => {
+                                        accept_completion(&mut line, &cs);
+                                        // If directory, immediately re-complete
+                                        if cs.entries[0].is_dir {
+                                            if let Some(cs2) =
+                                                start_completion(&line, shell.cols)
+                                            {
+                                                if cs2.entries.len() == 1 {
+                                                    accept_completion(&mut line, &cs2);
+                                                } else if !cs2.entries.is_empty() {
+                                                    mode = Mode::Completion(cs2);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Some(cs) if !cs.entries.is_empty() => {
+                                        mode = Mode::Completion(cs);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        match &mode {
+                            Mode::Normal => {
+                                let p = current_prompt(&prompt_str, &full_input);
+                                let pdl =
+                                    current_prompt_len(prompt_display_len, &full_input);
+                                render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                            }
+                            Mode::Completion(state) => {
+                                let p = current_prompt(&prompt_str, &full_input);
+                                let pdl =
+                                    current_prompt_len(prompt_display_len, &full_input);
+                                let rows_used =
+                                    render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                                render::render_completions(
+                                    &mut tw, state, shell.cols, rows_used,
+                                );
+                            }
+                            Mode::HistorySearch { .. } => {}
+                        }
+                        let _ = tw.flush_to_stdout();
+                    }
+
+                    Mode::Completion(state) => {
+                        match handle_completion_key(key, state, &mut line) {
+                            CompAction::Navigate => {}
+                            CompAction::Accept => {
+                                accept_completion(&mut line, state);
+                                let is_dir = state
+                                    .selected_entry()
+                                    .map(|e| e.is_dir)
+                                    .unwrap_or(false);
+                                mode = Mode::Normal;
+                                if is_dir {
+                                    if let Some(cs) = start_completion(&line, shell.cols) {
+                                        if cs.entries.len() == 1 {
+                                            accept_completion(&mut line, &cs);
+                                        } else if !cs.entries.is_empty() {
+                                            mode = Mode::Completion(cs);
+                                        }
+                                    }
+                                }
+                            }
+                            CompAction::Cancel => {
+                                mode = Mode::Normal;
+                            }
+                        }
+
+                        match &mode {
+                            Mode::Normal => {
+                                let p = current_prompt(&prompt_str, &full_input);
+                                let pdl =
+                                    current_prompt_len(prompt_display_len, &full_input);
+                                render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                            }
+                            Mode::Completion(state) => {
+                                let p = current_prompt(&prompt_str, &full_input);
+                                let pdl =
+                                    current_prompt_len(prompt_display_len, &full_input);
+                                let rows_used =
+                                    render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                                render::render_completions(
+                                    &mut tw, state, shell.cols, rows_used,
+                                );
+                            }
+                            _ => {}
+                        }
+                        let _ = tw.flush_to_stdout();
+                    }
+
+                    Mode::HistorySearch {
+                        query,
+                        matches,
+                        selected,
+                        saved_line,
+                    } => {
+                        match handle_history_search_key(key, query, matches, selected, shell) {
+                            HistAction::Continue => {
+                                render_history_mode(&mut tw, &mode, shell);
+                                let _ = tw.flush_to_stdout();
+                            }
+                            HistAction::Accept(text) => {
+                                line.set(&text);
+                                mode = Mode::Normal;
+                                tw.carriage_return();
+                                tw.clear_to_end_of_screen();
+                                render::render_line(
+                                    &mut tw,
+                                    &prompt_str,
+                                    prompt_display_len,
+                                    &line,
+                                    shell.cols,
+                                );
+                                let _ = tw.flush_to_stdout();
+                            }
+                            HistAction::Cancel => {
+                                line.set(saved_line);
+                                mode = Mode::Normal;
+                                tw.carriage_return();
+                                tw.clear_to_end_of_screen();
+                                render::render_line(
+                                    &mut tw,
+                                    &prompt_str,
+                                    prompt_display_len,
+                                    &line,
+                                    shell.cols,
+                                );
+                                let _ = tw.flush_to_stdout();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn current_prompt<'a>(prompt_str: &'a str, full_input: &str) -> &'a str {
+    if full_input.is_empty() {
+        prompt_str
+    } else {
+        "  "
+    }
+}
+
+fn current_prompt_len(prompt_display_len: usize, full_input: &str) -> usize {
+    if full_input.is_empty() {
+        prompt_display_len
+    } else {
+        2
+    }
+}
+
+enum KeyAction {
+    Continue,
+    Execute(String),
+    Continuation(String),
+    Cancel,
+    Exit,
+    ClearScreen,
+    StartHistorySearch,
+    StartCompletion,
+}
+
+fn handle_normal_key(
+    key: KeyEvent,
+    line: &mut LineBuffer,
+    history_idx: &mut Option<usize>,
+    saved_line: &mut String,
+    shell: &Shell,
+    full_input: &str,
+) -> KeyAction {
+    match (key.key, key.mods.ctrl, key.mods.alt) {
+        (Key::Char('c'), true, _) => return KeyAction::Cancel,
+        (Key::Char('d'), true, _) => {
+            if line.is_empty() && full_input.is_empty() {
+                return KeyAction::Exit;
+            }
+            line.delete_forward();
+        }
+        (Key::Char('a'), true, _) => line.move_home(),
+        (Key::Char('e'), true, _) => line.move_end(),
+        (Key::Char('k'), true, _) => line.kill_to_end(),
+        (Key::Char('u'), true, _) => line.kill_to_start(),
+        (Key::Char('w'), true, _) => line.kill_word_back(),
+        (Key::Char('y'), true, _) => line.yank(),
+        (Key::Char('l'), true, _) => return KeyAction::ClearScreen,
+        (Key::Char('r'), true, _) => return KeyAction::StartHistorySearch,
+
+        (Key::Char('b'), false, true) => line.move_word_left(),
+        (Key::Char('f'), false, true) => line.move_word_right(),
+
+        (Key::Up, _, _) if !key.mods.ctrl => {
+            navigate_history(line, history_idx, saved_line, shell, true);
+        }
+        (Key::Down, _, _) if !key.mods.ctrl => {
+            navigate_history(line, history_idx, saved_line, shell, false);
+        }
+        (Key::Left, _, _) if key.mods.ctrl || key.mods.alt => line.move_word_left(),
+        (Key::Right, _, _) if key.mods.ctrl || key.mods.alt => line.move_word_right(),
+        (Key::Left, _, _) => {
+            line.move_left();
+        }
+        (Key::Right, _, _) => {
+            line.move_right();
+        }
+        (Key::Home, _, _) => line.move_home(),
+        (Key::End, _, _) => line.move_end(),
+
+        (Key::Backspace, _, _) => {
+            line.delete_back();
+            *history_idx = None;
+        }
+        (Key::Delete, _, _) => {
+            line.delete_forward();
+        }
+        (Key::Tab, _, _) => {
+            if line.is_empty() {
+                line.insert_str("cd ");
+            }
+            return KeyAction::StartCompletion;
+        }
+        (Key::Enter, _, _) => {
+            let text = line.text().to_string();
+            let combined = if full_input.is_empty() {
+                text.clone()
+            } else {
+                format!("{full_input} {text}")
+            };
+            if parse::needs_continuation(&combined) {
+                return KeyAction::Continuation(text);
+            }
+            return KeyAction::Execute(text);
+        }
+
+        (Key::Char(c), false, false) => {
+            line.insert_char(c);
+            if c == ' ' {
+                try_alias_expand(line, &shell.aliases);
+            }
+            *history_idx = None;
+        }
+
+        _ => {}
+    }
+
+    KeyAction::Continue
+}
+
+fn navigate_history(
+    line: &mut LineBuffer,
+    history_idx: &mut Option<usize>,
+    saved_line: &mut String,
+    shell: &Shell,
+    up: bool,
+) {
+    let hist = &shell.history;
+    if hist.len() == 0 {
+        return;
+    }
+
+    if history_idx.is_none() {
+        *saved_line = line.text().to_string();
+    }
+
+    if up {
+        let skip = history_idx.map(|i| i + 1).unwrap_or(0);
+        let entry = if saved_line.is_empty() {
+            hist.entries().iter().rev().nth(skip).map(|s| s.as_str())
+        } else {
+            hist.prefix_search(saved_line, skip)
+        };
+        if let Some(e) = entry {
+            *history_idx = Some(skip);
+            line.set(e);
+        }
+    } else {
+        match history_idx {
+            Some(0) | None => {
+                *history_idx = None;
+                line.set(saved_line);
+            }
+            Some(idx) => {
+                *idx -= 1;
+                let skip = *idx;
+                let entry = if saved_line.is_empty() {
+                    hist.entries().iter().rev().nth(skip).map(|s| s.as_str())
+                } else {
+                    hist.prefix_search(saved_line, skip)
+                };
+                if let Some(e) = entry {
+                    line.set(e);
+                }
+            }
+        }
+    }
+}
+
+fn try_alias_expand(line: &mut LineBuffer, aliases: &AliasMap) {
+    let text = line.text().to_string();
+    let first_word = match text.split_whitespace().next() {
+        Some(w) => w.to_string(),
+        None => return,
+    };
+
+    if let Some(expansion) = aliases.get(&first_word) {
+        let rest = &text[first_word.len()..];
+        let expanded_str = expansion.join(" ");
+        let new_text = format!("{expanded_str}{rest}");
+        line.set(&new_text);
+    }
+}
+
+// -- Completion --
+
+enum CompAction {
+    Navigate,
+    Accept,
+    Cancel,
+}
+
+fn start_completion(line: &LineBuffer, term_cols: u16) -> Option<CompletionState> {
+    let text = line.text();
+    let before_cursor = &text[..line.cursor()];
+    let word_start = before_cursor.rfind(' ').map(|i| i + 1).unwrap_or(0);
+    let partial = &before_cursor[word_start..];
+
+    let (dir_prefix, filter) = if let Some(slash_pos) = partial.rfind('/') {
+        (
+            partial[..=slash_pos].to_string(),
+            partial[slash_pos + 1..].to_string(),
+        )
+    } else {
+        (String::new(), partial.to_string())
+    };
+
+    let entries = complete::complete_path(partial);
+    if entries.is_empty() {
+        return None;
+    }
+
+    let (cols, rows) = complete::compute_grid(&entries, term_cols);
+
+    Some(CompletionState {
+        entries,
+        selected: 0,
+        cols,
+        rows,
+        scroll: 0,
+        dir_prefix,
+        filter,
+    })
+}
+
+fn handle_completion_key(
+    key: KeyEvent,
+    state: &mut CompletionState,
+    _line: &mut LineBuffer,
+) -> CompAction {
+    match key.key {
+        Key::Up => {
+            state.move_up();
+            CompAction::Navigate
+        }
+        Key::Down => {
+            state.move_down();
+            CompAction::Navigate
+        }
+        Key::Left => {
+            state.move_left();
+            CompAction::Navigate
+        }
+        Key::Right => {
+            state.move_right();
+            CompAction::Navigate
+        }
+        Key::Tab | Key::Enter => CompAction::Accept,
+        Key::Escape => CompAction::Cancel,
+        Key::Char('c') if key.mods.ctrl => CompAction::Cancel,
+        _ => CompAction::Cancel,
+    }
+}
+
+fn accept_completion(line: &mut LineBuffer, state: &CompletionState) {
+    if let Some(entry) = state.selected_entry() {
+        let text = line.text().to_string();
+        let before_cursor = &text[..line.cursor()];
+        let word_start = before_cursor.rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let after_cursor = &text[line.cursor()..];
+
+        let mut completion = state.dir_prefix.clone();
+        completion.push_str(&entry.name);
+        if entry.is_dir {
+            completion.push('/');
+        }
+
+        let new_text = format!("{}{}{}", &text[..word_start], completion, after_cursor);
+        let new_cursor_chars = text[..word_start].chars().count() + completion.chars().count();
+        line.set(&new_text);
+        // Position cursor after the completion
+        line.move_home();
+        for _ in 0..new_cursor_chars {
+            line.move_right();
+        }
+    }
+}
+
+// -- History Search --
+
+enum HistAction {
+    Continue,
+    Accept(String),
+    Cancel,
+}
+
+fn handle_history_search_key(
+    key: KeyEvent,
+    query: &mut String,
+    matches: &mut Vec<FuzzyMatch>,
+    selected: &mut usize,
+    shell: &Shell,
+) -> HistAction {
+    match key.key {
+        Key::Escape => HistAction::Cancel,
+        Key::Char('c') if key.mods.ctrl => HistAction::Cancel,
+        Key::Enter => {
+            if let Some(m) = matches.get(*selected) {
+                HistAction::Accept(m.text.clone())
+            } else {
+                HistAction::Cancel
+            }
+        }
+        Key::Up | Key::Char('p') if key.key == Key::Up || key.mods.ctrl => {
+            if *selected + 1 < matches.len() {
+                *selected += 1;
+            }
+            HistAction::Continue
+        }
+        Key::Down | Key::Char('n') if key.key == Key::Down || key.mods.ctrl => {
+            if *selected > 0 {
+                *selected -= 1;
+            }
+            HistAction::Continue
+        }
+        Key::Backspace => {
+            query.pop();
+            *matches = shell.history.fuzzy_search(query);
+            *selected = 0;
+            HistAction::Continue
+        }
+        Key::Char(c) if !key.mods.ctrl => {
+            query.push(c);
+            *matches = shell.history.fuzzy_search(query);
+            *selected = 0;
+            HistAction::Continue
+        }
+        _ => HistAction::Continue,
+    }
+}
+
+fn render_history_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
+    if let Mode::HistorySearch {
+        query,
+        matches,
+        selected,
+        ..
+    } = mode
+    {
+        render::render_history_pager(tw, query, matches, *selected, shell.rows, shell.cols);
+    }
+}
+
+fn handle_exit(shell: &mut Shell) -> ReadResult {
+    if shell.job.is_some() {
+        if shell.exit_warned {
+            if let Some(job) = shell.job.take() {
+                unsafe {
+                    libc::killpg(job.pgid, libc::SIGTERM);
+                }
+            }
+            ReadResult::Exit
+        } else {
+            eprintln!("ish: there is a suspended job. Press Ctrl+D again to force quit.");
+            shell.exit_warned = true;
+            ReadResult::Empty
+        }
+    } else {
+        ReadResult::Exit
+    }
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
