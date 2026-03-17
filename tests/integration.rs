@@ -368,8 +368,8 @@ fn history_fuzzy_search_ordering() {
     // "gc" matches "git checkout" and "git commit", not "ls -la"
     // Most recent first
     assert_eq!(matches.len(), 2);
-    assert_eq!(matches[0].text, "git commit -m fix");
-    assert_eq!(matches[1].text, "git checkout main");
+    assert_eq!(h.get(matches[0].entry_idx), "git commit -m fix");
+    assert_eq!(h.get(matches[1].entry_idx), "git checkout main");
 }
 
 #[test]
@@ -384,7 +384,7 @@ fn history_fuzzy_empty_query_returns_all() {
     let matches = h.fuzzy_search("");
     assert_eq!(matches.len(), 3);
     // Most recent first
-    assert_eq!(matches[0].text, "c");
+    assert_eq!(h.get(matches[0].entry_idx), "c");
 }
 
 #[test]

@@ -91,15 +91,16 @@ impl History {
 
     /// Fuzzy (subsequence) search: every char of `query` appears in the entry
     /// in order, case-insensitive. Returns matching entries most-recent-first,
-    /// with indices of matching chars.
+    /// with entry index and indices of matching chars.
     pub fn fuzzy_search(&self, query: &str) -> Vec<FuzzyMatch> {
         if query.is_empty() {
             return self
                 .entries
                 .iter()
+                .enumerate()
                 .rev()
-                .map(|e| FuzzyMatch {
-                    text: e.clone(),
+                .map(|(idx, _)| FuzzyMatch {
+                    entry_idx: idx,
                     match_positions: Vec::new(),
                 })
                 .collect();
@@ -108,16 +109,21 @@ impl History {
         let query_lower: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
         let mut results = Vec::new();
 
-        for entry in self.entries.iter().rev() {
+        for (idx, entry) in self.entries.iter().enumerate().rev() {
             if let Some(positions) = subsequence_match(&query_lower, entry) {
                 results.push(FuzzyMatch {
-                    text: entry.clone(),
+                    entry_idx: idx,
                     match_positions: positions,
                 });
             }
         }
 
         results
+    }
+
+    /// Get entry text by index.
+    pub fn get(&self, idx: usize) -> &str {
+        &self.entries[idx]
     }
 
     fn append_to_file(&self, line: &str) {
@@ -135,29 +141,30 @@ impl History {
 }
 
 pub struct FuzzyMatch {
-    pub text: String,
+    pub entry_idx: usize,
     pub match_positions: Vec<usize>,
 }
 
 /// Check if `query` chars appear in `text` in order (case-insensitive).
 /// Returns character indices in `text` that matched.
 pub fn subsequence_match(query: &[char], text: &str) -> Option<Vec<usize>> {
-    let text_chars: Vec<char> = text.chars().collect();
+    if query.is_empty() {
+        return Some(Vec::new());
+    }
     let mut positions = Vec::with_capacity(query.len());
     let mut qi = 0;
 
-    for (ti, &tc) in text_chars.iter().enumerate() {
-        if qi < query.len() && tc.to_lowercase().next() == Some(query[qi]) {
+    for (ti, tc) in text.chars().enumerate() {
+        if tc.to_lowercase().next() == Some(query[qi]) {
             positions.push(ti);
             qi += 1;
+            if qi == query.len() {
+                return Some(positions);
+            }
         }
     }
 
-    if qi == query.len() {
-        Some(positions)
-    } else {
-        None
-    }
+    None
 }
 
 fn history_path() -> PathBuf {

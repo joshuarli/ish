@@ -793,7 +793,7 @@ fn handle_history_search_key(
         Key::Char('c') if key.mods.ctrl => HistAction::Cancel,
         Key::Enter => {
             if let Some(m) = matches.get(*selected) {
-                HistAction::Accept(m.text.clone())
+                HistAction::Accept(shell.history.get(m.entry_idx).to_string())
             } else {
                 HistAction::Cancel
             }
@@ -834,7 +834,15 @@ fn render_history_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
         ..
     } = mode
     {
-        render::render_history_pager(tw, query, matches, *selected, shell.rows, shell.cols);
+        render::render_history_pager(
+            tw,
+            query,
+            matches,
+            &shell.history,
+            *selected,
+            shell.rows,
+            shell.cols,
+        );
     }
 }
 

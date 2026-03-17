@@ -9,10 +9,34 @@ pub fn expand_word(
     home: &str,
     exec_subst: &mut dyn FnMut(&str) -> Result<String, Error>,
 ) -> Result<Vec<String>, Error> {
-    let word = expand_tilde(word, home);
-    let word = expand_variables(&word);
-    let word = expand_command_subst(&word, exec_subst)?;
-    expand_glob(&word)
+    // Avoid allocations when no expansion is needed.
+    let has_dollar = word.contains('$') || word.contains('`');
+    let has_tilde = word.starts_with('~');
+    let has_glob = has_glob_chars(word);
+
+    // Fast path: no expansion at all
+    if !has_dollar && !has_tilde && !has_glob && !word.contains(LITERAL) {
+        return Ok(vec![word.to_string()]);
+    }
+
+    // Only run stages that are needed, reusing the buffer between stages.
+    let word = if has_tilde {
+        expand_tilde(word, home)
+    } else {
+        word.to_string()
+    };
+    let word = if has_dollar {
+        let w = expand_variables(&word);
+        expand_command_subst(&w, exec_subst)?
+    } else {
+        word
+    };
+    if has_glob {
+        expand_glob(&word)
+    } else {
+        // Strip LITERAL markers
+        Ok(vec![strip_literal(&word)])
+    }
 }
 
 /// Expand argv in place. Each word may produce multiple results (from globs).
@@ -35,7 +59,11 @@ fn expand_tilde(word: &str, home: &str) -> String {
         return home.to_string();
     }
     if let Some(rest) = word.strip_prefix("~/") {
-        return format!("{home}/{rest}");
+        let mut s = String::with_capacity(home.len() + 1 + rest.len());
+        s.push_str(home);
+        s.push('/');
+        s.push_str(rest);
+        return s;
     }
     word.to_string()
 }
@@ -43,42 +71,50 @@ fn expand_tilde(word: &str, home: &str) -> String {
 // -- Variable Expansion --
 
 fn expand_variables(word: &str) -> String {
+    let bytes = word.as_bytes();
     let mut result = String::with_capacity(word.len());
-    let chars: Vec<char> = word.chars().collect();
     let mut i = 0;
 
-    while i < chars.len() {
-        if chars[i] == LITERAL {
-            // Escaped char — pass through with marker
+    while i < bytes.len() {
+        if bytes[i] == 0 {
+            // LITERAL marker — pass through with marker + next char
             result.push(LITERAL);
             i += 1;
-            if i < chars.len() {
-                result.push(chars[i]);
-                i += 1;
+            if i < bytes.len() {
+                // Advance past the full UTF-8 char following the marker
+                let rest = &word[i..];
+                let ch = rest.chars().next().unwrap();
+                result.push(ch);
+                i += ch.len_utf8();
             }
-        } else if chars[i] == '$' {
-            if i + 1 < chars.len() && chars[i + 1] == '(' {
+        } else if bytes[i] == b'$' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'(' {
                 // Command substitution — leave for later pass
                 result.push('$');
                 i += 1;
             } else {
-                // Variable name
+                // Variable name: ASCII alphanumeric + underscore
                 i += 1;
-                let mut name = String::new();
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                    name.push(chars[i]);
+                let name_start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
-                if name.is_empty() {
+                if i == name_start {
                     result.push('$');
-                } else if let Ok(val) = std::env::var(&name) {
-                    result.push_str(&val);
+                } else {
+                    let name = &word[name_start..i];
+                    if let Ok(val) = std::env::var(name) {
+                        result.push_str(&val);
+                    }
                 }
-                // Undefined var → empty string
             }
         } else {
-            result.push(chars[i]);
-            i += 1;
+            // Copy non-special content in bulk
+            let start = i;
+            while i < bytes.len() && bytes[i] != 0 && bytes[i] != b'$' {
+                i += 1;
+            }
+            result.push_str(&word[start..i]);
         }
     }
 
@@ -91,77 +127,80 @@ fn expand_command_subst(
     word: &str,
     exec_subst: &mut dyn FnMut(&str) -> Result<String, Error>,
 ) -> Result<String, Error> {
+    let bytes = word.as_bytes();
     let mut result = String::with_capacity(word.len());
-    let chars: Vec<char> = word.chars().collect();
     let mut i = 0;
 
-    while i < chars.len() {
-        if chars[i] == LITERAL {
+    while i < bytes.len() {
+        if bytes[i] == 0 {
+            // LITERAL marker
             result.push(LITERAL);
             i += 1;
-            if i < chars.len() {
-                result.push(chars[i]);
-                i += 1;
+            if i < bytes.len() {
+                let rest = &word[i..];
+                let ch = rest.chars().next().unwrap();
+                result.push(ch);
+                i += ch.len_utf8();
             }
-        } else if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1] == '(' {
+        } else if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             // $(...) command substitution
             let start = i + 2;
-            let end = find_matching_paren(&chars, start)?;
-            let cmd: String = chars[start..end].iter().collect();
-            // Strip LITERAL markers from the command before executing
-            let cmd = cmd.replace(LITERAL, "");
+            let end = find_matching_paren(bytes, start)?;
+            let cmd = strip_literal(&word[start..end]);
             let output = exec_subst(&cmd)?;
             result.push_str(output.trim_end_matches('\n'));
             i = end + 1;
-        } else if chars[i] == '`' {
+        } else if bytes[i] == b'`' {
             // Backtick command substitution
             let start = i + 1;
-            let end = find_backtick_end(&chars, start)?;
-            let cmd: String = chars[start..end].iter().collect();
-            let cmd = cmd.replace(LITERAL, "");
+            let end = find_backtick_end(bytes, start)?;
+            let cmd = strip_literal(&word[start..end]);
             let output = exec_subst(&cmd)?;
             result.push_str(output.trim_end_matches('\n'));
             i = end + 1;
         } else {
-            result.push(chars[i]);
-            i += 1;
+            // Copy non-special content in bulk
+            let start = i;
+            while i < bytes.len() && bytes[i] != 0 && bytes[i] != b'$' && bytes[i] != b'`' {
+                i += 1;
+            }
+            result.push_str(&word[start..i]);
         }
     }
 
     Ok(result)
 }
 
-fn find_matching_paren(chars: &[char], start: usize) -> Result<usize, Error> {
-    let mut depth = 1;
+fn find_matching_paren(bytes: &[u8], start: usize) -> Result<usize, Error> {
+    let mut depth: u32 = 1;
     let mut i = start;
-    while i < chars.len() && depth > 0 {
-        if chars[i] == LITERAL {
-            i += 2; // skip escaped char
-        } else if chars[i] == '(' {
-            depth += 1;
-            i += 1;
-        } else if chars[i] == ')' {
-            depth -= 1;
-            if depth == 0 {
-                return Ok(i);
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            0 => i += 2, // LITERAL + next byte (skip escaped char)
+            b'(' => {
+                depth += 1;
+                i += 1;
             }
-            i += 1;
-        } else {
-            i += 1;
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
     Err(Error::bad_substitution("unclosed $("))
 }
 
-fn find_backtick_end(chars: &[char], start: usize) -> Result<usize, Error> {
+fn find_backtick_end(bytes: &[u8], start: usize) -> Result<usize, Error> {
     let mut i = start;
-    while i < chars.len() {
-        if chars[i] == LITERAL {
-            i += 2;
-        } else if chars[i] == '`' {
-            return Ok(i);
-        } else {
-            i += 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            0 => i += 2,
+            b'`' => return Ok(i),
+            _ => i += 1,
         }
     }
     Err(Error::bad_substitution("unclosed backtick"))
@@ -187,21 +226,22 @@ fn expand_glob(word: &str) -> Result<Vec<String>, Error> {
 }
 
 fn has_glob_chars(word: &str) -> bool {
-    let chars: Vec<char> = word.chars().collect();
+    let bytes = word.as_bytes();
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == LITERAL {
-            i += 2; // skip escaped char
-        } else if matches!(chars[i], '*' | '?') {
-            return true;
-        } else {
-            i += 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            0 => i += 2, // LITERAL + next byte
+            b'*' | b'?' => return true,
+            _ => i += 1,
         }
     }
     false
 }
 
 fn strip_literal(s: &str) -> String {
+    if !s.contains(LITERAL) {
+        return s.to_string();
+    }
     s.replace(LITERAL, "")
 }
 
@@ -300,20 +340,18 @@ fn collect_recursive(dir: &str, out: &mut Vec<String>) -> Result<(), Error> {
 }
 
 /// Simple glob pattern matching: * matches any chars, ? matches one char.
+/// Operates on bytes for speed (filenames are almost always ASCII).
 fn pattern_match(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    pattern_match_inner(&p, &n, 0, 0)
+    pattern_match_bytes(pattern.as_bytes(), name.as_bytes(), 0, 0)
 }
 
-fn pattern_match_inner(p: &[char], n: &[char], pi: usize, ni: usize) -> bool {
+fn pattern_match_bytes(p: &[u8], n: &[u8], pi: usize, ni: usize) -> bool {
     if pi == p.len() {
         return ni == n.len();
     }
-    if p[pi] == '*' {
-        // * matches zero or more chars
+    if p[pi] == b'*' {
         for k in ni..=n.len() {
-            if pattern_match_inner(p, n, pi + 1, k) {
+            if pattern_match_bytes(p, n, pi + 1, k) {
                 return true;
             }
         }
@@ -322,8 +360,8 @@ fn pattern_match_inner(p: &[char], n: &[char], pi: usize, ni: usize) -> bool {
     if ni >= n.len() {
         return false;
     }
-    if p[pi] == '?' || p[pi] == n[ni] {
-        return pattern_match_inner(p, n, pi + 1, ni + 1);
+    if p[pi] == b'?' || p[pi] == n[ni] {
+        return pattern_match_bytes(p, n, pi + 1, ni + 1);
     }
     false
 }

@@ -169,11 +169,10 @@ pub fn shorten_pwd(pwd: &str, home: &str) -> String {
         return "~".to_string();
     }
 
-    let parts: Vec<&str> = remainder.split('/').collect();
-    let n_parts = parts.len();
+    let n_parts = remainder.split('/').count();
 
-    let mut out = String::new();
-    for (i, part) in parts.iter().enumerate() {
+    let mut out = String::with_capacity(remainder.len());
+    for (i, part) in remainder.split('/').enumerate() {
         if i > 0 {
             out.push('/');
         }

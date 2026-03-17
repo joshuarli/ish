@@ -61,23 +61,18 @@ enum Token {
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, Error> {
-    let chars: Vec<char> = input.chars().collect();
+    let bytes = input.as_bytes();
     let mut i = 0;
     let mut tokens = Vec::new();
 
-    while i < chars.len() {
-        // Skip whitespace
-        if chars[i] == ' ' || chars[i] == '\t' || chars[i] == '\n' {
-            i += 1;
-            continue;
-        }
-        // Comments
-        if chars[i] == '#' {
-            break;
-        }
-        match chars[i] {
-            '|' => {
-                if peek(&chars, i + 1) == Some('|') {
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\n' => {
+                i += 1;
+            }
+            b'#' => break,
+            b'|' => {
+                if bytes.get(i + 1) == Some(&b'|') {
                     tokens.push(Token::Or);
                     i += 2;
                 } else {
@@ -85,22 +80,23 @@ fn tokenize(input: &str) -> Result<Vec<Token>, Error> {
                     i += 1;
                 }
             }
-            '&' => {
-                if peek(&chars, i + 1) == Some('|') {
+            b'&' => match bytes.get(i + 1) {
+                Some(&b'|') => {
                     tokens.push(Token::PipeStderr);
                     i += 2;
-                } else if peek(&chars, i + 1) == Some('>') {
+                }
+                Some(&b'>') => {
                     tokens.push(Token::Redirect(RedirectKind::All));
                     i += 2;
-                } else if peek(&chars, i + 1) == Some('&') {
+                }
+                Some(&b'&') => {
                     tokens.push(Token::And);
                     i += 2;
-                } else {
-                    return Err(Error::msg("background (&) not supported"));
                 }
-            }
-            '>' => {
-                if peek(&chars, i + 1) == Some('>') {
+                _ => return Err(Error::msg("background (&) not supported")),
+            },
+            b'>' => {
+                if bytes.get(i + 1) == Some(&b'>') {
                     tokens.push(Token::Redirect(RedirectKind::Append));
                     i += 2;
                 } else {
@@ -108,20 +104,20 @@ fn tokenize(input: &str) -> Result<Vec<Token>, Error> {
                     i += 1;
                 }
             }
-            '<' => {
+            b'<' => {
                 tokens.push(Token::Redirect(RedirectKind::In));
                 i += 1;
             }
-            ';' => {
+            b';' => {
                 tokens.push(Token::Semi);
                 i += 1;
             }
-            '2' if peek(&chars, i + 1) == Some('>') => {
+            b'2' if bytes.get(i + 1) == Some(&b'>') => {
                 tokens.push(Token::Redirect(RedirectKind::Err));
                 i += 2;
             }
             _ => {
-                let (word, new_i) = scan_word(&chars, i)?;
+                let (word, new_i) = scan_word(input, bytes, i)?;
                 tokens.push(Token::Word(word));
                 i = new_i;
             }
@@ -131,77 +127,88 @@ fn tokenize(input: &str) -> Result<Vec<Token>, Error> {
     Ok(tokens)
 }
 
-fn peek(chars: &[char], idx: usize) -> Option<char> {
-    chars.get(idx).copied()
-}
-
-fn is_meta(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '|' | '&' | '>' | '<' | ';' | '#')
+fn is_meta(b: u8) -> bool {
+    matches!(
+        b,
+        b' ' | b'\t' | b'\n' | b'|' | b'&' | b'>' | b'<' | b';' | b'#'
+    )
 }
 
 /// Scan a word token, handling quoting. Returns (word_string, new_index).
 /// Uses LITERAL (\x00) prefix to mark chars that should not be expanded.
-fn scan_word(chars: &[char], start: usize) -> Result<(String, usize), Error> {
+fn scan_word(input: &str, bytes: &[u8], start: usize) -> Result<(String, usize), Error> {
     let mut word = String::new();
     let mut i = start;
 
-    while i < chars.len() {
-        match chars[i] {
-            c if is_meta(c) => break,
-            // Handle 2> specially only at start of a word-scan (handled in tokenize)
-            '\'' => {
+    while i < bytes.len() {
+        match bytes[i] {
+            b if is_meta(b) => break,
+            b'\'' => {
                 i += 1;
-                while i < chars.len() && chars[i] != '\'' {
-                    let c = chars[i];
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    let rest = &input[i..];
+                    let c = rest.chars().next().unwrap();
                     if is_expandable(c) {
                         word.push(LITERAL);
                     }
                     word.push(c);
-                    i += 1;
+                    i += c.len_utf8();
                 }
-                if i >= chars.len() {
+                if i >= bytes.len() {
                     return Err(Error::msg("unclosed single quote"));
                 }
                 i += 1;
             }
-            '"' => {
+            b'"' => {
                 i += 1;
-                while i < chars.len() && chars[i] != '"' {
-                    if chars[i] == '\\' && i + 1 < chars.len() {
-                        let next = chars[i + 1];
-                        if matches!(next, '$' | '"' | '\\' | '`') {
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        let next = &input[i + 1..];
+                        let next_ch = next.chars().next().unwrap();
+                        if matches!(next_ch, '$' | '"' | '\\' | '`') {
                             word.push(LITERAL);
-                            word.push(next);
-                            i += 2;
+                            word.push(next_ch);
+                            i += 1 + next_ch.len_utf8();
                         } else {
                             word.push(LITERAL);
                             word.push('\\');
                             i += 1;
                         }
                     } else {
-                        let c = chars[i];
-                        // In double quotes: glob/tilde chars are literal, $ and ` are expandable
+                        let rest = &input[i..];
+                        let c = rest.chars().next().unwrap();
                         if is_glob_or_tilde(c) {
                             word.push(LITERAL);
                         }
                         word.push(c);
-                        i += 1;
+                        i += c.len_utf8();
                     }
                 }
-                if i >= chars.len() {
+                if i >= bytes.len() {
                     return Err(Error::msg("unclosed double quote"));
                 }
                 i += 1;
             }
-            '\\' if i + 1 < chars.len() => {
+            b'\\' if i + 1 < bytes.len() => {
                 i += 1;
+                let rest = &input[i..];
+                let c = rest.chars().next().unwrap();
                 word.push(LITERAL);
-                word.push(chars[i]);
-                i += 1;
-            }
-            c => {
                 word.push(c);
-                i += 1;
+                i += c.len_utf8();
+            }
+            _ => {
+                // Copy non-special bytes in bulk
+                let start = i;
+                while i < bytes.len()
+                    && !is_meta(bytes[i])
+                    && bytes[i] != b'\''
+                    && bytes[i] != b'"'
+                    && bytes[i] != b'\\'
+                {
+                    i += 1;
+                }
+                word.push_str(&input[start..i]);
             }
         }
     }

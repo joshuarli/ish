@@ -1,5 +1,5 @@
 use crate::complete::{CompEntry, CompletionState};
-use crate::history::FuzzyMatch;
+use crate::history::{FuzzyMatch, History};
 use crate::line::LineBuffer;
 use crate::term::TermWriter;
 
@@ -174,6 +174,7 @@ pub fn render_history_pager(
     tw: &mut TermWriter,
     query: &str,
     matches: &[FuzzyMatch],
+    history: &History,
     selected: usize,
     term_rows: u16,
     term_cols: u16,
@@ -202,19 +203,21 @@ pub fn render_history_pager(
             tw.write_str("\x1b[7m"); // reverse video
         }
 
-        // Write entry with matching chars highlighted
-        let entry_chars: Vec<char> = m.text.chars().collect();
-        let mut match_set = std::collections::HashSet::new();
-        for &pos in &m.match_positions {
-            match_set.insert(pos);
-        }
+        let text = history.get(m.entry_idx);
 
+        // Write entry with matching chars highlighted.
+        // Use a sorted position index instead of HashSet to avoid allocation.
         let max_width = term_cols as usize - 2;
-        for (ci, &ch) in entry_chars.iter().enumerate() {
+        let mut pi = 0; // index into match_positions
+        for (ci, ch) in text.chars().enumerate() {
             if ci >= max_width {
                 break;
             }
-            if match_set.contains(&ci) && !is_selected {
+            let is_match = pi < m.match_positions.len() && m.match_positions[pi] == ci;
+            if is_match {
+                pi += 1;
+            }
+            if is_match && !is_selected {
                 tw.write_str("\x1b[1;33m"); // bold yellow
                 let mut buf = [0u8; 4];
                 tw.write_str(ch.encode_utf8(&mut buf));
