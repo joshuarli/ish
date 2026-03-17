@@ -240,6 +240,10 @@ fn glob_match(pattern: &str) -> Result<Vec<String>, Error> {
                     for entry in entries.flatten() {
                         let name = entry.file_name();
                         let name = name.to_string_lossy();
+                        // Skip filenames with control characters
+                        if name.bytes().any(|b| b < b' ' || b == 0x7f) {
+                            continue;
+                        }
                         // Skip hidden files unless pattern starts with .
                         if name.starts_with('.') && !seg.starts_with('.') {
                             continue;
@@ -280,7 +284,7 @@ fn collect_recursive(dir: &str, out: &mut Vec<String>) -> Result<(), Error> {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name.starts_with('.') {
+                if name.starts_with('.') || name.bytes().any(|b| b < b' ' || b == 0x7f) {
                     continue;
                 }
                 let child = if dir == "." {

@@ -66,8 +66,23 @@ struct Entry {
 }
 
 fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
-    let mut entries = Vec::new();
+    // If path is a file (or symlink to file), list just that entry.
+    let top_meta = std::fs::symlink_metadata(path)?;
+    let top_is_dir = if top_meta.file_type().is_symlink() {
+        std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+    } else {
+        top_meta.is_dir()
+    };
+    if !top_is_dir {
+        let p = std::path::Path::new(path);
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        return Ok(vec![build_entry(&name, p, &top_meta)]);
+    }
 
+    let mut entries = Vec::new();
     for dir_entry in std::fs::read_dir(path)? {
         let dir_entry = dir_entry?;
         let name = dir_entry.file_name().to_string_lossy().into_owned();
@@ -78,55 +93,11 @@ fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
         }
 
         let full_path = dir_entry.path();
-        let lmeta = std::fs::symlink_metadata(&full_path)?;
-        let mode = lmeta.mode();
-        let is_link = lmeta.file_type().is_symlink();
-        let is_dir = if is_link {
-            std::fs::metadata(&full_path)
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-        } else {
-            lmeta.is_dir()
+        let lmeta = match std::fs::symlink_metadata(&full_path) {
+            Ok(m) => m,
+            Err(_) => continue,
         };
-        let is_exec = !is_dir && mode & 0o111 != 0;
-
-        let link_target = if is_link {
-            std::fs::read_link(&full_path)
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        } else {
-            None
-        };
-
-        let display_name = if is_dir {
-            format!("{name}/")
-        } else {
-            name.clone()
-        };
-
-        let color_start = if is_link {
-            "\x1b[36m".to_string() // cyan
-        } else if is_dir {
-            "\x1b[34m".to_string() // blue
-        } else if mode & libc::S_ISUID as u32 != 0 {
-            "\x1b[31m".to_string() // red for setuid
-        } else if is_exec {
-            "\x1b[32m".to_string() // green
-        } else {
-            String::new()
-        };
-
-        entries.push(Entry {
-            mode_str: format_mode(mode),
-            nlink_str: lmeta.nlink().to_string(),
-            owner: username(lmeta.uid()),
-            group: groupname(lmeta.gid()),
-            size_str: human_size(lmeta.size()),
-            date_str: format_time(lmeta.mtime()),
-            display_name,
-            link_target,
-            color_start,
-        });
+        entries.push(build_entry(&name, &full_path, &lmeta));
     }
 
     // Sort case-insensitively
@@ -137,6 +108,69 @@ fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
     });
 
     Ok(entries)
+}
+
+fn build_entry(name: &str, full_path: &std::path::Path, lmeta: &std::fs::Metadata) -> Entry {
+    let mode = lmeta.mode();
+    let is_link = lmeta.file_type().is_symlink();
+    let is_dir = if is_link {
+        std::fs::metadata(full_path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+    } else {
+        lmeta.is_dir()
+    };
+    let is_exec = !is_dir && mode & 0o111 != 0;
+
+    let link_target = if is_link {
+        std::fs::read_link(full_path)
+            .ok()
+            .map(|p| sanitize_name(&p.to_string_lossy()))
+    } else {
+        None
+    };
+
+    let safe_name = sanitize_name(name);
+    let display_name = if is_dir {
+        format!("{safe_name}/")
+    } else {
+        safe_name
+    };
+
+    let color_start = if is_link {
+        "\x1b[36m".to_string() // cyan
+    } else if is_dir {
+        "\x1b[34m".to_string() // blue
+    } else if mode & libc::S_ISUID as u32 != 0 {
+        "\x1b[31m".to_string() // red for setuid
+    } else if is_exec {
+        "\x1b[32m".to_string() // green
+    } else {
+        String::new()
+    };
+
+    Entry {
+        mode_str: format_mode(mode),
+        nlink_str: lmeta.nlink().to_string(),
+        owner: username(lmeta.uid()),
+        group: groupname(lmeta.gid()),
+        size_str: human_size(lmeta.size()),
+        date_str: format_time(lmeta.mtime()),
+        display_name,
+        link_target,
+        color_start,
+    }
+}
+
+/// Replace control characters (newlines, tabs, etc.) in filenames with
+/// Unicode replacement char to prevent terminal injection and output corruption.
+fn sanitize_name(name: &str) -> String {
+    if name.bytes().all(|b| b >= b' ' && b != 0x7f) {
+        return name.to_string();
+    }
+    name.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
 }
 
 fn format_mode(mode: u32) -> String {

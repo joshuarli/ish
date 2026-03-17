@@ -51,6 +51,8 @@ impl History {
 
     /// Add entry. Deduplicates (removes prior occurrence).
     pub fn add(&mut self, line: &str) {
+        // Collapse newlines to spaces to prevent history file corruption.
+        let line = line.trim().replace('\n', " ");
         let line = line.trim();
         if line.is_empty() {
             return;

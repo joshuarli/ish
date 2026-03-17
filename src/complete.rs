@@ -129,6 +129,10 @@ pub fn complete_path(partial: &str, dirs_only: bool) -> Vec<CompEntry> {
             if name == "." || name == ".." {
                 return None;
             }
+            // Skip filenames with control characters (newlines, etc.)
+            if name.bytes().any(|b| b < b' ' || b == 0x7f) {
+                return None;
+            }
             // Skip hidden files unless prefix starts with .
             if name.starts_with('.') && !prefix.starts_with('.') {
                 return None;
