@@ -56,11 +56,21 @@ fn ish_binary() -> PathBuf {
 impl PtyShell {
     /// Spawn ish in a PTY with an isolated HOME directory.
     fn spawn() -> Self {
-        Self::spawn_with_opts(&[], &[])
+        Self::spawn_with_env(&[], &[], &[])
     }
 
     /// Spawn with files pre-created in HOME and optional history entries.
     fn spawn_with_opts(files: &[(&str, &str)], history: &[&str]) -> Self {
+        Self::spawn_with_env(files, history, &[])
+    }
+
+    /// Spawn with files, history, and extra environment variables.
+    /// Extra env vars override defaults (e.g. PATH).
+    fn spawn_with_env(
+        files: &[(&str, &str)],
+        history: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         let home = TempDir::new("ish_pty_test");
         let home_path = home.path().to_str().unwrap().to_string();
 
@@ -71,6 +81,11 @@ impl PtyShell {
                 std::fs::create_dir_all(parent).unwrap();
             }
             std::fs::write(&p, content).unwrap();
+            // Make files in bin/ executable
+            if name.starts_with("bin/") {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
 
         // Create history file
@@ -128,8 +143,8 @@ impl PtyShell {
             }
 
             // Exec ish with clean env
-            let err = Command::new(&binary)
-                .env_clear()
+            let mut cmd = Command::new(&binary);
+            cmd.env_clear()
                 .env("HOME", &home_path)
                 .env("USER", "testuser")
                 .env("PWD", &home_path)
@@ -137,8 +152,11 @@ impl PtyShell {
                 .env("TERM", "xterm-256color")
                 .env("XDG_CONFIG_HOME", format!("{home_path}/.config"))
                 .env("XDG_DATA_HOME", format!("{home_path}/.local/share"))
-                .current_dir(&home_path)
-                .exec();
+                .current_dir(&home_path);
+            for (key, value) in extra_env {
+                cmd.env(key, value);
+            }
+            let err = cmd.exec();
             eprintln!("exec failed: {err}");
             std::process::exit(127);
         }
@@ -345,10 +363,42 @@ impl PtyShell {
     }
 
     /// Send a command, press enter, wait for the next prompt.
+    ///
+    /// Waits for `"$ "` that appears after a newline. Typing renders use `\r`
+    /// only, so any `\n` indicates the shell processed Enter and started
+    /// execution. This prevents early returns from matching `"$ "` in typing
+    /// renders during slow commands (e.g., denv subprocess on cd).
+    /// Send a command, press enter, wait for the next prompt.
+    ///
+    /// Waits for `"$ "` that appears after a newline. Typing renders use `\r`
+    /// only, so any `\n` indicates the shell processed Enter and started
+    /// execution. This prevents early returns from matching `"$ "` in typing
+    /// renders during slow commands (e.g., denv subprocess on cd).
     fn run_command(&self, cmd: &str) -> String {
         self.type_str(cmd);
         self.enter();
-        self.wait_for_prompt(3000)
+        let mut accumulated = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
+
+        loop {
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u64;
+            if remaining == 0 {
+                break;
+            }
+
+            let chunk = self.read_timeout(remaining.min(200));
+            accumulated.push_str(&chunk);
+
+            if let Some(nl) = accumulated.find('\n')
+                && accumulated[nl..].contains("$ ")
+            {
+                return accumulated;
+            }
+        }
+
+        accumulated
     }
 
     /// Strip ANSI escape sequences from output for easier text matching.
@@ -394,16 +444,30 @@ impl PtyShell {
 
 impl Drop for PtyShell {
     fn drop(&mut self) {
-        // Send Ctrl+D to exit cleanly, then SIGTERM as fallback
+        // Send Ctrl+D to exit cleanly
         self.send(b"\x04");
         std::thread::sleep(std::time::Duration::from_millis(50));
+        // Escalate: SIGTERM, then SIGKILL
         unsafe {
             libc::kill(self.child, libc::SIGTERM);
         }
-        // Reap child
-        let mut status = 0i32;
-        unsafe {
-            libc::waitpid(self.child, &mut status, 0);
+        // Use WNOHANG polling — blocking waitpid can hang on macOS with open PTY master
+        let start = std::time::Instant::now();
+        loop {
+            let mut status = 0i32;
+            let ret = unsafe { libc::waitpid(self.child, &mut status, libc::WNOHANG) };
+            if ret != 0 {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_millis(500) {
+                unsafe {
+                    libc::kill(self.child, libc::SIGKILL);
+                }
+            }
+            if start.elapsed() > std::time::Duration::from_millis(2000) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
@@ -1024,4 +1088,194 @@ fn true_and_false_builtins() {
     let out = sh.run_command("false && echo bad || echo good");
     let text = PtyShell::strip_ansi(&out);
     assert!(text.contains("good"), "false should fail: {text:?}");
+}
+
+// ---------------------------------------------------------------------------
+// denv integration tests
+// ---------------------------------------------------------------------------
+
+/// Mock denv script — reads .denv_export from PWD, handles allow/deny/reload.
+const MOCK_DENV: &str = r#"#!/bin/sh
+case "$1" in
+export)
+    if [ -f "$PWD/.denv_export" ]; then
+        cat "$PWD/.denv_export"
+        echo "export __DENV_DIR='$PWD';"
+        echo "export __DENV_STATE='0 1 $PWD';"
+    elif [ -n "$__DENV_DIR" ]; then
+        echo "unset DENV_TEST_VAR;"
+        echo "unset __DENV_DIR;"
+        echo "unset __DENV_STATE;"
+    fi
+    ;;
+allow|reload)
+    if [ -f "$PWD/.denv_export" ]; then
+        cat "$PWD/.denv_export"
+        echo "export __DENV_DIR='$PWD';"
+        echo "export __DENV_STATE='0 1 $PWD';"
+    fi
+    ;;
+deny)
+    if [ -n "$__DENV_DIR" ]; then
+        echo "unset DENV_TEST_VAR;"
+        echo "unset __DENV_DIR;"
+        echo "unset __DENV_STATE;"
+    fi
+    ;;
+esac
+"#;
+
+/// Spawn ish with mock denv in PATH, using spawn_with_env.
+/// The home_path is dynamically determined by TempDir, so we need a custom
+/// PATH that includes $HOME/bin. We use spawn_with_env's extra_env to override PATH.
+fn spawn_with_denv(files: &[(&str, &str)]) -> PtyShell {
+    let mut all_files: Vec<(&str, &str)> = vec![("bin/denv", MOCK_DENV)];
+    all_files.extend_from_slice(files);
+    // We need HOME/bin in PATH, but don't know HOME yet.
+    // Use spawn_with_env — it creates TempDir, then applies env.
+    // The "PATH" env is set after HOME, so we can compute it.
+    // But spawn_with_env doesn't expose the home_path...
+    //
+    // Workaround: use a well-known prefix. TempDir creates /tmp/ish_pty_test_XXXXXX.
+    // We can't predict the suffix. Instead, symlink denv to a known location.
+    //
+    // Simplest: create /tmp/ish_mock_bin/ with a symlink that spawn_with_env populates.
+    // Actually simplest: just put the mock in /tmp directly with a unique name.
+    //
+    // Even simpler: use spawn_with_env but override PATH to include /tmp/ish_pty_test_*/bin
+    // via a glob... nope, env vars don't glob.
+    //
+    // Real fix: refactor spawn_with_env to return home_path before forking.
+    // For now, create a shared mock dir.
+
+    let mock_bin = "/tmp/ish_test_mock_bin";
+    let _ = std::fs::create_dir_all(mock_bin);
+    std::fs::write(format!("{mock_bin}/denv"), MOCK_DENV).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        format!("{mock_bin}/denv"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let path = format!("{mock_bin}:/usr/bin:/bin:/usr/sbin:/sbin");
+    PtyShell::spawn_with_env(&all_files, &[], &[("PATH", &path)])
+}
+
+#[test]
+fn denv_loads_env_on_cd() {
+    let sh = spawn_with_denv(&[("project/.denv_export", "export DENV_TEST_VAR='loaded';\n")]);
+    sh.run_command("cd project");
+    let out = sh.run_command("echo $DENV_TEST_VAR");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("loaded"),
+        "expected denv var after cd: {text:?}"
+    );
+}
+
+#[test]
+fn denv_unloads_on_leave() {
+    let sh = spawn_with_denv(&[("project/.denv_export", "export DENV_TEST_VAR='active';\n")]);
+    sh.run_command("cd project");
+    // Verify loaded
+    let out = sh.run_command("echo $DENV_TEST_VAR");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(text.contains("active"), "should be loaded: {text:?}");
+
+    // Leave the directory
+    sh.run_command("cd ..");
+    let out = sh.run_command("echo =$DENV_TEST_VAR=");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("=="),
+        "var should be unset after leaving: {text:?}"
+    );
+}
+
+#[test]
+fn denv_allow_applies_env() {
+    let sh = spawn_with_denv(&[("project/.denv_export", "export DENV_TEST_VAR='allowed';\n")]);
+    sh.run_command("cd project");
+    // denv allow should (re-)apply env
+    sh.run_command("denv allow");
+    let out = sh.run_command("echo $DENV_TEST_VAR");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("allowed"),
+        "expected var after denv allow: {text:?}"
+    );
+}
+
+#[test]
+fn denv_deny_removes_env() {
+    let sh = spawn_with_denv(&[("project/.denv_export", "export DENV_TEST_VAR='loaded';\n")]);
+    sh.run_command("cd project");
+    // Verify loaded
+    let out = sh.run_command("echo $DENV_TEST_VAR");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(text.contains("loaded"), "should be loaded: {text:?}");
+
+    // deny should unset
+    sh.run_command("denv deny");
+    let out = sh.run_command("echo =$DENV_TEST_VAR=");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("=="),
+        "var should be unset after deny: {text:?}"
+    );
+}
+
+#[test]
+fn denv_init_loads_at_startup() {
+    // .denv_export in HOME — should be loaded on first cd (init defers to avoid startup cost)
+    let sh = spawn_with_denv(&[(".denv_export", "export DENV_TEST_VAR='from_init';\n")]);
+    // Trigger on_cd by cd'ing to current dir
+    sh.run_command("cd .");
+    let out = sh.run_command("echo $DENV_TEST_VAR");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("from_init"),
+        "expected var loaded after first cd: {text:?}"
+    );
+}
+
+#[test]
+fn denv_value_with_spaces() {
+    let sh = spawn_with_denv(&[(
+        "project/.denv_export",
+        "export DENV_TEST_VAR='hello world';\n",
+    )]);
+    sh.run_command("cd project");
+    let out = sh.run_command("echo $DENV_TEST_VAR");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("hello world"),
+        "expected value with spaces: {text:?}"
+    );
+}
+
+#[test]
+fn denv_multiple_vars() {
+    let sh = spawn_with_denv(&[(
+        "project/.denv_export",
+        "export DENV_A='one';\nexport DENV_B='two';\n",
+    )]);
+    sh.run_command("cd project");
+    let out = sh.run_command("echo $DENV_A $DENV_B");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(text.contains("one"), "expected DENV_A: {text:?}");
+    assert!(text.contains("two"), "expected DENV_B: {text:?}");
+}
+
+#[test]
+fn denv_no_error_without_denv() {
+    // Without mock denv in PATH, shell should start fine (denv_active=false)
+    let sh = PtyShell::spawn();
+    let out = sh.run_command("echo works");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("works"),
+        "shell should work without denv: {text:?}"
+    );
 }

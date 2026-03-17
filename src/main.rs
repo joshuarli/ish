@@ -5,7 +5,7 @@ use ish::input::{InputEvent, InputReader, Key, KeyEvent};
 use ish::job::Job;
 use ish::line::LineBuffer;
 use ish::term::TermWriter;
-use ish::{complete, config, exec, history, parse, prompt, render, signal, term};
+use ish::{complete, config, denv, exec, history, parse, prompt, render, signal, term};
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -21,6 +21,7 @@ struct Shell {
     job: Option<Job>,
     path_cache: HashMap<String, PathBuf>,
     exit_warned: bool,
+    denv_active: bool,
     orig_termios: libc::termios,
     signal_fd: RawFd,
     home: String,
@@ -90,6 +91,7 @@ fn main() {
         job: None,
         path_cache: HashMap::new(),
         exit_warned: false,
+        denv_active: false,
         orig_termios,
         signal_fd,
         home: home.clone(),
@@ -101,6 +103,9 @@ fn main() {
 
     // Load config
     config::load(&mut shell.aliases);
+
+    // Initialize denv (auto .envrc/.env loading)
+    shell.denv_active = denv::init();
 
     // Main loop
     loop {
@@ -195,6 +200,20 @@ fn main() {
                                 continue;
                             }
 
+                            // Handle `denv allow|deny|reload` — apply output to env
+                            if first == "denv" && shell.denv_active {
+                                let args: Vec<String> =
+                                    cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
+                                if let Some(path_modified) = denv::command(&args) {
+                                    shell.last_status = 0;
+                                    if path_modified {
+                                        exec::rebuild_path_cache(&mut shell.path_cache);
+                                    }
+                                    continue;
+                                }
+                                // Not allow/deny/reload — fall through to normal exec
+                            }
+
                             // Handle `fg` with continuation support
                             if first == "fg" {
                                 let (status, cont) = exec::resume_job(&mut shell.job);
@@ -245,6 +264,9 @@ fn main() {
 
                         if is_cd {
                             shell.prompt.invalidate_git();
+                            if shell.denv_active && denv::on_cd() {
+                                exec::rebuild_path_cache(&mut shell.path_cache);
+                            }
                         }
                     }
                     Err(e) => {

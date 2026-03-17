@@ -2,6 +2,7 @@ pub mod alias;
 pub mod builtin;
 pub mod complete;
 pub mod config;
+pub mod denv;
 pub mod error;
 pub mod exec;
 pub mod expand;
