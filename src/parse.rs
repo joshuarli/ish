@@ -146,13 +146,21 @@ fn scan_word(input: &str, bytes: &[u8], start: usize) -> Result<(String, usize),
             b'\'' => {
                 i += 1;
                 while i < bytes.len() && bytes[i] != b'\'' {
-                    let rest = &input[i..];
-                    let c = rest.chars().next().unwrap();
-                    if is_expandable(c) {
-                        word.push(LITERAL);
+                    let b = bytes[i];
+                    if b < 0x80 {
+                        // ASCII fast path
+                        let c = b as char;
+                        if is_expandable(c) {
+                            word.push(LITERAL);
+                        }
+                        word.push(c);
+                        i += 1;
+                    } else {
+                        let rest = &input[i..];
+                        let c = rest.chars().next().unwrap();
+                        word.push(c);
+                        i += c.len_utf8();
                     }
-                    word.push(c);
-                    i += c.len_utf8();
                 }
                 if i >= bytes.len() {
                     return Err(Error::msg("unclosed single quote"));
@@ -163,25 +171,32 @@ fn scan_word(input: &str, bytes: &[u8], start: usize) -> Result<(String, usize),
                 i += 1;
                 while i < bytes.len() && bytes[i] != b'"' {
                     if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                        let next = &input[i + 1..];
-                        let next_ch = next.chars().next().unwrap();
-                        if matches!(next_ch, '$' | '"' | '\\' | '`') {
+                        let next_b = bytes[i + 1];
+                        if matches!(next_b, b'$' | b'"' | b'\\' | b'`') {
                             word.push(LITERAL);
-                            word.push(next_ch);
-                            i += 1 + next_ch.len_utf8();
+                            word.push(next_b as char);
+                            i += 2;
                         } else {
                             word.push(LITERAL);
                             word.push('\\');
                             i += 1;
                         }
                     } else {
-                        let rest = &input[i..];
-                        let c = rest.chars().next().unwrap();
-                        if is_glob_or_tilde(c) {
-                            word.push(LITERAL);
+                        let b = bytes[i];
+                        if b < 0x80 {
+                            // ASCII fast path
+                            let c = b as char;
+                            if is_glob_or_tilde(c) {
+                                word.push(LITERAL);
+                            }
+                            word.push(c);
+                            i += 1;
+                        } else {
+                            let rest = &input[i..];
+                            let c = rest.chars().next().unwrap();
+                            word.push(c);
+                            i += c.len_utf8();
                         }
-                        word.push(c);
-                        i += c.len_utf8();
                     }
                 }
                 if i >= bytes.len() {
@@ -191,11 +206,18 @@ fn scan_word(input: &str, bytes: &[u8], start: usize) -> Result<(String, usize),
             }
             b'\\' if i + 1 < bytes.len() => {
                 i += 1;
-                let rest = &input[i..];
-                let c = rest.chars().next().unwrap();
-                word.push(LITERAL);
-                word.push(c);
-                i += c.len_utf8();
+                let b = bytes[i];
+                if b < 0x80 {
+                    word.push(LITERAL);
+                    word.push(b as char);
+                    i += 1;
+                } else {
+                    let rest = &input[i..];
+                    let c = rest.chars().next().unwrap();
+                    word.push(LITERAL);
+                    word.push(c);
+                    i += c.len_utf8();
+                }
             }
             _ => {
                 // Copy non-special bytes in bulk
@@ -361,19 +383,19 @@ pub fn needs_continuation(input: &str) -> bool {
         return false;
     }
 
-    // Check unclosed quotes
+    // Check unclosed quotes — byte-based since quote chars are ASCII
     let mut in_single = false;
     let mut in_double = false;
     let mut escape = false;
-    for c in trimmed.chars() {
+    for &b in trimmed.as_bytes() {
         if escape {
             escape = false;
             continue;
         }
-        match c {
-            '\\' if !in_single => escape = true,
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
+        match b {
+            b'\\' if !in_single => escape = true,
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
             _ => {}
         }
     }

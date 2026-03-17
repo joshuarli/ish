@@ -81,11 +81,17 @@ fn expand_variables(word: &str) -> String {
             result.push(LITERAL);
             i += 1;
             if i < bytes.len() {
-                // Advance past the full UTF-8 char following the marker
-                let rest = &word[i..];
-                let ch = rest.chars().next().unwrap();
-                result.push(ch);
-                i += ch.len_utf8();
+                let b = bytes[i];
+                if b < 0x80 {
+                    // ASCII fast path
+                    result.push(b as char);
+                    i += 1;
+                } else {
+                    let rest = &word[i..];
+                    let ch = rest.chars().next().unwrap();
+                    result.push(ch);
+                    i += ch.len_utf8();
+                }
             }
         } else if bytes[i] == b'$' {
             if i + 1 < bytes.len() && bytes[i + 1] == b'(' {
@@ -137,10 +143,17 @@ fn expand_command_subst(
             result.push(LITERAL);
             i += 1;
             if i < bytes.len() {
-                let rest = &word[i..];
-                let ch = rest.chars().next().unwrap();
-                result.push(ch);
-                i += ch.len_utf8();
+                let b = bytes[i];
+                if b < 0x80 {
+                    // ASCII fast path
+                    result.push(b as char);
+                    i += 1;
+                } else {
+                    let rest = &word[i..];
+                    let ch = rest.chars().next().unwrap();
+                    result.push(ch);
+                    i += ch.len_utf8();
+                }
             }
         } else if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             // $(...) command substitution

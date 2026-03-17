@@ -79,14 +79,17 @@ impl Prompt {
     pub fn display_len(&self, prompt_str: &str) -> usize {
         let mut len = 0;
         let mut in_escape = false;
-        for c in prompt_str.chars() {
+        // Byte-based: prompt is ASCII + ANSI escapes. Non-ASCII chars
+        // (if any) are each one display column, same as the byte count.
+        for &b in prompt_str.as_bytes() {
             if in_escape {
-                if c == 'm' {
+                if b == b'm' {
                     in_escape = false;
                 }
-            } else if c == '\x1b' {
+            } else if b == 0x1b {
                 in_escape = true;
-            } else {
+            } else if b & 0xC0 != 0x80 {
+                // Count lead bytes (ASCII or UTF-8 start), skip continuation bytes
                 len += 1;
             }
         }
@@ -170,11 +173,15 @@ pub fn shorten_pwd(pwd: &str, home: &str) -> String {
             // Abbreviate: keep leading dot + 1 char
             let skip = if part.starts_with('.') { 1 } else { 0 };
             let take_chars = skip + 1;
-            let byte_end = part
-                .char_indices()
-                .nth(take_chars)
-                .map(|(i, _)| i)
-                .unwrap_or(part.len());
+            // Fast path: paths are almost always ASCII
+            let byte_end = if part.is_ascii() {
+                take_chars.min(part.len())
+            } else {
+                part.char_indices()
+                    .nth(take_chars)
+                    .map(|(i, _)| i)
+                    .unwrap_or(part.len())
+            };
             out.push_str(&part[..byte_end]);
         } else {
             out.push_str(part);

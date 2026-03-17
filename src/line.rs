@@ -41,12 +41,20 @@ impl LineBuffer {
 
     /// Number of display columns from start of line to cursor.
     pub fn display_cursor_pos(&self) -> usize {
-        self.buf[..self.cursor].chars().count()
+        if self.buf.is_ascii() {
+            self.cursor
+        } else {
+            self.buf[..self.cursor].chars().count()
+        }
     }
 
     /// Number of display columns for the full line.
     pub fn display_len(&self) -> usize {
-        self.buf.chars().count()
+        if self.buf.is_ascii() {
+            self.buf.len()
+        } else {
+            self.buf.chars().count()
+        }
     }
 
     // -- Insertion / Deletion --
@@ -183,7 +191,15 @@ impl LineBuffer {
     // -- Internal helpers --
 
     fn prev_char_boundary(&self) -> usize {
-        let mut pos = self.cursor.saturating_sub(1);
+        if self.cursor == 0 {
+            return 0;
+        }
+        // ASCII fast path: previous byte is always a char boundary
+        let prev = self.cursor - 1;
+        if self.buf.as_bytes()[prev] < 0x80 {
+            return prev;
+        }
+        let mut pos = prev;
         while pos > 0 && !self.buf.is_char_boundary(pos) {
             pos -= 1;
         }
@@ -191,7 +207,15 @@ impl LineBuffer {
     }
 
     fn next_char_boundary(&self) -> usize {
-        let mut pos = self.cursor + 1;
+        let next = self.cursor + 1;
+        if next >= self.buf.len() {
+            return self.buf.len();
+        }
+        // ASCII fast path: next byte is always a char boundary
+        if self.buf.as_bytes()[self.cursor] < 0x80 {
+            return next;
+        }
+        let mut pos = next;
         while pos < self.buf.len() && !self.buf.is_char_boundary(pos) {
             pos += 1;
         }
@@ -199,10 +223,26 @@ impl LineBuffer {
     }
 
     fn char_before_cursor(&self) -> Option<char> {
+        if self.cursor == 0 {
+            return None;
+        }
+        // ASCII fast path
+        let b = self.buf.as_bytes()[self.cursor - 1];
+        if b < 0x80 {
+            return Some(b as char);
+        }
         self.buf[..self.cursor].chars().next_back()
     }
 
     fn char_at_cursor(&self) -> Option<char> {
+        if self.cursor >= self.buf.len() {
+            return None;
+        }
+        // ASCII fast path
+        let b = self.buf.as_bytes()[self.cursor];
+        if b < 0x80 {
+            return Some(b as char);
+        }
         self.buf[self.cursor..].chars().next()
     }
 }

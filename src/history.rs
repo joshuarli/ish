@@ -151,6 +151,29 @@ pub fn subsequence_match(query: &[char], text: &str) -> Option<Vec<usize>> {
     if query.is_empty() {
         return Some(Vec::new());
     }
+
+    // ASCII fast path: if both query and text are ASCII, operate on bytes directly.
+    // This avoids char decoding and to_lowercase() overhead for the common case.
+    if text.is_ascii() && query.iter().all(|c| c.is_ascii()) {
+        let bytes = text.as_bytes();
+        let mut positions = Vec::with_capacity(query.len());
+        let mut qi = 0;
+        let qb = query[qi] as u8; // already lowercase from caller
+        let mut target = qb;
+
+        for (ti, &b) in bytes.iter().enumerate() {
+            if b.to_ascii_lowercase() == target {
+                positions.push(ti);
+                qi += 1;
+                if qi == query.len() {
+                    return Some(positions);
+                }
+                target = query[qi] as u8;
+            }
+        }
+        return None;
+    }
+
     let mut positions = Vec::with_capacity(query.len());
     let mut qi = 0;
 
