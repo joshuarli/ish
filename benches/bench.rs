@@ -9,11 +9,14 @@ use std::time::Duration;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
+use ish::alias::AliasMap;
 use ish::complete::{self, CompEntry};
 use ish::error::Error;
+use ish::exec;
 use ish::expand;
 use ish::history::History;
 use ish::line::LineBuffer;
+use ish::ls;
 use ish::parse;
 use ish::prompt;
 
@@ -426,6 +429,266 @@ fn bench_prompt(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// End-to-end: parse → expand (the Enter-key hot path)
+// ---------------------------------------------------------------------------
+
+fn bench_parse_expand(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_expand");
+    let mut no_subst = |_: &str| -> Result<String, Error> { Ok(String::new()) };
+
+    unsafe { std::env::set_var("ISH_BENCH_HOME", "/home/user") };
+    unsafe { std::env::set_var("ISH_BENCH_DIR", "/tmp/build") };
+
+    // Typical: simple command with tilde
+    group.bench_function("simple_with_tilde", |b| {
+        b.iter(|| {
+            let cmd = parse::parse("ls ~/projects").unwrap();
+            let argv = &cmd.segments[0].0.commands[0].cmd.argv;
+            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst))
+        });
+    });
+
+    // Typical: pipeline with variables
+    group.bench_function("pipeline_with_vars", |b| {
+        b.iter(|| {
+            let cmd = parse::parse("grep -r $ISH_BENCH_DIR | sort | head -20").unwrap();
+            let argv = &cmd.segments[0].0.commands[0].cmd.argv;
+            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst))
+        });
+    });
+
+    // Realistic: git workflow command
+    group.bench_function("git_workflow", |b| {
+        b.iter(|| {
+            let cmd = parse::parse(
+                "git add -A && git commit -m 'fix: resolve issue' && git push origin main",
+            )
+            .unwrap();
+            for (pipeline, _) in &cmd.segments {
+                for pcmd in &pipeline.commands {
+                    let _ = black_box(expand::expand_argv(
+                        &pcmd.cmd.argv,
+                        "/home/user",
+                        &mut no_subst,
+                    ));
+                }
+            }
+        });
+    });
+
+    // Worst case: many words with mixed expansion
+    group.bench_function("mixed_expansion_20_words", |b| {
+        b.iter(|| {
+            let cmd = parse::parse(
+                r#"echo ~/file $ISH_BENCH_DIR "quoted $ISH_BENCH_HOME" plain 'literal $X' a b c d e f g h i j k l m n"#,
+            )
+            .unwrap();
+            let argv = &cmd.segments[0].0.commands[0].cmd.argv;
+            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst))
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Prompt render (full — the before-every-command hot path)
+// ---------------------------------------------------------------------------
+
+fn bench_prompt_render(c: &mut Criterion) {
+    let mut group = c.benchmark_group("prompt_render");
+
+    // Full render in a git repo (this repo)
+    group.bench_function("full_in_git_repo", |b| {
+        let mut p = prompt::Prompt::new();
+        b.iter(|| black_box(p.render(0)));
+    });
+
+    // Render with error status
+    group.bench_function("full_error_status", |b| {
+        let mut p = prompt::Prompt::new();
+        b.iter(|| black_box(p.render(1)));
+    });
+
+    // display_len computation
+    group.bench_function("display_len", |b| {
+        let p = prompt::Prompt::new();
+        let sample = "\x1b[38;5;10muser@host ~/d/ish\x1b[0m \x1b[38;5;1m*\x1b[0m master $ ";
+        b.iter(|| black_box(p.display_len(sample)));
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// History add (dedup on every command)
+// ---------------------------------------------------------------------------
+
+fn bench_history_add(c: &mut Criterion) {
+    let mut group = c.benchmark_group("history_add");
+
+    // Add to a 1k history (typical size)
+    group.bench_function("add_new_1k", |b| {
+        let entries: Vec<String> = (0..1000)
+            .map(|i| format!("command_{i} --arg={i}"))
+            .collect();
+        b.iter(|| {
+            let mut h = History::from_entries(entries.clone());
+            h.add("brand_new_command --flag");
+            black_box(());
+        });
+    });
+
+    // Add duplicate (triggers retain scan + push)
+    group.bench_function("add_dup_1k", |b| {
+        let entries: Vec<String> = (0..1000)
+            .map(|i| format!("command_{i} --arg={i}"))
+            .collect();
+        b.iter(|| {
+            let mut h = History::from_entries(entries.clone());
+            h.add("command_500 --arg=500");
+            black_box(());
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// ls builtin (real I/O — the most-used builtin)
+// ---------------------------------------------------------------------------
+
+fn bench_ls(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ls");
+
+    // List the repo's src/ directory (~17 files)
+    group.bench_function("src_dir", |b| {
+        b.iter(|| black_box(ls::list_dir("./src")));
+    });
+
+    // List the repo root
+    group.bench_function("repo_root", |b| {
+        b.iter(|| black_box(ls::list_dir(".")));
+    });
+
+    // Single file
+    group.bench_function("single_file", |b| {
+        b.iter(|| black_box(ls::list_dir("Cargo.toml")));
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// PATH lookup (every external command)
+// ---------------------------------------------------------------------------
+
+fn bench_path_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("path_lookup");
+
+    // Build a real PATH cache
+    let mut cache = std::collections::HashMap::new();
+    exec::rebuild_path_cache(&mut cache);
+
+    // Cache hit (typical case)
+    group.bench_function("cache_hit", |b| {
+        b.iter(|| black_box(exec::find_in_path("ls", &cache)));
+    });
+
+    // Cache miss (falls through to scan_path)
+    group.bench_function("cache_miss_scan", |b| {
+        let empty = std::collections::HashMap::new();
+        b.iter(|| black_box(exec::find_in_path("ls", &empty)));
+    });
+
+    // Absolute path (skips cache entirely)
+    group.bench_function("absolute_path", |b| {
+        b.iter(|| black_box(exec::find_in_path("/usr/bin/ls", &cache)));
+    });
+
+    // Full PATH cache rebuild
+    group.bench_function("rebuild_cache", |b| {
+        let mut c = std::collections::HashMap::new();
+        b.iter(|| {
+            exec::rebuild_path_cache(&mut c);
+            black_box(c.len());
+        });
+    });
+
+    // scan_path for something that doesn't exist
+    group.bench_function("scan_not_found", |b| {
+        b.iter(|| black_box(exec::scan_path("nonexistent_command_xyz")));
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Alias lookup
+// ---------------------------------------------------------------------------
+
+fn bench_alias(c: &mut Criterion) {
+    let mut group = c.benchmark_group("alias");
+
+    let mut aliases = AliasMap::new();
+    aliases.set("g".into(), vec!["git".into()]);
+    aliases.set("gc".into(), vec!["git".into(), "commit".into()]);
+    aliases.set("ll".into(), vec!["ls".into(), "-la".into()]);
+    aliases.set(
+        "deploy".into(),
+        vec![
+            "make".into(),
+            "build".into(),
+            "&&".into(),
+            "./deploy.sh".into(),
+        ],
+    );
+    for i in 0..50 {
+        aliases.set(format!("alias_{i}"), vec![format!("cmd_{i}")]);
+    }
+
+    group.bench_function("hit", |b| {
+        b.iter(|| black_box(aliases.get("gc")));
+    });
+
+    group.bench_function("miss", |b| {
+        b.iter(|| black_box(aliases.get("nonexistent")));
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Completion: realistic filesystem
+// ---------------------------------------------------------------------------
+
+fn bench_completion_fs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("completion_fs");
+
+    // Complete in project root (mixed files and dirs)
+    group.bench_function("complete_root", |b| {
+        b.iter(|| black_box(complete::complete_path("./", false)));
+    });
+
+    // Complete with prefix filter
+    group.bench_function("complete_with_prefix", |b| {
+        b.iter(|| black_box(complete::complete_path("./src/l", false)));
+    });
+
+    // Dirs only (cd completion)
+    group.bench_function("complete_dirs_only", |b| {
+        b.iter(|| black_box(complete::complete_path("./", true)));
+    });
+
+    // /usr/bin — large directory, stress test
+    group.bench_function("complete_usr_bin", |b| {
+        b.iter(|| black_box(complete::complete_path("/usr/bin/z", false)));
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Allocation audit
 // ---------------------------------------------------------------------------
 
@@ -478,6 +741,43 @@ fn bench_alloc_audit(c: &mut Criterion) {
         });
         eprintln!("  [alloc] shorten_pwd:               {stats}");
 
+        // --- New practical operation audits ---
+
+        let stats = measure_allocs(|| {
+            let cmd = parse::parse("grep -r ~/src | sort | head -20").unwrap();
+            let mut no_subst = |_: &str| -> Result<String, Error> { Ok(String::new()) };
+            let argv = &cmd.segments[0].0.commands[0].cmd.argv;
+            let _ = black_box(expand::expand_argv(argv, "/home/user", &mut no_subst));
+        });
+        eprintln!("  [alloc] parse_expand_pipeline:     {stats}");
+
+        let stats = measure_allocs(|| {
+            let mut p = prompt::Prompt::new();
+            black_box(p.render(0));
+        });
+        eprintln!("  [alloc] prompt_render:             {stats}");
+
+        let stats = measure_allocs(|| {
+            let entries: Vec<String> = (0..1000)
+                .map(|i| format!("command_{i} --arg={i}"))
+                .collect();
+            let mut h = History::from_entries(entries);
+            h.add("brand_new_command --flag");
+        });
+        eprintln!("  [alloc] history_add_1k:            {stats}");
+
+        let stats = measure_allocs(|| {
+            let mut cache = std::collections::HashMap::new();
+            exec::rebuild_path_cache(&mut cache);
+            let _ = black_box(exec::find_in_path("ls", &cache));
+        });
+        eprintln!("  [alloc] path_cache_build+lookup:   {stats}");
+
+        let stats = measure_allocs(|| {
+            let _ = black_box(complete::complete_path("./src/", false));
+        });
+        eprintln!("  [alloc] complete_path_src:         {stats}");
+
         eprintln!();
     }
 
@@ -520,6 +820,13 @@ criterion_group!(
         bench_history,
         bench_completion,
         bench_prompt,
+        bench_parse_expand,
+        bench_prompt_render,
+        bench_history_add,
+        bench_ls,
+        bench_path_lookup,
+        bench_alias,
+        bench_completion_fs,
         bench_alloc_audit,
 );
 criterion_main!(benches);
