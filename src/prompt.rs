@@ -264,7 +264,10 @@ mod tests {
 
     #[test]
     fn pwd_shortens_middle() {
-        assert_eq!(shorten_pwd("/home/u/dev/fish-shell", "/home/u"), "~/d/fish-shell");
+        assert_eq!(
+            shorten_pwd("/home/u/dev/fish-shell", "/home/u"),
+            "~/d/fish-shell"
+        );
     }
 
     #[test]

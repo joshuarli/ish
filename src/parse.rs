@@ -299,10 +299,7 @@ fn parse_pipeline(tokens: &[Token], start: usize) -> Result<(Pipeline, usize), E
             false
         };
 
-        commands.push(PipedCommand {
-            cmd,
-            pipe_stderr,
-        });
+        commands.push(PipedCommand { cmd, pipe_stderr });
         break;
     }
 

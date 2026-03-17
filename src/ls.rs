@@ -23,22 +23,23 @@ pub fn list_dir(path: &str) -> i32 {
 
     let mut out = String::new();
     for e in &entries {
-        out.push_str(&e.color_start);
-        // mode nlink owner group size date name[/|@]
+        // mode nlink owner group size date — no color
         out.push_str(&format!(
-            "{} {:>nw$} {:<ow$}  {:<gw$}  {:>sw$} {} {}",
+            "{} {:>nw$} {:<ow$}  {:<gw$}  {:>sw$} {} ",
             e.mode_str,
             e.nlink_str,
             e.owner,
             e.group,
             e.size_str,
             e.date_str,
-            e.display_name,
             nw = max_nlink,
             ow = max_owner,
             gw = max_group,
             sw = max_size,
         ));
+        // Color only wraps the name
+        out.push_str(&e.color_start);
+        out.push_str(&e.display_name);
         if !e.color_start.is_empty() {
             out.push_str("\x1b[0m");
         }
@@ -120,7 +121,7 @@ fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
             nlink_str: lmeta.nlink().to_string(),
             owner: username(lmeta.uid()),
             group: groupname(lmeta.gid()),
-            size_str: human_size(lmeta.size() as u64),
+            size_str: human_size(lmeta.size()),
             date_str: format_time(lmeta.mtime()),
             display_name,
             link_target,
@@ -153,10 +154,22 @@ fn format_mode(mode: u32) -> String {
     });
 
     // User
-    s.push(if mode & libc::S_IRUSR as u32 != 0 { 'r' } else { '-' });
-    s.push(if mode & libc::S_IWUSR as u32 != 0 { 'w' } else { '-' });
+    s.push(if mode & libc::S_IRUSR as u32 != 0 {
+        'r'
+    } else {
+        '-'
+    });
+    s.push(if mode & libc::S_IWUSR as u32 != 0 {
+        'w'
+    } else {
+        '-'
+    });
     s.push(if mode & libc::S_ISUID as u32 != 0 {
-        if mode & libc::S_IXUSR as u32 != 0 { 's' } else { 'S' }
+        if mode & libc::S_IXUSR as u32 != 0 {
+            's'
+        } else {
+            'S'
+        }
     } else if mode & libc::S_IXUSR as u32 != 0 {
         'x'
     } else {
@@ -164,10 +177,22 @@ fn format_mode(mode: u32) -> String {
     });
 
     // Group
-    s.push(if mode & libc::S_IRGRP as u32 != 0 { 'r' } else { '-' });
-    s.push(if mode & libc::S_IWGRP as u32 != 0 { 'w' } else { '-' });
+    s.push(if mode & libc::S_IRGRP as u32 != 0 {
+        'r'
+    } else {
+        '-'
+    });
+    s.push(if mode & libc::S_IWGRP as u32 != 0 {
+        'w'
+    } else {
+        '-'
+    });
     s.push(if mode & libc::S_ISGID as u32 != 0 {
-        if mode & libc::S_IXGRP as u32 != 0 { 's' } else { 'S' }
+        if mode & libc::S_IXGRP as u32 != 0 {
+            's'
+        } else {
+            'S'
+        }
     } else if mode & libc::S_IXGRP as u32 != 0 {
         'x'
     } else {
@@ -175,10 +200,22 @@ fn format_mode(mode: u32) -> String {
     });
 
     // Other
-    s.push(if mode & libc::S_IROTH as u32 != 0 { 'r' } else { '-' });
-    s.push(if mode & libc::S_IWOTH as u32 != 0 { 'w' } else { '-' });
+    s.push(if mode & libc::S_IROTH as u32 != 0 {
+        'r'
+    } else {
+        '-'
+    });
+    s.push(if mode & libc::S_IWOTH as u32 != 0 {
+        'w'
+    } else {
+        '-'
+    });
     s.push(if mode & libc::S_ISVTX as u32 != 0 {
-        if mode & libc::S_IXOTH as u32 != 0 { 't' } else { 'T' }
+        if mode & libc::S_IXOTH as u32 != 0 {
+            't'
+        } else {
+            'T'
+        }
     } else if mode & libc::S_IXOTH as u32 != 0 {
         'x'
     } else {
@@ -225,7 +262,10 @@ fn format_time(mtime: i64) -> String {
 
     let six_months = 180 * 24 * 60 * 60;
     if (now - mtime).unsigned_abs() < six_months as u64 {
-        format!("{} {:2} {:02}:{:02}", month, tm.tm_mday, tm.tm_hour, tm.tm_min)
+        format!(
+            "{} {:2} {:02}:{:02}",
+            month, tm.tm_mday, tm.tm_hour, tm.tm_min
+        )
     } else {
         format!("{} {:2}  {}", month, tm.tm_mday, tm.tm_year + 1900)
     }

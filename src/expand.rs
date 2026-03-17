@@ -158,8 +158,6 @@ fn find_backtick_end(chars: &[char], start: usize) -> Result<usize, Error> {
     while i < chars.len() {
         if chars[i] == LITERAL {
             i += 2;
-        } else if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '`' {
-            i += 2;
         } else if chars[i] == '`' {
             return Ok(i);
         } else {
@@ -238,35 +236,32 @@ fn glob_match(pattern: &str) -> Result<Vec<String>, Error> {
             // Match this segment against directory entries
             let mut new_results = Vec::new();
             for dir in &results {
-                match std::fs::read_dir(dir) {
-                    Ok(entries) => {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name();
-                            let name = name.to_string_lossy();
-                            // Skip hidden files unless pattern starts with .
-                            if name.starts_with('.') && !seg.starts_with('.') {
-                                continue;
-                            }
-                            if pattern_match(seg, &name) {
-                                let path = if dir == "." {
-                                    name.to_string()
-                                } else if dir == "/" {
-                                    format!("/{name}")
-                                } else {
-                                    format!("{dir}/{name}")
-                                };
-                                // If not last segment, only keep directories
-                                if !is_last {
-                                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                                        new_results.push(path);
-                                    }
-                                } else {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        // Skip hidden files unless pattern starts with .
+                        if name.starts_with('.') && !seg.starts_with('.') {
+                            continue;
+                        }
+                        if pattern_match(seg, &name) {
+                            let path = if dir == "." {
+                                name.to_string()
+                            } else if dir == "/" {
+                                format!("/{name}")
+                            } else {
+                                format!("{dir}/{name}")
+                            };
+                            // If not last segment, only keep directories
+                            if !is_last {
+                                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                                     new_results.push(path);
                                 }
+                            } else {
+                                new_results.push(path);
                             }
                         }
                     }
-                    Err(_) => {}
                 }
             }
             results = new_results;
@@ -280,25 +275,22 @@ fn glob_match(pattern: &str) -> Result<Vec<String>, Error> {
 /// Recursively collect all directories from `dir` (including `dir` itself).
 fn collect_recursive(dir: &str, out: &mut Vec<String>) -> Result<(), Error> {
     out.push(dir.to_string());
-    match std::fs::read_dir(dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if name.starts_with('.') {
-                        continue;
-                    }
-                    let child = if dir == "." {
-                        name.to_string()
-                    } else {
-                        format!("{dir}/{name}")
-                    };
-                    collect_recursive(&child, out)?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') {
+                    continue;
                 }
+                let child = if dir == "." {
+                    name.to_string()
+                } else {
+                    format!("{dir}/{name}")
+                };
+                collect_recursive(&child, out)?;
             }
         }
-        Err(_) => {}
     }
     Ok(())
 }

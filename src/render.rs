@@ -82,7 +82,7 @@ pub fn render_completions(
         tw.carriage_return();
         tw.clear_to_end_of_line();
 
-        for col in 0..state.cols {
+        for (col, &col_w) in col_widths.iter().enumerate().take(state.cols) {
             let idx = col * state.rows + row;
             if idx >= state.entries.len() {
                 break;
@@ -102,7 +102,7 @@ pub fn render_completions(
 
             // Pad to column width
             let display_w = entry.display_width();
-            let pad = col_widths[col].saturating_sub(display_w) + 2;
+            let pad = col_w.saturating_sub(display_w) + 2;
             for _ in 0..pad {
                 tw.write_str(" ");
             }

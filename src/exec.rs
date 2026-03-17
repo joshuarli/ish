@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 /// Execute a full command line (segments with connectors).
 /// Returns the exit status of the last executed pipeline.
+#[allow(clippy::too_many_arguments)]
 pub fn execute(
     cmdline: &CommandLine,
     aliases: &AliasMap,
@@ -26,13 +27,13 @@ pub fn execute(
 
     for (i, (pipeline, _connector)) in cmdline.segments.iter().enumerate() {
         // Check the connector from the PREVIOUS segment
-        if i > 0 {
-            if let Some((_, Some(prev_conn))) = cmdline.segments.get(i - 1) {
-                match prev_conn {
-                    Connector::And if last_status != 0 => continue,
-                    Connector::Or if last_status == 0 => continue,
-                    Connector::Semi | Connector::And | Connector::Or => {}
-                }
+        if i > 0
+            && let Some((_, Some(prev_conn))) = cmdline.segments.get(i - 1)
+        {
+            match prev_conn {
+                Connector::And if last_status != 0 => continue,
+                Connector::Or if last_status == 0 => continue,
+                Connector::Semi | Connector::And | Connector::Or => {}
             }
         }
 
@@ -51,6 +52,7 @@ pub fn execute(
     last_status
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_pipeline(
     commands: &[PipedCommand],
     aliases: &AliasMap,
@@ -78,9 +80,8 @@ fn execute_pipeline(
         }
 
         // Expand words (tilde, vars, globs)
-        let mut exec_subst = |cmd: &str| -> Result<String, Error> {
-            capture_command_output(cmd, orig_termios)
-        };
+        let mut exec_subst =
+            |cmd: &str| -> Result<String, Error> { capture_command_output(cmd, orig_termios) };
         match expand::expand_argv(&argv, home, &mut exec_subst) {
             Ok(expanded_argv) => {
                 if expanded_argv.is_empty() {
@@ -285,7 +286,12 @@ fn capture_command_output(cmd: &str, orig_termios: &libc::termios) -> Result<Str
         let sh = CString::new("/bin/sh").unwrap();
         let c_flag = CString::new("-c").unwrap();
         let c_cmd = CString::new(cmd).unwrap();
-        let argv = [sh.as_ptr(), c_flag.as_ptr(), c_cmd.as_ptr(), std::ptr::null()];
+        let argv = [
+            sh.as_ptr(),
+            c_flag.as_ptr(),
+            c_cmd.as_ptr(),
+            std::ptr::null(),
+        ];
         unsafe {
             libc::execvp(sh.as_ptr(), argv.as_ptr());
             libc::_exit(127);
@@ -321,6 +327,7 @@ fn capture_command_output(cmd: &str, orig_termios: &libc::termios) -> Result<Str
 }
 
 /// Child process setup: pgid, pipes, redirects, exec. Does not return.
+#[allow(clippy::too_many_arguments)]
 fn child_setup(
     index: usize,
     pgid: libc::pid_t,
@@ -395,7 +402,11 @@ fn child_setup(
         // exec failed
         let err = std::io::Error::last_os_error();
         eprintln!("ish: {}: {err}", argv[0]);
-        libc::_exit(if err.raw_os_error() == Some(libc::ENOENT) { 127 } else { 126 });
+        libc::_exit(if err.raw_os_error() == Some(libc::ENOENT) {
+            127
+        } else {
+            126
+        });
     }
 }
 
@@ -412,22 +423,30 @@ fn apply_redirect(r: &Redirect) {
     match r.kind {
         RedirectKind::Out => {
             let fd = open_write(&r.target, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC);
-            if fd >= 0 { dup_close(fd, 1); }
+            if fd >= 0 {
+                dup_close(fd, 1);
+            }
         }
         RedirectKind::Append => {
             let fd = open_write(&r.target, libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND);
-            if fd >= 0 { dup_close(fd, 1); }
+            if fd >= 0 {
+                dup_close(fd, 1);
+            }
         }
         RedirectKind::In => {
             let fd = unsafe {
                 let c = CString::new(r.target.as_str()).unwrap();
                 libc::open(c.as_ptr(), libc::O_RDONLY, 0)
             };
-            if fd >= 0 { dup_close(fd, 0); }
+            if fd >= 0 {
+                dup_close(fd, 0);
+            }
         }
         RedirectKind::Err => {
             let fd = open_write(&r.target, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC);
-            if fd >= 0 { dup_close(fd, 2); }
+            if fd >= 0 {
+                dup_close(fd, 2);
+            }
         }
         RedirectKind::All => {
             let fd = open_write(&r.target, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC);
@@ -487,12 +506,12 @@ pub fn rebuild_path_cache(cache: &mut HashMap<String, PathBuf>) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if !cache.contains_key(&name) {
-                    if let Ok(meta) = entry.metadata() {
-                        use std::os::unix::fs::PermissionsExt;
-                        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
-                            cache.insert(name, entry.path());
-                        }
+                if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(name)
+                    && let Ok(meta) = entry.metadata()
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                        e.insert(entry.path());
                     }
                 }
             }

@@ -1,7 +1,6 @@
 use std::io::{self, Write};
 use std::os::fd::RawFd;
 
-
 pub const STDIN_FD: RawFd = 0;
 pub const STDOUT_FD: RawFd = 1;
 
@@ -38,10 +37,6 @@ impl RawMode {
         }
 
         Ok(Self { orig })
-    }
-
-    pub fn original(&self) -> &libc::termios {
-        &self.orig
     }
 }
 
@@ -100,18 +95,9 @@ impl TermWriter {
         self.buf.extend_from_slice(s.as_bytes());
     }
 
-    pub fn write_bytes(&mut self, b: &[u8]) {
-        self.buf.extend_from_slice(b);
-    }
-
     pub fn clear_screen(&mut self) {
         // ESC[H moves cursor home, ESC[2J clears visible screen (not scrollback)
         self.write_str("\x1b[H\x1b[2J");
-    }
-
-    pub fn cursor_to(&mut self, row: u16, col: u16) {
-
-        self.write_str(&format!("\x1b[{};{}H", row + 1, col + 1));
     }
 
     pub fn clear_to_end_of_screen(&mut self) {
@@ -120,10 +106,6 @@ impl TermWriter {
 
     pub fn clear_to_end_of_line(&mut self) {
         self.write_str("\x1b[K");
-    }
-
-    pub fn clear_line(&mut self) {
-        self.write_str("\x1b[2K");
     }
 
     pub fn hide_cursor(&mut self) {
@@ -138,43 +120,16 @@ impl TermWriter {
         self.write_str("\r");
     }
 
-    pub fn newline(&mut self) {
-        self.write_str("\n");
-    }
-
     pub fn move_cursor_right(&mut self, n: u16) {
         if n > 0 {
-    
             self.write_str(&format!("\x1b[{}C", n));
         }
     }
 
     pub fn move_cursor_up(&mut self, n: u16) {
         if n > 0 {
-    
             self.write_str(&format!("\x1b[{}A", n));
         }
-    }
-
-    pub fn move_cursor_down(&mut self, n: u16) {
-        if n > 0 {
-    
-            self.write_str(&format!("\x1b[{}B", n));
-        }
-    }
-
-    /// Set foreground color by ANSI 256-color index.
-    pub fn set_fg(&mut self, color: u8) {
-
-        self.write_str(&format!("\x1b[38;5;{}m", color));
-    }
-
-    pub fn set_bold(&mut self) {
-        self.write_str("\x1b[1m");
-    }
-
-    pub fn reset_style(&mut self) {
-        self.write_str("\x1b[0m");
     }
 }
 

@@ -61,16 +61,7 @@ pub fn restore_defaults() {
 pub fn read_signal() -> Option<i32> {
     let mut byte = 0u8;
     let n = unsafe { libc::read(PIPE_READ, &mut byte as *mut u8 as *mut libc::c_void, 1) };
-    if n == 1 {
-        Some(byte as i32)
-    } else {
-        None
-    }
-}
-
-/// Drain all pending signals from the pipe.
-pub fn drain() {
-    while read_signal().is_some() {}
+    if n == 1 { Some(byte as i32) } else { None }
 }
 
 fn install_handler(sig: i32) {

@@ -83,9 +83,7 @@ impl History {
                 .entries
                 .iter()
                 .rev()
-                .enumerate()
-                .map(|(i, e)| FuzzyMatch {
-                    entry_idx: self.entries.len() - 1 - i,
+                .map(|e| FuzzyMatch {
                     text: e.clone(),
                     match_positions: Vec::new(),
                 })
@@ -95,10 +93,9 @@ impl History {
         let query_lower: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
         let mut results = Vec::new();
 
-        for (idx, entry) in self.entries.iter().enumerate().rev() {
+        for entry in self.entries.iter().rev() {
             if let Some(positions) = subsequence_match(&query_lower, entry) {
                 results.push(FuzzyMatch {
-                    entry_idx: idx,
                     text: entry.clone(),
                     match_positions: positions,
                 });
@@ -123,7 +120,6 @@ impl History {
 }
 
 pub struct FuzzyMatch {
-    pub entry_idx: usize,
     pub text: String,
     pub match_positions: Vec<usize>,
 }

@@ -31,7 +31,7 @@ pub fn load(aliases: &mut AliasMap) {
     }
 }
 
-fn parse_set(rest: &str, lineno: usize, path: &PathBuf) {
+fn parse_set(rest: &str, lineno: usize, path: &std::path::Path) {
     // set VAR "value" or set VAR value
     let (name, value) = match rest.split_once(char::is_whitespace) {
         Some((n, v)) => (n.trim(), unquote(v.trim())),
@@ -39,7 +39,11 @@ fn parse_set(rest: &str, lineno: usize, path: &PathBuf) {
     };
 
     if name.is_empty() {
-        eprintln!("ish: {}:{}: set: missing variable name", path.display(), lineno);
+        eprintln!(
+            "ish: {}:{}: set: missing variable name",
+            path.display(),
+            lineno
+        );
         return;
     }
 
@@ -49,7 +53,7 @@ fn parse_set(rest: &str, lineno: usize, path: &PathBuf) {
     unsafe { std::env::set_var(name, &expanded) };
 }
 
-fn parse_alias(rest: &str, lineno: usize, path: &PathBuf, aliases: &mut AliasMap) {
+fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut AliasMap) {
     // alias name cmd [args...]
     let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
     if parts.is_empty() {

@@ -29,8 +29,6 @@ pub struct CompletionState {
     pub scroll: usize,
     /// The prefix that was used to generate completions (directory portion).
     pub dir_prefix: String,
-    /// The partial word the user typed for filtering.
-    pub filter: String,
 }
 
 impl CompletionState {
@@ -176,7 +174,7 @@ pub fn compute_grid(entries: &[CompEntry], term_cols: u16) -> (usize, usize) {
     let term_w = term_cols as usize;
 
     for cols in (1..=max_cols).rev() {
-        let rows = (n + cols - 1) / cols;
+        let rows = n.div_ceil(cols);
         // Compute column widths (column-major layout: entries[col*rows + row])
         let mut col_widths = vec![0usize; cols];
         for (i, entry) in entries.iter().enumerate() {
@@ -206,10 +204,7 @@ mod tests {
 
     #[test]
     fn split_path_with_dir() {
-        assert_eq!(
-            split_path("src/ma"),
-            ("src/".to_string(), "ma".to_string())
-        );
+        assert_eq!(split_path("src/ma"), ("src/".to_string(), "ma".to_string()));
     }
 
     #[test]

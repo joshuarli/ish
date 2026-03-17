@@ -20,10 +20,6 @@ impl AliasMap {
         self.map.get(name).map(|v| v.as_slice())
     }
 
-    pub fn remove(&mut self, name: &str) -> bool {
-        self.map.remove(name).is_some()
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[String])> {
         self.map.iter().map(|(k, v)| (k.as_str(), v.as_slice()))
     }

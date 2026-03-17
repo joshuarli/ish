@@ -22,6 +22,7 @@ pub enum Key {
 pub struct Modifiers {
     pub ctrl: bool,
     pub alt: bool,
+    #[allow(dead_code)]
     pub shift: bool,
 }
 
@@ -167,11 +168,7 @@ impl InputReader {
     fn read_byte(&self) -> Option<u8> {
         let mut byte = 0u8;
         let n = unsafe { libc::read(STDIN_FD, &mut byte as *mut u8 as *mut libc::c_void, 1) };
-        if n == 1 {
-            Some(byte)
-        } else {
-            None
-        }
+        if n == 1 { Some(byte) } else { None }
     }
 
     fn read_byte_timeout(&self, timeout_ms: i32) -> Option<u8> {
@@ -221,7 +218,7 @@ impl InputReader {
             Some(b'b') => Some(KeyEvent::alt('b')),
             Some(b'f') => Some(KeyEvent::alt('f')),
             Some(b'd') => Some(KeyEvent::alt('d')),
-            Some(b) if b >= 0x20 && b < 0x7f => Some(KeyEvent::alt(b as char)),
+            Some(b) if (0x20..0x7f).contains(&b) => Some(KeyEvent::alt(b as char)),
             _ => Some(KeyEvent::key(Key::Escape)),
         }
     }
@@ -268,10 +265,13 @@ impl InputReader {
             b'D' => Some(KeyEvent::with_mods(Key::Left, mods)),
             b'H' => Some(KeyEvent::with_mods(Key::Home, mods)),
             b'F' => Some(KeyEvent::with_mods(Key::End, mods)),
-            b'Z' => Some(KeyEvent::with_mods(Key::Tab, Modifiers {
-                shift: true,
-                ..Modifiers::NONE
-            })),
+            b'Z' => Some(KeyEvent::with_mods(
+                Key::Tab,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::NONE
+                },
+            )),
             b'~' => match params.first().copied().unwrap_or(0) {
                 1 | 7 => Some(KeyEvent::with_mods(Key::Home, mods)),
                 3 => Some(KeyEvent::with_mods(Key::Delete, mods)),

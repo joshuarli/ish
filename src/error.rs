@@ -10,7 +10,6 @@ enum ErrorKind {
     Io(std::io::Error),
     Msg(String),
     GlobNoMatch(String),
-    CommandNotFound(String),
     BadSubstitution(String),
 }
 
@@ -27,12 +26,6 @@ impl Error {
         }
     }
 
-    pub fn command_not_found(cmd: impl Into<String>) -> Self {
-        Self {
-            kind: ErrorKind::CommandNotFound(cmd.into()),
-        }
-    }
-
     pub fn bad_substitution(msg: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::BadSubstitution(msg.into()),
@@ -46,7 +39,6 @@ impl fmt::Display for Error {
             ErrorKind::Io(e) => write!(f, "{e}"),
             ErrorKind::Msg(s) => write!(f, "{s}"),
             ErrorKind::GlobNoMatch(p) => write!(f, "no matches for glob: {p}"),
-            ErrorKind::CommandNotFound(c) => write!(f, "command not found: {c}"),
             ErrorKind::BadSubstitution(m) => write!(f, "bad substitution: {m}"),
         }
     }

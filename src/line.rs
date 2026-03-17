@@ -26,20 +26,11 @@ impl LineBuffer {
         self.buf.is_empty()
     }
 
-    pub fn into_string(self) -> String {
-        self.buf
-    }
-
     /// Set content and move cursor to end.
     pub fn set(&mut self, s: &str) {
         self.buf.clear();
         self.buf.push_str(s);
         self.cursor = self.buf.len();
-    }
-
-    pub fn clear(&mut self) {
-        self.buf.clear();
-        self.cursor = 0;
     }
 
     /// Number of display columns from start of line to cursor.
@@ -116,7 +107,11 @@ impl LineBuffer {
         while self.cursor > 0 && self.char_before_cursor().is_some_and(|c| c.is_whitespace()) {
             self.cursor = self.prev_char_boundary();
         }
-        while self.cursor > 0 && self.char_before_cursor().is_some_and(|c| !c.is_whitespace()) {
+        while self.cursor > 0
+            && self
+                .char_before_cursor()
+                .is_some_and(|c| !c.is_whitespace())
+        {
             self.cursor = self.prev_char_boundary();
         }
     }
@@ -158,7 +153,11 @@ impl LineBuffer {
         while self.cursor > 0 && self.char_before_cursor().is_some_and(|c| c.is_whitespace()) {
             self.cursor = self.prev_char_boundary();
         }
-        while self.cursor > 0 && self.char_before_cursor().is_some_and(|c| !c.is_whitespace()) {
+        while self.cursor > 0
+            && self
+                .char_before_cursor()
+                .is_some_and(|c| !c.is_whitespace())
+        {
             self.cursor = self.prev_char_boundary();
         }
         if self.cursor < end {

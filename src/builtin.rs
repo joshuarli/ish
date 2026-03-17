@@ -6,11 +6,34 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Builtins that modify shell state — must run in the main process.
-const SPECIAL_BUILTINS: &[&str] = &["cd", "exit", "fg", "set", "unset", "alias", "copy-scrollback"];
+const SPECIAL_BUILTINS: &[&str] = &[
+    "cd",
+    "exit",
+    "fg",
+    "set",
+    "unset",
+    "alias",
+    "copy-scrollback",
+];
 
 /// All builtins.
 const ALL_BUILTINS: &[&str] = &[
-    "cd", "exit", "fg", "set", "unset", "alias", "l", "c", "w", "copy-scrollback",
+    "cd",
+    "exit",
+    "fg",
+    "set",
+    "unset",
+    "alias",
+    "l",
+    "c",
+    "w",
+    "which",
+    "type",
+    "echo",
+    "pwd",
+    "true",
+    "false",
+    "copy-scrollback",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -22,6 +45,7 @@ pub fn is_special_builtin(name: &str) -> bool {
 }
 
 /// Run a state-modifying builtin in the main process. Returns exit status.
+#[allow(clippy::too_many_arguments)]
 pub fn run_special(
     name: &str,
     args: &[String],
@@ -65,7 +89,23 @@ pub fn run_output(name: &str, args: &[String], _redirects: &[Redirect]) -> i32 {
             print!("\x1b[H\x1b[2J");
             0
         }
-        "w" => builtin_w(args),
+        "w" | "which" | "type" => builtin_w(args),
+        "echo" => {
+            println!("{}", args.join(" "));
+            0
+        }
+        "pwd" => match std::env::current_dir() {
+            Ok(dir) => {
+                println!("{}", dir.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("ish: pwd: {e}");
+                1
+            }
+        },
+        "true" => 0,
+        "false" => 1,
         "copy-scrollback" => {
             // OSC 52 clipboard — we'd need the scrollback content.
             // For now, this is a placeholder that copies a message.
