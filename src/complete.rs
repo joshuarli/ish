@@ -112,7 +112,8 @@ impl CompletionState {
 }
 
 /// Generate file completions for the given partial word.
-pub fn complete_path(partial: &str) -> Vec<CompEntry> {
+/// If `dirs_only` is true, only return directories (and symlinks to directories).
+pub fn complete_path(partial: &str, dirs_only: bool) -> Vec<CompEntry> {
     let (dir, prefix) = split_path(partial);
 
     let read_dir = match std::fs::read_dir(if dir.is_empty() { "." } else { &dir }) {
@@ -136,15 +137,20 @@ pub fn complete_path(partial: &str) -> Vec<CompEntry> {
             if !name.starts_with(&prefix) {
                 return None;
             }
+            // e.metadata() follows symlinks, so symlinks to dirs count as dirs
             let meta = e.metadata().ok()?;
+            let is_dir = meta.is_dir();
+            if dirs_only && !is_dir {
+                return None;
+            }
             let is_link = e
                 .path()
                 .symlink_metadata()
                 .map(|m| m.file_type().is_symlink())
                 .unwrap_or(false);
             Some(CompEntry {
-                is_dir: meta.is_dir(),
-                is_exec: !meta.is_dir() && meta.permissions().mode() & 0o111 != 0,
+                is_dir,
+                is_exec: !is_dir && meta.permissions().mode() & 0o111 != 0,
                 is_link,
                 name,
             })

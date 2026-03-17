@@ -3,15 +3,22 @@ use crate::history::FuzzyMatch;
 use crate::line::LineBuffer;
 use crate::term::TermWriter;
 
+/// Cursor position info returned by render_line, needed by completion rendering.
+pub struct PromptInfo {
+    pub total_rows: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+}
+
 /// Render the prompt + line buffer. Positions cursor correctly.
-/// Returns the number of rows used (for clearing later).
+/// Returns prompt geometry so completion rendering can restore cursor.
 pub fn render_line(
     tw: &mut TermWriter,
     prompt: &str,
     prompt_display_len: usize,
     line: &LineBuffer,
     term_cols: u16,
-) -> u16 {
+) -> PromptInfo {
     tw.hide_cursor();
     tw.carriage_return();
     tw.clear_to_end_of_screen();
@@ -39,21 +46,76 @@ pub fn render_line(
     }
 
     tw.show_cursor();
-    (total_rows + 1) as u16
+    PromptInfo {
+        total_rows: (total_rows + 1) as u16,
+        cursor_row: cursor_row as u16,
+        cursor_col: cursor_col as u16,
+    }
 }
 
-/// Render the completion grid below the current line.
-pub fn render_completions(
-    tw: &mut TermWriter,
-    state: &CompletionState,
-    term_cols: u16,
-    below_line_row: u16,
-) {
-    if state.entries.is_empty() || state.rows == 0 {
+/// Render the completion grid below the current line (initial render).
+/// Cursor should be on the prompt line (as left by render_line).
+/// Leaves cursor back on the prompt line at cursor position.
+pub fn render_completions(tw: &mut TermWriter, state: &CompletionState, info: &PromptInfo) {
+    let visible_rows = grid_visible_rows(state);
+    if visible_rows == 0 {
         return;
     }
+    tw.hide_cursor();
 
-    // Compute column widths
+    // Move from cursor to bottom of prompt area
+    let rows_below = info.total_rows - 1 - info.cursor_row;
+    if rows_below > 0 {
+        tw.move_cursor_down(rows_below);
+    }
+
+    // Create new line for grid
+    tw.write_str("\n");
+    draw_grid(tw, state, visible_rows);
+
+    // Move back to cursor position
+    let up = info.total_rows + visible_rows as u16 - 1 - info.cursor_row;
+    tw.move_cursor_up(up);
+    tw.carriage_return();
+    if info.cursor_col > 0 {
+        tw.move_cursor_right(info.cursor_col);
+    }
+    tw.show_cursor();
+}
+
+/// Repaint the completion grid in-place (navigation/refilter).
+/// Cursor should be on the prompt line. Leaves cursor on the prompt line.
+pub fn repaint_completions(tw: &mut TermWriter, state: &CompletionState, info: &PromptInfo) {
+    let visible_rows = grid_visible_rows(state);
+    if visible_rows == 0 {
+        return;
+    }
+    tw.hide_cursor();
+
+    // Move from cursor to first grid row (one row below last prompt row)
+    let down = info.total_rows - info.cursor_row;
+    tw.move_cursor_down(down);
+
+    draw_grid(tw, state, visible_rows);
+
+    // Move back to cursor position
+    let up = info.total_rows + visible_rows as u16 - 1 - info.cursor_row;
+    tw.move_cursor_up(up);
+    tw.carriage_return();
+    if info.cursor_col > 0 {
+        tw.move_cursor_right(info.cursor_col);
+    }
+    tw.show_cursor();
+}
+
+pub fn grid_visible_rows(state: &CompletionState) -> usize {
+    if state.entries.is_empty() || state.rows == 0 {
+        return 0;
+    }
+    state.rows.min(10)
+}
+
+fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) {
     let mut col_widths = vec![0usize; state.cols];
     for (i, entry) in state.entries.iter().enumerate() {
         let col = i / state.rows;
@@ -62,11 +124,6 @@ pub fn render_completions(
         }
     }
 
-    // Max visible rows
-    let max_visible = 10usize;
-    let visible_rows = state.rows.min(max_visible);
-
-    // Determine scroll window
     let selected_row = state.selected % state.rows;
     let scroll_start = if selected_row < state.scroll {
         selected_row
@@ -76,7 +133,6 @@ pub fn render_completions(
         state.scroll
     };
 
-    tw.write_str("\n");
     for vr in 0..visible_rows {
         let row = scroll_start + vr;
         tw.carriage_return();
@@ -100,7 +156,6 @@ pub fn render_completions(
                 tw.write_str("\x1b[0m");
             }
 
-            // Pad to column width
             let display_w = entry.display_width();
             let pad = col_w.saturating_sub(display_w) + 2;
             for _ in 0..pad {
@@ -112,9 +167,6 @@ pub fn render_completions(
             tw.write_str("\n");
         }
     }
-
-    let _ = term_cols;
-    let _ = below_line_row;
 }
 
 /// Render the Ctrl+R history search pager.

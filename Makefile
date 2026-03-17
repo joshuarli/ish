@@ -1,9 +1,6 @@
 NAME       := ish
 TARGET     := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 
-setup:
-	prek install --install-hooks
-
 build:
 	cargo build
 
@@ -14,6 +11,9 @@ release:
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
+
+setup:
+	prek install --install-hooks
 
 pc:
 	prek --quiet run --all-files

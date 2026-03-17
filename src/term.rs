@@ -131,6 +131,12 @@ impl TermWriter {
             self.write_str(&format!("\x1b[{}A", n));
         }
     }
+
+    pub fn move_cursor_down(&mut self, n: u16) {
+        if n > 0 {
+            self.write_str(&format!("\x1b[{}B", n));
+        }
+    }
 }
 
 impl Write for TermWriter {

@@ -376,20 +376,9 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 continue;
                             }
                             KeyAction::StartCompletion => {
-                                let comp_state = start_completion(&line, shell.cols);
-                                match comp_state {
+                                match start_completion(&line, shell.cols, &shell.home) {
                                     Some(cs) if cs.entries.len() == 1 => {
                                         accept_completion(&mut line, &cs);
-                                        // If directory, immediately re-complete
-                                        if cs.entries[0].is_dir
-                                            && let Some(cs2) = start_completion(&line, shell.cols)
-                                        {
-                                            if cs2.entries.len() == 1 {
-                                                accept_completion(&mut line, &cs2);
-                                            } else if !cs2.entries.is_empty() {
-                                                mode = Mode::Completion(cs2);
-                                            }
-                                        }
                                     }
                                     Some(cs) if !cs.entries.is_empty() => {
                                         mode = Mode::Completion(cs);
@@ -408,9 +397,8 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             Mode::Completion(state) => {
                                 let p = current_prompt(&prompt_str, &full_input);
                                 let pdl = current_prompt_len(prompt_display_len, &full_input);
-                                let rows_used =
-                                    render::render_line(&mut tw, p, pdl, &line, shell.cols);
-                                render::render_completions(&mut tw, state, shell.cols, rows_used);
+                                let info = render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                                render::render_completions(&mut tw, state, &info);
                             }
                             Mode::HistorySearch { .. } => {}
                         }
@@ -418,41 +406,49 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                     }
 
                     Mode::Completion(state) => {
+                        let p = current_prompt(&prompt_str, &full_input);
+                        let pdl = current_prompt_len(prompt_display_len, &full_input);
                         match handle_completion_key(key, state, &mut line) {
-                            CompAction::Navigate => {}
-                            CompAction::Accept => {
-                                accept_completion(&mut line, state);
-                                let is_dir =
-                                    state.selected_entry().map(|e| e.is_dir).unwrap_or(false);
-                                mode = Mode::Normal;
-                                if is_dir && let Some(cs) = start_completion(&line, shell.cols) {
-                                    if cs.entries.len() == 1 {
+                            CompAction::Navigate => {
+                                // Cursor is on prompt line — repaint grid in-place
+                                let info = render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                                render::repaint_completions(&mut tw, state, &info);
+                                let _ = tw.flush_to_stdout();
+                                continue;
+                            }
+                            CompAction::Refilter => {
+                                // User typed/deleted — re-run completion with updated line
+                                match start_completion(&line, shell.cols, &shell.home) {
+                                    Some(cs) if cs.entries.len() == 1 => {
                                         accept_completion(&mut line, &cs);
-                                    } else if !cs.entries.is_empty() {
+                                        mode = Mode::Normal;
+                                    }
+                                    Some(cs) if !cs.entries.is_empty() => {
+                                        // render_line clears old grid, render_completions draws new
+                                        let info =
+                                            render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                                        render::render_completions(&mut tw, &cs, &info);
                                         mode = Mode::Completion(cs);
+                                        let _ = tw.flush_to_stdout();
+                                        continue;
+                                    }
+                                    _ => {
+                                        mode = Mode::Normal;
                                     }
                                 }
+                            }
+                            CompAction::Accept => {
+                                accept_completion(&mut line, state);
+                                mode = Mode::Normal;
                             }
                             CompAction::Cancel => {
                                 mode = Mode::Normal;
                             }
                         }
 
-                        match &mode {
-                            Mode::Normal => {
-                                let p = current_prompt(&prompt_str, &full_input);
-                                let pdl = current_prompt_len(prompt_display_len, &full_input);
-                                render::render_line(&mut tw, p, pdl, &line, shell.cols);
-                            }
-                            Mode::Completion(state) => {
-                                let p = current_prompt(&prompt_str, &full_input);
-                                let pdl = current_prompt_len(prompt_display_len, &full_input);
-                                let rows_used =
-                                    render::render_line(&mut tw, p, pdl, &line, shell.cols);
-                                render::render_completions(&mut tw, state, shell.cols, rows_used);
-                            }
-                            _ => {}
-                        }
+                        // Cursor is on prompt line — render_line's \r + clear_to_end_of_screen
+                        // naturally clears the grid below
+                        render::render_line(&mut tw, p, pdl, &line, shell.cols);
                         let _ = tw.flush_to_stdout();
                     }
 
@@ -683,21 +679,36 @@ enum CompAction {
     Navigate,
     Accept,
     Cancel,
+    Refilter,
 }
 
-fn start_completion(line: &LineBuffer, term_cols: u16) -> Option<CompletionState> {
+fn start_completion(line: &LineBuffer, term_cols: u16, home: &str) -> Option<CompletionState> {
     let text = line.text();
     let before_cursor = &text[..line.cursor()];
     let word_start = before_cursor.rfind(' ').map(|i| i + 1).unwrap_or(0);
     let partial = &before_cursor[word_start..];
 
+    // Detect if first word is cd → complete only directories
+    let first_word = text.split_whitespace().next().unwrap_or("");
+    let dirs_only = first_word == "cd" && word_start > 0;
+
+    // Expand tilde for filesystem lookup
+    let expanded = if partial == "~" {
+        format!("{home}/")
+    } else if let Some(rest) = partial.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        partial.to_string()
+    };
+
+    // dir_prefix keeps the original (unexpanded) form for accept_completion
     let dir_prefix = if let Some(slash_pos) = partial.rfind('/') {
         partial[..=slash_pos].to_string()
     } else {
         String::new()
     };
 
-    let entries = complete::complete_path(partial);
+    let entries = complete::complete_path(&expanded, dirs_only);
     if entries.is_empty() {
         return None;
     }
@@ -717,14 +728,14 @@ fn start_completion(line: &LineBuffer, term_cols: u16) -> Option<CompletionState
 fn handle_completion_key(
     key: KeyEvent,
     state: &mut CompletionState,
-    _line: &mut LineBuffer,
+    line: &mut LineBuffer,
 ) -> CompAction {
     match key.key {
         Key::Up => {
             state.move_up();
             CompAction::Navigate
         }
-        Key::Down => {
+        Key::Down | Key::Tab => {
             state.move_down();
             CompAction::Navigate
         }
@@ -736,9 +747,21 @@ fn handle_completion_key(
             state.move_right();
             CompAction::Navigate
         }
-        Key::Tab | Key::Enter => CompAction::Accept,
+        Key::Enter => CompAction::Accept,
         Key::Escape => CompAction::Cancel,
         Key::Char('c') if key.mods.ctrl => CompAction::Cancel,
+        Key::Char(c) if !key.mods.ctrl && !key.mods.alt => {
+            line.insert_char(c);
+            CompAction::Refilter
+        }
+        Key::Backspace => {
+            if line.cursor() > 0 {
+                line.delete_back();
+                CompAction::Refilter
+            } else {
+                CompAction::Cancel
+            }
+        }
         _ => CompAction::Cancel,
     }
 }
