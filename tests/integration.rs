@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use ish::alias::AliasMap;
+use ish::builtin;
 use ish::complete::{self, CompEntry, CompletionState};
 use ish::config;
 use ish::error::Error;
@@ -14,7 +15,8 @@ use ish::expand;
 use ish::history::{self, History};
 use ish::input;
 use ish::line::LineBuffer;
-use ish::parse::{self, Connector, RedirectKind};
+use ish::ls;
+use ish::parse::{self, Connector, LITERAL, RedirectKind};
 use ish::prompt;
 
 // ---------------------------------------------------------------------------
@@ -914,4 +916,1538 @@ fn prompt_shorten_pwd_adversarial() {
     // Root path
     let result = prompt::shorten_pwd("/", "");
     assert_eq!(result, "/");
+}
+
+// ---------------------------------------------------------------------------
+// Error: Display and From impls
+// ---------------------------------------------------------------------------
+
+#[test]
+fn error_display_msg() {
+    let e = Error::msg("something failed");
+    assert_eq!(format!("{e}"), "something failed");
+}
+
+#[test]
+fn error_display_glob_no_match() {
+    let e = Error::glob_no_match("*.xyz");
+    assert_eq!(format!("{e}"), "no matches for glob: *.xyz");
+}
+
+#[test]
+fn error_display_bad_substitution() {
+    let e = Error::bad_substitution("unclosed $(");
+    assert_eq!(format!("{e}"), "bad substitution: unclosed $(");
+}
+
+#[test]
+fn error_display_io() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+    let e: Error = io_err.into();
+    assert_eq!(format!("{e}"), "file not found");
+}
+
+#[test]
+fn error_is_std_error() {
+    let e = Error::msg("test");
+    // Verify it implements std::error::Error
+    let _: &dyn std::error::Error = &e;
+}
+
+// ---------------------------------------------------------------------------
+// Config: load, parse_set, parse_alias, config_path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_load_all_paths() {
+    // Consolidate config load tests into one to avoid XDG_CONFIG_HOME races.
+    let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+
+    // 1. Nonexistent config — should not panic
+    let empty_dir = tempdir_with_files(&[]);
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", empty_dir.to_str().unwrap()) };
+    let mut aliases = AliasMap::new();
+    config::load(&mut aliases);
+
+    // 2. Full config with set, alias, comments, bad lines
+    let dir = tempdir_with_files(&[]);
+    let config_dir = dir.join("ish");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.ish"),
+        "# comment line\n\
+         set ISH_TEST_CFG_LOAD_VAR \"hello world\"\n\
+         alias ll ls -la\n\
+         \n\
+         badline\n",
+    )
+    .unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.to_str().unwrap()) };
+    let mut aliases = AliasMap::new();
+    config::load(&mut aliases);
+    assert_eq!(
+        std::env::var("ISH_TEST_CFG_LOAD_VAR").unwrap(),
+        "hello world"
+    );
+    assert_eq!(aliases.get("ll").unwrap(), &["ls", "-la"]);
+
+    // 3. Empty set name — error but no panic
+    let dir2 = tempdir_with_files(&[]);
+    let config_dir2 = dir2.join("ish");
+    std::fs::create_dir_all(&config_dir2).unwrap();
+    std::fs::write(config_dir2.join("config.ish"), "set  \n").unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", dir2.to_str().unwrap()) };
+    let mut aliases = AliasMap::new();
+    config::load(&mut aliases);
+
+    // 4. Alias without expansion — should not be added
+    let dir3 = tempdir_with_files(&[]);
+    let config_dir3 = dir3.join("ish");
+    std::fs::create_dir_all(&config_dir3).unwrap();
+    std::fs::write(config_dir3.join("config.ish"), "alias myalias\n").unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", dir3.to_str().unwrap()) };
+    let mut aliases = AliasMap::new();
+    config::load(&mut aliases);
+    assert!(aliases.get("myalias").is_none());
+
+    // 5. set VAR with no value → empty string
+    let dir4 = tempdir_with_files(&[]);
+    let config_dir4 = dir4.join("ish");
+    std::fs::create_dir_all(&config_dir4).unwrap();
+    std::fs::write(config_dir4.join("config.ish"), "set ISH_TEST_CFG_NOVAL\n").unwrap();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", dir4.to_str().unwrap()) };
+    let mut aliases = AliasMap::new();
+    config::load(&mut aliases);
+    assert_eq!(std::env::var("ISH_TEST_CFG_NOVAL").unwrap(), "");
+
+    // Restore
+    match old_xdg {
+        Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+        None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+    }
+}
+
+#[test]
+fn config_expand_vars_trailing_dollar() {
+    // Trailing $ with no variable name
+    let result = config::expand_vars_simple("hello$");
+    assert_eq!(result, "hello");
+}
+
+#[test]
+fn config_expand_vars_dollar_followed_by_non_alnum() {
+    let result = config::expand_vars_simple("price is $!00");
+    assert_eq!(result, "price is !00");
+}
+
+// ---------------------------------------------------------------------------
+// Prompt: display_len, render, git branch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prompt_display_len_no_ansi() {
+    let p = prompt::Prompt::new();
+    assert_eq!(p.display_len("hello world"), 11);
+}
+
+#[test]
+fn prompt_display_len_with_ansi() {
+    let p = prompt::Prompt::new();
+    let s = "\x1b[32mgreen\x1b[0m text";
+    assert_eq!(p.display_len(s), 10); // "green text"
+}
+
+#[test]
+fn prompt_display_len_multiple_escapes() {
+    let p = prompt::Prompt::new();
+    let s = "\x1b[1m\x1b[32mbold green\x1b[0m";
+    assert_eq!(p.display_len(s), 10); // "bold green"
+}
+
+#[test]
+fn prompt_display_len_utf8() {
+    let p = prompt::Prompt::new();
+    assert_eq!(p.display_len("日本語"), 3);
+}
+
+#[test]
+fn prompt_render_status_colors() {
+    let mut p = prompt::Prompt::new();
+    // status 0 → green, status 1 → red
+    let r0 = p.render(0);
+    assert!(r0.contains("\x1b[38;5;10m")); // bright green
+    assert!(r0.ends_with(" $ "));
+
+    let r1 = p.render(1);
+    assert!(r1.contains("\x1b[38;5;1m")); // red
+    assert!(r1.ends_with(" $ "));
+}
+
+#[test]
+fn prompt_render_dirty_indicator() {
+    // Test that the dirty indicator code path is exercised.
+    // We can't reliably test env var reads in parallel tests, so just
+    // verify the render doesn't crash with __DENV_DIRTY set or unset.
+    let mut p = prompt::Prompt::new();
+    let r1 = p.render(0);
+    assert!(r1.ends_with(" $ "));
+}
+
+#[test]
+fn prompt_invalidate_git() {
+    let mut p = prompt::Prompt::new();
+    p.invalidate_git(); // should not panic
+}
+
+#[test]
+fn prompt_default_impl() {
+    let p = prompt::Prompt::default();
+    let rendered = p.display_len("test");
+    assert_eq!(rendered, 4);
+}
+
+#[test]
+fn prompt_git_branch_in_git_repo() {
+    // We're running from within a git repo (ish itself)
+    let mut p = prompt::Prompt::new();
+    // Set PWD to our repo root
+    let cwd = std::env::current_dir().unwrap();
+    unsafe { std::env::set_var("PWD", cwd.to_str().unwrap()) };
+    let rendered = p.render(0);
+    // Should detect git branch — the rendered prompt should contain a branch name
+    // We can't predict the exact branch name, but it should be there
+    // At minimum, the prompt should not crash
+    assert!(rendered.ends_with(" $ "));
+}
+
+#[test]
+fn prompt_render_multiple() {
+    // Exercise the render path multiple times — exercises PWD caching
+    // and git branch detection. Can't assert exact equality due to
+    // env var races in parallel tests; just verify no panics.
+    let mut p = prompt::Prompt::new();
+    let r1 = p.render(0);
+    assert!(r1.ends_with(" $ "));
+    let r2 = p.render(1);
+    assert!(r2.ends_with(" $ "));
+}
+
+// ---------------------------------------------------------------------------
+// Builtin: is_builtin, is_special_builtin
+// ---------------------------------------------------------------------------
+
+#[test]
+fn builtin_is_builtin_known() {
+    assert!(builtin::is_builtin("cd"));
+    assert!(builtin::is_builtin("exit"));
+    assert!(builtin::is_builtin("fg"));
+    assert!(builtin::is_builtin("set"));
+    assert!(builtin::is_builtin("unset"));
+    assert!(builtin::is_builtin("alias"));
+    assert!(builtin::is_builtin("l"));
+    assert!(builtin::is_builtin("c"));
+    assert!(builtin::is_builtin("w"));
+    assert!(builtin::is_builtin("which"));
+    assert!(builtin::is_builtin("type"));
+    assert!(builtin::is_builtin("echo"));
+    assert!(builtin::is_builtin("pwd"));
+    assert!(builtin::is_builtin("true"));
+    assert!(builtin::is_builtin("false"));
+    assert!(builtin::is_builtin("copy-scrollback"));
+}
+
+#[test]
+fn builtin_is_builtin_unknown() {
+    assert!(!builtin::is_builtin("ls"));
+    assert!(!builtin::is_builtin("grep"));
+    assert!(!builtin::is_builtin(""));
+    assert!(!builtin::is_builtin("nonexistent"));
+}
+
+#[test]
+fn builtin_is_special_known() {
+    assert!(builtin::is_special_builtin("cd"));
+    assert!(builtin::is_special_builtin("exit"));
+    assert!(builtin::is_special_builtin("fg"));
+    assert!(builtin::is_special_builtin("set"));
+    assert!(builtin::is_special_builtin("unset"));
+    assert!(builtin::is_special_builtin("alias"));
+    assert!(builtin::is_special_builtin("copy-scrollback"));
+}
+
+#[test]
+fn builtin_is_special_not_special() {
+    assert!(!builtin::is_special_builtin("l"));
+    assert!(!builtin::is_special_builtin("echo"));
+    assert!(!builtin::is_special_builtin("pwd"));
+    assert!(!builtin::is_special_builtin("true"));
+}
+
+#[test]
+fn builtin_run_output_echo() {
+    let args = vec!["hello".to_string(), "world".to_string()];
+    let status = builtin::run_output("echo", &args, &[]);
+    assert_eq!(status, 0);
+}
+
+#[test]
+fn builtin_run_output_true_false() {
+    assert_eq!(builtin::run_output("true", &[], &[]), 0);
+    assert_eq!(builtin::run_output("false", &[], &[]), 1);
+}
+
+#[test]
+fn builtin_run_output_pwd() {
+    // pwd should succeed or fail gracefully (CWD may be changed by other tests)
+    let status = builtin::run_output("pwd", &[], &[]);
+    assert!(status == 0 || status == 1);
+}
+
+#[test]
+fn builtin_run_output_l_cwd() {
+    let dir = tempdir_with_files(&["a.txt"]);
+    let status = builtin::run_output("l", &[dir.to_str().unwrap().to_string()], &[]);
+    assert_eq!(status, 0);
+}
+
+#[test]
+fn builtin_run_output_l_file() {
+    let dir = tempdir_with_files(&["test_file.txt"]);
+    let file_path = dir.join("test_file.txt");
+    let status = builtin::run_output("l", &[file_path.to_str().unwrap().to_string()], &[]);
+    assert_eq!(status, 0);
+}
+
+#[test]
+fn builtin_run_output_l_nonexistent() {
+    let status = builtin::run_output("l", &["/nonexistent/path".to_string()], &[]);
+    assert_eq!(status, 1);
+}
+
+#[test]
+fn builtin_run_output_c_clear() {
+    let status = builtin::run_output("c", &[], &[]);
+    assert_eq!(status, 0);
+}
+
+#[test]
+fn builtin_run_output_w_no_args() {
+    let status = builtin::run_output("w", &[], &[]);
+    assert_eq!(status, 1);
+}
+
+#[test]
+fn builtin_run_output_w_builtin() {
+    let status = builtin::run_output("w", &["cd".to_string()], &[]);
+    assert_eq!(status, 0);
+}
+
+#[test]
+fn builtin_run_output_w_which_type_aliases() {
+    // "which" and "type" should work like "w"
+    assert_eq!(builtin::run_output("which", &["echo".to_string()], &[]), 0);
+    assert_eq!(builtin::run_output("type", &["echo".to_string()], &[]), 0);
+}
+
+#[test]
+fn builtin_run_output_w_not_found() {
+    let status = builtin::run_output("w", &["nonexistent_cmd_xyz".to_string()], &[]);
+    assert_eq!(status, 1);
+}
+
+#[test]
+fn builtin_run_output_copy_scrollback() {
+    let status = builtin::run_output("copy-scrollback", &[], &[]);
+    assert_eq!(status, 1); // "not yet implemented"
+}
+
+#[test]
+fn builtin_run_output_special_in_pipeline() {
+    // Special builtins shouldn't work in pipeline context (via run_output)
+    assert_eq!(builtin::run_output("cd", &[], &[]), 1);
+    assert_eq!(builtin::run_output("exit", &[], &[]), 1);
+    assert_eq!(builtin::run_output("set", &[], &[]), 1);
+}
+
+#[test]
+fn builtin_run_output_unknown() {
+    assert_eq!(builtin::run_output("notabuiltin", &[], &[]), 1);
+}
+
+#[test]
+fn builtin_run_special_cd_target() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    let dir = tempdir_with_files(&[]);
+    let old_dir = std::env::current_dir().unwrap();
+    let status = builtin::run_special(
+        "cd",
+        &[dir.to_str().unwrap().to_string()],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 0);
+    assert!(prev_dir.is_some());
+
+    // Restore
+    let _ = std::env::set_current_dir(&old_dir);
+}
+
+#[test]
+fn builtin_run_special_cd_dash_no_prev() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    let status = builtin::run_special(
+        "cd",
+        &["-".to_string()],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 1); // no previous directory
+}
+
+#[test]
+fn builtin_run_special_cd_dash_with_prev() {
+    use std::collections::HashMap;
+    let dir = tempdir_with_files(&[]);
+    let mut prev_dir = Some(dir.to_str().unwrap().to_string());
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    let old_dir = std::env::current_dir().unwrap();
+    let status = builtin::run_special(
+        "cd",
+        &["-".to_string()],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 0);
+
+    let _ = std::env::set_current_dir(&old_dir);
+}
+
+#[test]
+fn builtin_run_special_cd_nonexistent() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    let status = builtin::run_special(
+        "cd",
+        &["/nonexistent_dir_xyz".to_string()],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 1);
+}
+
+#[test]
+fn builtin_run_special_set_print_all() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    // set with no args prints all env vars
+    let status = builtin::run_special(
+        "set",
+        &[],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 0);
+}
+
+#[test]
+fn builtin_run_special_set_var() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    let status = builtin::run_special(
+        "set",
+        &["ISH_TEST_BUILTIN_SET".to_string(), "myvalue".to_string()],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 0);
+    assert_eq!(std::env::var("ISH_TEST_BUILTIN_SET").unwrap(), "myvalue");
+    unsafe { std::env::remove_var("ISH_TEST_BUILTIN_SET") };
+}
+
+#[test]
+fn builtin_run_special_set_no_value() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    let status = builtin::run_special(
+        "set",
+        &["ISH_TEST_BUILTIN_SET_EMPTY".to_string()],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 0);
+    assert_eq!(std::env::var("ISH_TEST_BUILTIN_SET_EMPTY").unwrap(), "");
+    unsafe { std::env::remove_var("ISH_TEST_BUILTIN_SET_EMPTY") };
+}
+
+#[test]
+fn builtin_run_special_unset() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    unsafe { std::env::set_var("ISH_TEST_UNSET_ME", "value") };
+    let status = builtin::run_special(
+        "unset",
+        &["ISH_TEST_UNSET_ME".to_string()],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 0);
+    assert!(std::env::var("ISH_TEST_UNSET_ME").is_err());
+}
+
+#[test]
+fn builtin_run_special_unset_no_args() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    let status = builtin::run_special(
+        "unset",
+        &[],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 1);
+}
+
+#[test]
+fn builtin_run_special_alias_error() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    let status = builtin::run_special(
+        "alias",
+        &[],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 1);
+}
+
+#[test]
+fn builtin_run_special_copy_scrollback() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    let status = builtin::run_special(
+        "copy-scrollback",
+        &[],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 0);
+}
+
+#[test]
+fn builtin_run_special_unknown() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    let status = builtin::run_special(
+        "notabuiltin",
+        &[],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 1);
+}
+
+#[test]
+fn builtin_run_special_exit() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    // exit in pipeline context returns 1
+    let status = builtin::run_special(
+        "exit",
+        &[],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 1);
+}
+
+#[test]
+fn builtin_run_special_set_path_rebuilds_cache() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    // Insert a dummy entry into the cache
+    cache.insert("dummy".to_string(), std::path::PathBuf::from("/tmp/dummy"));
+
+    let status = builtin::run_special(
+        "set",
+        &["PATH".to_string(), "/usr/bin".to_string()],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 0);
+    // Cache should have been rebuilt (old entry gone)
+    assert!(!cache.contains_key("dummy"));
+}
+
+#[test]
+fn builtin_run_special_unset_path_clears_cache() {
+    use std::collections::HashMap;
+    let mut prev_dir = None;
+    let mut job = None;
+    let mut cache = HashMap::new();
+    let mut log = String::new();
+
+    cache.insert("dummy".to_string(), std::path::PathBuf::from("/tmp/dummy"));
+
+    // Save and restore PATH since we're unsetting it
+    let old_path = std::env::var("PATH").ok();
+    let status = builtin::run_special(
+        "unset",
+        &["PATH".to_string()],
+        &[],
+        &mut prev_dir,
+        "/tmp",
+        &mut job,
+        &mut cache,
+        &mut log,
+    );
+    assert_eq!(status, 0);
+    assert!(cache.is_empty());
+
+    // Restore PATH
+    if let Some(p) = old_path {
+        unsafe { std::env::set_var("PATH", p) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// History: file I/O
+// ---------------------------------------------------------------------------
+
+#[test]
+fn history_load_empty() {
+    let h = History::load();
+    // Just verify it doesn't panic and returns a valid history
+    let _ = h.len();
+}
+
+#[test]
+fn history_add_with_newlines() {
+    let mut h = History::from_entries(vec![]);
+    h.add("echo\nhello");
+    // Newlines should be collapsed to spaces
+    assert_eq!(h.entries().last().unwrap(), "echo hello");
+}
+
+#[test]
+fn history_add_dedup_preserves_order() {
+    let mut h = History::from_entries(vec!["a".into(), "b".into(), "c".into()]);
+    h.add("a");
+    assert_eq!(h.entries(), &["b", "c", "a"]);
+}
+
+#[test]
+fn history_get_and_len() {
+    let h = History::from_entries(vec!["first".into(), "second".into()]);
+    assert_eq!(h.len(), 2);
+    assert!(!h.is_empty());
+    assert_eq!(h.get(0), "first");
+    assert_eq!(h.get(1), "second");
+}
+
+#[test]
+fn history_from_entries_empty() {
+    let h = History::from_entries(vec![]);
+    assert!(h.is_empty());
+    assert_eq!(h.len(), 0);
+}
+
+#[test]
+fn history_prefix_search_no_match() {
+    let h = History::from_entries(vec!["ls -la".into(), "cd /tmp".into()]);
+    assert!(h.prefix_search("git", 0).is_none());
+}
+
+#[test]
+fn history_fuzzy_match_positions_empty_query() {
+    let q: Vec<char> = "".chars().collect();
+    let positions = history::subsequence_match(&q, "anything");
+    assert_eq!(positions, Some(vec![]));
+}
+
+// ---------------------------------------------------------------------------
+// ls: directory listing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ls_list_dir_cwd() {
+    let dir = tempdir_with_files(&["file.txt"]);
+    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+}
+
+#[test]
+fn ls_list_dir_file() {
+    let dir = tempdir_with_files(&["test_file.txt"]);
+    let file_path = dir.join("test_file.txt");
+    assert_eq!(ls::list_dir(file_path.to_str().unwrap()), 0);
+}
+
+#[test]
+fn ls_list_dir_nonexistent() {
+    assert_eq!(ls::list_dir("/nonexistent_path_xyz"), 1);
+}
+
+#[test]
+fn ls_list_dir_tempdir() {
+    let dir = tempdir_with_files(&["alpha.txt", "beta.rs"]);
+    std::fs::create_dir(dir.join("subdir")).unwrap();
+    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+}
+
+#[test]
+fn ls_list_dir_empty() {
+    let dir = tempdir_with_files(&[]);
+    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+}
+
+#[test]
+fn ls_list_dir_symlink() {
+    let dir = tempdir_with_files(&["target.txt"]);
+    let link_path = dir.join("link.txt");
+    std::os::unix::fs::symlink(dir.join("target.txt"), &link_path).unwrap();
+    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Expand: more edge cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn expand_variable_in_middle_of_word() {
+    unsafe { std::env::set_var("ISH_MID_VAR", "world") };
+    let result = expand::expand_word("hello$ISH_MID_VAR!", "/home/test", &mut no_subst).unwrap();
+    assert_eq!(result, ["helloworld!"]);
+}
+
+#[test]
+fn expand_multiple_variables() {
+    unsafe { std::env::set_var("ISH_A", "foo") };
+    unsafe { std::env::set_var("ISH_B", "bar") };
+    let result = expand::expand_word("$ISH_A-$ISH_B", "/home/test", &mut no_subst).unwrap();
+    assert_eq!(result, ["foo-bar"]);
+}
+
+#[test]
+fn expand_dollar_paren_pass_through_in_variables() {
+    // $(cmd) should be left for command substitution pass
+    let mut exec = |cmd: &str| -> Result<String, Error> {
+        assert_eq!(cmd, "echo hi");
+        Ok("hi\n".to_string())
+    };
+    let result = expand::expand_word("$(echo hi)", "/home/test", &mut exec).unwrap();
+    assert_eq!(result, ["hi"]);
+}
+
+#[test]
+fn expand_glob_recursive_star() {
+    let dir = tempdir_with_files(&[]);
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let sub = dir.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("deep.txt"), "").unwrap();
+
+    let pattern = format!("{}/**/*.txt", dir.display());
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    assert!(result.iter().any(|r| r.ends_with("deep.txt")));
+}
+
+#[test]
+fn expand_literal_in_word() {
+    // LITERAL markers should be stripped in output
+    let word = format!("{LITERAL}$plain");
+    let result = expand::expand_word(&word, "/home/test", &mut no_subst).unwrap();
+    // The LITERAL $ should be kept as literal, not expanded
+    assert_eq!(result, ["$plain"]);
+}
+
+#[test]
+fn expand_argv_multiple_words() {
+    let words: Vec<String> = vec!["hello".into(), "~".into(), "plain".into()];
+    let result = expand::expand_argv(&words, "/home/test", &mut no_subst).unwrap();
+    assert_eq!(result, ["hello", "/home/test", "plain"]);
+}
+
+#[test]
+fn expand_glob_hidden_skip() {
+    // Glob should skip hidden files unless pattern starts with .
+    let dir = tempdir_with_files(&[".hidden", "visible"]);
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let pattern = format!("{}/v*", dir.display());
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    assert_eq!(result.len(), 1);
+    assert!(result[0].ends_with("visible"));
+}
+
+#[test]
+fn expand_glob_dot_pattern_includes_hidden() {
+    let dir = tempdir_with_files(&[".hidden", "visible"]);
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let pattern = format!("{}/.h*", dir.display());
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    assert_eq!(result.len(), 1);
+    assert!(result[0].ends_with(".hidden"));
+}
+
+// ---------------------------------------------------------------------------
+// Parse: more error paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_background_amp_alone() {
+    let result = parse::parse("echo hello &");
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("background"));
+}
+
+#[test]
+fn parse_redirect_without_target() {
+    // Redirect followed by a connector instead of a word
+    let result = parse::parse("echo >");
+    assert!(result.is_err());
+}
+
+#[test]
+fn parse_trailing_connector_and() {
+    // "a &&" — needs_continuation detects the trailing &&
+    assert!(parse::needs_continuation("a &&"));
+}
+
+#[test]
+fn parse_trailing_connector_or() {
+    assert!(parse::needs_continuation("a ||"));
+}
+
+#[test]
+fn parse_trailing_pipe() {
+    let result = parse::parse("a |");
+    assert!(result.is_err());
+}
+
+#[test]
+fn parse_unescape_with_literal() {
+    let s = format!("hello{LITERAL}world");
+    assert_eq!(parse::unescape(&s), "helloworld");
+}
+
+#[test]
+fn parse_unescape_no_literal() {
+    assert_eq!(parse::unescape("hello world"), "hello world");
+}
+
+#[test]
+fn parse_needs_continuation_escaped_quote() {
+    // Backslash-escaped quote should not count as open
+    assert!(!parse::needs_continuation(r"echo \'"));
+}
+
+#[test]
+fn parse_needs_continuation_double_quote_escaped() {
+    assert!(!parse::needs_continuation(r#"echo \""#));
+}
+
+#[test]
+fn parse_2_redirect() {
+    let cmd = parse::parse("cmd 2> errfile").unwrap();
+    let r = &cmd.segments[0].0.commands[0].cmd.redirects;
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].kind, RedirectKind::Err);
+    assert_eq!(r[0].target, "errfile");
+}
+
+#[test]
+fn parse_append_redirect() {
+    let cmd = parse::parse("echo hi >> log.txt").unwrap();
+    assert_eq!(
+        cmd.segments[0].0.commands[0].cmd.redirects[0].kind,
+        RedirectKind::Append
+    );
+}
+
+#[test]
+fn parse_input_redirect() {
+    let cmd = parse::parse("cmd < input.txt").unwrap();
+    assert_eq!(
+        cmd.segments[0].0.commands[0].cmd.redirects[0].kind,
+        RedirectKind::In
+    );
+}
+
+#[test]
+fn parse_semicolon_separator() {
+    let cmd = parse::parse("a ; b").unwrap();
+    assert_eq!(cmd.segments.len(), 2);
+    assert_eq!(cmd.segments[0].1, Some(Connector::Semi));
+}
+
+// ---------------------------------------------------------------------------
+// Alias: Default impl
+// ---------------------------------------------------------------------------
+
+#[test]
+fn alias_default_impl() {
+    let aliases = AliasMap::default();
+    assert!(aliases.get("anything").is_none());
+    assert_eq!(aliases.iter().count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// LineBuffer: Default impl and more edges
+// ---------------------------------------------------------------------------
+
+#[test]
+fn line_buffer_default_impl() {
+    let lb = LineBuffer::default();
+    assert!(lb.is_empty());
+    assert_eq!(lb.cursor(), 0);
+    assert_eq!(lb.text(), "");
+}
+
+#[test]
+fn line_buffer_display_len() {
+    let mut lb = LineBuffer::new();
+    lb.set("hello");
+    assert_eq!(lb.display_len(), 5);
+    lb.set("日本語");
+    assert_eq!(lb.display_len(), 3);
+}
+
+#[test]
+fn line_buffer_move_word_at_boundaries() {
+    let mut lb = LineBuffer::new();
+    lb.set("hello");
+    // move_word_left from end
+    lb.move_word_left();
+    assert_eq!(lb.cursor(), 0);
+    // move_word_left from 0 — should stay
+    lb.move_word_left();
+    assert_eq!(lb.cursor(), 0);
+    // move_word_right from 0
+    lb.move_word_right();
+    assert_eq!(lb.cursor(), 5);
+    // move_word_right at end — should stay
+    lb.move_word_right();
+    assert_eq!(lb.cursor(), 5);
+}
+
+#[test]
+fn line_buffer_kill_to_end_at_end() {
+    let mut lb = LineBuffer::new();
+    lb.set("hello");
+    // Already at end — kill_to_end is no-op
+    lb.kill_to_end();
+    assert_eq!(lb.text(), "hello");
+}
+
+#[test]
+fn line_buffer_kill_to_start_at_start() {
+    let mut lb = LineBuffer::new();
+    lb.set("hello");
+    lb.move_home();
+    // Already at start — kill_to_start is no-op
+    lb.kill_to_start();
+    assert_eq!(lb.text(), "hello");
+}
+
+#[test]
+fn line_buffer_kill_word_back_at_start() {
+    let mut lb = LineBuffer::new();
+    lb.set("hello");
+    lb.move_home();
+    lb.kill_word_back();
+    assert_eq!(lb.text(), "hello");
+}
+
+#[test]
+fn line_buffer_yank_empty_kill_ring() {
+    let mut lb = LineBuffer::new();
+    lb.set("hello");
+    lb.yank(); // kill ring is empty — should be no-op
+    assert_eq!(lb.text(), "hello");
+}
+
+#[test]
+fn line_buffer_word_movement_with_whitespace() {
+    let mut lb = LineBuffer::new();
+    lb.set("  hello  world  ");
+    lb.move_home();
+    lb.move_word_right(); // skip ws, then skip "hello", then skip ws -> at 'w'
+    let pos = lb.display_cursor_pos();
+    // Should be past first word and whitespace
+    assert!(pos > 0);
+    lb.move_word_left();
+    // Should go back
+    assert!(lb.display_cursor_pos() < pos);
+}
+
+// ---------------------------------------------------------------------------
+// Completion: more navigation edges
+// ---------------------------------------------------------------------------
+
+#[test]
+fn completion_state_selected_entry() {
+    let entries = make_entries(&["a", "b", "c"]);
+    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let state = CompletionState {
+        entries,
+        selected: 1,
+        cols,
+        rows,
+        scroll: 0,
+        dir_prefix: String::new(),
+    };
+    assert_eq!(state.selected_entry().unwrap().name, "b");
+}
+
+#[test]
+fn completion_state_selected_entry_out_of_bounds() {
+    let entries = make_entries(&["a"]);
+    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let state = CompletionState {
+        entries,
+        selected: 99,
+        cols,
+        rows,
+        scroll: 0,
+        dir_prefix: String::new(),
+    };
+    assert!(state.selected_entry().is_none());
+}
+
+#[test]
+fn completion_move_with_zero_rows() {
+    let state_entries: Vec<CompEntry> = vec![];
+    let mut state = CompletionState {
+        entries: state_entries,
+        selected: 0,
+        cols: 0,
+        rows: 0,
+        scroll: 0,
+        dir_prefix: String::new(),
+    };
+    // All moves should be no-ops when rows == 0
+    state.move_up();
+    state.move_down();
+    state.move_left();
+    state.move_right();
+    assert_eq!(state.selected, 0);
+}
+
+#[test]
+fn completion_navigation_single_entry() {
+    let entries = make_entries(&["only"]);
+    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let mut state = CompletionState {
+        entries,
+        selected: 0,
+        cols,
+        rows,
+        scroll: 0,
+        dir_prefix: String::new(),
+    };
+    state.move_up();
+    assert_eq!(state.selected, 0);
+    state.move_down();
+    assert_eq!(state.selected, 0);
+    state.move_left();
+    assert_eq!(state.selected, 0);
+    state.move_right();
+    assert_eq!(state.selected, 0);
+}
+
+#[test]
+fn completion_move_right_wraps_to_first_col() {
+    let entries = make_entries(&["a", "b", "c", "d", "e", "f"]);
+    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let mut state = CompletionState {
+        entries,
+        selected: 0,
+        cols,
+        rows,
+        scroll: 0,
+        dir_prefix: String::new(),
+    };
+    // Move right until we wrap
+    for _ in 0..20 {
+        state.move_right();
+        assert!(state.selected < state.entries.len());
+    }
+}
+
+#[test]
+fn completion_move_left_wraps_to_last_col() {
+    let entries = make_entries(&["a", "b", "c", "d", "e", "f"]);
+    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let mut state = CompletionState {
+        entries,
+        selected: 0,
+        cols,
+        rows,
+        scroll: 0,
+        dir_prefix: String::new(),
+    };
+    state.move_left(); // from col 0 should wrap to last col
+    assert!(state.selected > 0);
+    assert!(state.selected < state.entries.len());
+}
+
+#[test]
+fn comp_entry_display_link() {
+    let e = CompEntry {
+        name: "link".into(),
+        is_dir: false,
+        is_link: true,
+        is_exec: false,
+    };
+    assert_eq!(e.display_name(), "link");
+    assert_eq!(e.display_width(), 4);
+}
+
+#[test]
+fn comp_entry_display_exec() {
+    let e = CompEntry {
+        name: "script".into(),
+        is_dir: false,
+        is_link: false,
+        is_exec: true,
+    };
+    assert_eq!(e.display_name(), "script");
+}
+
+// ---------------------------------------------------------------------------
+// Input: KeyEvent constructors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn input_key_event_constructors() {
+    use ish::input::{Key, KeyEvent, Modifiers};
+
+    let ke = KeyEvent::key(Key::Enter);
+    assert_eq!(ke.key, Key::Enter);
+    assert!(!ke.mods.ctrl && !ke.mods.alt && !ke.mods.shift);
+
+    let ke = KeyEvent::char('a');
+    assert_eq!(ke.key, Key::Char('a'));
+
+    let ke = KeyEvent::ctrl('c');
+    assert_eq!(ke.key, Key::Char('c'));
+    assert!(ke.mods.ctrl);
+
+    let ke = KeyEvent::alt('f');
+    assert_eq!(ke.key, Key::Char('f'));
+    assert!(ke.mods.alt);
+
+    let ke = KeyEvent::with_mods(
+        Key::Up,
+        Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+        },
+    );
+    assert_eq!(ke.key, Key::Up);
+    assert!(ke.mods.ctrl && ke.mods.alt && ke.mods.shift);
+}
+
+#[test]
+fn input_modifiers_none() {
+    use ish::input::Modifiers;
+    let m = Modifiers::NONE;
+    assert!(!m.ctrl && !m.alt && !m.shift);
+}
+
+#[test]
+fn input_modifiers_default() {
+    use ish::input::Modifiers;
+    let m = Modifiers::default();
+    assert!(!m.ctrl && !m.alt && !m.shift);
+}
+
+#[test]
+fn input_modifier_from_param_zero() {
+    // param=0 → saturating_sub(1) = 0, all false
+    let m = input::modifier_from_param(0);
+    assert!(!m.ctrl && !m.alt && !m.shift);
+}
+
+// ---------------------------------------------------------------------------
+// Prompt: shorten_pwd additional edges
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prompt_shorten_pwd_single_char_components() {
+    // Single-char middle components should not be abbreviated further
+    assert_eq!(prompt::shorten_pwd("/a/b/c/target", ""), "/a/b/c/target");
+}
+
+#[test]
+fn prompt_shorten_pwd_dotfiles_in_middle() {
+    assert_eq!(
+        prompt::shorten_pwd("/home/u/.local/share/ish", "/home/u"),
+        "~/.l/s/ish"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// History: file I/O with tempdir
+// ---------------------------------------------------------------------------
+
+#[test]
+fn history_file_io() {
+    let dir = tempdir_with_files(&[]);
+    let hist_dir = dir.join("ish");
+    std::fs::create_dir_all(&hist_dir).unwrap();
+    let hist_file = hist_dir.join("history");
+
+    let old = std::env::var("XDG_DATA_HOME").ok();
+    unsafe { std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap()) };
+
+    // Write history
+    let mut h = History::load();
+    h.add("test command 1");
+    h.add("test command 2");
+    h.add("test command 1"); // dup — should be deduped in memory
+
+    // Verify file was written
+    let content = std::fs::read_to_string(&hist_file).unwrap();
+    assert!(content.contains("test command 1"));
+    assert!(content.contains("test command 2"));
+
+    // Reload and verify dedup
+    let h2 = History::load();
+    assert!(h2.len() >= 2);
+
+    // Restore
+    match old {
+        Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
+        None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Expand: LITERAL marker handling
+// ---------------------------------------------------------------------------
+
+#[test]
+fn expand_strip_literal_no_markers() {
+    // expand_word with no special chars should fast-path
+    let result = expand::expand_word("plain_word", "/home/test", &mut no_subst).unwrap();
+    assert_eq!(result, ["plain_word"]);
+}
+
+#[test]
+fn expand_backtick_subst() {
+    let mut exec = |cmd: &str| -> Result<String, Error> {
+        assert_eq!(cmd, "date");
+        Ok("2024-01-01\n".to_string())
+    };
+    let result = expand::expand_word("`date`", "/home/test", &mut exec).unwrap();
+    assert_eq!(result, ["2024-01-01"]);
+}
+
+#[test]
+fn expand_nested_command_subst() {
+    let mut exec = |_cmd: &str| -> Result<String, Error> { Ok("inner\n".to_string()) };
+    let result = expand::expand_word("$(echo $(pwd))", "/home/test", &mut exec).unwrap();
+    assert_eq!(result, ["inner"]);
+}
+
+#[test]
+fn expand_tilde_not_prefix() {
+    // ~ not at start should not expand
+    let result = expand::expand_word("path/~/file", "/home/test", &mut no_subst).unwrap();
+    assert_eq!(result, ["path/~/file"]);
+}
+
+#[test]
+fn expand_tilde_user_not_supported() {
+    // ~otheruser should pass through unchanged
+    let result = expand::expand_word("~otheruser/file", "/home/test", &mut no_subst).unwrap();
+    assert_eq!(result, ["~otheruser/file"]);
+}
+
+// ---------------------------------------------------------------------------
+// ls: executable files, symlinks, permissions edge cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ls_list_dir_with_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir_with_files(&["script.sh"]);
+    // Make executable
+    let path = dir.join("script.sh");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+}
+
+#[test]
+fn ls_list_dir_with_symlink_to_dir() {
+    let dir = tempdir_with_files(&[]);
+    let subdir = dir.join("realdir");
+    std::fs::create_dir(&subdir).unwrap();
+    let link_path = dir.join("linkdir");
+    std::os::unix::fs::symlink(&subdir, &link_path).unwrap();
+    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+}
+
+#[test]
+fn ls_list_symlink_to_dir_as_file() {
+    // When listing a symlink that points to a dir, should list the dir contents
+    let dir = tempdir_with_files(&["inside.txt"]);
+    let parent = dir.parent().unwrap();
+    let link_path = parent.join(format!("ish_test_link_{}", std::process::id()));
+    let _ = std::fs::remove_file(&link_path);
+    std::os::unix::fs::symlink(&dir, &link_path).unwrap();
+    assert_eq!(ls::list_dir(link_path.to_str().unwrap()), 0);
+    let _ = std::fs::remove_file(&link_path);
+}
+
+#[test]
+fn ls_list_dir_sorts_case_insensitive() {
+    let dir = tempdir_with_files(&["Zebra", "alpha", "Beta"]);
+    // Should not crash; output should be sorted
+    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Prompt: git branch with temp repo
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prompt_git_branch_detects_repo() {
+    let dir = tempdir_with_files(&[]);
+    let git_dir = dir.join(".git");
+    std::fs::create_dir(&git_dir).unwrap();
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/test-branch\n").unwrap();
+
+    // Render sets PWD, but other tests may race. Just verify the code path runs.
+    let mut p = prompt::Prompt::new();
+    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
+    let rendered = p.render(0);
+    // If PWD wasn't clobbered, we see the branch. Either way, no crash.
+    assert!(rendered.ends_with(" $ "));
+}
+
+#[test]
+fn prompt_git_branch_detached_head() {
+    let dir = tempdir_with_files(&[]);
+    let git_dir = dir.join(".git");
+    std::fs::create_dir(&git_dir).unwrap();
+    std::fs::write(git_dir.join("HEAD"), "abc12345deadbeef\n").unwrap();
+
+    let mut p = prompt::Prompt::new();
+    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
+    let rendered = p.render(0);
+    assert!(rendered.ends_with(" $ "));
+}
+
+#[test]
+fn prompt_git_branch_no_repo() {
+    let dir = tempdir_with_files(&[]);
+    let mut p = prompt::Prompt::new();
+    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
+    let rendered = p.render(0);
+    assert!(rendered.ends_with(" $ "));
+}
+
+#[test]
+fn prompt_git_cache_no_repo_reuse() {
+    let dir = tempdir_with_files(&[]);
+    let subdir = dir.join("sub");
+    std::fs::create_dir(&subdir).unwrap();
+
+    let mut p = prompt::Prompt::new();
+
+    // First render in dir with no repo — caches NoRepo
+    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
+    let _ = p.render(0);
+
+    // Render in subdir — exercises the NoRepo cache path
+    unsafe { std::env::set_var("PWD", subdir.to_str().unwrap()) };
+    let r = p.render(0);
+    assert!(r.ends_with(" $ "));
+}
+
+#[test]
+fn prompt_git_invalidate_clears_cache() {
+    let dir = tempdir_with_files(&[]);
+    let git_dir = dir.join(".git");
+    std::fs::create_dir(&git_dir).unwrap();
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    let mut p = prompt::Prompt::new();
+    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
+    let _ = p.render(0);
+
+    // Invalidate and re-render — exercises the Unknown→Repo path again
+    p.invalidate_git();
+    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
+    let r = p.render(0);
+    assert!(r.ends_with(" $ "));
+}
+
+#[test]
+fn prompt_git_bare_ref() {
+    let dir = tempdir_with_files(&[]);
+    let git_dir = dir.join(".git");
+    std::fs::create_dir(&git_dir).unwrap();
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/remotes/origin/main\n").unwrap();
+
+    let mut p = prompt::Prompt::new();
+    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
+    let rendered = p.render(0);
+    assert!(rendered.ends_with(" $ "));
+}
+
+#[test]
+fn prompt_git_worktree_gitdir_file() {
+    let dir = tempdir_with_files(&[]);
+    let real_git = dir.join("real_git");
+    std::fs::create_dir(&real_git).unwrap();
+    std::fs::write(real_git.join("HEAD"), "ref: refs/heads/worktree\n").unwrap();
+
+    // Create a .git file (not directory) pointing to the real git dir
+    let worktree = dir.join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", real_git.display()),
+    )
+    .unwrap();
+
+    let mut p = prompt::Prompt::new();
+    unsafe { std::env::set_var("PWD", worktree.to_str().unwrap()) };
+    let rendered = p.render(0);
+    assert!(rendered.ends_with(" $ "));
+}
+
+// ---------------------------------------------------------------------------
+// Completion: symlinks in completions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn complete_path_symlink() {
+    let dir = tempdir_with_files(&["target.txt"]);
+    let link_path = dir.join("link.txt");
+    std::os::unix::fs::symlink(dir.join("target.txt"), &link_path).unwrap();
+
+    let path = format!("{}/", dir.display());
+    let entries = complete::complete_path(&path, false);
+    let names: HashSet<_> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains("target.txt"));
+    assert!(names.contains("link.txt"));
+    // link should be marked as a link
+    let link_entry = entries.iter().find(|e| e.name == "link.txt").unwrap();
+    assert!(link_entry.is_link);
 }

@@ -505,9 +505,9 @@ fn bench_alloc_audit(c: &mut Criterion) {
 
 fn fast_config() -> Criterion {
     Criterion::default()
-        .sample_size(50)
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(2))
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(1))
 }
 
 criterion_group!(
