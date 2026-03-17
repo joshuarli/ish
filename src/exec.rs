@@ -2,7 +2,7 @@ use crate::alias::AliasMap;
 use crate::builtin;
 use crate::error::Error;
 use crate::expand;
-use crate::job::Job;
+use crate::job::{Continuation, Job};
 use crate::parse::{self, CommandLine, Connector, PipedCommand, Redirect, RedirectKind};
 use crate::signal;
 use crate::sys;
@@ -21,9 +21,13 @@ fn close_fd(fd: RawFd) {
 
 /// Execute a full command line (segments with connectors).
 /// Returns the exit status of the last executed pipeline.
+///
+/// `entry`: if resuming a continuation, provides the resumed pipeline's exit status
+/// and the connector linking it to the first segment. `None` for normal execution.
 #[allow(clippy::too_many_arguments)]
 pub fn execute(
     cmdline: &CommandLine,
+    entry: Option<(i32, Connector)>,
     aliases: &AliasMap,
     job: &mut Option<Job>,
     orig_termios: &libc::termios,
@@ -32,14 +36,18 @@ pub fn execute(
     path_cache: &mut HashMap<String, PathBuf>,
     session_log: &mut String,
 ) -> i32 {
-    let mut last_status = 0i32;
+    let mut last_status = entry.map_or(0, |(s, _)| s);
 
     for (i, (pipeline, _connector)) in cmdline.segments.iter().enumerate() {
-        // Check the connector from the PREVIOUS segment
-        if i > 0
-            && let Some((_, Some(prev_conn))) = cmdline.segments.get(i - 1)
-        {
-            match prev_conn {
+        // Check connector: for i=0 use entry connector, else use previous segment's connector
+        let prev_conn = if i == 0 {
+            entry.map(|(_, c)| c)
+        } else {
+            cmdline.segments[i - 1].1
+        };
+
+        if let Some(conn) = prev_conn {
+            match conn {
                 Connector::And if last_status != 0 => continue,
                 Connector::Or if last_status == 0 => continue,
                 Connector::Semi | Connector::And | Connector::Or => {}
@@ -56,6 +64,22 @@ pub fn execute(
             path_cache,
             session_log,
         );
+
+        // If pipeline was suspended, set full command text and save continuation
+        if last_status == 148 {
+            if let Some(j) = job {
+                j.cmd = format_segments(&cmdline.segments);
+                if let Some(connector) = cmdline.segments[i].1
+                    && i + 1 < cmdline.segments.len()
+                {
+                    j.continuation = Some(Continuation {
+                        connector,
+                        segments: cmdline.segments[i + 1..].to_vec(),
+                    });
+                }
+            }
+            return 148;
+        }
     }
 
     last_status
@@ -246,6 +270,7 @@ fn execute_pipeline(
             pgid,
             cmd: cmd_text,
             termios: job_termios,
+            continuation: None, // filled by execute() if remaining segments exist
         });
         eprintln!("\nish: job suspended: {}", job.as_ref().unwrap().cmd);
         return 148; // 128 + SIGTSTP(20) = 148
@@ -434,6 +459,31 @@ fn apply_redirect(r: &Redirect) {
     }
 }
 
+/// Reconstruct display text from parsed segments: `sleep 2 && echo hi`.
+fn format_segments(segments: &[(parse::Pipeline, Option<Connector>)]) -> String {
+    let mut out = String::new();
+    for (i, (pipeline, connector)) in segments.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        for (j, pc) in pipeline.commands.iter().enumerate() {
+            if j > 0 {
+                out.push_str(if pc.pipe_stderr { " &| " } else { " | " });
+            }
+            let words: Vec<String> = pc.cmd.argv.iter().map(|a| parse::unescape(a)).collect();
+            out.push_str(&words.join(" "));
+        }
+        if let Some(conn) = connector {
+            match conn {
+                Connector::And => out.push_str(" &&"),
+                Connector::Or => out.push_str(" ||"),
+                Connector::Semi => out.push(';'),
+            }
+        }
+    }
+    out
+}
+
 /// Look up command in PATH cache, fall back to direct PATH scan.
 pub fn find_in_path(cmd: &str, cache: &HashMap<String, PathBuf>) -> String {
     // Absolute or relative path
@@ -493,15 +543,19 @@ pub fn rebuild_path_cache(cache: &mut HashMap<String, PathBuf>) {
 }
 
 /// Resume a suspended job in the foreground.
-pub fn resume_job(job: &mut Option<Job>) -> i32 {
+/// Returns (exit_status, optional_continuation).
+/// If the job had remaining segments from a compound command, the continuation
+/// is returned so the caller can execute it.
+pub fn resume_job(job: &mut Option<Job>) -> (i32, Option<Continuation>) {
     let j = match job.take() {
         Some(j) => j,
         None => {
             eprintln!("ish: fg: no suspended job");
-            return 1;
+            return (1, None);
         }
     };
 
+    let continuation = j.continuation;
     eprintln!("ish: resuming: {}", j.cmd);
 
     unsafe {
@@ -524,7 +578,8 @@ pub fn resume_job(job: &mut Option<Job>) -> i32 {
             break;
         }
         if libc::WIFSTOPPED(wstatus) {
-            // Stopped again — save terminal attrs before reclaiming
+            // Stopped again — save terminal attrs before reclaiming.
+            // Continuation stays on the job for next fg.
             let mut job_termios: libc::termios = unsafe { std::mem::zeroed() };
             unsafe { libc::tcgetattr(0, &mut job_termios) };
 
@@ -532,9 +587,13 @@ pub fn resume_job(job: &mut Option<Job>) -> i32 {
                 pgid: j.pgid,
                 cmd: j.cmd,
                 termios: job_termios,
+                continuation,
             });
             eprintln!("\nish: job suspended again");
-            break;
+
+            // Reclaim foreground
+            unsafe { libc::tcsetpgrp(0, libc::getpgrp()) };
+            return (148, None);
         }
     }
 
@@ -543,11 +602,13 @@ pub fn resume_job(job: &mut Option<Job>) -> i32 {
         libc::tcsetpgrp(0, libc::getpgrp());
     }
 
-    if libc::WIFEXITED(wstatus) {
+    let status = if libc::WIFEXITED(wstatus) {
         libc::WEXITSTATUS(wstatus)
     } else if libc::WIFSIGNALED(wstatus) {
         128 + libc::WTERMSIG(wstatus)
     } else {
-        148
-    }
+        1
+    };
+
+    (status, continuation)
 }

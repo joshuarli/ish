@@ -195,6 +195,15 @@ fn main() {
                                 continue;
                             }
 
+                            // Handle `fg` with continuation support
+                            if first == "fg" {
+                                let (status, cont) = exec::resume_job(&mut shell.job);
+                                shell.last_status = status;
+                                // Execute remaining segments from compound command
+                                run_continuation(&mut shell, cont);
+                                continue;
+                            }
+
                             // Handle `w`/`which`/`type` with alias awareness
                             if first == "w" || first == "which" || first == "type" {
                                 let args: Vec<String> =
@@ -224,6 +233,7 @@ fn main() {
 
                         shell.last_status = exec::execute(
                             &cmdline,
+                            None,
                             &shell.aliases,
                             &mut shell.job,
                             &shell.orig_termios,
@@ -857,6 +867,29 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
     } else {
         ReadResult::Exit
     }
+}
+
+/// Execute remaining segments from a compound command after job resume.
+/// E.g., `sleep 2 && echo hi` suspended during sleep — after fg, runs `echo hi`.
+fn run_continuation(shell: &mut Shell, cont: Option<ish::job::Continuation>) {
+    let Some(cont) = cont else { return };
+
+    let remaining = parse::CommandLine {
+        segments: cont.segments,
+    };
+    shell.last_status = exec::execute(
+        &remaining,
+        Some((shell.last_status, cont.connector)),
+        &shell.aliases,
+        &mut shell.job,
+        &shell.orig_termios,
+        &shell.home,
+        &mut shell.prev_dir,
+        &mut shell.path_cache,
+        &mut shell.session_log,
+    );
+    // If the continuation itself suspended, any further continuation is
+    // already saved on the job by execute(). Nothing more to do here.
 }
 
 fn base64_encode(input: &[u8]) -> String {

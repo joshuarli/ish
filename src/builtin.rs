@@ -59,7 +59,7 @@ pub fn run_special(
     match name {
         "cd" => builtin_cd(args, prev_dir, home, path_cache),
         "exit" => builtin_exit(args, job),
-        "fg" => exec::resume_job(job),
+        "fg" => exec::resume_job(job).0, // continuation handled in main.rs
         "set" => builtin_set(args, path_cache),
         "unset" => builtin_unset(args, path_cache),
         "alias" => {
