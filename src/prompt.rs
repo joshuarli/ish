@@ -17,6 +17,12 @@ enum GitCache {
     NoRepo { from: PathBuf },
 }
 
+impl Default for Prompt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Prompt {
     pub fn new() -> Self {
         let user = std::env::var("USER").unwrap_or_default();
@@ -176,8 +182,13 @@ pub fn shorten_pwd(pwd: &str, home: &str) -> String {
         } else if i < n_parts - 1 && !part.is_empty() {
             // Abbreviate: keep leading dot + 1 char
             let skip = if part.starts_with('.') { 1 } else { 0 };
-            let take = (skip + 1).min(part.len());
-            out.push_str(&part[..take]);
+            let take_chars = skip + 1;
+            let byte_end = part
+                .char_indices()
+                .nth(take_chars)
+                .map(|(i, _)| i)
+                .unwrap_or(part.len());
+            out.push_str(&part[..byte_end]);
         } else {
             out.push_str(part);
         }

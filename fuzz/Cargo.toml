@@ -1,0 +1,43 @@
+[package]
+name = "ish-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ish]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_parse"
+path = "fuzz_targets/fuzz_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_expand"
+path = "fuzz_targets/fuzz_expand.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_line"
+path = "fuzz_targets/fuzz_line.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_config"
+path = "fuzz_targets/fuzz_config.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_history"
+path = "fuzz_targets/fuzz_history.rs"
+doc = false

@@ -1,31 +1,14 @@
-mod alias;
-mod builtin;
-mod complete;
-mod config;
-mod error;
-mod exec;
-mod expand;
-mod history;
-mod input;
-mod job;
-mod line;
-mod ls;
-mod parse;
-mod prompt;
-mod render;
-mod signal;
-mod term;
-
-use alias::AliasMap;
-use complete::CompletionState;
-use history::FuzzyMatch;
-use input::{InputEvent, InputReader, Key, KeyEvent};
-use job::Job;
-use line::LineBuffer;
+use ish::alias::AliasMap;
+use ish::complete::CompletionState;
+use ish::history::FuzzyMatch;
+use ish::input::{InputEvent, InputReader, Key, KeyEvent};
+use ish::job::Job;
+use ish::line::LineBuffer;
+use ish::term::TermWriter;
+use ish::{complete, config, exec, history, parse, prompt, render, signal, term};
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
-use term::TermWriter;
 
 struct Shell {
     aliases: AliasMap,
@@ -617,7 +600,7 @@ fn navigate_history(
     up: bool,
 ) {
     let hist = &shell.history;
-    if hist.len() == 0 {
+    if hist.is_empty() {
         return;
     }
 

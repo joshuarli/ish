@@ -81,7 +81,7 @@ fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut 
 }
 
 /// Remove surrounding quotes from a value.
-fn unquote(s: &str) -> String {
+pub fn unquote(s: &str) -> String {
     if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
         s[1..s.len() - 1].to_string()
     } else {
@@ -90,7 +90,7 @@ fn unquote(s: &str) -> String {
 }
 
 /// Simple $VAR expansion for config values.
-fn expand_vars_simple(s: &str) -> String {
+pub fn expand_vars_simple(s: &str) -> String {
     let mut result = String::new();
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -116,7 +116,7 @@ fn expand_vars_simple(s: &str) -> String {
 }
 
 /// Simple word splitting respecting quotes.
-fn shell_words(s: &str) -> Vec<String> {
+pub fn shell_words(s: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_single = false;

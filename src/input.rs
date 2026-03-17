@@ -318,7 +318,7 @@ impl InputReader {
     }
 }
 
-fn modifier_from_param(param: u32) -> Modifiers {
+pub fn modifier_from_param(param: u32) -> Modifiers {
     let bits = param.saturating_sub(1);
     Modifiers {
         ctrl: bits & 4 != 0,

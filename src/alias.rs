@@ -5,6 +5,12 @@ pub struct AliasMap {
     map: HashMap<String, Vec<String>>,
 }
 
+impl Default for AliasMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AliasMap {
     pub fn new() -> Self {
         Self {

@@ -6,6 +6,13 @@ edition = "2024"
 [dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "bench"
+harness = false
+
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"

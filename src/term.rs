@@ -74,6 +74,12 @@ pub struct TermWriter {
     buf: Vec<u8>,
 }
 
+impl Default for TermWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TermWriter {
     pub fn new() -> Self {
         Self {

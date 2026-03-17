@@ -41,6 +41,15 @@ impl History {
     }
 
     /// Add entry. Deduplicates (removes prior occurrence).
+    /// Create from pre-existing entries (for testing).
+    pub fn from_entries(entries: Vec<String>) -> Self {
+        Self {
+            entries,
+            path: PathBuf::from("/dev/null"),
+        }
+    }
+
+    /// Add entry. Deduplicates (removes prior occurrence).
     pub fn add(&mut self, line: &str) {
         let line = line.trim();
         if line.is_empty() {
@@ -61,6 +70,10 @@ impl History {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Prefix search: find entries that start with `prefix`, starting from
@@ -126,7 +139,7 @@ pub struct FuzzyMatch {
 
 /// Check if `query` chars appear in `text` in order (case-insensitive).
 /// Returns character indices in `text` that matched.
-fn subsequence_match(query: &[char], text: &str) -> Option<Vec<usize>> {
+pub fn subsequence_match(query: &[char], text: &str) -> Option<Vec<usize>> {
     let text_chars: Vec<char> = text.chars().collect();
     let mut positions = Vec::with_capacity(query.len());
     let mut qi = 0;

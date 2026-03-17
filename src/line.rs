@@ -5,6 +5,12 @@ pub struct LineBuffer {
     kill_ring: String,
 }
 
+impl Default for LineBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LineBuffer {
     pub fn new() -> Self {
         Self {
