@@ -284,8 +284,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                 }
                 // Re-render
                 if let Mode::Normal = &mode {
-                    let p = current_prompt(&prompt_str, &full_input);
-                    let pdl = current_prompt_len(prompt_display_len, &full_input);
+                    let (p, pdl) = active_prompt(&prompt_str, prompt_display_len, &full_input);
                     render::render_line(&mut tw, p, pdl, &line, shell.cols);
                 }
                 let _ = tw.flush_to_stdout();
@@ -373,15 +372,15 @@ fn read_line(shell: &mut Shell) -> ReadResult {
 
                         match &mode {
                             Mode::Normal => {
-                                let p = current_prompt(&prompt_str, &full_input);
-                                let pdl = current_prompt_len(prompt_display_len, &full_input);
+                                let (p, pdl) =
+                                    active_prompt(&prompt_str, prompt_display_len, &full_input);
                                 render::render_line(&mut tw, p, pdl, &line, shell.cols);
                             }
                             Mode::Completion(state) => {
-                                let p = current_prompt(&prompt_str, &full_input);
-                                let pdl = current_prompt_len(prompt_display_len, &full_input);
+                                let (p, pdl) =
+                                    active_prompt(&prompt_str, prompt_display_len, &full_input);
                                 let info = render::render_line(&mut tw, p, pdl, &line, shell.cols);
-                                render::render_completions(&mut tw, state, &info);
+                                render::render_completions(&mut tw, state, &info, true);
                             }
                             Mode::HistorySearch { .. } => {}
                         }
@@ -389,13 +388,12 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                     }
 
                     Mode::Completion(state) => {
-                        let p = current_prompt(&prompt_str, &full_input);
-                        let pdl = current_prompt_len(prompt_display_len, &full_input);
+                        let (p, pdl) = active_prompt(&prompt_str, prompt_display_len, &full_input);
                         match handle_completion_key(key, state, &mut line) {
                             CompAction::Navigate => {
                                 // Cursor is on prompt line — repaint grid in-place
                                 let info = render::render_line(&mut tw, p, pdl, &line, shell.cols);
-                                render::repaint_completions(&mut tw, state, &info);
+                                render::render_completions(&mut tw, state, &info, false);
                                 let _ = tw.flush_to_stdout();
                                 continue;
                             }
@@ -410,7 +408,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         // render_line clears old grid, render_completions draws new
                                         let info =
                                             render::render_line(&mut tw, p, pdl, &line, shell.cols);
-                                        render::render_completions(&mut tw, &cs, &info);
+                                        render::render_completions(&mut tw, &cs, &info, true);
                                         mode = Mode::Completion(cs);
                                         let _ = tw.flush_to_stdout();
                                         continue;
@@ -480,19 +478,15 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     }
 }
 
-fn current_prompt<'a>(prompt_str: &'a str, full_input: &str) -> &'a str {
+fn active_prompt<'a>(
+    prompt_str: &'a str,
+    prompt_display_len: usize,
+    full_input: &str,
+) -> (&'a str, usize) {
     if full_input.is_empty() {
-        prompt_str
+        (prompt_str, prompt_display_len)
     } else {
-        "  "
-    }
-}
-
-fn current_prompt_len(prompt_display_len: usize, full_input: &str) -> usize {
-    if full_input.is_empty() {
-        prompt_display_len
-    } else {
-        2
+        ("  ", 2)
     }
 }
 
@@ -799,14 +793,14 @@ fn handle_history_search_key(
             }
         }
         Key::Up | Key::Char('p') if key.key == Key::Up || key.mods.ctrl => {
-            if *selected + 1 < matches.len() {
-                *selected += 1;
+            if *selected > 0 {
+                *selected -= 1;
             }
             HistAction::Continue
         }
         Key::Down | Key::Char('n') if key.key == Key::Down || key.mods.ctrl => {
-            if *selected > 0 {
-                *selected -= 1;
+            if *selected + 1 < matches.len() {
+                *selected += 1;
             }
             HistAction::Continue
         }

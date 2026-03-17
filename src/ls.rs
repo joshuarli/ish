@@ -176,7 +176,6 @@ fn sanitize_name(name: &str) -> String {
 fn format_mode(mode: u32) -> String {
     let mut s = String::with_capacity(10);
 
-    // File type
     s.push(match mode & libc::S_IFMT as u32 {
         m if m == libc::S_IFDIR as u32 => 'd',
         m if m == libc::S_IFLNK as u32 => 'l',
@@ -187,74 +186,44 @@ fn format_mode(mode: u32) -> String {
         _ => '-',
     });
 
-    // User
-    s.push(if mode & libc::S_IRUSR as u32 != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    s.push(if mode & libc::S_IWUSR as u32 != 0 {
-        'w'
-    } else {
-        '-'
-    });
-    s.push(if mode & libc::S_ISUID as u32 != 0 {
-        if mode & libc::S_IXUSR as u32 != 0 {
-            's'
+    // (read, write, exec, setbit, set_char, SET_CHAR)
+    const PERMS: [(u32, u32, u32, u32, char, char); 3] = [
+        (
+            libc::S_IRUSR as u32,
+            libc::S_IWUSR as u32,
+            libc::S_IXUSR as u32,
+            libc::S_ISUID as u32,
+            's',
+            'S',
+        ),
+        (
+            libc::S_IRGRP as u32,
+            libc::S_IWGRP as u32,
+            libc::S_IXGRP as u32,
+            libc::S_ISGID as u32,
+            's',
+            'S',
+        ),
+        (
+            libc::S_IROTH as u32,
+            libc::S_IWOTH as u32,
+            libc::S_IXOTH as u32,
+            libc::S_ISVTX as u32,
+            't',
+            'T',
+        ),
+    ];
+    for &(r, w, x, set, sc, tc) in &PERMS {
+        s.push(if mode & r != 0 { 'r' } else { '-' });
+        s.push(if mode & w != 0 { 'w' } else { '-' });
+        s.push(if mode & set != 0 {
+            if mode & x != 0 { sc } else { tc }
+        } else if mode & x != 0 {
+            'x'
         } else {
-            'S'
-        }
-    } else if mode & libc::S_IXUSR as u32 != 0 {
-        'x'
-    } else {
-        '-'
-    });
-
-    // Group
-    s.push(if mode & libc::S_IRGRP as u32 != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    s.push(if mode & libc::S_IWGRP as u32 != 0 {
-        'w'
-    } else {
-        '-'
-    });
-    s.push(if mode & libc::S_ISGID as u32 != 0 {
-        if mode & libc::S_IXGRP as u32 != 0 {
-            's'
-        } else {
-            'S'
-        }
-    } else if mode & libc::S_IXGRP as u32 != 0 {
-        'x'
-    } else {
-        '-'
-    });
-
-    // Other
-    s.push(if mode & libc::S_IROTH as u32 != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    s.push(if mode & libc::S_IWOTH as u32 != 0 {
-        'w'
-    } else {
-        '-'
-    });
-    s.push(if mode & libc::S_ISVTX as u32 != 0 {
-        if mode & libc::S_IXOTH as u32 != 0 {
-            't'
-        } else {
-            'T'
-        }
-    } else if mode & libc::S_IXOTH as u32 != 0 {
-        'x'
-    } else {
-        '-'
-    });
+            '-'
+        });
+    }
 
     s
 }
@@ -278,21 +247,10 @@ fn format_time(mtime: i64) -> String {
         libc::localtime_r(&mtime, &mut tm);
     }
 
-    let month = match tm.tm_mon {
-        0 => "Jan",
-        1 => "Feb",
-        2 => "Mar",
-        3 => "Apr",
-        4 => "May",
-        5 => "Jun",
-        6 => "Jul",
-        7 => "Aug",
-        8 => "Sep",
-        9 => "Oct",
-        10 => "Nov",
-        11 => "Dec",
-        _ => "???",
-    };
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS.get(tm.tm_mon as usize).copied().unwrap_or("???");
 
     let six_months = 180 * 24 * 60 * 60;
     if (now - mtime).unsigned_abs() < six_months as u64 {

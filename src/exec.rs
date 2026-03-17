@@ -10,6 +10,14 @@ use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
+fn close_fd(fd: RawFd) {
+    if fd >= 0 {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
 /// Execute a full command line (segments with connectors).
 /// Returns the exit status of the last executed pipeline.
 #[allow(clippy::too_many_arguments)]
@@ -190,16 +198,8 @@ fn execute_pipeline(
             libc::setpgid(pid, pgid);
         }
 
-        if prev_read != -1 {
-            unsafe {
-                libc::close(prev_read);
-            }
-        }
-        if pipe_w != -1 {
-            unsafe {
-                libc::close(pipe_w);
-            }
-        }
+        close_fd(prev_read);
+        close_fd(pipe_w);
         prev_read = pipe_r;
         pids.push(pid);
     }

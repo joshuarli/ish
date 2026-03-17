@@ -99,6 +99,7 @@ impl Prompt {
     }
 
     fn git_branch(&mut self, cwd: &Path) -> Option<String> {
+        // Check cache first
         match &self.git {
             GitCache::Repo { root, head } if cwd.starts_with(root) => {
                 return read_head(head);
@@ -106,32 +107,19 @@ impl Prompt {
             GitCache::NoRepo { from } if from.starts_with(cwd) => {
                 return None;
             }
-            GitCache::NoRepo { from } if cwd.starts_with(from) => {
-                let ceiling = from.clone();
-                match find_git_dir(cwd, Some(&ceiling)) {
-                    Some(git_dir) => {
-                        let root = git_dir.parent().unwrap_or(cwd).to_path_buf();
-                        let head_path = git_dir.join("HEAD");
-                        let branch = read_head(&head_path);
-                        self.git = GitCache::Repo {
-                            root,
-                            head: head_path,
-                        };
-                        return branch;
-                    }
-                    None => {
-                        self.git = GitCache::NoRepo {
-                            from: cwd.to_path_buf(),
-                        };
-                        return None;
-                    }
-                }
-            }
             _ => {}
         }
 
-        // Full walk
-        match find_git_dir(cwd, None) {
+        // Walk up from cwd, using cached NoRepo as ceiling if applicable
+        let ceiling = match &self.git {
+            GitCache::NoRepo { from } if cwd.starts_with(from) => Some(from.clone()),
+            _ => None,
+        };
+        self.resolve_git(cwd, ceiling.as_ref())
+    }
+
+    fn resolve_git(&mut self, cwd: &Path, ceiling: Option<&PathBuf>) -> Option<String> {
+        match find_git_dir(cwd, ceiling) {
             Some(git_dir) => {
                 let root = git_dir.parent().unwrap_or(cwd).to_path_buf();
                 let head_path = git_dir.join("HEAD");

@@ -158,6 +158,10 @@ fn expand_command_subst(
             let output = exec_subst(&cmd)?;
             result.push_str(output.trim_end_matches('\n'));
             i = end + 1;
+        } else if bytes[i] == b'$' {
+            // Bare $ (not followed by '(') — pass through
+            result.push('$');
+            i += 1;
         } else {
             // Copy non-special content in bulk
             let start = i;

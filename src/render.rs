@@ -53,48 +53,32 @@ pub fn render_line(
     }
 }
 
-/// Render the completion grid below the current line (initial render).
-/// Cursor should be on the prompt line (as left by render_line).
-/// Leaves cursor back on the prompt line at cursor position.
-pub fn render_completions(tw: &mut TermWriter, state: &CompletionState, info: &PromptInfo) {
-    let visible_rows = grid_visible_rows(state);
-    if visible_rows == 0 {
-        return;
-    }
-    tw.hide_cursor();
-
-    // Move from cursor to bottom of prompt area
-    let rows_below = info.total_rows - 1 - info.cursor_row;
-    if rows_below > 0 {
-        tw.move_cursor_down(rows_below);
-    }
-
-    // Create new line for grid
-    tw.write_str("\n");
-    draw_grid(tw, state, visible_rows);
-
-    // Move back to cursor position
-    let up = info.total_rows + visible_rows as u16 - 1 - info.cursor_row;
-    tw.move_cursor_up(up);
-    tw.carriage_return();
-    if info.cursor_col > 0 {
-        tw.move_cursor_right(info.cursor_col);
-    }
-    tw.show_cursor();
-}
-
-/// Repaint the completion grid in-place (navigation/refilter).
+/// Render the completion grid below the current line.
+/// `initial`: true for first render (adds newline), false for repaint.
 /// Cursor should be on the prompt line. Leaves cursor on the prompt line.
-pub fn repaint_completions(tw: &mut TermWriter, state: &CompletionState, info: &PromptInfo) {
+pub fn render_completions(
+    tw: &mut TermWriter,
+    state: &CompletionState,
+    info: &PromptInfo,
+    initial: bool,
+) {
     let visible_rows = grid_visible_rows(state);
     if visible_rows == 0 {
         return;
     }
     tw.hide_cursor();
 
-    // Move from cursor to first grid row (one row below last prompt row)
-    let down = info.total_rows - info.cursor_row;
-    tw.move_cursor_down(down);
+    if initial {
+        // Move to bottom of prompt area, then create new line
+        let rows_below = info.total_rows - 1 - info.cursor_row;
+        if rows_below > 0 {
+            tw.move_cursor_down(rows_below);
+        }
+        tw.write_str("\n");
+    } else {
+        // Move to first grid row (one below last prompt row)
+        tw.move_cursor_down(info.total_rows - info.cursor_row);
+    }
 
     draw_grid(tw, state, visible_rows);
 
