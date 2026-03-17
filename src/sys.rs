@@ -86,6 +86,67 @@ pub fn close_fds_from(min_fd: RawFd) {
     }
 }
 
+/// Execute a command, searching PATH if needed. Does not return on success.
+///
+/// Linux: uses execveat() — iterates PATH directories by fd, no path string
+/// construction needed. Falls through to error if all dirs fail.
+/// macOS: uses execvp() which handles PATH search internally.
+///
+/// # Safety
+/// Must be called in a forked child process. `argv` must be a valid
+/// null-terminated array of C string pointers.
+pub unsafe fn exec_command(cmd: &std::ffi::CStr, argv: *const *const libc::c_char) {
+    #[cfg(target_os = "linux")]
+    {
+        // Absolute or relative path — exec directly
+        if cmd.to_bytes().contains(&b'/') {
+            libc::execve(cmd.as_ptr(), argv, get_environ());
+            return;
+        }
+
+        // Search PATH using execveat: open each dir as fd, try exec relative to it.
+        // No path string allocation — the kernel resolves cmd within the directory.
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in path_var.split(':') {
+                if dir.is_empty() {
+                    continue;
+                }
+                if let Ok(c_dir) = std::ffi::CString::new(dir) {
+                    let dirfd = libc::openat(
+                        libc::AT_FDCWD,
+                        c_dir.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    );
+                    if dirfd >= 0 {
+                        libc::syscall(
+                            libc::SYS_execveat,
+                            dirfd,
+                            cmd.as_ptr(),
+                            argv,
+                            get_environ(),
+                            0,
+                        );
+                        // execveat returned — exec failed, try next dir
+                        libc::close(dirfd);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::execvp(cmd.as_ptr(), argv);
+    }
+}
+
+unsafe fn get_environ() -> *const *const libc::c_char {
+    unsafe extern "C" {
+        static environ: *const *mut libc::c_char;
+    }
+    unsafe { environ as *const *const libc::c_char }
+}
+
 /// Spawn a child for command substitution using posix_spawn.
 /// Avoids fork's page-table copy — on Linux, posix_spawn uses
 /// clone(CLONE_VFORK|CLONE_VM) internally.
@@ -134,10 +195,6 @@ pub fn spawn_command_subst(cmd: &str) -> Result<(libc::pid_t, RawFd), std::io::E
         std::ptr::null_mut(),
     ];
 
-    unsafe extern "C" {
-        static environ: *const *mut libc::c_char;
-    }
-
     let mut pid: libc::pid_t = 0;
     let rc = unsafe {
         libc::posix_spawnp(
@@ -146,7 +203,7 @@ pub fn spawn_command_subst(cmd: &str) -> Result<(libc::pid_t, RawFd), std::io::E
             &file_actions,
             &attrs,
             argv.as_ptr(),
-            environ,
+            get_environ() as *const *mut libc::c_char,
         )
     };
 

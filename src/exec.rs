@@ -186,7 +186,6 @@ fn execute_pipeline(
                 argv,
                 redirects,
                 orig_termios,
-                path_cache,
             );
             // child_setup does not return
         }
@@ -234,19 +233,27 @@ fn execute_pipeline(
         }
     }
 
-    // Reclaim foreground
-    unsafe {
-        libc::tcsetpgrp(0, libc::getpgrp());
-    }
-
     if stopped {
+        // Save the job's terminal attributes BEFORE reclaiming foreground.
+        // This preserves settings from programs like vim/less that modify termios.
+        let mut job_termios: libc::termios = unsafe { std::mem::zeroed() };
+        unsafe { libc::tcgetattr(0, &mut job_termios) };
+
+        // Reclaim foreground
+        unsafe { libc::tcsetpgrp(0, libc::getpgrp()) };
+
         *job = Some(Job {
             pgid,
             cmd: cmd_text,
+            termios: job_termios,
         });
-        // Notify user
         eprintln!("\nish: job suspended: {}", job.as_ref().unwrap().cmd);
         return 148; // 128 + SIGTSTP(20) = 148
+    }
+
+    // Reclaim foreground (normal exit)
+    unsafe {
+        libc::tcsetpgrp(0, libc::getpgrp());
     }
 
     if libc::WIFEXITED(last_status) {
@@ -300,7 +307,6 @@ fn child_setup(
     argv: &[String],
     redirects: &[Redirect],
     orig_termios: &libc::termios,
-    path_cache: &HashMap<String, PathBuf>,
 ) -> ! {
     unsafe {
         // Process group
@@ -345,9 +351,9 @@ fn child_setup(
             libc::_exit(status);
         }
 
-        // Exec
-        let path = find_in_path(&argv[0], path_cache);
-        let c_path = match CString::new(path.as_str()) {
+        // Exec — on Linux uses execveat (no path string construction),
+        // on macOS uses execvp.
+        let c_cmd = match CString::new(argv[0].as_str()) {
             Ok(c) => c,
             Err(_) => {
                 eprintln!("ish: invalid command name");
@@ -364,7 +370,7 @@ fn child_setup(
             .chain(std::iter::once(std::ptr::null()))
             .collect();
 
-        libc::execvp(c_path.as_ptr(), c_argv.as_ptr());
+        sys::exec_command(&c_cmd, c_argv.as_ptr());
 
         // exec failed
         let err = std::io::Error::last_os_error();
@@ -499,9 +505,11 @@ pub fn resume_job(job: &mut Option<Job>) -> i32 {
     eprintln!("ish: resuming: {}", j.cmd);
 
     unsafe {
-        // Give the job the foreground
+        // Give the job the foreground and restore its terminal settings.
+        // This is critical for programs like vim/less that set raw mode —
+        // without this, they'd resume with the shell's terminal settings.
         libc::tcsetpgrp(0, j.pgid);
-        // Send SIGCONT
+        libc::tcsetattr(0, libc::TCSADRAIN, &j.termios);
         libc::killpg(j.pgid, libc::SIGCONT);
     }
 
@@ -516,10 +524,14 @@ pub fn resume_job(job: &mut Option<Job>) -> i32 {
             break;
         }
         if libc::WIFSTOPPED(wstatus) {
-            // Stopped again
+            // Stopped again — save terminal attrs before reclaiming
+            let mut job_termios: libc::termios = unsafe { std::mem::zeroed() };
+            unsafe { libc::tcgetattr(0, &mut job_termios) };
+
             *job = Some(Job {
                 pgid: j.pgid,
                 cmd: j.cmd,
+                termios: job_termios,
             });
             eprintln!("\nish: job suspended again");
             break;
