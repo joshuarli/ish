@@ -43,7 +43,8 @@ impl RawMode {
 impl Drop for RawMode {
     fn drop(&mut self) {
         unsafe {
-            libc::tcsetattr(STDIN_FD, libc::TCSAFLUSH, &self.orig);
+            // Use TCSANOW to avoid blocking if output hasn't drained (e.g. PTY).
+            libc::tcsetattr(STDIN_FD, libc::TCSANOW, &self.orig);
         }
     }
 }
