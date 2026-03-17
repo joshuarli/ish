@@ -14,4 +14,5 @@ pub mod parse;
 pub mod prompt;
 pub mod render;
 pub mod signal;
+pub mod sys;
 pub mod term;

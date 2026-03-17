@@ -1,3 +1,4 @@
+use crate::sys;
 use std::os::fd::RawFd;
 
 static mut PIPE_WRITE: RawFd = -1;
@@ -6,20 +7,12 @@ static mut PIPE_READ: RawFd = -1;
 /// Initialize signal handling: create self-pipe, install handlers.
 /// Returns the read-end fd for polling.
 pub fn init() -> RawFd {
-    let mut fds = [0i32; 2];
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() failed");
-
-    for &fd in &fds {
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-    }
+    let (read_fd, write_fd) =
+        sys::pipe_nonblock_cloexec().expect("pipe() failed for signal self-pipe");
 
     unsafe {
-        PIPE_READ = fds[0];
-        PIPE_WRITE = fds[1];
+        PIPE_READ = read_fd;
+        PIPE_WRITE = write_fd;
     }
 
     install_handler(libc::SIGCHLD);

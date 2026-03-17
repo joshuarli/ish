@@ -5,6 +5,7 @@ use crate::expand;
 use crate::job::Job;
 use crate::parse::{self, CommandLine, Connector, PipedCommand, Redirect, RedirectKind};
 use crate::signal;
+use crate::sys;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::RawFd;
@@ -154,14 +155,15 @@ fn execute_pipeline(
     for (i, (argv, redirects, pipe_stderr)) in expanded.iter().enumerate() {
         let is_last = i == n - 1;
 
-        // Create pipe unless last command
+        // Create pipe unless last command (O_CLOEXEC: auto-closed on exec)
         let (pipe_r, pipe_w) = if !is_last {
-            let mut fds = [0i32; 2];
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-                eprintln!("ish: pipe() failed");
-                return 1;
+            match sys::pipe_cloexec() {
+                Ok(fds) => fds,
+                Err(_) => {
+                    eprintln!("ish: pipe() failed");
+                    return 1;
+                }
             }
-            (fds[0], fds[1])
         } else {
             (-1, -1)
         };
@@ -257,51 +259,11 @@ fn execute_pipeline(
 }
 
 /// Execute a command string and capture its stdout (for command substitution).
-fn capture_command_output(cmd: &str, orig_termios: &libc::termios) -> Result<String, Error> {
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(Error::msg("pipe() failed for command substitution"));
-    }
-    let (pipe_r, pipe_w) = (fds[0], fds[1]);
-
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        unsafe {
-            libc::close(pipe_r);
-            libc::close(pipe_w);
-        }
-        return Err(Error::msg("fork() failed for command substitution"));
-    }
-
-    if pid == 0 {
-        // Child: redirect stdout to pipe, exec via /bin/sh
-        unsafe {
-            libc::close(pipe_r);
-            libc::dup2(pipe_w, 1);
-            libc::close(pipe_w);
-            // Restore terminal
-            libc::tcsetattr(0, libc::TCSANOW, orig_termios);
-            signal::restore_defaults();
-        }
-        let sh = CString::new("/bin/sh").unwrap();
-        let c_flag = CString::new("-c").unwrap();
-        let c_cmd = CString::new(cmd).unwrap();
-        let argv = [
-            sh.as_ptr(),
-            c_flag.as_ptr(),
-            c_cmd.as_ptr(),
-            std::ptr::null(),
-        ];
-        unsafe {
-            libc::execvp(sh.as_ptr(), argv.as_ptr());
-            libc::_exit(127);
-        }
-    }
-
-    // Parent
-    unsafe {
-        libc::close(pipe_w);
-    }
+/// Uses posix_spawn to avoid fork's page-table copy — on Linux this uses
+/// clone(CLONE_VFORK|CLONE_VM) internally.
+fn capture_command_output(cmd: &str, _orig_termios: &libc::termios) -> Result<String, Error> {
+    let (pid, pipe_r) = sys::spawn_command_subst(cmd)
+        .map_err(|e| Error::msg(format!("command substitution: {e}")))?;
 
     let mut output = String::new();
     let mut buf = [0u8; 4096];
@@ -371,6 +333,11 @@ fn child_setup(
         for r in redirects {
             apply_redirect(r);
         }
+
+        // Close any inherited fds above stderr (defense-in-depth).
+        // Our pipes are O_CLOEXEC so exec would close them, but builtins
+        // call _exit() not exec, and this catches any other leaked fds.
+        sys::close_fds_from(3);
 
         // Check for output-only builtins in pipeline
         if builtin::is_builtin(&argv[0]) {
