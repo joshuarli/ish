@@ -165,6 +165,23 @@ pub fn complete_path(partial: &str, dirs_only: bool) -> Vec<CompEntry> {
     entries
 }
 
+/// Generate environment variable completions for a `$` prefix.
+/// `partial` should include the `$` (e.g., `$PA`).
+pub fn complete_env(partial: &str) -> Vec<CompEntry> {
+    let prefix = partial.strip_prefix('$').unwrap_or(partial);
+    let mut entries: Vec<CompEntry> = std::env::vars()
+        .filter(|(key, _)| key.starts_with(prefix))
+        .map(|(key, _)| CompEntry {
+            name: key,
+            is_dir: false,
+            is_link: false,
+            is_exec: false,
+        })
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
 /// Split "path/to/pref" into ("path/to/", "pref").
 fn split_path(partial: &str) -> (String, String) {
     match partial.rfind('/') {

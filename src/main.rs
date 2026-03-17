@@ -697,6 +697,23 @@ fn start_completion(line: &LineBuffer, term_cols: u16, home: &str) -> Option<Com
     let word_start = before_cursor.rfind(' ').map(|i| i + 1).unwrap_or(0);
     let partial = &before_cursor[word_start..];
 
+    // Environment variable completion: $FOO<tab>
+    if partial.starts_with('$') {
+        let entries = complete::complete_env(partial);
+        if entries.is_empty() {
+            return None;
+        }
+        let (cols, rows) = complete::compute_grid(&entries, term_cols);
+        return Some(CompletionState {
+            entries,
+            selected: 0,
+            cols,
+            rows,
+            scroll: 0,
+            dir_prefix: "$".to_string(),
+        });
+    }
+
     // Detect if first word is cd → complete only directories
     let first_word = text.split_whitespace().next().unwrap_or("");
     let dirs_only = first_word == "cd" && word_start > 0;

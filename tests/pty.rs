@@ -1279,3 +1279,46 @@ fn denv_no_error_without_denv() {
         "shell should work without denv: {text:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Environment variable completion tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn env_var_completion_single() {
+    let sh = PtyShell::spawn();
+    // Set a unique var, then complete it
+    sh.run_command("set ISH_COMP_TEST_XYZ hello");
+    sh.type_str("echo $ISH_COMP_TEST_X");
+    sh.tab();
+    // Single match — should auto-complete to ISH_COMP_TEST_XYZ
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    sh.enter();
+    let out = sh.wait_for_prompt(3000);
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("hello"),
+        "expected env var completion: {text:?}"
+    );
+}
+
+#[test]
+fn env_var_completion_grid() {
+    let sh = PtyShell::spawn();
+    // Set multiple vars with same prefix
+    sh.run_command("set ISH_COMP_GR_A one");
+    sh.run_command("set ISH_COMP_GR_B two");
+    sh.run_command("set ISH_COMP_GR_C three");
+    sh.type_str("echo $ISH_COMP_GR");
+    sh.tab();
+    // Multiple matches — grid should appear
+    let out = sh.read_timeout(500);
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("ISH_COMP_GR_A") || text.contains("ISH_COMP_GR_B"),
+        "expected env var grid: {text:?}"
+    );
+    // Escape to dismiss
+    sh.escape();
+    sh.ctrl_u();
+}
