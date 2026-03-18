@@ -492,6 +492,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     full_input.push(' ');
                                     full_input.push_str(&text);
                                 }
+                                // Strip trailing \ for backslash-newline continuation
+                                if parse::ends_with_line_continuation(&full_input) {
+                                    let end = full_input.trim_end().len();
+                                    full_input.truncate(end - 1);
+                                }
                                 line = LineBuffer::new();
                                 history_idx = None;
                                 tw.write_str("\r\n");

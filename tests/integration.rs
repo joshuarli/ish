@@ -202,12 +202,72 @@ fn continuation_detection_comprehensive() {
     assert!(parse::needs_continuation("echo 'unclosed"));
     assert!(parse::needs_continuation(r#"echo "unclosed"#));
 
+    // Trailing backslash = line continuation
+    assert!(parse::needs_continuation("echo \\"));
+    assert!(parse::needs_continuation("python3 script.py \\"));
+    assert!(parse::needs_continuation("cmd --flag \\"));
+
     // Does NOT need continuation
     assert!(!parse::needs_continuation("ls -la"));
     assert!(!parse::needs_continuation("a && b"));
     assert!(!parse::needs_continuation("echo 'closed'"));
     assert!(!parse::needs_continuation(""));
     assert!(!parse::needs_continuation("   "));
+    // Escaped backslash (\\) is a literal, not a continuation
+    assert!(!parse::needs_continuation("echo \\\\"));
+    assert!(!parse::needs_continuation("path\\\\"));
+}
+
+#[test]
+fn backslash_line_continuation() {
+    // ends_with_line_continuation: unquoted trailing backslash only
+    assert!(parse::ends_with_line_continuation("echo \\"));
+    assert!(parse::ends_with_line_continuation("cmd --flag \\"));
+    assert!(parse::ends_with_line_continuation("  \\"));
+    // Escaped backslash at end — NOT a continuation
+    assert!(!parse::ends_with_line_continuation("echo \\\\"));
+    // Backslash inside double quote — NOT a line continuation
+    assert!(!parse::ends_with_line_continuation(r#"echo "hello \"#));
+    // Backslash inside single quote — NOT a line continuation
+    assert!(!parse::ends_with_line_continuation("echo 'hello \\"));
+    // No backslash at all
+    assert!(!parse::ends_with_line_continuation("ls -la"));
+    assert!(!parse::ends_with_line_continuation(""));
+    assert!(!parse::ends_with_line_continuation("   "));
+}
+
+#[test]
+fn backslash_continuation_joined_parses() {
+    // Simulate what the shell does: two lines joined after stripping the
+    // trailing backslash, separated by a space.
+    let line1 = "python3 script.py"; // trailing \ already stripped
+    let line2 = "--coverage-db /tmp/x"; // trailing \ already stripped
+    let line3 = "--output /tmp/out.txt";
+    let combined = format!("{line1} {line2} {line3}");
+    let cmd = parse::parse(&combined).unwrap();
+    let argv = &cmd.segments[0].0.commands[0].cmd.argv;
+    assert_eq!(
+        argv.iter().map(|w| parse::unescape(w)).collect::<Vec<_>>(),
+        [
+            "python3",
+            "script.py",
+            "--coverage-db",
+            "/tmp/x",
+            "--output",
+            "/tmp/out.txt"
+        ],
+    );
+}
+
+#[test]
+fn trailing_backslash_does_not_hang_tokenizer() {
+    // Defensive: a lone trailing backslash must not infinite-loop the parser.
+    // (Before the fix, scan_word spun on this input.)
+    let cmd = parse::parse("echo \\").unwrap();
+    let argv = &cmd.segments[0].0.commands[0].cmd.argv;
+    assert_eq!(argv.len(), 2);
+    assert_eq!(parse::unescape(&argv[0]), "echo");
+    assert_eq!(parse::unescape(&argv[1]), "\\");
 }
 
 // ---------------------------------------------------------------------------

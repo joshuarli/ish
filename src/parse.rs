@@ -233,6 +233,12 @@ fn scan_word(input: &str, bytes: &[u8], start: usize) -> Result<(String, usize),
                     i += c.len_utf8();
                 }
             }
+            b'\\' => {
+                // Trailing backslash with nothing after it — treat as literal
+                word.push(LITERAL);
+                word.push('\\');
+                i += 1;
+            }
             _ => {
                 // Copy non-special bytes in bulk
                 let start = i;
@@ -416,9 +422,37 @@ pub fn needs_continuation(input: &str) -> bool {
     if in_single || in_double {
         return true;
     }
+    // Trailing unquoted backslash = line continuation (\<newline>)
+    if escape {
+        return true;
+    }
 
     // Check for trailing operator
     trimmed.ends_with('|') || trimmed.ends_with("&&") || trimmed.ends_with("||")
+}
+
+/// Returns true if input ends with a trailing unquoted backslash (line continuation).
+pub fn ends_with_line_continuation(input: &str) -> bool {
+    let trimmed = input.trim_end();
+    if !trimmed.ends_with('\\') {
+        return false;
+    }
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    for &b in trimmed.as_bytes() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match b {
+            b'\\' if !in_single => escape = true,
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            _ => {}
+        }
+    }
+    escape && !in_single && !in_double
 }
 
 /// Remove the LITERAL markers, producing a clean string.
@@ -478,5 +512,32 @@ mod tests {
         assert!(needs_continuation("echo 'unclosed"));
         assert!(!needs_continuation("ls -la"));
         assert!(!needs_continuation("a && b"));
+        // Trailing backslash = line continuation
+        assert!(needs_continuation("echo \\"));
+        assert!(needs_continuation("python3 script.py \\"));
+        // Escaped backslash (\\) is NOT continuation
+        assert!(!needs_continuation("echo \\\\"));
+    }
+
+    #[test]
+    fn line_continuation_detection() {
+        assert!(ends_with_line_continuation("echo \\"));
+        assert!(ends_with_line_continuation("cmd --flag \\"));
+        // Escaped backslash — not a continuation
+        assert!(!ends_with_line_continuation("echo \\\\"));
+        // Backslash inside double quote — not a line continuation
+        assert!(!ends_with_line_continuation("echo \"hello \\"));
+        // Backslash inside single quote — not a line continuation
+        assert!(!ends_with_line_continuation("echo 'hello \\"));
+        assert!(!ends_with_line_continuation("ls -la"));
+        assert!(!ends_with_line_continuation(""));
+    }
+
+    #[test]
+    fn trailing_backslash_tokenizes() {
+        // Trailing backslash should not hang the tokenizer
+        let cmd = parse("echo \\").unwrap();
+        let argv = &cmd.segments[0].0.commands[0].cmd.argv;
+        assert_eq!(argv.len(), 2);
     }
 }
