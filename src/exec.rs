@@ -6,7 +6,6 @@ use crate::job::{Continuation, Job};
 use crate::parse::{self, CommandLine, Connector, PipedCommand, Redirect, RedirectKind};
 use crate::signal;
 use crate::sys;
-use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -34,7 +33,6 @@ pub fn execute(
     orig_termios: &libc::termios,
     home: &str,
     prev_dir: &mut Option<String>,
-    path_cache: &mut HashMap<String, PathBuf>,
     session_log: &mut String,
 ) -> i32 {
     let mut last_status = entry.map_or(0, |(s, _)| s);
@@ -62,7 +60,6 @@ pub fn execute(
             orig_termios,
             home,
             prev_dir,
-            path_cache,
             session_log,
         );
 
@@ -94,7 +91,6 @@ fn execute_pipeline(
     orig_termios: &libc::termios,
     home: &str,
     prev_dir: &mut Option<String>,
-    path_cache: &mut HashMap<String, PathBuf>,
     session_log: &mut String,
 ) -> i32 {
     // Expand all commands
@@ -156,7 +152,6 @@ fn execute_pipeline(
                 prev_dir,
                 home,
                 job,
-                path_cache,
                 session_log,
             );
         }
@@ -516,26 +511,6 @@ fn format_segments(segments: &[(parse::Pipeline, Option<Connector>)]) -> String 
     out
 }
 
-/// Look up command in PATH cache, fall back to direct PATH scan.
-pub fn find_in_path(cmd: &str, cache: &HashMap<String, PathBuf>) -> String {
-    // Absolute or relative path
-    if cmd.contains('/') {
-        return cmd.to_string();
-    }
-
-    // Check cache
-    if let Some(path) = cache.get(cmd) {
-        return path.to_string_lossy().to_string();
-    }
-
-    // Live scan
-    if let Some(path) = scan_path(cmd) {
-        return path.to_string_lossy().to_string();
-    }
-
-    cmd.to_string()
-}
-
 pub fn scan_path(cmd: &str) -> Option<PathBuf> {
     let path_var = std::env::var("PATH").ok()?;
     for dir in path_var.split(':') {
@@ -548,30 +523,6 @@ pub fn scan_path(cmd: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Rebuild the PATH cache.
-pub fn rebuild_path_cache(cache: &mut HashMap<String, PathBuf>) {
-    cache.clear();
-    let path_var = match std::env::var("PATH") {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    for dir in path_var.split(':') {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(name)
-                    && let Ok(meta) = entry.metadata()
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
-                        e.insert(entry.path());
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Resume a suspended job in the foreground.

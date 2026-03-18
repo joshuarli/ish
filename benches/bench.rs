@@ -586,36 +586,12 @@ fn bench_ls(c: &mut Criterion) {
 fn bench_path_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("path_lookup");
 
-    // Build a real PATH cache
-    let mut cache = std::collections::HashMap::new();
-    exec::rebuild_path_cache(&mut cache);
-
-    // Cache hit (typical case)
-    group.bench_function("cache_hit", |b| {
-        b.iter(|| black_box(exec::find_in_path("ls", &cache)));
+    // scan_path: find ls (typical case)
+    group.bench_function("scan_path_ls", |b| {
+        b.iter(|| black_box(exec::scan_path("ls")));
     });
 
-    // Cache miss (falls through to scan_path)
-    group.bench_function("cache_miss_scan", |b| {
-        let empty = std::collections::HashMap::new();
-        b.iter(|| black_box(exec::find_in_path("ls", &empty)));
-    });
-
-    // Absolute path (skips cache entirely)
-    group.bench_function("absolute_path", |b| {
-        b.iter(|| black_box(exec::find_in_path("/usr/bin/ls", &cache)));
-    });
-
-    // Full PATH cache rebuild
-    group.bench_function("rebuild_cache", |b| {
-        let mut c = std::collections::HashMap::new();
-        b.iter(|| {
-            exec::rebuild_path_cache(&mut c);
-            black_box(c.len());
-        });
-    });
-
-    // scan_path for something that doesn't exist
+    // scan_path: not found (worst case — scans all dirs)
     group.bench_function("scan_not_found", |b| {
         b.iter(|| black_box(exec::scan_path("nonexistent_command_xyz")));
     });
@@ -807,11 +783,9 @@ fn bench_alloc_audit(c: &mut Criterion) {
         eprintln!("  [alloc] history_add_1k:            {stats}");
 
         let stats = measure_allocs(|| {
-            let mut cache = std::collections::HashMap::new();
-            exec::rebuild_path_cache(&mut cache);
-            let _ = black_box(exec::find_in_path("ls", &cache));
+            let _ = black_box(exec::scan_path("ls"));
         });
-        eprintln!("  [alloc] path_cache_build+lookup:   {stats}");
+        eprintln!("  [alloc] scan_path_ls:              {stats}");
 
         let stats = measure_allocs(|| {
             let _ = black_box(complete::complete_path("./src/", false));
@@ -863,13 +837,10 @@ fn bench_startup(c: &mut Criterion) {
     // Full cold startup in a git repo (this repo).
     // Skips terminal setup (requires real tty) and signal::init (creates
     // pipe per call). Everything else mirrors main() order.
+    // No PATH cache build — commands resolve via scan_path on demand.
     group.bench_function("git_repo", |b| {
         b.iter(|| {
             let _history = black_box(History::load());
-
-            let mut cache = std::collections::HashMap::new();
-            exec::rebuild_path_cache(&mut cache);
-            black_box(cache.len());
 
             let mut aliases = AliasMap::new();
             ish::config::load(&mut aliases, None);
@@ -890,10 +861,6 @@ fn bench_startup(c: &mut Criterion) {
         b.iter(|| {
             let _history = black_box(History::load());
 
-            let mut cache = std::collections::HashMap::new();
-            exec::rebuild_path_cache(&mut cache);
-            black_box(cache.len());
-
             let mut aliases = AliasMap::new();
             ish::config::load(&mut aliases, None);
 
@@ -913,20 +880,9 @@ fn bench_startup(c: &mut Criterion) {
         b.iter(|| black_box(History::load()));
     });
 
-    group.bench_function("path_cache_build", |b| {
-        let mut cache = std::collections::HashMap::new();
-        b.iter(|| {
-            exec::rebuild_path_cache(&mut cache);
-            black_box(cache.len());
-        });
-    });
-
     group.bench_function("denv_init", |b| {
         b.iter(|| black_box(ish::denv::init()));
     });
-
-    // signal::init creates a pipe each call — not safe to bench in a loop.
-    // It runs once at startup and takes <1µs (just sigaction + pipe).
 
     group.finish();
 }

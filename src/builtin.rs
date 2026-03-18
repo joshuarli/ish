@@ -2,8 +2,6 @@ use crate::exec;
 use crate::job::Job;
 use crate::ls;
 use crate::parse::Redirect;
-use std::collections::HashMap;
-use std::path::PathBuf;
 
 /// Builtins that modify shell state — must run in the main process.
 const SPECIAL_BUILTINS: &[&str] = &[
@@ -45,7 +43,6 @@ pub fn is_special_builtin(name: &str) -> bool {
 }
 
 /// Run a state-modifying builtin in the main process. Returns exit status.
-#[allow(clippy::too_many_arguments)]
 pub fn run_special(
     name: &str,
     args: &[String],
@@ -53,15 +50,14 @@ pub fn run_special(
     prev_dir: &mut Option<String>,
     home: &str,
     job: &mut Option<Job>,
-    path_cache: &mut HashMap<String, PathBuf>,
     _session_log: &mut String,
 ) -> i32 {
     match name {
-        "cd" => builtin_cd(args, prev_dir, home, path_cache),
+        "cd" => builtin_cd(args, prev_dir, home),
         "exit" => builtin_exit(args, job),
         "fg" => exec::resume_job(job).0, // continuation handled in main.rs
-        "set" => builtin_set(args, path_cache),
-        "unset" => builtin_unset(args, path_cache),
+        "set" => builtin_set(args),
+        "unset" => builtin_unset(args),
         "alias" => {
             eprintln!("ish: alias: use at the prompt level");
             1
@@ -124,12 +120,7 @@ pub fn run_output(name: &str, args: &[String], _redirects: &[Redirect]) -> i32 {
     }
 }
 
-fn builtin_cd(
-    args: &[String],
-    prev_dir: &mut Option<String>,
-    home: &str,
-    _path_cache: &mut HashMap<String, PathBuf>,
-) -> i32 {
+fn builtin_cd(args: &[String], prev_dir: &mut Option<String>, home: &str) -> i32 {
     let target = if args.is_empty() {
         home.to_string()
     } else if args[0] == "-" {
@@ -165,12 +156,6 @@ fn builtin_cd(
     }
 
     *prev_dir = old_pwd;
-
-    // PATH cache is invalidated by:
-    // - `set PATH ...` in builtin_set
-    // - denv on_cd() when it modifies PATH
-    // No need to rebuild here — cd itself doesn't change PATH.
-
     0
 }
 
@@ -181,7 +166,7 @@ fn builtin_exit(_args: &[String], _job: &mut Option<Job>) -> i32 {
     1
 }
 
-fn builtin_set(args: &[String], path_cache: &mut HashMap<String, PathBuf>) -> i32 {
+fn builtin_set(args: &[String]) -> i32 {
     if args.is_empty() {
         // Print all env vars
         for (key, val) in std::env::vars() {
@@ -199,15 +184,10 @@ fn builtin_set(args: &[String], path_cache: &mut HashMap<String, PathBuf>) -> i3
 
     // SAFETY: single-threaded shell
     unsafe { std::env::set_var(name, &value) };
-
-    if name == "PATH" {
-        exec::rebuild_path_cache(path_cache);
-    }
-
     0
 }
 
-fn builtin_unset(args: &[String], path_cache: &mut HashMap<String, PathBuf>) -> i32 {
+fn builtin_unset(args: &[String]) -> i32 {
     if args.is_empty() {
         eprintln!("ish: unset: expected variable name");
         return 1;
@@ -216,9 +196,6 @@ fn builtin_unset(args: &[String], path_cache: &mut HashMap<String, PathBuf>) -> 
     for name in args {
         // SAFETY: single-threaded shell
         unsafe { std::env::remove_var(name) };
-        if name == "PATH" {
-            path_cache.clear();
-        }
     }
     0
 }

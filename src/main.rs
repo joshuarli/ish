@@ -6,9 +6,7 @@ use ish::job::Job;
 use ish::line::LineBuffer;
 use ish::term::TermWriter;
 use ish::{complete, config, denv, exec, history, parse, prompt, render, signal, term};
-use std::collections::HashMap;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
 
 struct Shell {
     aliases: AliasMap,
@@ -19,7 +17,6 @@ struct Shell {
     history: history::History,
     prompt: prompt::Prompt,
     job: Option<Job>,
-    path_cache: HashMap<String, PathBuf>,
     exit_warned: bool,
     denv_active: bool,
     orig_termios: libc::termios,
@@ -132,7 +129,6 @@ fn main() {
         history: history::History::load(),
         prompt: prompt::Prompt::new(),
         job: None,
-        path_cache: HashMap::new(),
         exit_warned: false,
         denv_active: false,
         orig_termios,
@@ -140,9 +136,6 @@ fn main() {
         home: home.clone(),
         session_log: String::new(),
     };
-
-    // Build initial PATH cache
-    exec::rebuild_path_cache(&mut shell.path_cache);
 
     // Load config
     if !cli.no_config {
@@ -250,11 +243,8 @@ fn main() {
                             if first == "denv" && shell.denv_active {
                                 let args: Vec<String> =
                                     cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
-                                if let Some(path_modified) = denv::command(&args) {
+                                if let Some(_path_modified) = denv::command(&args) {
                                     shell.last_status = 0;
-                                    if path_modified {
-                                        exec::rebuild_path_cache(&mut shell.path_cache);
-                                    }
                                     continue;
                                 }
                                 // Not allow/deny/reload — fall through to normal exec
@@ -304,14 +294,13 @@ fn main() {
                             &shell.orig_termios,
                             &shell.home,
                             &mut shell.prev_dir,
-                            &mut shell.path_cache,
                             &mut shell.session_log,
                         );
 
                         if is_cd {
                             shell.prompt.invalidate_git();
-                            if shell.denv_active && denv::on_cd() {
-                                exec::rebuild_path_cache(&mut shell.path_cache);
+                            if shell.denv_active {
+                                denv::on_cd();
                             }
                         }
                     }
@@ -971,7 +960,6 @@ fn run_continuation(shell: &mut Shell, cont: Option<ish::job::Continuation>) {
         &shell.orig_termios,
         &shell.home,
         &mut shell.prev_dir,
-        &mut shell.path_cache,
         &mut shell.session_log,
     );
     // If the continuation itself suspended, any further continuation is

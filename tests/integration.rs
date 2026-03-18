@@ -1276,10 +1276,8 @@ fn builtin_run_output_unknown() {
 
 #[test]
 fn builtin_run_special_cd_target() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
     let dir = tempdir_with_files(&[]);
@@ -1291,7 +1289,6 @@ fn builtin_run_special_cd_target() {
         &mut prev_dir,
         "/tmp",
         &mut job,
-        &mut cache,
         &mut log,
     );
     assert_eq!(status, 0);
@@ -1303,10 +1300,8 @@ fn builtin_run_special_cd_target() {
 
 #[test]
 fn builtin_run_special_cd_dash_no_prev() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
     let status = builtin::run_special(
@@ -1316,7 +1311,6 @@ fn builtin_run_special_cd_dash_no_prev() {
         &mut prev_dir,
         "/tmp",
         &mut job,
-        &mut cache,
         &mut log,
     );
     assert_eq!(status, 1); // no previous directory
@@ -1324,11 +1318,9 @@ fn builtin_run_special_cd_dash_no_prev() {
 
 #[test]
 fn builtin_run_special_cd_dash_with_prev() {
-    use std::collections::HashMap;
     let dir = tempdir_with_files(&[]);
     let mut prev_dir = Some(dir.to_str().unwrap().to_string());
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
     let old_dir = std::env::current_dir().unwrap();
@@ -1339,7 +1331,6 @@ fn builtin_run_special_cd_dash_with_prev() {
         &mut prev_dir,
         "/tmp",
         &mut job,
-        &mut cache,
         &mut log,
     );
     assert_eq!(status, 0);
@@ -1349,10 +1340,8 @@ fn builtin_run_special_cd_dash_with_prev() {
 
 #[test]
 fn builtin_run_special_cd_nonexistent() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
     let status = builtin::run_special(
@@ -1362,7 +1351,6 @@ fn builtin_run_special_cd_nonexistent() {
         &mut prev_dir,
         "/tmp",
         &mut job,
-        &mut cache,
         &mut log,
     );
     assert_eq!(status, 1);
@@ -1370,32 +1358,19 @@ fn builtin_run_special_cd_nonexistent() {
 
 #[test]
 fn builtin_run_special_set_print_all() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
     // set with no args prints all env vars
-    let status = builtin::run_special(
-        "set",
-        &[],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut cache,
-        &mut log,
-    );
+    let status = builtin::run_special("set", &[], &[], &mut prev_dir, "/tmp", &mut job, &mut log);
     assert_eq!(status, 0);
 }
 
 #[test]
 fn builtin_run_special_set_var() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
     let status = builtin::run_special(
@@ -1405,7 +1380,6 @@ fn builtin_run_special_set_var() {
         &mut prev_dir,
         "/tmp",
         &mut job,
-        &mut cache,
         &mut log,
     );
     assert_eq!(status, 0);
@@ -1415,10 +1389,8 @@ fn builtin_run_special_set_var() {
 
 #[test]
 fn builtin_run_special_set_no_value() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
     let status = builtin::run_special(
@@ -1428,7 +1400,6 @@ fn builtin_run_special_set_no_value() {
         &mut prev_dir,
         "/tmp",
         &mut job,
-        &mut cache,
         &mut log,
     );
     assert_eq!(status, 0);
@@ -1438,10 +1409,8 @@ fn builtin_run_special_set_no_value() {
 
 #[test]
 fn builtin_run_special_unset() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
     unsafe { std::env::set_var("ISH_TEST_UNSET_ME", "value") };
@@ -1452,7 +1421,6 @@ fn builtin_run_special_unset() {
         &mut prev_dir,
         "/tmp",
         &mut job,
-        &mut cache,
         &mut log,
     );
     assert_eq!(status, 0);
@@ -1461,52 +1429,28 @@ fn builtin_run_special_unset() {
 
 #[test]
 fn builtin_run_special_unset_no_args() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
-    let status = builtin::run_special(
-        "unset",
-        &[],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut cache,
-        &mut log,
-    );
+    let status = builtin::run_special("unset", &[], &[], &mut prev_dir, "/tmp", &mut job, &mut log);
     assert_eq!(status, 1);
 }
 
 #[test]
 fn builtin_run_special_alias_error() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
-    let status = builtin::run_special(
-        "alias",
-        &[],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut cache,
-        &mut log,
-    );
+    let status = builtin::run_special("alias", &[], &[], &mut prev_dir, "/tmp", &mut job, &mut log);
     assert_eq!(status, 1);
 }
 
 #[test]
 fn builtin_run_special_copy_scrollback() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
     let status = builtin::run_special(
@@ -1516,7 +1460,6 @@ fn builtin_run_special_copy_scrollback() {
         &mut prev_dir,
         "/tmp",
         &mut job,
-        &mut cache,
         &mut log,
     );
     assert_eq!(status, 0);
@@ -1524,10 +1467,8 @@ fn builtin_run_special_copy_scrollback() {
 
 #[test]
 fn builtin_run_special_unknown() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
     let status = builtin::run_special(
@@ -1537,7 +1478,6 @@ fn builtin_run_special_unknown() {
         &mut prev_dir,
         "/tmp",
         &mut job,
-        &mut cache,
         &mut log,
     );
     assert_eq!(status, 1);
@@ -1545,81 +1485,13 @@ fn builtin_run_special_unknown() {
 
 #[test]
 fn builtin_run_special_exit() {
-    use std::collections::HashMap;
     let mut prev_dir = None;
     let mut job = None;
-    let mut cache = HashMap::new();
     let mut log = String::new();
 
     // exit in pipeline context returns 1
-    let status = builtin::run_special(
-        "exit",
-        &[],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut cache,
-        &mut log,
-    );
+    let status = builtin::run_special("exit", &[], &[], &mut prev_dir, "/tmp", &mut job, &mut log);
     assert_eq!(status, 1);
-}
-
-#[test]
-fn builtin_run_special_set_path_rebuilds_cache() {
-    use std::collections::HashMap;
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut cache = HashMap::new();
-    let mut log = String::new();
-
-    // Insert a dummy entry into the cache
-    cache.insert("dummy".to_string(), std::path::PathBuf::from("/tmp/dummy"));
-
-    let status = builtin::run_special(
-        "set",
-        &["PATH".to_string(), "/usr/bin".to_string()],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut cache,
-        &mut log,
-    );
-    assert_eq!(status, 0);
-    // Cache should have been rebuilt (old entry gone)
-    assert!(!cache.contains_key("dummy"));
-}
-
-#[test]
-fn builtin_run_special_unset_path_clears_cache() {
-    use std::collections::HashMap;
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut cache = HashMap::new();
-    let mut log = String::new();
-
-    cache.insert("dummy".to_string(), std::path::PathBuf::from("/tmp/dummy"));
-
-    // Save and restore PATH since we're unsetting it
-    let old_path = std::env::var("PATH").ok();
-    let status = builtin::run_special(
-        "unset",
-        &["PATH".to_string()],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut cache,
-        &mut log,
-    );
-    assert_eq!(status, 0);
-    assert!(cache.is_empty());
-
-    // Restore PATH
-    if let Some(p) = old_path {
-        unsafe { std::env::set_var("PATH", p) };
-    }
 }
 
 // ---------------------------------------------------------------------------
