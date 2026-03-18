@@ -769,19 +769,63 @@ fn start_completion(line: &LineBuffer, term_cols: u16, home: &str) -> Option<Com
     };
 
     let entries = complete::complete_path(&expanded, dirs_only);
-    if entries.is_empty() {
+    if !entries.is_empty() {
+        let (cols, rows) = complete::compute_grid(&entries, term_cols);
+        return Some(CompletionState {
+            entries,
+            selected: 0,
+            cols,
+            rows,
+            scroll: 0,
+            dir_prefix,
+        });
+    }
+
+    // Fish-style partial path completion: each intermediate component is a prefix.
+    // e.g., "~/de/s" → resolve "de" to "dev", complete "s" in ~/dev/
+    let partial_results = complete::complete_partial_path(&expanded, dirs_only);
+    if partial_results.is_empty() {
         return None;
     }
 
-    let (cols, rows) = complete::compute_grid(&entries, term_cols);
+    // Determine the user-facing root prefix (for tilde re-contraction)
+    let (user_root, expanded_root) = if partial.starts_with("~/") || partial == "~" {
+        ("~/".to_string(), format!("{home}/"))
+    } else if partial.starts_with('/') {
+        ("/".to_string(), "/".to_string())
+    } else {
+        (String::new(), String::new())
+    };
 
+    // Build entries with resolved intermediate components in the name
+    let mut all_entries = Vec::new();
+    for (resolved_dir, dir_entries) in partial_results {
+        let rel_dir = if expanded_root.is_empty() {
+            resolved_dir.to_string()
+        } else {
+            resolved_dir
+                .strip_prefix(&expanded_root)
+                .unwrap_or(&resolved_dir)
+                .to_string()
+        };
+        for entry in dir_entries {
+            all_entries.push(complete::CompEntry {
+                name: format!("{rel_dir}{}", entry.name),
+                is_dir: entry.is_dir,
+                is_link: entry.is_link,
+                is_exec: entry.is_exec,
+            });
+        }
+    }
+
+    let (cols, rows) = complete::compute_grid(&all_entries, term_cols);
     Some(CompletionState {
-        entries,
+        entries: all_entries,
         selected: 0,
         cols,
         rows,
         scroll: 0,
-        dir_prefix,
+        dir_prefix: user_root,
     })
 }
 

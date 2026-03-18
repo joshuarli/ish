@@ -6,9 +6,6 @@ PGO_MERGED := $(PGO_DIR)/merged.profdata
 
 .PHONY: setup build release release-pgo pgo-profile bench-pgo install pc
 
-setup:
-	prek install --install-hooks
-
 build:
 	cargo build
 
@@ -49,6 +46,9 @@ $(PGO_MERGED):
 
 install: release-pgo
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
+
+setup:
+	prek install --install-hooks
 
 pc:
 	prek --quiet run --all-files

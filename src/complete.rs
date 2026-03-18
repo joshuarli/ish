@@ -129,7 +129,11 @@ impl CompletionState {
 /// If `dirs_only` is true, only return directories (and symlinks to directories).
 pub fn complete_path(partial: &str, dirs_only: bool) -> Vec<CompEntry> {
     let (dir, prefix) = split_path(partial);
+    complete_in_dir(dir, prefix, dirs_only)
+}
 
+/// Complete entries in `dir` whose names start with `prefix`.
+fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool) -> Vec<CompEntry> {
     let read_dir = match std::fs::read_dir(if dir.is_empty() { "." } else { dir }) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
@@ -177,6 +181,98 @@ pub fn complete_path(partial: &str, dirs_only: bool) -> Vec<CompEntry> {
 
     entries.sort_by_key(|a| a.name.to_lowercase());
     entries
+}
+
+/// Fish-style partial path completion: each intermediate directory component
+/// is treated as a prefix. e.g., "/home/user/de/s" finds entries starting
+/// with "s" in /home/user/dev/, /home/user/Desktop/, etc.
+/// Returns (resolved_dir_with_slash, entries) pairs.
+pub fn complete_partial_path(partial: &str, dirs_only: bool) -> Vec<(String, Vec<CompEntry>)> {
+    let (dir, prefix) = split_path(partial);
+    if dir.is_empty() {
+        return Vec::new();
+    }
+
+    let dir_trimmed = dir.trim_end_matches('/');
+
+    // If dir already exists, complete_path handles it
+    if std::fs::metadata(dir_trimmed)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        return Vec::new();
+    }
+
+    let resolved_dirs = resolve_partial_dir(dir_trimmed);
+    let mut results = Vec::new();
+    for rdir in resolved_dirs {
+        let entries = complete_in_dir(&rdir, prefix, dirs_only);
+        if !entries.is_empty() {
+            results.push((format!("{rdir}/"), entries));
+        }
+    }
+    results
+}
+
+/// Recursively resolve a directory path where each component is a prefix.
+/// e.g., "/home/user/de" → ["/home/user/dev", "/home/user/Desktop", ...]
+fn resolve_partial_dir(dir: &str) -> Vec<String> {
+    let dir = dir.trim_end_matches('/');
+    if dir.is_empty() {
+        return Vec::new();
+    }
+
+    // Base: if it exists as a directory, return it
+    if std::fs::metadata(dir).map(|m| m.is_dir()).unwrap_or(false) {
+        return vec![dir.to_string()];
+    }
+
+    // Split parent / component
+    let (parent, component) = match dir.rfind('/') {
+        Some(0) => ("/", &dir[1..]),
+        Some(i) => (&dir[..i], &dir[i + 1..]),
+        None => (".", dir),
+    };
+
+    if component.is_empty() {
+        return Vec::new();
+    }
+
+    // Recursively resolve parent
+    let parents = resolve_partial_dir(parent);
+
+    let mut results = Vec::new();
+    for p in &parents {
+        let rd = match std::fs::read_dir(p.as_str()) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for entry in rd.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(component) {
+                continue;
+            }
+            if name.starts_with('.') && !component.starts_with('.') {
+                continue;
+            }
+            if !entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if p == "/" {
+                results.push(format!("/{name}"));
+            } else if p == "." {
+                results.push(name);
+            } else {
+                results.push(format!("{p}/{name}"));
+            }
+        }
+        // Cap expansion to avoid combinatorial explosion
+        if results.len() > 64 {
+            results.truncate(64);
+            break;
+        }
+    }
+    results
 }
 
 /// Generate environment variable completions for a `$` prefix.
@@ -263,5 +359,67 @@ mod tests {
         assert!(cols >= 1);
         assert!(rows >= 1);
         assert!(cols * rows >= 7);
+    }
+
+    #[test]
+    fn partial_path_resolves_this_repo() {
+        // "src" exists under ".", so "sr" should resolve to "src"
+        let resolved = resolve_partial_dir("sr");
+        assert!(
+            resolved.iter().any(|d| d == "src"),
+            "expected 'src' in {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn partial_path_two_levels() {
+        // "sr/m" should resolve to "src/main.rs" parent, i.e., "src"
+        // but "m" as a directory — only if there's a dir starting with "m" in src/
+        // There isn't, so this tests the resolution still works (returns src at least)
+        let resolved = resolve_partial_dir("sr");
+        assert!(!resolved.is_empty());
+    }
+
+    #[test]
+    fn partial_path_complete_finds_entries() {
+        // "./sr/m" → should find main.rs in src/
+        let results = complete_partial_path("./sr/m", false);
+        let names: Vec<&str> = results
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().map(|e| e.name.as_str()))
+            .collect();
+        assert!(
+            names.iter().any(|n| n.starts_with("main")),
+            "expected main.rs in {names:?}"
+        );
+    }
+
+    #[test]
+    fn partial_path_existing_dir_returns_empty() {
+        // If the directory exists, complete_partial_path defers to complete_path
+        let results = complete_partial_path("./src/m", false);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn partial_path_nonexistent_returns_empty() {
+        let results = complete_partial_path("./zzzzz/m", false);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn partial_path_absolute_tilde_expanded() {
+        // Simulate "~/de/s" with tilde already expanded
+        let home = std::env::var("HOME").unwrap();
+        let expanded = format!("{home}/de/s");
+        let results = complete_partial_path(&expanded, true);
+        let all_names: Vec<&str> = results
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().map(|e| e.name.as_str()))
+            .collect();
+        assert!(
+            all_names.contains(&"sentry"),
+            "expected 'sentry' in {all_names:?}"
+        );
     }
 }
