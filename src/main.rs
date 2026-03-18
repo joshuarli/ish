@@ -166,6 +166,11 @@ fn main() {
                 }
                 shell.exit_warned = false;
 
+                // Rewrite shorthand cd forms before parsing:
+                //   ".." → "cd ..", "..." → "cd ../..", etc.
+                //   single-arg directory that isn't an executable → "cd <dir>"
+                let line = maybe_rewrite_cd(&line, &shell.aliases);
+
                 // Add to history unless it's a bare alias or builtin
                 let first_word = line.split_whitespace().next().unwrap_or("");
                 if first_word == "cd"
@@ -1114,6 +1119,60 @@ fn run_continuation(shell: &mut Shell, cont: Option<ish::job::Continuation>) {
     );
     // If the continuation itself suspended, any further continuation is
     // already saved on the job by execute(). Nothing more to do here.
+}
+
+/// Rewrite shorthand cd forms:
+///   ".." → "cd ..", "..." → "cd ../..", "...." → "cd ../../..", etc.
+///   single-arg that is a directory (and not an alias/builtin/executable) → "cd <arg>"
+fn maybe_rewrite_cd(line: &str, aliases: &AliasMap) -> String {
+    let trimmed = line.trim();
+    let mut words = trimmed.split_whitespace();
+    let first = match words.next() {
+        Some(w) => w,
+        None => return line.to_string(),
+    };
+
+    // Dot-dot shorthand: ".." is already valid, "..." → "../..", etc.
+    if first.len() >= 2 && first.bytes().all(|b| b == b'.') {
+        let levels = first.len() - 1; // ".." = 1 level, "..." = 2, etc.
+        let path = (0..levels).map(|_| "..").collect::<Vec<_>>().join("/");
+        let rest: String = words.collect::<Vec<_>>().join(" ");
+        return if rest.is_empty() {
+            format!("cd {path}")
+        } else {
+            format!("cd {path} {rest}")
+        };
+    }
+
+    // Implicit cd: single arg, not an alias/builtin, is a directory, not an executable
+    if words.next().is_none()
+        && !builtin::is_builtin(first)
+        && aliases.get(first).is_none()
+        && !first.contains('|')
+        && !first.contains('&')
+        && !first.contains(';')
+    {
+        // Resolve ~ prefix
+        let expanded = if let Some(rest) = first.strip_prefix('~') {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{home}{rest}")
+        } else {
+            first.to_string()
+        };
+        let path = std::path::Path::new(&expanded);
+        if path.is_dir() && !is_executable(path) {
+            return format!("cd {first}");
+        }
+    }
+
+    line.to_string()
+}
+
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .map(|m| m.permissions().mode() & 0o111 != 0 && m.is_file())
+        .unwrap_or(false)
 }
 
 fn base64_encode(input: &[u8]) -> String {
