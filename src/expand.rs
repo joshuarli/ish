@@ -319,9 +319,10 @@ fn glob_match(pattern: &str) -> Result<Vec<String>, Error> {
                             } else {
                                 format!("{dir}/{name}")
                             };
-                            // If not last segment, only keep directories
+                            // If not last segment, only keep directories.
+                            // Use metadata() (follows symlinks) so /var → /private/var works.
                             if !is_last {
-                                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                if entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
                                     new_results.push(path);
                                 }
                             } else {
@@ -344,7 +345,7 @@ fn collect_recursive(dir: &str, out: &mut Vec<String>) -> Result<(), Error> {
     out.push(dir.to_string());
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.starts_with('.') || name.bytes().any(|b| b < b' ' || b == 0x7f) {
