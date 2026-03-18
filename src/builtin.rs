@@ -7,6 +7,7 @@ use crate::parse::Redirect;
 const SPECIAL_BUILTINS: &[&str] = &[
     "cd",
     "exit",
+    "export",
     "fg",
     "set",
     "unset",
@@ -19,6 +20,7 @@ const SPECIAL_BUILTINS: &[&str] = &[
 const ALL_BUILTINS: &[&str] = &[
     "cd",
     "exit",
+    "export",
     "fg",
     "set",
     "unset",
@@ -58,6 +60,7 @@ pub fn run_special(
         "cd" => builtin_cd(args, prev_dir, home),
         "exit" => builtin_exit(args, job),
         "fg" => exec::resume_job(job).0, // continuation handled in main.rs
+        "export" => builtin_export(args),
         "set" => builtin_set(args),
         "unset" => builtin_unset(args),
         "alias" => {
@@ -111,7 +114,7 @@ pub fn run_output(name: &str, args: &[String], _redirects: &[Redirect]) -> i32 {
             1
         }
         // Special builtins in a pipeline context (forked) — these shouldn't modify state
-        "cd" | "exit" | "fg" | "set" | "unset" | "alias" => {
+        "cd" | "exit" | "export" | "fg" | "set" | "unset" | "alias" => {
             eprintln!("ish: {name}: cannot use in a pipeline");
             1
         }
@@ -166,6 +169,33 @@ fn builtin_exit(_args: &[String], _job: &mut Option<Job>) -> i32 {
     // This is only reached if exit somehow gets here in a pipeline
     eprintln!("ish: exit: cannot use in a pipeline");
     1
+}
+
+fn builtin_export(args: &[String]) -> i32 {
+    if args.is_empty() {
+        // Print all exported vars (all env vars in ish)
+        let mut vars: Vec<(String, String)> = std::env::vars().collect();
+        vars.sort_by(|a, b| a.0.cmp(&b.0));
+        for (key, val) in vars {
+            println!("export {key}={val}");
+        }
+        return 0;
+    }
+
+    for arg in args {
+        if let Some(eq) = exec::var_assignment_pos(arg) {
+            let name = &arg[..eq];
+            let val = &arg[eq + 1..];
+            // SAFETY: single-threaded shell
+            unsafe { std::env::set_var(name, val) };
+        } else {
+            // `export FOO` — no-op if already set, otherwise set to empty
+            if std::env::var(arg).is_err() {
+                unsafe { std::env::set_var(arg, "") };
+            }
+        }
+    }
+    0
 }
 
 fn builtin_set(args: &[String]) -> i32 {

@@ -177,13 +177,8 @@ fn execute_pipeline(
                 // Split leading NAME=VALUE prefix assignments
                 let env = split_env_prefix(&mut expanded_argv);
                 if expanded_argv.is_empty() {
-                    if !env.is_empty() && commands.len() == 1 {
-                        // Bare assignment: set in current shell process
-                        for (name, val) in &env {
-                            // SAFETY: single-threaded shell
-                            unsafe { std::env::set_var(name, val) };
-                        }
-                    }
+                    // Bare FOO=bar without a command is a no-op.
+                    // Use `export FOO=bar` to set environment variables.
                     return 0;
                 }
                 let mut redirects = Vec::new();
