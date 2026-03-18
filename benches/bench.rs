@@ -698,15 +698,6 @@ fn bench_completion_fs(c: &mut Criterion) {
         b.iter(|| black_box(complete::complete_path("/usr/bin/z", false)));
     });
 
-    // Environment variable completion
-    group.bench_function("complete_env_all", |b| {
-        b.iter(|| black_box(complete::complete_env("$")));
-    });
-
-    group.bench_function("complete_env_prefix", |b| {
-        b.iter(|| black_box(complete::complete_env("$HO")));
-    });
-
     group.finish();
 }
 
@@ -864,23 +855,6 @@ fn bench_alloc_audit(c: &mut Criterion) {
                 black_box(&comp);
             });
             eprintln!("  [alloc] complete_path_warm:        {stats}");
-        }
-
-        let stats = measure_allocs(|| {
-            let _ = black_box(complete::complete_env("$HO"));
-        });
-        eprintln!("  [alloc] complete_env_prefix:       {stats}");
-
-        // Warm: reuse pre-allocated Completions for env
-        {
-            let mut comp = complete::Completions::with_capacity(2048, 64);
-            complete::complete_env_into("$HO", &mut comp);
-            let stats = measure_allocs(|| {
-                comp.clear();
-                complete::complete_env_into("$HO", &mut comp);
-                black_box(&comp);
-            });
-            eprintln!("  [alloc] complete_env_warm:         {stats}");
         }
 
         let stats = measure_allocs(|| {

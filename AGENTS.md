@@ -39,7 +39,7 @@ src/
   builtin.rs   — cd, exit, fg, set, unset, alias, l, c, w/which/type, echo, pwd, true, false
   ls.rs        — Native directory listing (l builtin): stat, permissions, color — like ls -plAhG
   history.rs   — Append-only file, in-memory Vec, prefix search, zero-alloc fuzzy subsequence search
-  complete.rs  — Arena-backed file + env var completion via libc readdir/stat, grid layout, arrow nav
+  complete.rs  — Arena-backed file completion via libc readdir/stat, grid layout, arrow navigation
   alias.rs     — AliasMap (HashMap wrapper), inline expansion on space
   config.rs    — Parse ~/.config/ish/config.ish (set + alias directives)
   job.rs       — Single suspended job (Ctrl+Z / fg)
@@ -61,7 +61,7 @@ src/
 
 **Tab completion:**
 1. Extract the word under cursor from `LineBuffer`
-2. `$` prefix → `complete::complete_env_into()` (env var names via `libc::environ`); otherwise `complete::complete_path_into()` (libc readdir/stat + prefix filter). Both use a pooled `Completions` arena — zero allocation on warm path.
+2. `complete::complete_path_into()` (libc readdir/stat + prefix filter) uses a pooled `Completions` arena — zero allocation on warm path.
 3. Single match → auto-insert. Multiple → `compute_grid()` for column-major layout
 4. Arrow keys navigate the grid; Enter accepts; Escape cancels. Refilter on typing reuses the arena buffer.
 
@@ -176,7 +176,7 @@ Key testing patterns:
 - Prompt git tests assert on structure (`ends_with(" $ ")`) not exact branch names
 
 ### PTY tests (`tests/pty.rs` — 54 tests)
-Spawns the real `ish` binary in a pseudo-terminal and drives it with keystrokes. Each test gets an isolated HOME directory with controlled files, history, and config. Tests the full shell loop: raw mode, prompt rendering, line editing, completion, history search, aliases, pipes, redirects, globs, denv integration, env var completion, exit handling.
+Spawns the real `ish` binary in a pseudo-terminal and drives it with keystrokes. Each test gets an isolated HOME directory with controlled files, history, and config. Tests the full shell loop: raw mode, prompt rendering, line editing, completion, history search, aliases, pipes, redirects, globs, denv integration, exit handling.
 
 The PTY harness (`PtyShell`) uses `openpty()` + `fork()` to create an isolated terminal session with a fixed 80x24 size. Assertions operate on visible terminal output with ANSI stripping. Drop uses WNOHANG polling (not blocking waitpid) to avoid hangs on macOS when the PTY master fd is still open.
 
@@ -188,7 +188,7 @@ The PTY harness (`PtyShell`) uses `openpty()` + `fork()` to create an isolated t
 - `fuzz_history` — Fuzzy match positions valid and ascending
 
 ### Benchmarks (`benches/bench.rs` — 15 groups)
-Criterion benchmarks with a custom counting allocator that tracks heap allocations and bytes. Covers: parsing, expansion, line buffer ops, history search, completion grid + sort, prompt rendering, end-to-end parse+expand, PATH lookup, alias lookup, `ls` builtin, filesystem completion, env var completion, and denv output parsing. Includes an allocation audit section that prints cold and warm (pooled buffer) allocation counts — warm paths should show 0 allocs.
+Criterion benchmarks with a custom counting allocator that tracks heap allocations and bytes. Covers: parsing, expansion, line buffer ops, history search, completion grid + sort, prompt rendering, end-to-end parse+expand, PATH lookup, alias lookup, `ls` builtin, filesystem completion, and denv output parsing. Includes an allocation audit section that prints cold and warm (pooled buffer) allocation counts — warm paths should show 0 allocs.
 
 ## Design Principles
 
@@ -200,7 +200,7 @@ Criterion benchmarks with a custom counting allocator that tracks heap allocatio
 
 **Zero-allocation warm paths.** All interactive hot paths — prompt render, tab completion, fuzzy history search — are zero-allocation on the steady state via pre-allocated pooled buffers (`prompt_buf`, `comp_buf`, `match_buf` on Shell). Completions use an arena (`Completions.names` String + offset-based `CompEntry`). Filesystem operations use `libc::opendir`/`readdir`/`stat` directly with stack buffers instead of `std::fs`. Env var reads use `libc::getenv` (zero-alloc `&str` into env block). The benchmark suite tracks allocations per operation with a custom counting allocator.
 
-**Unsafe is contained.** All unsafe code is in 8 modules: `term.rs` (termios), `signal.rs` (signal handlers), `exec.rs` (fork/exec + libc::getenv/stat), `input.rs` (raw fd reads), `sys.rs` (platform syscalls), `denv.rs` (fork/exec for denv subprocess), `complete.rs` (libc opendir/readdir/stat/lstat/environ), and `main.rs` (libc::getenv). The rest of the codebase is safe Rust.
+**Unsafe is contained.** All unsafe code is in 8 modules: `term.rs` (termios), `signal.rs` (signal handlers), `exec.rs` (fork/exec + libc::getenv/stat), `input.rs` (raw fd reads), `sys.rs` (platform syscalls), `denv.rs` (fork/exec for denv subprocess), `complete.rs` (libc opendir/readdir/stat/lstat), and `main.rs` (libc::getenv). The rest of the codebase is safe Rust.
 
 ## Common Tasks for Agents
 
