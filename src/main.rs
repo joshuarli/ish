@@ -854,6 +854,65 @@ enum CompAction {
     Refilter,
 }
 
+/// Find the start of the completion word, respecting quotes.
+/// Returns (byte_offset_of_word_start, currently_inside_single_quote).
+fn find_comp_word_start(s: &str) -> (usize, bool) {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut word_start = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                i += 1;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                i += 1;
+            }
+            b'\\' if !in_single && i + 1 < bytes.len() => {
+                i += 2;
+            }
+            b' ' | b'\t' if !in_single && !in_double => {
+                i += 1;
+                word_start = i;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    (word_start, in_single)
+}
+
+/// Whether a completion string needs quoting for the shell.
+fn needs_quoting(s: &str) -> bool {
+    s.bytes().any(|b| {
+        matches!(
+            b,
+            b' ' | b'\t'
+                | b'('
+                | b')'
+                | b'$'
+                | b'*'
+                | b'?'
+                | b'['
+                | b']'
+                | b'|'
+                | b'&'
+                | b'>'
+                | b'<'
+                | b';'
+                | b'#'
+                | b'\\'
+                | b'"'
+                | b'`'
+        )
+    })
+}
+
 fn start_completion(
     line: &LineBuffer,
     term_cols: u16,
@@ -864,8 +923,21 @@ fn start_completion(
 
     let text = line.text();
     let before_cursor = &text[..line.cursor()];
-    let word_start = before_cursor.rfind(' ').map(|i| i + 1).unwrap_or(0);
-    let partial = &before_cursor[word_start..];
+    let (word_start, in_single) = find_comp_word_start(before_cursor);
+    let raw_word = &before_cursor[word_start..];
+
+    // Strip quotes for filesystem lookup; track whether the word was quoted.
+    // Handles: open quote ('path), balanced quote ('path'), and tilde (~/'path').
+    let (partial, in_quote): (String, bool) = if in_single {
+        (raw_word.strip_prefix('\'').unwrap_or(raw_word).into(), true)
+    } else if let Some(rest) = raw_word.strip_prefix("~/'") {
+        let unquoted = rest.strip_suffix('\'').unwrap_or(rest);
+        (format!("~/{unquoted}"), true)
+    } else if let Some(inner) = raw_word.strip_prefix('\'') {
+        (inner.strip_suffix('\'').unwrap_or(inner).into(), true)
+    } else {
+        (raw_word.into(), false)
+    };
 
     // Detect if first word is cd → complete only directories
     let first_word = text.split_whitespace().next().unwrap_or("");
@@ -877,7 +949,7 @@ fn start_completion(
     } else if let Some(rest) = partial.strip_prefix("~/") {
         format!("{home}/{rest}")
     } else {
-        partial.to_string()
+        partial.clone()
     };
 
     // dir_prefix keeps the original (unexpanded) form for accept_completion
@@ -897,6 +969,7 @@ fn start_completion(
             rows,
             scroll: 0,
             dir_prefix,
+            in_quote,
         };
     }
 
@@ -941,6 +1014,7 @@ fn start_completion(
             rows,
             scroll: 0,
             dir_prefix: user_root,
+            in_quote,
         };
     }
 
@@ -952,6 +1026,7 @@ fn start_completion(
         rows: 0,
         scroll: 0,
         dir_prefix: String::new(),
+        in_quote,
     }
 }
 
@@ -1008,17 +1083,31 @@ fn accept_completion(line: &mut LineBuffer, state: &CompletionState) {
 
     let text = line.text().to_string();
     let before_cursor = &text[..line.cursor()];
-    let word_start = before_cursor.rfind(' ').map(|i| i + 1).unwrap_or(0);
+    let (word_start, _) = find_comp_word_start(before_cursor);
     let after_cursor = &text[line.cursor()..];
 
-    let mut completion = state.dir_prefix.clone();
-    completion.push_str(name);
+    let mut inner = state.dir_prefix.clone();
+    inner.push_str(name);
     if entry.is_dir {
-        completion.push('/');
+        inner.push('/');
     }
 
-    let new_text = format!("{}{}{}", &text[..word_start], completion, after_cursor);
-    let new_cursor_chars = text[..word_start].chars().count() + completion.chars().count();
+    // Single-quote the completion if it contains special characters.
+    // Always close the quote so the line is valid for immediate execution.
+    // On the next tab press, start_completion strips the outer quotes for lookup.
+    // Keep ~/ outside the quotes so tilde expansion still works.
+    let replacement = if state.in_quote || needs_quoting(&inner) {
+        if let Some(rest) = inner.strip_prefix("~/") {
+            format!("~/'{rest}'")
+        } else {
+            format!("'{inner}'")
+        }
+    } else {
+        inner
+    };
+
+    let new_text = format!("{}{}{}", &text[..word_start], replacement, after_cursor);
+    let new_cursor_chars = text[..word_start].chars().count() + replacement.chars().count();
     line.set(&new_text);
     // Position cursor after the completion
     line.move_home();

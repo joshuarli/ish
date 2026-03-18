@@ -155,6 +155,8 @@ pub struct CompletionState {
     pub scroll: usize,
     /// The prefix that was used to generate completions (directory portion).
     pub dir_prefix: String,
+    /// Whether the user was inside a single-quote when completion started.
+    pub in_quote: bool,
 }
 
 impl CompletionState {

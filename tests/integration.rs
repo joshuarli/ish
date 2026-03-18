@@ -458,6 +458,7 @@ fn completion_state_navigation_wraps() {
         rows,
         scroll: 0,
         dir_prefix: String::new(),
+        in_quote: false,
     };
 
     // Navigate down through all entries
@@ -485,6 +486,7 @@ fn completion_state_left_right_wrap() {
         rows,
         scroll: 0,
         dir_prefix: String::new(),
+        in_quote: false,
     };
 
     // Move left from first column should wrap to last
@@ -1871,6 +1873,7 @@ fn completion_state_selected_entry() {
         rows,
         scroll: 0,
         dir_prefix: String::new(),
+        in_quote: false,
     };
     assert_eq!(state.selected_name().unwrap(), "b");
 }
@@ -1886,6 +1889,7 @@ fn completion_state_selected_entry_out_of_bounds() {
         rows,
         scroll: 0,
         dir_prefix: String::new(),
+        in_quote: false,
     };
     assert!(state.selected_entry().is_none());
 }
@@ -1899,6 +1903,7 @@ fn completion_move_with_zero_rows() {
         rows: 0,
         scroll: 0,
         dir_prefix: String::new(),
+        in_quote: false,
     };
     // All moves should be no-ops when rows == 0
     state.move_up();
@@ -1919,6 +1924,7 @@ fn completion_navigation_single_entry() {
         rows,
         scroll: 0,
         dir_prefix: String::new(),
+        in_quote: false,
     };
     state.move_up();
     assert_eq!(state.selected, 0);
@@ -1941,6 +1947,7 @@ fn completion_move_right_wraps_to_first_col() {
         rows,
         scroll: 0,
         dir_prefix: String::new(),
+        in_quote: false,
     };
     // Move right until we wrap
     for _ in 0..20 {
@@ -1960,6 +1967,7 @@ fn completion_move_left_wraps_to_last_col() {
         rows,
         scroll: 0,
         dir_prefix: String::new(),
+        in_quote: false,
     };
     state.move_left(); // from col 0 should wrap to last col
     assert!(state.selected > 0);
