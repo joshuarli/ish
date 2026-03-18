@@ -10,31 +10,28 @@ pub struct History {
 impl History {
     pub fn load() -> Self {
         let path = history_path();
-        let entries = if path.exists() {
-            match fs::File::open(&path) {
-                Ok(f) => {
-                    let reader = io::BufReader::new(f);
-                    let mut seen = std::collections::HashSet::new();
-                    let mut entries: Vec<String> = Vec::new();
-                    // Read all lines, dedup keeping most recent
-                    let all_lines: Vec<String> = reader
-                        .lines()
-                        .map_while(Result::ok)
-                        .filter(|l| !l.is_empty())
-                        .collect();
-                    // Iterate in reverse to keep most recent, then reverse back
-                    for line in all_lines.into_iter().rev() {
-                        if seen.insert(line.clone()) {
-                            entries.push(line);
-                        }
+        // Open directly — avoids a redundant stat() from path.exists()
+        let entries = match fs::File::open(&path) {
+            Ok(f) => {
+                let reader = io::BufReader::new(f);
+                let mut seen = std::collections::HashSet::new();
+                let mut entries: Vec<String> = Vec::new();
+                // Read all lines, dedup keeping most recent
+                let all_lines: Vec<String> = reader
+                    .lines()
+                    .map_while(Result::ok)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                // Iterate in reverse to keep most recent, then reverse back
+                for line in all_lines.into_iter().rev() {
+                    if seen.insert(line.clone()) {
+                        entries.push(line);
                     }
-                    entries.reverse();
-                    entries
                 }
-                Err(_) => Vec::new(),
+                entries.reverse();
+                entries
             }
-        } else {
-            Vec::new()
+            Err(_) => Vec::new(),
         };
 
         Self { entries, path }

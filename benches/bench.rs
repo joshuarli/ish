@@ -837,15 +837,13 @@ fn bench_startup(c: &mut Criterion) {
     // Full cold startup in a git repo (this repo).
     // Skips terminal setup (requires real tty) and signal::init (creates
     // pipe per call). Everything else mirrors main() order.
-    // No PATH cache build — commands resolve via scan_path on demand.
+    // denv::init() is now deferred to first cd — not part of startup.
     group.bench_function("git_repo", |b| {
         b.iter(|| {
             let _history = black_box(History::load());
 
             let mut aliases = AliasMap::new();
             ish::config::load(&mut aliases, None);
-
-            let _denv = black_box(ish::denv::init());
 
             // Fresh prompt — git cache is cold
             let mut p = prompt::Prompt::new();
@@ -863,8 +861,6 @@ fn bench_startup(c: &mut Criterion) {
 
             let mut aliases = AliasMap::new();
             ish::config::load(&mut aliases, None);
-
-            let _denv = black_box(ish::denv::init());
 
             let mut p = prompt::Prompt::new();
             black_box(p.render(0));

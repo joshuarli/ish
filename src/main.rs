@@ -18,7 +18,7 @@ struct Shell {
     prompt: prompt::Prompt,
     job: Option<Job>,
     exit_warned: bool,
-    denv_active: bool,
+    denv_active: Option<bool>, // None = unchecked, defers scan_path to first use
     orig_termios: libc::termios,
     signal_fd: RawFd,
     home: String,
@@ -91,11 +91,9 @@ fn print_help() {
 fn main() {
     let cli = parse_args();
 
-    // Set $SHELL to our own binary path
-    if let Ok(exe) = std::env::current_exe() {
-        // SAFETY: single-threaded shell, no other threads reading env
-        unsafe { std::env::set_var("SHELL", exe) };
-    }
+    // Unset $SHELL — ish is not POSIX, don't confuse child processes
+    // SAFETY: single-threaded shell, no other threads reading env
+    unsafe { std::env::remove_var("SHELL") };
 
     // Save original termios
     let orig_termios = match term::save_termios() {
@@ -111,7 +109,8 @@ fn main() {
     unsafe {
         let pid = libc::getpid();
         let _ = libc::setpgid(pid, pid);
-        let _ = libc::tcsetpgrp(0, libc::getpgrp());
+        // pgid == pid after setpgid above, no need for getpgrp() syscall
+        let _ = libc::tcsetpgrp(0, pid);
     }
 
     // Initialize signals
@@ -130,7 +129,7 @@ fn main() {
         prompt: prompt::Prompt::new(),
         job: None,
         exit_warned: false,
-        denv_active: false,
+        denv_active: None,
         orig_termios,
         signal_fd,
         home: home.clone(),
@@ -142,8 +141,7 @@ fn main() {
         config::load(&mut shell.aliases, cli.config.as_deref());
     }
 
-    // Initialize denv (auto .envrc/.env loading)
-    shell.denv_active = denv::init();
+    // denv init is deferred — scan_path("denv") runs on first cd, not startup
 
     // Main loop
     loop {
@@ -240,7 +238,8 @@ fn main() {
                             }
 
                             // Handle `denv allow|deny|reload` — apply output to env
-                            if first == "denv" && shell.denv_active {
+                            if first == "denv" && *shell.denv_active.get_or_insert_with(denv::init)
+                            {
                                 let args: Vec<String> =
                                     cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
                                 if let Some(_path_modified) = denv::command(&args) {
@@ -299,7 +298,7 @@ fn main() {
 
                         if is_cd {
                             shell.prompt.invalidate_git();
-                            if shell.denv_active {
+                            if *shell.denv_active.get_or_insert_with(denv::init) {
                                 denv::on_cd();
                             }
                         }
