@@ -237,7 +237,30 @@ fn main() {
                                     .map(|s| parse::unescape(s))
                                     .and_then(|s| s.parse().ok())
                                     .unwrap_or(0);
+                                shell.history.save_cache();
                                 std::process::exit(code);
+                            }
+
+                            // Handle `history` builtin
+                            if first == "history" {
+                                let sub = cmd.argv.get(1).map(|s| parse::unescape(s));
+                                match sub.as_deref() {
+                                    None => {
+                                        for i in 0..shell.history.len() {
+                                            println!("{}", shell.history.get(i));
+                                        }
+                                        shell.last_status = 0;
+                                    }
+                                    Some("compact") => {
+                                        shell.history.compact();
+                                        shell.last_status = 0;
+                                    }
+                                    Some(other) => {
+                                        eprintln!("ish: history: unknown subcommand: {other}");
+                                        shell.last_status = 1;
+                                    }
+                                }
+                                continue;
                             }
 
                             // Handle `copy-scrollback` — OSC 52 clipboard
@@ -323,7 +346,10 @@ fn main() {
                     }
                 }
             }
-            ReadResult::Exit => break,
+            ReadResult::Exit => {
+                shell.history.compact();
+                break;
+            }
             ReadResult::Empty => {}
         }
     }

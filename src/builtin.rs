@@ -12,6 +12,7 @@ const SPECIAL_BUILTINS: &[&str] = &[
     "unset",
     "alias",
     "copy-scrollback",
+    "history",
 ];
 
 /// All builtins.
@@ -32,6 +33,7 @@ const ALL_BUILTINS: &[&str] = &[
     "true",
     "false",
     "copy-scrollback",
+    "history",
 ];
 
 pub fn is_builtin(name: &str) -> bool {

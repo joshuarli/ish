@@ -2,7 +2,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const CACHE_MAGIC: &[u8; 4] = b"ISH\x01";
+const CACHE_HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + text_size + entry_count + arena_size
 
 fn hash_str(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
@@ -15,6 +18,8 @@ pub struct History {
     arena: String,
     /// (start, len) byte offsets into `arena` for each entry.
     offsets: Vec<(u32, u16)>,
+    /// Ordered hashes parallel to `offsets` — for cache serialization.
+    hash_vec: Vec<u64>,
     /// Hash index for O(1) duplicate checks in add().
     hashes: HashSet<u64>,
     path: PathBuf,
@@ -23,14 +28,34 @@ pub struct History {
 impl History {
     pub fn load() -> Self {
         let path = history_path();
-        let (arena, offsets, hashes) = match fs::read(&path) {
+        let text_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+        // Try binary cache fast-path
+        if text_size > 0
+            && let Some(cached) = Self::load_from_cache(text_size, &path)
+        {
+            return cached;
+        }
+
+        // Fall through to text file parsing
+        let hist = Self::load_from_text(&path);
+
+        // Rebuild cache from fresh parse
+        if !hist.offsets.is_empty() {
+            hist.save_cache();
+        }
+
+        hist
+    }
+
+    fn load_from_text(path: &Path) -> Self {
+        let (arena, offsets, hash_vec, hashes) = match fs::read(path) {
             Ok(data) => {
                 let line_count = memchr_count(b'\n', &data);
                 let mut seen = HashSet::with_capacity(line_count);
                 let mut deduped: Vec<&str> = Vec::with_capacity(line_count);
                 let mut hashes_vec: Vec<u64> = Vec::with_capacity(line_count);
 
-                // rsplit iterates from end — first insert of each hash wins (= most recent)
                 for chunk in data.rsplit(|&b| b == b'\n') {
                     if let Ok(line) = std::str::from_utf8(chunk)
                         && !line.is_empty()
@@ -45,7 +70,6 @@ impl History {
                 deduped.reverse();
                 hashes_vec.reverse();
 
-                // Pack into a single arena allocation
                 let total: usize = deduped.iter().map(|s| s.len()).sum();
                 let mut arena = String::with_capacity(total);
                 let mut offsets = Vec::with_capacity(deduped.len());
@@ -55,17 +79,197 @@ impl History {
                     offsets.push((start, line.len() as u16));
                 }
 
-                (arena, offsets, hashes_vec.into_iter().collect())
+                let hashes = hashes_vec.iter().copied().collect();
+                (arena, offsets, hashes_vec, hashes)
             }
-            Err(_) => (String::new(), Vec::new(), HashSet::new()),
+            Err(_) => (String::new(), Vec::new(), Vec::new(), HashSet::new()),
         };
 
         Self {
             arena,
             offsets,
+            hash_vec,
             hashes,
-            path,
+            path: path.to_path_buf(),
         }
+    }
+
+    fn load_from_cache(text_file_size: u64, path: &Path) -> Option<Self> {
+        let data = fs::read(cache_path()).ok()?;
+
+        if data.len() < CACHE_HEADER_SIZE {
+            return None;
+        }
+        if &data[0..4] != CACHE_MAGIC {
+            return None;
+        }
+
+        let stored_text_size = u64::from_le_bytes(data[4..12].try_into().ok()?);
+        if stored_text_size != text_file_size {
+            return None;
+        }
+
+        let entry_count = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
+        let arena_size = u32::from_le_bytes(data[16..20].try_into().ok()?) as usize;
+
+        let expected = CACHE_HEADER_SIZE + entry_count * 8 + entry_count * 6 + arena_size;
+        if data.len() != expected {
+            return None;
+        }
+
+        let mut pos = CACHE_HEADER_SIZE;
+
+        // Read hashes
+        let mut hash_vec = Vec::with_capacity(entry_count);
+        let mut hashes = HashSet::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            let h = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+            hash_vec.push(h);
+            hashes.insert(h);
+            pos += 8;
+        }
+
+        // Read offsets
+        let mut offsets = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            let start = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
+            let len = u16::from_le_bytes(data[pos + 4..pos + 6].try_into().ok()?);
+            offsets.push((start, len));
+            pos += 6;
+        }
+
+        // Read arena
+        let arena = String::from_utf8(data[pos..pos + arena_size].to_vec()).ok()?;
+
+        Some(Self {
+            arena,
+            offsets,
+            hash_vec,
+            hashes,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Write binary cache from current in-memory state.
+    /// Atomic: writes to .tmp then renames.
+    pub fn save_cache(&self) {
+        let text_size = match fs::metadata(&self.path) {
+            Ok(m) => m.len(),
+            Err(_) => return,
+        };
+
+        let cache = cache_path();
+        let tmp = cache.with_extension("bin.tmp");
+
+        let entry_count = self.offsets.len();
+        let arena_bytes = self.arena.as_bytes();
+        let total = CACHE_HEADER_SIZE + entry_count * 8 + entry_count * 6 + arena_bytes.len();
+
+        let mut buf = Vec::with_capacity(total);
+
+        // Header
+        buf.extend_from_slice(CACHE_MAGIC);
+        buf.extend_from_slice(&text_size.to_le_bytes());
+        buf.extend_from_slice(&(entry_count as u32).to_le_bytes());
+        buf.extend_from_slice(&(arena_bytes.len() as u32).to_le_bytes());
+
+        // Hashes
+        for &h in &self.hash_vec {
+            buf.extend_from_slice(&h.to_le_bytes());
+        }
+
+        // Offsets
+        for &(start, len) in &self.offsets {
+            buf.extend_from_slice(&start.to_le_bytes());
+            buf.extend_from_slice(&len.to_le_bytes());
+        }
+
+        // Arena
+        buf.extend_from_slice(arena_bytes);
+
+        if fs::write(&tmp, &buf).is_ok() {
+            let _ = fs::rename(&tmp, &cache);
+        }
+    }
+
+    /// Re-read text file, dedup, rewrite text file + cache.
+    /// Uses flock to serialize across concurrent shells.
+    pub fn compact(&mut self) {
+        let lock = lock_path();
+        if let Some(parent) = lock.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        let lock_fd = match fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&lock)
+        {
+            Ok(f) => f,
+            Err(_) => {
+                self.save_cache();
+                return;
+            }
+        };
+
+        use std::os::fd::AsRawFd;
+        // Try non-blocking lock — skip if another shell is compacting
+        let rc = unsafe { libc::flock(lock_fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            self.save_cache();
+            return;
+        }
+
+        // Re-read text file under lock, dedup, rebuild
+        if let Ok(data) = fs::read(&self.path) {
+            let line_count = memchr_count(b'\n', &data);
+            let mut seen = HashSet::with_capacity(line_count);
+            let mut deduped: Vec<&str> = Vec::with_capacity(line_count);
+            let mut hashes_vec: Vec<u64> = Vec::with_capacity(line_count);
+
+            for chunk in data.rsplit(|&b| b == b'\n') {
+                if let Ok(line) = std::str::from_utf8(chunk)
+                    && !line.is_empty()
+                {
+                    let h = hash_str(line);
+                    if seen.insert(h) {
+                        deduped.push(line);
+                        hashes_vec.push(h);
+                    }
+                }
+            }
+            deduped.reverse();
+            hashes_vec.reverse();
+
+            // Rebuild arena
+            let total: usize = deduped.iter().map(|s| s.len()).sum();
+            let mut arena = String::with_capacity(total);
+            let mut offsets = Vec::with_capacity(deduped.len());
+            for line in &deduped {
+                let start = arena.len() as u32;
+                arena.push_str(line);
+                offsets.push((start, line.len() as u16));
+            }
+
+            // Rewrite text file (atomic rename)
+            let tmp_text = self.path.with_extension("compact_tmp");
+            if let Ok(mut f) = fs::File::create(&tmp_text) {
+                for line in &deduped {
+                    let _ = writeln!(f, "{line}");
+                }
+                let _ = fs::rename(&tmp_text, &self.path);
+            }
+
+            // Update in-memory state
+            self.arena = arena;
+            self.offsets = offsets;
+            self.hashes = hashes_vec.iter().copied().collect();
+            self.hash_vec = hashes_vec;
+        }
+
+        self.save_cache();
+        // lock released when lock_fd drops
     }
 
     /// Create from pre-existing entries (for testing/benchmarks).
@@ -73,16 +277,20 @@ impl History {
         let total: usize = entries.iter().map(|e| e.len()).sum();
         let mut arena = String::with_capacity(total);
         let mut offsets = Vec::with_capacity(entries.len());
+        let mut hash_vec = Vec::with_capacity(entries.len());
         let mut hashes = HashSet::with_capacity(entries.len());
         for e in &entries {
             let start = arena.len() as u32;
+            let h = hash_str(e);
             arena.push_str(e);
             offsets.push((start, e.len() as u16));
-            hashes.insert(hash_str(e));
+            hash_vec.push(h);
+            hashes.insert(h);
         }
         Self {
             arena,
             offsets,
+            hash_vec,
             hashes,
             path: PathBuf::from("/dev/null"),
         }
@@ -99,14 +307,22 @@ impl History {
 
         let h = hash_str(line);
         if self.hashes.contains(&h) {
-            // Likely duplicate — remove prior occurrence
-            self.offsets.retain(|&(start, len)| {
-                &self.arena[start as usize..start as usize + len as usize] != line
-            });
+            // Likely duplicate — remove prior occurrence from both parallel vecs
+            let mut i = 0;
+            while i < self.offsets.len() {
+                let (start, len) = self.offsets[i];
+                if &self.arena[start as usize..start as usize + len as usize] == line {
+                    self.offsets.remove(i);
+                    self.hash_vec.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
         }
         let start = self.arena.len() as u32;
         self.arena.push_str(line);
         self.offsets.push((start, line.len() as u16));
+        self.hash_vec.push(h);
         self.hashes.insert(h);
 
         // Append to file
@@ -294,6 +510,22 @@ fn history_path() -> PathBuf {
     }
 }
 
+fn cache_path() -> PathBuf {
+    let mut p = history_path();
+    let mut name = p.file_name().unwrap_or_default().to_os_string();
+    name.push(".bin");
+    p.set_file_name(name);
+    p
+}
+
+fn lock_path() -> PathBuf {
+    let mut p = history_path();
+    let mut name = p.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    p.set_file_name(name);
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +542,24 @@ mod tests {
     fn subsequence_no_match() {
         let q: Vec<char> = "xyz".chars().collect();
         assert!(subsequence_match(&q, "hello").is_none());
+    }
+
+    #[test]
+    fn hash_vec_sync_after_add() {
+        let entries: Vec<String> = vec!["aaa".into(), "bbb".into(), "ccc".into()];
+        let mut h = History::from_entries(entries);
+        assert_eq!(h.hash_vec.len(), 3);
+        assert_eq!(h.offsets.len(), 3);
+
+        // Add duplicate — should remove old and append new
+        h.add("bbb");
+        assert_eq!(h.offsets.len(), 3); // aaa, ccc, bbb
+        assert_eq!(h.hash_vec.len(), 3);
+        assert_eq!(h.get(h.len() - 1), "bbb");
+
+        // Add new
+        h.add("ddd");
+        assert_eq!(h.offsets.len(), 4);
+        assert_eq!(h.hash_vec.len(), 4);
     }
 }
