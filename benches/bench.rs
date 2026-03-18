@@ -685,6 +685,46 @@ fn bench_completion_fs(c: &mut Criterion) {
         b.iter(|| black_box(complete::complete_path("/usr/bin/z", false)));
     });
 
+    // Environment variable completion
+    group.bench_function("complete_env_all", |b| {
+        b.iter(|| black_box(complete::complete_env("$")));
+    });
+
+    group.bench_function("complete_env_prefix", |b| {
+        b.iter(|| black_box(complete::complete_env("$HO")));
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// denv output parsing
+// ---------------------------------------------------------------------------
+
+fn bench_denv(c: &mut Criterion) {
+    let mut group = c.benchmark_group("denv");
+
+    // Typical denv export output: 5-10 vars
+    let small_output = "export FOO='bar';\nexport BAZ='qux';\nexport PATH='/usr/bin:/bin';\n";
+    group.bench_function("parse_small_output", |b| {
+        b.iter(|| black_box(ish::denv::apply_bash_output_bench(small_output)));
+    });
+
+    // Larger: 50 vars
+    let large_output: String = (0..50)
+        .map(|i| format!("export DENV_BENCH_{i}='value_{i}';"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    group.bench_function("parse_50_vars", |b| {
+        b.iter(|| black_box(ish::denv::apply_bash_output_bench(&large_output)));
+    });
+
+    // Mixed export + unset
+    let mixed = "export A='1';\nexport B='two';\nunset C;\nexport D='it'\\''s here';\nunset E;\n";
+    group.bench_function("parse_mixed", |b| {
+        b.iter(|| black_box(ish::denv::apply_bash_output_bench(mixed)));
+    });
+
     group.finish();
 }
 
@@ -778,6 +818,18 @@ fn bench_alloc_audit(c: &mut Criterion) {
         });
         eprintln!("  [alloc] complete_path_src:         {stats}");
 
+        let stats = measure_allocs(|| {
+            let _ = black_box(complete::complete_env("$HO"));
+        });
+        eprintln!("  [alloc] complete_env_prefix:       {stats}");
+
+        let stats = measure_allocs(|| {
+            let _ = black_box(ish::denv::apply_bash_output_bench(
+                "export A='1';\nexport B='two';\nunset C;\n",
+            ));
+        });
+        eprintln!("  [alloc] denv_parse_3_directives:   {stats}");
+
         eprintln!();
     }
 
@@ -827,6 +879,7 @@ criterion_group!(
         bench_path_lookup,
         bench_alias,
         bench_completion_fs,
+        bench_denv,
         bench_alloc_audit,
 );
 criterion_main!(benches);

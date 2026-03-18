@@ -216,6 +216,25 @@ fn apply_bash_output(output: &str) {
     }
 }
 
+/// Benchmark-only: parse denv output lines without mutating environment.
+/// Returns the number of directives parsed.
+pub fn apply_bash_output_bench(output: &str) -> usize {
+    let mut count = 0;
+    for line in output.lines() {
+        let line = line.trim_end_matches(';');
+        if let Some(rest) = line.strip_prefix("export ") {
+            if let Some(eq) = rest.find('=') {
+                let _key = &rest[..eq];
+                let _value = unquote_bash(&rest[eq + 1..]);
+                count += 1;
+            }
+        } else if line.strip_prefix("unset ").is_some() {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Unquote a bash single-quoted string: `'value'` → `value`, `'\''` → `'`.
 fn unquote_bash(s: &str) -> String {
     let s = s.strip_prefix('\'').unwrap_or(s);

@@ -9,7 +9,7 @@ ish is a minimal interactive-only shell written in Rust, inspired by fish-shell.
 - **Single dependency**: `libc` (for system calls). No other crates at runtime.
 - **No subprocessing for shell operations**: Directory listing, git branch detection, glob expansion, prompt rendering — all implemented natively. Only user commands get fork/exec'd.
 - **Interactive only**: No scripting, no POSIX compatibility, no `source`, no control flow (`if`/`for`/`while`/`function`). Refuses to run script files.
-- **Single binary crate**: 17 library modules + `main.rs`. No workspace, no proc macros.
+- **Single binary crate**: 19 library modules + `main.rs`. No workspace, no proc macros.
 
 ## Architecture
 
@@ -27,7 +27,7 @@ User types → input.rs (decode bytes → KeyEvent)
 ```
 src/
   main.rs      — Entry point, shell loop, Shell struct, Mode enum, all keybind dispatch
-  lib.rs       — Module declarations (17 pub mod statements)
+  lib.rs       — Module declarations (19 pub mod statements)
   term.rs      — Raw mode (termios), terminal size, TermWriter (buffered VT100 output)
   input.rs     — Byte reader, VT100 escape decoder → KeyEvent, modifier parsing
   line.rs      — Line editing buffer: cursor, insert/delete, word ops, kill ring
@@ -39,11 +39,13 @@ src/
   builtin.rs   — cd, exit, fg, set, unset, alias, l, c, w/which/type, echo, pwd, true, false
   ls.rs        — Native directory listing (l builtin): stat, permissions, color — like ls -plAhG
   history.rs   — Append-only file, in-memory Vec, prefix search, fuzzy subsequence search
-  complete.rs  — File completion via readdir, grid layout (column-major), arrow navigation
+  complete.rs  — File + env var completion via readdir/$-prefix, grid layout, arrow navigation
   alias.rs     — AliasMap (HashMap wrapper), inline expansion on space
   config.rs    — Parse ~/.config/ish/config.ish (set + alias directives)
   job.rs       — Single suspended job (Ctrl+Z / fg)
   signal.rs    — Self-pipe pattern for SIGINT/SIGTSTP/SIGCHLD/SIGWINCH
+  sys.rs       — Platform-specific syscall wrappers (pipe2, close_range, execveat, posix_spawn)
+  denv.rs      — Native denv integration: auto .envrc/.env loading on cd via fork/exec
   error.rs     — Shell error type (Io, Msg, GlobNoMatch, BadSubstitution)
 ```
 
@@ -59,7 +61,7 @@ src/
 
 **Tab completion:**
 1. Extract the word under cursor from `LineBuffer`
-2. `complete::complete_path()` does readdir + prefix filter
+2. `$` prefix → `complete::complete_env()` (env var names); otherwise `complete::complete_path()` (readdir + prefix filter)
 3. Single match → auto-insert. Multiple → `compute_grid()` for column-major layout
 4. Arrow keys navigate the grid; Enter accepts; Escape cancels
 
@@ -89,7 +91,7 @@ CompletionState { entries: Vec<CompEntry>, selected: usize, cols: usize, rows: u
 CompEntry { name: String, is_dir: bool, is_link: bool, is_exec: bool }
 
 // main.rs — Shell state (lives in main.rs, not the library)
-Shell { aliases, last_status, prev_dir, rows, cols, history, prompt, job, path_cache, ... }
+Shell { aliases, last_status, prev_dir, rows, cols, history, prompt, job, path_cache, denv_active, ... }
 ```
 
 ## Supported Syntax
@@ -161,7 +163,7 @@ cargo +nightly fuzz run fuzz_parse  # Fuzz the parser (requires cargo-fuzz)
 ## Test Structure
 
 ### Unit tests (`cargo test --lib`)
-26 tests embedded in source modules (input.rs, expand.rs, etc.) for isolated logic.
+37 tests embedded in source modules (input.rs, expand.rs, complete.rs, denv.rs, etc.) for isolated logic.
 
 ### Integration tests (`tests/integration.rs` — 205 tests)
 Exercises the library API directly: parsing, expansion, line buffer, history, completion grid, aliases, config, prompt, builtins, ls. Achieves 95%+ coverage of all library modules.
@@ -171,10 +173,10 @@ Key testing patterns:
 - All file-dependent tests use temp directories with absolute paths
 - Prompt git tests assert on structure (`ends_with(" $ ")`) not exact branch names
 
-### PTY tests (`tests/pty.rs` — 44 tests)
-Spawns the real `ish` binary in a pseudo-terminal and drives it with keystrokes. Each test gets an isolated HOME directory with controlled files, history, and config. Tests the full shell loop: raw mode, prompt rendering, line editing, completion, history search, aliases, pipes, redirects, globs, exit handling.
+### PTY tests (`tests/pty.rs` — 54 tests)
+Spawns the real `ish` binary in a pseudo-terminal and drives it with keystrokes. Each test gets an isolated HOME directory with controlled files, history, and config. Tests the full shell loop: raw mode, prompt rendering, line editing, completion, history search, aliases, pipes, redirects, globs, denv integration, env var completion, exit handling.
 
-The PTY harness (`PtyShell`) uses `openpty()` + `fork()` to create an isolated terminal session with a fixed 80x24 size. Assertions operate on visible terminal output with ANSI stripping.
+The PTY harness (`PtyShell`) uses `openpty()` + `fork()` to create an isolated terminal session with a fixed 80x24 size. Assertions operate on visible terminal output with ANSI stripping. Drop uses WNOHANG polling (not blocking waitpid) to avoid hangs on macOS when the PTY master fd is still open.
 
 ### Fuzz targets (`fuzz/fuzz_targets/` — 5 targets)
 - `fuzz_parse` — Parser never panics on any input
@@ -183,8 +185,8 @@ The PTY harness (`PtyShell`) uses `openpty()` + `fork()` to create an isolated t
 - `fuzz_config` — Config parsing functions never panic
 - `fuzz_history` — Fuzzy match positions valid and ascending
 
-### Benchmarks (`benches/bench.rs` — 14 groups)
-Criterion benchmarks with a custom counting allocator that tracks heap allocations and bytes. Covers: parsing, expansion, line buffer ops, history search, completion grid, prompt rendering, end-to-end parse+expand, PATH cache, alias lookup, `ls` builtin, and filesystem completion. Includes an allocation audit section that prints per-operation allocation counts.
+### Benchmarks (`benches/bench.rs` — 15 groups)
+Criterion benchmarks with a custom counting allocator that tracks heap allocations and bytes. Covers: parsing, expansion, line buffer ops, history search, completion grid, prompt rendering, end-to-end parse+expand, PATH cache, alias lookup, `ls` builtin, filesystem completion, env var completion, and denv output parsing. Includes an allocation audit section that prints per-operation allocation counts.
 
 ## Design Principles
 
@@ -196,7 +198,7 @@ Criterion benchmarks with a custom counting allocator that tracks heap allocatio
 
 **Minimal allocation.** Hot paths (prompt render, key dispatch, alias lookup) are profiled for allocation count. The benchmark suite tracks allocations per operation. Avoid unnecessary String clones; prefer `&str` where possible.
 
-**Unsafe is contained.** All unsafe code is in 4 modules: `term.rs` (termios), `signal.rs` (signal handlers), `exec.rs` (fork/exec), and `input.rs` (raw fd reads). The rest of the codebase is safe Rust.
+**Unsafe is contained.** All unsafe code is in 6 modules: `term.rs` (termios), `signal.rs` (signal handlers), `exec.rs` (fork/exec), `input.rs` (raw fd reads), `sys.rs` (platform syscalls), and `denv.rs` (fork/exec for denv subprocess). The rest of the codebase is safe Rust.
 
 ## Common Tasks for Agents
 
@@ -214,27 +216,29 @@ Criterion benchmarks with a custom counting allocator that tracks heap allocatio
 
 | File | Lines |
 |------|-------|
-| main.rs | 884 |
-| exec.rs | 574 |
-| parse.rs | 446 |
-| expand.rs | 402 |
+| main.rs | 956 |
+| exec.rs | 614 |
+| parse.rs | 468 |
+| expand.rs | 415 |
 | input.rs | 333 |
-| prompt.rs | 295 |
+| line.rs | 305 |
+| denv.rs | 303 |
+| prompt.rs | 302 |
 | ls.rs | 288 |
-| line.rs | 265 |
-| render.rs | 247 |
+| complete.rs | 252 |
 | builtin.rs | 248 |
-| complete.rs | 235 |
-| history.rs | 196 |
+| render.rs | 247 |
+| sys.rs | 222 |
+| history.rs | 219 |
 | config.rs | 161 |
 | term.rs | 158 |
-| signal.rs | 88 |
+| signal.rs | 81 |
 | error.rs | 55 |
 | alias.rs | 32 |
-| lib.rs | 17 |
-| job.rs | 4 |
-| **Total src/** | **4,898** |
+| lib.rs | 19 |
+| job.rs | 17 |
+| **Total src/** | **5,645** |
 | tests/integration.rs | 2,453 |
-| tests/pty.rs | 1,027 |
+| tests/pty.rs | 1,324 |
 | benches/bench.rs | 832 |
-| **Total** | **9,210** |
+| **Total** | **10,254** |
