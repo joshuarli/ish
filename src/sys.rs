@@ -109,7 +109,7 @@ pub unsafe fn exec_command(cmd: &std::ffi::CStr, argv: *const *const libc::c_cha
     {
         // Absolute or relative path — exec directly
         if cmd.to_bytes().contains(&b'/') {
-            libc::execve(cmd.as_ptr(), argv, get_environ());
+            unsafe { libc::execve(cmd.as_ptr(), argv, get_environ()) };
             return;
         }
 
@@ -121,22 +121,26 @@ pub unsafe fn exec_command(cmd: &std::ffi::CStr, argv: *const *const libc::c_cha
                     continue;
                 }
                 if let Ok(c_dir) = std::ffi::CString::new(dir) {
-                    let dirfd = libc::openat(
-                        libc::AT_FDCWD,
-                        c_dir.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                    );
+                    let dirfd = unsafe {
+                        libc::openat(
+                            libc::AT_FDCWD,
+                            c_dir.as_ptr(),
+                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                        )
+                    };
                     if dirfd >= 0 {
-                        libc::syscall(
-                            libc::SYS_execveat,
-                            dirfd,
-                            cmd.as_ptr(),
-                            argv,
-                            get_environ(),
-                            0,
-                        );
+                        unsafe {
+                            libc::syscall(
+                                libc::SYS_execveat,
+                                dirfd,
+                                cmd.as_ptr(),
+                                argv,
+                                get_environ(),
+                                0,
+                            )
+                        };
                         // execveat returned — exec failed, try next dir
-                        libc::close(dirfd);
+                        unsafe { libc::close(dirfd) };
                     }
                 }
             }

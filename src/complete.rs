@@ -650,17 +650,17 @@ mod tests {
     }
 
     #[test]
-    fn partial_path_absolute_tilde_expanded() {
-        let home = std::env::var("HOME").unwrap();
-        let expanded = format!("{home}/de/s");
-        let (comp, groups) = complete_partial_path(&expanded, true);
+    fn partial_path_absolute() {
+        // Use /usr as a stable path that exists on all platforms.
+        // /usr/bi → should resolve to /usr/bin, then find entries starting with "t"
+        let (comp, groups) = complete_partial_path("/usr/bi/t", false);
         let all_names: Vec<&str> = groups
             .iter()
             .flat_map(|(_, start, count)| (*start..*start + *count).map(|i| comp.name(i)))
             .collect();
         assert!(
-            all_names.contains(&"sentry"),
-            "expected 'sentry' in {all_names:?}"
+            all_names.iter().any(|n| n.starts_with("t")),
+            "expected entries starting with 't' in /usr/bin: {all_names:?}"
         );
     }
 }
