@@ -28,21 +28,18 @@ pub struct History {
 impl History {
     pub fn load() -> Self {
         let path = history_path();
-        let text_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
-        // Try binary cache fast-path
-        if text_size > 0
-            && let Some(cached) = Self::load_from_cache(text_size, &path)
-        {
-            return cached;
+        // Try loading binary cache, then merge any new entries from the text file
+        if let Some(mut hist) = Self::load_from_cache(&path) {
+            hist.merge_text_tail();
+            return hist;
         }
 
-        // Fall through to text file parsing
+        // No cache — full text parse, then write cache + truncate text file
         let hist = Self::load_from_text(&path);
-
-        // Rebuild cache from fresh parse
         if !hist.offsets.is_empty() {
             hist.save_cache();
+            let _ = fs::File::create(&path); // truncate
         }
 
         hist
@@ -94,7 +91,7 @@ impl History {
         }
     }
 
-    fn load_from_cache(text_file_size: u64, path: &Path) -> Option<Self> {
+    fn load_from_cache(path: &Path) -> Option<Self> {
         let data = fs::read(cache_path()).ok()?;
 
         if data.len() < CACHE_HEADER_SIZE {
@@ -104,11 +101,7 @@ impl History {
             return None;
         }
 
-        let stored_text_size = u64::from_le_bytes(data[4..12].try_into().ok()?);
-        if stored_text_size != text_file_size {
-            return None;
-        }
-
+        // Skip stored text_size field (bytes 4..12) — no longer used for staleness
         let entry_count = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
         let arena_size = u32::from_le_bytes(data[16..20].try_into().ok()?) as usize;
 
@@ -150,13 +143,47 @@ impl History {
         })
     }
 
-    /// Write binary cache from current in-memory state.
-    /// Atomic: writes to .tmp then renames.
-    pub fn save_cache(&self) {
-        let text_size = match fs::metadata(&self.path) {
-            Ok(m) => m.len(),
-            Err(_) => return,
+    /// Merge new entries from the text file (appended since last cache build).
+    /// Deduplicates against existing hashes. Text entries win over cache
+    /// entries (they're newer).
+    fn merge_text_tail(&mut self) {
+        let data = match fs::read(&self.path) {
+            Ok(d) if !d.is_empty() => d,
+            _ => return,
         };
+
+        // Parse tail entries — these are newer, so they take priority
+        for chunk in data.split(|&b| b == b'\n') {
+            if let Ok(line) = std::str::from_utf8(chunk)
+                && !line.is_empty()
+            {
+                let h = hash_str(line);
+                if self.hashes.contains(&h) {
+                    // Duplicate — remove old occurrence, add at end
+                    let mut i = 0;
+                    while i < self.offsets.len() {
+                        let (start, len) = self.offsets[i];
+                        if &self.arena[start as usize..start as usize + len as usize] == line {
+                            self.offsets.remove(i);
+                            self.hash_vec.remove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                let start = self.arena.len() as u32;
+                self.arena.push_str(line);
+                self.offsets.push((start, line.len() as u16));
+                self.hash_vec.push(h);
+                self.hashes.insert(h);
+            }
+        }
+    }
+
+    /// Write binary cache from current in-memory state, then truncate text file.
+    /// Atomic: writes cache to .tmp then renames.
+    pub fn save_cache(&self) {
+        let text_size: u64 = 0; // reserved field
 
         let cache = cache_path();
         let tmp = cache.with_extension("bin.tmp");
@@ -187,12 +214,14 @@ impl History {
         // Arena
         buf.extend_from_slice(arena_bytes);
 
-        if fs::write(&tmp, &buf).is_ok() {
-            let _ = fs::rename(&tmp, &cache);
+        if fs::write(&tmp, &buf).is_ok() && fs::rename(&tmp, &cache).is_ok() {
+            // Cache written — truncate text file since its contents
+            // are now in the cache. New commands append to a fresh file.
+            let _ = fs::File::create(&self.path);
         }
     }
 
-    /// Re-read text file, dedup, rewrite text file + cache.
+    /// Merge text tail into cache, dedup, rewrite cache + truncate text.
     /// Uses flock to serialize across concurrent shells.
     pub fn compact(&mut self) {
         let lock = lock_path();
@@ -221,53 +250,10 @@ impl History {
             return;
         }
 
-        // Re-read text file under lock, dedup, rebuild
-        if let Ok(data) = fs::read(&self.path) {
-            let line_count = memchr_count(b'\n', &data);
-            let mut seen = HashSet::with_capacity(line_count);
-            let mut deduped: Vec<&str> = Vec::with_capacity(line_count);
-            let mut hashes_vec: Vec<u64> = Vec::with_capacity(line_count);
+        // Re-read text tail from other shells, merge into our state
+        self.merge_text_tail();
 
-            for chunk in data.rsplit(|&b| b == b'\n') {
-                if let Ok(line) = std::str::from_utf8(chunk)
-                    && !line.is_empty()
-                {
-                    let h = hash_str(line);
-                    if seen.insert(h) {
-                        deduped.push(line);
-                        hashes_vec.push(h);
-                    }
-                }
-            }
-            deduped.reverse();
-            hashes_vec.reverse();
-
-            // Rebuild arena
-            let total: usize = deduped.iter().map(|s| s.len()).sum();
-            let mut arena = String::with_capacity(total);
-            let mut offsets = Vec::with_capacity(deduped.len());
-            for line in &deduped {
-                let start = arena.len() as u32;
-                arena.push_str(line);
-                offsets.push((start, line.len() as u16));
-            }
-
-            // Rewrite text file (atomic rename)
-            let tmp_text = self.path.with_extension("compact_tmp");
-            if let Ok(mut f) = fs::File::create(&tmp_text) {
-                for line in &deduped {
-                    let _ = writeln!(f, "{line}");
-                }
-                let _ = fs::rename(&tmp_text, &self.path);
-            }
-
-            // Update in-memory state
-            self.arena = arena;
-            self.offsets = offsets;
-            self.hashes = hashes_vec.iter().copied().collect();
-            self.hash_vec = hashes_vec;
-        }
-
+        // save_cache writes cache + truncates text file
         self.save_cache();
         // lock released when lock_fd drops
     }
