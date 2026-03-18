@@ -46,6 +46,7 @@ $(PGO_MERGED):
 
 install: release-pgo
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
+	codesign -fs - ~/usr/bin/$(NAME)
 
 # So we don't do duplicate work (building both debug and release) in CI.
 test-ci:
