@@ -183,8 +183,11 @@ impl LineBuffer {
     /// Yank (paste) from kill ring (Ctrl+Y).
     pub fn yank(&mut self) {
         if !self.kill_ring.is_empty() {
-            let text = self.kill_ring.clone();
+            // Take the kill ring to avoid borrow conflict with insert_str,
+            // then restore it. mem::take replaces with empty String (no alloc).
+            let text = std::mem::take(&mut self.kill_ring);
             self.insert_str(&text);
+            self.kill_ring = text;
         }
     }
 

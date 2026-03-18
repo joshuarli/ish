@@ -2110,7 +2110,7 @@ fn comp_entry_display_link() {
         is_link: true,
         is_exec: false,
     };
-    assert_eq!(e.display_name(), "link");
+    assert_eq!(&*e.display_name(), "link");
     assert_eq!(e.display_width(), 4);
 }
 
@@ -2122,7 +2122,7 @@ fn comp_entry_display_exec() {
         is_link: false,
         is_exec: true,
     };
-    assert_eq!(e.display_name(), "script");
+    assert_eq!(&*e.display_name(), "script");
 }
 
 // ---------------------------------------------------------------------------

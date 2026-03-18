@@ -100,7 +100,8 @@ pub fn grid_visible_rows(state: &CompletionState) -> usize {
 }
 
 fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) {
-    let mut col_widths = vec![0usize; state.cols];
+    // Stack array — max 6 columns, no heap allocation per grid draw.
+    let mut col_widths = [0usize; 6];
     for (i, entry) in state.entries.iter().enumerate() {
         let col = i / state.rows;
         if col < state.cols {
@@ -122,7 +123,7 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) 
         tw.carriage_return();
         tw.clear_to_end_of_line();
 
-        for (col, &col_w) in col_widths.iter().enumerate().take(state.cols) {
+        for (col, &col_w) in col_widths[..state.cols].iter().enumerate() {
             let idx = col * state.rows + row;
             if idx >= state.entries.len() {
                 break;
@@ -239,7 +240,8 @@ fn write_colored_entry(tw: &mut TermWriter, entry: &CompEntry) {
         tw.write_str("\x1b[32m"); // green
     }
 
-    tw.write_str(&entry.display_name());
+    // Write name + "/" for dirs directly — no heap allocation.
+    entry.write_display_name(tw);
 
     if entry.is_link || entry.is_dir || entry.is_exec {
         tw.write_str("\x1b[0m");

@@ -137,20 +137,39 @@ impl TermWriter {
 
     pub fn move_cursor_right(&mut self, n: u16) {
         if n > 0 {
-            self.write_str(&format!("\x1b[{}C", n));
+            self.push_csi(n, b'C');
         }
     }
 
     pub fn move_cursor_up(&mut self, n: u16) {
         if n > 0 {
-            self.write_str(&format!("\x1b[{}A", n));
+            self.push_csi(n, b'A');
         }
     }
 
     pub fn move_cursor_down(&mut self, n: u16) {
         if n > 0 {
-            self.write_str(&format!("\x1b[{}B", n));
+            self.push_csi(n, b'B');
         }
+    }
+
+    /// Write CSI sequence `\x1b[{n}{suffix}` directly into the buffer.
+    /// Inline u16→ASCII avoids format!() heap allocation on every cursor move.
+    fn push_csi(&mut self, n: u16, suffix: u8) {
+        self.buf.extend_from_slice(b"\x1b[");
+        let mut tmp = [0u8; 5];
+        let mut i = tmp.len();
+        let mut val = n;
+        loop {
+            i -= 1;
+            tmp[i] = b'0' + (val % 10) as u8;
+            val /= 10;
+            if val == 0 {
+                break;
+            }
+        }
+        self.buf.extend_from_slice(&tmp[i..]);
+        self.buf.push(suffix);
     }
 }
 

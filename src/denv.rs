@@ -74,7 +74,11 @@ fn fast_path_ok() -> bool {
 
     // Must be in or under the cached directory
     let pwd = std::env::var("PWD").unwrap_or_default();
-    if pwd != dir && !pwd.starts_with(&format!("{dir}/")) {
+    if pwd != dir
+        && !(pwd.len() > dir.len()
+            && pwd.as_bytes().get(dir.len()) == Some(&b'/')
+            && pwd.starts_with(dir))
+    {
         return false;
     }
 
@@ -84,8 +88,14 @@ fn fast_path_ok() -> bool {
     }
 
     let sentinel_mt = file_mtime(&sentinel);
-    let envrc_path = format!("{dir}/.envrc");
-    let dotenv_path = format!("{dir}/.env");
+    // Build paths without format! — reuse a single String buffer.
+    let mut path_buf = String::with_capacity(dir.len() + 8);
+    path_buf.push_str(dir);
+    path_buf.push_str("/.envrc");
+    let envrc_path = path_buf.clone();
+    path_buf.truncate(dir.len());
+    path_buf.push_str("/.env");
+    let dotenv_path = path_buf;
 
     // Neither file newer than sentinel
     if file_mtime(&envrc_path) > sentinel_mt {
@@ -253,7 +263,12 @@ pub fn apply_bash_output_bench(output: &str) -> usize {
 fn unquote_bash(s: &str) -> String {
     let s = s.strip_prefix('\'').unwrap_or(s);
     let s = s.strip_suffix('\'').unwrap_or(s);
-    s.replace("'\\''", "'")
+    // Avoid allocation when no embedded quotes (the common case)
+    if s.contains("'\\''") {
+        s.replace("'\\''", "'")
+    } else {
+        s.to_string()
+    }
 }
 
 #[cfg(test)]

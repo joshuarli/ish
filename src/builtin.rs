@@ -128,7 +128,7 @@ fn builtin_cd(
     args: &[String],
     prev_dir: &mut Option<String>,
     home: &str,
-    path_cache: &mut HashMap<String, PathBuf>,
+    _path_cache: &mut HashMap<String, PathBuf>,
 ) -> i32 {
     let target = if args.is_empty() {
         home.to_string()
@@ -166,8 +166,10 @@ fn builtin_cd(
 
     *prev_dir = old_pwd;
 
-    // Invalidate PATH cache on cd
-    exec::rebuild_path_cache(path_cache);
+    // PATH cache is invalidated by:
+    // - `set PATH ...` in builtin_set
+    // - denv on_cd() when it modifies PATH
+    // No need to rebuild here — cd itself doesn't change PATH.
 
     0
 }

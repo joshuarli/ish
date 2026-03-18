@@ -8,16 +8,30 @@ pub struct CompEntry {
 }
 
 impl CompEntry {
-    pub fn display_name(&self) -> String {
+    pub fn display_width(&self) -> usize {
+        self.name.len() + if self.is_dir { 1 } else { 0 }
+    }
+
+    /// Display name: name for files, name + "/" for dirs.
+    /// Returns Cow — borrows for files (zero alloc), allocates only for dirs.
+    pub fn display_name(&self) -> std::borrow::Cow<'_, str> {
         if self.is_dir {
-            format!("{}/", self.name)
+            let mut s = String::with_capacity(self.name.len() + 1);
+            s.push_str(&self.name);
+            s.push('/');
+            std::borrow::Cow::Owned(s)
         } else {
-            self.name.clone()
+            std::borrow::Cow::Borrowed(&self.name)
         }
     }
 
-    pub fn display_width(&self) -> usize {
-        self.name.len() + if self.is_dir { 1 } else { 0 }
+    /// Write the display name directly into a TermWriter — zero allocation.
+    /// Prefer this on the rendering hot path over display_name().
+    pub fn write_display_name(&self, tw: &mut crate::term::TermWriter) {
+        tw.write_str(&self.name);
+        if self.is_dir {
+            tw.write_str("/");
+        }
     }
 }
 
@@ -116,7 +130,7 @@ impl CompletionState {
 pub fn complete_path(partial: &str, dirs_only: bool) -> Vec<CompEntry> {
     let (dir, prefix) = split_path(partial);
 
-    let read_dir = match std::fs::read_dir(if dir.is_empty() { "." } else { &dir }) {
+    let read_dir = match std::fs::read_dir(if dir.is_empty() { "." } else { dir }) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
@@ -138,7 +152,7 @@ pub fn complete_path(partial: &str, dirs_only: bool) -> Vec<CompEntry> {
                 return None;
             }
             // Filter by prefix
-            if !name.starts_with(&prefix) {
+            if !name.starts_with(prefix) {
                 return None;
             }
             // e.metadata() follows symlinks, so symlinks to dirs count as dirs
@@ -183,10 +197,11 @@ pub fn complete_env(partial: &str) -> Vec<CompEntry> {
 }
 
 /// Split "path/to/pref" into ("path/to/", "pref").
-fn split_path(partial: &str) -> (String, String) {
+/// Returns slices — no heap allocation.
+fn split_path(partial: &str) -> (&str, &str) {
     match partial.rfind('/') {
-        Some(i) => (partial[..=i].to_string(), partial[i + 1..].to_string()),
-        None => (String::new(), partial.to_string()),
+        Some(i) => (&partial[..=i], &partial[i + 1..]),
+        None => ("", partial),
     }
 }
 
@@ -202,8 +217,8 @@ pub fn compute_grid(entries: &[CompEntry], term_cols: u16) -> (usize, usize) {
 
     for cols in (1..=max_cols).rev() {
         let rows = n.div_ceil(cols);
-        // Compute column widths (column-major layout: entries[col*rows + row])
-        let mut col_widths = vec![0usize; cols];
+        // Stack array for col widths — max 6 columns, no heap allocation.
+        let mut col_widths = [0usize; 6];
         for (i, entry) in entries.iter().enumerate() {
             let col = i / rows;
             if col < cols {
@@ -211,7 +226,7 @@ pub fn compute_grid(entries: &[CompEntry], term_cols: u16) -> (usize, usize) {
             }
         }
         // Total width with 2-char gaps between columns
-        let total: usize = col_widths.iter().sum::<usize>() + cols.saturating_sub(1) * 2;
+        let total: usize = col_widths[..cols].iter().sum::<usize>() + cols.saturating_sub(1) * 2;
         if total <= term_w {
             return (cols, rows);
         }
@@ -226,12 +241,12 @@ mod tests {
 
     #[test]
     fn split_path_no_slash() {
-        assert_eq!(split_path("foo"), ("".to_string(), "foo".to_string()));
+        assert_eq!(split_path("foo"), ("", "foo"));
     }
 
     #[test]
     fn split_path_with_dir() {
-        assert_eq!(split_path("src/ma"), ("src/".to_string(), "ma".to_string()));
+        assert_eq!(split_path("src/ma"), ("src/", "ma"));
     }
 
     #[test]

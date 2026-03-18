@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::error::Error;
 /// Re-exported from parse. See [`parse::LITERAL`] for the protocol docs.
 /// `\x00` before a char means "this char is literal, do not expand it".
@@ -19,28 +21,27 @@ pub fn expand_word(
     let has_tilde = word.starts_with('~');
     let has_glob = has_glob_chars(word);
 
-    // Fast path: no expansion at all
+    // Fast path: no expansion at all — zero allocation
     if !has_dollar && !has_tilde && !has_glob && !word.contains(LITERAL) {
         return Ok(vec![word.to_string()]);
     }
 
-    // Only run stages that are needed, reusing the buffer between stages.
-    let word = if has_tilde {
-        expand_tilde(word, home)
+    // Use Cow to avoid allocation when stages are skipped.
+    let word: Cow<str> = if has_tilde {
+        Cow::Owned(expand_tilde(word, home))
     } else {
-        word.to_string()
+        Cow::Borrowed(word)
     };
-    let word = if has_dollar {
+    let word: Cow<str> = if has_dollar {
         let w = expand_variables(&word);
-        expand_command_subst(&w, exec_subst)?
+        Cow::Owned(expand_command_subst(&w, exec_subst)?)
     } else {
         word
     };
     if has_glob {
         expand_glob(&word)
     } else {
-        // Strip LITERAL markers
-        Ok(vec![strip_literal(&word)])
+        Ok(vec![strip_literal(&word).into_owned()])
     }
 }
 
@@ -234,14 +235,14 @@ fn expand_glob(word: &str) -> Result<Vec<String>, Error> {
     // Check if word has any unescaped glob chars
     if !has_glob_chars(word) {
         // No glob — just strip LITERAL markers and return
-        return Ok(vec![strip_literal(word)]);
+        return Ok(vec![strip_literal(word).into_owned()]);
     }
 
     let pattern = strip_literal(word);
     let matches = glob_match(&pattern)?;
 
     if matches.is_empty() {
-        return Err(Error::glob_no_match(&pattern));
+        return Err(Error::glob_no_match(&*pattern));
     }
 
     Ok(matches)
@@ -260,11 +261,11 @@ fn has_glob_chars(word: &str) -> bool {
     false
 }
 
-fn strip_literal(s: &str) -> String {
+fn strip_literal(s: &str) -> Cow<'_, str> {
     if !s.contains(LITERAL) {
-        return s.to_string();
+        return Cow::Borrowed(s);
     }
-    s.replace(LITERAL, "")
+    Cow::Owned(s.replace(LITERAL, ""))
 }
 
 /// Expand a glob pattern into matching paths.
