@@ -131,6 +131,50 @@ impl History {
         results
     }
 
+    /// Like `fuzzy_search` but appends into a caller-owned Vec (zero-alloc reuse).
+    /// Caps at `limit` results since the pager only shows a screenful.
+    pub fn fuzzy_search_into(&self, query: &str, results: &mut Vec<FuzzyMatch>, limit: usize) {
+        results.clear();
+
+        if query.is_empty() {
+            for (idx, _) in self.entries.iter().enumerate().rev() {
+                results.push(FuzzyMatch {
+                    entry_idx: idx,
+                    match_positions: [0; 32],
+                    match_count: 0,
+                });
+                if results.len() >= limit {
+                    break;
+                }
+            }
+            return;
+        }
+
+        let mut query_buf = ['\0'; 64];
+        let mut query_len = 0;
+        for c in query.chars().flat_map(|c| c.to_lowercase()) {
+            if query_len >= query_buf.len() {
+                break;
+            }
+            query_buf[query_len] = c;
+            query_len += 1;
+        }
+        let query_lower = &query_buf[..query_len];
+
+        for (idx, entry) in self.entries.iter().enumerate().rev() {
+            if let Some((positions, count)) = subsequence_match(query_lower, entry) {
+                results.push(FuzzyMatch {
+                    entry_idx: idx,
+                    match_positions: positions,
+                    match_count: count,
+                });
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Get entry text by index.
     pub fn get(&self, idx: usize) -> &str {
         &self.entries[idx]

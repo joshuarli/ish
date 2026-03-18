@@ -34,6 +34,18 @@ impl Completions {
         }
     }
 
+    pub fn with_capacity(names_cap: usize, entries_cap: usize) -> Self {
+        Self {
+            names: String::with_capacity(names_cap),
+            entries: Vec::with_capacity(entries_cap),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.names.clear();
+        self.entries.clear();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -250,6 +262,12 @@ pub fn complete_path(partial: &str, dirs_only: bool) -> Completions {
     let mut comp = Completions::new();
     complete_in_dir(dir, prefix, dirs_only, &mut comp);
     comp
+}
+
+/// Like `complete_path` but appends into a caller-owned `Completions` (zero-alloc reuse).
+pub fn complete_path_into(partial: &str, dirs_only: bool, comp: &mut Completions) {
+    let (dir, prefix) = split_path(partial);
+    complete_in_dir(dir, prefix, dirs_only, comp);
 }
 
 /// Complete entries in `dir` whose names start with `prefix`.
@@ -567,6 +585,42 @@ pub fn complete_env(partial: &str) -> Completions {
         an.cmp(bn)
     });
     comp
+}
+
+/// Like `complete_env` but appends into a caller-owned `Completions` (zero-alloc reuse).
+pub fn complete_env_into(partial: &str, comp: &mut Completions) {
+    unsafe extern "C" {
+        static environ: *const *const libc::c_char;
+    }
+
+    let prefix = partial.strip_prefix('$').unwrap_or(partial);
+    let prefix_bytes = prefix.as_bytes();
+
+    unsafe {
+        let mut ep = environ;
+        if ep.is_null() {
+            return;
+        }
+        while !(*ep).is_null() {
+            let entry = std::ffi::CStr::from_ptr(*ep).to_bytes();
+            if let Some(eq_pos) = entry.iter().position(|&b| b == b'=') {
+                let key = &entry[..eq_pos];
+                if key.starts_with(prefix_bytes)
+                    && let Ok(name) = std::str::from_utf8(key)
+                {
+                    comp.push(name, false, false, false);
+                }
+            }
+            ep = ep.add(1);
+        }
+    }
+
+    let names = comp.names.as_bytes();
+    comp.entries.sort_unstable_by(|a, b| {
+        let an = &names[a.name_start as usize..][..a.name_len as usize];
+        let bn = &names[b.name_start as usize..][..b.name_len as usize];
+        an.cmp(bn)
+    });
 }
 
 /// Split "path/to/pref" into ("path/to/", "pref").

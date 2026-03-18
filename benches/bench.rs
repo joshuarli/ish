@@ -786,6 +786,17 @@ fn bench_alloc_audit(c: &mut Criterion) {
         });
         eprintln!("  [alloc] fuzzy_search_1k:           {stats}");
 
+        // Warm: reuse pre-allocated Vec — should be 0 allocs
+        {
+            let mut results = Vec::with_capacity(200);
+            history.fuzzy_search_into("cmd99", &mut results, 200);
+            let stats = measure_allocs(|| {
+                history.fuzzy_search_into("cmd99", &mut results, 200);
+                black_box(&results);
+            });
+            eprintln!("  [alloc] fuzzy_search_warm:         {stats}");
+        }
+
         let stats = measure_allocs(|| {
             black_box(prompt::shorten_pwd(
                 "/home/user/projects/rust/ish/src",
@@ -843,10 +854,34 @@ fn bench_alloc_audit(c: &mut Criterion) {
         });
         eprintln!("  [alloc] complete_path_src:         {stats}");
 
+        // Warm: reuse pre-allocated Completions — should be 0 allocs
+        {
+            let mut comp = complete::Completions::with_capacity(2048, 64);
+            complete::complete_path_into("./src/", false, &mut comp);
+            let stats = measure_allocs(|| {
+                comp.clear();
+                complete::complete_path_into("./src/", false, &mut comp);
+                black_box(&comp);
+            });
+            eprintln!("  [alloc] complete_path_warm:        {stats}");
+        }
+
         let stats = measure_allocs(|| {
             let _ = black_box(complete::complete_env("$HO"));
         });
         eprintln!("  [alloc] complete_env_prefix:       {stats}");
+
+        // Warm: reuse pre-allocated Completions for env
+        {
+            let mut comp = complete::Completions::with_capacity(2048, 64);
+            complete::complete_env_into("$HO", &mut comp);
+            let stats = measure_allocs(|| {
+                comp.clear();
+                complete::complete_env_into("$HO", &mut comp);
+                black_box(&comp);
+            });
+            eprintln!("  [alloc] complete_env_warm:         {stats}");
+        }
 
         let stats = measure_allocs(|| {
             let _ = black_box(ish::denv::apply_bash_output_bench(

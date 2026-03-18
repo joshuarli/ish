@@ -18,6 +18,10 @@ struct Shell {
     prompt: prompt::Prompt,
     /// Reusable buffer for rendered prompt string — avoids allocation per render.
     prompt_buf: String,
+    /// Reusable completion arena — avoids allocation per tab press.
+    comp_buf: complete::Completions,
+    /// Reusable fuzzy match buffer — avoids allocation per Ctrl+R keystroke.
+    match_buf: Vec<history::FuzzyMatch>,
     job: Option<Job>,
     exit_warned: bool,
     denv_active: Option<bool>, // None = unchecked, defers scan_path to first use
@@ -130,6 +134,8 @@ fn main() {
         history: history::History::load(),
         prompt: prompt::Prompt::new(),
         prompt_buf: String::with_capacity(128),
+        comp_buf: complete::Completions::with_capacity(2048, 64),
+        match_buf: Vec::with_capacity(200),
         job: None,
         exit_warned: false,
         denv_active: None,
@@ -438,7 +444,8 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             }
                             KeyAction::StartHistorySearch => {
                                 saved_line = line.text().to_string();
-                                let matches = shell.history.fuzzy_search("");
+                                let mut matches = std::mem::take(&mut shell.match_buf);
+                                shell.history.fuzzy_search_into("", &mut matches, 200);
                                 mode = Mode::HistorySearch {
                                     query: String::new(),
                                     matches,
@@ -450,14 +457,15 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 continue;
                             }
                             KeyAction::StartCompletion => {
-                                match start_completion(&line, shell.cols, &shell.home) {
-                                    Some(cs) if cs.comp.len() == 1 => {
-                                        accept_completion(&mut line, &cs);
-                                    }
-                                    Some(cs) if !cs.comp.is_empty() => {
-                                        mode = Mode::Completion(cs);
-                                    }
-                                    _ => {}
+                                let comp = std::mem::take(&mut shell.comp_buf);
+                                let cs = start_completion(&line, shell.cols, &shell.home, comp);
+                                if cs.comp.len() == 1 {
+                                    accept_completion(&mut line, &cs);
+                                    shell.comp_buf = cs.comp;
+                                } else if !cs.comp.is_empty() {
+                                    mode = Mode::Completion(cs);
+                                } else {
+                                    shell.comp_buf = cs.comp;
                                 }
                             }
                         }
@@ -490,31 +498,32 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 continue;
                             }
                             CompAction::Refilter => {
-                                // User typed/deleted — re-run completion with updated line
-                                match start_completion(&line, shell.cols, &shell.home) {
-                                    Some(cs) if cs.comp.len() == 1 => {
-                                        accept_completion(&mut line, &cs);
-                                        mode = Mode::Normal;
-                                    }
-                                    Some(cs) if !cs.comp.is_empty() => {
-                                        // render_line clears old grid, render_completions draws new
-                                        let info =
-                                            render::render_line(&mut tw, p, pdl, &line, shell.cols);
-                                        render::render_completions(&mut tw, &cs, &info, true);
-                                        mode = Mode::Completion(cs);
-                                        let _ = tw.flush_to_stdout();
-                                        continue;
-                                    }
-                                    _ => {
-                                        mode = Mode::Normal;
-                                    }
+                                // Reclaim buffer from current state, re-run completion
+                                let comp = std::mem::take(&mut state.comp);
+                                let cs = start_completion(&line, shell.cols, &shell.home, comp);
+                                if cs.comp.len() == 1 {
+                                    accept_completion(&mut line, &cs);
+                                    shell.comp_buf = cs.comp;
+                                    mode = Mode::Normal;
+                                } else if !cs.comp.is_empty() {
+                                    let info =
+                                        render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                                    render::render_completions(&mut tw, &cs, &info, true);
+                                    mode = Mode::Completion(cs);
+                                    let _ = tw.flush_to_stdout();
+                                    continue;
+                                } else {
+                                    shell.comp_buf = cs.comp;
+                                    mode = Mode::Normal;
                                 }
                             }
                             CompAction::Accept => {
                                 accept_completion(&mut line, state);
+                                shell.comp_buf = std::mem::take(&mut state.comp);
                                 mode = Mode::Normal;
                             }
                             CompAction::Cancel => {
+                                shell.comp_buf = std::mem::take(&mut state.comp);
                                 mode = Mode::Normal;
                             }
                         }
@@ -537,6 +546,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         }
                         HistAction::Accept(text) => {
                             line.set(&text);
+                            shell.match_buf = std::mem::take(matches);
                             mode = Mode::Normal;
                             tw.carriage_return();
                             tw.clear_to_end_of_screen();
@@ -551,6 +561,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         }
                         HistAction::Cancel => {
                             line.set(saved_line);
+                            shell.match_buf = std::mem::take(matches);
                             mode = Mode::Normal;
                             tw.carriage_return();
                             tw.clear_to_end_of_screen();
@@ -751,7 +762,14 @@ enum CompAction {
     Refilter,
 }
 
-fn start_completion(line: &LineBuffer, term_cols: u16, home: &str) -> Option<CompletionState> {
+fn start_completion(
+    line: &LineBuffer,
+    term_cols: u16,
+    home: &str,
+    mut comp: complete::Completions,
+) -> CompletionState {
+    comp.clear();
+
     let text = line.text();
     let before_cursor = &text[..line.cursor()];
     let word_start = before_cursor.rfind(' ').map(|i| i + 1).unwrap_or(0);
@@ -759,19 +777,18 @@ fn start_completion(line: &LineBuffer, term_cols: u16, home: &str) -> Option<Com
 
     // Environment variable completion: $FOO<tab>
     if partial.starts_with('$') {
-        let comp = complete::complete_env(partial);
-        if comp.is_empty() {
-            return None;
+        complete::complete_env_into(partial, &mut comp);
+        if !comp.is_empty() {
+            let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
+            return CompletionState {
+                comp,
+                selected: 0,
+                cols,
+                rows,
+                scroll: 0,
+                dir_prefix: "$".to_string(),
+            };
         }
-        let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
-        return Some(CompletionState {
-            comp,
-            selected: 0,
-            cols,
-            rows,
-            scroll: 0,
-            dir_prefix: "$".to_string(),
-        });
     }
 
     // Detect if first word is cd → complete only directories
@@ -794,65 +811,72 @@ fn start_completion(line: &LineBuffer, term_cols: u16, home: &str) -> Option<Com
         String::new()
     };
 
-    let comp = complete::complete_path(&expanded, dirs_only);
+    complete::complete_path_into(&expanded, dirs_only, &mut comp);
     if !comp.is_empty() {
         let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
-        return Some(CompletionState {
+        return CompletionState {
             comp,
             selected: 0,
             cols,
             rows,
             scroll: 0,
             dir_prefix,
-        });
+        };
     }
 
     // Fish-style partial path completion: each intermediate component is a prefix.
     // e.g., "~/de/s" → resolve "de" to "dev", complete "s" in ~/dev/
     let (partial_comp, groups) = complete::complete_partial_path(&expanded, dirs_only);
-    if groups.is_empty() {
-        return None;
-    }
-
-    // Determine the user-facing root prefix (for tilde re-contraction)
-    let (user_root, expanded_root) = if partial.starts_with("~/") || partial == "~" {
-        ("~/".to_string(), format!("{home}/"))
-    } else if partial.starts_with('/') {
-        ("/".to_string(), "/".to_string())
-    } else {
-        (String::new(), String::new())
-    };
-
-    // Build entries with resolved intermediate components in the name.
-    // Uses a single arena for all combined "rel_dir/name" strings.
-    let mut comp = complete::Completions::new();
-    for (resolved_dir, start, count) in &groups {
-        let rel_dir = if expanded_root.is_empty() {
-            resolved_dir.as_str()
+    if !groups.is_empty() {
+        // Determine the user-facing root prefix (for tilde re-contraction)
+        let (user_root, expanded_root) = if partial.starts_with("~/") || partial == "~" {
+            ("~/".to_string(), format!("{home}/"))
+        } else if partial.starts_with('/') {
+            ("/".to_string(), "/".to_string())
         } else {
-            resolved_dir
-                .strip_prefix(&expanded_root)
-                .unwrap_or(resolved_dir)
+            (String::new(), String::new())
         };
-        for i in *start..*start + *count {
-            let entry = &partial_comp.entries[i];
-            let orig_name = partial_comp.entry_name(entry);
-            let mark = comp.begin_entry();
-            comp.names.push_str(rel_dir);
-            comp.names.push_str(orig_name);
-            comp.finish_entry(mark, entry.is_dir, entry.is_link, entry.is_exec);
+
+        // Build entries with resolved intermediate components in the name.
+        // comp is already empty — reuse its arena for combined "rel_dir/name" strings.
+        for (resolved_dir, start, count) in &groups {
+            let rel_dir = if expanded_root.is_empty() {
+                resolved_dir.as_str()
+            } else {
+                resolved_dir
+                    .strip_prefix(&expanded_root)
+                    .unwrap_or(resolved_dir)
+            };
+            for i in *start..*start + *count {
+                let entry = &partial_comp.entries[i];
+                let orig_name = partial_comp.entry_name(entry);
+                let mark = comp.begin_entry();
+                comp.names.push_str(rel_dir);
+                comp.names.push_str(orig_name);
+                comp.finish_entry(mark, entry.is_dir, entry.is_link, entry.is_exec);
+            }
         }
+
+        let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
+        return CompletionState {
+            comp,
+            selected: 0,
+            cols,
+            rows,
+            scroll: 0,
+            dir_prefix: user_root,
+        };
     }
 
-    let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
-    Some(CompletionState {
+    // Nothing found — return empty state, preserving the buffer for reuse.
+    CompletionState {
         comp,
         selected: 0,
-        cols,
-        rows,
+        cols: 0,
+        rows: 0,
         scroll: 0,
-        dir_prefix: user_root,
-    })
+        dir_prefix: String::new(),
+    }
 }
 
 fn handle_completion_key(
@@ -966,13 +990,13 @@ fn handle_history_search_key(
         }
         Key::Backspace => {
             query.pop();
-            *matches = shell.history.fuzzy_search(query);
+            shell.history.fuzzy_search_into(query, matches, 200);
             *selected = 0;
             HistAction::Continue
         }
         Key::Char(c) if !key.mods.ctrl => {
             query.push(c);
-            *matches = shell.history.fuzzy_search(query);
+            shell.history.fuzzy_search_into(query, matches, 200);
             *selected = 0;
             HistAction::Continue
         }
