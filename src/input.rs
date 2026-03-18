@@ -87,6 +87,7 @@ pub enum InputEvent {
 
 pub struct InputReader {
     signal_fd: RawFd,
+    in_paste: bool,
 }
 
 enum PollResult {
@@ -98,7 +99,15 @@ enum PollResult {
 
 impl InputReader {
     pub fn new(signal_fd: RawFd) -> Self {
-        Self { signal_fd }
+        Self {
+            signal_fd,
+            in_paste: false,
+        }
+    }
+
+    /// True while inside a bracketed paste (`\x1b[200~` … `\x1b[201~`).
+    pub fn in_paste(&self) -> bool {
+        self.in_paste
     }
 
     /// Block until a key or signal event is available.
@@ -247,7 +256,7 @@ impl InputReader {
         }
     }
 
-    fn csi_to_key(&self, final_byte: u8, params: &[u32]) -> Option<KeyEvent> {
+    fn csi_to_key(&mut self, final_byte: u8, params: &[u32]) -> Option<KeyEvent> {
         let mods = if params.len() >= 2 {
             modifier_from_param(params[1])
         } else {
@@ -272,6 +281,14 @@ impl InputReader {
                 1 | 7 => Some(KeyEvent::with_mods(Key::Home, mods)),
                 3 => Some(KeyEvent::with_mods(Key::Delete, mods)),
                 4 | 8 => Some(KeyEvent::with_mods(Key::End, mods)),
+                200 => {
+                    self.in_paste = true;
+                    None
+                }
+                201 => {
+                    self.in_paste = false;
+                    None
+                }
                 _ => None,
             },
             _ => None,

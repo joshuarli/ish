@@ -41,12 +41,20 @@ impl RawMode {
             }
         }
 
+        // Enable bracketed paste mode so the terminal wraps pastes in
+        // \x1b[200~ ... \x1b[201~, letting us distinguish paste from typing.
+        let _ = io::stdout().write_all(b"\x1b[?2004h");
+        let _ = io::stdout().flush();
+
         Ok(Self { orig })
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        // Disable bracketed paste mode before restoring cooked terminal.
+        let _ = io::stdout().write_all(b"\x1b[?2004l");
+        let _ = io::stdout().flush();
         // SAFETY: Restores saved termios. TCSANOW avoids blocking if output
         // hasn't drained (e.g. PTY). orig was captured in enable().
         unsafe {

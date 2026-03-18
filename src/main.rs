@@ -470,95 +470,123 @@ fn read_line(shell: &mut Shell) -> ReadResult {
             InputEvent::Key(key) => {
                 match &mut mode {
                     Mode::Normal => {
-                        match handle_normal_key(
-                            key,
-                            &mut line,
-                            &mut history_idx,
-                            &mut saved_line,
-                            shell,
-                            &full_input,
-                        ) {
-                            KeyAction::Continue => {}
-                            KeyAction::Execute(text) => {
-                                tw.write_str("\r\n");
-                                let _ = tw.flush_to_stdout();
-                                shell.prompt_buf = prompt_str;
-                                if full_input.is_empty() {
-                                    return if text.is_empty() {
-                                        ReadResult::Empty
+                        // Bracketed paste: convert bare newlines to "; "
+                        // command separators instead of executing immediately.
+                        // Continuations (trailing \, unclosed quotes, trailing
+                        // operators) still go through the normal path.
+                        let paste_sep = key.key == Key::Enter && reader.in_paste() && {
+                            let text = line.text();
+                            let combined = if full_input.is_empty() {
+                                text.to_string()
+                            } else {
+                                format!("{full_input} {text}")
+                            };
+                            !parse::needs_continuation(&combined)
+                        };
+
+                        if paste_sep {
+                            // Merge any accumulated continuation into line
+                            if !full_input.is_empty() {
+                                let text = line.text().to_string();
+                                full_input.push(' ');
+                                full_input.push_str(&text);
+                                line.set(&full_input);
+                                full_input = String::new();
+                            }
+                            if !line.text().is_empty() {
+                                line.insert_str("; ");
+                            }
+                        } else {
+                            match handle_normal_key(
+                                key,
+                                &mut line,
+                                &mut history_idx,
+                                &mut saved_line,
+                                shell,
+                                &full_input,
+                            ) {
+                                KeyAction::Continue => {}
+                                KeyAction::Execute(text) => {
+                                    tw.write_str("\r\n");
+                                    let _ = tw.flush_to_stdout();
+                                    shell.prompt_buf = prompt_str;
+                                    if full_input.is_empty() {
+                                        return if text.is_empty() {
+                                            ReadResult::Empty
+                                        } else {
+                                            ReadResult::Line(text)
+                                        };
                                     } else {
-                                        ReadResult::Line(text)
+                                        full_input.push(' ');
+                                        full_input.push_str(&text);
+                                        return ReadResult::Line(full_input);
+                                    }
+                                }
+                                KeyAction::Continuation(text) => {
+                                    if full_input.is_empty() {
+                                        full_input = text;
+                                    } else {
+                                        full_input.push(' ');
+                                        full_input.push_str(&text);
+                                    }
+                                    // Strip trailing \ for backslash-newline continuation
+                                    if parse::ends_with_line_continuation(&full_input) {
+                                        let end = full_input.trim_end().len();
+                                        full_input.truncate(end - 1);
+                                    }
+                                    line = LineBuffer::new();
+                                    history_idx = None;
+                                    tw.write_str("\r\n");
+                                    let info =
+                                        render::render_line(&mut tw, "  ", 2, &line, shell.cols, 0);
+                                    cursor_row = info.cursor_row;
+                                    let _ = tw.flush_to_stdout();
+                                    continue;
+                                }
+                                KeyAction::Cancel => {
+                                    tw.write_str("^C\r\n");
+                                    let _ = tw.flush_to_stdout();
+                                    shell.prompt_buf = prompt_str;
+                                    return ReadResult::Empty;
+                                }
+                                KeyAction::Exit => {
+                                    tw.write_str("\r\n");
+                                    let _ = tw.flush_to_stdout();
+                                    shell.prompt_buf = prompt_str;
+                                    return handle_exit(shell);
+                                }
+                                KeyAction::ClearScreen => {
+                                    tw.clear_screen();
+                                    cursor_row = 0;
+                                }
+                                KeyAction::StartHistorySearch => {
+                                    saved_line = line.text().to_string();
+                                    let mut matches = std::mem::take(&mut shell.match_buf);
+                                    shell.history.fuzzy_search_into("", &mut matches, 200);
+                                    mode = Mode::HistorySearch {
+                                        query: String::new(),
+                                        matches,
+                                        selected: 0,
+                                        saved_line: saved_line.clone(),
                                     };
-                                } else {
-                                    full_input.push(' ');
-                                    full_input.push_str(&text);
-                                    return ReadResult::Line(full_input);
+                                    render_history_mode(&mut tw, &mode, shell);
+                                    let _ = tw.flush_to_stdout();
+                                    continue;
+                                }
+                                KeyAction::StartCompletion => {
+                                    let comp = std::mem::take(&mut shell.comp_buf);
+                                    let cs = start_completion(&line, shell.cols, &shell.home, comp);
+                                    if cs.comp.len() == 1 {
+                                        accept_completion(&mut line, &cs);
+                                        shell.comp_buf = cs.comp;
+                                    } else if !cs.comp.is_empty() {
+                                        mode = Mode::Completion(cs);
+                                    } else {
+                                        shell.comp_buf = cs.comp;
+                                    }
                                 }
                             }
-                            KeyAction::Continuation(text) => {
-                                if full_input.is_empty() {
-                                    full_input = text;
-                                } else {
-                                    full_input.push(' ');
-                                    full_input.push_str(&text);
-                                }
-                                // Strip trailing \ for backslash-newline continuation
-                                if parse::ends_with_line_continuation(&full_input) {
-                                    let end = full_input.trim_end().len();
-                                    full_input.truncate(end - 1);
-                                }
-                                line = LineBuffer::new();
-                                history_idx = None;
-                                tw.write_str("\r\n");
-                                let info =
-                                    render::render_line(&mut tw, "  ", 2, &line, shell.cols, 0);
-                                cursor_row = info.cursor_row;
-                                let _ = tw.flush_to_stdout();
-                                continue;
-                            }
-                            KeyAction::Cancel => {
-                                tw.write_str("^C\r\n");
-                                let _ = tw.flush_to_stdout();
-                                shell.prompt_buf = prompt_str;
-                                return ReadResult::Empty;
-                            }
-                            KeyAction::Exit => {
-                                tw.write_str("\r\n");
-                                let _ = tw.flush_to_stdout();
-                                shell.prompt_buf = prompt_str;
-                                return handle_exit(shell);
-                            }
-                            KeyAction::ClearScreen => {
-                                tw.clear_screen();
-                                cursor_row = 0;
-                            }
-                            KeyAction::StartHistorySearch => {
-                                saved_line = line.text().to_string();
-                                let mut matches = std::mem::take(&mut shell.match_buf);
-                                shell.history.fuzzy_search_into("", &mut matches, 200);
-                                mode = Mode::HistorySearch {
-                                    query: String::new(),
-                                    matches,
-                                    selected: 0,
-                                    saved_line: saved_line.clone(),
-                                };
-                                render_history_mode(&mut tw, &mode, shell);
-                                let _ = tw.flush_to_stdout();
-                                continue;
-                            }
-                            KeyAction::StartCompletion => {
-                                let comp = std::mem::take(&mut shell.comp_buf);
-                                let cs = start_completion(&line, shell.cols, &shell.home, comp);
-                                if cs.comp.len() == 1 {
-                                    accept_completion(&mut line, &cs);
-                                    shell.comp_buf = cs.comp;
-                                } else if !cs.comp.is_empty() {
-                                    mode = Mode::Completion(cs);
-                                } else {
-                                    shell.comp_buf = cs.comp;
-                                }
-                            }
-                        }
+                        } // else (not paste_sep)
 
                         match &mode {
                             Mode::Normal => {
