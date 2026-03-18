@@ -4,7 +4,7 @@ LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 
-.PHONY: setup build release release-pgo pgo-profile bench-pgo install pc
+.PHONY: setup build release release-pgo pgo-profile bench-pgo install test-ci pc bump-version
 
 build:
 	cargo build
@@ -47,8 +47,25 @@ $(PGO_MERGED):
 install: release-pgo
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
 
+# So we don't do duplicate work (building both debug and release) in CI.
+test-ci:
+	@OUT=$$(cargo test --quiet --release -- --test-threads=32 2>&1) || { echo "$$OUT"; exit 1; }
+
 setup:
 	prek install --install-hooks
 
 pc:
 	prek --quiet run --all-files
+
+# Usage: make bump-version [V=x.y.z]
+# Without V, increments the patch version.
+bump-version:
+ifndef V
+	$(eval OLD := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml))
+	$(eval V := $(shell echo "$(OLD)" | awk -F. '{printf "%d.%d.%d", $$1, $$2, $$3+1}'))
+endif
+	sed -i '' 's/^version = ".*"/version = "$(V)"/' Cargo.toml
+	cargo check --quiet 2>/dev/null
+	git add Cargo.toml Cargo.lock
+	git commit -m "bump version to $(V)"
+	git tag "release/$(V)"

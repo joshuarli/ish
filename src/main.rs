@@ -61,6 +61,10 @@ fn parse_args() -> Args {
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         match arg.as_str() {
+            "-V" | "--version" => {
+                println!("ish {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -86,12 +90,13 @@ fn parse_args() -> Args {
 fn print_help() {
     println!("ish — minimal interactive shell");
     println!();
-    println!("usage: ish [-c config] [--no-config] [-h|--help]");
+    println!("usage: ish [-c config] [--no-config] [-V|--version] [-h|--help]");
     println!();
     println!("options:");
-    println!("  -c <path>    Use a custom config file instead of the default");
-    println!("  --no-config  Skip loading the config file");
-    println!("  -h, --help   Show this help message");
+    println!("  -c <path>      Use a custom config file instead of the default");
+    println!("  --no-config    Skip loading the config file");
+    println!("  -V, --version  Show version");
+    println!("  -h, --help     Show this help message");
 }
 
 fn main() {
