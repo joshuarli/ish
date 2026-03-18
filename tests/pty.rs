@@ -1066,7 +1066,8 @@ fn single_quotes_no_expansion() {
 #[test]
 fn history_persisted_across_commands() {
     let sh = PtyShell::spawn();
-    sh.run_command("echo unique_cmd_12345");
+    // Use /bin/echo (external command) — builtins are excluded from history
+    sh.run_command("/bin/echo unique_cmd_12345");
     // Now up arrow should recall it
     sh.up();
     sh.enter();

@@ -5,7 +5,7 @@ use ish::input::{InputEvent, InputReader, Key, KeyEvent};
 use ish::job::Job;
 use ish::line::LineBuffer;
 use ish::term::TermWriter;
-use ish::{complete, config, denv, exec, history, parse, prompt, render, signal, term};
+use ish::{builtin, complete, config, denv, exec, history, parse, prompt, render, signal, term};
 use std::os::fd::RawFd;
 
 struct Shell {
@@ -165,7 +165,12 @@ fn main() {
                     continue;
                 }
                 shell.exit_warned = false;
-                shell.history.add(&line);
+
+                // Add to history unless it's a bare alias or builtin
+                let first_word = line.split_whitespace().next().unwrap_or("");
+                if !builtin::is_builtin(first_word) && shell.aliases.get(first_word).is_none() {
+                    shell.history.add(&line);
+                }
 
                 // Log for session transcript
                 shell.session_log.push_str(&line);
