@@ -9,6 +9,8 @@ pub struct Prompt {
     pwd_last: String,
     /// Cached shortened PWD string.
     pwd_short: String,
+    /// Reusable buffer for git branch — avoids allocation per render.
+    branch_buf: String,
 }
 
 enum GitCache {
@@ -34,13 +36,14 @@ impl Prompt {
             git: GitCache::Unknown,
             pwd_last: String::new(),
             pwd_short: String::new(),
+            branch_buf: String::new(),
         }
     }
 
-    /// Render the prompt string with ANSI colors.
+    /// Render the prompt into a caller-owned buffer (zero allocation steady-state).
     /// Layout: `user@host colored_pwd[*][ branch] $ `
-    pub fn render(&mut self, last_status: i32) -> String {
-        let pwd = std::env::var("PWD").unwrap_or_default();
+    /// `pwd` and `denv_dirty` are passed in to avoid env var reads.
+    pub fn render_into(&mut self, out: &mut String, last_status: i32, pwd: &str, denv_dirty: bool) {
         let color = if last_status == 0 {
             "\x1b[38;5;10m" // bright green
         } else {
@@ -50,28 +53,38 @@ impl Prompt {
 
         // Update shortened PWD if directory changed
         if pwd != self.pwd_last {
-            self.pwd_short = shorten_pwd(&pwd, &self.home);
-            self.pwd_last = pwd.clone();
+            self.pwd_short.clear();
+            shorten_pwd_into(pwd, &self.home, &mut self.pwd_short);
+            self.pwd_last.clear();
+            self.pwd_last.push_str(pwd);
         }
 
-        let mut out = String::with_capacity(128);
+        out.clear();
         out.push_str(&self.user_host);
         out.push_str(color);
         out.push_str(&self.pwd_short);
         out.push_str(reset);
 
         // Dirty indicator
-        if std::env::var("__DENV_DIRTY").as_deref() == Ok("1") {
+        if denv_dirty {
             out.push_str("\x1b[38;5;1m *\x1b[0m");
         }
 
         // Git branch
-        if let Some(branch) = self.git_branch(Path::new(&pwd)) {
+        if self.git_branch_into(Path::new(pwd)) {
             out.push(' ');
-            out.push_str(&branch);
+            out.push_str(&self.branch_buf);
         }
 
         out.push_str(" $ ");
+    }
+
+    /// Legacy render — allocates. Used by benchmarks and tests.
+    pub fn render(&mut self, last_status: i32) -> String {
+        let pwd = std::env::var("PWD").unwrap_or_default();
+        let denv_dirty = std::env::var("__DENV_DIRTY").as_deref() == Ok("1");
+        let mut out = String::with_capacity(128);
+        self.render_into(&mut out, last_status, &pwd, denv_dirty);
         out
     }
 
@@ -101,14 +114,16 @@ impl Prompt {
         self.git = GitCache::Unknown;
     }
 
-    fn git_branch(&mut self, cwd: &Path) -> Option<String> {
+    /// Write git branch into self.branch_buf. Returns true if branch found.
+    fn git_branch_into(&mut self, cwd: &Path) -> bool {
         // Check cache first
         match &self.git {
             GitCache::Repo { root, head } if cwd.starts_with(root) => {
-                return read_head(head);
+                self.branch_buf.clear();
+                return read_head_into(head, &mut self.branch_buf);
             }
             GitCache::NoRepo { from } if from.starts_with(cwd) => {
-                return None;
+                return false;
             }
             _ => {}
         }
@@ -121,23 +136,24 @@ impl Prompt {
         self.resolve_git(cwd, ceiling.as_ref())
     }
 
-    fn resolve_git(&mut self, cwd: &Path, ceiling: Option<&PathBuf>) -> Option<String> {
+    fn resolve_git(&mut self, cwd: &Path, ceiling: Option<&PathBuf>) -> bool {
         match find_git_dir(cwd, ceiling) {
             Some(git_dir) => {
                 let root = git_dir.parent().unwrap_or(cwd).to_path_buf();
                 let head_path = git_dir.join("HEAD");
-                let branch = read_head(&head_path);
+                self.branch_buf.clear();
+                let found = read_head_into(&head_path, &mut self.branch_buf);
                 self.git = GitCache::Repo {
                     root,
                     head: head_path,
                 };
-                branch
+                found
             }
             None => {
                 self.git = GitCache::NoRepo {
                     from: cwd.to_path_buf(),
                 };
-                None
+                false
             }
         }
     }
@@ -147,6 +163,13 @@ impl Prompt {
 
 /// Shorten PWD: tilde-contract home, abbreviate middle components to 1 char.
 pub fn shorten_pwd(pwd: &str, home: &str) -> String {
+    let mut out = String::with_capacity(pwd.len());
+    shorten_pwd_into(pwd, home, &mut out);
+    out
+}
+
+/// Shorten PWD into a caller-owned buffer (zero allocation).
+fn shorten_pwd_into(pwd: &str, home: &str, out: &mut String) {
     let (tilde, remainder) = if !home.is_empty()
         && pwd.starts_with(home)
         && (pwd.len() == home.len() || pwd.as_bytes().get(home.len()) == Some(&b'/'))
@@ -157,12 +180,12 @@ pub fn shorten_pwd(pwd: &str, home: &str) -> String {
     };
 
     if remainder.is_empty() && tilde {
-        return "~".to_string();
+        out.push('~');
+        return;
     }
 
     let n_parts = remainder.split('/').count();
 
-    let mut out = String::with_capacity(remainder.len());
     for (i, part) in remainder.split('/').enumerate() {
         if i > 0 {
             out.push('/');
@@ -187,8 +210,6 @@ pub fn shorten_pwd(pwd: &str, home: &str) -> String {
             out.push_str(part);
         }
     }
-
-    out
 }
 
 // -- Git helpers --
@@ -227,13 +248,18 @@ fn resolve_gitdir_file(path: &Path) -> Option<PathBuf> {
     })
 }
 
-fn read_head(head_path: &Path) -> Option<String> {
+/// Read HEAD into `out`. Returns true if branch found. Zero allocation.
+fn read_head_into(head_path: &Path, out: &mut String) -> bool {
     use std::io::Read;
     let mut buf = [0u8; 256];
-    let n = std::fs::File::open(head_path)
-        .and_then(|mut f| f.read(&mut buf))
-        .ok()?;
-    let line = std::str::from_utf8(&buf[..n]).ok()?.trim_end();
+    let n = match std::fs::File::open(head_path).and_then(|mut f| f.read(&mut buf)) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let line = match std::str::from_utf8(&buf[..n]) {
+        Ok(s) => s.trim_end(),
+        Err(_) => return false,
+    };
     let branch = if let Some(b) = line.strip_prefix("ref: refs/heads/") {
         b
     } else if let Some(b) = line.strip_prefix("ref: ") {
@@ -243,9 +269,10 @@ fn read_head(head_path: &Path) -> Option<String> {
         &line[..line.len().min(8)]
     };
     if branch.is_empty() {
-        return None;
+        return false;
     }
-    Some(branch.to_string())
+    out.push_str(branch);
+    true
 }
 
 fn hostname() -> String {

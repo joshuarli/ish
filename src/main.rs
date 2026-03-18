@@ -16,6 +16,8 @@ struct Shell {
     cols: u16,
     history: history::History,
     prompt: prompt::Prompt,
+    /// Reusable buffer for rendered prompt string — avoids allocation per render.
+    prompt_buf: String,
     job: Option<Job>,
     exit_warned: bool,
     denv_active: Option<bool>, // None = unchecked, defers scan_path to first use
@@ -127,6 +129,7 @@ fn main() {
         cols,
         history: history::History::load(),
         prompt: prompt::Prompt::new(),
+        prompt_buf: String::with_capacity(128),
         job: None,
         exit_warned: false,
         denv_active: None,
@@ -315,6 +318,20 @@ fn main() {
     }
 }
 
+/// Read an env var via libc::getenv — zero allocation (returns &str into env block).
+/// SAFETY: Only safe in a single-threaded context (which ish is).
+fn getenv_str(name: &std::ffi::CStr) -> &'static str {
+    unsafe {
+        let ptr = libc::getenv(name.as_ptr());
+        if ptr.is_null() {
+            return "";
+        }
+        let cstr = std::ffi::CStr::from_ptr(ptr);
+        // Env vars set by the shell are always valid UTF-8; fallback to empty on exotic values.
+        std::str::from_utf8(cstr.to_bytes()).unwrap_or("")
+    }
+}
+
 fn read_line(shell: &mut Shell) -> ReadResult {
     let _raw = match term::RawMode::enable() {
         Ok(r) => r,
@@ -332,8 +349,14 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     let mut history_idx: Option<usize> = None;
     let mut saved_line = String::new();
 
-    // Render prompt
-    let prompt_str = shell.prompt.render(shell.last_status);
+    // Render prompt — zero-alloc: reuse shell.prompt_buf, read env via getenv.
+    // Take ownership so prompt_str can be borrowed independently of shell.
+    let pwd = getenv_str(c"PWD");
+    let denv_dirty = getenv_str(c"__DENV_DIRTY") == "1";
+    shell
+        .prompt
+        .render_into(&mut shell.prompt_buf, shell.last_status, pwd, denv_dirty);
+    let prompt_str = std::mem::take(&mut shell.prompt_buf);
     let prompt_display_len = shell.prompt.display_len(&prompt_str);
 
     render::render_line(&mut tw, &prompt_str, prompt_display_len, &line, shell.cols);
@@ -371,6 +394,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             KeyAction::Execute(text) => {
                                 tw.write_str("\r\n");
                                 let _ = tw.flush_to_stdout();
+                                shell.prompt_buf = prompt_str;
                                 if full_input.is_empty() {
                                     return if text.is_empty() {
                                         ReadResult::Empty
@@ -400,11 +424,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             KeyAction::Cancel => {
                                 tw.write_str("^C\r\n");
                                 let _ = tw.flush_to_stdout();
+                                shell.prompt_buf = prompt_str;
                                 return ReadResult::Empty;
                             }
                             KeyAction::Exit => {
                                 tw.write_str("\r\n");
                                 let _ = tw.flush_to_stdout();
+                                shell.prompt_buf = prompt_str;
                                 return handle_exit(shell);
                             }
                             KeyAction::ClearScreen => {

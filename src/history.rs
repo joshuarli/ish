@@ -98,19 +98,32 @@ impl History {
                 .rev()
                 .map(|(idx, _)| FuzzyMatch {
                     entry_idx: idx,
-                    match_positions: Vec::new(),
+                    match_positions: [0; 32],
+                    match_count: 0,
                 })
                 .collect();
         }
 
-        let query_lower: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
+        // Stack array for lowercased query — avoids Vec allocation
+        let mut query_buf = ['\0'; 64];
+        let mut query_len = 0;
+        for c in query.chars().flat_map(|c| c.to_lowercase()) {
+            if query_len >= query_buf.len() {
+                break;
+            }
+            query_buf[query_len] = c;
+            query_len += 1;
+        }
+        let query_lower = &query_buf[..query_len];
+
         let mut results = Vec::new();
 
         for (idx, entry) in self.entries.iter().enumerate().rev() {
-            if let Some(positions) = subsequence_match(&query_lower, entry) {
+            if let Some((positions, count)) = subsequence_match(query_lower, entry) {
                 results.push(FuzzyMatch {
                     entry_idx: idx,
                     match_positions: positions,
+                    match_count: count,
                 });
             }
         }
@@ -139,31 +152,34 @@ impl History {
 
 pub struct FuzzyMatch {
     pub entry_idx: usize,
-    pub match_positions: Vec<usize>,
+    /// Matched character indices (as u16 — entries are always <64K chars).
+    pub match_positions: [u16; 32],
+    pub match_count: u8,
 }
 
 /// Check if `query` chars appear in `text` in order (case-insensitive).
-/// Returns character indices in `text` that matched.
-pub fn subsequence_match(query: &[char], text: &str) -> Option<Vec<usize>> {
+/// Returns a fixed-size array of matched character indices and the count.
+/// Zero heap allocations — uses stack arrays only.
+pub fn subsequence_match(query: &[char], text: &str) -> Option<([u16; 32], u8)> {
     if query.is_empty() {
-        return Some(Vec::new());
+        return Some(([0; 32], 0));
     }
+
+    let mut positions = [0u16; 32];
 
     // ASCII fast path: if both query and text are ASCII, operate on bytes directly.
     // This avoids char decoding and to_lowercase() overhead for the common case.
     if text.is_ascii() && query.iter().all(|c| c.is_ascii()) {
         let bytes = text.as_bytes();
-        let mut positions = Vec::with_capacity(query.len());
         let mut qi = 0;
-        let qb = query[qi] as u8; // already lowercase from caller
-        let mut target = qb;
+        let mut target = query[qi] as u8; // already lowercase from caller
 
         for (ti, &b) in bytes.iter().enumerate() {
             if b.to_ascii_lowercase() == target {
-                positions.push(ti);
+                positions[qi] = ti as u16;
                 qi += 1;
                 if qi == query.len() {
-                    return Some(positions);
+                    return Some((positions, qi as u8));
                 }
                 target = query[qi] as u8;
             }
@@ -171,15 +187,14 @@ pub fn subsequence_match(query: &[char], text: &str) -> Option<Vec<usize>> {
         return None;
     }
 
-    let mut positions = Vec::with_capacity(query.len());
     let mut qi = 0;
 
     for (ti, tc) in text.chars().enumerate() {
         if tc.to_lowercase().next() == Some(query[qi]) {
-            positions.push(ti);
+            positions[qi] = ti as u16;
             qi += 1;
             if qi == query.len() {
-                return Some(positions);
+                return Some((positions, qi as u8));
             }
         }
     }
@@ -204,8 +219,9 @@ mod tests {
     #[test]
     fn subsequence() {
         let q: Vec<char> = "gco".chars().collect();
-        let positions = subsequence_match(&q, "git checkout").unwrap();
-        assert_eq!(positions, vec![0, 4, 9]);
+        let (positions, count) = subsequence_match(&q, "git checkout").unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(&positions[..3], &[0, 4, 9]);
     }
 
     #[test]

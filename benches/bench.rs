@@ -767,11 +767,25 @@ fn bench_alloc_audit(c: &mut Criterion) {
         });
         eprintln!("  [alloc] parse_expand_pipeline:     {stats}");
 
+        // Cold start (includes Prompt::new allocations)
         let stats = measure_allocs(|| {
             let mut p = prompt::Prompt::new();
             black_box(p.render(0));
         });
-        eprintln!("  [alloc] prompt_render:             {stats}");
+        eprintln!("  [alloc] prompt_render_cold:         {stats}");
+
+        // Warm: second render reuses all buffers — should be 0 allocs
+        {
+            let mut p = prompt::Prompt::new();
+            let mut buf = String::with_capacity(128);
+            let pwd = std::env::var("PWD").unwrap_or_default();
+            p.render_into(&mut buf, 0, &pwd, false); // warm up caches
+            let stats = measure_allocs(|| {
+                p.render_into(&mut buf, 0, &pwd, false);
+                black_box(&buf);
+            });
+            eprintln!("  [alloc] prompt_render_warm:         {stats}");
+        }
 
         let stats = measure_allocs(|| {
             let entries: Vec<String> = (0..1000)

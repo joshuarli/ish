@@ -198,7 +198,7 @@ pub fn render_history_pager(
             if ci >= max_width {
                 break;
             }
-            let is_match = pi < m.match_positions.len() && m.match_positions[pi] == ci;
+            let is_match = pi < m.match_count as usize && m.match_positions[pi] == ci as u16;
             if is_match {
                 pi += 1;
             }

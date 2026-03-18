@@ -512,14 +512,41 @@ fn format_segments(segments: &[(parse::Pipeline, Option<Connector>)]) -> String 
 }
 
 pub fn scan_path(cmd: &str) -> Option<PathBuf> {
-    let path_var = std::env::var("PATH").ok()?;
-    for dir in path_var.split(':') {
-        let full = PathBuf::from(dir).join(cmd);
-        if let Ok(meta) = full.metadata() {
-            use std::os::unix::fs::PermissionsExt;
-            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
-                return Some(full);
-            }
+    // SAFETY: Single-threaded shell. getenv returns a pointer into the
+    // environment block, valid until the variable is next modified.
+    let path_bytes = unsafe {
+        let ptr = libc::getenv(c"PATH".as_ptr());
+        if ptr.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(ptr).to_bytes()
+    };
+
+    // Stack buffer for "dir/cmd\0" — avoids all PathBuf/String allocations
+    let mut buf = [0u8; 4096];
+    let cmd_bytes = cmd.as_bytes();
+
+    for dir in path_bytes.split(|&b| b == b':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let total = dir.len() + 1 + cmd_bytes.len();
+        if total >= buf.len() {
+            continue;
+        }
+        buf[..dir.len()].copy_from_slice(dir);
+        buf[dir.len()] = b'/';
+        buf[dir.len() + 1..total].copy_from_slice(cmd_bytes);
+        buf[total] = 0; // NUL terminator for stat
+
+        // SAFETY: buf is NUL-terminated, stat writes into a stack struct.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::stat(buf.as_ptr() as *const libc::c_char, &mut st) } == 0
+            && (st.st_mode & libc::S_IFREG != 0)
+            && (st.st_mode & 0o111 != 0)
+        {
+            use std::os::unix::ffi::OsStrExt;
+            return Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..total])));
         }
     }
     None

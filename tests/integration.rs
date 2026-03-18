@@ -392,8 +392,9 @@ fn history_fuzzy_empty_query_returns_all() {
 #[test]
 fn history_fuzzy_match_positions_correct() {
     let q: Vec<char> = "gco".chars().collect();
-    let positions = history::subsequence_match(&q, "git checkout").unwrap();
-    assert_eq!(positions, vec![0, 4, 9]); // g=0, c=4, o=9
+    let (positions, count) = history::subsequence_match(&q, "git checkout").unwrap();
+    assert_eq!(count, 3);
+    assert_eq!(&positions[..3], &[0, 4, 9]); // g=0, c=4, o=9
 }
 
 #[test]
@@ -1545,8 +1546,8 @@ fn history_prefix_search_no_match() {
 #[test]
 fn history_fuzzy_match_positions_empty_query() {
     let q: Vec<char> = "".chars().collect();
-    let positions = history::subsequence_match(&q, "anything");
-    assert_eq!(positions, Some(vec![]));
+    let result = history::subsequence_match(&q, "anything");
+    assert_eq!(result, Some(([0; 32], 0)));
 }
 
 // ---------------------------------------------------------------------------
