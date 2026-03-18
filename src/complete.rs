@@ -1,7 +1,6 @@
-use std::os::unix::fs::PermissionsExt;
-
 pub struct CompEntry {
-    pub name: String,
+    name_start: u32,
+    name_len: u16,
     pub is_dir: bool,
     pub is_link: bool,
     pub is_exec: bool,
@@ -9,34 +8,95 @@ pub struct CompEntry {
 
 impl CompEntry {
     pub fn display_width(&self) -> usize {
-        self.name.len() + if self.is_dir { 1 } else { 0 }
+        self.name_len as usize + if self.is_dir { 1 } else { 0 }
     }
+}
 
-    /// Display name: name for files, name + "/" for dirs.
-    /// Returns Cow — borrows for files (zero alloc), allocates only for dirs.
-    pub fn display_name(&self) -> std::borrow::Cow<'_, str> {
-        if self.is_dir {
-            let mut s = String::with_capacity(self.name.len() + 1);
-            s.push_str(&self.name);
-            s.push('/');
-            std::borrow::Cow::Owned(s)
-        } else {
-            std::borrow::Cow::Borrowed(&self.name)
+/// Arena-backed completion results. All entry names are stored contiguously
+/// in `names`; each `CompEntry` stores an offset+length into it.
+/// Typical completion: 2 heap allocations total (the arena String + entries Vec).
+pub struct Completions {
+    pub names: String,
+    pub entries: Vec<CompEntry>,
+}
+
+impl Default for Completions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Completions {
+    pub fn new() -> Self {
+        Self {
+            names: String::new(),
+            entries: Vec::new(),
         }
     }
 
-    /// Write the display name directly into a TermWriter — zero allocation.
-    /// Prefer this on the rendering hot path over display_name().
-    pub fn write_display_name(&self, tw: &mut crate::term::TermWriter) {
-        tw.write_str(&self.name);
-        if self.is_dir {
-            tw.write_str("/");
-        }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Get the name of an entry by index.
+    pub fn name(&self, idx: usize) -> &str {
+        let e = &self.entries[idx];
+        &self.names[e.name_start as usize..][..e.name_len as usize]
+    }
+
+    /// Get the name of an entry reference.
+    pub fn entry_name(&self, e: &CompEntry) -> &str {
+        &self.names[e.name_start as usize..][..e.name_len as usize]
+    }
+
+    pub fn push(&mut self, name: &str, is_dir: bool, is_link: bool, is_exec: bool) {
+        let start = self.names.len() as u32;
+        self.names.push_str(name);
+        self.entries.push(CompEntry {
+            name_start: start,
+            name_len: name.len() as u16,
+            is_dir,
+            is_link,
+            is_exec,
+        });
+    }
+
+    /// Begin a name by recording the current arena position.
+    /// Call `finish_entry` after pushing name parts to `names`.
+    pub fn begin_entry(&self) -> u32 {
+        self.names.len() as u32
+    }
+
+    /// Finish an entry whose name starts at `start` in the arena.
+    pub fn finish_entry(&mut self, start: u32, is_dir: bool, is_link: bool, is_exec: bool) {
+        let name_len = (self.names.len() - start as usize) as u16;
+        self.entries.push(CompEntry {
+            name_start: start,
+            name_len,
+            is_dir,
+            is_link,
+            is_exec,
+        });
+    }
+
+    fn sort_by_name(&mut self) {
+        let names = &self.names;
+        self.entries.sort_by(|a, b| {
+            let an = &names[a.name_start as usize..][..a.name_len as usize];
+            let bn = &names[b.name_start as usize..][..b.name_len as usize];
+            an.bytes()
+                .map(|b| b.to_ascii_lowercase())
+                .cmp(bn.bytes().map(|b| b.to_ascii_lowercase()))
+        });
     }
 }
 
 pub struct CompletionState {
-    pub entries: Vec<CompEntry>,
+    pub comp: Completions,
     pub selected: usize,
     pub cols: usize,
     pub rows: usize,
@@ -46,8 +106,26 @@ pub struct CompletionState {
 }
 
 impl CompletionState {
+    pub fn selected_name(&self) -> Option<&str> {
+        if self.selected < self.comp.len() {
+            Some(self.comp.name(self.selected))
+        } else {
+            None
+        }
+    }
+
     pub fn selected_entry(&self) -> Option<&CompEntry> {
-        self.entries.get(self.selected)
+        self.comp.entries.get(self.selected)
+    }
+
+    /// Write the display name of entry `idx` into a TermWriter — zero allocation.
+    pub fn write_display_name(&self, idx: usize, tw: &mut crate::term::TermWriter) {
+        let e = &self.comp.entries[idx];
+        let name = &self.comp.names[e.name_start as usize..][..e.name_len as usize];
+        tw.write_str(name);
+        if e.is_dir {
+            tw.write_str("/");
+        }
     }
 
     pub fn move_up(&mut self) {
@@ -61,12 +139,12 @@ impl CompletionState {
             if col > 0 {
                 let prev_col = col - 1;
                 let idx = prev_col * self.rows + self.rows - 1;
-                self.selected = idx.min(self.entries.len() - 1);
+                self.selected = idx.min(self.comp.entries.len() - 1);
             } else {
                 // Wrap to last column
-                let last_col = (self.entries.len().saturating_sub(1)) / self.rows;
+                let last_col = (self.comp.entries.len().saturating_sub(1)) / self.rows;
                 let idx = last_col * self.rows + self.rows - 1;
-                self.selected = idx.min(self.entries.len() - 1);
+                self.selected = idx.min(self.comp.entries.len() - 1);
             }
         } else {
             self.selected -= 1;
@@ -79,11 +157,11 @@ impl CompletionState {
         }
         let row = self.selected % self.rows;
         let col = self.selected / self.rows;
-        if row + 1 >= self.rows || self.selected + 1 >= self.entries.len() {
+        if row + 1 >= self.rows || self.selected + 1 >= self.comp.entries.len() {
             // Wrap to next column, first row
             let next_col = col + 1;
             let idx = next_col * self.rows;
-            if idx < self.entries.len() {
+            if idx < self.comp.entries.len() {
                 self.selected = idx;
             } else {
                 self.selected = 0;
@@ -101,9 +179,9 @@ impl CompletionState {
         let row = self.selected % self.rows;
         if col == 0 {
             // Wrap to last column
-            let last_col = (self.entries.len().saturating_sub(1)) / self.rows;
+            let last_col = (self.comp.entries.len().saturating_sub(1)) / self.rows;
             let idx = last_col * self.rows + row;
-            self.selected = idx.min(self.entries.len() - 1);
+            self.selected = idx.min(self.comp.entries.len() - 1);
         } else {
             self.selected -= self.rows;
         }
@@ -116,102 +194,177 @@ impl CompletionState {
         let col = self.selected / self.rows;
         let row = self.selected % self.rows;
         let next = (col + 1) * self.rows + row;
-        if next < self.entries.len() {
+        if next < self.comp.entries.len() {
             self.selected = next;
         } else {
             // Wrap to first column
-            self.selected = row.min(self.entries.len() - 1);
+            self.selected = row.min(self.comp.entries.len() - 1);
         }
     }
 }
 
 /// Generate file completions for the given partial word.
 /// If `dirs_only` is true, only return directories (and symlinks to directories).
-pub fn complete_path(partial: &str, dirs_only: bool) -> Vec<CompEntry> {
+pub fn complete_path(partial: &str, dirs_only: bool) -> Completions {
     let (dir, prefix) = split_path(partial);
-    complete_in_dir(dir, prefix, dirs_only)
+    let mut comp = Completions::new();
+    complete_in_dir(dir, prefix, dirs_only, &mut comp);
+    comp
 }
 
 /// Complete entries in `dir` whose names start with `prefix`.
-fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool) -> Vec<CompEntry> {
-    let read_dir = match std::fs::read_dir(if dir.is_empty() { "." } else { dir }) {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
+/// Uses libc opendir/readdir + stat directly. Names are appended to the arena.
+fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completions) {
+    let dir_path = if dir.is_empty() { "." } else { dir };
+
+    // Build NUL-terminated dir path on stack
+    let dir_bytes = dir_path.as_bytes();
+    let mut dir_buf = [0u8; 4096];
+    if dir_bytes.len() >= dir_buf.len() {
+        return;
+    }
+    dir_buf[..dir_bytes.len()].copy_from_slice(dir_bytes);
+    dir_buf[dir_bytes.len()] = 0;
+
+    // SAFETY: dir_buf is NUL-terminated, opendir is safe for valid paths.
+    let dp = unsafe { libc::opendir(dir_buf.as_ptr() as *const libc::c_char) };
+    if dp.is_null() {
+        return;
+    }
+
+    let prefix_bytes = prefix.as_bytes();
+
+    // Stack buffer for "dir/name\0" used by stat/lstat
+    let mut path_buf = [0u8; 4096];
+    let dir_prefix_len = if dir_path == "." {
+        0
+    } else {
+        let len = dir_bytes.len();
+        path_buf[..len].copy_from_slice(dir_bytes);
+        if dir_bytes.last() != Some(&b'/') {
+            path_buf[len] = b'/';
+            len + 1
+        } else {
+            len
+        }
     };
 
-    let mut entries: Vec<CompEntry> = read_dir
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            // Skip . and ..
-            if name == "." || name == ".." {
-                return None;
-            }
-            // Skip filenames with control characters (newlines, etc.)
-            if name.bytes().any(|b| b < b' ' || b == 0x7f) {
-                return None;
-            }
-            // Skip hidden files unless prefix starts with .
-            if name.starts_with('.') && !prefix.starts_with('.') {
-                return None;
-            }
-            // Filter by prefix
-            if !name.starts_with(prefix) {
-                return None;
-            }
-            // e.metadata() follows symlinks, so symlinks to dirs count as dirs
-            let meta = e.metadata().ok()?;
-            let is_dir = meta.is_dir();
-            if dirs_only && !is_dir {
-                return None;
-            }
-            let is_link = e
-                .path()
-                .symlink_metadata()
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false);
-            Some(CompEntry {
-                is_dir,
-                is_exec: !is_dir && meta.permissions().mode() & 0o111 != 0,
-                is_link,
-                name,
-            })
-        })
-        .collect();
+    loop {
+        // SAFETY: dp is a valid DIR* from opendir above.
+        let ent = unsafe { libc::readdir(dp) };
+        if ent.is_null() {
+            break;
+        }
 
-    entries.sort_by_key(|a| a.name.to_lowercase());
-    entries
+        // SAFETY: d_name is a NUL-terminated C string within the dirent.
+        let name_cstr = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let name_bytes = name_cstr.to_bytes();
+
+        // Skip . and ..
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        // Skip filenames with control characters
+        if name_bytes.iter().any(|&b| b < b' ' || b == 0x7f) {
+            continue;
+        }
+        // Skip hidden files unless prefix starts with .
+        if name_bytes.first() == Some(&b'.') && !prefix_bytes.starts_with(b".") {
+            continue;
+        }
+        // Filter by prefix
+        if !name_bytes.starts_with(prefix_bytes) {
+            continue;
+        }
+
+        // Build full path for stat: "dir/name\0"
+        let total = dir_prefix_len + name_bytes.len();
+        if total >= path_buf.len() {
+            continue;
+        }
+        path_buf[dir_prefix_len..total].copy_from_slice(name_bytes);
+        path_buf[total] = 0;
+
+        // stat follows symlinks (so symlink-to-dir counts as dir)
+        // SAFETY: path_buf is NUL-terminated, stat writes into stack struct.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::stat(path_buf.as_ptr() as *const libc::c_char, &mut st) } != 0 {
+            continue;
+        }
+        let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+        if dirs_only && !is_dir {
+            continue;
+        }
+
+        // lstat to detect symlinks
+        let mut lst: libc::stat = unsafe { std::mem::zeroed() };
+        let is_link = unsafe { libc::lstat(path_buf.as_ptr() as *const libc::c_char, &mut lst) }
+            == 0
+            && lst.st_mode & libc::S_IFMT == libc::S_IFLNK;
+
+        let is_exec = !is_dir && st.st_mode & 0o111 != 0;
+
+        let name = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        comp.push(name, is_dir, is_link, is_exec);
+    }
+
+    // SAFETY: dp is a valid DIR* from opendir.
+    unsafe { libc::closedir(dp) };
+
+    comp.sort_by_name();
 }
 
 /// Fish-style partial path completion: each intermediate directory component
 /// is treated as a prefix. e.g., "/home/user/de/s" finds entries starting
 /// with "s" in /home/user/dev/, /home/user/Desktop/, etc.
-/// Returns (resolved_dir_with_slash, entries) pairs.
-pub fn complete_partial_path(partial: &str, dirs_only: bool) -> Vec<(String, Vec<CompEntry>)> {
+/// Returns (resolved_dir_with_slash, start_idx, count) tuples indexing into the Completions.
+pub fn complete_partial_path(
+    partial: &str,
+    dirs_only: bool,
+) -> (Completions, Vec<(String, usize, usize)>) {
     let (dir, prefix) = split_path(partial);
     if dir.is_empty() {
-        return Vec::new();
+        return (Completions::new(), Vec::new());
     }
 
     let dir_trimmed = dir.trim_end_matches('/');
 
     // If dir already exists, complete_path handles it
-    if std::fs::metadata(dir_trimmed)
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-    {
-        return Vec::new();
+    if is_dir(dir_trimmed) {
+        return (Completions::new(), Vec::new());
     }
 
     let resolved_dirs = resolve_partial_dir(dir_trimmed);
-    let mut results = Vec::new();
+    let mut comp = Completions::new();
+    let mut groups = Vec::new();
+
     for rdir in resolved_dirs {
-        let entries = complete_in_dir(&rdir, prefix, dirs_only);
-        if !entries.is_empty() {
-            results.push((format!("{rdir}/"), entries));
+        let start = comp.entries.len();
+        complete_in_dir(&rdir, prefix, dirs_only, &mut comp);
+        let count = comp.entries.len() - start;
+        if count > 0 {
+            groups.push((format!("{rdir}/"), start, count));
         }
     }
-    results
+    (comp, groups)
+}
+
+/// Check if path is a directory using libc::stat — zero allocation.
+fn is_dir(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let mut buf = [0u8; 4096];
+    if bytes.len() >= buf.len() {
+        return false;
+    }
+    buf[..bytes.len()].copy_from_slice(bytes);
+    buf[bytes.len()] = 0;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::stat(buf.as_ptr() as *const libc::c_char, &mut st) };
+    rc == 0 && st.st_mode & libc::S_IFMT == libc::S_IFDIR
 }
 
 /// Recursively resolve a directory path where each component is a prefix.
@@ -223,7 +376,7 @@ fn resolve_partial_dir(dir: &str) -> Vec<String> {
     }
 
     // Base: if it exists as a directory, return it
-    if std::fs::metadata(dir).map(|m| m.is_dir()).unwrap_or(false) {
+    if is_dir(dir) {
         return vec![dir.to_string()];
     }
 
@@ -238,34 +391,92 @@ fn resolve_partial_dir(dir: &str) -> Vec<String> {
         return Vec::new();
     }
 
+    let comp_bytes = component.as_bytes();
+
     // Recursively resolve parent
     let parents = resolve_partial_dir(parent);
 
     let mut results = Vec::new();
     for p in &parents {
-        let rd = match std::fs::read_dir(p.as_str()) {
-            Ok(d) => d,
-            Err(_) => continue,
+        // Open directory with libc
+        let p_bytes = p.as_bytes();
+        let mut dir_buf = [0u8; 4096];
+        if p_bytes.len() >= dir_buf.len() {
+            continue;
+        }
+        dir_buf[..p_bytes.len()].copy_from_slice(p_bytes);
+        dir_buf[p_bytes.len()] = 0;
+
+        let dp = unsafe { libc::opendir(dir_buf.as_ptr() as *const libc::c_char) };
+        if dp.is_null() {
+            continue;
+        }
+
+        // Stack buffer for "parent/name\0" for stat
+        let mut path_buf = [0u8; 4096];
+        let prefix_len = if p == "." {
+            0
+        } else {
+            let len = p_bytes.len();
+            path_buf[..len].copy_from_slice(p_bytes);
+            if p_bytes.last() != Some(&b'/') {
+                path_buf[len] = b'/';
+                len + 1
+            } else {
+                len
+            }
         };
-        for entry in rd.filter_map(|e| e.ok()) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with(component) {
+
+        loop {
+            let ent = unsafe { libc::readdir(dp) };
+            if ent.is_null() {
+                break;
+            }
+            let name_cstr = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+            let name_bytes = name_cstr.to_bytes();
+
+            if name_bytes == b"." || name_bytes == b".." {
                 continue;
             }
-            if name.starts_with('.') && !component.starts_with('.') {
+            if !name_bytes.starts_with(comp_bytes) {
                 continue;
             }
-            if !entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+            if name_bytes.first() == Some(&b'.') && !comp_bytes.starts_with(b".") {
                 continue;
             }
+
+            // stat to check if it's a directory
+            let total = prefix_len + name_bytes.len();
+            if total >= path_buf.len() {
+                continue;
+            }
+            path_buf[prefix_len..total].copy_from_slice(name_bytes);
+            path_buf[total] = 0;
+
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::stat(path_buf.as_ptr() as *const libc::c_char, &mut st) } != 0 {
+                continue;
+            }
+            if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                continue;
+            }
+
+            let name = match std::str::from_utf8(name_bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
             if p == "/" {
                 results.push(format!("/{name}"));
             } else if p == "." {
-                results.push(name);
+                results.push(name.to_string());
             } else {
                 results.push(format!("{p}/{name}"));
             }
         }
+
+        unsafe { libc::closedir(dp) };
+
         // Cap expansion to avoid combinatorial explosion
         if results.len() > 64 {
             results.truncate(64);
@@ -277,19 +488,45 @@ fn resolve_partial_dir(dir: &str) -> Vec<String> {
 
 /// Generate environment variable completions for a `$` prefix.
 /// `partial` should include the `$` (e.g., `$PA`).
-pub fn complete_env(partial: &str) -> Vec<CompEntry> {
+/// Uses environ directly — only allocates the arena + entries Vec.
+pub fn complete_env(partial: &str) -> Completions {
+    unsafe extern "C" {
+        static environ: *const *const libc::c_char;
+    }
+
     let prefix = partial.strip_prefix('$').unwrap_or(partial);
-    let mut entries: Vec<CompEntry> = std::env::vars()
-        .filter(|(key, _)| key.starts_with(prefix))
-        .map(|(key, _)| CompEntry {
-            name: key,
-            is_dir: false,
-            is_link: false,
-            is_exec: false,
-        })
-        .collect();
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    entries
+    let prefix_bytes = prefix.as_bytes();
+    let mut comp = Completions::new();
+
+    // SAFETY: Single-threaded shell. environ is a NULL-terminated array of
+    // "KEY=VALUE\0" pointers, valid until the environment is next modified.
+    unsafe {
+        let mut ep = environ;
+        if ep.is_null() {
+            return comp;
+        }
+        while !(*ep).is_null() {
+            let entry = std::ffi::CStr::from_ptr(*ep).to_bytes();
+            // Find the '=' separator
+            if let Some(eq_pos) = entry.iter().position(|&b| b == b'=') {
+                let key = &entry[..eq_pos];
+                if key.starts_with(prefix_bytes)
+                    && let Ok(name) = std::str::from_utf8(key)
+                {
+                    comp.push(name, false, false, false);
+                }
+            }
+            ep = ep.add(1);
+        }
+    }
+
+    let names = &comp.names;
+    comp.entries.sort_by(|a, b| {
+        let an = &names[a.name_start as usize..][..a.name_len as usize];
+        let bn = &names[b.name_start as usize..][..b.name_len as usize];
+        an.cmp(bn)
+    });
+    comp
 }
 
 /// Split "path/to/pref" into ("path/to/", "pref").
@@ -347,15 +584,11 @@ mod tests {
 
     #[test]
     fn grid_computation() {
-        let entries: Vec<CompEntry> = (0..7)
-            .map(|i| CompEntry {
-                name: format!("file{i}.rs"),
-                is_dir: false,
-                is_link: false,
-                is_exec: false,
-            })
-            .collect();
-        let (cols, rows) = compute_grid(&entries, 80);
+        let mut comp = Completions::new();
+        for i in 0..7 {
+            comp.push(&format!("file{i}.rs"), false, false, false);
+        }
+        let (cols, rows) = compute_grid(&comp.entries, 80);
         assert!(cols >= 1);
         assert!(rows >= 1);
         assert!(cols * rows >= 7);
@@ -363,7 +596,6 @@ mod tests {
 
     #[test]
     fn partial_path_resolves_this_repo() {
-        // "src" exists under ".", so "sr" should resolve to "src"
         let resolved = resolve_partial_dir("sr");
         assert!(
             resolved.iter().any(|d| d == "src"),
@@ -373,20 +605,16 @@ mod tests {
 
     #[test]
     fn partial_path_two_levels() {
-        // "sr/m" should resolve to "src/main.rs" parent, i.e., "src"
-        // but "m" as a directory — only if there's a dir starting with "m" in src/
-        // There isn't, so this tests the resolution still works (returns src at least)
         let resolved = resolve_partial_dir("sr");
         assert!(!resolved.is_empty());
     }
 
     #[test]
     fn partial_path_complete_finds_entries() {
-        // "./sr/m" → should find main.rs in src/
-        let results = complete_partial_path("./sr/m", false);
-        let names: Vec<&str> = results
+        let (comp, groups) = complete_partial_path("./sr/m", false);
+        let names: Vec<&str> = groups
             .iter()
-            .flat_map(|(_, entries)| entries.iter().map(|e| e.name.as_str()))
+            .flat_map(|(_, start, count)| (*start..*start + *count).map(|i| comp.name(i)))
             .collect();
         assert!(
             names.iter().any(|n| n.starts_with("main")),
@@ -396,26 +624,24 @@ mod tests {
 
     #[test]
     fn partial_path_existing_dir_returns_empty() {
-        // If the directory exists, complete_partial_path defers to complete_path
-        let results = complete_partial_path("./src/m", false);
-        assert!(results.is_empty());
+        let (_comp, groups) = complete_partial_path("./src/m", false);
+        assert!(groups.is_empty());
     }
 
     #[test]
     fn partial_path_nonexistent_returns_empty() {
-        let results = complete_partial_path("./zzzzz/m", false);
-        assert!(results.is_empty());
+        let (_comp, groups) = complete_partial_path("./zzzzz/m", false);
+        assert!(groups.is_empty());
     }
 
     #[test]
     fn partial_path_absolute_tilde_expanded() {
-        // Simulate "~/de/s" with tilde already expanded
         let home = std::env::var("HOME").unwrap();
         let expanded = format!("{home}/de/s");
-        let results = complete_partial_path(&expanded, true);
-        let all_names: Vec<&str> = results
+        let (comp, groups) = complete_partial_path(&expanded, true);
+        let all_names: Vec<&str> = groups
             .iter()
-            .flat_map(|(_, entries)| entries.iter().map(|e| e.name.as_str()))
+            .flat_map(|(_, start, count)| (*start..*start + *count).map(|i| comp.name(i)))
             .collect();
         assert!(
             all_names.contains(&"sentry"),

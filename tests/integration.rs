@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use ish::alias::AliasMap;
 use ish::builtin;
-use ish::complete::{self, CompEntry, CompletionState};
+use ish::complete::{self, CompletionState, Completions};
 use ish::config;
 use ish::error::Error;
 use ish::expand;
@@ -409,55 +409,51 @@ fn history_add_whitespace_only_ignored() {
 // Completion: grid layout
 // ---------------------------------------------------------------------------
 
-fn make_entries(names: &[&str]) -> Vec<CompEntry> {
-    names
-        .iter()
-        .map(|n| CompEntry {
-            name: n.to_string(),
-            is_dir: false,
-            is_link: false,
-            is_exec: false,
-        })
-        .collect()
+fn make_entries(names: &[&str]) -> Completions {
+    let mut comp = Completions::new();
+    for n in names {
+        comp.push(n, false, false, false);
+    }
+    comp
 }
 
 #[test]
 fn grid_single_entry() {
-    let entries = make_entries(&["foo"]);
-    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let comp = make_entries(&["foo"]);
+    let (cols, rows) = complete::compute_grid(&comp.entries, 80);
     assert_eq!(cols, 1);
     assert_eq!(rows, 1);
 }
 
 #[test]
 fn grid_fits_multiple_columns() {
-    let entries = make_entries(&["a", "b", "c", "d", "e", "f"]);
-    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let comp = make_entries(&["a", "b", "c", "d", "e", "f"]);
+    let (cols, rows) = complete::compute_grid(&comp.entries, 80);
     assert!(cols > 1);
     assert!(cols * rows >= 6);
 }
 
 #[test]
 fn grid_narrow_terminal_forces_single_column() {
-    let entries = make_entries(&["longfilename.rs", "anotherlongname.rs"]);
-    let (cols, _rows) = complete::compute_grid(&entries, 20);
+    let comp = make_entries(&["longfilename.rs", "anotherlongname.rs"]);
+    let (cols, _rows) = complete::compute_grid(&comp.entries, 20);
     assert_eq!(cols, 1);
 }
 
 #[test]
 fn grid_empty_entries() {
-    let entries: Vec<CompEntry> = vec![];
-    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let comp = Completions::new();
+    let (cols, rows) = complete::compute_grid(&comp.entries, 80);
     assert_eq!(cols, 0);
     assert_eq!(rows, 0);
 }
 
 #[test]
 fn completion_state_navigation_wraps() {
-    let entries = make_entries(&["a", "b", "c", "d", "e", "f"]);
-    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let comp = make_entries(&["a", "b", "c", "d", "e", "f"]);
+    let (cols, rows) = complete::compute_grid(&comp.entries, 80);
     let mut state = CompletionState {
-        entries,
+        comp,
         selected: 0,
         cols,
         rows,
@@ -471,20 +467,20 @@ fn completion_state_navigation_wraps() {
     }
     // Should wrap around eventually
     // Just verify it doesn't panic and stays in bounds
-    assert!(state.selected < state.entries.len());
+    assert!(state.selected < state.comp.entries.len());
 
     // Navigate up from 0
     state.selected = 0;
     state.move_up();
-    assert!(state.selected < state.entries.len());
+    assert!(state.selected < state.comp.entries.len());
 }
 
 #[test]
 fn completion_state_left_right_wrap() {
-    let entries = make_entries(&["a", "b", "c", "d", "e", "f"]);
-    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let comp = make_entries(&["a", "b", "c", "d", "e", "f"]);
+    let (cols, rows) = complete::compute_grid(&comp.entries, 80);
     let mut state = CompletionState {
-        entries,
+        comp,
         selected: 0,
         cols,
         rows,
@@ -494,35 +490,31 @@ fn completion_state_left_right_wrap() {
 
     // Move left from first column should wrap to last
     state.move_left();
-    assert!(state.selected < state.entries.len());
+    assert!(state.selected < state.comp.entries.len());
 
     // Move right from last column should wrap to first
-    state.selected = state.entries.len() - 1;
+    state.selected = state.comp.entries.len() - 1;
     state.move_right();
-    assert!(state.selected < state.entries.len());
+    assert!(state.selected < state.comp.entries.len());
 }
 
 #[test]
 fn comp_entry_display_name_dir_suffix() {
-    let e = CompEntry {
-        name: "src".into(),
-        is_dir: true,
-        is_link: false,
-        is_exec: false,
-    };
-    assert_eq!(e.display_name(), "src/");
+    let mut comp = Completions::new();
+    comp.push("src", true, false, false);
+    let e = &comp.entries[0];
+    let name = comp.entry_name(e);
+    assert_eq!(name, "src");
     assert_eq!(e.display_width(), 4); // "src/"
 }
 
 #[test]
 fn comp_entry_display_name_file() {
-    let e = CompEntry {
-        name: "main.rs".into(),
-        is_dir: false,
-        is_link: false,
-        is_exec: false,
-    };
-    assert_eq!(e.display_name(), "main.rs");
+    let mut comp = Completions::new();
+    comp.push("main.rs", false, false, false);
+    let e = &comp.entries[0];
+    let name = comp.entry_name(e);
+    assert_eq!(name, "main.rs");
     assert_eq!(e.display_width(), 7);
 }
 
@@ -534,9 +526,9 @@ fn comp_entry_display_name_file() {
 fn complete_path_finds_files() {
     let dir = tempdir_with_files(&["foo.rs", "foo.txt", "bar.rs"]);
     let path = format!("{}/foo", dir.display());
-    let entries = complete::complete_path(&path, false);
-    assert_eq!(entries.len(), 2);
-    let names: HashSet<_> = entries.iter().map(|e| e.name.as_str()).collect();
+    let comp = complete::complete_path(&path, false);
+    assert_eq!(comp.len(), 2);
+    let names: HashSet<_> = (0..comp.len()).map(|i| comp.name(i)).collect();
     assert!(names.contains("foo.rs"));
     assert!(names.contains("foo.txt"));
 }
@@ -546,10 +538,10 @@ fn complete_path_dirs_only() {
     let dir = tempdir_with_files(&["file.rs"]);
     std::fs::create_dir(dir.join("subdir")).unwrap();
     let path = format!("{}/", dir.display());
-    let entries = complete::complete_path(&path, true);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, "subdir");
-    assert!(entries[0].is_dir);
+    let comp = complete::complete_path(&path, true);
+    assert_eq!(comp.len(), 1);
+    assert_eq!(comp.name(0), "subdir");
+    assert!(comp.entries[0].is_dir);
 }
 
 #[test]
@@ -557,22 +549,22 @@ fn complete_path_hidden_files() {
     let dir = tempdir_with_files(&[".hidden", "visible"]);
     // Without dot prefix, hidden files should be excluded
     let path = format!("{}/", dir.display());
-    let entries = complete::complete_path(&path, false);
-    let names: HashSet<_> = entries.iter().map(|e| e.name.as_str()).collect();
+    let comp = complete::complete_path(&path, false);
+    let names: HashSet<_> = (0..comp.len()).map(|i| comp.name(i)).collect();
     assert!(names.contains("visible"));
     assert!(!names.contains(".hidden"));
 
     // With dot prefix, hidden files should be included
     let path = format!("{}/.h", dir.display());
-    let entries = complete::complete_path(&path, false);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, ".hidden");
+    let comp = complete::complete_path(&path, false);
+    assert_eq!(comp.len(), 1);
+    assert_eq!(comp.name(0), ".hidden");
 }
 
 #[test]
 fn complete_path_nonexistent_dir() {
-    let entries = complete::complete_path("/nonexistent/path/foo", false);
-    assert!(entries.is_empty());
+    let comp = complete::complete_path("/nonexistent/path/foo", false);
+    assert!(comp.is_empty());
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1870,25 +1862,25 @@ fn line_buffer_word_movement_with_whitespace() {
 
 #[test]
 fn completion_state_selected_entry() {
-    let entries = make_entries(&["a", "b", "c"]);
-    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let comp = make_entries(&["a", "b", "c"]);
+    let (cols, rows) = complete::compute_grid(&comp.entries, 80);
     let state = CompletionState {
-        entries,
+        comp,
         selected: 1,
         cols,
         rows,
         scroll: 0,
         dir_prefix: String::new(),
     };
-    assert_eq!(state.selected_entry().unwrap().name, "b");
+    assert_eq!(state.selected_name().unwrap(), "b");
 }
 
 #[test]
 fn completion_state_selected_entry_out_of_bounds() {
-    let entries = make_entries(&["a"]);
-    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let comp = make_entries(&["a"]);
+    let (cols, rows) = complete::compute_grid(&comp.entries, 80);
     let state = CompletionState {
-        entries,
+        comp,
         selected: 99,
         cols,
         rows,
@@ -1900,9 +1892,8 @@ fn completion_state_selected_entry_out_of_bounds() {
 
 #[test]
 fn completion_move_with_zero_rows() {
-    let state_entries: Vec<CompEntry> = vec![];
     let mut state = CompletionState {
-        entries: state_entries,
+        comp: Completions::new(),
         selected: 0,
         cols: 0,
         rows: 0,
@@ -1919,10 +1910,10 @@ fn completion_move_with_zero_rows() {
 
 #[test]
 fn completion_navigation_single_entry() {
-    let entries = make_entries(&["only"]);
-    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let comp = make_entries(&["only"]);
+    let (cols, rows) = complete::compute_grid(&comp.entries, 80);
     let mut state = CompletionState {
-        entries,
+        comp,
         selected: 0,
         cols,
         rows,
@@ -1941,10 +1932,10 @@ fn completion_navigation_single_entry() {
 
 #[test]
 fn completion_move_right_wraps_to_first_col() {
-    let entries = make_entries(&["a", "b", "c", "d", "e", "f"]);
-    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let comp = make_entries(&["a", "b", "c", "d", "e", "f"]);
+    let (cols, rows) = complete::compute_grid(&comp.entries, 80);
     let mut state = CompletionState {
-        entries,
+        comp,
         selected: 0,
         cols,
         rows,
@@ -1954,16 +1945,16 @@ fn completion_move_right_wraps_to_first_col() {
     // Move right until we wrap
     for _ in 0..20 {
         state.move_right();
-        assert!(state.selected < state.entries.len());
+        assert!(state.selected < state.comp.entries.len());
     }
 }
 
 #[test]
 fn completion_move_left_wraps_to_last_col() {
-    let entries = make_entries(&["a", "b", "c", "d", "e", "f"]);
-    let (cols, rows) = complete::compute_grid(&entries, 80);
+    let comp = make_entries(&["a", "b", "c", "d", "e", "f"]);
+    let (cols, rows) = complete::compute_grid(&comp.entries, 80);
     let mut state = CompletionState {
-        entries,
+        comp,
         selected: 0,
         cols,
         rows,
@@ -1972,30 +1963,24 @@ fn completion_move_left_wraps_to_last_col() {
     };
     state.move_left(); // from col 0 should wrap to last col
     assert!(state.selected > 0);
-    assert!(state.selected < state.entries.len());
+    assert!(state.selected < state.comp.entries.len());
 }
 
 #[test]
 fn comp_entry_display_link() {
-    let e = CompEntry {
-        name: "link".into(),
-        is_dir: false,
-        is_link: true,
-        is_exec: false,
-    };
-    assert_eq!(&*e.display_name(), "link");
+    let mut comp = Completions::new();
+    comp.push("link", false, true, false);
+    let e = &comp.entries[0];
+    assert_eq!(comp.entry_name(e), "link");
     assert_eq!(e.display_width(), 4);
 }
 
 #[test]
 fn comp_entry_display_exec() {
-    let e = CompEntry {
-        name: "script".into(),
-        is_dir: false,
-        is_link: false,
-        is_exec: true,
-    };
-    assert_eq!(&*e.display_name(), "script");
+    let mut comp = Completions::new();
+    comp.push("script", false, false, true);
+    let e = &comp.entries[0];
+    assert_eq!(comp.entry_name(e), "script");
 }
 
 // ---------------------------------------------------------------------------
@@ -2316,11 +2301,13 @@ fn complete_path_symlink() {
     std::os::unix::fs::symlink(dir.join("target.txt"), &link_path).unwrap();
 
     let path = format!("{}/", dir.display());
-    let entries = complete::complete_path(&path, false);
-    let names: HashSet<_> = entries.iter().map(|e| e.name.as_str()).collect();
+    let comp = complete::complete_path(&path, false);
+    let names: HashSet<_> = (0..comp.len()).map(|i| comp.name(i)).collect();
     assert!(names.contains("target.txt"));
     assert!(names.contains("link.txt"));
     // link should be marked as a link
-    let link_entry = entries.iter().find(|e| e.name == "link.txt").unwrap();
-    assert!(link_entry.is_link);
+    let link_idx = (0..comp.len())
+        .find(|&i| comp.name(i) == "link.txt")
+        .unwrap();
+    assert!(comp.entries[link_idx].is_link);
 }

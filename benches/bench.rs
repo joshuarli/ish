@@ -10,7 +10,7 @@ use std::time::Duration;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use ish::alias::AliasMap;
-use ish::complete::{self, CompEntry};
+use ish::complete;
 use ish::error::Error;
 use ish::exec;
 use ish::expand;
@@ -358,34 +358,26 @@ fn bench_completion(c: &mut Criterion) {
     let mut group = c.benchmark_group("completion");
 
     // Grid layout computation
-    let entries: Vec<CompEntry> = (0..100)
-        .map(|i| CompEntry {
-            name: format!("file_{i:03}.rs"),
-            is_dir: i % 5 == 0,
-            is_link: false,
-            is_exec: i % 10 == 0,
-        })
-        .collect();
+    let mut comp100 = complete::Completions::new();
+    for i in 0..100 {
+        comp100.push(&format!("file_{i:03}.rs"), i % 5 == 0, false, i % 10 == 0);
+    }
 
     group.bench_function("compute_grid_100_entries", |b| {
-        b.iter(|| black_box(complete::compute_grid(&entries, 120)));
+        b.iter(|| black_box(complete::compute_grid(&comp100.entries, 120)));
     });
 
     group.bench_function("compute_grid_100_narrow", |b| {
-        b.iter(|| black_box(complete::compute_grid(&entries, 40)));
+        b.iter(|| black_box(complete::compute_grid(&comp100.entries, 40)));
     });
 
-    let small: Vec<CompEntry> = (0..5)
-        .map(|i| CompEntry {
-            name: format!("f{i}.rs"),
-            is_dir: false,
-            is_link: false,
-            is_exec: false,
-        })
-        .collect();
+    let mut comp5 = complete::Completions::new();
+    for i in 0..5 {
+        comp5.push(&format!("f{i}.rs"), false, false, false);
+    }
 
     group.bench_function("compute_grid_5_entries", |b| {
-        b.iter(|| black_box(complete::compute_grid(&small, 80)));
+        b.iter(|| black_box(complete::compute_grid(&comp5.entries, 80)));
     });
 
     // Filesystem completion (real I/O — measures readdir performance)

@@ -451,10 +451,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             }
                             KeyAction::StartCompletion => {
                                 match start_completion(&line, shell.cols, &shell.home) {
-                                    Some(cs) if cs.entries.len() == 1 => {
+                                    Some(cs) if cs.comp.len() == 1 => {
                                         accept_completion(&mut line, &cs);
                                     }
-                                    Some(cs) if !cs.entries.is_empty() => {
+                                    Some(cs) if !cs.comp.is_empty() => {
                                         mode = Mode::Completion(cs);
                                     }
                                     _ => {}
@@ -492,11 +492,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             CompAction::Refilter => {
                                 // User typed/deleted — re-run completion with updated line
                                 match start_completion(&line, shell.cols, &shell.home) {
-                                    Some(cs) if cs.entries.len() == 1 => {
+                                    Some(cs) if cs.comp.len() == 1 => {
                                         accept_completion(&mut line, &cs);
                                         mode = Mode::Normal;
                                     }
-                                    Some(cs) if !cs.entries.is_empty() => {
+                                    Some(cs) if !cs.comp.is_empty() => {
                                         // render_line clears old grid, render_completions draws new
                                         let info =
                                             render::render_line(&mut tw, p, pdl, &line, shell.cols);
@@ -759,13 +759,13 @@ fn start_completion(line: &LineBuffer, term_cols: u16, home: &str) -> Option<Com
 
     // Environment variable completion: $FOO<tab>
     if partial.starts_with('$') {
-        let entries = complete::complete_env(partial);
-        if entries.is_empty() {
+        let comp = complete::complete_env(partial);
+        if comp.is_empty() {
             return None;
         }
-        let (cols, rows) = complete::compute_grid(&entries, term_cols);
+        let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
         return Some(CompletionState {
-            entries,
+            comp,
             selected: 0,
             cols,
             rows,
@@ -794,11 +794,11 @@ fn start_completion(line: &LineBuffer, term_cols: u16, home: &str) -> Option<Com
         String::new()
     };
 
-    let entries = complete::complete_path(&expanded, dirs_only);
-    if !entries.is_empty() {
-        let (cols, rows) = complete::compute_grid(&entries, term_cols);
+    let comp = complete::complete_path(&expanded, dirs_only);
+    if !comp.is_empty() {
+        let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
         return Some(CompletionState {
-            entries,
+            comp,
             selected: 0,
             cols,
             rows,
@@ -809,8 +809,8 @@ fn start_completion(line: &LineBuffer, term_cols: u16, home: &str) -> Option<Com
 
     // Fish-style partial path completion: each intermediate component is a prefix.
     // e.g., "~/de/s" → resolve "de" to "dev", complete "s" in ~/dev/
-    let partial_results = complete::complete_partial_path(&expanded, dirs_only);
-    if partial_results.is_empty() {
+    let (partial_comp, groups) = complete::complete_partial_path(&expanded, dirs_only);
+    if groups.is_empty() {
         return None;
     }
 
@@ -823,30 +823,30 @@ fn start_completion(line: &LineBuffer, term_cols: u16, home: &str) -> Option<Com
         (String::new(), String::new())
     };
 
-    // Build entries with resolved intermediate components in the name
-    let mut all_entries = Vec::new();
-    for (resolved_dir, dir_entries) in partial_results {
+    // Build entries with resolved intermediate components in the name.
+    // Uses a single arena for all combined "rel_dir/name" strings.
+    let mut comp = complete::Completions::new();
+    for (resolved_dir, start, count) in &groups {
         let rel_dir = if expanded_root.is_empty() {
-            resolved_dir.to_string()
+            resolved_dir.as_str()
         } else {
             resolved_dir
                 .strip_prefix(&expanded_root)
-                .unwrap_or(&resolved_dir)
-                .to_string()
+                .unwrap_or(resolved_dir)
         };
-        for entry in dir_entries {
-            all_entries.push(complete::CompEntry {
-                name: format!("{rel_dir}{}", entry.name),
-                is_dir: entry.is_dir,
-                is_link: entry.is_link,
-                is_exec: entry.is_exec,
-            });
+        for i in *start..*start + *count {
+            let entry = &partial_comp.entries[i];
+            let orig_name = partial_comp.entry_name(entry);
+            let mark = comp.begin_entry();
+            comp.names.push_str(rel_dir);
+            comp.names.push_str(orig_name);
+            comp.finish_entry(mark, entry.is_dir, entry.is_link, entry.is_exec);
         }
     }
 
-    let (cols, rows) = complete::compute_grid(&all_entries, term_cols);
+    let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
     Some(CompletionState {
-        entries: all_entries,
+        comp,
         selected: 0,
         cols,
         rows,
@@ -897,26 +897,33 @@ fn handle_completion_key(
 }
 
 fn accept_completion(line: &mut LineBuffer, state: &CompletionState) {
-    if let Some(entry) = state.selected_entry() {
-        let text = line.text().to_string();
-        let before_cursor = &text[..line.cursor()];
-        let word_start = before_cursor.rfind(' ').map(|i| i + 1).unwrap_or(0);
-        let after_cursor = &text[line.cursor()..];
+    let entry = match state.selected_entry() {
+        Some(e) => e,
+        None => return,
+    };
+    let name = match state.selected_name() {
+        Some(n) => n,
+        None => return,
+    };
 
-        let mut completion = state.dir_prefix.clone();
-        completion.push_str(&entry.name);
-        if entry.is_dir {
-            completion.push('/');
-        }
+    let text = line.text().to_string();
+    let before_cursor = &text[..line.cursor()];
+    let word_start = before_cursor.rfind(' ').map(|i| i + 1).unwrap_or(0);
+    let after_cursor = &text[line.cursor()..];
 
-        let new_text = format!("{}{}{}", &text[..word_start], completion, after_cursor);
-        let new_cursor_chars = text[..word_start].chars().count() + completion.chars().count();
-        line.set(&new_text);
-        // Position cursor after the completion
-        line.move_home();
-        for _ in 0..new_cursor_chars {
-            line.move_right();
-        }
+    let mut completion = state.dir_prefix.clone();
+    completion.push_str(name);
+    if entry.is_dir {
+        completion.push('/');
+    }
+
+    let new_text = format!("{}{}{}", &text[..word_start], completion, after_cursor);
+    let new_cursor_chars = text[..word_start].chars().count() + completion.chars().count();
+    line.set(&new_text);
+    // Position cursor after the completion
+    line.move_home();
+    for _ in 0..new_cursor_chars {
+        line.move_right();
     }
 }
 

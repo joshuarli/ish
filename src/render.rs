@@ -1,4 +1,4 @@
-use crate::complete::{CompEntry, CompletionState};
+use crate::complete::CompletionState;
 use crate::history::{FuzzyMatch, History};
 use crate::line::LineBuffer;
 use crate::term::TermWriter;
@@ -93,7 +93,7 @@ pub fn render_completions(
 }
 
 pub fn grid_visible_rows(state: &CompletionState) -> usize {
-    if state.entries.is_empty() || state.rows == 0 {
+    if state.comp.is_empty() || state.rows == 0 {
         return 0;
     }
     state.rows.min(10)
@@ -102,7 +102,7 @@ pub fn grid_visible_rows(state: &CompletionState) -> usize {
 fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) {
     // Stack array — max 6 columns, no heap allocation per grid draw.
     let mut col_widths = [0usize; 6];
-    for (i, entry) in state.entries.iter().enumerate() {
+    for (i, entry) in state.comp.entries.iter().enumerate() {
         let col = i / state.rows;
         if col < state.cols {
             col_widths[col] = col_widths[col].max(entry.display_width());
@@ -125,17 +125,30 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) 
 
         for (col, &col_w) in col_widths[..state.cols].iter().enumerate() {
             let idx = col * state.rows + row;
-            if idx >= state.entries.len() {
+            if idx >= state.comp.entries.len() {
                 break;
             }
-            let entry = &state.entries[idx];
+            let entry = &state.comp.entries[idx];
             let is_selected = idx == state.selected;
 
             if is_selected {
                 tw.write_str("\x1b[7m"); // reverse video
             }
 
-            write_colored_entry(tw, entry);
+            // Color: symlink=cyan, dir=blue, exec=green
+            if entry.is_link {
+                tw.write_str("\x1b[36m");
+            } else if entry.is_dir {
+                tw.write_str("\x1b[34m");
+            } else if entry.is_exec {
+                tw.write_str("\x1b[32m");
+            }
+
+            state.write_display_name(idx, tw);
+
+            if entry.is_link || entry.is_dir || entry.is_exec {
+                tw.write_str("\x1b[0m");
+            }
 
             if is_selected {
                 tw.write_str("\x1b[0m");
@@ -229,21 +242,4 @@ pub fn render_history_pager(
     tw.carriage_return();
     tw.move_cursor_right((8 + query.len()) as u16); // "search: " = 8 chars
     tw.show_cursor();
-}
-
-fn write_colored_entry(tw: &mut TermWriter, entry: &CompEntry) {
-    if entry.is_link {
-        tw.write_str("\x1b[36m"); // cyan
-    } else if entry.is_dir {
-        tw.write_str("\x1b[34m"); // blue
-    } else if entry.is_exec {
-        tw.write_str("\x1b[32m"); // green
-    }
-
-    // Write name + "/" for dirs directly — no heap allocation.
-    entry.write_display_name(tw);
-
-    if entry.is_link || entry.is_dir || entry.is_exec {
-        tw.write_str("\x1b[0m");
-    }
 }
