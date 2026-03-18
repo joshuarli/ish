@@ -359,7 +359,6 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     let mut mode = Mode::Normal;
     let mut history_idx: Option<usize> = None;
     let mut saved_line = String::new();
-
     // Render prompt — zero-alloc: reuse shell.prompt_buf, read env via getenv.
     // Take ownership so prompt_str can be borrowed independently of shell.
     let pwd = getenv_str(c"PWD");
@@ -370,7 +369,15 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     let prompt_str = std::mem::take(&mut shell.prompt_buf);
     let prompt_display_len = shell.prompt.display_len(&prompt_str);
 
-    render::render_line(&mut tw, &prompt_str, prompt_display_len, &line, shell.cols);
+    let info = render::render_line(
+        &mut tw,
+        &prompt_str,
+        prompt_display_len,
+        &line,
+        shell.cols,
+        0,
+    );
+    let mut cursor_row = info.cursor_row;
     let _ = tw.flush_to_stdout();
 
     loop {
@@ -385,7 +392,8 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                 // Re-render
                 if let Mode::Normal = &mode {
                     let (p, pdl) = active_prompt(&prompt_str, prompt_display_len, &full_input);
-                    render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                    let info = render::render_line(&mut tw, p, pdl, &line, shell.cols, cursor_row);
+                    cursor_row = info.cursor_row;
                 }
                 let _ = tw.flush_to_stdout();
                 continue;
@@ -428,7 +436,9 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 line = LineBuffer::new();
                                 history_idx = None;
                                 tw.write_str("\r\n");
-                                render::render_line(&mut tw, "  ", 2, &line, shell.cols);
+                                let info =
+                                    render::render_line(&mut tw, "  ", 2, &line, shell.cols, 0);
+                                cursor_row = info.cursor_row;
                                 let _ = tw.flush_to_stdout();
                                 continue;
                             }
@@ -446,6 +456,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             }
                             KeyAction::ClearScreen => {
                                 tw.clear_screen();
+                                cursor_row = 0;
                             }
                             KeyAction::StartHistorySearch => {
                                 saved_line = line.text().to_string();
@@ -479,12 +490,18 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             Mode::Normal => {
                                 let (p, pdl) =
                                     active_prompt(&prompt_str, prompt_display_len, &full_input);
-                                render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                                let info = render::render_line(
+                                    &mut tw, p, pdl, &line, shell.cols, cursor_row,
+                                );
+                                cursor_row = info.cursor_row;
                             }
                             Mode::Completion(state) => {
                                 let (p, pdl) =
                                     active_prompt(&prompt_str, prompt_display_len, &full_input);
-                                let info = render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                                let info = render::render_line(
+                                    &mut tw, p, pdl, &line, shell.cols, cursor_row,
+                                );
+                                cursor_row = info.cursor_row;
                                 render::render_completions(&mut tw, state, &info, true);
                             }
                             Mode::HistorySearch { .. } => {}
@@ -497,7 +514,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         match handle_completion_key(key, state, &mut line) {
                             CompAction::Navigate => {
                                 // Cursor is on prompt line — repaint grid in-place
-                                let info = render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                                let info = render::render_line(
+                                    &mut tw, p, pdl, &line, shell.cols, cursor_row,
+                                );
+                                cursor_row = info.cursor_row;
                                 render::render_completions(&mut tw, state, &info, false);
                                 let _ = tw.flush_to_stdout();
                                 continue;
@@ -511,8 +531,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     shell.comp_buf = cs.comp;
                                     mode = Mode::Normal;
                                 } else if !cs.comp.is_empty() {
-                                    let info =
-                                        render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                                    let info = render::render_line(
+                                        &mut tw, p, pdl, &line, shell.cols, cursor_row,
+                                    );
+                                    cursor_row = info.cursor_row;
                                     render::render_completions(&mut tw, &cs, &info, true);
                                     mode = Mode::Completion(cs);
                                     let _ = tw.flush_to_stdout();
@@ -535,7 +557,9 @@ fn read_line(shell: &mut Shell) -> ReadResult {
 
                         // Cursor is on prompt line — render_line's \r + clear_to_end_of_screen
                         // naturally clears the grid below
-                        render::render_line(&mut tw, p, pdl, &line, shell.cols);
+                        let info =
+                            render::render_line(&mut tw, p, pdl, &line, shell.cols, cursor_row);
+                        cursor_row = info.cursor_row;
                         let _ = tw.flush_to_stdout();
                     }
 
@@ -555,13 +579,15 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             mode = Mode::Normal;
                             tw.carriage_return();
                             tw.clear_to_end_of_screen();
-                            render::render_line(
+                            let info = render::render_line(
                                 &mut tw,
                                 &prompt_str,
                                 prompt_display_len,
                                 &line,
                                 shell.cols,
+                                0,
                             );
+                            cursor_row = info.cursor_row;
                             let _ = tw.flush_to_stdout();
                         }
                         HistAction::Cancel => {
@@ -570,13 +596,15 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             mode = Mode::Normal;
                             tw.carriage_return();
                             tw.clear_to_end_of_screen();
-                            render::render_line(
+                            let info = render::render_line(
                                 &mut tw,
                                 &prompt_str,
                                 prompt_display_len,
                                 &line,
                                 shell.cols,
+                                0,
                             );
+                            cursor_row = info.cursor_row;
                             let _ = tw.flush_to_stdout();
                         }
                     },

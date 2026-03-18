@@ -11,6 +11,8 @@ pub struct PromptInfo {
 }
 
 /// Render the prompt + line buffer. Positions cursor correctly.
+/// `prev_cursor_row` is the cursor row from the previous render — needed to
+/// move back to the top of the prompt area before clearing.
 /// Returns prompt geometry so completion rendering can restore cursor.
 pub fn render_line(
     tw: &mut TermWriter,
@@ -18,8 +20,10 @@ pub fn render_line(
     prompt_display_len: usize,
     line: &LineBuffer,
     term_cols: u16,
+    prev_cursor_row: u16,
 ) -> PromptInfo {
     tw.hide_cursor();
+    tw.move_cursor_up(prev_cursor_row);
     tw.carriage_return();
     tw.clear_to_end_of_screen();
 
