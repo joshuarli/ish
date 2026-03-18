@@ -297,79 +297,72 @@ fn bench_line_buffer(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Synthetic history generator — reproducible, no dependency on real files
+// ---------------------------------------------------------------------------
+
+/// Generate 45k realistic shell commands (~45 bytes avg, varied patterns).
+fn synthetic_history_45k() -> Vec<String> {
+    let templates = [
+        "git commit -m 'fix issue #{}' --no-verify",
+        "git checkout -b feature/task-{}",
+        "cargo test --package ish -- test_{}",
+        "rg '{}' src/ --type rust",
+        "/opt/homebrew/bin/git diff HEAD~{}",
+        "cd ~/projects/project-{}/src",
+        "make -j{} build",
+        "docker compose up -d service-{}",
+        "ssh deploy@prod-{}.example.com",
+        "curl -s https://api.example.com/v{}/status",
+        "python3 scripts/migrate_{}.py --dry-run",
+        "npm run build -- --env=staging-{}",
+        "kubectl get pods -n namespace-{}",
+        "vim src/module_{}/lib.rs",
+        "tar czf backup-{}.tar.gz data/",
+    ];
+    (0..45_000)
+        .map(|i| {
+            let t = templates[i % templates.len()];
+            t.replace("{}", &i.to_string())
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // History benchmarks
 // ---------------------------------------------------------------------------
 
 fn bench_history(c: &mut Criterion) {
     let mut group = c.benchmark_group("history");
 
-    let entries: Vec<String> = (0..10_000)
-        .map(|i| format!("command_{i} --arg={i} /path/to/file_{i}"))
-        .collect();
-    let history = History::from_entries(entries);
+    let entries_45k = synthetic_history_45k();
+    let history = History::from_entries(entries_45k.clone());
 
-    group.bench_function("prefix_search_10k", |b| {
-        b.iter(|| black_box(history.prefix_search("command_999", 0)));
+    group.bench_function("prefix_search_45k", |b| {
+        b.iter(|| black_box(history.prefix_search("git commit", 0)));
     });
 
-    group.bench_function("fuzzy_search_10k", |b| {
-        b.iter(|| black_box(history.fuzzy_search("cmd99")));
+    group.bench_function("fuzzy_search_45k", |b| {
+        b.iter(|| black_box(history.fuzzy_search("gco")));
     });
 
-    group.bench_function("fuzzy_search_miss_10k", |b| {
+    group.bench_function("fuzzy_search_miss_45k", |b| {
         b.iter(|| black_box(history.fuzzy_search("zzzznotfound")));
     });
 
-    group.bench_function("fuzzy_search_empty_query_10k", |b| {
+    group.bench_function("fuzzy_search_empty_45k", |b| {
         b.iter(|| {
             let results = history.fuzzy_search("");
             black_box(results.len());
         });
     });
 
-    // Small history — more representative of typical use
-    let small_entries: Vec<String> = vec![
-        "git commit -m 'fix'",
-        "cargo build",
-        "cargo test",
-        "git push origin main",
-        "cd ~/projects",
-        "ls -la",
-        "vim src/main.rs",
-        "make build",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-    let small_history = History::from_entries(small_entries);
-
-    group.bench_function("fuzzy_search_small", |b| {
-        b.iter(|| black_box(small_history.fuzzy_search("gb")));
-    });
-
-    // Real history — benchmarks with the actual user history file
-    let real = History::load();
-    let real_len = real.len();
-
-    group.bench_function(format!("fuzzy_search_real_{real_len}"), |b| {
-        b.iter(|| black_box(real.fuzzy_search("gco")));
-    });
-
-    group.bench_function(format!("fuzzy_search_real_miss_{real_len}"), |b| {
-        b.iter(|| black_box(real.fuzzy_search("zzzznotfound")));
-    });
-
-    group.bench_function(format!("fuzzy_search_into_real_{real_len}"), |b| {
+    group.bench_function("fuzzy_search_into_45k", |b| {
         let mut results = Vec::with_capacity(200);
-        real.fuzzy_search_into("gco", &mut results, 200);
+        history.fuzzy_search_into("gco", &mut results, 200);
         b.iter(|| {
-            real.fuzzy_search_into("gco", &mut results, 200);
+            history.fuzzy_search_into("gco", &mut results, 200);
             black_box(&results);
         });
-    });
-
-    group.bench_function(format!("prefix_search_real_{real_len}"), |b| {
-        b.iter(|| black_box(real.prefix_search("git ", 0)));
     });
 
     group.finish();
@@ -589,58 +582,30 @@ fn bench_prompt_render(c: &mut Criterion) {
 fn bench_history_add(c: &mut Criterion) {
     let mut group = c.benchmark_group("history_add");
 
-    // Add to a 1k history (typical size)
-    {
-        let entries: Vec<String> = (0..1000)
-            .map(|i| format!("command_{i} --arg={i}"))
-            .collect();
+    let entries_45k = synthetic_history_45k();
 
-        group.bench_function("add_new_1k", |b| {
-            b.iter_batched(
-                || History::from_entries(entries.clone()),
-                |mut h| h.add("brand_new_command --flag"),
-                BatchSize::LargeInput,
-            );
-        });
+    group.bench_function("add_new_45k", |b| {
+        b.iter_batched(
+            || History::from_entries(entries_45k.clone()),
+            |mut h| {
+                h.add("brand_new_command_xyz --flag");
+                h
+            },
+            BatchSize::LargeInput,
+        );
+    });
 
-        group.bench_function("add_dup_1k", |b| {
-            b.iter_batched(
-                || History::from_entries(entries.clone()),
-                |mut h| h.add("command_500 --arg=500"),
-                BatchSize::LargeInput,
-            );
-        });
-    }
-
-    // Real history — add to 44k entries
-    {
-        let real = History::load();
-        let real_len = real.len();
-        let entries: Vec<String> = (0..real_len).map(|i| real.get(i).to_string()).collect();
-
-        group.bench_function(format!("add_new_real_{real_len}"), |b| {
-            b.iter_batched(
-                || History::from_entries(entries.clone()),
-                |mut h| {
-                    h.add("brand_new_command_xyz --flag");
-                    h
-                },
-                BatchSize::LargeInput,
-            );
-        });
-
-        group.bench_function(format!("add_dup_real_{real_len}"), |b| {
-            let mid = entries[entries.len() / 2].clone();
-            b.iter_batched(
-                || History::from_entries(entries.clone()),
-                |mut h| {
-                    h.add(&mid);
-                    h
-                },
-                BatchSize::LargeInput,
-            );
-        });
-    }
+    group.bench_function("add_dup_45k", |b| {
+        let mid = entries_45k[entries_45k.len() / 2].clone();
+        b.iter_batched(
+            || History::from_entries(entries_45k.clone()),
+            |mut h| {
+                h.add(&mid);
+                h
+            },
+            BatchSize::LargeInput,
+        );
+    });
 
     group.finish();
 }
@@ -989,6 +954,14 @@ fn bench_startup(c: &mut Criterion) {
     group.bench_function("history_load", |b| {
         b.iter(|| black_box(History::load()));
     });
+
+    // Synthetic: from_entries (measures arena+hash construction for 45k)
+    {
+        let entries = synthetic_history_45k();
+        group.bench_function("history_from_entries_45k", |b| {
+            b.iter(|| black_box(History::from_entries(entries.clone())));
+        });
+    }
 
     group.bench_function("denv_init", |b| {
         b.iter(|| black_box(ish::denv::init()));
