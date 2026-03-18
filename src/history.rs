@@ -35,11 +35,10 @@ impl History {
             return hist;
         }
 
-        // No cache — full text parse, then write cache + truncate text file
+        // No cache or corrupt — full text parse, then write cache + truncate text
         let hist = Self::load_from_text(&path);
         if !hist.offsets.is_empty() {
             hist.save_cache();
-            let _ = fs::File::create(&path); // truncate
         }
 
         hist
@@ -133,6 +132,13 @@ impl History {
 
         // Read arena
         let arena = String::from_utf8(data[pos..pos + arena_size].to_vec()).ok()?;
+
+        // Validate all offsets fall within the arena
+        for &(start, len) in &offsets {
+            if (start as usize) + (len as usize) > arena.len() {
+                return None;
+            }
+        }
 
         Some(Self {
             arena,
