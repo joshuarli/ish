@@ -73,26 +73,31 @@ pub fn render_completions(
     tw.hide_cursor();
 
     if initial {
-        // Move to bottom of prompt area, then create new line
+        // Pre-create grid rows below the prompt. The \n's may scroll
+        // the terminal, so we do this before save_cursor.
         let rows_below = info.total_rows - 1 - info.cursor_row;
         if rows_below > 0 {
             tw.move_cursor_down(rows_below);
         }
-        tw.write_str("\n");
-    } else {
-        // Move to first grid row (one below last prompt row)
-        tw.move_cursor_down(info.total_rows - info.cursor_row);
+        for _ in 0..visible_rows {
+            tw.write_str("\n");
+        }
+        // Return to cursor position — total relative movement was
+        // rows_below (down) + visible_rows (down via \n), so reverse it.
+        tw.move_cursor_up(rows_below + visible_rows as u16);
+        tw.carriage_return();
+        if info.cursor_col > 0 {
+            tw.move_cursor_right(info.cursor_col);
+        }
     }
 
+    // Save cursor, draw grid, restore — works for both initial and
+    // repaint because all scrolling is already done above.
+    tw.save_cursor();
+    tw.move_cursor_down(info.total_rows - info.cursor_row);
     draw_grid(tw, state, visible_rows);
+    tw.restore_cursor();
 
-    // Move back to cursor position
-    let up = info.total_rows + visible_rows as u16 - 1 - info.cursor_row;
-    tw.move_cursor_up(up);
-    tw.carriage_return();
-    if info.cursor_col > 0 {
-        tw.move_cursor_right(info.cursor_col);
-    }
     tw.show_cursor();
 }
 

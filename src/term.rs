@@ -153,6 +153,14 @@ impl TermWriter {
         }
     }
 
+    pub fn save_cursor(&mut self) {
+        self.write_str("\x1b7");
+    }
+
+    pub fn restore_cursor(&mut self) {
+        self.write_str("\x1b8");
+    }
+
     /// Write CSI sequence `\x1b[{n}{suffix}` directly into the buffer.
     /// Inline u16→ASCII avoids format!() heap allocation on every cursor move.
     fn push_csi(&mut self, n: u16, suffix: u8) {
