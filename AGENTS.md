@@ -35,11 +35,11 @@ src/
   render.rs    — Composites prompt + line + completions + history pager → VT100 sequences
   parse.rs     — Single-pass tokenizer/parser → CommandLine (flat, no AST)
   expand.rs    — Tilde, $VAR, $(), glob expansion (*, ?, **)
-  exec.rs      — fork/exec, pipe plumbing, redirections, process groups, PATH cache
+  exec.rs      — fork/exec, pipe plumbing, redirections, process groups, zero-alloc PATH scan
   builtin.rs   — cd, exit, fg, set, unset, alias, l, c, w/which/type, echo, pwd, true, false
   ls.rs        — Native directory listing (l builtin): stat, permissions, color — like ls -plAhG
-  history.rs   — Append-only file, in-memory Vec, prefix search, fuzzy subsequence search
-  complete.rs  — File + env var completion via readdir/$-prefix, grid layout, arrow navigation
+  history.rs   — Append-only file, in-memory Vec, prefix search, zero-alloc fuzzy subsequence search
+  complete.rs  — Arena-backed file + env var completion via libc readdir/stat, grid layout, arrow nav
   alias.rs     — AliasMap (HashMap wrapper), inline expansion on space
   config.rs    — Parse ~/.config/ish/config.ish (set + alias directives)
   job.rs       — Single suspended job (Ctrl+Z / fg)
@@ -61,12 +61,12 @@ src/
 
 **Tab completion:**
 1. Extract the word under cursor from `LineBuffer`
-2. `$` prefix → `complete::complete_env()` (env var names); otherwise `complete::complete_path()` (readdir + prefix filter)
+2. `$` prefix → `complete::complete_env_into()` (env var names via `libc::environ`); otherwise `complete::complete_path_into()` (libc readdir/stat + prefix filter). Both use a pooled `Completions` arena — zero allocation on warm path.
 3. Single match → auto-insert. Multiple → `compute_grid()` for column-major layout
-4. Arrow keys navigate the grid; Enter accepts; Escape cancels
+4. Arrow keys navigate the grid; Enter accepts; Escape cancels. Refilter on typing reuses the arena buffer.
 
 **History search (Ctrl+R):**
-1. `history::fuzzy_search()` does subsequence matching across all entries
+1. `history::fuzzy_search_into()` does subsequence matching into a pooled `Vec<FuzzyMatch>` — zero allocation per keystroke. Results capped at 200. ASCII fast path avoids char decoding.
 2. `render::render_history_pager()` shows results with highlighted match positions
 3. Up/Down cycle through matches; Enter accepts; Escape cancels
 
@@ -83,15 +83,17 @@ Connector   = And | Or | Semi
 // line.rs — Editing buffer
 LineBuffer { text: String, cursor: usize, kill_ring: String }
 
-// history.rs — Search results
-FuzzyMatch { entry_idx: usize, score: i32, match_positions: Vec<usize> }
+// history.rs — Search results (fixed-size, zero-alloc per match)
+FuzzyMatch { entry_idx: usize, match_positions: [u16; 32], match_count: u8 }
 
-// complete.rs — Completion state
-CompletionState { entries: Vec<CompEntry>, selected: usize, cols: usize, rows: usize, scroll: usize, dir_prefix: String }
-CompEntry { name: String, is_dir: bool, is_link: bool, is_exec: bool }
+// complete.rs — Arena-backed completions (all names in one contiguous String)
+Completions { names: String, entries: Vec<CompEntry> }
+CompEntry { name_start: u32, name_len: u16, is_dir: bool, is_link: bool, is_exec: bool }
+CompletionState { comp: Completions, selected: usize, cols: usize, rows: usize, scroll: usize, dir_prefix: String }
 
 // main.rs — Shell state (lives in main.rs, not the library)
-Shell { aliases, last_status, prev_dir, rows, cols, history, prompt, job, path_cache, denv_active, ... }
+// prompt_buf, comp_buf, match_buf are pre-allocated pools reused across operations (zero-alloc warm paths)
+Shell { aliases, last_status, prev_dir, rows, cols, history, prompt, prompt_buf, comp_buf, match_buf, job, denv_active, ... }
 ```
 
 ## Supported Syntax
@@ -163,9 +165,9 @@ cargo +nightly fuzz run fuzz_parse  # Fuzz the parser (requires cargo-fuzz)
 ## Test Structure
 
 ### Unit tests (`cargo test --lib`)
-37 tests embedded in source modules (input.rs, expand.rs, complete.rs, denv.rs, etc.) for isolated logic.
+43 tests embedded in source modules (input.rs, expand.rs, complete.rs, denv.rs, etc.) for isolated logic.
 
-### Integration tests (`tests/integration.rs` — 205 tests)
+### Integration tests (`tests/integration.rs` — 203 tests)
 Exercises the library API directly: parsing, expansion, line buffer, history, completion grid, aliases, config, prompt, builtins, ls. Achieves 95%+ coverage of all library modules.
 
 Key testing patterns:
@@ -186,7 +188,7 @@ The PTY harness (`PtyShell`) uses `openpty()` + `fork()` to create an isolated t
 - `fuzz_history` — Fuzzy match positions valid and ascending
 
 ### Benchmarks (`benches/bench.rs` — 15 groups)
-Criterion benchmarks with a custom counting allocator that tracks heap allocations and bytes. Covers: parsing, expansion, line buffer ops, history search, completion grid, prompt rendering, end-to-end parse+expand, PATH cache, alias lookup, `ls` builtin, filesystem completion, env var completion, and denv output parsing. Includes an allocation audit section that prints per-operation allocation counts.
+Criterion benchmarks with a custom counting allocator that tracks heap allocations and bytes. Covers: parsing, expansion, line buffer ops, history search, completion grid + sort, prompt rendering, end-to-end parse+expand, PATH lookup, alias lookup, `ls` builtin, filesystem completion, env var completion, and denv output parsing. Includes an allocation audit section that prints cold and warm (pooled buffer) allocation counts — warm paths should show 0 allocs.
 
 ## Design Principles
 
@@ -196,9 +198,9 @@ Criterion benchmarks with a custom counting allocator that tracks heap allocatio
 
 **Flat data structures.** The parser produces a flat `CommandLine` with no recursive AST. No nesting means simple, predictable execution. The completion grid is a flat Vec with column-major indexing. History is a flat Vec with linear search.
 
-**Minimal allocation.** Hot paths (prompt render, key dispatch, alias lookup) are profiled for allocation count. The benchmark suite tracks allocations per operation. Avoid unnecessary String clones; prefer `&str` where possible.
+**Zero-allocation warm paths.** All interactive hot paths — prompt render, tab completion, fuzzy history search — are zero-allocation on the steady state via pre-allocated pooled buffers (`prompt_buf`, `comp_buf`, `match_buf` on Shell). Completions use an arena (`Completions.names` String + offset-based `CompEntry`). Filesystem operations use `libc::opendir`/`readdir`/`stat` directly with stack buffers instead of `std::fs`. Env var reads use `libc::getenv` (zero-alloc `&str` into env block). The benchmark suite tracks allocations per operation with a custom counting allocator.
 
-**Unsafe is contained.** All unsafe code is in 6 modules: `term.rs` (termios), `signal.rs` (signal handlers), `exec.rs` (fork/exec), `input.rs` (raw fd reads), `sys.rs` (platform syscalls), and `denv.rs` (fork/exec for denv subprocess). The rest of the codebase is safe Rust.
+**Unsafe is contained.** All unsafe code is in 8 modules: `term.rs` (termios), `signal.rs` (signal handlers), `exec.rs` (fork/exec + libc::getenv/stat), `input.rs` (raw fd reads), `sys.rs` (platform syscalls), `denv.rs` (fork/exec for denv subprocess), `complete.rs` (libc opendir/readdir/stat/lstat/environ), and `main.rs` (libc::getenv). The rest of the codebase is safe Rust.
 
 ## Common Tasks for Agents
 
@@ -216,29 +218,29 @@ Criterion benchmarks with a custom counting allocator that tracks heap allocatio
 
 | File | Lines |
 |------|-------|
-| main.rs | 956 |
-| exec.rs | 614 |
-| parse.rs | 468 |
-| expand.rs | 415 |
-| input.rs | 333 |
-| line.rs | 305 |
-| denv.rs | 303 |
-| prompt.rs | 302 |
-| ls.rs | 288 |
-| complete.rs | 252 |
-| builtin.rs | 248 |
-| render.rs | 247 |
-| sys.rs | 222 |
-| history.rs | 219 |
-| config.rs | 161 |
-| term.rs | 158 |
-| signal.rs | 81 |
+| main.rs | 1,091 |
+| complete.rs | 745 |
+| exec.rs | 628 |
+| parse.rs | 482 |
+| expand.rs | 421 |
+| denv.rs | 351 |
+| input.rs | 337 |
+| prompt.rs | 331 |
+| line.rs | 308 |
+| ls.rs | 296 |
+| history.rs | 276 |
+| render.rs | 245 |
+| sys.rs | 241 |
+| builtin.rs | 227 |
+| term.rs | 185 |
+| config.rs | 170 |
+| signal.rs | 96 |
 | error.rs | 55 |
 | alias.rs | 32 |
 | lib.rs | 19 |
 | job.rs | 17 |
-| **Total src/** | **5,645** |
-| tests/integration.rs | 2,453 |
+| **Total src/** | **6,553** |
+| tests/integration.rs | 2,313 |
 | tests/pty.rs | 1,324 |
-| benches/bench.rs | 832 |
-| **Total** | **10,254** |
+| benches/bench.rs | 1,002 |
+| **Total** | **11,192** |
