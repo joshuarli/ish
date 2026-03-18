@@ -4,13 +4,19 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const CACHE_MAGIC: &[u8; 4] = b"ISH\x01";
-const CACHE_HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + text_size + entry_count + arena_size
+const CACHE_MAGIC_V1: &[u8; 4] = b"ISH\x01";
+const CACHE_MAGIC_V2: &[u8; 4] = b"ISH\x02";
+const CACHE_HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + reserved + entry_count + arena_size
 
 fn hash_str(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+/// Current epoch seconds via libc::time (commpage on macOS, vDSO on Linux — no syscall).
+fn now_secs() -> u32 {
+    unsafe { libc::time(std::ptr::null_mut()) as u32 }
 }
 
 pub struct History {
@@ -20,6 +26,8 @@ pub struct History {
     offsets: Vec<(u32, u16)>,
     /// Ordered hashes parallel to `offsets` — for cache serialization.
     hash_vec: Vec<u64>,
+    /// Epoch seconds when each entry was last used. Parallel to `offsets`.
+    timestamps: Vec<u32>,
     /// Hash index for O(1) duplicate checks in add().
     hashes: HashSet<u64>,
     path: PathBuf,
@@ -81,10 +89,15 @@ impl History {
             Err(_) => (String::new(), Vec::new(), Vec::new(), HashSet::new()),
         };
 
+        // No timestamps in text format — use current time for all entries
+        let ts = now_secs();
+        let timestamps = vec![ts; offsets.len()];
+
         Self {
             arena,
             offsets,
             hash_vec,
+            timestamps,
             hashes,
             path: path.to_path_buf(),
         }
@@ -96,15 +109,20 @@ impl History {
         if data.len() < CACHE_HEADER_SIZE {
             return None;
         }
-        if &data[0..4] != CACHE_MAGIC {
-            return None;
-        }
 
-        // Skip stored text_size field (bytes 4..12) — no longer used for staleness
+        let version = match &data[0..4] {
+            x if x == CACHE_MAGIC_V2 => 2,
+            x if x == CACHE_MAGIC_V1 => 1,
+            _ => return None,
+        };
+
+        // Skip reserved field (bytes 4..12)
         let entry_count = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
         let arena_size = u32::from_le_bytes(data[16..20].try_into().ok()?) as usize;
 
-        let expected = CACHE_HEADER_SIZE + entry_count * 8 + entry_count * 6 + arena_size;
+        let timestamps_size = if version >= 2 { entry_count * 4 } else { 0 };
+        let expected =
+            CACHE_HEADER_SIZE + entry_count * 8 + timestamps_size + entry_count * 6 + arena_size;
         if data.len() != expected {
             return None;
         }
@@ -120,6 +138,18 @@ impl History {
             hashes.insert(h);
             pos += 8;
         }
+
+        // Read timestamps (v2+) or default to 0 (v1)
+        let timestamps = if version >= 2 {
+            let mut ts = Vec::with_capacity(entry_count);
+            for _ in 0..entry_count {
+                ts.push(u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?));
+                pos += 4;
+            }
+            ts
+        } else {
+            vec![0; entry_count]
+        };
 
         // Read offsets
         let mut offsets = Vec::with_capacity(entry_count);
@@ -144,6 +174,7 @@ impl History {
             arena,
             offsets,
             hash_vec,
+            timestamps,
             hashes,
             path: path.to_path_buf(),
         })
@@ -157,6 +188,8 @@ impl History {
             Ok(d) if !d.is_empty() => d,
             _ => return,
         };
+
+        let ts = now_secs();
 
         // Parse tail entries — these are newer, so they take priority
         for chunk in data.split(|&b| b == b'\n') {
@@ -172,6 +205,7 @@ impl History {
                         if &self.arena[start as usize..start as usize + len as usize] == line {
                             self.offsets.remove(i);
                             self.hash_vec.remove(i);
+                            self.timestamps.remove(i);
                         } else {
                             i += 1;
                         }
@@ -181,34 +215,42 @@ impl History {
                 self.arena.push_str(line);
                 self.offsets.push((start, line.len() as u16));
                 self.hash_vec.push(h);
+                self.timestamps.push(ts);
                 self.hashes.insert(h);
             }
         }
     }
 
-    /// Write binary cache from current in-memory state, then truncate text file.
+    /// Write binary cache (v2 with timestamps), then truncate text file.
     /// Atomic: writes cache to .tmp then renames.
     pub fn save_cache(&self) {
-        let text_size: u64 = 0; // reserved field
-
         let cache = cache_path();
         let tmp = cache.with_extension("bin.tmp");
 
         let entry_count = self.offsets.len();
         let arena_bytes = self.arena.as_bytes();
-        let total = CACHE_HEADER_SIZE + entry_count * 8 + entry_count * 6 + arena_bytes.len();
+        let total = CACHE_HEADER_SIZE
+            + entry_count * 8
+            + entry_count * 4
+            + entry_count * 6
+            + arena_bytes.len();
 
         let mut buf = Vec::with_capacity(total);
 
-        // Header
-        buf.extend_from_slice(CACHE_MAGIC);
-        buf.extend_from_slice(&text_size.to_le_bytes());
+        // Header (v2)
+        buf.extend_from_slice(CACHE_MAGIC_V2);
+        buf.extend_from_slice(&0u64.to_le_bytes()); // reserved
         buf.extend_from_slice(&(entry_count as u32).to_le_bytes());
         buf.extend_from_slice(&(arena_bytes.len() as u32).to_le_bytes());
 
         // Hashes
         for &h in &self.hash_vec {
             buf.extend_from_slice(&h.to_le_bytes());
+        }
+
+        // Timestamps
+        for &ts in &self.timestamps {
+            buf.extend_from_slice(&ts.to_le_bytes());
         }
 
         // Offsets
@@ -266,10 +308,12 @@ impl History {
 
     /// Create from pre-existing entries (for testing/benchmarks).
     pub fn from_entries(entries: Vec<String>) -> Self {
+        let ts = now_secs();
         let total: usize = entries.iter().map(|e| e.len()).sum();
         let mut arena = String::with_capacity(total);
         let mut offsets = Vec::with_capacity(entries.len());
         let mut hash_vec = Vec::with_capacity(entries.len());
+        let mut timestamps = Vec::with_capacity(entries.len());
         let mut hashes = HashSet::with_capacity(entries.len());
         for e in &entries {
             let start = arena.len() as u32;
@@ -277,12 +321,14 @@ impl History {
             arena.push_str(e);
             offsets.push((start, e.len() as u16));
             hash_vec.push(h);
+            timestamps.push(ts);
             hashes.insert(h);
         }
         Self {
             arena,
             offsets,
             hash_vec,
+            timestamps,
             hashes,
             path: PathBuf::from("/dev/null"),
         }
@@ -299,13 +345,14 @@ impl History {
 
         let h = hash_str(line);
         if self.hashes.contains(&h) {
-            // Likely duplicate — remove prior occurrence from both parallel vecs
+            // Likely duplicate — remove prior occurrence from all parallel vecs
             let mut i = 0;
             while i < self.offsets.len() {
                 let (start, len) = self.offsets[i];
                 if &self.arena[start as usize..start as usize + len as usize] == line {
                     self.offsets.remove(i);
                     self.hash_vec.remove(i);
+                    self.timestamps.remove(i);
                 } else {
                     i += 1;
                 }
@@ -315,6 +362,7 @@ impl History {
         self.arena.push_str(line);
         self.offsets.push((start, line.len() as u16));
         self.hash_vec.push(h);
+        self.timestamps.push(now_secs());
         self.hashes.insert(h);
 
         // Append to file
@@ -327,6 +375,11 @@ impl History {
 
     pub fn is_empty(&self) -> bool {
         self.offsets.is_empty()
+    }
+
+    /// Get the timestamp (epoch seconds) for entry at index.
+    pub fn timestamp(&self, idx: usize) -> u32 {
+        self.timestamps[idx]
     }
 
     /// Prefix search: find entries that start with `prefix`, starting from
@@ -542,16 +595,29 @@ mod tests {
         let mut h = History::from_entries(entries);
         assert_eq!(h.hash_vec.len(), 3);
         assert_eq!(h.offsets.len(), 3);
+        assert_eq!(h.timestamps.len(), 3);
 
         // Add duplicate — should remove old and append new
         h.add("bbb");
         assert_eq!(h.offsets.len(), 3); // aaa, ccc, bbb
         assert_eq!(h.hash_vec.len(), 3);
+        assert_eq!(h.timestamps.len(), 3);
         assert_eq!(h.get(h.len() - 1), "bbb");
 
         // Add new
         h.add("ddd");
         assert_eq!(h.offsets.len(), 4);
         assert_eq!(h.hash_vec.len(), 4);
+        assert_eq!(h.timestamps.len(), 4);
+    }
+
+    #[test]
+    fn timestamps_are_set() {
+        let mut h = History::from_entries(vec!["old".into()]);
+        let before = now_secs();
+        h.add("new_cmd");
+        let after = now_secs();
+        let ts = h.timestamp(h.len() - 1);
+        assert!(ts >= before && ts <= after);
     }
 }
