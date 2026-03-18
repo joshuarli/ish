@@ -67,7 +67,8 @@ fn main() {
         }
     };
 
-    // Set shell as its own process group, take foreground
+    // SAFETY: Set shell as its own process group leader and take foreground
+    // control of the terminal. Called once at startup, single-threaded.
     unsafe {
         let pid = libc::getpid();
         let _ = libc::setpgid(pid, pid);
@@ -166,6 +167,7 @@ fn main() {
                                 if shell.job.is_some() {
                                     if shell.exit_warned {
                                         if let Some(job) = shell.job.take() {
+                                            // SAFETY: Send SIGTERM to job's pgid before exit.
                                             unsafe {
                                                 libc::killpg(job.pgid, libc::SIGTERM);
                                             }
@@ -893,6 +895,7 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
     if shell.job.is_some() {
         if shell.exit_warned {
             if let Some(job) = shell.job.take() {
+                // SAFETY: Send SIGTERM to the job's pgid before force-quit.
                 unsafe {
                     libc::killpg(job.pgid, libc::SIGTERM);
                 }

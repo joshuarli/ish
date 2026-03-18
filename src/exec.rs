@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 fn close_fd(fd: RawFd) {
     if fd >= 0 {
+        // SAFETY: fd is a valid file descriptor (checked >= 0).
         unsafe {
             libc::close(fd);
         }
@@ -192,6 +193,8 @@ fn execute_pipeline(
             (-1, -1)
         };
 
+        // SAFETY: fork() in single-threaded process. Child inherits fds and
+        // memory; parent continues with the returned pid.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             eprintln!("ish: fork() failed");
@@ -218,7 +221,7 @@ fn execute_pipeline(
         if i == 0 {
             pgid = pid;
         }
-        // Set child's pgid (race: also done in child)
+        // SAFETY: Set child's pgid (race: also done in child to avoid TOCTOU).
         unsafe {
             libc::setpgid(pid, pgid);
         }
@@ -229,7 +232,8 @@ fn execute_pipeline(
         pids.push(pid);
     }
 
-    // Give foreground to pipeline's process group
+    // SAFETY: Give foreground to pipeline's process group so it receives
+    // terminal signals (SIGINT, SIGTSTP). pgid is valid (set above).
     unsafe {
         libc::tcsetpgrp(0, pgid);
     }
@@ -240,6 +244,7 @@ fn execute_pipeline(
     for &pid in &pids {
         let mut wstatus = 0i32;
         loop {
+            // SAFETY: waitpid with WUNTRACED returns on exit, signal, or stop.
             let r = unsafe { libc::waitpid(pid, &mut wstatus, libc::WUNTRACED) };
             if r < 0 {
                 break;
@@ -258,12 +263,13 @@ fn execute_pipeline(
     }
 
     if stopped {
-        // Save the job's terminal attributes BEFORE reclaiming foreground.
+        // SAFETY: Save the job's terminal attributes BEFORE reclaiming foreground.
         // This preserves settings from programs like vim/less that modify termios.
+        // zeroed() is valid for termios; tcgetattr fills it from the terminal.
         let mut job_termios: libc::termios = unsafe { std::mem::zeroed() };
         unsafe { libc::tcgetattr(0, &mut job_termios) };
 
-        // Reclaim foreground
+        // SAFETY: Reclaim foreground for the shell's process group.
         unsafe { libc::tcsetpgrp(0, libc::getpgrp()) };
 
         *job = Some(Job {
@@ -276,7 +282,7 @@ fn execute_pipeline(
         return 148; // 128 + SIGTSTP(20) = 148
     }
 
-    // Reclaim foreground (normal exit)
+    // SAFETY: Reclaim foreground for the shell after pipeline completes.
     unsafe {
         libc::tcsetpgrp(0, libc::getpgrp());
     }
@@ -300,19 +306,29 @@ fn capture_command_output(cmd: &str, _orig_termios: &libc::termios) -> Result<St
     let mut output = String::new();
     let mut buf = [0u8; 4096];
     loop {
+        // SAFETY: Reading from a valid pipe fd into a stack buffer.
         let n = unsafe { libc::read(pipe_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
-            break;
-        }
-        if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
-            output.push_str(s);
+        if n > 0 {
+            if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
+                output.push_str(s);
+            }
+        } else if n == 0 {
+            break; // EOF
+        } else {
+            // n < 0: error — retry on EINTR, break on other errors
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
         }
     }
+    // SAFETY: Close the pipe read end and wait for child to exit.
     unsafe {
         libc::close(pipe_r);
     }
 
     let mut wstatus = 0i32;
+    // SAFETY: Wait for the spawned child to exit. pid is valid from posix_spawn.
     unsafe {
         libc::waitpid(pid, &mut wstatus, 0);
     }
@@ -333,6 +349,9 @@ fn child_setup(
     redirects: &[Redirect],
     orig_termios: &libc::termios,
 ) -> ! {
+    // SAFETY: This entire block runs in a forked child process.
+    // We set up the process group, restore terminal settings,
+    // wire up pipes/redirects, then exec or _exit. No return.
     unsafe {
         // Process group
         let my_pgid = if index == 0 { 0 } else { pgid };
@@ -385,10 +404,17 @@ fn child_setup(
                 libc::_exit(127);
             }
         };
-        let c_args: Vec<CString> = argv
+        let c_args: Vec<CString> = match argv
             .iter()
-            .map(|a| CString::new(a.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
-            .collect();
+            .map(|a| CString::new(a.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(args) => args,
+            Err(_) => {
+                eprintln!("ish: argument contains NUL byte");
+                libc::_exit(126);
+            }
+        };
         let c_argv: Vec<*const libc::c_char> = c_args
             .iter()
             .map(|a| a.as_ptr())
@@ -408,11 +434,15 @@ fn child_setup(
     }
 }
 
+/// Apply a single redirect in the child process. Called after fork, before exec.
+/// Failures are silently ignored (child will exec or _exit shortly).
 fn apply_redirect(r: &Redirect) {
+    // SAFETY: open() with a valid CString path. Called in forked child.
     let open_write = |path: &str, flags: i32| unsafe {
         let c = CString::new(path).unwrap();
         libc::open(c.as_ptr(), flags, 0o644)
     };
+    // SAFETY: dup2 + close to wire fd to target. Both fds are valid.
     let dup_close = |fd: i32, target: i32| unsafe {
         libc::dup2(fd, target);
         libc::close(fd);
@@ -432,6 +462,7 @@ fn apply_redirect(r: &Redirect) {
             }
         }
         RedirectKind::In => {
+            // SAFETY: open() for read with valid CString. In forked child.
             let fd = unsafe {
                 let c = CString::new(r.target.as_str()).unwrap();
                 libc::open(c.as_ptr(), libc::O_RDONLY, 0)
@@ -449,6 +480,7 @@ fn apply_redirect(r: &Redirect) {
         RedirectKind::All => {
             let fd = open_write(&r.target, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC);
             if fd >= 0 {
+                // SAFETY: Redirect both stdout and stderr to the opened fd.
                 unsafe {
                     libc::dup2(fd, 1);
                     libc::dup2(fd, 2);
@@ -558,10 +590,11 @@ pub fn resume_job(job: &mut Option<Job>) -> (i32, Option<Continuation>) {
     let continuation = j.continuation;
     eprintln!("ish: resuming: {}", j.cmd);
 
+    // SAFETY: Give the job the foreground and restore its terminal settings.
+    // This is critical for programs like vim/less that set raw mode —
+    // without this, they'd resume with the shell's terminal settings.
+    // j.pgid and j.termios are valid (saved when job was suspended).
     unsafe {
-        // Give the job the foreground and restore its terminal settings.
-        // This is critical for programs like vim/less that set raw mode —
-        // without this, they'd resume with the shell's terminal settings.
         libc::tcsetpgrp(0, j.pgid);
         libc::tcsetattr(0, libc::TCSADRAIN, &j.termios);
         libc::killpg(j.pgid, libc::SIGCONT);
@@ -570,6 +603,8 @@ pub fn resume_job(job: &mut Option<Job>) -> (i32, Option<Continuation>) {
     // Wait
     let mut wstatus = 0i32;
     loop {
+        // SAFETY: Wait for any process in the job's pgid. WUNTRACED lets us
+        // detect if the job is stopped again (e.g., Ctrl+Z in resumed vim).
         let r = unsafe { libc::waitpid(-j.pgid, &mut wstatus, libc::WUNTRACED) };
         if r < 0 {
             break;
@@ -580,6 +615,7 @@ pub fn resume_job(job: &mut Option<Job>) -> (i32, Option<Continuation>) {
         if libc::WIFSTOPPED(wstatus) {
             // Stopped again — save terminal attrs before reclaiming.
             // Continuation stays on the job for next fg.
+            // SAFETY: zeroed() valid for termios; tcgetattr fills it.
             let mut job_termios: libc::termios = unsafe { std::mem::zeroed() };
             unsafe { libc::tcgetattr(0, &mut job_termios) };
 
@@ -591,13 +627,13 @@ pub fn resume_job(job: &mut Option<Job>) -> (i32, Option<Continuation>) {
             });
             eprintln!("\nish: job suspended again");
 
-            // Reclaim foreground
+            // SAFETY: Reclaim foreground for the shell after job re-suspended.
             unsafe { libc::tcsetpgrp(0, libc::getpgrp()) };
             return (148, None);
         }
     }
 
-    // Reclaim foreground
+    // SAFETY: Reclaim foreground for the shell after resumed job exits.
     unsafe {
         libc::tcsetpgrp(0, libc::getpgrp());
     }

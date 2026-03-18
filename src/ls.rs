@@ -241,7 +241,10 @@ fn human_size(size: u64) -> String {
 }
 
 fn format_time(mtime: i64) -> String {
+    // SAFETY: time(NULL) returns seconds since epoch, cannot fail meaningfully.
     let now = unsafe { libc::time(std::ptr::null_mut()) };
+    // SAFETY: zeroed tm is valid for localtime_r. localtime_r is thread-safe
+    // (unlike localtime) and writes into our stack-allocated tm struct.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe {
         libc::localtime_r(&mtime, &mut tm);
@@ -264,6 +267,9 @@ fn format_time(mtime: i64) -> String {
 }
 
 fn username(uid: u32) -> String {
+    // SAFETY: getpwuid returns a pointer to a static struct (or NULL).
+    // We immediately copy pw_name into an owned String. Single-threaded
+    // shell so no concurrent getpwuid calls can invalidate the pointer.
     unsafe {
         let pw = libc::getpwuid(uid);
         if pw.is_null() {
@@ -276,6 +282,8 @@ fn username(uid: u32) -> String {
 }
 
 fn groupname(gid: u32) -> String {
+    // SAFETY: getgrgid returns a pointer to a static struct (or NULL).
+    // We immediately copy gr_name into an owned String. Single-threaded.
     unsafe {
         let gr = libc::getgrgid(gid);
         if gr.is_null() {

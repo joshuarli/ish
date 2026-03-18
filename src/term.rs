@@ -10,6 +10,8 @@ pub struct RawMode {
 
 impl RawMode {
     pub fn enable() -> io::Result<Self> {
+        // SAFETY: tcgetattr reads terminal attributes into a zeroed struct.
+        // STDIN_FD is a valid fd (the shell's controlling terminal).
         let orig = unsafe {
             let mut t = std::mem::zeroed();
             if libc::tcgetattr(STDIN_FD, &mut t) != 0 {
@@ -30,6 +32,8 @@ impl RawMode {
         raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 0;
 
+        // SAFETY: tcsetattr with TCSAFLUSH drains output, discards pending input,
+        // then applies the new settings. raw is a valid modified copy of orig.
         unsafe {
             if libc::tcsetattr(STDIN_FD, libc::TCSAFLUSH, &raw) != 0 {
                 return Err(io::Error::last_os_error());
@@ -42,14 +46,17 @@ impl RawMode {
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        // SAFETY: Restores saved termios. TCSANOW avoids blocking if output
+        // hasn't drained (e.g. PTY). orig was captured in enable().
         unsafe {
-            // Use TCSANOW to avoid blocking if output hasn't drained (e.g. PTY).
             libc::tcsetattr(STDIN_FD, libc::TCSANOW, &self.orig);
         }
     }
 }
 
 pub fn term_size() -> (u16, u16) {
+    // SAFETY: ioctl(TIOCGWINSZ) reads window size into a zeroed winsize struct.
+    // Returns 0 on success. Falls back to 24x80 on failure.
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(STDOUT_FD, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
@@ -62,6 +69,7 @@ pub fn term_size() -> (u16, u16) {
 
 /// Save original termios without entering raw mode (for child process restoration).
 pub fn save_termios() -> io::Result<libc::termios> {
+    // SAFETY: tcgetattr reads terminal attributes. STDIN_FD is valid.
     unsafe {
         let mut t = std::mem::zeroed();
         if libc::tcgetattr(STDIN_FD, &mut t) != 0 {

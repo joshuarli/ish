@@ -25,6 +25,7 @@ pub fn init() -> bool {
             let home = std::env::var("HOME").unwrap_or_default();
             format!("{home}/.local/share/denv")
         });
+    // SAFETY: single-threaded shell
     unsafe {
         std::env::set_var("__DENV_SENTINEL", format!("{data_dir}/active_{pid}"));
     }
@@ -137,6 +138,7 @@ fn run_denv_and_apply(args: &[String]) -> bool {
         Err(_) => return false,
     };
 
+    // SAFETY: fork() in single-threaded process. Child inherits fds/memory.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         unsafe {
@@ -147,7 +149,8 @@ fn run_denv_and_apply(args: &[String]) -> bool {
     }
 
     if pid == 0 {
-        // Child: redirect stdout to pipe, stdin from /dev/null, reset signals, exec
+        // SAFETY: Forked child — redirect stdout to pipe, stdin from /dev/null,
+        // reset signals, then exec /bin/sh. Does not return on success.
         unsafe {
             libc::close(pipe_r);
             libc::dup2(pipe_w, 1);
@@ -177,19 +180,29 @@ fn run_denv_and_apply(args: &[String]) -> bool {
     }
 
     // Parent: close write end, read output, wait for child
+    // SAFETY: pipe_w is a valid fd from pipe_cloexec.
     unsafe { libc::close(pipe_w) };
 
     let mut output = String::new();
     let mut buf = [0u8; 4096];
     loop {
+        // SAFETY: Reading from valid pipe fd into stack buffer.
         let n = unsafe { libc::read(pipe_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
-            break;
-        }
-        if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
-            output.push_str(s);
+        if n > 0 {
+            if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
+                output.push_str(s);
+            }
+        } else if n == 0 {
+            break; // EOF
+        } else {
+            // n < 0: retry on EINTR, break on other errors
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
         }
     }
+    // SAFETY: Close pipe and reap child. pid is valid from fork above.
     unsafe {
         libc::close(pipe_r);
         libc::waitpid(pid, std::ptr::null_mut(), 0);
@@ -211,6 +224,7 @@ fn apply_bash_output(output: &str) {
                 unsafe { std::env::set_var(key, &value) };
             }
         } else if let Some(key) = line.strip_prefix("unset ") {
+            // SAFETY: single-threaded shell
             unsafe { std::env::remove_var(key.trim()) };
         }
     }

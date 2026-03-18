@@ -1,6 +1,20 @@
 use crate::error::Error;
 
-/// Internal literal marker: chars prefixed with this byte are not expanded.
+/// Internal literal marker used in the parse↔expand protocol.
+///
+/// When the parser encounters a character inside quotes or after a backslash
+/// that would normally trigger expansion (e.g., `$`, `*`, `~`, `?`), it
+/// prefixes that character with `\x00` in the token string. The expand module
+/// then skips any character preceded by this marker, treating it as literal text.
+///
+/// Example: parsing `echo '$HOME'` produces argv `["echo", "\x00$HOME"]`.
+/// The expander sees `\x00$` and keeps it as the literal `$` character instead
+/// of performing variable expansion. After expansion, `strip_literal()` or
+/// `unescape()` removes all `\x00` bytes to produce clean output.
+///
+/// This avoids a separate AST node for "quoted vs unquoted" — the marker is
+/// inline in the string, so the parser remains single-pass with no allocation
+/// for quoting metadata.
 pub const LITERAL: char = '\x00';
 
 #[derive(Debug, Clone)]

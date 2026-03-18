@@ -134,6 +134,8 @@ impl InputReader {
             },
         ];
         loop {
+            // SAFETY: poll on two valid fds (stdin + signal pipe). Returns
+            // count of ready fds, 0 on timeout, -1 on error.
             let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
             if n < 0 {
                 let e = std::io::Error::last_os_error();
@@ -161,12 +163,14 @@ impl InputReader {
             events: libc::POLLIN,
             revents: 0,
         }];
+        // SAFETY: poll on a single valid fd (stdin). Stack-allocated pollfd array.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
         n > 0 && fds[0].revents & libc::POLLIN != 0
     }
 
     fn read_byte(&self) -> Option<u8> {
         let mut byte = 0u8;
+        // SAFETY: Reading 1 byte from stdin into a stack variable. STDIN_FD is valid.
         let n = unsafe { libc::read(STDIN_FD, &mut byte as *mut u8 as *mut libc::c_void, 1) };
         if n == 1 { Some(byte) } else { None }
     }

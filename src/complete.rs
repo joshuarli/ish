@@ -161,7 +161,7 @@ pub fn complete_path(partial: &str, dirs_only: bool) -> Vec<CompEntry> {
         })
         .collect();
 
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    entries.sort_by_key(|a| a.name.to_lowercase());
     entries
 }
 

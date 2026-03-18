@@ -12,6 +12,7 @@ pub fn pipe_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
 
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: pipe2 writes two valid fds into the array on success.
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -19,10 +20,12 @@ pub fn pipe_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
 
     #[cfg(target_os = "macos")]
     {
+        // SAFETY: pipe writes two valid fds into the array on success.
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
         for &fd in &fds {
+            // SAFETY: fd is valid (just created by pipe above).
             unsafe {
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
@@ -40,6 +43,7 @@ pub fn pipe_nonblock_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
 
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: pipe2 with combined flags, writes two valid fds on success.
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -47,10 +51,12 @@ pub fn pipe_nonblock_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
 
     #[cfg(target_os = "macos")]
     {
+        // SAFETY: pipe writes two valid fds on success.
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
         for &fd in &fds {
+            // SAFETY: fd is valid (just created by pipe above).
             unsafe {
                 let flags = libc::fcntl(fd, libc::F_GETFL);
                 libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -70,13 +76,16 @@ pub fn pipe_nonblock_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
 /// macOS: iterates to getdtablesize().
 pub fn close_fds_from(min_fd: RawFd) {
     #[cfg(target_os = "linux")]
+    // SAFETY: close_range closes a range of fds. On older kernels (< 5.9)
+    // returns ENOSYS which we ignore — fd leak is non-critical.
     unsafe {
-        // close_range(2) — Linux 5.9+. Silently ignored on older kernels (ENOSYS).
         libc::syscall(libc::SYS_close_range, min_fd as u32, u32::MAX, 0u32);
     }
 
     #[cfg(target_os = "macos")]
     {
+        // SAFETY: getdtablesize returns the fd table size. Closing invalid
+        // fds returns EBADF which is harmlessly ignored.
         let max = unsafe { libc::getdtablesize() };
         for fd in min_fd..max {
             unsafe {
@@ -140,6 +149,11 @@ pub unsafe fn exec_command(cmd: &std::ffi::CStr, argv: *const *const libc::c_cha
     }
 }
 
+/// Access the process environment pointer for exec calls.
+///
+/// # Safety
+/// The returned pointer is only valid for immediate use in exec syscalls
+/// within a forked child. The shell is single-threaded so environ is stable.
 unsafe fn get_environ() -> *const *const libc::c_char {
     unsafe extern "C" {
         static environ: *const *mut libc::c_char;
@@ -158,7 +172,8 @@ pub fn spawn_command_subst(cmd: &str) -> Result<(libc::pid_t, RawFd), std::io::E
 
     let (pipe_r, pipe_w) = pipe_cloexec()?;
 
-    // File actions: stdout → pipe, stdin → /dev/null
+    // SAFETY: posix_spawn_file_actions are opaque structs managed by init/destroy.
+    // We init, configure, use in spawn, then destroy — standard lifecycle.
     let mut file_actions: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::posix_spawn_file_actions_init(&mut file_actions);
@@ -174,7 +189,8 @@ pub fn spawn_command_subst(cmd: &str) -> Result<(libc::pid_t, RawFd), std::io::E
         );
     }
 
-    // Attributes: reset all signals to default
+    // SAFETY: posix_spawnattr managed by init/destroy. SETSIGDEF with a full
+    // sigset resets all signals to default in the child.
     let mut attrs: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::posix_spawnattr_init(&mut attrs);
@@ -196,6 +212,8 @@ pub fn spawn_command_subst(cmd: &str) -> Result<(libc::pid_t, RawFd), std::io::E
     ];
 
     let mut pid: libc::pid_t = 0;
+    // SAFETY: All CStrings are alive for the duration of the call.
+    // argv is a valid null-terminated array. file_actions and attrs are initialized.
     let rc = unsafe {
         libc::posix_spawnp(
             &mut pid,
@@ -207,6 +225,7 @@ pub fn spawn_command_subst(cmd: &str) -> Result<(libc::pid_t, RawFd), std::io::E
         )
     };
 
+    // SAFETY: Cleanup — destroy must be called after init regardless of spawn result.
     unsafe {
         libc::posix_spawn_file_actions_destroy(&mut file_actions);
         libc::posix_spawnattr_destroy(&mut attrs);

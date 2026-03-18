@@ -1,4 +1,9 @@
 use crate::error::Error;
+/// Re-exported from parse. See [`parse::LITERAL`] for the protocol docs.
+/// `\x00` before a char means "this char is literal, do not expand it".
+/// Each expansion stage (variables, command subst, glob) checks for this
+/// marker and skips marked characters. `strip_literal()` removes all
+/// markers after expansion is complete.
 use crate::parse::LITERAL;
 
 /// Full expansion pipeline for a single word. Returns one or more strings
