@@ -168,7 +168,9 @@ fn main() {
 
                 // Add to history unless it's a bare alias or builtin
                 let first_word = line.split_whitespace().next().unwrap_or("");
-                if !builtin::is_builtin(first_word) && shell.aliases.get(first_word).is_none() {
+                if first_word == "cd"
+                    || (!builtin::is_builtin(first_word) && shell.aliases.get(first_word).is_none())
+                {
                     shell.history.add(&line);
                 }
 
