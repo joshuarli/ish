@@ -45,12 +45,54 @@ enum Mode {
     },
 }
 
-fn main() {
-    // Refuse script mode
-    if std::env::args().len() > 1 {
-        eprintln!("ish: this shell is interactive-only and does not run scripts");
-        std::process::exit(1);
+struct Args {
+    config: Option<String>, // -c <path>: custom config file
+    no_config: bool,        // --no-config: skip config loading
+}
+
+fn parse_args() -> Args {
+    let mut args = Args {
+        config: None,
+        no_config: false,
+    };
+    let mut argv = std::env::args().skip(1);
+    while let Some(arg) = argv.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "-c" => match argv.next() {
+                Some(path) => args.config = Some(path),
+                None => {
+                    eprintln!("ish: -c requires a config file path");
+                    std::process::exit(1);
+                }
+            },
+            "--no-config" => args.no_config = true,
+            _ => {
+                eprintln!("ish: this shell is interactive-only and does not run scripts");
+                eprintln!("usage: ish [-c config] [--no-config] [-h|--help]");
+                std::process::exit(1);
+            }
+        }
     }
+    args
+}
+
+fn print_help() {
+    println!("ish — minimal interactive shell");
+    println!();
+    println!("usage: ish [-c config] [--no-config] [-h|--help]");
+    println!();
+    println!("options:");
+    println!("  -c <path>    Use a custom config file instead of the default");
+    println!("  --no-config  Skip loading the config file");
+    println!("  -h, --help   Show this help message");
+}
+
+fn main() {
+    let cli = parse_args();
 
     // Set $SHELL to our own binary path
     if let Ok(exe) = std::env::current_exe() {
@@ -103,7 +145,9 @@ fn main() {
     exec::rebuild_path_cache(&mut shell.path_cache);
 
     // Load config
-    config::load(&mut shell.aliases);
+    if !cli.no_config {
+        config::load(&mut shell.aliases, cli.config.as_deref());
+    }
 
     // Initialize denv (auto .envrc/.env loading)
     shell.denv_active = denv::init();

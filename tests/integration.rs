@@ -967,7 +967,7 @@ fn config_load_all_paths() {
     let empty_dir = tempdir_with_files(&[]);
     unsafe { std::env::set_var("XDG_CONFIG_HOME", empty_dir.to_str().unwrap()) };
     let mut aliases = AliasMap::new();
-    config::load(&mut aliases);
+    config::load(&mut aliases, None);
 
     // 2. Full config with set, alias, comments, bad lines
     let dir = tempdir_with_files(&[]);
@@ -984,7 +984,7 @@ fn config_load_all_paths() {
     .unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.to_str().unwrap()) };
     let mut aliases = AliasMap::new();
-    config::load(&mut aliases);
+    config::load(&mut aliases, None);
     assert_eq!(
         std::env::var("ISH_TEST_CFG_LOAD_VAR").unwrap(),
         "hello world"
@@ -998,7 +998,7 @@ fn config_load_all_paths() {
     std::fs::write(config_dir2.join("config.ish"), "set  \n").unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", dir2.to_str().unwrap()) };
     let mut aliases = AliasMap::new();
-    config::load(&mut aliases);
+    config::load(&mut aliases, None);
 
     // 4. Alias without expansion — should not be added
     let dir3 = tempdir_with_files(&[]);
@@ -1007,7 +1007,7 @@ fn config_load_all_paths() {
     std::fs::write(config_dir3.join("config.ish"), "alias myalias\n").unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", dir3.to_str().unwrap()) };
     let mut aliases = AliasMap::new();
-    config::load(&mut aliases);
+    config::load(&mut aliases, None);
     assert!(aliases.get("myalias").is_none());
 
     // 5. set VAR with no value → empty string
@@ -1017,7 +1017,7 @@ fn config_load_all_paths() {
     std::fs::write(config_dir4.join("config.ish"), "set ISH_TEST_CFG_NOVAL\n").unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", dir4.to_str().unwrap()) };
     let mut aliases = AliasMap::new();
-    config::load(&mut aliases);
+    config::load(&mut aliases, None);
     assert_eq!(std::env::var("ISH_TEST_CFG_NOVAL").unwrap(), "");
 
     // Restore

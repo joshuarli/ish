@@ -1,14 +1,23 @@
 use crate::alias::AliasMap;
 use std::path::PathBuf;
 
-/// Load config from ~/.config/ish/config.ish.
+/// Load config from the given path, or the default config path.
 /// Supports: `set VAR "value"` and `alias name cmd [args...]`.
 /// Warns on bad lines, continues processing.
-pub fn load(aliases: &mut AliasMap) {
-    let path = config_path();
+pub fn load(aliases: &mut AliasMap, path_override: Option<&str>) {
+    let path = match path_override {
+        Some(p) => PathBuf::from(p),
+        None => config_path(),
+    };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return, // no config file is fine
+        Err(e) => {
+            // Only warn if the user explicitly specified a config file
+            if path_override.is_some() {
+                eprintln!("ish: {}: {e}", path.display());
+            }
+            return;
+        }
     };
 
     for (lineno, line) in content.lines().enumerate() {

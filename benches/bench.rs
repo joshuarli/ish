@@ -854,6 +854,84 @@ fn bench_alloc_audit(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Startup (time-to-prompt) benchmarks
+// ---------------------------------------------------------------------------
+
+fn bench_startup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("startup");
+
+    // Full cold startup in a git repo (this repo).
+    // Skips terminal setup (requires real tty) and signal::init (creates
+    // pipe per call). Everything else mirrors main() order.
+    group.bench_function("git_repo", |b| {
+        b.iter(|| {
+            let _history = black_box(History::load());
+
+            let mut cache = std::collections::HashMap::new();
+            exec::rebuild_path_cache(&mut cache);
+            black_box(cache.len());
+
+            let mut aliases = AliasMap::new();
+            ish::config::load(&mut aliases, None);
+
+            let _denv = black_box(ish::denv::init());
+
+            // Fresh prompt — git cache is cold
+            let mut p = prompt::Prompt::new();
+            black_box(p.render(0));
+        });
+    });
+
+    // Full cold startup outside a git repo (/tmp)
+    group.bench_function("no_git", |b| {
+        let original_dir = std::env::current_dir().ok();
+        let _ = std::env::set_current_dir("/tmp");
+
+        b.iter(|| {
+            let _history = black_box(History::load());
+
+            let mut cache = std::collections::HashMap::new();
+            exec::rebuild_path_cache(&mut cache);
+            black_box(cache.len());
+
+            let mut aliases = AliasMap::new();
+            ish::config::load(&mut aliases, None);
+
+            let _denv = black_box(ish::denv::init());
+
+            let mut p = prompt::Prompt::new();
+            black_box(p.render(0));
+        });
+
+        if let Some(d) = original_dir {
+            let _ = std::env::set_current_dir(d);
+        }
+    });
+
+    // Individual startup components
+    group.bench_function("history_load", |b| {
+        b.iter(|| black_box(History::load()));
+    });
+
+    group.bench_function("path_cache_build", |b| {
+        let mut cache = std::collections::HashMap::new();
+        b.iter(|| {
+            exec::rebuild_path_cache(&mut cache);
+            black_box(cache.len());
+        });
+    });
+
+    group.bench_function("denv_init", |b| {
+        b.iter(|| black_box(ish::denv::init()));
+    });
+
+    // signal::init creates a pipe each call — not safe to bench in a loop.
+    // It runs once at startup and takes <1µs (just sigaction + pipe).
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 
 fn fast_config() -> Criterion {
     Criterion::default()
@@ -866,6 +944,7 @@ criterion_group!(
     name = benches;
     config = fast_config();
     targets =
+        bench_startup,
         bench_parse,
         bench_expand,
         bench_line_buffer,
