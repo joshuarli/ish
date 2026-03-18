@@ -1727,6 +1727,59 @@ fn expand_glob_dot_pattern_includes_hidden() {
     assert!(result[0].ends_with(".hidden"));
 }
 
+#[test]
+fn expand_glob_through_symlink() {
+    // Glob must follow symlinks when traversing intermediate path segments.
+    // On macOS /var -> /private/var, so globs like /var/.../* would fail
+    // if the traversal used lstat (file_type) instead of stat (metadata).
+    let dir = tempdir_with_files(&["a.txt", "b.txt"]);
+    let dir = std::fs::canonicalize(&dir).unwrap();
+
+    // Create a symlink pointing to the temp dir
+    let link_parent = dir.parent().unwrap();
+    let link_path = link_parent.join(format!(
+        "{}_link",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_file(&link_path);
+    std::os::unix::fs::symlink(&dir, &link_path).unwrap();
+
+    // Glob through the symlink
+    let pattern = format!("{}/*.txt", link_path.display());
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    assert_eq!(result.len(), 2);
+    assert!(result.iter().any(|r| r.ends_with("a.txt")));
+    assert!(result.iter().any(|r| r.ends_with("b.txt")));
+
+    // Cleanup
+    let _ = std::fs::remove_file(&link_path);
+}
+
+#[test]
+fn expand_glob_through_nested_symlink() {
+    // Symlink as an intermediate segment: real_dir/sub/ with link -> real_dir,
+    // then glob link/sub/*
+    let dir = tempdir_with_files(&[]);
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("file.rs"), "").unwrap();
+
+    let link_path = dir.parent().unwrap().join(format!(
+        "{}_nested_link",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_file(&link_path);
+    std::os::unix::fs::symlink(&dir, &link_path).unwrap();
+
+    let pattern = format!("{}/sub/*.rs", link_path.display());
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    assert_eq!(result.len(), 1);
+    assert!(result[0].ends_with("file.rs"));
+
+    let _ = std::fs::remove_file(&link_path);
+}
+
 // ---------------------------------------------------------------------------
 // Parse: more error paths
 // ---------------------------------------------------------------------------

@@ -470,10 +470,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
             InputEvent::Key(key) => {
                 match &mut mode {
                     Mode::Normal => {
-                        // Bracketed paste: convert bare newlines to "; "
-                        // command separators instead of executing immediately.
-                        // Continuations (trailing \, unclosed quotes, trailing
-                        // operators) still go through the normal path.
+                        // Bracketed paste: convert bare newlines to spaces
+                        // instead of executing immediately. Continuations
+                        // (trailing \, unclosed quotes, trailing operators)
+                        // still go through the normal path.
                         let paste_sep = key.key == Key::Enter && reader.in_paste() && {
                             let text = line.text();
                             let combined = if full_input.is_empty() {
@@ -493,8 +493,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 line.set(&full_input);
                                 full_input = String::new();
                             }
+                            // Replace newline with space — safer than ";"
+                            // for text copied from tmux/terminal where
+                            // newlines may be visual wraps, not commands.
                             if !line.text().is_empty() {
-                                line.insert_str("; ");
+                                line.insert_char(' ');
                             }
                         } else {
                             match handle_normal_key(
