@@ -102,9 +102,11 @@ fn print_help() {
 fn main() {
     let cli = parse_args();
 
-    // Unset $SHELL — ish is not POSIX, don't confuse child processes
+    // Set $SHELL to ish binary path
     // SAFETY: single-threaded shell, no other threads reading env
-    unsafe { std::env::remove_var("SHELL") };
+    if let Ok(exe) = std::env::current_exe() {
+        unsafe { std::env::set_var("SHELL", exe) };
+    }
 
     // Save original termios
     let orig_termios = match term::save_termios() {
@@ -397,6 +399,25 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     let mut mode = Mode::Normal;
     let mut history_idx: Option<usize> = None;
     let mut saved_line = String::new();
+    // Emit OSC 7 so terminal emulators track the working directory
+    {
+        let pwd = getenv_str(c"PWD");
+        if !pwd.is_empty() {
+            let hostname = getenv_str(c"HOSTNAME");
+            // percent-encode spaces in the path
+            let mut osc = format!("\x1b]7;file://{hostname}");
+            for b in pwd.bytes() {
+                if b == b' ' {
+                    osc.push_str("%20");
+                } else {
+                    osc.push(b as char);
+                }
+            }
+            osc.push('\x07');
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
+        }
+    }
+
     // Render prompt — zero-alloc: reuse shell.prompt_buf, read env via getenv.
     // Take ownership so prompt_str can be borrowed independently of shell.
     let pwd = getenv_str(c"PWD");
