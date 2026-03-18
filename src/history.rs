@@ -1,9 +1,19 @@
+use std::collections::HashSet;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Write;
 use std::path::PathBuf;
+
+fn hash_str(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
 
 pub struct History {
     entries: Vec<String>,
+    /// Hash index for O(1) duplicate checks in add().
+    hashes: HashSet<u64>,
     path: PathBuf,
 }
 
@@ -11,21 +21,20 @@ impl History {
     pub fn load() -> Self {
         let path = history_path();
         // Open directly — avoids a redundant stat() from path.exists()
-        let entries = match fs::File::open(&path) {
-            Ok(f) => {
-                let reader = io::BufReader::new(f);
-                let mut seen = std::collections::HashSet::new();
+        let entries = match fs::read(&path) {
+            Ok(data) => {
+                let mut seen = HashSet::new();
                 let mut entries: Vec<String> = Vec::new();
-                // Read all lines, dedup keeping most recent
-                let all_lines: Vec<String> = reader
-                    .lines()
-                    .map_while(Result::ok)
-                    .filter(|l| !l.is_empty())
+                // Split on newlines, skip invalid UTF-8 lines
+                let all_lines: Vec<&str> = data
+                    .split(|&b| b == b'\n')
+                    .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+                    .filter(|s| !s.is_empty())
                     .collect();
                 // Iterate in reverse to keep most recent, then reverse back
                 for line in all_lines.into_iter().rev() {
-                    if seen.insert(line.clone()) {
-                        entries.push(line);
+                    if seen.insert(line.to_string()) {
+                        entries.push(line.to_string());
                     }
                 }
                 entries.reverse();
@@ -33,15 +42,21 @@ impl History {
             }
             Err(_) => Vec::new(),
         };
+        let hashes = entries.iter().map(|e| hash_str(e)).collect();
 
-        Self { entries, path }
-    }
-
-    /// Add entry. Deduplicates (removes prior occurrence).
-    /// Create from pre-existing entries (for testing).
-    pub fn from_entries(entries: Vec<String>) -> Self {
         Self {
             entries,
+            hashes,
+            path,
+        }
+    }
+
+    /// Create from pre-existing entries (for testing/benchmarks).
+    pub fn from_entries(entries: Vec<String>) -> Self {
+        let hashes = entries.iter().map(|e| hash_str(e)).collect();
+        Self {
+            entries,
+            hashes,
             path: PathBuf::from("/dev/null"),
         }
     }
@@ -55,8 +70,12 @@ impl History {
             return;
         }
 
-        // Remove prior duplicate
-        self.entries.retain(|e| e != line);
+        let h = hash_str(line);
+        if self.hashes.contains(&h) {
+            // Likely duplicate — remove prior occurrence
+            self.entries.retain(|e| e != line);
+        }
+        self.hashes.insert(h);
         self.entries.push(line.to_string());
 
         // Append to file

@@ -7,7 +7,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Duration;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
 use ish::alias::AliasMap;
 use ish::complete;
@@ -347,6 +347,31 @@ fn bench_history(c: &mut Criterion) {
         b.iter(|| black_box(small_history.fuzzy_search("gb")));
     });
 
+    // Real history — benchmarks with the actual user history file
+    let real = History::load();
+    let real_len = real.len();
+
+    group.bench_function(format!("fuzzy_search_real_{real_len}"), |b| {
+        b.iter(|| black_box(real.fuzzy_search("gco")));
+    });
+
+    group.bench_function(format!("fuzzy_search_real_miss_{real_len}"), |b| {
+        b.iter(|| black_box(real.fuzzy_search("zzzznotfound")));
+    });
+
+    group.bench_function(format!("fuzzy_search_into_real_{real_len}"), |b| {
+        let mut results = Vec::with_capacity(200);
+        real.fuzzy_search_into("gco", &mut results, 200);
+        b.iter(|| {
+            real.fuzzy_search_into("gco", &mut results, 200);
+            black_box(&results);
+        });
+    });
+
+    group.bench_function(format!("prefix_search_real_{real_len}"), |b| {
+        b.iter(|| black_box(real.prefix_search("git ", 0)));
+    });
+
     group.finish();
 }
 
@@ -565,28 +590,57 @@ fn bench_history_add(c: &mut Criterion) {
     let mut group = c.benchmark_group("history_add");
 
     // Add to a 1k history (typical size)
-    group.bench_function("add_new_1k", |b| {
+    {
         let entries: Vec<String> = (0..1000)
             .map(|i| format!("command_{i} --arg={i}"))
             .collect();
-        b.iter(|| {
-            let mut h = History::from_entries(entries.clone());
-            h.add("brand_new_command --flag");
-            black_box(());
-        });
-    });
 
-    // Add duplicate (triggers retain scan + push)
-    group.bench_function("add_dup_1k", |b| {
-        let entries: Vec<String> = (0..1000)
-            .map(|i| format!("command_{i} --arg={i}"))
-            .collect();
-        b.iter(|| {
-            let mut h = History::from_entries(entries.clone());
-            h.add("command_500 --arg=500");
-            black_box(());
+        group.bench_function("add_new_1k", |b| {
+            b.iter_batched(
+                || History::from_entries(entries.clone()),
+                |mut h| h.add("brand_new_command --flag"),
+                BatchSize::LargeInput,
+            );
         });
-    });
+
+        group.bench_function("add_dup_1k", |b| {
+            b.iter_batched(
+                || History::from_entries(entries.clone()),
+                |mut h| h.add("command_500 --arg=500"),
+                BatchSize::LargeInput,
+            );
+        });
+    }
+
+    // Real history — add to 44k entries
+    {
+        let real = History::load();
+        let real_len = real.len();
+        let entries: Vec<String> = real.entries().to_vec();
+
+        group.bench_function(format!("add_new_real_{real_len}"), |b| {
+            b.iter_batched(
+                || History::from_entries(entries.clone()),
+                |mut h| {
+                    h.add("brand_new_command_xyz --flag");
+                    h
+                },
+                BatchSize::LargeInput,
+            );
+        });
+
+        group.bench_function(format!("add_dup_real_{real_len}"), |b| {
+            let mid = entries[entries.len() / 2].clone();
+            b.iter_batched(
+                || History::from_entries(entries.clone()),
+                |mut h| {
+                    h.add(&mid);
+                    h
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
 
     group.finish();
 }

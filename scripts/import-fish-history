@@ -1,0 +1,40 @@
+#!/bin/bash
+# Import fish shell history into ish history.
+#
+# Fish entries are prepended before existing ish entries so that ish's
+# deduplication (keep last occurrence) preserves the ish version when
+# the same command appears in both.
+
+set -euo pipefail
+
+fish_history="${XDG_DATA_HOME:-$HOME/.local/share}/fish/fish_history"
+ish_history="${XDG_DATA_HOME:-$HOME/.local/share}/ish/history"
+
+if [[ ! -f "$fish_history" ]]; then
+    printf 'error: fish history not found at %s\n' "$fish_history" >&2
+    exit 1
+fi
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+# Parse fish history: extract commands, strip zsh-import prefix, unescape \n
+LC_ALL=C awk '/^- cmd: / {
+    cmd = substr($0, 8)
+    sub(/^: [0-9]+:[0-9]+;/, "", cmd)
+    gsub(/\\n/, " ", cmd)
+    gsub(/^[ \t]+|[ \t]+$/, "", cmd)
+    if (cmd != "") print cmd
+}' "$fish_history" > "$tmp"
+
+count=$(wc -l < "$tmp" | tr -d ' ')
+
+# Append existing ish entries after fish entries (last occurrence wins on load)
+mkdir -p "$(dirname "$ish_history")"
+if [[ -f "$ish_history" ]]; then
+    cat "$ish_history" >> "$tmp"
+fi
+
+mv "$tmp" "$ish_history"
+
+printf 'imported %s commands from fish history into %s\n' "$count" "$ish_history"
