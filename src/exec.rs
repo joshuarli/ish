@@ -10,6 +10,63 @@ use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
+/// Check if a string is a `NAME=VALUE` variable assignment.
+/// Returns the byte position of `=` if the prefix is a valid variable name.
+pub fn var_assignment_pos(s: &str) -> Option<usize> {
+    let eq = s.find('=')?;
+    if eq == 0 {
+        return None;
+    }
+    let name = &s.as_bytes()[..eq];
+    if !name[0].is_ascii_alphabetic() && name[0] != b'_' {
+        return None;
+    }
+    if name.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_') {
+        Some(eq)
+    } else {
+        None
+    }
+}
+
+/// Split leading `NAME=VALUE` entries from argv, returning them separately.
+fn split_env_prefix(argv: &mut Vec<String>) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    while let Some(entry) = argv.first() {
+        if let Some(eq) = var_assignment_pos(entry) {
+            let name = entry[..eq].to_string();
+            let val = entry[eq + 1..].to_string();
+            env.push((name, val));
+            argv.remove(0);
+        } else {
+            break;
+        }
+    }
+    env
+}
+
+/// Temporarily set env vars, returning the previous values for restore.
+fn set_env_temp(env: &[(String, String)]) -> Vec<(String, Option<String>)> {
+    env.iter()
+        .map(|(k, v)| {
+            let old = std::env::var(k).ok();
+            // SAFETY: single-threaded shell
+            unsafe { std::env::set_var(k, v) };
+            (k.clone(), old)
+        })
+        .collect()
+}
+
+/// Restore env vars saved by set_env_temp.
+fn restore_env(saved: &[(String, Option<String>)]) {
+    for (k, old) in saved {
+        // SAFETY: single-threaded shell
+        match old {
+            Some(v) => unsafe { std::env::set_var(k, v) },
+            None => unsafe { std::env::remove_var(k) },
+        }
+    }
+}
+
 fn close_fd(fd: RawFd) {
     if fd >= 0 {
         // SAFETY: fd is a valid file descriptor (checked >= 0).
@@ -98,14 +155,17 @@ fn execute_pipeline(
     for pcmd in commands {
         let mut argv = pcmd.cmd.argv.clone();
 
-        // Alias expansion (first word only, no recursion)
-        if let Some(first) = argv.first() {
-            let clean_first = parse::unescape(first);
-            if let Some(alias_args) = aliases.get(&clean_first) {
-                argv.remove(0);
-                let mut new_argv: Vec<String> = alias_args.iter().map(|s| s.to_string()).collect();
-                new_argv.extend(argv);
-                argv = new_argv;
+        // Alias expansion (first non-assignment word only, no recursion)
+        let cmd_idx = argv
+            .iter()
+            .position(|w| var_assignment_pos(&parse::unescape(w)).is_none());
+        if let Some(idx) = cmd_idx {
+            let clean = parse::unescape(&argv[idx]);
+            if let Some(alias_args) = aliases.get(&clean) {
+                argv.remove(idx);
+                for (j, a) in alias_args.iter().enumerate() {
+                    argv.insert(idx + j, a.to_string());
+                }
             }
         }
 
@@ -113,8 +173,17 @@ fn execute_pipeline(
         let mut exec_subst =
             |cmd: &str| -> Result<String, Error> { capture_command_output(cmd, orig_termios) };
         match expand::expand_argv(&argv, home, &mut exec_subst) {
-            Ok(expanded_argv) => {
+            Ok(mut expanded_argv) => {
+                // Split leading NAME=VALUE prefix assignments
+                let env = split_env_prefix(&mut expanded_argv);
                 if expanded_argv.is_empty() {
+                    if !env.is_empty() && commands.len() == 1 {
+                        // Bare assignment: set in current shell process
+                        for (name, val) in &env {
+                            // SAFETY: single-threaded shell
+                            unsafe { std::env::set_var(name, val) };
+                        }
+                    }
                     return 0;
                 }
                 let mut redirects = Vec::new();
@@ -127,7 +196,7 @@ fn execute_pipeline(
                         target,
                     });
                 }
-                expanded.push((expanded_argv, redirects, pcmd.pipe_stderr));
+                expanded.push((expanded_argv, redirects, pcmd.pipe_stderr, env));
             }
             Err(e) => {
                 eprintln!("ish: {e}");
@@ -142,10 +211,11 @@ fn execute_pipeline(
 
     // Single command, no pipe: check for builtins that modify state
     if expanded.len() == 1 {
-        let (argv, redirects, _) = &expanded[0];
+        let (argv, redirects, _, env) = &expanded[0];
         let cmd_name = &argv[0];
         if builtin::is_special_builtin(cmd_name) {
-            return builtin::run_special(
+            let saved = set_env_temp(env);
+            let status = builtin::run_special(
                 cmd_name,
                 &argv[1..],
                 redirects,
@@ -154,10 +224,15 @@ fn execute_pipeline(
                 job,
                 session_log,
             );
+            restore_env(&saved);
+            return status;
         }
         // Output-only builtins as single commands: run in-process too
         if builtin::is_builtin(cmd_name) {
-            return builtin::run_output(cmd_name, &argv[1..], redirects);
+            let saved = set_env_temp(env);
+            let status = builtin::run_output(cmd_name, &argv[1..], redirects);
+            restore_env(&saved);
+            return status;
         }
     }
 
@@ -168,11 +243,15 @@ fn execute_pipeline(
     let mut pgid: libc::pid_t = 0;
     let cmd_text: String = expanded
         .iter()
-        .map(|(argv, _, _)| argv.join(" "))
+        .map(|(argv, _, _, env)| {
+            let mut parts: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            parts.extend(argv.iter().cloned());
+            parts.join(" ")
+        })
         .collect::<Vec<_>>()
         .join(" | ");
 
-    for (i, (argv, redirects, pipe_stderr)) in expanded.iter().enumerate() {
+    for (i, (argv, redirects, pipe_stderr, env)) in expanded.iter().enumerate() {
         let is_last = i == n - 1;
 
         // Create pipe unless last command (O_CLOEXEC: auto-closed on exec)
@@ -207,6 +286,7 @@ fn execute_pipeline(
                 *pipe_stderr,
                 argv,
                 redirects,
+                env,
                 orig_termios,
             );
             // child_setup does not return
@@ -342,6 +422,7 @@ fn child_setup(
     pipe_stderr: bool,
     argv: &[String],
     redirects: &[Redirect],
+    env: &[(String, String)],
     orig_termios: &libc::termios,
 ) -> ! {
     // SAFETY: This entire block runs in a forked child process.
@@ -355,6 +436,11 @@ fn child_setup(
         // Restore terminal settings and signal defaults
         libc::tcsetattr(0, libc::TCSANOW, orig_termios);
         signal::restore_defaults();
+
+        // Set prefix environment variables (VAR=VALUE cmd)
+        for (name, val) in env {
+            std::env::set_var(name, val);
+        }
 
         // Pipe: stdin from previous pipe
         if prev_read != -1 {
@@ -625,4 +711,48 @@ pub fn resume_job(job: &mut Option<Job>) -> (i32, Option<Continuation>) {
     };
 
     (status, continuation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn var_assignment_detection() {
+        assert_eq!(var_assignment_pos("FOO=bar"), Some(3));
+        assert_eq!(var_assignment_pos("A="), Some(1));
+        assert_eq!(var_assignment_pos("_X=1"), Some(2));
+        assert_eq!(var_assignment_pos("PATH=/usr/bin"), Some(4));
+        // Not assignments
+        assert_eq!(var_assignment_pos("=bar"), None);
+        assert_eq!(var_assignment_pos("echo"), None);
+        assert_eq!(var_assignment_pos("1FOO=bar"), None);
+        assert_eq!(var_assignment_pos("FOO-X=bar"), None);
+    }
+
+    #[test]
+    fn env_prefix_splitting() {
+        let mut argv = vec!["FOO=bar".into(), "echo".into(), "hi".into()];
+        let env = split_env_prefix(&mut argv);
+        assert_eq!(env, vec![("FOO".into(), "bar".into())]);
+        assert_eq!(argv, vec!["echo", "hi"]);
+
+        // Multiple assignments
+        let mut argv = vec!["A=1".into(), "B=2".into(), "cmd".into()];
+        let env = split_env_prefix(&mut argv);
+        assert_eq!(env.len(), 2);
+        assert_eq!(argv, vec!["cmd"]);
+
+        // No assignments
+        let mut argv = vec!["echo".into(), "FOO=bar".into()];
+        let env = split_env_prefix(&mut argv);
+        assert!(env.is_empty());
+        assert_eq!(argv, vec!["echo", "FOO=bar"]);
+
+        // Bare assignment (all entries are assignments)
+        let mut argv = vec!["FOO=bar".into()];
+        let env = split_env_prefix(&mut argv);
+        assert_eq!(env, vec![("FOO".into(), "bar".into())]);
+        assert!(argv.is_empty());
+    }
 }

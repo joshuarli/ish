@@ -196,8 +196,13 @@ fn main() {
                         if cmdline.segments.len() == 1 && cmdline.segments[0].0.commands.len() == 1
                         {
                             let cmd = &cmdline.segments[0].0.commands[0].cmd;
-                            let first =
-                                parse::unescape(cmd.argv.first().map(|s| s.as_str()).unwrap_or(""));
+                            // Skip leading NAME=VALUE assignments to find the command word
+                            let first = cmd
+                                .argv
+                                .iter()
+                                .map(|s| parse::unescape(s))
+                                .find(|s| exec::var_assignment_pos(s).is_none())
+                                .unwrap_or_default();
                             if first == "source" || first == "." {
                                 eprintln!("ish: {first}: sourcing is not supported");
                                 shell.last_status = 1;
@@ -332,14 +337,14 @@ fn main() {
                         // Handle cd specially to invalidate prompt git cache
                         let is_cd = cmdline.segments.len() == 1
                             && cmdline.segments[0].0.commands.len() == 1
-                            && parse::unescape(
-                                cmdline.segments[0].0.commands[0]
-                                    .cmd
-                                    .argv
-                                    .first()
-                                    .map(|s| s.as_str())
-                                    .unwrap_or(""),
-                            ) == "cd";
+                            && cmdline.segments[0].0.commands[0]
+                                .cmd
+                                .argv
+                                .iter()
+                                .map(|s| parse::unescape(s))
+                                .find(|s| exec::var_assignment_pos(s).is_none())
+                                .as_deref()
+                                == Some("cd");
 
                         shell.last_status = exec::execute(
                             &cmdline,
