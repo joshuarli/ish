@@ -741,7 +741,7 @@ fn navigate_history(
     if up {
         let skip = history_idx.map(|i| i + 1).unwrap_or(0);
         let entry = if saved_line.is_empty() {
-            hist.entries().iter().rev().nth(skip).map(|s| s.as_str())
+            hist.len().checked_sub(1 + skip).map(|i| hist.get(i))
         } else {
             hist.prefix_search(saved_line, skip)
         };
@@ -759,7 +759,7 @@ fn navigate_history(
                 *idx -= 1;
                 let skip = *idx;
                 let entry = if saved_line.is_empty() {
-                    hist.entries().iter().rev().nth(skip).map(|s| s.as_str())
+                    hist.len().checked_sub(1 + skip).map(|i| hist.get(i))
                 } else {
                     hist.prefix_search(saved_line, skip)
                 };

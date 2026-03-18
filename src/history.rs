@@ -11,7 +11,10 @@ fn hash_str(s: &str) -> u64 {
 }
 
 pub struct History {
-    entries: Vec<String>,
+    /// All entry text packed into a single allocation.
+    arena: String,
+    /// (start, len) byte offsets into `arena` for each entry.
+    offsets: Vec<(u32, u16)>,
     /// Hash index for O(1) duplicate checks in add().
     hashes: HashSet<u64>,
     path: PathBuf,
@@ -20,32 +23,46 @@ pub struct History {
 impl History {
     pub fn load() -> Self {
         let path = history_path();
-        // Open directly — avoids a redundant stat() from path.exists()
-        let entries = match fs::read(&path) {
+        let (arena, offsets, hashes) = match fs::read(&path) {
             Ok(data) => {
-                let mut seen = HashSet::new();
-                let mut entries: Vec<String> = Vec::new();
-                // Split on newlines, skip invalid UTF-8 lines
-                let all_lines: Vec<&str> = data
-                    .split(|&b| b == b'\n')
-                    .filter_map(|bytes| std::str::from_utf8(bytes).ok())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                // Iterate in reverse to keep most recent, then reverse back
-                for line in all_lines.into_iter().rev() {
-                    if seen.insert(line.to_string()) {
-                        entries.push(line.to_string());
+                let line_count = memchr_count(b'\n', &data);
+                let mut seen = HashSet::with_capacity(line_count);
+                let mut deduped: Vec<&str> = Vec::with_capacity(line_count);
+                let mut hashes_vec: Vec<u64> = Vec::with_capacity(line_count);
+
+                // rsplit iterates from end — first insert of each hash wins (= most recent)
+                for chunk in data.rsplit(|&b| b == b'\n') {
+                    if let Ok(line) = std::str::from_utf8(chunk)
+                        && !line.is_empty()
+                    {
+                        let h = hash_str(line);
+                        if seen.insert(h) {
+                            deduped.push(line);
+                            hashes_vec.push(h);
+                        }
                     }
                 }
-                entries.reverse();
-                entries
+                deduped.reverse();
+                hashes_vec.reverse();
+
+                // Pack into a single arena allocation
+                let total: usize = deduped.iter().map(|s| s.len()).sum();
+                let mut arena = String::with_capacity(total);
+                let mut offsets = Vec::with_capacity(deduped.len());
+                for line in &deduped {
+                    let start = arena.len() as u32;
+                    arena.push_str(line);
+                    offsets.push((start, line.len() as u16));
+                }
+
+                (arena, offsets, hashes_vec.into_iter().collect())
             }
-            Err(_) => Vec::new(),
+            Err(_) => (String::new(), Vec::new(), HashSet::new()),
         };
-        let hashes = entries.iter().map(|e| hash_str(e)).collect();
 
         Self {
-            entries,
+            arena,
+            offsets,
             hashes,
             path,
         }
@@ -53,9 +70,19 @@ impl History {
 
     /// Create from pre-existing entries (for testing/benchmarks).
     pub fn from_entries(entries: Vec<String>) -> Self {
-        let hashes = entries.iter().map(|e| hash_str(e)).collect();
+        let total: usize = entries.iter().map(|e| e.len()).sum();
+        let mut arena = String::with_capacity(total);
+        let mut offsets = Vec::with_capacity(entries.len());
+        let mut hashes = HashSet::with_capacity(entries.len());
+        for e in &entries {
+            let start = arena.len() as u32;
+            arena.push_str(e);
+            offsets.push((start, e.len() as u16));
+            hashes.insert(hash_str(e));
+        }
         Self {
-            entries,
+            arena,
+            offsets,
             hashes,
             path: PathBuf::from("/dev/null"),
         }
@@ -73,36 +100,38 @@ impl History {
         let h = hash_str(line);
         if self.hashes.contains(&h) {
             // Likely duplicate — remove prior occurrence
-            self.entries.retain(|e| e != line);
+            self.offsets.retain(|&(start, len)| {
+                &self.arena[start as usize..start as usize + len as usize] != line
+            });
         }
+        let start = self.arena.len() as u32;
+        self.arena.push_str(line);
+        self.offsets.push((start, line.len() as u16));
         self.hashes.insert(h);
-        self.entries.push(line.to_string());
 
         // Append to file
         self.append_to_file(line);
     }
 
-    pub fn entries(&self) -> &[String] {
-        &self.entries
-    }
-
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.offsets.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.offsets.is_empty()
     }
 
     /// Prefix search: find entries that start with `prefix`, starting from
     /// the end and skipping `skip` matches. Returns the entry text.
     pub fn prefix_search(&self, prefix: &str, skip: usize) -> Option<&str> {
-        self.entries
+        self.offsets
             .iter()
             .rev()
-            .filter(|e| e.starts_with(prefix))
+            .filter_map(|&(start, len)| {
+                let s = &self.arena[start as usize..start as usize + len as usize];
+                s.starts_with(prefix).then_some(s)
+            })
             .nth(skip)
-            .map(|s| s.as_str())
     }
 
     /// Fuzzy (subsequence) search: every char of `query` appears in the entry
@@ -110,12 +139,9 @@ impl History {
     /// with entry index and indices of matching chars.
     pub fn fuzzy_search(&self, query: &str) -> Vec<FuzzyMatch> {
         if query.is_empty() {
-            return self
-                .entries
-                .iter()
-                .enumerate()
+            return (0..self.offsets.len())
                 .rev()
-                .map(|(idx, _)| FuzzyMatch {
+                .map(|idx| FuzzyMatch {
                     entry_idx: idx,
                     match_positions: [0; 32],
                     match_count: 0,
@@ -123,22 +149,12 @@ impl History {
                 .collect();
         }
 
-        // Stack array for lowercased query — avoids Vec allocation
-        let mut query_buf = ['\0'; 64];
-        let mut query_len = 0;
-        for c in query.chars().flat_map(|c| c.to_lowercase()) {
-            if query_len >= query_buf.len() {
-                break;
-            }
-            query_buf[query_len] = c;
-            query_len += 1;
-        }
-        let query_lower = &query_buf[..query_len];
-
+        let query_lower = lowercase_query(query);
         let mut results = Vec::new();
 
-        for (idx, entry) in self.entries.iter().enumerate().rev() {
-            if let Some((positions, count)) = subsequence_match(query_lower, entry) {
+        for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
+            let entry = &self.arena[start as usize..start as usize + len as usize];
+            if let Some((positions, count)) = subsequence_match(&query_lower, entry) {
                 results.push(FuzzyMatch {
                     entry_idx: idx,
                     match_positions: positions,
@@ -156,7 +172,7 @@ impl History {
         results.clear();
 
         if query.is_empty() {
-            for (idx, _) in self.entries.iter().enumerate().rev() {
+            for idx in (0..self.offsets.len()).rev() {
                 results.push(FuzzyMatch {
                     entry_idx: idx,
                     match_positions: [0; 32],
@@ -169,19 +185,11 @@ impl History {
             return;
         }
 
-        let mut query_buf = ['\0'; 64];
-        let mut query_len = 0;
-        for c in query.chars().flat_map(|c| c.to_lowercase()) {
-            if query_len >= query_buf.len() {
-                break;
-            }
-            query_buf[query_len] = c;
-            query_len += 1;
-        }
-        let query_lower = &query_buf[..query_len];
+        let query_lower = lowercase_query(query);
 
-        for (idx, entry) in self.entries.iter().enumerate().rev() {
-            if let Some((positions, count)) = subsequence_match(query_lower, entry) {
+        for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
+            let entry = &self.arena[start as usize..start as usize + len as usize];
+            if let Some((positions, count)) = subsequence_match(&query_lower, entry) {
                 results.push(FuzzyMatch {
                     entry_idx: idx,
                     match_positions: positions,
@@ -196,7 +204,8 @@ impl History {
 
     /// Get entry text by index.
     pub fn get(&self, idx: usize) -> &str {
-        &self.entries[idx]
+        let (start, len) = self.offsets[idx];
+        &self.arena[start as usize..start as usize + len as usize]
     }
 
     fn append_to_file(&self, line: &str) {
@@ -211,6 +220,11 @@ impl History {
             let _ = writeln!(f, "{line}");
         }
     }
+}
+
+/// Lowercase a query into a fixed stack buffer, returning the used slice.
+fn lowercase_query(query: &str) -> Vec<char> {
+    query.chars().flat_map(|c| c.to_lowercase()).collect()
 }
 
 pub struct FuzzyMatch {
@@ -263,6 +277,11 @@ pub fn subsequence_match(query: &[char], text: &str) -> Option<([u16; 32], u8)> 
     }
 
     None
+}
+
+/// Count occurrences of a byte in a slice.
+fn memchr_count(needle: u8, haystack: &[u8]) -> usize {
+    haystack.iter().filter(|&&b| b == needle).count()
 }
 
 fn history_path() -> PathBuf {

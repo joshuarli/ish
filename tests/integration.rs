@@ -334,10 +334,9 @@ fn history_dedup_on_add() {
     // Already deduped by from_entries? No, from_entries takes them as-is.
     // add() deduplicates.
     h.add("ls");
-    let entries = h.entries();
     // "ls" should appear only once, at the end
-    assert_eq!(entries.iter().filter(|e| *e == "ls").count(), 1);
-    assert_eq!(entries.last().unwrap(), "ls");
+    assert_eq!((0..h.len()).filter(|&i| h.get(i) == "ls").count(), 1);
+    assert_eq!(h.get(h.len() - 1), "ls");
 }
 
 #[test]
@@ -1503,14 +1502,15 @@ fn history_add_with_newlines() {
     let mut h = History::from_entries(vec![]);
     h.add("echo\nhello");
     // Newlines should be collapsed to spaces
-    assert_eq!(h.entries().last().unwrap(), "echo hello");
+    assert_eq!(h.get(h.len() - 1), "echo hello");
 }
 
 #[test]
 fn history_add_dedup_preserves_order() {
     let mut h = History::from_entries(vec!["a".into(), "b".into(), "c".into()]);
     h.add("a");
-    assert_eq!(h.entries(), &["b", "c", "a"]);
+    let entries: Vec<&str> = (0..h.len()).map(|i| h.get(i)).collect();
+    assert_eq!(entries, &["b", "c", "a"]);
 }
 
 #[test]

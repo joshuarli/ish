@@ -616,7 +616,7 @@ fn bench_history_add(c: &mut Criterion) {
     {
         let real = History::load();
         let real_len = real.len();
-        let entries: Vec<String> = real.entries().to_vec();
+        let entries: Vec<String> = (0..real_len).map(|i| real.get(i).to_string()).collect();
 
         group.bench_function(format!("add_new_real_{real_len}"), |b| {
             b.iter_batched(
