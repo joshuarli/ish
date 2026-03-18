@@ -385,6 +385,51 @@ fn bench_completion(c: &mut Criterion) {
         b.iter(|| black_box(complete::complete_path("./src/", false)));
     });
 
+    // Sort benchmark: isolated sort of typical directory listing (~17 entries)
+    group.bench_function("sort_17_filenames", |b| {
+        // Realistic filenames from a Rust project src/ dir
+        let names = [
+            "main.rs",
+            "lib.rs",
+            "prompt.rs",
+            "render.rs",
+            "complete.rs",
+            "history.rs",
+            "parse.rs",
+            "expand.rs",
+            "exec.rs",
+            "builtin.rs",
+            "line.rs",
+            "term.rs",
+            "input.rs",
+            "signal.rs",
+            "config.rs",
+            "alias.rs",
+            "error.rs",
+        ];
+        b.iter(|| {
+            let mut comp = complete::Completions::new();
+            // Push in reverse to force real sorting work
+            for n in names.iter().rev() {
+                comp.push(n, false, false, false);
+            }
+            comp.sort_entries();
+            black_box(&comp);
+        });
+    });
+
+    // Sort: large directory (100 entries)
+    group.bench_function("sort_100_filenames", |b| {
+        b.iter(|| {
+            let mut comp = complete::Completions::new();
+            for i in (0..100).rev() {
+                comp.push(&format!("file_{i:03}.rs"), false, false, false);
+            }
+            comp.sort_entries();
+            black_box(&comp);
+        });
+    });
+
     group.finish();
 }
 

@@ -83,16 +83,56 @@ impl Completions {
         });
     }
 
-    fn sort_by_name(&mut self) {
-        let names = &self.names;
-        self.entries.sort_by(|a, b| {
-            let an = &names[a.name_start as usize..][..a.name_len as usize];
-            let bn = &names[b.name_start as usize..][..b.name_len as usize];
-            an.bytes()
-                .map(|b| b.to_ascii_lowercase())
-                .cmp(bn.bytes().map(|b| b.to_ascii_lowercase()))
-        });
+    /// Sort entries case-insensitively by name.
+    pub fn sort_entries(&mut self) {
+        let n = self.entries.len();
+        if n <= 1 {
+            return;
+        }
+        let names = self.names.as_bytes();
+        if n <= 40 {
+            // Insertion sort — O(n²) but minimal overhead for small N.
+            for i in 1..n {
+                let mut j = i;
+                while j > 0
+                    && cmp_icase_arena(names, &self.entries[j], &self.entries[j - 1])
+                        == std::cmp::Ordering::Less
+                {
+                    self.entries.swap(j, j - 1);
+                    j -= 1;
+                }
+            }
+        } else {
+            self.entries
+                .sort_unstable_by(|a, b| cmp_icase_arena(names, a, b));
+        }
     }
+}
+
+/// Case-insensitive byte-level comparator for arena-backed entries.
+/// Inlined into sort hot path — no iterator overhead.
+#[inline(always)]
+fn cmp_icase_arena(names: &[u8], a: &CompEntry, b: &CompEntry) -> std::cmp::Ordering {
+    let a_bytes = &names[a.name_start as usize..][..a.name_len as usize];
+    let b_bytes = &names[b.name_start as usize..][..b.name_len as usize];
+    let len = a_bytes.len().min(b_bytes.len());
+    let mut i = 0;
+    while i < len {
+        let mut ab = a_bytes[i];
+        let mut bb = b_bytes[i];
+        // ASCII lowercase: branchless for the common case
+        ab += (ab.is_ascii_uppercase() as u8) * 32;
+        bb += (bb.is_ascii_uppercase() as u8) * 32;
+        if ab != bb {
+            return if ab < bb {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        i += 1;
+    }
+    a_bytes.len().cmp(&b_bytes.len())
 }
 
 pub struct CompletionState {
@@ -315,7 +355,7 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
     // SAFETY: dp is a valid DIR* from opendir.
     unsafe { libc::closedir(dp) };
 
-    comp.sort_by_name();
+    comp.sort_entries();
 }
 
 /// Fish-style partial path completion: each intermediate directory component
