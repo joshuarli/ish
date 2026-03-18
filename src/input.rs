@@ -157,6 +157,11 @@ impl InputReader {
         }
     }
 
+    /// Returns true if stdin has data available to read immediately.
+    pub fn has_pending_input(&self) -> bool {
+        self.poll_stdin(0)
+    }
+
     fn poll_stdin(&self, timeout_ms: i32) -> bool {
         let mut fds = [libc::pollfd {
             fd: STDIN_FD,

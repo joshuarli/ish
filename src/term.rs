@@ -32,10 +32,11 @@ impl RawMode {
         raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 0;
 
-        // SAFETY: tcsetattr with TCSAFLUSH drains output, discards pending input,
-        // then applies the new settings. raw is a valid modified copy of orig.
+        // SAFETY: tcsetattr with TCSADRAIN drains output, then applies settings.
+        // Preserves pending input so typeahead typed during child execution
+        // is available to read_line.
         unsafe {
-            if libc::tcsetattr(STDIN_FD, libc::TCSAFLUSH, &raw) != 0 {
+            if libc::tcsetattr(STDIN_FD, libc::TCSADRAIN, &raw) != 0 {
                 return Err(io::Error::last_os_error());
             }
         }

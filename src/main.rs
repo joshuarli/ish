@@ -468,7 +468,15 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             shell,
                             &full_input,
                         ) {
-                            KeyAction::Continue => {}
+                            KeyAction::Continue => {
+                                // Batch typeahead: defer render while more
+                                // input is available, so pasted text and
+                                // keys typed during a command appear in one
+                                // repaint instead of flickering per-char.
+                                if reader.has_pending_input() {
+                                    continue;
+                                }
+                            }
                             KeyAction::Execute(text) => {
                                 tw.write_str("\r\n");
                                 let _ = tw.flush_to_stdout();
