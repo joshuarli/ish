@@ -180,11 +180,8 @@ fn main() {
                 //   single-arg directory that isn't an executable → "cd <dir>"
                 let line = maybe_rewrite_cd(&line, &shell.aliases);
 
-                // Add to history unless it's a bare alias or builtin
-                let first_word = line.split_whitespace().next().unwrap_or("");
-                if first_word == "cd"
-                    || (!builtin::is_builtin(first_word) && shell.aliases.get(first_word).is_none())
-                {
+                // Add to history (exclude bare 'l' — too frequent to be useful)
+                if line.trim() != "l" {
                     shell.history.add(&line);
                 }
 
