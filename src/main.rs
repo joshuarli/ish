@@ -485,20 +485,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         };
 
                         if paste_sep {
-                            // Merge any accumulated continuation into line
-                            if !full_input.is_empty() {
-                                let text = line.text().to_string();
-                                full_input.push(' ');
-                                full_input.push_str(&text);
-                                line.set(&full_input);
-                                full_input = String::new();
-                            }
-                            // Replace newline with space — safer than ";"
-                            // for text copied from tmux/terminal where
-                            // newlines may be visual wraps, not commands.
-                            if !line.text().is_empty() {
-                                line.insert_char(' ');
-                            }
+                            handle_paste_newline(&mut line, &mut full_input);
                         } else {
                             match handle_normal_key(
                                 key,
@@ -532,7 +519,6 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         full_input.push(' ');
                                         full_input.push_str(&text);
                                     }
-                                    // Strip trailing \ for backslash-newline continuation
                                     if parse::ends_with_line_continuation(&full_input) {
                                         let end = full_input.trim_end().len();
                                         full_input.truncate(end - 1);
@@ -589,7 +575,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     }
                                 }
                             }
-                        } // else (not paste_sep)
+                        }
 
                         match &mode {
                             Mode::Normal => {
@@ -740,6 +726,21 @@ enum KeyAction {
     ClearScreen,
     StartHistorySearch,
     StartCompletion,
+}
+
+/// Handle a newline during bracketed paste: merge any continuation and
+/// insert a space instead of executing.
+fn handle_paste_newline(line: &mut LineBuffer, full_input: &mut String) {
+    if !full_input.is_empty() {
+        let text = line.text().to_string();
+        full_input.push(' ');
+        full_input.push_str(&text);
+        line.set(full_input);
+        *full_input = String::new();
+    }
+    if !line.text().is_empty() {
+        line.insert_char(' ');
+    }
 }
 
 fn handle_normal_key(

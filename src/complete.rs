@@ -273,25 +273,10 @@ pub fn complete_path_into(partial: &str, dirs_only: bool, comp: &mut Completions
 }
 
 /// Complete entries in `dir` matching `prefix`.
-/// Tries exact prefix first; falls back to case-insensitive substring
-/// (like fish) so "tom" matches "Cargo.toml".
+/// Single readdir pass: collects prefix and substring matches together,
+/// preferring prefix matches when any exist. Substring fallback is
+/// case-insensitive (like fish) so "tom" matches "Cargo.toml".
 fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completions) {
-    let before = comp.entries.len();
-    complete_in_dir_mode(dir, prefix, dirs_only, comp, false);
-    // Fallback: case-insensitive substring match
-    if comp.entries.len() == before && !prefix.is_empty() {
-        complete_in_dir_mode(dir, prefix, dirs_only, comp, true);
-    }
-}
-
-/// Inner completion with exact-prefix or substring matching.
-fn complete_in_dir_mode(
-    dir: &str,
-    prefix: &str,
-    dirs_only: bool,
-    comp: &mut Completions,
-    substring: bool,
-) {
     let dir_path = if dir.is_empty() { "." } else { dir };
 
     // Build NUL-terminated dir path on stack
@@ -310,6 +295,8 @@ fn complete_in_dir_mode(
     }
 
     let prefix_bytes = prefix.as_bytes();
+    let before = comp.entries.len();
+    let mut prefix_count = 0usize;
 
     // Stack buffer for "dir/name\0" used by stat/lstat
     let mut path_buf = [0u8; 4096];
@@ -349,12 +336,9 @@ fn complete_in_dir_mode(
         if name_bytes.first() == Some(&b'.') && !prefix_bytes.starts_with(b".") {
             continue;
         }
-        // Filter by prefix or substring
-        if substring {
-            if !contains_icase(name_bytes, prefix_bytes) {
-                continue;
-            }
-        } else if !name_bytes.starts_with(prefix_bytes) {
+        // Classify: prefix match vs substring match
+        let is_prefix = name_bytes.starts_with(prefix_bytes);
+        if !is_prefix && (prefix_bytes.is_empty() || !contains_icase(name_bytes, prefix_bytes)) {
             continue;
         }
 
@@ -391,10 +375,28 @@ fn complete_in_dir_mode(
         };
 
         comp.push(name, is_dir, is_link, is_exec);
+        if is_prefix {
+            prefix_count += 1;
+        }
     }
 
     // SAFETY: dp is a valid DIR* from opendir.
     unsafe { libc::closedir(dp) };
+
+    // If we have prefix matches, discard substring-only matches
+    let added = comp.entries.len() - before;
+    if prefix_count > 0 && prefix_count < added {
+        let mut i = before;
+        while i < comp.entries.len() {
+            let e = &comp.entries[i];
+            let name = &comp.names.as_bytes()[e.name_start as usize..][..e.name_len as usize];
+            if name.starts_with(prefix_bytes) {
+                i += 1;
+            } else {
+                comp.entries.remove(i);
+            }
+        }
+    }
 
     comp.sort_entries();
 }

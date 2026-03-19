@@ -396,18 +396,13 @@ fn parse_command(tokens: &[Token], start: usize) -> Result<(Command, usize), Err
     Ok((Command { argv, redirects }, i))
 }
 
-/// Check if input needs a continuation line.
-pub fn needs_continuation(input: &str) -> bool {
-    let trimmed = input.trim_end();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    // Check unclosed quotes — byte-based since quote chars are ASCII
+/// Scan quote and escape state across input bytes.
+/// Returns (in_single_quote, in_double_quote, trailing_escape).
+fn scan_quote_state(input: &[u8]) -> (bool, bool, bool) {
     let mut in_single = false;
     let mut in_double = false;
     let mut escape = false;
-    for &b in trimmed.as_bytes() {
+    for &b in input {
         if escape {
             escape = false;
             continue;
@@ -419,15 +414,19 @@ pub fn needs_continuation(input: &str) -> bool {
             _ => {}
         }
     }
-    if in_single || in_double {
-        return true;
-    }
-    // Trailing unquoted backslash = line continuation (\<newline>)
-    if escape {
-        return true;
-    }
+    (in_single, in_double, escape)
+}
 
-    // Check for trailing operator
+/// Check if input needs a continuation line.
+pub fn needs_continuation(input: &str) -> bool {
+    let trimmed = input.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let (in_single, in_double, escape) = scan_quote_state(trimmed.as_bytes());
+    if in_single || in_double || escape {
+        return true;
+    }
     trimmed.ends_with('|') || trimmed.ends_with("&&") || trimmed.ends_with("||")
 }
 
@@ -437,21 +436,7 @@ pub fn ends_with_line_continuation(input: &str) -> bool {
     if !trimmed.ends_with('\\') {
         return false;
     }
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escape = false;
-    for &b in trimmed.as_bytes() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        match b {
-            b'\\' if !in_single => escape = true,
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            _ => {}
-        }
-    }
+    let (in_single, in_double, escape) = scan_quote_state(trimmed.as_bytes());
     escape && !in_single && !in_double
 }
 
