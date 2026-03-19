@@ -943,6 +943,93 @@ impl PathCache {
     }
 }
 
+/// Collect executable names from $PATH matching `prefix` into `comp`.
+pub fn complete_commands(prefix: &str, comp: &mut crate::complete::Completions) {
+    // SAFETY: Single-threaded shell. getenv returns a pointer into the
+    // environment block, valid until the variable is next modified.
+    let path_bytes = unsafe {
+        let ptr = libc::getenv(c"PATH".as_ptr());
+        if ptr.is_null() {
+            return;
+        }
+        std::ffi::CStr::from_ptr(ptr).to_bytes()
+    };
+
+    let prefix_bytes = prefix.as_bytes();
+    let mut pathbuf = [0u8; 4096];
+
+    for dir in path_bytes.split(|&b| b == b':') {
+        if dir.is_empty() {
+            continue;
+        }
+        if dir.len() >= pathbuf.len() {
+            continue;
+        }
+        pathbuf[..dir.len()].copy_from_slice(dir);
+        pathbuf[dir.len()] = 0;
+
+        // SAFETY: pathbuf is NUL-terminated. opendir returns NULL on failure.
+        let dp = unsafe { libc::opendir(pathbuf.as_ptr() as *const libc::c_char) };
+        if dp.is_null() {
+            continue;
+        }
+
+        loop {
+            // SAFETY: readdir returns entries from an open directory handle.
+            let entry = unsafe { libc::readdir(dp) };
+            if entry.is_null() {
+                break;
+            }
+
+            // SAFETY: d_name is a NUL-terminated C string within the dirent.
+            let name_cstr = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let name_bytes = name_cstr.to_bytes();
+
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            if !name_bytes.starts_with(prefix_bytes) {
+                continue;
+            }
+            if name_bytes.first() == Some(&b'.') && !prefix_bytes.starts_with(b".") {
+                continue;
+            }
+
+            // Build "dir/name\0" for stat
+            let total = dir.len() + 1 + name_bytes.len();
+            if total >= pathbuf.len() {
+                continue;
+            }
+            pathbuf[dir.len()] = b'/';
+            pathbuf[dir.len() + 1..total].copy_from_slice(name_bytes);
+            pathbuf[total] = 0;
+
+            // SAFETY: pathbuf is NUL-terminated. stat fills a stack struct.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::stat(pathbuf.as_ptr() as *const libc::c_char, &mut st) } != 0 {
+                continue;
+            }
+            if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                continue;
+            }
+            if st.st_mode & 0o111 == 0 {
+                continue;
+            }
+
+            let name = match std::str::from_utf8(name_bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            comp.push(name, false, false, true);
+        }
+
+        // SAFETY: Close the directory handle opened above.
+        unsafe {
+            libc::closedir(dp);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

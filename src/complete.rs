@@ -131,6 +131,22 @@ impl Completions {
                 .sort_unstable_by(|a, b| cmp_icase_arena(names, a, b));
         }
     }
+
+    /// Remove duplicate adjacent entries (by exact name). Call after `sort_entries`.
+    pub fn dedup_sorted(&mut self) {
+        let mut i = 1;
+        while i < self.entries.len() {
+            let prev = &self.entries[i - 1];
+            let curr = &self.entries[i];
+            if self.names[prev.name_start as usize..][..prev.name_len as usize]
+                == self.names[curr.name_start as usize..][..curr.name_len as usize]
+            {
+                self.entries.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 /// Case-insensitive byte-level comparator for arena-backed entries.

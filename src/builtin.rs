@@ -17,7 +17,7 @@ const SPECIAL_BUILTINS: &[&str] = &[
 ];
 
 /// All builtins.
-const ALL_BUILTINS: &[&str] = &[
+pub const ALL_BUILTINS: &[&str] = &[
     "cd",
     "exit",
     "export",

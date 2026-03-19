@@ -558,7 +558,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 }
                                 KeyAction::StartCompletion => {
                                     let comp = std::mem::take(&mut shell.comp_buf);
-                                    let cs = start_completion(&line, shell.cols, &shell.home, comp);
+                                    let cs = start_completion(
+                                        &line,
+                                        shell.cols,
+                                        &shell.home,
+                                        &shell.aliases,
+                                        comp,
+                                    );
                                     if cs.comp.len() == 1 {
                                         accept_completion(&mut line, &cs);
                                         shell.comp_buf = cs.comp;
@@ -659,7 +665,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             CompAction::Refilter => {
                                 // Reclaim buffer from current state, re-run completion
                                 let comp = std::mem::take(&mut state.comp);
-                                let cs = start_completion(&line, shell.cols, &shell.home, comp);
+                                let cs = start_completion(
+                                    &line,
+                                    shell.cols,
+                                    &shell.home,
+                                    &shell.aliases,
+                                    comp,
+                                );
                                 if cs.comp.len() == 1 {
                                     accept_completion(&mut line, &cs);
                                     shell.comp_buf = cs.comp;
@@ -999,6 +1011,15 @@ enum CompAction {
     Refilter,
 }
 
+/// Whether the cursor is at a command position (first word, or after | && ;).
+fn is_command_position(before_cursor: &str, word_start: usize) -> bool {
+    if word_start == 0 {
+        return true;
+    }
+    let before_word = before_cursor[..word_start].trim_end();
+    before_word.ends_with('|') || before_word.ends_with(';') || before_word.ends_with("&&")
+}
+
 /// Find the start of the completion word, respecting quotes.
 /// Returns (byte_offset_of_word_start, currently_inside_single_quote).
 fn find_comp_word_start(s: &str) -> (usize, bool) {
@@ -1062,6 +1083,7 @@ fn start_completion(
     line: &LineBuffer,
     term_cols: u16,
     home: &str,
+    aliases: &AliasMap,
     mut comp: complete::Completions,
 ) -> CompletionState {
     comp.clear();
@@ -1083,6 +1105,39 @@ fn start_completion(
     } else {
         (raw_word.into(), false)
     };
+
+    // Command position: first word or after |, &&, ;
+    if !partial.is_empty()
+        && !partial.contains('/')
+        && is_command_position(before_cursor, word_start)
+    {
+        for &b in builtin::ALL_BUILTINS {
+            if b.starts_with(partial.as_str()) {
+                comp.push(b, false, false, false);
+            }
+        }
+        for (name, _) in aliases.iter() {
+            if name.starts_with(partial.as_str()) {
+                comp.push(name, false, false, false);
+            }
+        }
+        exec::complete_commands(&partial, &mut comp);
+        comp.sort_entries();
+        comp.dedup_sorted();
+
+        if !comp.is_empty() {
+            let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
+            return CompletionState {
+                comp,
+                selected: 0,
+                cols,
+                rows,
+                scroll: 0,
+                dir_prefix: String::new(),
+                in_quote: false,
+            };
+        }
+    }
 
     // Detect if first word is cd → complete only directories
     let first_word = text.split_whitespace().next().unwrap_or("");
