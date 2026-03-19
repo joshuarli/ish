@@ -1122,21 +1122,21 @@ fn start_completion(
             }
         }
         exec::complete_commands(&partial, &mut comp);
+        // Directories are valid commands (implicit cd)
+        complete::complete_path_into(&partial, true, &mut comp);
         comp.sort_entries();
         comp.dedup_sorted();
 
-        if !comp.is_empty() {
-            let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
-            return CompletionState {
-                comp,
-                selected: 0,
-                cols,
-                rows,
-                scroll: 0,
-                dir_prefix: String::new(),
-                in_quote: false,
-            };
-        }
+        let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
+        return CompletionState {
+            comp,
+            selected: 0,
+            cols,
+            rows,
+            scroll: 0,
+            dir_prefix: String::new(),
+            in_quote: false,
+        };
     }
 
     // Detect if first word is cd → complete only directories
