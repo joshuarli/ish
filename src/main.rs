@@ -1141,7 +1141,7 @@ fn start_completion(
                 let mark = comp.begin_entry();
                 comp.names.push_str(rel_dir);
                 comp.names.push_str(orig_name);
-                comp.finish_entry(mark, entry.is_dir, entry.is_link, entry.is_exec);
+                comp.finish_entry(mark, entry.is_dir(), entry.is_link(), entry.is_exec());
             }
         }
 
@@ -1227,7 +1227,7 @@ fn accept_completion(line: &mut LineBuffer, state: &CompletionState) {
 
     let mut inner = state.dir_prefix.clone();
     inner.push_str(name);
-    if entry.is_dir {
+    if entry.is_dir() {
         inner.push('/');
     }
 

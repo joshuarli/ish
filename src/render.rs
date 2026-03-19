@@ -178,17 +178,17 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) 
             }
 
             // Color: symlink=cyan, dir=blue, exec=green
-            if entry.is_link {
+            if entry.is_link() {
                 tw.write_str("\x1b[36m");
-            } else if entry.is_dir {
+            } else if entry.is_dir() {
                 tw.write_str("\x1b[34m");
-            } else if entry.is_exec {
+            } else if entry.is_exec() {
                 tw.write_str("\x1b[32m");
             }
 
             state.write_display_name(idx, tw);
 
-            if entry.is_link || entry.is_dir || entry.is_exec {
+            if entry.is_link() || entry.is_dir() || entry.is_exec() {
                 tw.write_str("\x1b[0m");
             }
 

@@ -1,15 +1,31 @@
+/// Completion entry — 8 bytes per entry (u32 offset + u8 len + u8 flags).
+/// name_len is u8: NAME_MAX is 255 on Linux/macOS.
 pub struct CompEntry {
     name_start: u32,
-    name_len: u16,
-    pub is_dir: bool,
-    pub is_link: bool,
-    pub is_exec: bool,
+    name_len: u8,
+    flags: u8, // bit 0: is_dir, bit 1: is_link, bit 2: is_exec
 }
 
 impl CompEntry {
     pub fn display_width(&self) -> usize {
-        self.name_len as usize + if self.is_dir { 1 } else { 0 }
+        self.name_len as usize + if self.is_dir() { 1 } else { 0 }
     }
+
+    pub fn is_dir(&self) -> bool {
+        self.flags & 1 != 0
+    }
+
+    pub fn is_link(&self) -> bool {
+        self.flags & 2 != 0
+    }
+
+    pub fn is_exec(&self) -> bool {
+        self.flags & 4 != 0
+    }
+}
+
+fn pack_flags(is_dir: bool, is_link: bool, is_exec: bool) -> u8 {
+    (is_dir as u8) | ((is_link as u8) << 1) | ((is_exec as u8) << 2)
 }
 
 /// Arena-backed completion results. All entry names are stored contiguously
@@ -70,10 +86,8 @@ impl Completions {
         self.names.push_str(name);
         self.entries.push(CompEntry {
             name_start: start,
-            name_len: name.len() as u16,
-            is_dir,
-            is_link,
-            is_exec,
+            name_len: name.len().min(255) as u8,
+            flags: pack_flags(is_dir, is_link, is_exec),
         });
     }
 
@@ -85,13 +99,11 @@ impl Completions {
 
     /// Finish an entry whose name starts at `start` in the arena.
     pub fn finish_entry(&mut self, start: u32, is_dir: bool, is_link: bool, is_exec: bool) {
-        let name_len = (self.names.len() - start as usize) as u16;
+        let name_len = (self.names.len() - start as usize).min(255) as u8;
         self.entries.push(CompEntry {
             name_start: start,
             name_len,
-            is_dir,
-            is_link,
-            is_exec,
+            flags: pack_flags(is_dir, is_link, is_exec),
         });
     }
 
@@ -177,7 +189,7 @@ impl CompletionState {
         let e = &self.comp.entries[idx];
         let name = &self.comp.names[e.name_start as usize..][..e.name_len as usize];
         tw.write_str(name);
-        if e.is_dir {
+        if e.is_dir() {
             tw.write_str("/");
         }
     }

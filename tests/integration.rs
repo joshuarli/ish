@@ -603,7 +603,7 @@ fn complete_path_dirs_only() {
     let comp = complete::complete_path(&path, true);
     assert_eq!(comp.len(), 1);
     assert_eq!(comp.name(0), "subdir");
-    assert!(comp.entries[0].is_dir);
+    assert!(comp.entries[0].is_dir());
 }
 
 #[test]
@@ -2477,5 +2477,5 @@ fn complete_path_symlink() {
     let link_idx = (0..comp.len())
         .find(|&i| comp.name(i) == "link.txt")
         .unwrap();
-    assert!(comp.entries[link_idx].is_link);
+    assert!(comp.entries[link_idx].is_link());
 }
