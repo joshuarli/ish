@@ -188,6 +188,7 @@ fn bench_expand(c: &mut Criterion) {
                 "~/src/project",
                 "/home/user",
                 &mut no_subst,
+                0,
             ))
         });
     });
@@ -199,6 +200,7 @@ fn bench_expand(c: &mut Criterion) {
                 "$ISH_BENCH_VAR",
                 "/home/user",
                 &mut no_subst,
+                0,
             ))
         });
     });
@@ -209,6 +211,7 @@ fn bench_expand(c: &mut Criterion) {
                 "simple_word",
                 "/home/user",
                 &mut no_subst,
+                0,
             ))
         });
     });
@@ -216,7 +219,7 @@ fn bench_expand(c: &mut Criterion) {
     // Multi-word expansion
     let words: Vec<String> = (0..50).map(|i| format!("word{i}")).collect();
     group.bench_function("expand_argv_50_words", |b| {
-        b.iter(|| black_box(expand::expand_argv(&words, "/home/user", &mut no_subst)));
+        b.iter(|| black_box(expand::expand_argv(&words, "/home/user", &mut no_subst, 0)));
     });
 
     group.finish();
@@ -499,7 +502,7 @@ fn bench_parse_expand(c: &mut Criterion) {
         b.iter(|| {
             let cmd = parse::parse("ls ~/projects").unwrap();
             let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst))
+            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst, 0))
         });
     });
 
@@ -508,7 +511,7 @@ fn bench_parse_expand(c: &mut Criterion) {
         b.iter(|| {
             let cmd = parse::parse("grep -r $ISH_BENCH_DIR | sort | head -20").unwrap();
             let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst))
+            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst, 0))
         });
     });
 
@@ -525,6 +528,7 @@ fn bench_parse_expand(c: &mut Criterion) {
                         &pcmd.cmd.argv,
                         "/home/user",
                         &mut no_subst,
+                        0,
                     ));
                 }
             }
@@ -539,7 +543,7 @@ fn bench_parse_expand(c: &mut Criterion) {
             )
             .unwrap();
             let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst))
+            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst, 0))
         });
     });
 
@@ -774,6 +778,7 @@ fn bench_alloc_audit(c: &mut Criterion) {
                 "~/src/project",
                 "/home/user",
                 &mut no_subst,
+                0,
             ));
         });
         eprintln!("  [alloc] expand_tilde:              {stats}");
@@ -821,7 +826,7 @@ fn bench_alloc_audit(c: &mut Criterion) {
             let cmd = parse::parse("grep -r ~/src | sort | head -20").unwrap();
             let mut no_subst = |_: &str| -> Result<String, Error> { Ok(String::new()) };
             let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-            let _ = black_box(expand::expand_argv(argv, "/home/user", &mut no_subst));
+            let _ = black_box(expand::expand_argv(argv, "/home/user", &mut no_subst, 0));
         });
         eprintln!("  [alloc] parse_expand_pipeline:     {stats}");
 

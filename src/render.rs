@@ -14,6 +14,7 @@ pub struct PromptInfo {
 /// `prev_cursor_row` is the cursor row from the previous render — needed to
 /// move back to the top of the prompt area before clearing.
 /// Returns prompt geometry so completion rendering can restore cursor.
+#[allow(clippy::too_many_arguments)]
 pub fn render_line(
     tw: &mut TermWriter,
     prompt: &str,
@@ -21,6 +22,8 @@ pub fn render_line(
     line: &LineBuffer,
     term_cols: u16,
     prev_cursor_row: u16,
+    cmd_color: Option<bool>,
+    suggestion: &str,
 ) -> PromptInfo {
     tw.hide_cursor();
     tw.move_cursor_up(prev_cursor_row);
@@ -28,11 +31,34 @@ pub fn render_line(
     tw.clear_to_end_of_screen();
 
     tw.write_str(prompt);
-    tw.write_str(line.text());
+
+    // Write line text with optional command-word coloring
+    let text = line.text();
+    match cmd_color {
+        Some(valid) => {
+            let color = if valid { "\x1b[32m" } else { "\x1b[31m" };
+            let first_end = text.find(|c: char| c.is_whitespace()).unwrap_or(text.len());
+            tw.write_str(color);
+            tw.write_str(&text[..first_end]);
+            tw.write_str("\x1b[0m");
+            tw.write_str(&text[first_end..]);
+        }
+        None => tw.write_str(text),
+    }
+
+    // Autosuggestion ghost text (dim gray, after line content)
+    let suggestion_display_len = if suggestion.is_empty() {
+        0
+    } else {
+        tw.write_str("\x1b[38;5;8m");
+        tw.write_str(suggestion);
+        tw.write_str("\x1b[0m");
+        suggestion.len()
+    };
 
     // Calculate cursor position
     let total_before_cursor = prompt_display_len + line.display_cursor_pos();
-    let total_full = prompt_display_len + line.display_len();
+    let total_full = prompt_display_len + line.display_len() + suggestion_display_len;
     let cols = term_cols as usize;
 
     let cursor_row = total_before_cursor / cols;

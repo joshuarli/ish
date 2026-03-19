@@ -11,6 +11,7 @@ pub mod input;
 pub mod job;
 pub mod line;
 pub mod ls;
+pub mod math;
 pub mod parse;
 pub mod prompt;
 pub mod render;

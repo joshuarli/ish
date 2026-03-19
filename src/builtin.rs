@@ -31,6 +31,7 @@ const ALL_BUILTINS: &[&str] = &[
     "which",
     "type",
     "echo",
+    "math",
     "pwd",
     "true",
     "false",
@@ -94,6 +95,19 @@ pub fn run_output(name: &str, args: &[String], _redirects: &[Redirect]) -> i32 {
         "echo" => {
             println!("{}", args.join(" "));
             0
+        }
+        "math" => {
+            let expr = args.join(" ");
+            match crate::math::eval(&expr) {
+                Ok(result) => {
+                    println!("{result}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("ish: math: {e}");
+                    1
+                }
+            }
         }
         "pwd" => match std::env::current_dir() {
             Ok(dir) => {

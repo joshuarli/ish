@@ -6,6 +6,7 @@ use crate::job::{Continuation, Job};
 use crate::parse::{self, CommandLine, Connector, PipedCommand, Redirect, RedirectKind};
 use crate::signal;
 use crate::sys;
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -91,8 +92,9 @@ pub fn execute(
     home: &str,
     prev_dir: &mut Option<String>,
     session_log: &mut String,
+    prev_status: i32,
 ) -> i32 {
-    let mut last_status = entry.map_or(0, |(s, _)| s);
+    let mut last_status = entry.map_or(prev_status, |(s, _)| s);
 
     for (i, (pipeline, _connector)) in cmdline.segments.iter().enumerate() {
         // Check connector: for i=0 use entry connector, else use previous segment's connector
@@ -118,6 +120,7 @@ pub fn execute(
             home,
             prev_dir,
             session_log,
+            last_status,
         );
 
         // If pipeline was suspended, set full command text and save continuation
@@ -149,6 +152,7 @@ fn execute_pipeline(
     home: &str,
     prev_dir: &mut Option<String>,
     session_log: &mut String,
+    last_status: i32,
 ) -> i32 {
     // Expand all commands
     let mut expanded = Vec::new();
@@ -172,7 +176,7 @@ fn execute_pipeline(
         // Expand words (tilde, vars, globs)
         let mut exec_subst =
             |cmd: &str| -> Result<String, Error> { capture_command_output(cmd, orig_termios) };
-        match expand::expand_argv(&argv, home, &mut exec_subst) {
+        match expand::expand_argv(&argv, home, &mut exec_subst, last_status) {
             Ok(mut expanded_argv) => {
                 // Split leading NAME=VALUE prefix assignments
                 let env = split_env_prefix(&mut expanded_argv);
@@ -183,7 +187,7 @@ fn execute_pipeline(
                 }
                 let mut redirects = Vec::new();
                 for r in &pcmd.cmd.redirects {
-                    let target = expand::expand_word(&r.target, home, &mut exec_subst)
+                    let target = expand::expand_word(&r.target, home, &mut exec_subst, last_status)
                         .map(|v| v.join(" "))
                         .unwrap_or_else(|_| parse::unescape(&r.target));
                     redirects.push(Redirect {
@@ -706,6 +710,140 @@ pub fn resume_job(job: &mut Option<Job>) -> (i32, Option<Continuation>) {
     };
 
     (status, continuation)
+}
+
+// -- PATH Cache --
+
+/// FNV-1a hash for short strings (command names). Inline, no dependencies.
+fn fnv1a(s: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in s {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// O(1) command existence cache built from $PATH directories.
+/// Stores FNV-1a hashes of executable names in a `HashSet<u64>`.
+pub struct PathCache {
+    commands: HashSet<u64>,
+    path_hash: u64,
+}
+
+impl Default for PathCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PathCache {
+    pub fn new() -> Self {
+        Self {
+            commands: HashSet::new(),
+            path_hash: 0,
+        }
+    }
+
+    /// Check if `cmd` is an executable on $PATH.
+    /// Rebuilds the cache if $PATH has changed since the last check.
+    pub fn contains(&mut self, cmd: &str) -> bool {
+        self.ensure_fresh();
+        self.commands.contains(&fnv1a(cmd.as_bytes()))
+    }
+
+    /// Rebuild the cache if $PATH has changed.
+    fn ensure_fresh(&mut self) {
+        // SAFETY: Single-threaded shell. getenv returns a pointer into the
+        // environment block, valid until the variable is next modified.
+        let path_bytes = unsafe {
+            let ptr = libc::getenv(c"PATH".as_ptr());
+            if ptr.is_null() {
+                if self.path_hash != 0 {
+                    self.commands.clear();
+                    self.path_hash = 0;
+                }
+                return;
+            }
+            std::ffi::CStr::from_ptr(ptr).to_bytes()
+        };
+
+        let current_hash = fnv1a(path_bytes);
+        if current_hash == self.path_hash && !self.commands.is_empty() {
+            return;
+        }
+        self.path_hash = current_hash;
+        self.rebuild(path_bytes);
+    }
+
+    /// Scan each directory in $PATH using libc opendir/readdir, insert hashes
+    /// of executable filenames.
+    fn rebuild(&mut self, path_bytes: &[u8]) {
+        self.commands.clear();
+
+        let mut pathbuf = [0u8; 4096];
+
+        for dir in path_bytes.split(|&b| b == b':') {
+            if dir.is_empty() {
+                continue;
+            }
+            // NUL-terminate the directory path for opendir
+            if dir.len() >= pathbuf.len() {
+                continue;
+            }
+            pathbuf[..dir.len()].copy_from_slice(dir);
+            pathbuf[dir.len()] = 0;
+
+            // SAFETY: pathbuf is NUL-terminated. opendir returns NULL on failure.
+            let dp = unsafe { libc::opendir(pathbuf.as_ptr() as *const libc::c_char) };
+            if dp.is_null() {
+                continue;
+            }
+
+            loop {
+                // SAFETY: readdir returns entries from an open directory handle.
+                let entry = unsafe { libc::readdir(dp) };
+                if entry.is_null() {
+                    break;
+                }
+
+                // SAFETY: d_name is a NUL-terminated C string within the dirent.
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+                let name_bytes = name.to_bytes();
+
+                // Skip . and ..
+                if name_bytes == b"." || name_bytes == b".." {
+                    continue;
+                }
+
+                // Build "dir/name\0" for stat
+                let total = dir.len() + 1 + name_bytes.len();
+                if total >= pathbuf.len() {
+                    continue;
+                }
+                // dir is already at pathbuf[..dir.len()]
+                pathbuf[dir.len()] = b'/';
+                pathbuf[dir.len() + 1..total].copy_from_slice(name_bytes);
+                pathbuf[total] = 0;
+
+                // SAFETY: pathbuf is NUL-terminated. stat fills a stack struct.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::stat(pathbuf.as_ptr() as *const libc::c_char, &mut st) } != 0 {
+                    continue;
+                }
+
+                // Regular file with at least one execute bit
+                if (st.st_mode & libc::S_IFREG != 0) && (st.st_mode & 0o111 != 0) {
+                    self.commands.insert(fnv1a(name_bytes));
+                }
+            }
+
+            // SAFETY: Close the directory handle opened above.
+            unsafe {
+                libc::closedir(dp);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

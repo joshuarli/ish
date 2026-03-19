@@ -40,6 +40,7 @@ fn parse_expand_simple_command() {
         &argv.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         "/home/test",
         &mut no_subst,
+        0,
     )
     .unwrap();
     assert_eq!(expanded, ["echo", "hello", "world"]);
@@ -49,7 +50,7 @@ fn parse_expand_simple_command() {
 fn parse_expand_tilde() {
     let cmd = parse::parse("ls ~/docs").unwrap();
     let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-    let expanded = expand::expand_argv(argv, "/home/josh", &mut no_subst).unwrap();
+    let expanded = expand::expand_argv(argv, "/home/josh", &mut no_subst, 0).unwrap();
     assert_eq!(expanded, ["ls", "/home/josh/docs"]);
 }
 
@@ -58,7 +59,7 @@ fn parse_expand_variable() {
     unsafe { std::env::set_var("ISH_INTEG_VAR", "myval") };
     let cmd = parse::parse("echo $ISH_INTEG_VAR").unwrap();
     let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-    let expanded = expand::expand_argv(argv, "/home/test", &mut no_subst).unwrap();
+    let expanded = expand::expand_argv(argv, "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(expanded, ["echo", "myval"]);
 }
 
@@ -67,7 +68,7 @@ fn parse_expand_single_quote_prevents_expansion() {
     unsafe { std::env::set_var("ISH_INTEG_VAR", "should_not_appear") };
     let cmd = parse::parse("echo '$ISH_INTEG_VAR'").unwrap();
     let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-    let expanded = expand::expand_argv(argv, "/home/test", &mut no_subst).unwrap();
+    let expanded = expand::expand_argv(argv, "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(expanded, ["echo", "$ISH_INTEG_VAR"]);
 }
 
@@ -76,7 +77,7 @@ fn parse_expand_double_quote_expands_vars() {
     unsafe { std::env::set_var("ISH_DQ_TEST", "value") };
     let cmd = parse::parse(r#"echo "$ISH_DQ_TEST""#).unwrap();
     let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-    let expanded = expand::expand_argv(argv, "/home/test", &mut no_subst).unwrap();
+    let expanded = expand::expand_argv(argv, "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(expanded, ["echo", "value"]);
 }
 
@@ -88,7 +89,7 @@ fn parse_expand_command_substitution() {
         assert_eq!(cmd, "pwd");
         Ok("/home/test\n".to_string())
     };
-    let result = expand::expand_word("$(pwd)", "/home/test", &mut exec_subst).unwrap();
+    let result = expand::expand_word("$(pwd)", "/home/test", &mut exec_subst, 0).unwrap();
     assert_eq!(result, ["/home/test"]);
 }
 
@@ -100,7 +101,7 @@ fn parse_expand_backtick_substitution() {
         assert_eq!(cmd, "pwd");
         Ok("/home/test\n".to_string())
     };
-    let expanded = expand::expand_argv(argv, "/home/test", &mut exec_subst).unwrap();
+    let expanded = expand::expand_argv(argv, "/home/test", &mut exec_subst, 0).unwrap();
     assert_eq!(expanded, ["echo", "/home/test"]);
 }
 
@@ -763,43 +764,43 @@ fn input_modifier_combinations() {
 #[test]
 fn expand_undefined_var_is_empty() {
     let result =
-        expand::expand_word("$UNDEFINED_ISH_VAR_XYZ", "/home/test", &mut no_subst).unwrap();
+        expand::expand_word("$UNDEFINED_ISH_VAR_XYZ", "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result, [""]);
 }
 
 #[test]
 fn expand_tilde_alone() {
-    let result = expand::expand_word("~", "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word("~", "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result, ["/home/test"]);
 }
 
 #[test]
 fn expand_tilde_with_path() {
-    let result = expand::expand_word("~/docs/file.txt", "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word("~/docs/file.txt", "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result, ["/home/test/docs/file.txt"]);
 }
 
 #[test]
 fn expand_tilde_not_at_start() {
-    let result = expand::expand_word("foo~bar", "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word("foo~bar", "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result, ["foo~bar"]);
 }
 
 #[test]
 fn expand_dollar_sign_alone() {
-    let result = expand::expand_word("$", "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word("$", "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result, ["$"]);
 }
 
 #[test]
 fn expand_unclosed_command_subst_is_error() {
-    let result = expand::expand_word("$(unclosed", "/home/test", &mut no_subst);
+    let result = expand::expand_word("$(unclosed", "/home/test", &mut no_subst, 0);
     assert!(result.is_err());
 }
 
 #[test]
 fn expand_unclosed_backtick_is_error() {
-    let result = expand::expand_word("`unclosed", "/home/test", &mut no_subst);
+    let result = expand::expand_word("`unclosed", "/home/test", &mut no_subst, 0);
     assert!(result.is_err());
 }
 
@@ -813,7 +814,7 @@ fn expand_glob_star() {
     // Canonicalize to resolve symlinks (e.g. /var -> /private/var on macOS)
     let dir = std::fs::canonicalize(&dir).unwrap();
     let pattern = format!("{}/test_*.rs", dir.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result.len(), 2);
     assert!(result.iter().any(|r| r.ends_with("test_a.rs")));
     assert!(result.iter().any(|r| r.ends_with("test_b.rs")));
@@ -824,13 +825,13 @@ fn expand_glob_question_mark() {
     let dir = tempdir_with_files(&["a1", "a2", "ab"]);
     let dir = std::fs::canonicalize(&dir).unwrap();
     let pattern = format!("{}/a?", dir.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result.len(), 3);
 }
 
 #[test]
 fn expand_glob_no_match_is_error() {
-    let result = expand::expand_word("/nonexistent/*.xyz", "/home/test", &mut no_subst);
+    let result = expand::expand_word("/nonexistent/*.xyz", "/home/test", &mut no_subst, 0);
     assert!(result.is_err());
 }
 
@@ -910,7 +911,7 @@ fn expand_nested_parens_no_panic() {
         Ok("val\n".to_string())
     };
     // Should not panic regardless of whether nesting works correctly
-    let _ = expand::expand_word(word, "/home/test", &mut exec_subst);
+    let _ = expand::expand_word(word, "/home/test", &mut exec_subst, 0);
 }
 
 #[test]
@@ -1654,7 +1655,7 @@ fn ls_list_dir_symlink() {
 #[test]
 fn expand_variable_in_middle_of_word() {
     unsafe { std::env::set_var("ISH_MID_VAR", "world") };
-    let result = expand::expand_word("hello$ISH_MID_VAR!", "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word("hello$ISH_MID_VAR!", "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result, ["helloworld!"]);
 }
 
@@ -1662,7 +1663,7 @@ fn expand_variable_in_middle_of_word() {
 fn expand_multiple_variables() {
     unsafe { std::env::set_var("ISH_A", "foo") };
     unsafe { std::env::set_var("ISH_B", "bar") };
-    let result = expand::expand_word("$ISH_A-$ISH_B", "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word("$ISH_A-$ISH_B", "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result, ["foo-bar"]);
 }
 
@@ -1673,7 +1674,7 @@ fn expand_dollar_paren_pass_through_in_variables() {
         assert_eq!(cmd, "echo hi");
         Ok("hi\n".to_string())
     };
-    let result = expand::expand_word("$(echo hi)", "/home/test", &mut exec).unwrap();
+    let result = expand::expand_word("$(echo hi)", "/home/test", &mut exec, 0).unwrap();
     assert_eq!(result, ["hi"]);
 }
 
@@ -1686,7 +1687,7 @@ fn expand_glob_recursive_star() {
     std::fs::write(sub.join("deep.txt"), "").unwrap();
 
     let pattern = format!("{}/**/*.txt", dir.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
     assert!(result.iter().any(|r| r.ends_with("deep.txt")));
 }
 
@@ -1694,7 +1695,7 @@ fn expand_glob_recursive_star() {
 fn expand_literal_in_word() {
     // LITERAL markers should be stripped in output
     let word = format!("{LITERAL}$plain");
-    let result = expand::expand_word(&word, "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word(&word, "/home/test", &mut no_subst, 0).unwrap();
     // The LITERAL $ should be kept as literal, not expanded
     assert_eq!(result, ["$plain"]);
 }
@@ -1702,7 +1703,7 @@ fn expand_literal_in_word() {
 #[test]
 fn expand_argv_multiple_words() {
     let words: Vec<String> = vec!["hello".into(), "~".into(), "plain".into()];
-    let result = expand::expand_argv(&words, "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_argv(&words, "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result, ["hello", "/home/test", "plain"]);
 }
 
@@ -1712,7 +1713,7 @@ fn expand_glob_hidden_skip() {
     let dir = tempdir_with_files(&[".hidden", "visible"]);
     let dir = std::fs::canonicalize(&dir).unwrap();
     let pattern = format!("{}/v*", dir.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result.len(), 1);
     assert!(result[0].ends_with("visible"));
 }
@@ -1722,7 +1723,7 @@ fn expand_glob_dot_pattern_includes_hidden() {
     let dir = tempdir_with_files(&[".hidden", "visible"]);
     let dir = std::fs::canonicalize(&dir).unwrap();
     let pattern = format!("{}/.h*", dir.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result.len(), 1);
     assert!(result[0].ends_with(".hidden"));
 }
@@ -1746,7 +1747,7 @@ fn expand_glob_through_symlink() {
 
     // Glob through the symlink
     let pattern = format!("{}/*.txt", link_path.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result.len(), 2);
     assert!(result.iter().any(|r| r.ends_with("a.txt")));
     assert!(result.iter().any(|r| r.ends_with("b.txt")));
@@ -1773,7 +1774,7 @@ fn expand_glob_through_nested_symlink() {
     std::os::unix::fs::symlink(&dir, &link_path).unwrap();
 
     let pattern = format!("{}/sub/*.rs", link_path.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result.len(), 1);
     assert!(result[0].ends_with("file.rs"));
 
@@ -2221,7 +2222,7 @@ fn history_file_io() {
 #[test]
 fn expand_strip_literal_no_markers() {
     // expand_word with no special chars should fast-path
-    let result = expand::expand_word("plain_word", "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word("plain_word", "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result, ["plain_word"]);
 }
 
@@ -2231,28 +2232,28 @@ fn expand_backtick_subst() {
         assert_eq!(cmd, "date");
         Ok("2024-01-01\n".to_string())
     };
-    let result = expand::expand_word("`date`", "/home/test", &mut exec).unwrap();
+    let result = expand::expand_word("`date`", "/home/test", &mut exec, 0).unwrap();
     assert_eq!(result, ["2024-01-01"]);
 }
 
 #[test]
 fn expand_nested_command_subst() {
     let mut exec = |_cmd: &str| -> Result<String, Error> { Ok("inner\n".to_string()) };
-    let result = expand::expand_word("$(echo $(pwd))", "/home/test", &mut exec).unwrap();
+    let result = expand::expand_word("$(echo $(pwd))", "/home/test", &mut exec, 0).unwrap();
     assert_eq!(result, ["inner"]);
 }
 
 #[test]
 fn expand_tilde_not_prefix() {
     // ~ not at start should not expand
-    let result = expand::expand_word("path/~/file", "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word("path/~/file", "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result, ["path/~/file"]);
 }
 
 #[test]
 fn expand_tilde_user_not_supported() {
     // ~otheruser should pass through unchanged
-    let result = expand::expand_word("~otheruser/file", "/home/test", &mut no_subst).unwrap();
+    let result = expand::expand_word("~otheruser/file", "/home/test", &mut no_subst, 0).unwrap();
     assert_eq!(result, ["~otheruser/file"]);
 }
 

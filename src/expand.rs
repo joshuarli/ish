@@ -15,6 +15,7 @@ pub fn expand_word(
     word: &str,
     home: &str,
     exec_subst: &mut dyn FnMut(&str) -> Result<String, Error>,
+    last_status: i32,
 ) -> Result<Vec<String>, Error> {
     // Avoid allocations when no expansion is needed.
     let has_dollar = word.contains('$') || word.contains('`');
@@ -33,7 +34,7 @@ pub fn expand_word(
         Cow::Borrowed(word)
     };
     let word: Cow<str> = if has_dollar {
-        let w = expand_variables(&word);
+        let w = expand_variables(&word, last_status);
         Cow::Owned(expand_command_subst(&w, exec_subst)?)
     } else {
         word
@@ -50,10 +51,11 @@ pub fn expand_argv(
     argv: &[String],
     home: &str,
     exec_subst: &mut dyn FnMut(&str) -> Result<String, Error>,
+    last_status: i32,
 ) -> Result<Vec<String>, Error> {
     let mut result = Vec::new();
     for word in argv {
-        result.extend(expand_word(word, home, exec_subst)?);
+        result.extend(expand_word(word, home, exec_subst, last_status)?);
     }
     Ok(result)
 }
@@ -76,7 +78,35 @@ fn expand_tilde(word: &str, home: &str) -> String {
 
 // -- Variable Expansion --
 
-fn expand_variables(word: &str) -> String {
+/// Zero-alloc i32 to decimal string into a stack buffer.
+fn itoa_i32(n: i32, buf: &mut [u8; 12]) -> &str {
+    if n == 0 {
+        buf[0] = b'0';
+        // SAFETY: b'0' is valid UTF-8.
+        return unsafe { std::str::from_utf8_unchecked(&buf[..1]) };
+    }
+    let negative = n < 0;
+    // Use u32 to handle i32::MIN without overflow
+    let mut v: u32 = if negative {
+        (n as i64).unsigned_abs() as u32
+    } else {
+        n as u32
+    };
+    let mut pos = buf.len();
+    while v > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    if negative {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    // SAFETY: digits and '-' are valid UTF-8.
+    unsafe { std::str::from_utf8_unchecked(&buf[pos..]) }
+}
+
+fn expand_variables(word: &str, last_status: i32) -> String {
     let bytes = word.as_bytes();
     let mut result = String::with_capacity(word.len());
     let mut i = 0;
@@ -104,6 +134,11 @@ fn expand_variables(word: &str) -> String {
                 // Command substitution — leave for later pass
                 result.push('$');
                 i += 1;
+            } else if i + 1 < bytes.len() && bytes[i + 1] == b'?' {
+                i += 2;
+                let mut buf = [0u8; 12];
+                let s = itoa_i32(last_status, &mut buf);
+                result.push_str(s);
             } else {
                 // Variable name: ASCII alphanumeric + underscore
                 i += 1;
@@ -410,10 +445,17 @@ mod tests {
     #[test]
     fn variables() {
         unsafe { std::env::set_var("ISH_TEST_VAR", "hello") };
-        assert_eq!(expand_variables("$ISH_TEST_VAR world"), "hello world");
-        assert_eq!(expand_variables("${ISH_TEST_VAR}"), "${ISH_TEST_VAR}");
+        assert_eq!(expand_variables("$ISH_TEST_VAR world", 0), "hello world");
+        assert_eq!(expand_variables("${ISH_TEST_VAR}", 0), "${ISH_TEST_VAR}");
         // Undefined var → empty
-        assert_eq!(expand_variables("$UNDEFINED_ISH_VAR"), "");
+        assert_eq!(expand_variables("$UNDEFINED_ISH_VAR", 0), "");
+    }
+
+    #[test]
+    fn last_status() {
+        assert_eq!(expand_variables("$?", 0), "0");
+        assert_eq!(expand_variables("$?", 127), "127");
+        assert_eq!(expand_variables("exit:$?", 1), "exit:1");
     }
 
     #[test]
