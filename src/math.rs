@@ -7,6 +7,11 @@
 
 pub fn eval(expr: &str) -> Result<String, &'static str> {
     let tokens = tokenize(expr)?;
+    // Guard against stack overflow from deeply nested parentheses.
+    let depth = tokens.iter().filter(|t| matches!(t, Token::LParen)).count();
+    if depth > 64 {
+        return Err("expression too deeply nested");
+    }
     let mut pos = 0;
     let result = parse_comparison(&tokens, &mut pos)?;
     if pos < tokens.len() {
@@ -315,5 +320,16 @@ mod tests {
     fn integer_formatting() {
         assert_eq!(eval("6 / 2").unwrap(), "3");
         assert_eq!(eval("0").unwrap(), "0");
+    }
+
+    #[test]
+    fn deep_nesting_rejected() {
+        let expr = "(".repeat(100) + "1" + &")".repeat(100);
+        assert!(eval(&expr).is_err());
+    }
+
+    #[test]
+    fn reasonable_nesting_ok() {
+        assert_eq!(eval("((((1 + 2))))").unwrap(), "3");
     }
 }

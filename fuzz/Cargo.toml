@@ -41,3 +41,8 @@ doc = false
 name = "fuzz_history"
 path = "fuzz_targets/fuzz_history.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_math"
+path = "fuzz_targets/fuzz_math.rs"
+doc = false

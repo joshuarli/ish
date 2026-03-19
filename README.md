@@ -1,8 +1,8 @@
 # ish
 
-A minimal interactive shell.
+A purely interactive shell.
 
-184K binary. No scripting, no POSIX compat, no plugins. Just a prompt.
+No scripting, no POSIX compat, no plugins.
 
 
 ## Features
@@ -166,18 +166,22 @@ alias .. "cd .."
 
 Two directives: `set` and `alias`. Variables expand in values. Comments with `#`.
 
-## Non-Features
+## Non-Features (by Design)
+
+Every omission is deliberate. No scripting engine means no code injection, no `source`-based exploits, no eval chains. No `if`/`for`/`while`/functions means no control flow to hijack. No `${VAR}` brace expansion means no expansion-based attacks. One suspended job (no `&` backgrounding) means no resource exhaustion through job spawning. No plugins means no supply chain.
+
+The result: the entire shell is a single flat pipeline executor with a small, auditable attack surface. If you can't `source` it, you can't trick a user into `source`-ing it.
 
 - No scripting. `ish script.sh` prints an error.
 - No POSIX compliance.
-- No `${VAR}` brace expansion.
+- No `source`, no `eval`, no `${VAR}` brace expansion.
 - No `if`/`for`/`while`/functions.
 - No plugins, no prompt customization, no themes.
 - No background jobs (`&`). One suspended job only.
 
 ## Architecture
 
-17 source files, single binary crate, one dependency (`libc`).
+Single binary crate, one dependency (`libc`).
 
 The shell never subprocesses for its own operations — directory listing, git detection, glob expansion, environment loading checks are all native. Only user commands get `fork`/`exec`'d.
 

@@ -9,7 +9,7 @@ ish is a minimal interactive-only shell written in Rust, inspired by fish-shell.
 - **Single dependency**: `libc` (for system calls). No other crates at runtime.
 - **No subprocessing for shell operations**: Directory listing, git branch detection, glob expansion, prompt rendering — all implemented natively. Only user commands get fork/exec'd.
 - **Interactive only**: No scripting, no POSIX compatibility, no `source`, no control flow (`if`/`for`/`while`/`function`). Refuses to run script files.
-- **Single binary crate**: 19 library modules + `main.rs`. No workspace, no proc macros.
+- **Single binary crate**: No workspace, no proc macros.
 
 ## Architecture
 
@@ -165,9 +165,9 @@ cargo +nightly fuzz run fuzz_parse  # Fuzz the parser (requires cargo-fuzz)
 ## Test Structure
 
 ### Unit tests (`cargo test --lib`)
-43 tests embedded in source modules (input.rs, expand.rs, complete.rs, denv.rs, etc.) for isolated logic.
+Embedded in source modules (input.rs, expand.rs, complete.rs, denv.rs, etc.) for isolated logic.
 
-### Integration tests (`tests/integration.rs` — 203 tests)
+### Integration tests (`tests/integration.rs`)
 Exercises the library API directly: parsing, expansion, line buffer, history, completion grid, aliases, config, prompt, builtins, ls. Achieves 95%+ coverage of all library modules.
 
 Key testing patterns:
@@ -175,24 +175,27 @@ Key testing patterns:
 - All file-dependent tests use temp directories with absolute paths
 - Prompt git tests assert on structure (`ends_with(" $ ")`) not exact branch names
 
-### PTY tests (`tests/pty.rs` — 54 tests)
+### PTY tests (`tests/pty.rs`)
 Spawns the real `ish` binary in a pseudo-terminal and drives it with keystrokes. Each test gets an isolated HOME directory with controlled files, history, and config. Tests the full shell loop: raw mode, prompt rendering, line editing, completion, history search, aliases, pipes, redirects, globs, denv integration, exit handling.
 
 The PTY harness (`PtyShell`) uses `openpty()` + `fork()` to create an isolated terminal session with a fixed 80x24 size. Assertions operate on visible terminal output with ANSI stripping. Drop uses WNOHANG polling (not blocking waitpid) to avoid hangs on macOS when the PTY master fd is still open.
 
-### Fuzz targets (`fuzz/fuzz_targets/` — 5 targets)
+### Fuzz targets (`fuzz/fuzz_targets/`)
 - `fuzz_parse` — Parser never panics on any input
 - `fuzz_expand` — Expander never panics (capped at 256 bytes)
 - `fuzz_line` — LineBuffer invariants (cursor in bounds, at char boundary)
 - `fuzz_config` — Config parsing functions never panic
 - `fuzz_history` — Fuzzy match positions valid and ascending
+- `fuzz_math` — Expression evaluator never panics, no stack overflow on deep nesting
 
-### Benchmarks (`benches/bench.rs` — 15 groups)
+### Benchmarks (`benches/bench.rs`)
 Criterion benchmarks with a custom counting allocator that tracks heap allocations and bytes. Covers: parsing, expansion, line buffer ops, history search, completion grid + sort, prompt rendering, end-to-end parse+expand, PATH lookup, alias lookup, `ls` builtin, filesystem completion, and denv output parsing. Includes an allocation audit section that prints cold and warm (pooled buffer) allocation counts — warm paths should show 0 allocs.
 
 ## Design Principles
 
 **Simplicity over features.** Every feature earns its place through daily use. No configuration knobs, no plugin system, no themes. The shell does one thing: run commands interactively, with just enough UX to be pleasant.
+
+**Small attack surface by omission.** No scripting engine, no `source`/`eval`, no control flow (`if`/`for`/`while`/functions), no background jobs (`&`), one suspended job slot. These aren't missing features — they're eliminated attack vectors. No scripting means no code injection or `source`-based exploits. No `eval` means no expansion chains to hijack. A single job slot means no resource exhaustion through job spawning. No plugins means no supply chain risk. The entire execution model is a flat pipeline executor: parse a line, expand it, fork/exec it. Nothing recursive, nothing deferred, nothing ambient.
 
 **Native everything.** The shell never forks for its own operations. `l` does readdir+stat+getpwuid+getgrgid. Git branch reads `.git/HEAD` directly. Glob expansion walks the filesystem with readdir. This keeps the shell fast and self-contained.
 
@@ -214,33 +217,3 @@ Criterion benchmarks with a custom counting allocator that tracks heap allocatio
 
 **Running tests after changes:** Always run `cargo test` (all suites). The PTY tests (`--test pty`) catch rendering regressions that unit tests miss. Pre-commit hooks enforce `cargo fmt` and `cargo clippy -- -D warnings`.
 
-## File Size Reference
-
-| File | Lines |
-|------|-------|
-| main.rs | 1,091 |
-| complete.rs | 745 |
-| exec.rs | 628 |
-| parse.rs | 482 |
-| expand.rs | 421 |
-| denv.rs | 351 |
-| input.rs | 337 |
-| prompt.rs | 331 |
-| line.rs | 308 |
-| ls.rs | 296 |
-| history.rs | 276 |
-| render.rs | 245 |
-| sys.rs | 241 |
-| builtin.rs | 227 |
-| term.rs | 185 |
-| config.rs | 170 |
-| signal.rs | 96 |
-| error.rs | 55 |
-| alias.rs | 32 |
-| lib.rs | 19 |
-| job.rs | 17 |
-| **Total src/** | **6,553** |
-| tests/integration.rs | 2,313 |
-| tests/pty.rs | 1,324 |
-| benches/bench.rs | 1,002 |
-| **Total** | **11,192** |
