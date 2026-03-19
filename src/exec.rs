@@ -74,6 +74,87 @@ struct ExpandedCommand {
     env: Vec<(String, String)>,
 }
 
+/// Apply redirects in the current process (for in-process builtins).
+/// Returns saved (target_fd, saved_copy) pairs to restore later.
+fn apply_redirects_in_process(redirects: &[Redirect]) -> Vec<(RawFd, RawFd)> {
+    let mut saved = Vec::new();
+    for r in redirects {
+        // SAFETY: open/dup/dup2 on valid paths and fds. Single-threaded shell.
+        unsafe {
+            let c = match CString::new(r.target.as_str()) {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("ish: {}: invalid filename", r.target);
+                    continue;
+                }
+            };
+
+            let (fd, target_fds): (RawFd, &[RawFd]) = match r.kind {
+                RedirectKind::Out => (
+                    libc::open(
+                        c.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                        0o644,
+                    ),
+                    &[1],
+                ),
+                RedirectKind::Append => (
+                    libc::open(
+                        c.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                        0o644,
+                    ),
+                    &[1],
+                ),
+                RedirectKind::In => (libc::open(c.as_ptr(), libc::O_RDONLY, 0), &[0]),
+                RedirectKind::Err => (
+                    libc::open(
+                        c.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                        0o644,
+                    ),
+                    &[2],
+                ),
+                RedirectKind::All => (
+                    libc::open(
+                        c.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                        0o644,
+                    ),
+                    &[1, 2],
+                ),
+            };
+
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!("ish: {}: {err}", r.target);
+                continue;
+            }
+
+            for &target in target_fds {
+                let backup = libc::dup(target);
+                if backup >= 0 {
+                    saved.push((target, backup));
+                }
+                libc::dup2(fd, target);
+            }
+            libc::close(fd);
+        }
+    }
+    saved
+}
+
+/// Restore file descriptors saved by apply_redirects_in_process.
+fn restore_redirects(saved: &[(RawFd, RawFd)]) {
+    for &(target, backup) in saved.iter().rev() {
+        // SAFETY: restoring previously dup'd fds.
+        unsafe {
+            libc::dup2(backup, target);
+            libc::close(backup);
+        }
+    }
+}
+
 fn close_fd(fd: RawFd) {
     if fd >= 0 {
         // SAFETY: fd is a valid file descriptor (checked >= 0).
@@ -224,7 +305,8 @@ fn execute_pipeline(
         let cmd = &expanded[0];
         let cmd_name = &cmd.argv[0];
         if builtin::is_special_builtin(cmd_name) {
-            let saved = set_env_temp(&cmd.env);
+            let saved_env = set_env_temp(&cmd.env);
+            let saved_fds = apply_redirects_in_process(&cmd.redirects);
             let status = builtin::run_special(
                 cmd_name,
                 &cmd.argv[1..],
@@ -234,14 +316,17 @@ fn execute_pipeline(
                 job,
                 session_log,
             );
-            restore_env(&saved);
+            restore_redirects(&saved_fds);
+            restore_env(&saved_env);
             return status;
         }
         // Output-only builtins as single commands: run in-process too
         if builtin::is_builtin(cmd_name) {
-            let saved = set_env_temp(&cmd.env);
+            let saved_env = set_env_temp(&cmd.env);
+            let saved_fds = apply_redirects_in_process(&cmd.redirects);
             let status = builtin::run_output(cmd_name, &cmd.argv[1..], &cmd.redirects);
-            restore_env(&saved);
+            restore_redirects(&saved_fds);
+            restore_env(&saved_env);
             return status;
         }
     }
