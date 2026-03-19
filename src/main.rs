@@ -180,9 +180,11 @@ fn main() {
                 //   single-arg directory that isn't an executable → "cd <dir>"
                 let line = maybe_rewrite_cd(&line, &shell.aliases);
 
-                // Add to history (exclude bare 'l' — too frequent to be useful)
-                if line.trim() != "l" {
-                    shell.history.add(&line);
+                // Expand aliases before recording in history so "g status"
+                // becomes "git status" — matches what actually runs.
+                let history_line = expand_aliases_for_history(&line, &shell.aliases);
+                if history_line.trim() != "l" {
+                    shell.history.add(&history_line);
                 }
 
                 // Log for session transcript
@@ -774,6 +776,19 @@ enum KeyAction {
 
 /// Handle a newline during bracketed paste: merge any continuation and
 /// insert a space instead of executing.
+/// Expand the first word of each ;/&&/||-separated segment through aliases.
+/// Used to record expanded commands in history (e.g., "g status" → "git status").
+fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
+    let trimmed = line.trim();
+    let first_word = trimmed.split_whitespace().next().unwrap_or("");
+    if let Some(expansion) = aliases.get(first_word) {
+        let rest = &trimmed[first_word.len()..];
+        format!("{}{rest}", expansion.join(" "))
+    } else {
+        line.to_string()
+    }
+}
+
 fn handle_paste_newline(line: &mut LineBuffer, full_input: &mut String) {
     if !full_input.is_empty() {
         let text = line.text().to_string();
