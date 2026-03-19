@@ -177,8 +177,10 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) 
                 tw.write_str("\x1b[7m"); // reverse video
             }
 
-            // Color: symlink=cyan, dir=blue, exec=green
-            if entry.is_link() {
+            // Color: symlink=cyan, dir=blue, exec=green, host=magenta
+            if entry.is_host() {
+                tw.write_str("\x1b[35m");
+            } else if entry.is_link() {
                 tw.write_str("\x1b[36m");
             } else if entry.is_dir() {
                 tw.write_str("\x1b[34m");
@@ -188,7 +190,7 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) 
 
             state.write_display_name(idx, tw);
 
-            if entry.is_link() || entry.is_dir() || entry.is_exec() {
+            if entry.is_host() || entry.is_link() || entry.is_dir() || entry.is_exec() {
                 tw.write_str("\x1b[0m");
             }
 

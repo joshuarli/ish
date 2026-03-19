@@ -3,12 +3,17 @@
 pub struct CompEntry {
     name_start: u32,
     name_len: u8,
-    flags: u8, // bit 0: is_dir, bit 1: is_link, bit 2: is_exec
+    flags: u8, // bit 0: is_dir, bit 1: is_link, bit 2: is_exec, bit 3: is_host
 }
 
 impl CompEntry {
     pub fn display_width(&self) -> usize {
-        self.name_len as usize + if self.is_dir() { 1 } else { 0 }
+        self.name_len as usize
+            + if self.is_dir() || self.is_host() {
+                1
+            } else {
+                0
+            }
     }
 
     pub fn is_dir(&self) -> bool {
@@ -21,6 +26,10 @@ impl CompEntry {
 
     pub fn is_exec(&self) -> bool {
         self.flags & 4 != 0
+    }
+
+    pub fn is_host(&self) -> bool {
+        self.flags & 8 != 0
     }
 }
 
@@ -207,6 +216,8 @@ impl CompletionState {
         tw.write_str(name);
         if e.is_dir() {
             tw.write_str("/");
+        } else if e.is_host() {
+            tw.write_str(":");
         }
     }
 
@@ -658,9 +669,219 @@ pub fn compute_grid(entries: &[CompEntry], term_cols: u16) -> (usize, usize) {
     (1, n)
 }
 
+// -- SSH Completion --
+
+/// Parse hostnames from ~/.ssh/config and ~/.ssh/known_hosts.
+fn parse_ssh_hosts(home: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+
+    // ~/.ssh/config: extract Host directives (skip wildcards)
+    if let Ok(data) = std::fs::read_to_string(format!("{home}/.ssh/config")) {
+        for line in data.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed
+                .strip_prefix("Host ")
+                .or_else(|| trimmed.strip_prefix("Host\t"))
+            {
+                for host in rest.split_whitespace() {
+                    if !host.contains('*') && !host.contains('?') && host != "." {
+                        hosts.push(host.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // ~/.ssh/known_hosts: first field is hostname (skip hashed entries)
+    if let Ok(data) = std::fs::read_to_string(format!("{home}/.ssh/known_hosts")) {
+        for line in data.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('|') {
+                continue;
+            }
+            if let Some(host_field) = trimmed.split_whitespace().next() {
+                // May contain comma-separated aliases and [host]:port
+                for entry in host_field.split(',') {
+                    let host = entry
+                        .strip_prefix('[')
+                        .and_then(|s| s.split(']').next())
+                        .unwrap_or(entry);
+                    if !host.is_empty() && !host.contains('*') {
+                        hosts.push(host.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Complete SSH hostnames matching `prefix`.
+pub fn complete_hostnames(prefix: &str, home: &str, comp: &mut Completions) {
+    for host in parse_ssh_hosts(home) {
+        if host.starts_with(prefix) {
+            let start = comp.names.len() as u32;
+            comp.names.push_str(&host);
+            comp.entries.push(CompEntry {
+                name_start: start,
+                name_len: host.len().min(255) as u8,
+                flags: 8, // is_host
+            });
+        }
+    }
+}
+
+/// Complete remote paths via SSH. Runs `ssh -o BatchMode=yes -o ConnectTimeout=2`
+/// to list files on the remote host. Nearly instant when ControlMaster is active.
+/// Returns after at most ~2 seconds.
+pub fn complete_remote_path(host: &str, path_prefix: &str, comp: &mut Completions) {
+    // Build the remote ls command — shell-quote the glob pattern
+    let cmd = format!(
+        "ssh -o BatchMode=yes -o ConnectTimeout=2 {} 'ls -dp {}* 2>/dev/null'",
+        host,
+        shell_escape(path_prefix),
+    );
+
+    let (pid, pipe_r) = match crate::sys::spawn_command_subst(&cmd) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // Read output with a 3-second deadline
+    let deadline_ns = monotonic_ns() + 3_000_000_000;
+    let mut output = String::new();
+    let mut buf = [0u8; 4096];
+
+    // Set pipe to non-blocking so we can enforce the deadline
+    // SAFETY: pipe_r is a valid fd from spawn_command_subst.
+    unsafe {
+        let flags = libc::fcntl(pipe_r, libc::F_GETFL);
+        libc::fcntl(pipe_r, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    loop {
+        // SAFETY: reading from a valid pipe fd into a stack buffer.
+        let n = unsafe { libc::read(pipe_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n > 0 {
+            if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
+                output.push_str(s);
+            }
+        } else if n == 0 {
+            break; // EOF
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EAGAIN)
+                || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+            {
+                if monotonic_ns() >= deadline_ns {
+                    // SAFETY: kill the timed-out child.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    break;
+                }
+                // Brief poll to avoid busy-spinning
+                let mut pfd = libc::pollfd {
+                    fd: pipe_r,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll on a single valid fd with 100ms timeout.
+                unsafe { libc::poll(&mut pfd, 1, 100) };
+                continue;
+            }
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+    }
+
+    // SAFETY: close pipe and reap child.
+    unsafe {
+        libc::close(pipe_r);
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    }
+
+    // Determine the directory prefix to strip (everything up to and including the last /)
+    let dir_prefix = match path_prefix.rfind('/') {
+        Some(i) => &path_prefix[..=i],
+        None => "",
+    };
+
+    for line in output.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let is_dir = line.ends_with('/');
+        let path = line.trim_end_matches('/');
+        // Strip the directory prefix to get just the filename
+        let name = if !dir_prefix.is_empty() {
+            path.strip_prefix(dir_prefix).unwrap_or(path)
+        } else {
+            // ls -dp without a leading / returns relative names
+            path.rsplit('/').next().unwrap_or(path)
+        };
+        if !name.is_empty() {
+            comp.push(name, is_dir, false, false);
+        }
+    }
+}
+
+/// Minimal shell escaping for use inside single quotes in an ssh command.
+fn shell_escape(s: &str) -> String {
+    // Inside single quotes, only ' needs escaping (as '\'' — end quote, escaped quote, reopen)
+    if !s.contains('\'') {
+        return s.to_string();
+    }
+    s.replace('\'', "'\\''")
+}
+
+/// Monotonic clock in nanoseconds.
+fn monotonic_ns() -> u64 {
+    // SAFETY: clock_gettime writes into a stack-allocated timespec.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts)
+    };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts)
+    };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_flag() {
+        let mut comp = Completions::new();
+        // Push a host entry manually
+        let start = comp.names.len() as u32;
+        comp.names.push_str("myhost");
+        comp.entries.push(CompEntry {
+            name_start: start,
+            name_len: 6,
+            flags: 8,
+        });
+        assert!(comp.entries[0].is_host());
+        assert!(!comp.entries[0].is_dir());
+        assert_eq!(comp.entries[0].display_width(), 7); // "myhost" + ":"
+    }
+
+    #[test]
+    fn shell_escape_no_quotes() {
+        assert_eq!(shell_escape("hello"), "hello");
+        assert_eq!(shell_escape("/tmp/foo"), "/tmp/foo");
+    }
+
+    #[test]
+    fn shell_escape_with_quotes() {
+        assert_eq!(shell_escape("it's"), "it'\\''s");
+    }
 
     #[test]
     fn split_path_no_slash() {

@@ -1190,6 +1190,52 @@ fn start_completion(
     let first_word = text.split_whitespace().next().unwrap_or("");
     let dirs_only = first_word == "cd" && word_start > 0;
 
+    // SSH-aware completion: hostname and remote path
+    const SSH_CMDS: &[&str] = &["ssh", "scp", "rsync", "sftp", "mosh"];
+    if word_start > 0 && SSH_CMDS.contains(&first_word) {
+        if let Some(colon_pos) = partial.find(':') {
+            // Remote path: host:/path/prefix → complete via SSH
+            let host = &partial[..colon_pos];
+            let remote_path = &partial[colon_pos + 1..];
+            complete::complete_remote_path(host, remote_path, &mut comp);
+            if !comp.is_empty() {
+                let dir_prefix = if let Some(slash) = remote_path.rfind('/') {
+                    format!("{}:{}", host, &remote_path[..=slash])
+                } else {
+                    format!("{host}:")
+                };
+                let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
+                return CompletionState {
+                    comp,
+                    selected: 0,
+                    cols,
+                    rows,
+                    scroll: 0,
+                    dir_prefix,
+                    in_quote,
+                };
+            }
+        } else if !partial.contains('/') {
+            // No colon, no slash → hostname completion + local files
+            complete::complete_hostnames(&partial, home, &mut comp);
+            complete::complete_path_into(&partial, false, &mut comp);
+            comp.sort_entries();
+            comp.dedup_sorted();
+            if !comp.is_empty() {
+                let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
+                return CompletionState {
+                    comp,
+                    selected: 0,
+                    cols,
+                    rows,
+                    scroll: 0,
+                    dir_prefix: String::new(),
+                    in_quote,
+                };
+            }
+        }
+    }
+
     // Expand tilde for filesystem lookup
     let expanded = if partial == "~" {
         format!("{home}/")
@@ -1337,6 +1383,8 @@ fn accept_completion(line: &mut LineBuffer, state: &CompletionState) {
     inner.push_str(name);
     if entry.is_dir() {
         inner.push('/');
+    } else if entry.is_host() {
+        inner.push(':');
     }
 
     // Single-quote the completion if it contains special characters.
