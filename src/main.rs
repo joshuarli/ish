@@ -1049,13 +1049,22 @@ enum CompAction {
     Refilter,
 }
 
-/// Whether the cursor is at a command position (first word, or after | && ;).
+/// Whether the cursor is at a command position (first word, after | && ;,
+/// or immediately after sudo/doas/su).
 fn is_command_position(before_cursor: &str, word_start: usize) -> bool {
     if word_start == 0 {
         return true;
     }
     let before_word = before_cursor[..word_start].trim_end();
-    before_word.ends_with('|') || before_word.ends_with(';') || before_word.ends_with("&&")
+    if before_word.ends_with('|') || before_word.ends_with(';') || before_word.ends_with("&&") {
+        return true;
+    }
+    // The argument after sudo/doas/su is also a command
+    let prev_word = before_word
+        .rsplit_once(|c: char| c.is_whitespace() || c == '|' || c == ';')
+        .map(|(_, w)| w)
+        .unwrap_or(before_word);
+    matches!(prev_word, "sudo" | "doas" | "su")
 }
 
 /// Find the start of the completion word, respecting quotes.
