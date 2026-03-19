@@ -1247,11 +1247,13 @@ fn accept_completion(line: &mut LineBuffer, state: &CompletionState) {
     // Always close the quote so the line is valid for immediate execution.
     // On the next tab press, start_completion strips the outer quotes for lookup.
     // Keep ~/ outside the quotes so tilde expansion still works.
-    let replacement = if state.in_quote || needs_quoting(&inner) {
-        if let Some(rest) = inner.strip_prefix("~/") {
+    // Escape embedded single quotes: ' → '\'' (end quote, escaped quote, reopen).
+    let replacement = if state.in_quote || needs_quoting(&inner) || inner.contains('\'') {
+        let escaped = inner.replace('\'', "'\\''");
+        if let Some(rest) = escaped.strip_prefix("~/") {
             format!("~/'{rest}'")
         } else {
-            format!("'{inner}'")
+            format!("'{escaped}'")
         }
     } else {
         inner
