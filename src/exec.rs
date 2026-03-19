@@ -275,11 +275,23 @@ fn execute_pipeline(
                     // Use `export FOO=bar` to set environment variables.
                     return 0;
                 }
+                // Validate expanded arguments (control chars, NUL bytes)
+                for arg in &expanded_argv {
+                    if let Some(msg) = blocked_arg(arg) {
+                        eprintln!("ish: {msg}");
+                        return 1;
+                    }
+                }
                 let mut redirects = Vec::new();
                 for r in &pcmd.cmd.redirects {
                     let target = expand::expand_word(&r.target, home, &mut exec_subst, last_status)
                         .map(|v| v.join(" "))
                         .unwrap_or_else(|_| parse::unescape(&r.target));
+                    // Validate redirect target (pathname opened by the shell)
+                    if let Some(msg) = blocked_pathname(&target) {
+                        eprintln!("ish: {msg}");
+                        return 1;
+                    }
                     redirects.push(Redirect {
                         kind: r.kind,
                         target,
@@ -1030,6 +1042,34 @@ pub fn complete_commands(prefix: &str, comp: &mut crate::complete::Completions) 
     }
 }
 
+/// Check for control characters (bytes < space or DEL).
+fn has_control_chars(s: &str) -> bool {
+    s.bytes().any(|b| b < b' ' || b == 0x7f)
+}
+
+/// Reject redirect targets (pathnames the shell opens) that look suspicious.
+/// Inspired by git's "strange pathname '-' blocked" approach.
+fn blocked_pathname(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return Some("strange pathname '' blocked".into());
+    }
+    if path == "-" || path.starts_with('-') {
+        return Some(format!("strange pathname '{path}' blocked"));
+    }
+    if has_control_chars(path) {
+        return Some(format!("strange pathname {path:?} blocked"));
+    }
+    None
+}
+
+/// Reject expanded arguments containing control characters.
+fn blocked_arg(arg: &str) -> Option<String> {
+    if has_control_chars(arg) {
+        return Some(format!("strange argument {arg:?} blocked"));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,6 +1085,38 @@ mod tests {
         assert_eq!(var_assignment_pos("echo"), None);
         assert_eq!(var_assignment_pos("1FOO=bar"), None);
         assert_eq!(var_assignment_pos("FOO-X=bar"), None);
+    }
+
+    #[test]
+    fn blocked_pathname_rejects_suspicious() {
+        // Dash-prefixed (option injection / ambiguous stdin)
+        assert!(blocked_pathname("-").is_some());
+        assert!(blocked_pathname("--foo").is_some());
+        assert!(blocked_pathname("-rf").is_some());
+        // Empty
+        assert!(blocked_pathname("").is_some());
+        // Control characters
+        assert!(blocked_pathname("foo\x01bar").is_some());
+        assert!(blocked_pathname("\x7f").is_some());
+        assert!(blocked_pathname("foo\x00").is_some());
+        // Valid pathnames
+        assert!(blocked_pathname("foo").is_none());
+        assert!(blocked_pathname("/tmp/foo").is_none());
+        assert!(blocked_pathname("./foo").is_none());
+        assert!(blocked_pathname("a-b").is_none());
+        assert!(blocked_pathname("file.txt").is_none());
+    }
+
+    #[test]
+    fn blocked_arg_rejects_control_chars() {
+        assert!(blocked_arg("foo\x01bar").is_some());
+        assert!(blocked_arg("\x7f").is_some());
+        assert!(blocked_arg("\x00").is_some());
+        // Valid args (including dash-prefixed flags)
+        assert!(blocked_arg("--flag").is_none());
+        assert!(blocked_arg("-rf").is_none());
+        assert!(blocked_arg("normal").is_none());
+        assert!(blocked_arg("path/to/file").is_none());
     }
 
     #[test]

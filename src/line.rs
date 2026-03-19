@@ -39,6 +39,16 @@ impl LineBuffer {
         self.cursor = self.buf.len();
     }
 
+    /// Set content and place cursor at the given byte offset.
+    pub fn set_with_cursor(&mut self, s: &str, cursor: usize) {
+        self.buf.clear();
+        self.buf.push_str(s);
+        self.cursor = cursor.min(self.buf.len());
+        while self.cursor > 0 && !self.buf.is_char_boundary(self.cursor) {
+            self.cursor -= 1;
+        }
+    }
+
     /// Number of display columns from start of line to cursor.
     pub fn display_cursor_pos(&self) -> usize {
         if self.buf.is_ascii() {
@@ -262,6 +272,20 @@ mod tests {
         assert_eq!(lb.text(), "hi");
         assert_eq!(lb.cursor(), 2);
         assert_eq!(lb.display_cursor_pos(), 2);
+    }
+
+    #[test]
+    fn set_with_cursor_position() {
+        let mut lb = LineBuffer::new();
+        lb.set_with_cursor("hello world", 5);
+        assert_eq!(lb.text(), "hello world");
+        assert_eq!(lb.cursor(), 5);
+        // Clamp to end
+        lb.set_with_cursor("hi", 100);
+        assert_eq!(lb.cursor(), 2);
+        // Position 0
+        lb.set_with_cursor("test", 0);
+        assert_eq!(lb.cursor(), 0);
     }
 
     #[test]

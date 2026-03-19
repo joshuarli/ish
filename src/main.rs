@@ -383,6 +383,8 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     let mut tw = TermWriter::new();
     let mut reader = InputReader::new(shell.signal_fd);
     let mut full_input = String::new();
+    let mut cont_stack: Vec<(String, u16, String)> = Vec::new(); // (line_text, rows_above, full_input_before)
+    let mut rows_above: u16 = 0;
     let mut line = LineBuffer::new();
     let mut mode = Mode::Normal;
     let mut history_idx: Option<usize> = None;
@@ -500,6 +502,8 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     }
                                 }
                                 KeyAction::Continuation(text) => {
+                                    cont_stack.push((text.clone(), rows_above, full_input.clone()));
+                                    rows_above += cursor_row + 1;
                                     if full_input.is_empty() {
                                         full_input = text;
                                     } else {
@@ -526,6 +530,29 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     let _ = tw.flush_to_stdout();
                                     continue;
                                 }
+                                KeyAction::Unwind => {
+                                    if let Some((prev_text, prev_rows_above, prev_full_input)) =
+                                        cont_stack.pop()
+                                    {
+                                        let current = line.text().to_string();
+                                        let mut prev = prev_text;
+                                        // Strip trailing `\` continuation marker
+                                        if parse::ends_with_line_continuation(&prev) {
+                                            let end = prev.trim_end().len();
+                                            prev.truncate(end - 1);
+                                        }
+                                        let join_pos = prev.len();
+                                        if !current.is_empty() {
+                                            prev.push(' ');
+                                            prev.push_str(&current);
+                                        }
+                                        line.set_with_cursor(&prev, join_pos);
+                                        full_input = prev_full_input;
+                                        cursor_row = rows_above + cursor_row - prev_rows_above;
+                                        rows_above = prev_rows_above;
+                                        history_idx = None;
+                                    }
+                                }
                                 KeyAction::Cancel => {
                                     tw.write_str("^C\r\n");
                                     let _ = tw.flush_to_stdout();
@@ -541,6 +568,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 KeyAction::ClearScreen => {
                                     tw.clear_screen();
                                     cursor_row = 0;
+                                    rows_above = 0;
+                                    for entry in &mut cont_stack {
+                                        entry.1 = 0;
+                                    }
                                 }
                                 KeyAction::StartHistorySearch => {
                                     saved_line = line.text().to_string();
@@ -791,6 +822,7 @@ enum KeyAction {
     Continue,
     Execute(String),
     Continuation(String),
+    Unwind,
     Cancel,
     Exit,
     ClearScreen,
@@ -872,6 +904,9 @@ fn handle_normal_key(
         (Key::Char('f'), false, true) => line.move_word_right(),
 
         (Key::Up, _, _) if !key.mods.ctrl => {
+            if !full_input.is_empty() {
+                return KeyAction::Unwind;
+            }
             navigate_history(line, history_idx, saved_line, shell, true);
         }
         (Key::Down, _, _) if !key.mods.ctrl => {
@@ -897,6 +932,9 @@ fn handle_normal_key(
         (Key::End, _, _) => line.move_end(),
 
         (Key::Backspace, _, _) => {
+            if line.cursor() == 0 && !full_input.is_empty() {
+                return KeyAction::Unwind;
+            }
             line.delete_back();
             *history_idx = None;
         }
