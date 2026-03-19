@@ -526,59 +526,57 @@ fn child_setup(
 }
 
 /// Apply a single redirect in the child process. Called after fork, before exec.
-/// Failures are silently ignored (child will exec or _exit shortly).
 fn apply_redirect(r: &Redirect) {
-    // SAFETY: open() with a valid CString path. Called in forked child.
-    let open_write = |path: &str, flags: i32| unsafe {
-        let c = CString::new(path).unwrap();
-        libc::open(c.as_ptr(), flags, 0o644)
-    };
-    // SAFETY: dup2 + close to wire fd to target. Both fds are valid.
-    let dup_close = |fd: i32, target: i32| unsafe {
-        libc::dup2(fd, target);
-        libc::close(fd);
-    };
+    // SAFETY: All operations are in a forked child before exec.
+    unsafe {
+        let c = match CString::new(r.target.as_str()) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("ish: {}: invalid filename", r.target);
+                return;
+            }
+        };
 
-    match r.kind {
-        RedirectKind::Out => {
-            let fd = open_write(&r.target, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC);
-            if fd >= 0 {
-                dup_close(fd, 1);
-            }
-        }
-        RedirectKind::Append => {
-            let fd = open_write(&r.target, libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND);
-            if fd >= 0 {
-                dup_close(fd, 1);
-            }
-        }
-        RedirectKind::In => {
-            // SAFETY: open() for read with valid CString. In forked child.
-            let fd = unsafe {
-                let c = CString::new(r.target.as_str()).unwrap();
-                libc::open(c.as_ptr(), libc::O_RDONLY, 0)
-            };
-            if fd >= 0 {
-                dup_close(fd, 0);
-            }
-        }
-        RedirectKind::Err => {
-            let fd = open_write(&r.target, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC);
-            if fd >= 0 {
-                dup_close(fd, 2);
-            }
-        }
-        RedirectKind::All => {
-            let fd = open_write(&r.target, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC);
-            if fd >= 0 {
-                // SAFETY: Redirect both stdout and stderr to the opened fd.
-                unsafe {
-                    libc::dup2(fd, 1);
-                    libc::dup2(fd, 2);
-                    libc::close(fd);
+        let open_flags = |flags: i32| -> i32 { libc::open(c.as_ptr(), flags, 0o644) };
+        let dup_close = |fd: i32, target: i32| {
+            libc::dup2(fd, target);
+            libc::close(fd);
+        };
+
+        let (fd, target_fd) = match r.kind {
+            RedirectKind::Out => (
+                open_flags(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC),
+                1,
+            ),
+            RedirectKind::Append => (
+                open_flags(libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND),
+                1,
+            ),
+            RedirectKind::In => (libc::open(c.as_ptr(), libc::O_RDONLY, 0), 0),
+            RedirectKind::Err => (
+                open_flags(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC),
+                2,
+            ),
+            RedirectKind::All => {
+                let fd = open_flags(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC);
+                if fd < 0 {
+                    let err = std::io::Error::last_os_error();
+                    eprintln!("ish: {}: {err}", r.target);
+                    return;
                 }
+                libc::dup2(fd, 1);
+                libc::dup2(fd, 2);
+                libc::close(fd);
+                return;
             }
+        };
+
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("ish: {}: {err}", r.target);
+            return;
         }
+        dup_close(fd, target_fd);
     }
 }
 

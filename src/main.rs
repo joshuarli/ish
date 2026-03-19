@@ -193,160 +193,135 @@ fn main() {
                 match parse::parse(&line) {
                     Ok(cmdline) => {
                         // Single simple command: handle shell-level builtins
-                        let handled = cmdline.segments.len() == 1
-                            && cmdline.segments[0].0.commands.len() == 1
-                            && {
-                                let cmd = &cmdline.segments[0].0.commands[0].cmd;
-                                // Skip leading NAME=VALUE assignments to find the command word
-                                let first = cmd
-                                    .argv
-                                    .iter()
-                                    .map(|s| parse::unescape(s))
-                                    .find(|s| exec::var_assignment_pos(s).is_none())
-                                    .unwrap_or_default();
-                                match first.as_str() {
-                                    "source" | "." => {
-                                        eprintln!("ish: {first}: sourcing is not supported");
-                                        shell.last_status = 1;
-                                        true
+                        let handled = if let Some(first) = first_command_word(&cmdline) {
+                            let cmd = &cmdline.segments[0].0.commands[0].cmd;
+                            match first.as_str() {
+                                "source" | "." => {
+                                    eprintln!("ish: {first}: sourcing is not supported");
+                                    shell.last_status = 1;
+                                    true
+                                }
+                                "alias" => {
+                                    let args: Vec<String> =
+                                        cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
+                                    if args.len() >= 2 {
+                                        let name = args[0].clone();
+                                        let expansion = args[1..].to_vec();
+                                        shell.aliases.set(name, expansion);
+                                        shell.last_status = 0;
+                                    } else if args.len() == 1 {
+                                        if let Some(exp) = shell.aliases.get(&args[0]) {
+                                            println!("alias {} {}", args[0], exp.join(" "));
+                                        } else {
+                                            eprintln!("ish: alias: not found: {}", args[0]);
+                                            shell.last_status = 1;
+                                        }
+                                    } else {
+                                        for (name, exp) in shell.aliases.iter() {
+                                            println!("alias {name} {}", exp.join(" "));
+                                        }
+                                        shell.last_status = 0;
                                     }
-                                    "alias" => {
-                                        let args: Vec<String> = cmd.argv[1..]
-                                            .iter()
+                                    true
+                                }
+                                "exit" => {
+                                    if shell.job.is_some() {
+                                        if shell.exit_warned {
+                                            if let Some(job) = shell.job.take() {
+                                                // SAFETY: Send SIGTERM to job's pgid before exit.
+                                                unsafe {
+                                                    libc::killpg(job.pgid, libc::SIGTERM);
+                                                }
+                                            }
+                                            break;
+                                        } else {
+                                            eprintln!(
+                                                "ish: there is a suspended job. Exit again to force quit."
+                                            );
+                                            shell.exit_warned = true;
+                                            shell.last_status = 1;
+                                            true
+                                        }
+                                    } else {
+                                        let code: i32 = cmd
+                                            .argv
+                                            .get(1)
                                             .map(|s| parse::unescape(s))
-                                            .collect();
-                                        if args.len() >= 2 {
-                                            let name = args[0].clone();
-                                            let expansion = args[1..].to_vec();
-                                            shell.aliases.set(name, expansion);
-                                            shell.last_status = 0;
-                                        } else if args.len() == 1 {
-                                            if let Some(exp) = shell.aliases.get(&args[0]) {
-                                                println!("alias {} {}", args[0], exp.join(" "));
-                                            } else {
-                                                eprintln!("ish: alias: not found: {}", args[0]);
-                                                shell.last_status = 1;
-                                            }
-                                        } else {
-                                            for (name, exp) in shell.aliases.iter() {
-                                                println!("alias {name} {}", exp.join(" "));
+                                            .and_then(|s| s.parse().ok())
+                                            .unwrap_or(0);
+                                        shell.history.save_cache();
+                                        std::process::exit(code);
+                                    }
+                                }
+                                "history" => {
+                                    let sub = cmd.argv.get(1).map(|s| parse::unescape(s));
+                                    match sub.as_deref() {
+                                        None => {
+                                            for i in 0..shell.history.len() {
+                                                println!("{}", shell.history.get(i));
                                             }
                                             shell.last_status = 0;
                                         }
-                                        true
-                                    }
-                                    "exit" => {
-                                        if shell.job.is_some() {
-                                            if shell.exit_warned {
-                                                if let Some(job) = shell.job.take() {
-                                                    // SAFETY: Send SIGTERM to job's pgid before exit.
-                                                    unsafe {
-                                                        libc::killpg(job.pgid, libc::SIGTERM);
-                                                    }
-                                                }
-                                                break;
-                                            } else {
-                                                eprintln!(
-                                                    "ish: there is a suspended job. Exit again to force quit."
-                                                );
-                                                shell.exit_warned = true;
-                                                shell.last_status = 1;
-                                                true
-                                            }
-                                        } else {
-                                            let code: i32 = cmd
-                                                .argv
-                                                .get(1)
-                                                .map(|s| parse::unescape(s))
-                                                .and_then(|s| s.parse().ok())
-                                                .unwrap_or(0);
-                                            shell.history.save_cache();
-                                            std::process::exit(code);
+                                        Some("compact") => {
+                                            shell.history.compact();
+                                            shell.last_status = 0;
+                                        }
+                                        Some(other) => {
+                                            eprintln!("ish: history: unknown subcommand: {other}");
+                                            shell.last_status = 1;
                                         }
                                     }
-                                    "history" => {
-                                        let sub = cmd.argv.get(1).map(|s| parse::unescape(s));
-                                        match sub.as_deref() {
-                                            None => {
-                                                for i in 0..shell.history.len() {
-                                                    println!("{}", shell.history.get(i));
-                                                }
-                                                shell.last_status = 0;
-                                            }
-                                            Some("compact") => {
-                                                shell.history.compact();
-                                                shell.last_status = 0;
-                                            }
-                                            Some(other) => {
-                                                eprintln!(
-                                                    "ish: history: unknown subcommand: {other}"
-                                                );
-                                                shell.last_status = 1;
-                                            }
-                                        }
-                                        true
-                                    }
-                                    "copy-scrollback" => {
-                                        use std::io::Write;
-                                        let encoded = base64_encode(shell.session_log.as_bytes());
-                                        let osc = format!("\x1b]52;c;{encoded}\x07");
-                                        let _ = std::io::stdout().write_all(osc.as_bytes());
-                                        let _ = std::io::stdout().flush();
+                                    true
+                                }
+                                "copy-scrollback" => {
+                                    use std::io::Write;
+                                    let encoded = base64_encode(shell.session_log.as_bytes());
+                                    let osc = format!("\x1b]52;c;{encoded}\x07");
+                                    let _ = std::io::stdout().write_all(osc.as_bytes());
+                                    let _ = std::io::stdout().flush();
+                                    shell.last_status = 0;
+                                    true
+                                }
+                                "denv" if *shell.denv_active.get_or_insert_with(denv::init) => {
+                                    let args: Vec<String> =
+                                        cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
+                                    if let Some(_path_modified) = denv::command(&args) {
                                         shell.last_status = 0;
                                         true
+                                    } else {
+                                        false // not allow/deny/reload — fall through to exec
                                     }
-                                    "denv" if *shell.denv_active.get_or_insert_with(denv::init) => {
-                                        let args: Vec<String> = cmd.argv[1..]
-                                            .iter()
-                                            .map(|s| parse::unescape(s))
-                                            .collect();
-                                        if let Some(_path_modified) = denv::command(&args) {
-                                            shell.last_status = 0;
-                                            true
-                                        } else {
-                                            false // not allow/deny/reload — fall through to exec
-                                        }
-                                    }
-                                    "fg" => {
-                                        let (status, cont) = exec::resume_job(&mut shell.job);
-                                        shell.last_status = status;
-                                        run_continuation(&mut shell, cont);
-                                        true
-                                    }
-                                    "w" | "which" | "type" => {
-                                        let args: Vec<String> = cmd.argv[1..]
-                                            .iter()
-                                            .map(|s| parse::unescape(s))
-                                            .collect();
-                                        if let Some(name) = args.first()
-                                            && let Some(exp) = shell.aliases.get(name.as_str())
-                                        {
-                                            println!("alias: {} {}", name, exp.join(" "));
-                                            shell.last_status = 0;
-                                            true
-                                        } else {
-                                            false // fall through to exec for builtin/PATH check
-                                        }
-                                    }
-                                    _ => false,
                                 }
-                            };
+                                "fg" => {
+                                    let (status, cont) = exec::resume_job(&mut shell.job);
+                                    shell.last_status = status;
+                                    run_continuation(&mut shell, cont);
+                                    true
+                                }
+                                "w" | "which" | "type" => {
+                                    let args: Vec<String> =
+                                        cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
+                                    if let Some(name) = args.first()
+                                        && let Some(exp) = shell.aliases.get(name.as_str())
+                                    {
+                                        println!("alias: {} {}", name, exp.join(" "));
+                                        shell.last_status = 0;
+                                        true
+                                    } else {
+                                        false // fall through to exec for builtin/PATH check
+                                    }
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        };
 
                         if handled {
                             continue;
                         }
 
-                        // Handle cd specially to invalidate prompt git cache
-                        let is_cd = cmdline.segments.len() == 1
-                            && cmdline.segments[0].0.commands.len() == 1
-                            && cmdline.segments[0].0.commands[0]
-                                .cmd
-                                .argv
-                                .iter()
-                                .map(|s| parse::unescape(s))
-                                .find(|s| exec::var_assignment_pos(s).is_none())
-                                .as_deref()
-                                == Some("cd");
+                        let is_cd = first_command_word(&cmdline).as_deref() == Some("cd");
 
                         shell.last_status = exec::execute(
                             &cmdline,
@@ -815,6 +790,19 @@ enum KeyAction {
 /// insert a space instead of executing.
 /// Expand the first word of each ;/&&/||-separated segment through aliases.
 /// Used to record expanded commands in history (e.g., "g status" → "git status").
+/// Get the first non-assignment command word from a single-command cmdline.
+fn first_command_word(cmdline: &parse::CommandLine) -> Option<String> {
+    if cmdline.segments.len() != 1 || cmdline.segments[0].0.commands.len() != 1 {
+        return None;
+    }
+    cmdline.segments[0].0.commands[0]
+        .cmd
+        .argv
+        .iter()
+        .map(|s| parse::unescape(s))
+        .find(|s| exec::var_assignment_pos(s).is_none())
+}
+
 fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
     let trimmed = line.trim();
     let first_word = trimmed.split_whitespace().next().unwrap_or("");

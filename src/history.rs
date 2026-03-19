@@ -358,9 +358,11 @@ impl History {
                 }
             }
         }
+        // Truncate entries that exceed u16 max (64KB) — shouldn't happen in practice
+        let len = line.len().min(u16::MAX as usize);
         let start = self.arena.len() as u32;
-        self.arena.push_str(line);
-        self.offsets.push((start, line.len() as u16));
+        self.arena.push_str(&line[..len]);
+        self.offsets.push((start, len as u16));
         self.hash_vec.push(h);
         self.timestamps.push(now_secs());
         self.hashes.insert(h);
