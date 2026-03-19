@@ -39,7 +39,9 @@ pub fn expand_word(
     } else {
         word
     };
-    if has_glob {
+    // Re-check for glob chars after expansion — $? contains '?' in the raw
+    // token but expands to a number, so the original has_glob is stale.
+    if has_glob && has_glob_chars(&word) {
         expand_glob(&word)
     } else {
         Ok(vec![strip_literal(&word).into_owned()])
