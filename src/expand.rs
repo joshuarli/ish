@@ -141,8 +141,89 @@ fn expand_variables(word: &str, last_status: i32) -> String {
                 let mut buf = [0u8; 12];
                 let s = itoa_i32(last_status, &mut buf);
                 result.push_str(s);
+            } else if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                // ${VAR} and ${VAR:-default}, ${VAR:+alt}, ${VAR#prefix}, ${VAR%suffix}
+                i += 2; // skip ${
+                let name_start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let name = &word[name_start..i];
+                if i < bytes.len() && bytes[i] == b'}' {
+                    // Simple ${VAR}
+                    i += 1;
+                    if !name.is_empty()
+                        && let Ok(val) = std::env::var(name)
+                    {
+                        result.push_str(&val);
+                    }
+                } else if i < bytes.len() && !name.is_empty() {
+                    // Parameter substitution operators
+                    let val = std::env::var(name).ok();
+                    let op_start = i;
+                    // Find closing }
+                    let mut depth = 1u32;
+                    while i < bytes.len() && depth > 0 {
+                        match bytes[i] {
+                            0 => i += 2, // LITERAL + next byte
+                            b'{' => {
+                                depth += 1;
+                                i += 1;
+                            }
+                            b'}' => {
+                                depth -= 1;
+                                i += 1;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    let operand = strip_literal(&word[op_start..i - 1]);
+                    let is_set = val.as_ref().is_some_and(|v| !v.is_empty());
+                    if let Some(default) = operand.strip_prefix(":-") {
+                        // ${VAR:-default} — use default if unset or empty
+                        if is_set {
+                            result.push_str(val.as_deref().unwrap());
+                        } else {
+                            result.push_str(default);
+                        }
+                    } else if let Some(default) = operand.strip_prefix('-') {
+                        // ${VAR-default} — use default if unset (empty counts as set)
+                        match &val {
+                            Some(v) => result.push_str(v),
+                            None => result.push_str(default),
+                        }
+                    } else if let Some(alt) = operand.strip_prefix(":+") {
+                        // ${VAR:+alt} — use alt if set and non-empty
+                        if is_set {
+                            result.push_str(alt);
+                        }
+                    } else if let Some(alt) = operand.strip_prefix('+') {
+                        // ${VAR+alt} — use alt if set (even if empty)
+                        if val.is_some() {
+                            result.push_str(alt);
+                        }
+                    } else if let Some(pat) = operand.strip_prefix('#') {
+                        // ${VAR#prefix} — remove shortest prefix match
+                        if let Some(v) = &val {
+                            result.push_str(strip_prefix_glob(v, pat));
+                        }
+                    } else if let Some(pat) = operand.strip_prefix('%') {
+                        // ${VAR%suffix} — remove shortest suffix match
+                        if let Some(v) = &val {
+                            result.push_str(strip_suffix_glob(v, pat));
+                        }
+                    }
+                } else {
+                    // Malformed ${...} — skip to } if possible
+                    while i < bytes.len() && bytes[i] != b'}' {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
             } else {
-                // Variable name: ASCII alphanumeric + underscore
+                // $NAME — bare variable name
                 i += 1;
                 let name_start = i;
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -298,6 +379,48 @@ fn has_glob_chars(word: &str) -> bool {
     false
 }
 
+/// Remove shortest prefix matching a simple glob pattern (* only).
+fn strip_prefix_glob<'a>(val: &'a str, pattern: &str) -> &'a str {
+    if pattern == "*" {
+        return "";
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        // *SUFFIX — find first occurrence of suffix
+        if let Some(pos) = val.find(suffix) {
+            return &val[pos + suffix.len()..];
+        }
+    } else if let Some(rest) = pattern.strip_suffix('*') {
+        // PREFIX* — strip if starts with prefix
+        if let Some(stripped) = val.strip_prefix(rest) {
+            return stripped;
+        }
+    } else if let Some(stripped) = val.strip_prefix(pattern) {
+        return stripped;
+    }
+    val
+}
+
+/// Remove shortest suffix matching a simple glob pattern (* only).
+fn strip_suffix_glob<'a>(val: &'a str, pattern: &str) -> &'a str {
+    if pattern == "*" {
+        return "";
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        // PREFIX* — find last occurrence of prefix
+        if let Some(pos) = val.rfind(prefix) {
+            return &val[..pos];
+        }
+    } else if let Some(suffix) = pattern.strip_prefix('*') {
+        // *SUFFIX — strip if ends with suffix
+        if let Some(stripped) = val.strip_suffix(suffix) {
+            return stripped;
+        }
+    } else if let Some(stripped) = val.strip_suffix(pattern) {
+        return stripped;
+    }
+    val
+}
+
 fn strip_literal(s: &str) -> Cow<'_, str> {
     if !s.contains(LITERAL) {
         return Cow::Borrowed(s);
@@ -448,9 +571,46 @@ mod tests {
     fn variables() {
         unsafe { std::env::set_var("ISH_TEST_VAR", "hello") };
         assert_eq!(expand_variables("$ISH_TEST_VAR world", 0), "hello world");
-        assert_eq!(expand_variables("${ISH_TEST_VAR}", 0), "${ISH_TEST_VAR}");
+        assert_eq!(expand_variables("${ISH_TEST_VAR}", 0), "hello");
+        assert_eq!(expand_variables("${ISH_TEST_VAR}!", 0), "hello!");
         // Undefined var → empty
         assert_eq!(expand_variables("$UNDEFINED_ISH_VAR", 0), "");
+        assert_eq!(expand_variables("${UNDEFINED_ISH_VAR}", 0), "");
+    }
+
+    #[test]
+    fn braced_var_default() {
+        unsafe { std::env::set_var("ISH_SET", "val") };
+        unsafe { std::env::remove_var("ISH_UNSET") };
+        // ${VAR:-default} — default if unset or empty
+        assert_eq!(expand_variables("${ISH_SET:-fallback}", 0), "val");
+        assert_eq!(expand_variables("${ISH_UNSET:-fallback}", 0), "fallback");
+        // ${VAR-default} — default if unset only
+        assert_eq!(expand_variables("${ISH_SET-fallback}", 0), "val");
+        assert_eq!(expand_variables("${ISH_UNSET-fallback}", 0), "fallback");
+    }
+
+    #[test]
+    fn braced_var_alternate() {
+        unsafe { std::env::set_var("ISH_SET", "val") };
+        unsafe { std::env::remove_var("ISH_UNSET") };
+        // ${VAR:+alt} — alt if set and non-empty
+        assert_eq!(expand_variables("${ISH_SET:+yes}", 0), "yes");
+        assert_eq!(expand_variables("${ISH_UNSET:+yes}", 0), "");
+        // ${VAR+alt} — alt if set
+        assert_eq!(expand_variables("${ISH_SET+yes}", 0), "yes");
+        assert_eq!(expand_variables("${ISH_UNSET+yes}", 0), "");
+    }
+
+    #[test]
+    fn braced_var_strip() {
+        unsafe { std::env::set_var("ISH_PATH", "/home/user/file.txt") };
+        // ${VAR#pattern} — remove shortest prefix
+        assert_eq!(expand_variables("${ISH_PATH#*/}", 0), "home/user/file.txt");
+        // ${VAR%pattern} — remove shortest suffix
+        assert_eq!(expand_variables("${ISH_PATH%/*}", 0), "/home/user");
+        // ${VAR%.ext}
+        assert_eq!(expand_variables("${ISH_PATH%.txt}", 0), "/home/user/file");
     }
 
     #[test]
@@ -458,6 +618,33 @@ mod tests {
         assert_eq!(expand_variables("$?", 0), "0");
         assert_eq!(expand_variables("$?", 127), "127");
         assert_eq!(expand_variables("exit:$?", 1), "exit:1");
+    }
+
+    #[test]
+    fn strip_prefix_glob_cases() {
+        assert_eq!(
+            strip_prefix_glob("/home/user/file.txt", "*/"),
+            "home/user/file.txt"
+        );
+        assert_eq!(
+            strip_prefix_glob("/home/user/file.txt", "/home/"),
+            "user/file.txt"
+        );
+        assert_eq!(strip_prefix_glob("foobar", "foo"), "bar");
+        assert_eq!(strip_prefix_glob("foobar", "baz"), "foobar");
+        assert_eq!(strip_prefix_glob("anything", "*"), "");
+    }
+
+    #[test]
+    fn strip_suffix_glob_cases() {
+        assert_eq!(strip_suffix_glob("/home/user/file.txt", "/*"), "/home/user");
+        assert_eq!(
+            strip_suffix_glob("/home/user/file.txt", ".txt"),
+            "/home/user/file"
+        );
+        assert_eq!(strip_suffix_glob("foobar", "bar"), "foo");
+        assert_eq!(strip_suffix_glob("foobar", "baz"), "foobar");
+        assert_eq!(strip_suffix_glob("anything", "*"), "");
     }
 
     #[test]

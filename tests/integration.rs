@@ -762,6 +762,52 @@ fn input_modifier_combinations() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn expand_braced_var() {
+    // SAFETY: single-threaded tests
+    unsafe { std::env::set_var("ISH_TEST_BRACE", "world") };
+    // ${VAR} basic
+    let result = expand::expand_word("${ISH_TEST_BRACE}", "/home/test", &mut no_subst, 0).unwrap();
+    assert_eq!(result, ["world"]);
+    // ${VAR} concatenated
+    let result =
+        expand::expand_word("hello_${ISH_TEST_BRACE}!", "/home/test", &mut no_subst, 0).unwrap();
+    assert_eq!(result, ["hello_world!"]);
+}
+
+#[test]
+fn expand_braced_var_default() {
+    unsafe { std::env::set_var("ISH_TEST_SET", "val") };
+    unsafe { std::env::remove_var("ISH_TEST_UNSET") };
+    let result = expand::expand_word(
+        "${ISH_TEST_UNSET:-fallback}",
+        "/home/test",
+        &mut no_subst,
+        0,
+    )
+    .unwrap();
+    assert_eq!(result, ["fallback"]);
+    let result =
+        expand::expand_word("${ISH_TEST_SET:-fallback}", "/home/test", &mut no_subst, 0).unwrap();
+    assert_eq!(result, ["val"]);
+}
+
+#[test]
+fn expand_var_in_double_quotes() {
+    // Variables inside double quotes should expand (parser passes $ through)
+    unsafe { std::env::set_var("ISH_TEST_DQ", "quoted") };
+    let cmd = parse::parse(r#"echo "$ISH_TEST_DQ""#).unwrap();
+    let argv = cmd.segments[0].0.commands[0].cmd.argv.to_vec();
+    let expanded = expand::expand_argv(&argv, "/home/test", &mut no_subst, 0).unwrap();
+    assert_eq!(expanded, ["echo", "quoted"]);
+
+    // ${VAR} inside double quotes
+    let cmd = parse::parse(r#"echo "${ISH_TEST_DQ}""#).unwrap();
+    let argv = cmd.segments[0].0.commands[0].cmd.argv.to_vec();
+    let expanded = expand::expand_argv(&argv, "/home/test", &mut no_subst, 0).unwrap();
+    assert_eq!(expanded, ["echo", "quoted"]);
+}
+
+#[test]
 fn expand_undefined_var_is_empty() {
     let result =
         expand::expand_word("$UNDEFINED_ISH_VAR_XYZ", "/home/test", &mut no_subst, 0).unwrap();
