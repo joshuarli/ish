@@ -170,8 +170,7 @@ fn builtin_cd(args: &[String], prev_dir: &mut Option<String>, home: &str) -> i32
     // Update PWD
     if let Ok(new_pwd) = std::env::current_dir() {
         let new_pwd_str = new_pwd.to_string_lossy().into_owned();
-        // SAFETY: single-threaded shell, no other threads reading env
-        unsafe { std::env::set_var("PWD", &new_pwd_str) };
+        crate::shell_setenv("PWD", &new_pwd_str);
     }
 
     *prev_dir = old_pwd;
@@ -200,12 +199,11 @@ fn builtin_export(args: &[String]) -> i32 {
         if let Some(eq) = exec::var_assignment_pos(arg) {
             let name = &arg[..eq];
             let val = &arg[eq + 1..];
-            // SAFETY: single-threaded shell
-            unsafe { std::env::set_var(name, val) };
+            crate::shell_setenv(name, val);
         } else {
             // `export FOO` — no-op if already set, otherwise set to empty
             if std::env::var(arg).is_err() {
-                unsafe { std::env::set_var(arg, "") };
+                crate::shell_setenv(arg, "");
             }
         }
     }
@@ -228,8 +226,7 @@ fn builtin_set(args: &[String]) -> i32 {
         String::new() // set VAR with no value → empty string
     };
 
-    // SAFETY: single-threaded shell
-    unsafe { std::env::set_var(name, &value) };
+    crate::shell_setenv(name, &value);
     0
 }
 
@@ -240,8 +237,7 @@ fn builtin_unset(args: &[String]) -> i32 {
     }
 
     for name in args {
-        // SAFETY: single-threaded shell
-        unsafe { std::env::remove_var(name) };
+        crate::shell_unsetenv(name);
     }
     0
 }

@@ -58,8 +58,7 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path) {
 
     // Expand variables in value
     let expanded = expand_vars_simple(&value);
-    // SAFETY: single-threaded shell, called during startup
-    unsafe { std::env::set_var(name, &expanded) };
+    crate::shell_setenv(name, &expanded);
 }
 
 fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut AliasMap) {

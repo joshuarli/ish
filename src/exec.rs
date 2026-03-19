@@ -50,8 +50,7 @@ fn set_env_temp(env: &[(String, String)]) -> Vec<(String, Option<String>)> {
     env.iter()
         .map(|(k, v)| {
             let old = std::env::var(k).ok();
-            // SAFETY: single-threaded shell
-            unsafe { std::env::set_var(k, v) };
+            crate::shell_setenv(k, v);
             (k.clone(), old)
         })
         .collect()
@@ -60,12 +59,19 @@ fn set_env_temp(env: &[(String, String)]) -> Vec<(String, Option<String>)> {
 /// Restore env vars saved by set_env_temp.
 fn restore_env(saved: &[(String, Option<String>)]) {
     for (k, old) in saved {
-        // SAFETY: single-threaded shell
         match old {
-            Some(v) => unsafe { std::env::set_var(k, v) },
-            None => unsafe { std::env::remove_var(k) },
+            Some(v) => crate::shell_setenv(k, v),
+            None => crate::shell_unsetenv(k),
         }
     }
+}
+
+/// A single command in an expanded pipeline, ready for execution.
+struct ExpandedCommand {
+    argv: Vec<String>,
+    redirects: Vec<Redirect>,
+    pipe_stderr: bool,
+    env: Vec<(String, String)>,
 }
 
 fn close_fd(fd: RawFd) {
@@ -195,7 +201,12 @@ fn execute_pipeline(
                         target,
                     });
                 }
-                expanded.push((expanded_argv, redirects, pcmd.pipe_stderr, env));
+                expanded.push(ExpandedCommand {
+                    argv: expanded_argv,
+                    redirects,
+                    pipe_stderr: pcmd.pipe_stderr,
+                    env,
+                });
             }
             Err(e) => {
                 eprintln!("ish: {e}");
@@ -210,14 +221,14 @@ fn execute_pipeline(
 
     // Single command, no pipe: check for builtins that modify state
     if expanded.len() == 1 {
-        let (argv, redirects, _, env) = &expanded[0];
-        let cmd_name = &argv[0];
+        let cmd = &expanded[0];
+        let cmd_name = &cmd.argv[0];
         if builtin::is_special_builtin(cmd_name) {
-            let saved = set_env_temp(env);
+            let saved = set_env_temp(&cmd.env);
             let status = builtin::run_special(
                 cmd_name,
-                &argv[1..],
-                redirects,
+                &cmd.argv[1..],
+                &cmd.redirects,
                 prev_dir,
                 home,
                 job,
@@ -228,8 +239,8 @@ fn execute_pipeline(
         }
         // Output-only builtins as single commands: run in-process too
         if builtin::is_builtin(cmd_name) {
-            let saved = set_env_temp(env);
-            let status = builtin::run_output(cmd_name, &argv[1..], redirects);
+            let saved = set_env_temp(&cmd.env);
+            let status = builtin::run_output(cmd_name, &cmd.argv[1..], &cmd.redirects);
             restore_env(&saved);
             return status;
         }
@@ -242,15 +253,15 @@ fn execute_pipeline(
     let mut pgid: libc::pid_t = 0;
     let cmd_text: String = expanded
         .iter()
-        .map(|(argv, _, _, env)| {
-            let mut parts: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            parts.extend(argv.iter().cloned());
+        .map(|cmd| {
+            let mut parts: Vec<String> = cmd.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            parts.extend(cmd.argv.iter().cloned());
             parts.join(" ")
         })
         .collect::<Vec<_>>()
         .join(" | ");
 
-    for (i, (argv, redirects, pipe_stderr, env)) in expanded.iter().enumerate() {
+    for (i, cmd) in expanded.iter().enumerate() {
         let is_last = i == n - 1;
 
         // Create pipe unless last command (O_CLOEXEC: auto-closed on exec)
@@ -282,10 +293,10 @@ fn execute_pipeline(
                 prev_read,
                 pipe_r,
                 pipe_w,
-                *pipe_stderr,
-                argv,
-                redirects,
-                env,
+                cmd.pipe_stderr,
+                &cmd.argv,
+                &cmd.redirects,
+                &cmd.env,
                 orig_termios,
             );
             // child_setup does not return
@@ -438,7 +449,7 @@ fn child_setup(
 
         // Set prefix environment variables (VAR=VALUE cmd)
         for (name, val) in env {
-            std::env::set_var(name, val);
+            crate::shell_setenv(name, val);
         }
 
         // Pipe: stdin from previous pipe

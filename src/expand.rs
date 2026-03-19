@@ -108,6 +108,91 @@ fn itoa_i32(n: i32, buf: &mut [u8; 12]) -> &str {
     unsafe { std::str::from_utf8_unchecked(&buf[pos..]) }
 }
 
+/// Expand a `${...}` parameter substitution.
+/// `start` points to the first byte after `${` (the variable name).
+/// Returns the number of bytes consumed (from `start` to after the closing `}`).
+fn expand_braced_var(word: &str, bytes: &[u8], start: usize, result: &mut String) -> usize {
+    let mut i = start;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    let name = &word[start..i];
+
+    if i < bytes.len() && bytes[i] == b'}' {
+        // Simple ${VAR}
+        i += 1;
+        if !name.is_empty()
+            && let Ok(val) = std::env::var(name)
+        {
+            result.push_str(&val);
+        }
+        return i - start;
+    }
+
+    if i >= bytes.len() || name.is_empty() {
+        // Malformed — skip to }
+        while i < bytes.len() && bytes[i] != b'}' {
+            i += 1;
+        }
+        if i < bytes.len() {
+            i += 1;
+        }
+        return i - start;
+    }
+
+    // Parameter substitution: find closing }
+    let val = std::env::var(name).ok();
+    let op_start = i;
+    let mut depth = 1u32;
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            0 => i += 2,
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let operand = strip_literal(&word[op_start..i - 1]);
+    let is_set = val.as_ref().is_some_and(|v| !v.is_empty());
+
+    if let Some(default) = operand.strip_prefix(":-") {
+        if is_set {
+            result.push_str(val.as_deref().unwrap());
+        } else {
+            result.push_str(default);
+        }
+    } else if let Some(default) = operand.strip_prefix('-') {
+        match &val {
+            Some(v) => result.push_str(v),
+            None => result.push_str(default),
+        }
+    } else if let Some(alt) = operand.strip_prefix(":+") {
+        if is_set {
+            result.push_str(alt);
+        }
+    } else if let Some(alt) = operand.strip_prefix('+') {
+        if val.is_some() {
+            result.push_str(alt);
+        }
+    } else if let Some(pat) = operand.strip_prefix('#') {
+        if let Some(v) = &val {
+            result.push_str(strip_prefix_glob(v, pat));
+        }
+    } else if let Some(pat) = operand.strip_prefix('%')
+        && let Some(v) = &val
+    {
+        result.push_str(strip_suffix_glob(v, pat));
+    }
+
+    i - start
+}
+
 fn expand_variables(word: &str, last_status: i32) -> String {
     let bytes = word.as_bytes();
     let mut result = String::with_capacity(word.len());
@@ -142,86 +227,8 @@ fn expand_variables(word: &str, last_status: i32) -> String {
                 let s = itoa_i32(last_status, &mut buf);
                 result.push_str(s);
             } else if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                // ${VAR} and ${VAR:-default}, ${VAR:+alt}, ${VAR#prefix}, ${VAR%suffix}
                 i += 2; // skip ${
-                let name_start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                let name = &word[name_start..i];
-                if i < bytes.len() && bytes[i] == b'}' {
-                    // Simple ${VAR}
-                    i += 1;
-                    if !name.is_empty()
-                        && let Ok(val) = std::env::var(name)
-                    {
-                        result.push_str(&val);
-                    }
-                } else if i < bytes.len() && !name.is_empty() {
-                    // Parameter substitution operators
-                    let val = std::env::var(name).ok();
-                    let op_start = i;
-                    // Find closing }
-                    let mut depth = 1u32;
-                    while i < bytes.len() && depth > 0 {
-                        match bytes[i] {
-                            0 => i += 2, // LITERAL + next byte
-                            b'{' => {
-                                depth += 1;
-                                i += 1;
-                            }
-                            b'}' => {
-                                depth -= 1;
-                                i += 1;
-                            }
-                            _ => i += 1,
-                        }
-                    }
-                    let operand = strip_literal(&word[op_start..i - 1]);
-                    let is_set = val.as_ref().is_some_and(|v| !v.is_empty());
-                    if let Some(default) = operand.strip_prefix(":-") {
-                        // ${VAR:-default} — use default if unset or empty
-                        if is_set {
-                            result.push_str(val.as_deref().unwrap());
-                        } else {
-                            result.push_str(default);
-                        }
-                    } else if let Some(default) = operand.strip_prefix('-') {
-                        // ${VAR-default} — use default if unset (empty counts as set)
-                        match &val {
-                            Some(v) => result.push_str(v),
-                            None => result.push_str(default),
-                        }
-                    } else if let Some(alt) = operand.strip_prefix(":+") {
-                        // ${VAR:+alt} — use alt if set and non-empty
-                        if is_set {
-                            result.push_str(alt);
-                        }
-                    } else if let Some(alt) = operand.strip_prefix('+') {
-                        // ${VAR+alt} — use alt if set (even if empty)
-                        if val.is_some() {
-                            result.push_str(alt);
-                        }
-                    } else if let Some(pat) = operand.strip_prefix('#') {
-                        // ${VAR#prefix} — remove shortest prefix match
-                        if let Some(v) = &val {
-                            result.push_str(strip_prefix_glob(v, pat));
-                        }
-                    } else if let Some(pat) = operand.strip_prefix('%') {
-                        // ${VAR%suffix} — remove shortest suffix match
-                        if let Some(v) = &val {
-                            result.push_str(strip_suffix_glob(v, pat));
-                        }
-                    }
-                } else {
-                    // Malformed ${...} — skip to } if possible
-                    while i < bytes.len() && bytes[i] != b'}' {
-                        i += 1;
-                    }
-                    if i < bytes.len() {
-                        i += 1;
-                    }
-                }
+                i += expand_braced_var(word, bytes, i, &mut result);
             } else {
                 // $NAME — bare variable name
                 i += 1;

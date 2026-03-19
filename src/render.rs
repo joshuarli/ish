@@ -10,11 +10,19 @@ pub struct PromptInfo {
     pub cursor_col: u16,
 }
 
+/// Optional display hints for render_line.
+#[derive(Default)]
+pub struct RenderOpts<'a> {
+    /// Color the command word: Some(true) = green, Some(false) = red, None = no color.
+    pub cmd_color: Option<bool>,
+    /// Autosuggestion ghost text to show after the cursor.
+    pub suggestion: &'a str,
+}
+
 /// Render the prompt + line buffer. Positions cursor correctly.
 /// `prev_cursor_row` is the cursor row from the previous render — needed to
 /// move back to the top of the prompt area before clearing.
 /// Returns prompt geometry so completion rendering can restore cursor.
-#[allow(clippy::too_many_arguments)]
 pub fn render_line(
     tw: &mut TermWriter,
     prompt: &str,
@@ -22,8 +30,7 @@ pub fn render_line(
     line: &LineBuffer,
     term_cols: u16,
     prev_cursor_row: u16,
-    cmd_color: Option<bool>,
-    suggestion: &str,
+    opts: &RenderOpts,
 ) -> PromptInfo {
     tw.hide_cursor();
     tw.move_cursor_up(prev_cursor_row);
@@ -34,7 +41,7 @@ pub fn render_line(
 
     // Write line text with optional command-word coloring
     let text = line.text();
-    match cmd_color {
+    match opts.cmd_color {
         Some(valid) => {
             let color = if valid { "\x1b[32m" } else { "\x1b[31m" };
             let first_end = text.find(|c: char| c.is_whitespace()).unwrap_or(text.len());
@@ -47,13 +54,13 @@ pub fn render_line(
     }
 
     // Autosuggestion ghost text (dim gray, after line content)
-    let suggestion_display_len = if suggestion.is_empty() {
+    let suggestion_display_len = if opts.suggestion.is_empty() {
         0
     } else {
         tw.write_str("\x1b[38;5;8m");
-        tw.write_str(suggestion);
+        tw.write_str(opts.suggestion);
         tw.write_str("\x1b[0m");
-        suggestion.len()
+        opts.suggestion.len()
     };
 
     // Calculate cursor position

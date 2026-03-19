@@ -1,3 +1,13 @@
+/// Set an environment variable. Single-threaded shell -- always safe.
+pub fn shell_setenv(key: &str, val: &str) {
+    unsafe { std::env::set_var(key, val) }
+}
+
+/// Remove an environment variable. Single-threaded shell -- always safe.
+pub fn shell_unsetenv(key: &str) {
+    unsafe { std::env::remove_var(key) }
+}
+
 pub mod alias;
 pub mod builtin;
 pub mod complete;

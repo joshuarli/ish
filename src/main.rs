@@ -104,14 +104,13 @@ fn main() {
     let cli = parse_args();
 
     // Set $SHELL to ish binary path
-    // SAFETY: single-threaded shell, no other threads reading env
     if let Ok(exe) = std::env::current_exe() {
-        unsafe { std::env::set_var("SHELL", exe) };
+        ish::shell_setenv("SHELL", &exe.to_string_lossy());
     }
 
     // Set $PWD — parent process (terminal emulator) may not provide it
     if let Ok(cwd) = std::env::current_dir() {
-        unsafe { std::env::set_var("PWD", cwd) };
+        ish::shell_setenv("PWD", &cwd.to_string_lossy());
     }
 
     // Save original termios
@@ -193,146 +192,148 @@ fn main() {
 
                 match parse::parse(&line) {
                     Ok(cmdline) => {
-                        // Handle alias builtin specially
-                        if cmdline.segments.len() == 1 && cmdline.segments[0].0.commands.len() == 1
-                        {
-                            let cmd = &cmdline.segments[0].0.commands[0].cmd;
-                            // Skip leading NAME=VALUE assignments to find the command word
-                            let first = cmd
-                                .argv
-                                .iter()
-                                .map(|s| parse::unescape(s))
-                                .find(|s| exec::var_assignment_pos(s).is_none())
-                                .unwrap_or_default();
-                            if first == "source" || first == "." {
-                                eprintln!("ish: {first}: sourcing is not supported");
-                                shell.last_status = 1;
-                                continue;
-                            }
-
-                            if first == "alias" {
-                                let args: Vec<String> =
-                                    cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
-                                if args.len() >= 2 {
-                                    let name = args[0].clone();
-                                    let expansion = args[1..].to_vec();
-                                    shell.aliases.set(name, expansion);
-                                    shell.last_status = 0;
-                                } else if args.len() == 1 {
-                                    // Show alias
-                                    if let Some(exp) = shell.aliases.get(&args[0]) {
-                                        println!("alias {} {}", args[0], exp.join(" "));
-                                    } else {
-                                        eprintln!("ish: alias: not found: {}", args[0]);
+                        // Single simple command: handle shell-level builtins
+                        let handled = cmdline.segments.len() == 1
+                            && cmdline.segments[0].0.commands.len() == 1
+                            && {
+                                let cmd = &cmdline.segments[0].0.commands[0].cmd;
+                                // Skip leading NAME=VALUE assignments to find the command word
+                                let first = cmd
+                                    .argv
+                                    .iter()
+                                    .map(|s| parse::unescape(s))
+                                    .find(|s| exec::var_assignment_pos(s).is_none())
+                                    .unwrap_or_default();
+                                match first.as_str() {
+                                    "source" | "." => {
+                                        eprintln!("ish: {first}: sourcing is not supported");
                                         shell.last_status = 1;
+                                        true
                                     }
-                                } else {
-                                    // List all aliases
-                                    for (name, exp) in shell.aliases.iter() {
-                                        println!("alias {name} {}", exp.join(" "));
+                                    "alias" => {
+                                        let args: Vec<String> = cmd.argv[1..]
+                                            .iter()
+                                            .map(|s| parse::unescape(s))
+                                            .collect();
+                                        if args.len() >= 2 {
+                                            let name = args[0].clone();
+                                            let expansion = args[1..].to_vec();
+                                            shell.aliases.set(name, expansion);
+                                            shell.last_status = 0;
+                                        } else if args.len() == 1 {
+                                            if let Some(exp) = shell.aliases.get(&args[0]) {
+                                                println!("alias {} {}", args[0], exp.join(" "));
+                                            } else {
+                                                eprintln!("ish: alias: not found: {}", args[0]);
+                                                shell.last_status = 1;
+                                            }
+                                        } else {
+                                            for (name, exp) in shell.aliases.iter() {
+                                                println!("alias {name} {}", exp.join(" "));
+                                            }
+                                            shell.last_status = 0;
+                                        }
+                                        true
                                     }
-                                    shell.last_status = 0;
-                                }
-                                continue;
-                            }
-
-                            // Handle `exit` with exit_warned logic
-                            if first == "exit" {
-                                if shell.job.is_some() {
-                                    if shell.exit_warned {
-                                        if let Some(job) = shell.job.take() {
-                                            // SAFETY: Send SIGTERM to job's pgid before exit.
-                                            unsafe {
-                                                libc::killpg(job.pgid, libc::SIGTERM);
+                                    "exit" => {
+                                        if shell.job.is_some() {
+                                            if shell.exit_warned {
+                                                if let Some(job) = shell.job.take() {
+                                                    // SAFETY: Send SIGTERM to job's pgid before exit.
+                                                    unsafe {
+                                                        libc::killpg(job.pgid, libc::SIGTERM);
+                                                    }
+                                                }
+                                                break;
+                                            } else {
+                                                eprintln!(
+                                                    "ish: there is a suspended job. Exit again to force quit."
+                                                );
+                                                shell.exit_warned = true;
+                                                shell.last_status = 1;
+                                                true
+                                            }
+                                        } else {
+                                            let code: i32 = cmd
+                                                .argv
+                                                .get(1)
+                                                .map(|s| parse::unescape(s))
+                                                .and_then(|s| s.parse().ok())
+                                                .unwrap_or(0);
+                                            shell.history.save_cache();
+                                            std::process::exit(code);
+                                        }
+                                    }
+                                    "history" => {
+                                        let sub = cmd.argv.get(1).map(|s| parse::unescape(s));
+                                        match sub.as_deref() {
+                                            None => {
+                                                for i in 0..shell.history.len() {
+                                                    println!("{}", shell.history.get(i));
+                                                }
+                                                shell.last_status = 0;
+                                            }
+                                            Some("compact") => {
+                                                shell.history.compact();
+                                                shell.last_status = 0;
+                                            }
+                                            Some(other) => {
+                                                eprintln!(
+                                                    "ish: history: unknown subcommand: {other}"
+                                                );
+                                                shell.last_status = 1;
                                             }
                                         }
-                                        break;
-                                    } else {
-                                        eprintln!(
-                                            "ish: there is a suspended job. Exit again to force quit."
-                                        );
-                                        shell.exit_warned = true;
-                                        shell.last_status = 1;
-                                        continue;
+                                        true
                                     }
-                                }
-                                let code: i32 = cmd
-                                    .argv
-                                    .get(1)
-                                    .map(|s| parse::unescape(s))
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0);
-                                shell.history.save_cache();
-                                std::process::exit(code);
-                            }
-
-                            // Handle `history` builtin
-                            if first == "history" {
-                                let sub = cmd.argv.get(1).map(|s| parse::unescape(s));
-                                match sub.as_deref() {
-                                    None => {
-                                        for i in 0..shell.history.len() {
-                                            println!("{}", shell.history.get(i));
+                                    "copy-scrollback" => {
+                                        use std::io::Write;
+                                        let encoded = base64_encode(shell.session_log.as_bytes());
+                                        let osc = format!("\x1b]52;c;{encoded}\x07");
+                                        let _ = std::io::stdout().write_all(osc.as_bytes());
+                                        let _ = std::io::stdout().flush();
+                                        shell.last_status = 0;
+                                        true
+                                    }
+                                    "denv" if *shell.denv_active.get_or_insert_with(denv::init) => {
+                                        let args: Vec<String> = cmd.argv[1..]
+                                            .iter()
+                                            .map(|s| parse::unescape(s))
+                                            .collect();
+                                        if let Some(_path_modified) = denv::command(&args) {
+                                            shell.last_status = 0;
+                                            true
+                                        } else {
+                                            false // not allow/deny/reload — fall through to exec
                                         }
-                                        shell.last_status = 0;
                                     }
-                                    Some("compact") => {
-                                        shell.history.compact();
-                                        shell.last_status = 0;
+                                    "fg" => {
+                                        let (status, cont) = exec::resume_job(&mut shell.job);
+                                        shell.last_status = status;
+                                        run_continuation(&mut shell, cont);
+                                        true
                                     }
-                                    Some(other) => {
-                                        eprintln!("ish: history: unknown subcommand: {other}");
-                                        shell.last_status = 1;
+                                    "w" | "which" | "type" => {
+                                        let args: Vec<String> = cmd.argv[1..]
+                                            .iter()
+                                            .map(|s| parse::unescape(s))
+                                            .collect();
+                                        if let Some(name) = args.first()
+                                            && let Some(exp) = shell.aliases.get(name.as_str())
+                                        {
+                                            println!("alias: {} {}", name, exp.join(" "));
+                                            shell.last_status = 0;
+                                            true
+                                        } else {
+                                            false // fall through to exec for builtin/PATH check
+                                        }
                                     }
+                                    _ => false,
                                 }
-                                continue;
-                            }
+                            };
 
-                            // Handle `copy-scrollback` — OSC 52 clipboard
-                            if first == "copy-scrollback" {
-                                use std::io::Write;
-                                let encoded = base64_encode(shell.session_log.as_bytes());
-                                let osc = format!("\x1b]52;c;{encoded}\x07");
-                                let _ = std::io::stdout().write_all(osc.as_bytes());
-                                let _ = std::io::stdout().flush();
-                                shell.last_status = 0;
-                                continue;
-                            }
-
-                            // Handle `denv allow|deny|reload` — apply output to env
-                            if first == "denv" && *shell.denv_active.get_or_insert_with(denv::init)
-                            {
-                                let args: Vec<String> =
-                                    cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
-                                if let Some(_path_modified) = denv::command(&args) {
-                                    shell.last_status = 0;
-                                    continue;
-                                }
-                                // Not allow/deny/reload — fall through to normal exec
-                            }
-
-                            // Handle `fg` with continuation support
-                            if first == "fg" {
-                                let (status, cont) = exec::resume_job(&mut shell.job);
-                                shell.last_status = status;
-                                // Execute remaining segments from compound command
-                                run_continuation(&mut shell, cont);
-                                continue;
-                            }
-
-                            // Handle `w`/`which`/`type` with alias awareness
-                            if first == "w" || first == "which" || first == "type" {
-                                let args: Vec<String> =
-                                    cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
-                                if let Some(name) = args.first()
-                                    && let Some(exp) = shell.aliases.get(name.as_str())
-                                {
-                                    println!("alias: {} {}", name, exp.join(" "));
-                                    shell.last_status = 0;
-                                    continue;
-                                }
-                                // Fall through to normal exec for builtin/PATH check
-                            }
+                        if handled {
+                            continue;
                         }
 
                         // Handle cd specially to invalidate prompt git cache
@@ -447,8 +448,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
         &line,
         shell.cols,
         0,
-        None,
-        "",
+        &render::RenderOpts::default(),
     );
     let mut cursor_row = info.cursor_row;
     let _ = tw.flush_to_stdout();
@@ -466,7 +466,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                 if let Mode::Normal = &mode {
                     let (p, pdl) = active_prompt(&prompt_str, prompt_display_len, &full_input);
                     let info = render::render_line(
-                        &mut tw, p, pdl, &line, shell.cols, cursor_row, None, "",
+                        &mut tw,
+                        p,
+                        pdl,
+                        &line,
+                        shell.cols,
+                        cursor_row,
+                        &render::RenderOpts::default(),
                     );
                     cursor_row = info.cursor_row;
                 }
@@ -533,7 +539,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     history_idx = None;
                                     tw.write_str("\r\n");
                                     let info = render::render_line(
-                                        &mut tw, "  ", 2, &line, shell.cols, 0, None, "",
+                                        &mut tw,
+                                        "  ",
+                                        2,
+                                        &line,
+                                        shell.cols,
+                                        0,
+                                        &render::RenderOpts::default(),
                                     );
                                     cursor_row = info.cursor_row;
                                     let _ = tw.flush_to_stdout();
@@ -621,9 +633,12 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     ""
                                 };
 
-                                let info = render::render_line(
-                                    &mut tw, p, pdl, &line, shell.cols, cursor_row, cmd_color,
+                                let opts = render::RenderOpts {
+                                    cmd_color,
                                     suggestion,
+                                };
+                                let info = render::render_line(
+                                    &mut tw, p, pdl, &line, shell.cols, cursor_row, &opts,
                                 );
                                 cursor_row = info.cursor_row;
                             }
@@ -631,7 +646,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 let (p, pdl) =
                                     active_prompt(&prompt_str, prompt_display_len, &full_input);
                                 let info = render::render_line(
-                                    &mut tw, p, pdl, &line, shell.cols, cursor_row, None, "",
+                                    &mut tw,
+                                    p,
+                                    pdl,
+                                    &line,
+                                    shell.cols,
+                                    cursor_row,
+                                    &render::RenderOpts::default(),
                                 );
                                 cursor_row = info.cursor_row;
                                 render::render_completions(&mut tw, state, &info, true);
@@ -647,7 +668,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             CompAction::Navigate => {
                                 // Cursor is on prompt line — repaint grid in-place
                                 let info = render::render_line(
-                                    &mut tw, p, pdl, &line, shell.cols, cursor_row, None, "",
+                                    &mut tw,
+                                    p,
+                                    pdl,
+                                    &line,
+                                    shell.cols,
+                                    cursor_row,
+                                    &render::RenderOpts::default(),
                                 );
                                 cursor_row = info.cursor_row;
                                 render::render_completions(&mut tw, state, &info, false);
@@ -664,7 +691,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     mode = Mode::Normal;
                                 } else if !cs.comp.is_empty() {
                                     let info = render::render_line(
-                                        &mut tw, p, pdl, &line, shell.cols, cursor_row, None, "",
+                                        &mut tw,
+                                        p,
+                                        pdl,
+                                        &line,
+                                        shell.cols,
+                                        cursor_row,
+                                        &render::RenderOpts::default(),
                                     );
                                     cursor_row = info.cursor_row;
                                     render::render_completions(&mut tw, &cs, &info, true);
@@ -690,7 +723,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         // Cursor is on prompt line — render_line's \r + clear_to_end_of_screen
                         // naturally clears the grid below
                         let info = render::render_line(
-                            &mut tw, p, pdl, &line, shell.cols, cursor_row, None, "",
+                            &mut tw,
+                            p,
+                            pdl,
+                            &line,
+                            shell.cols,
+                            cursor_row,
+                            &render::RenderOpts::default(),
                         );
                         cursor_row = info.cursor_row;
                         let _ = tw.flush_to_stdout();
@@ -719,8 +758,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 &line,
                                 shell.cols,
                                 0,
-                                None,
-                                "",
+                                &render::RenderOpts::default(),
                             );
                             cursor_row = info.cursor_row;
                             let _ = tw.flush_to_stdout();
@@ -738,8 +776,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 &line,
                                 shell.cols,
                                 0,
-                                None,
-                                "",
+                                &render::RenderOpts::default(),
                             );
                             cursor_row = info.cursor_row;
                             let _ = tw.flush_to_stdout();

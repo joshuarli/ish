@@ -13,11 +13,8 @@ pub fn init() -> bool {
     }
 
     let pid = std::process::id();
-    // SAFETY: single-threaded shell
-    unsafe {
-        std::env::set_var("__DENV_PID", pid.to_string());
-        std::env::set_var("__DENV_SHELL", "bash");
-    }
+    crate::shell_setenv("__DENV_PID", &pid.to_string());
+    crate::shell_setenv("__DENV_SHELL", "bash");
 
     let data_dir = std::env::var("DENV_DATA_DIR")
         .or_else(|_| std::env::var("XDG_DATA_HOME").map(|d| format!("{d}/denv")))
@@ -25,10 +22,7 @@ pub fn init() -> bool {
             let home = std::env::var("HOME").unwrap_or_default();
             format!("{home}/.local/share/denv")
         });
-    // SAFETY: single-threaded shell
-    unsafe {
-        std::env::set_var("__DENV_SENTINEL", format!("{data_dir}/active_{pid}"));
-    }
+    crate::shell_setenv("__DENV_SENTINEL", &format!("{data_dir}/active_{pid}"));
 
     // Initial export deferred to first cd — avoids startup subprocess.
     true
@@ -230,12 +224,10 @@ fn apply_bash_output(output: &str) {
             if let Some(eq) = rest.find('=') {
                 let key = &rest[..eq];
                 let value = unquote_bash(&rest[eq + 1..]);
-                // SAFETY: single-threaded shell
-                unsafe { std::env::set_var(key, &value) };
+                crate::shell_setenv(key, &value);
             }
         } else if let Some(key) = line.strip_prefix("unset ") {
-            // SAFETY: single-threaded shell
-            unsafe { std::env::remove_var(key.trim()) };
+            crate::shell_unsetenv(key.trim());
         }
     }
 }
@@ -304,12 +296,12 @@ mod tests {
     fn apply_export_sets_var() {
         apply_bash_output("export _DENV_TEST_A='hello_world';");
         assert_eq!(std::env::var("_DENV_TEST_A").unwrap(), "hello_world");
-        unsafe { std::env::remove_var("_DENV_TEST_A") };
+        crate::shell_unsetenv("_DENV_TEST_A");
     }
 
     #[test]
     fn apply_unset_removes_var() {
-        unsafe { std::env::set_var("_DENV_TEST_B", "exists") };
+        crate::shell_setenv("_DENV_TEST_B", "exists");
         apply_bash_output("unset _DENV_TEST_B;");
         assert!(std::env::var("_DENV_TEST_B").is_err());
     }
@@ -322,10 +314,8 @@ mod tests {
         assert_eq!(std::env::var("_DENV_TEST_C").unwrap(), "one");
         assert_eq!(std::env::var("_DENV_TEST_D").unwrap(), "two");
         assert!(std::env::var("_DENV_TEST_E").is_err());
-        unsafe {
-            std::env::remove_var("_DENV_TEST_C");
-            std::env::remove_var("_DENV_TEST_D");
-        }
+        crate::shell_unsetenv("_DENV_TEST_C");
+        crate::shell_unsetenv("_DENV_TEST_D");
     }
 
     #[test]
