@@ -272,9 +272,26 @@ pub fn complete_path_into(partial: &str, dirs_only: bool, comp: &mut Completions
     complete_in_dir(dir, prefix, dirs_only, comp);
 }
 
-/// Complete entries in `dir` whose names start with `prefix`.
-/// Uses libc opendir/readdir + stat directly. Names are appended to the arena.
+/// Complete entries in `dir` matching `prefix`.
+/// Tries exact prefix first; falls back to case-insensitive substring
+/// (like fish) so "tom" matches "Cargo.toml".
 fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completions) {
+    let before = comp.entries.len();
+    complete_in_dir_mode(dir, prefix, dirs_only, comp, false);
+    // Fallback: case-insensitive substring match
+    if comp.entries.len() == before && !prefix.is_empty() {
+        complete_in_dir_mode(dir, prefix, dirs_only, comp, true);
+    }
+}
+
+/// Inner completion with exact-prefix or substring matching.
+fn complete_in_dir_mode(
+    dir: &str,
+    prefix: &str,
+    dirs_only: bool,
+    comp: &mut Completions,
+    substring: bool,
+) {
     let dir_path = if dir.is_empty() { "." } else { dir };
 
     // Build NUL-terminated dir path on stack
@@ -332,8 +349,12 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
         if name_bytes.first() == Some(&b'.') && !prefix_bytes.starts_with(b".") {
             continue;
         }
-        // Filter by prefix
-        if !name_bytes.starts_with(prefix_bytes) {
+        // Filter by prefix or substring
+        if substring {
+            if !contains_icase(name_bytes, prefix_bytes) {
+                continue;
+            }
+        } else if !name_bytes.starts_with(prefix_bytes) {
             continue;
         }
 
@@ -546,6 +567,28 @@ fn resolve_partial_dir(dir: &str) -> Vec<String> {
     results
 }
 
+/// Case-insensitive substring search: does `haystack` contain `needle`?
+fn contains_icase(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    let first = needle[0].to_ascii_lowercase();
+    for i in 0..=(haystack.len() - needle.len()) {
+        if haystack[i].to_ascii_lowercase() == first
+            && haystack[i..i + needle.len()]
+                .iter()
+                .zip(needle)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Split "path/to/pref" into ("path/to/", "pref").
 /// Returns slices — no heap allocation.
 fn split_path(partial: &str) -> (&str, &str) {
@@ -649,6 +692,36 @@ mod tests {
     fn partial_path_nonexistent_returns_empty() {
         let (_comp, groups) = complete_partial_path("./zzzzz/m", false);
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn contains_icase_basic() {
+        assert!(contains_icase(b"Cargo.toml", b"tom"));
+        assert!(contains_icase(b"Cargo.toml", b"TOM"));
+        assert!(contains_icase(b"Cargo.toml", b"cargo"));
+        assert!(contains_icase(b"Cargo.toml", b"Cargo"));
+        assert!(!contains_icase(b"Cargo.toml", b"xyz"));
+        assert!(contains_icase(b"anything", b""));
+        assert!(!contains_icase(b"ab", b"abc"));
+    }
+
+    #[test]
+    fn substring_fallback_finds_toml() {
+        // This repo has Cargo.toml — "tom" should match via substring fallback
+        let comp = complete_path("tom", false);
+        let names: Vec<&str> = (0..comp.len()).map(|i| comp.name(i)).collect();
+        assert!(
+            names.iter().any(|n| n.contains("toml")),
+            "expected Cargo.toml in {names:?}"
+        );
+    }
+
+    #[test]
+    fn prefix_match_preferred_over_substring() {
+        // "src" prefix-matches "src" directly — should not fall back to substring
+        let comp = complete_path("src", false);
+        let names: Vec<&str> = (0..comp.len()).map(|i| comp.name(i)).collect();
+        assert!(names.contains(&"src"), "expected exact 'src' in {names:?}");
     }
 
     #[test]
