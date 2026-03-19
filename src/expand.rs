@@ -448,74 +448,88 @@ fn glob_match(pattern: &str) -> Result<Vec<String>, Error> {
 
     let mut results = vec![base];
 
-    for (idx, seg) in segments[seg_start..].iter().enumerate() {
+    let segs = &segments[seg_start..];
+    let mut idx = 0;
+    while idx < segs.len() {
+        let seg = segs[idx];
         if seg.is_empty() {
+            idx += 1;
             continue;
         }
 
-        let is_last = idx == segments.len() - seg_start - 1;
+        let is_last = idx == segs.len() - 1;
 
-        if *seg == "**" {
-            // Recursive: expand ** to all descendant directories
+        if seg == "**" {
+            // Merge ** with the next segment to avoid double traversal.
+            // e.g. **/foo.rs → recurse into all dirs, match "foo.rs" during the walk.
+            let next_pat = if idx + 1 < segs.len() {
+                idx += 1;
+                segs[idx]
+            } else {
+                "*" // bare ** at end matches everything
+            };
+            let match_is_last = idx == segs.len() - 1;
             let mut new_results = Vec::new();
             for dir in &results {
-                collect_recursive(dir, &mut new_results)?;
+                collect_recursive_match(dir, next_pat, match_is_last, &mut new_results)?;
             }
             results = new_results;
         } else {
             // Match this segment against directory entries
             let mut new_results = Vec::new();
             for dir in &results {
-                if let Ok(entries) = std::fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name();
-                        let name = name.to_string_lossy();
-                        // Skip filenames with control characters
-                        if name.bytes().any(|b| b < b' ' || b == 0x7f) {
-                            continue;
-                        }
-                        // Skip hidden files unless pattern starts with .
-                        if name.starts_with('.') && !seg.starts_with('.') {
-                            continue;
-                        }
-                        if pattern_match(seg, &name) {
-                            let path = if dir == "." {
-                                name.to_string()
-                            } else if dir == "/" {
-                                format!("/{name}")
-                            } else {
-                                format!("{dir}/{name}")
-                            };
-                            // If not last segment, only keep directories.
-                            // Use std::fs::metadata (stat, follows symlinks)
-                            // instead of entry.metadata (lstat) so that
-                            // symlinks to directories like /var → /private/var
-                            // are traversed.
-                            if !is_last {
-                                if std::fs::metadata(&path)
-                                    .map(|m| m.is_dir())
-                                    .unwrap_or(false)
-                                {
-                                    new_results.push(path);
-                                }
-                            } else {
-                                new_results.push(path);
-                            }
-                        }
-                    }
-                }
+                match_segment(dir, seg, is_last, &mut new_results);
             }
             results = new_results;
         }
+        idx += 1;
     }
 
     results.sort();
     Ok(results)
 }
 
-/// Recursively collect all directories from `dir` (including `dir` itself).
-fn collect_recursive(dir: &str, out: &mut Vec<String>) -> Result<(), Error> {
-    out.push(dir.to_string());
+/// Match entries in `dir` against `pattern`, collecting into `out`.
+fn match_segment(dir: &str, pattern: &str, is_last: bool, out: &mut Vec<String>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.bytes().any(|b| b < b' ' || b == 0x7f) {
+                continue;
+            }
+            if name.starts_with('.') && !pattern.starts_with('.') {
+                continue;
+            }
+            if pattern_match(pattern, &name) {
+                let path = join_path(dir, &name);
+                if !is_last {
+                    if std::fs::metadata(&path)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false)
+                    {
+                        out.push(path);
+                    }
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+    }
+}
+
+/// Recursively walk directories from `dir`, matching `pattern` at every level.
+/// This merges the ** traversal with the next segment's matching in one pass.
+fn collect_recursive_match(
+    dir: &str,
+    pattern: &str,
+    is_last: bool,
+    out: &mut Vec<String>,
+) -> Result<(), Error> {
+    // Match in current directory
+    match_segment(dir, pattern, is_last, out);
+
+    // Recurse into subdirectories
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -524,43 +538,56 @@ fn collect_recursive(dir: &str, out: &mut Vec<String>) -> Result<(), Error> {
                 if name.starts_with('.') || name.bytes().any(|b| b < b' ' || b == 0x7f) {
                     continue;
                 }
-                let child = if dir == "." {
-                    name.to_string()
-                } else {
-                    format!("{dir}/{name}")
-                };
-                collect_recursive(&child, out)?;
+                let child = join_path(dir, &name);
+                collect_recursive_match(&child, pattern, is_last, out)?;
             }
         }
     }
     Ok(())
 }
 
-/// Simple glob pattern matching: * matches any chars, ? matches one char.
-/// Operates on bytes for speed (filenames are almost always ASCII).
-fn pattern_match(pattern: &str, name: &str) -> bool {
-    pattern_match_bytes(pattern.as_bytes(), name.as_bytes(), 0, 0)
+fn join_path(dir: &str, name: &str) -> String {
+    if dir == "." {
+        name.to_string()
+    } else if dir == "/" {
+        format!("/{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
 }
 
-fn pattern_match_bytes(p: &[u8], n: &[u8], pi: usize, ni: usize) -> bool {
-    if pi == p.len() {
-        return ni == n.len();
-    }
-    if p[pi] == b'*' {
-        for k in ni..=n.len() {
-            if pattern_match_bytes(p, n, pi + 1, k) {
-                return true;
-            }
+/// Simple glob pattern matching: * matches any chars, ? matches one char.
+/// Iterative algorithm — O(n*m) worst case, no recursion, no stack overflow.
+pub fn pattern_match(pattern: &str, name: &str) -> bool {
+    let p = pattern.as_bytes();
+    let n = name.as_bytes();
+    let mut pi = 0;
+    let mut ni = 0;
+    let mut star_pi = usize::MAX; // pattern pos after last *
+    let mut star_ni = 0; // name pos to retry from
+
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_pi = pi + 1;
+            star_ni = ni;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            // Backtrack: let the last * consume one more char
+            star_ni += 1;
+            ni = star_ni;
+            pi = star_pi;
+        } else {
+            return false;
         }
-        return false;
     }
-    if ni >= n.len() {
-        return false;
+    // Consume trailing *s
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
     }
-    if p[pi] == b'?' || p[pi] == n[ni] {
-        return pattern_match_bytes(p, n, pi + 1, ni + 1);
-    }
-    false
+    pi == p.len()
 }
 
 #[cfg(test)]

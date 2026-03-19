@@ -46,3 +46,13 @@ doc = false
 name = "fuzz_math"
 path = "fuzz_targets/fuzz_math.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_glob"
+path = "fuzz_targets/fuzz_glob.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_input"
+path = "fuzz_targets/fuzz_input.rs"
+doc = false

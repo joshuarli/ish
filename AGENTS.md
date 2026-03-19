@@ -187,6 +187,8 @@ The PTY harness (`PtyShell`) uses `openpty()` + `fork()` to create an isolated t
 - `fuzz_config` — Config parsing functions never panic
 - `fuzz_history` — Fuzzy match positions valid and ascending
 - `fuzz_math` — Expression evaluator never panics, no stack overflow on deep nesting
+- `fuzz_glob` — Glob pattern matching terminates in bounded time, no stack overflow
+- `fuzz_input` — Full parse → expand pipeline never panics on any input
 
 ### Benchmarks (`benches/bench.rs`)
 Criterion benchmarks with a custom counting allocator that tracks heap allocations and bytes. Covers: parsing, expansion, line buffer ops, history search, completion grid + sort, prompt rendering, end-to-end parse+expand, PATH lookup, alias lookup, `ls` builtin, filesystem completion, and denv output parsing. Includes an allocation audit section that prints cold and warm (pooled buffer) allocation counts — warm paths should show 0 allocs.

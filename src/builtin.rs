@@ -83,8 +83,25 @@ pub fn run_special(
 pub fn run_output(name: &str, args: &[String], _redirects: &[Redirect]) -> i32 {
     match name {
         "l" => {
-            let path = args.first().map(|s| s.as_str()).unwrap_or(".");
-            ls::list_dir(path)
+            if args.is_empty() {
+                ls::list_dir(".")
+            } else {
+                let mut status = 0;
+                let label = args.len() > 1;
+                for (i, arg) in args.iter().enumerate() {
+                    if label {
+                        if i > 0 {
+                            println!();
+                        }
+                        println!("{arg}:");
+                    }
+                    let s = ls::list_dir(arg);
+                    if s != 0 {
+                        status = s;
+                    }
+                }
+                status
+            }
         }
         "c" => {
             // Clear screen
