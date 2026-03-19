@@ -31,20 +31,25 @@ pub struct History {
     /// Hash index for O(1) duplicate checks in add().
     hashes: HashSet<u64>,
     path: PathBuf,
+    /// Byte offset into the text file we've read up to. Enables incremental
+    /// sync — only new bytes appended by other shells are read.
+    file_pos: u64,
 }
 
 impl History {
     pub fn load() -> Self {
         let path = history_path();
 
-        // Try loading binary cache, then merge any new entries from the text file
+        // Try loading binary cache, then sync any new entries from the text file
         if let Some(mut hist) = Self::load_from_cache(&path) {
-            hist.merge_text_tail();
+            // file_pos starts at 0 — sync reads the entire text tail
+            hist.sync();
             return hist;
         }
 
         // No cache or corrupt — full text parse, then write cache + truncate text
-        let hist = Self::load_from_text(&path);
+        let mut hist = Self::load_from_text(&path);
+        hist.file_pos = fs::metadata(&hist.path).map(|m| m.len()).unwrap_or(0);
         if !hist.offsets.is_empty() {
             hist.save_cache();
         }
@@ -100,6 +105,7 @@ impl History {
             timestamps,
             hashes,
             path: path.to_path_buf(),
+            file_pos: 0,
         }
     }
 
@@ -177,48 +183,75 @@ impl History {
             timestamps,
             hashes,
             path: path.to_path_buf(),
+            file_pos: 0,
         })
     }
 
-    /// Merge new entries from the text file (appended since last cache build).
-    /// Deduplicates against existing hashes. Text entries win over cache
-    /// entries (they're newer).
-    fn merge_text_tail(&mut self) {
-        let data = match fs::read(&self.path) {
-            Ok(d) if !d.is_empty() => d,
-            _ => return,
+    /// Read new entries appended to the text file by other shell instances.
+    /// One stat() call to check for growth; reads only the new tail bytes.
+    /// Called at each prompt and before Ctrl+R history search.
+    pub fn sync(&mut self) {
+        let file_size = match fs::metadata(&self.path) {
+            Ok(m) => m.len(),
+            Err(_) => return,
         };
 
-        let ts = now_secs();
+        if file_size == self.file_pos {
+            return; // fast path: nothing new
+        }
 
-        // Parse tail entries — these are newer, so they take priority
-        for chunk in data.split(|&b| b == b'\n') {
-            if let Ok(line) = std::str::from_utf8(chunk)
-                && !line.is_empty()
-            {
-                let h = hash_str(line);
-                if self.hashes.contains(&h) {
-                    // Duplicate — remove old occurrence, add at end
-                    let mut i = 0;
-                    while i < self.offsets.len() {
-                        let (start, len) = self.offsets[i];
-                        if &self.arena[start as usize..start as usize + len as usize] == line {
-                            self.offsets.remove(i);
-                            self.hash_vec.remove(i);
-                            self.timestamps.remove(i);
-                        } else {
-                            i += 1;
-                        }
+        if file_size < self.file_pos {
+            // File was truncated (compacted by another shell). Our in-memory
+            // entries are still valid — just reset the read position.
+            self.file_pos = file_size;
+            return;
+        }
+
+        // Read only the new tail
+        let mut f = match fs::File::open(&self.path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        use std::io::{Read, Seek, SeekFrom};
+        if f.seek(SeekFrom::Start(self.file_pos)).is_err() {
+            return;
+        }
+
+        let mut tail = String::new();
+        if f.read_to_string(&mut tail).is_err() {
+            return;
+        }
+
+        let ts = now_secs();
+        for line in tail.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let h = hash_str(line);
+            if self.hashes.contains(&h) {
+                // Duplicate — remove old occurrence, re-add at end
+                let mut i = 0;
+                while i < self.offsets.len() {
+                    let (start, len) = self.offsets[i];
+                    if &self.arena[start as usize..start as usize + len as usize] == line {
+                        self.offsets.remove(i);
+                        self.hash_vec.remove(i);
+                        self.timestamps.remove(i);
+                    } else {
+                        i += 1;
                     }
                 }
-                let start = self.arena.len() as u32;
-                self.arena.push_str(line);
-                self.offsets.push((start, line.len() as u16));
-                self.hash_vec.push(h);
-                self.timestamps.push(ts);
-                self.hashes.insert(h);
             }
+            let start = self.arena.len() as u32;
+            self.arena.push_str(line);
+            self.offsets.push((start, line.len() as u16));
+            self.hash_vec.push(h);
+            self.timestamps.push(ts);
+            self.hashes.insert(h);
         }
+
+        self.file_pos = file_size;
     }
 
     /// Write binary cache (v2 with timestamps), then truncate text file.
@@ -299,7 +332,8 @@ impl History {
         }
 
         // Re-read text tail from other shells, merge into our state
-        self.merge_text_tail();
+        self.file_pos = 0;
+        self.sync();
 
         // save_cache writes cache + truncates text file
         self.save_cache();
@@ -331,6 +365,7 @@ impl History {
             timestamps,
             hashes,
             path: PathBuf::from("/dev/null"),
+            file_pos: 0,
         }
     }
 
@@ -471,7 +506,7 @@ impl History {
         &self.arena[start as usize..start as usize + len as usize]
     }
 
-    fn append_to_file(&self, line: &str) {
+    fn append_to_file(&mut self, line: &str) {
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -481,6 +516,10 @@ impl History {
             .open(&self.path)
         {
             let _ = writeln!(f, "{line}");
+            // Update file_pos so sync() doesn't re-read our own write
+            if let Ok(m) = f.metadata() {
+                self.file_pos = m.len();
+            }
         }
     }
 }

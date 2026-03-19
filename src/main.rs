@@ -167,6 +167,7 @@ fn main() {
 
     // Main loop
     loop {
+        shell.history.sync();
         match read_line(&mut shell) {
             ReadResult::Line(line) => {
                 if line.trim().is_empty() {
@@ -574,6 +575,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     }
                                 }
                                 KeyAction::StartHistorySearch => {
+                                    shell.history.sync();
                                     saved_line = line.text().to_string();
                                     let mut matches = std::mem::take(&mut shell.match_buf);
                                     shell.history.fuzzy_search_into("", &mut matches, 200);
