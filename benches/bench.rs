@@ -976,6 +976,95 @@ fn bench_startup(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Autosuggestion + command coloring benchmarks
+// ---------------------------------------------------------------------------
+
+fn bench_autosuggestion(c: &mut Criterion) {
+    let mut group = c.benchmark_group("autosuggestion");
+
+    let entries = synthetic_history_45k();
+    let history = History::from_entries(entries);
+
+    // Typical case: user typed a few chars, suggestion found quickly
+    group.bench_function("prefix_search_hit", |b| {
+        b.iter(|| {
+            let entry = history.prefix_search("git commit", 0);
+            let suffix = entry.and_then(|e| e.strip_prefix("git commit"));
+            black_box(suffix);
+        });
+    });
+
+    // Worst case: no match, scans all 45k entries
+    group.bench_function("prefix_search_miss", |b| {
+        b.iter(|| {
+            black_box(history.prefix_search("zzzznotfound", 0));
+        });
+    });
+
+    // Verify zero allocations for a suggestion hit
+    group.bench_function("prefix_search_allocs", |b| {
+        b.iter(|| {
+            let stats = measure_allocs(|| {
+                let entry = history.prefix_search("git commit", 0);
+                let suffix = entry.and_then(|e| e.strip_prefix("git commit"));
+                black_box(suffix);
+            });
+            assert_eq!(stats.count, 0, "autosuggestion should be zero-alloc");
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_command_coloring(c: &mut Criterion) {
+    let mut group = c.benchmark_group("command_coloring");
+
+    let mut cache = exec::PathCache::new();
+
+    // First call rebuilds the cache — measure that separately
+    group.bench_function("path_cache_rebuild", |b| {
+        b.iter(|| {
+            let mut fresh = exec::PathCache::new();
+            black_box(fresh.contains("ls"));
+        });
+    });
+
+    // Warm the cache, then measure O(1) lookups
+    cache.contains("ls"); // force rebuild
+
+    group.bench_function("path_cache_hit", |b| {
+        b.iter(|| black_box(cache.contains("ls")));
+    });
+
+    group.bench_function("path_cache_miss", |b| {
+        b.iter(|| black_box(cache.contains("zzzznotacommand")));
+    });
+
+    // Verify zero allocations for a cached lookup
+    group.bench_function("path_cache_allocs", |b| {
+        b.iter(|| {
+            let stats = measure_allocs(|| {
+                black_box(cache.contains("git"));
+            });
+            assert_eq!(stats.count, 0, "cached lookup should be zero-alloc");
+        });
+    });
+
+    // Full per-keystroke cost: builtin check + alias check + path cache
+    let aliases = AliasMap::new();
+    group.bench_function("full_cmd_check", |b| {
+        b.iter(|| {
+            let cmd = "git";
+            let valid =
+                ish::builtin::is_builtin(cmd) || aliases.get(cmd).is_some() || cache.contains(cmd);
+            black_box(valid);
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 
 fn fast_config() -> Criterion {
     Criterion::default()
@@ -1004,5 +1093,7 @@ criterion_group!(
         bench_completion_fs,
         bench_denv,
         bench_alloc_audit,
+        bench_autosuggestion,
+        bench_command_coloring,
 );
 criterion_main!(benches);

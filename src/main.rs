@@ -606,7 +606,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
 
                                 // Autosuggestion: gray ghost from history
                                 let text = line.text();
-                                let suggestion = if !text.is_empty()
+                                let suggestion = if text.len() >= 3
                                     && full_input.is_empty()
                                     && line.cursor() == text.len()
                                 {
