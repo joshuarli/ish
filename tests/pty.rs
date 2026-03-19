@@ -850,6 +850,103 @@ fn alias_expansion() {
 }
 
 #[test]
+fn alias_self_referencing_no_reexpand() {
+    let sh = PtyShell::spawn();
+    sh.run_command("alias rg rg --hidden -S -g !.git");
+    // Type "rg" then space — should expand once
+    sh.type_str("rg");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    sh.type_str(" ");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let after_first = sh.read_timeout(300);
+    let first_text = PtyShell::strip_ansi(&after_first);
+    eprintln!("AFTER FIRST SPACE: {first_text:?}");
+    // Type another space — should NOT re-expand
+    sh.type_str(" ");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let after_second = sh.read_timeout(300);
+    let second_text = PtyShell::strip_ansi(&after_second);
+    eprintln!("AFTER SECOND SPACE: {second_text:?}");
+    // Cancel the line
+    sh.ctrl_c();
+    sh.wait_for_prompt(2000);
+
+    // After first space: should see expanded form
+    assert!(
+        first_text.contains("rg --hidden -S -g !.git"),
+        "expected alias expansion on first space: {first_text:?}"
+    );
+    // After second space: line should be identical (just one more trailing space).
+    // The expansion "rg --hidden -S -g !.git" should appear exactly once.
+    let count = second_text.matches("--hidden").count();
+    assert!(
+        count <= 1,
+        "alias re-expanded on second space (--hidden appears {count} times): {second_text:?}"
+    );
+}
+
+#[test]
+fn alias_self_referencing_from_config() {
+    let config = "alias rg rg --hidden -S -g !.git\n";
+    let sh = PtyShell::spawn_with_opts(&[(".config/ish/config.ish", config)], &[]);
+    // Type "rg" then space — should expand once
+    sh.type_str("rg");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    sh.type_str(" ");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let after_first = sh.read_timeout(300);
+    let first_text = PtyShell::strip_ansi(&after_first);
+    eprintln!("CONFIG AFTER FIRST SPACE: {first_text:?}");
+    // Type another space
+    sh.type_str(" ");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let after_second = sh.read_timeout(300);
+    let second_text = PtyShell::strip_ansi(&after_second);
+    eprintln!("CONFIG AFTER SECOND SPACE: {second_text:?}");
+    // Third space
+    sh.type_str(" ");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let after_third = sh.read_timeout(300);
+    let third_text = PtyShell::strip_ansi(&after_third);
+    eprintln!("CONFIG AFTER THIRD SPACE: {third_text:?}");
+    sh.ctrl_c();
+    sh.wait_for_prompt(2000);
+
+    assert!(
+        first_text.contains("rg --hidden -S -g !.git"),
+        "expected alias expansion on first space: {first_text:?}"
+    );
+    let count = second_text.matches("--hidden").count();
+    assert!(
+        count <= 1,
+        "config alias re-expanded on second space (--hidden appears {count} times): {second_text:?}"
+    );
+    let count = third_text.matches("--hidden").count();
+    assert!(
+        count <= 1,
+        "config alias re-expanded on third space (--hidden appears {count} times): {third_text:?}"
+    );
+}
+
+#[test]
+fn alias_self_referencing_exec() {
+    let sh = PtyShell::spawn();
+    sh.run_command("alias myecho echo --verbose");
+    // Run the alias — should expand once, not double
+    let out = sh.run_command("myecho hello");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("--verbose hello"),
+        "expected single expansion: {text:?}"
+    );
+    // Should NOT have doubled --verbose
+    assert!(
+        !text.contains("--verbose --verbose"),
+        "alias double-expanded at exec: {text:?}"
+    );
+}
+
+#[test]
 fn alias_list() {
     let sh = PtyShell::spawn();
     sh.run_command("alias myalias echo test");

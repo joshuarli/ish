@@ -807,8 +807,12 @@ fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
     let trimmed = line.trim();
     let first_word = trimmed.split_whitespace().next().unwrap_or("");
     if let Some(expansion) = aliases.get(first_word) {
+        let expanded_str = expansion.join(" ");
+        if trimmed.starts_with(&expanded_str) {
+            return line.to_string();
+        }
         let rest = &trimmed[first_word.len()..];
-        format!("{}{rest}", expansion.join(" "))
+        format!("{expanded_str}{rest}")
     } else {
         line.to_string()
     }
@@ -970,14 +974,16 @@ fn navigate_history(
 }
 
 fn try_alias_expand(line: &mut LineBuffer, aliases: &AliasMap) {
-    let text = line.text().to_string();
-    let first_word = match text.split_whitespace().next() {
-        Some(w) => w.to_string(),
-        None => return,
-    };
+    let text = line.text();
+    // Only expand on the first space — if the trimmed text already contains
+    // a space, the alias was already expanded or the user typed arguments.
+    let trimmed = text.trim_end();
+    if trimmed.contains(' ') {
+        return;
+    }
 
-    if let Some(expansion) = aliases.get(&first_word) {
-        let rest = &text[first_word.len()..];
+    if let Some(expansion) = aliases.get(trimmed) {
+        let rest = &text[trimmed.len()..];
         let expanded_str = expansion.join(" ");
         let new_text = format!("{expanded_str}{rest}");
         line.set(&new_text);

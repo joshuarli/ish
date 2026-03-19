@@ -253,9 +253,12 @@ fn execute_pipeline(
         if let Some(idx) = cmd_idx {
             let clean = parse::unescape(&argv[idx]);
             if let Some(alias_args) = aliases.get(&clean) {
-                argv.remove(idx);
-                for (j, a) in alias_args.iter().enumerate() {
-                    argv.insert(idx + j, a.to_string());
+                // Skip self-referencing aliases — the display already expanded them
+                if alias_args.first().is_none_or(|first| first != &clean) {
+                    argv.remove(idx);
+                    for (j, a) in alias_args.iter().enumerate() {
+                        argv.insert(idx + j, a.to_string());
+                    }
                 }
             }
         }
