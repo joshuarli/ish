@@ -995,9 +995,9 @@ fn navigate_history(
     if up {
         let skip = history_idx.map(|i| i + 1).unwrap_or(0);
         let entry = if saved_line.is_empty() {
-            hist.len().checked_sub(1 + skip).map(|i| hist.get(i))
+            hist.local_get(skip)
         } else {
-            hist.prefix_search(saved_line, skip)
+            hist.local_prefix_search(saved_line, skip)
         };
         if let Some(e) = entry {
             *history_idx = Some(skip);
@@ -1013,9 +1013,9 @@ fn navigate_history(
                 *idx -= 1;
                 let skip = *idx;
                 let entry = if saved_line.is_empty() {
-                    hist.len().checked_sub(1 + skip).map(|i| hist.get(i))
+                    hist.local_get(skip)
                 } else {
-                    hist.prefix_search(saved_line, skip)
+                    hist.local_prefix_search(saved_line, skip)
                 };
                 if let Some(e) = entry {
                     line.set(e);

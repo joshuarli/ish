@@ -34,6 +34,10 @@ pub struct History {
     /// Byte offset into the text file we've read up to. Enables incremental
     /// sync — only new bytes appended by other shells are read.
     file_pos: u64,
+    /// Per-entry flag: true if the entry was loaded at startup or added by
+    /// this shell session (`add()`). Up-arrow navigation uses only local
+    /// entries; Ctrl+R and autosuggestion search everything.
+    local: Vec<bool>,
 }
 
 impl History {
@@ -96,7 +100,8 @@ impl History {
 
         // No timestamps in text format — use current time for all entries
         let ts = now_secs();
-        let timestamps = vec![ts; offsets.len()];
+        let count = offsets.len();
+        let timestamps = vec![ts; count];
 
         Self {
             arena,
@@ -106,6 +111,7 @@ impl History {
             hashes,
             path: path.to_path_buf(),
             file_pos: 0,
+            local: vec![true; count],
         }
     }
 
@@ -176,6 +182,7 @@ impl History {
             }
         }
 
+        let count = offsets.len();
         Some(Self {
             arena,
             offsets,
@@ -184,6 +191,7 @@ impl History {
             hashes,
             path: path.to_path_buf(),
             file_pos: 0,
+            local: vec![true; count],
         })
     }
 
@@ -230,7 +238,21 @@ impl History {
             }
             let h = hash_str(line);
             if self.hashes.contains(&h) {
-                // Duplicate — remove old occurrence, re-add at end
+                // If a local entry already has this command, skip —
+                // don't disturb the session's up-arrow timeline.
+                let any_local =
+                    self.offsets
+                        .iter()
+                        .zip(self.local.iter())
+                        .any(|(&(start, len), &is_local)| {
+                            is_local
+                                && &self.arena[start as usize..start as usize + len as usize]
+                                    == line
+                        });
+                if any_local {
+                    continue;
+                }
+                // Remove old non-local duplicate, re-add at end
                 let mut i = 0;
                 while i < self.offsets.len() {
                     let (start, len) = self.offsets[i];
@@ -238,6 +260,7 @@ impl History {
                         self.offsets.remove(i);
                         self.hash_vec.remove(i);
                         self.timestamps.remove(i);
+                        self.local.remove(i);
                     } else {
                         i += 1;
                     }
@@ -248,6 +271,7 @@ impl History {
             self.offsets.push((start, line.len() as u16));
             self.hash_vec.push(h);
             self.timestamps.push(ts);
+            self.local.push(false);
             self.hashes.insert(h);
         }
 
@@ -358,6 +382,7 @@ impl History {
             timestamps.push(ts);
             hashes.insert(h);
         }
+        let count = offsets.len();
         Self {
             arena,
             offsets,
@@ -366,6 +391,7 @@ impl History {
             hashes,
             path: PathBuf::from("/dev/null"),
             file_pos: 0,
+            local: vec![true; count],
         }
     }
 
@@ -388,6 +414,7 @@ impl History {
                     self.offsets.remove(i);
                     self.hash_vec.remove(i);
                     self.timestamps.remove(i);
+                    self.local.remove(i);
                 } else {
                     i += 1;
                 }
@@ -400,6 +427,7 @@ impl History {
         self.offsets.push((start, len as u16));
         self.hash_vec.push(h);
         self.timestamps.push(now_secs());
+        self.local.push(true);
         self.hashes.insert(h);
 
         // Append to file
@@ -426,6 +454,32 @@ impl History {
             .iter()
             .rev()
             .filter_map(|&(start, len)| {
+                let s = &self.arena[start as usize..start as usize + len as usize];
+                s.starts_with(prefix).then_some(s)
+            })
+            .nth(skip)
+    }
+
+    /// Get the `skip`'th local entry from the end (for up-arrow navigation).
+    /// Local entries are those loaded at startup or added by this session.
+    pub fn local_get(&self, skip: usize) -> Option<&str> {
+        self.offsets
+            .iter()
+            .zip(self.local.iter())
+            .rev()
+            .filter(|&(_, &is_local)| is_local)
+            .nth(skip)
+            .map(|(&(start, len), _)| &self.arena[start as usize..start as usize + len as usize])
+    }
+
+    /// Prefix search over local entries only (for up-arrow with partial input).
+    pub fn local_prefix_search(&self, prefix: &str, skip: usize) -> Option<&str> {
+        self.offsets
+            .iter()
+            .zip(self.local.iter())
+            .rev()
+            .filter(|&(_, &is_local)| is_local)
+            .filter_map(|(&(start, len), _)| {
                 let s = &self.arena[start as usize..start as usize + len as usize];
                 s.starts_with(prefix).then_some(s)
             })
