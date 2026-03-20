@@ -183,9 +183,6 @@ fn main() {
                 // Expand aliases before recording in history so "g status"
                 // becomes "git status" — matches what actually runs.
                 let history_line = expand_aliases_for_history(&line, &shell.aliases);
-                if history_line.trim() != "l" {
-                    shell.history.add(&history_line);
-                }
 
                 // Log for session transcript
                 shell.session_log.push_str(&line);
@@ -323,6 +320,9 @@ fn main() {
                         };
 
                         if handled {
+                            if history_line.trim() != "l" {
+                                shell.history.add(&history_line);
+                            }
                             continue;
                         }
 
@@ -339,6 +339,12 @@ fn main() {
                             &mut shell.session_log,
                             shell.last_status,
                         );
+
+                        // Don't record commands that don't exist (127) or
+                        // aren't executable (126) — they're just typos.
+                        if !matches!(shell.last_status, 126 | 127) && history_line.trim() != "l" {
+                            shell.history.add(&history_line);
+                        }
 
                         if is_cd {
                             shell.prompt.invalidate_git();
@@ -491,6 +497,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             ) {
                                 KeyAction::Continue => {}
                                 KeyAction::Execute(text) => {
+                                    // Clear autosuggestion ghost text before freezing the line
+                                    if line.cursor() == line.text().len() {
+                                        tw.write_str("\x1b[J");
+                                    }
                                     tw.write_str("\r\n");
                                     let _ = tw.flush_to_stdout();
                                     shell.prompt_buf = prompt_str;
