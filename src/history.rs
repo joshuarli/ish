@@ -6,7 +6,16 @@ use std::path::{Path, PathBuf};
 
 const CACHE_MAGIC_V1: &[u8; 4] = b"ISH\x01";
 const CACHE_MAGIC_V2: &[u8; 4] = b"ISH\x02";
-const CACHE_HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + reserved + entry_count + arena_size
+const CACHE_MAGIC_V3: &[u8; 4] = b"ISH\x03";
+
+/// v1/v2 header: magic(4) + reserved(8) + entry_count(4) + arena_size(4)
+const V2_HEADER_SIZE: usize = 20;
+/// v3 header: magic(4) + entry_count(4) + arena_size(4)
+const V3_HEADER_SIZE: usize = 12;
+
+/// 1998-01-01T00:00:00 UTC as Unix epoch seconds.
+/// v3 timestamps are stored relative to this, extending range to ~2134.
+const TS_EPOCH: u32 = 883_612_800;
 
 fn hash_str(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
@@ -24,8 +33,6 @@ pub struct History {
     arena: String,
     /// (start, len) byte offsets into `arena` for each entry.
     offsets: Vec<(u32, u16)>,
-    /// Ordered hashes parallel to `offsets` — for cache serialization.
-    hash_vec: Vec<u64>,
     /// Epoch seconds when each entry was last used. Parallel to `offsets`.
     timestamps: Vec<u32>,
     /// Hash index for O(1) duplicate checks in add().
@@ -74,13 +81,26 @@ impl History {
         }
     }
 
+    /// Rebuild the binary cache from the text history file, replacing the
+    /// current in-memory state and overwriting any existing cache on disk.
+    pub fn rebuild(&mut self) {
+        let mut fresh = Self::load_from_text(&self.path);
+        fresh.file_pos = fs::metadata(&fresh.path).map(|m| m.len()).unwrap_or(0);
+        fresh.cache_dirty = false;
+        fresh.save_cache();
+        eprintln!(
+            "ish: rebuilt history cache — {} entries",
+            fresh.offsets.len()
+        );
+        *self = fresh;
+    }
+
     fn load_from_text(path: &Path) -> Self {
-        let (arena, offsets, hash_vec, hashes) = match fs::read(path) {
+        let (arena, offsets, hashes) = match fs::read(path) {
             Ok(data) => {
                 let line_count = memchr_count(b'\n', &data);
                 let mut seen = HashSet::with_capacity(line_count);
                 let mut deduped: Vec<&str> = Vec::with_capacity(line_count);
-                let mut hashes_vec: Vec<u64> = Vec::with_capacity(line_count);
 
                 for chunk in data.rsplit(|&b| b == b'\n') {
                     if let Ok(line) = std::str::from_utf8(chunk)
@@ -89,12 +109,10 @@ impl History {
                         let h = hash_str(line);
                         if seen.insert(h) {
                             deduped.push(line);
-                            hashes_vec.push(h);
                         }
                     }
                 }
                 deduped.reverse();
-                hashes_vec.reverse();
 
                 let total: usize = deduped.iter().map(|s| s.len()).sum();
                 let mut arena = String::with_capacity(total);
@@ -105,10 +123,9 @@ impl History {
                     offsets.push((start, line.len() as u16));
                 }
 
-                let hashes = hashes_vec.iter().copied().collect();
-                (arena, offsets, hashes_vec, hashes)
+                (arena, offsets, seen)
             }
-            Err(_) => (String::new(), Vec::new(), Vec::new(), HashSet::new()),
+            Err(_) => (String::new(), Vec::new(), HashSet::new()),
         };
 
         // No timestamps in text format — use current time for all entries
@@ -119,7 +136,6 @@ impl History {
         Self {
             arena,
             offsets,
-            hash_vec,
             timestamps,
             hashes,
             path: path.to_path_buf(),
@@ -154,15 +170,83 @@ impl History {
     }
 
     fn parse_cache(data: &[u8], path: &Path) -> Option<Self> {
-        if data.len() < CACHE_HEADER_SIZE {
+        if data.len() < 4 {
             return None;
         }
 
-        let version = match &data[0..4] {
-            x if x == CACHE_MAGIC_V2 => 2,
-            x if x == CACHE_MAGIC_V1 => 1,
-            _ => return None,
-        };
+        match &data[0..4] {
+            x if x == CACHE_MAGIC_V3 => Self::parse_v3(data, path),
+            x if x == CACHE_MAGIC_V2 => Self::parse_v1v2(data, path, 2),
+            x if x == CACHE_MAGIC_V1 => Self::parse_v1v2(data, path, 1),
+            _ => None,
+        }
+    }
+
+    /// Parse v3 format: [magic(4)][entry_count(4)][arena_size(4)][timestamps: N×4][arena: \0-delimited]
+    fn parse_v3(data: &[u8], path: &Path) -> Option<Self> {
+        if data.len() < V3_HEADER_SIZE {
+            return None;
+        }
+
+        let entry_count = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
+        let arena_size = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
+
+        let expected = V3_HEADER_SIZE + entry_count * 4 + arena_size;
+        if data.len() != expected {
+            return None;
+        }
+
+        // Bulk-copy timestamps, converting from 1998-epoch to Unix epoch
+        let ts_start = V3_HEADER_SIZE;
+        let mut timestamps = Vec::with_capacity(entry_count);
+        for i in 0..entry_count {
+            let off = ts_start + i * 4;
+            let stored = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
+            timestamps.push(stored.wrapping_add(TS_EPOCH));
+        }
+
+        // Arena: null-delimited entries
+        let arena_start = ts_start + entry_count * 4;
+        let arena_bytes = &data[arena_start..arena_start + arena_size];
+        let arena_str = std::str::from_utf8(arena_bytes).ok()?;
+
+        let mut arena = String::with_capacity(arena_size);
+        let mut offsets = Vec::with_capacity(entry_count);
+        let mut hashes = HashSet::with_capacity(entry_count);
+        let mut count = 0;
+
+        for entry in arena_str.split('\0') {
+            if entry.is_empty() {
+                continue;
+            }
+            let start = arena.len() as u32;
+            arena.push_str(entry);
+            offsets.push((start, entry.len() as u16));
+            hashes.insert(hash_str(entry));
+            count += 1;
+        }
+
+        if count != entry_count {
+            return None;
+        }
+
+        Some(Self {
+            arena,
+            offsets,
+            timestamps,
+            hashes,
+            path: path.to_path_buf(),
+            file_pos: 0,
+            local: vec![true; count],
+            cache_dirty: false,
+        })
+    }
+
+    /// Parse legacy v1/v2 format for migration.
+    fn parse_v1v2(data: &[u8], path: &Path, version: u8) -> Option<Self> {
+        if data.len() < V2_HEADER_SIZE {
+            return None;
+        }
 
         // Skip reserved field (bytes 4..12)
         let entry_count = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
@@ -170,22 +254,16 @@ impl History {
 
         let timestamps_size = if version >= 2 { entry_count * 4 } else { 0 };
         let expected =
-            CACHE_HEADER_SIZE + entry_count * 8 + timestamps_size + entry_count * 6 + arena_size;
+            V2_HEADER_SIZE + entry_count * 8 + timestamps_size + entry_count * 6 + arena_size;
         if data.len() != expected {
             return None;
         }
 
-        let mut pos = CACHE_HEADER_SIZE;
+        let mut pos = V2_HEADER_SIZE;
 
-        // Read hashes
-        let mut hash_vec = Vec::with_capacity(entry_count);
+        // Skip hashes (no longer stored in-memory)
         let mut hashes = HashSet::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            let h = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
-            hash_vec.push(h);
-            hashes.insert(h);
-            pos += 8;
-        }
+        pos += entry_count * 8;
 
         // Read timestamps (v2+) or default to 0 (v1)
         let timestamps = if version >= 2 {
@@ -211,18 +289,20 @@ impl History {
         // Read arena
         let arena = String::from_utf8(data[pos..pos + arena_size].to_vec()).ok()?;
 
-        // Validate all offsets fall within the arena
+        // Validate offsets and build hash index
         for &(start, len) in &offsets {
-            if (start as usize) + (len as usize) > arena.len() {
+            let s = start as usize;
+            let l = len as usize;
+            if s + l > arena.len() {
                 return None;
             }
+            hashes.insert(hash_str(&arena[s..s + l]));
         }
 
         let count = offsets.len();
         Some(Self {
             arena,
             offsets,
-            hash_vec,
             timestamps,
             hashes,
             path: path.to_path_buf(),
@@ -295,7 +375,6 @@ impl History {
                     let (start, len) = self.offsets[i];
                     if &self.arena[start as usize..start as usize + len as usize] == line {
                         self.offsets.remove(i);
-                        self.hash_vec.remove(i);
                         self.timestamps.remove(i);
                         self.local.remove(i);
                     } else {
@@ -306,7 +385,6 @@ impl History {
             let start = self.arena.len() as u32;
             self.arena.push_str(line);
             self.offsets.push((start, line.len() as u16));
-            self.hash_vec.push(h);
             self.timestamps.push(ts);
             self.local.push(false);
             self.hashes.insert(h);
@@ -315,7 +393,8 @@ impl History {
         self.file_pos = file_size;
     }
 
-    /// Write binary cache (v2 with timestamps), then truncate text file.
+    /// Write v3 binary cache, then truncate text file.
+    /// v3 format: [magic(4)][entry_count(4)][arena_size(4)][timestamps: N×4][arena: \0-delimited]
     /// Atomic: writes cache to .tmp then renames.
     pub fn save_cache(&self) {
         if self.cache_dirty {
@@ -325,47 +404,46 @@ impl History {
         let tmp = cache.with_extension("bin.tmp");
 
         let entry_count = self.offsets.len();
-        let arena_bytes = self.arena.as_bytes();
-        let total = CACHE_HEADER_SIZE
-            + entry_count * 8
-            + entry_count * 4
-            + entry_count * 6
-            + arena_bytes.len();
 
+        // Build null-delimited arena
+        let mut arena_buf = Vec::new();
+        for &(start, len) in &self.offsets {
+            arena_buf.extend_from_slice(
+                &self.arena.as_bytes()[start as usize..start as usize + len as usize],
+            );
+            arena_buf.push(0);
+        }
+        let arena_size = arena_buf.len();
+
+        let total = V3_HEADER_SIZE + entry_count * 4 + arena_size;
         let mut buf = Vec::with_capacity(total);
 
-        // Header (v2)
-        buf.extend_from_slice(CACHE_MAGIC_V2);
-        buf.extend_from_slice(&0u64.to_le_bytes()); // reserved
+        // Header
+        buf.extend_from_slice(CACHE_MAGIC_V3);
         buf.extend_from_slice(&(entry_count as u32).to_le_bytes());
-        buf.extend_from_slice(&(arena_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(arena_size as u32).to_le_bytes());
 
-        // Hashes
-        for &h in &self.hash_vec {
-            buf.extend_from_slice(&h.to_le_bytes());
-        }
-
-        // Timestamps
+        // Timestamps (offset from 1998 epoch)
         for &ts in &self.timestamps {
-            buf.extend_from_slice(&ts.to_le_bytes());
+            buf.extend_from_slice(&ts.wrapping_sub(TS_EPOCH).to_le_bytes());
         }
 
-        // Offsets
-        for &(start, len) in &self.offsets {
-            buf.extend_from_slice(&start.to_le_bytes());
-            buf.extend_from_slice(&len.to_le_bytes());
-        }
-
-        // Arena
-        buf.extend_from_slice(arena_bytes);
+        // Null-delimited arena
+        buf.extend_from_slice(&arena_buf);
 
         // Guard: refuse to overwrite a larger cache with a much smaller one.
-        // This prevents catastrophic data loss from bugs or corruption.
         if let Ok(existing) = fs::read(&cache)
-            && existing.len() >= CACHE_HEADER_SIZE
+            && existing.len() >= 4
         {
-            let old_count =
-                u32::from_le_bytes(existing[12..16].try_into().unwrap_or_default()) as usize;
+            let old_count = match &existing[0..4] {
+                x if x == CACHE_MAGIC_V3 && existing.len() >= V3_HEADER_SIZE => {
+                    u32::from_le_bytes(existing[4..8].try_into().unwrap_or_default()) as usize
+                }
+                _ if existing.len() >= V2_HEADER_SIZE => {
+                    u32::from_le_bytes(existing[12..16].try_into().unwrap_or_default()) as usize
+                }
+                _ => 0,
+            };
             if entry_count < old_count / 2 && old_count > 100 {
                 eprintln!(
                     "ish: refusing to shrink history cache from {old_count} to {entry_count} entries"
@@ -430,7 +508,6 @@ impl History {
         let total: usize = entries.iter().map(|e| e.len()).sum();
         let mut arena = String::with_capacity(total);
         let mut offsets = Vec::with_capacity(entries.len());
-        let mut hash_vec = Vec::with_capacity(entries.len());
         let mut timestamps = Vec::with_capacity(entries.len());
         let mut hashes = HashSet::with_capacity(entries.len());
         for e in &entries {
@@ -438,7 +515,6 @@ impl History {
             let h = hash_str(e);
             arena.push_str(e);
             offsets.push((start, e.len() as u16));
-            hash_vec.push(h);
             timestamps.push(ts);
             hashes.insert(h);
         }
@@ -446,7 +522,6 @@ impl History {
         Self {
             arena,
             offsets,
-            hash_vec,
             timestamps,
             hashes,
             path: PathBuf::from("/dev/null"),
@@ -473,7 +548,6 @@ impl History {
                 let (start, len) = self.offsets[i];
                 if &self.arena[start as usize..start as usize + len as usize] == line {
                     self.offsets.remove(i);
-                    self.hash_vec.remove(i);
                     self.timestamps.remove(i);
                     self.local.remove(i);
                 } else {
@@ -486,7 +560,6 @@ impl History {
         let start = self.arena.len() as u32;
         self.arena.push_str(&line[..len]);
         self.offsets.push((start, len as u16));
-        self.hash_vec.push(h);
         self.timestamps.push(now_secs());
         self.local.push(true);
         self.hashes.insert(h);
@@ -746,24 +819,21 @@ mod tests {
     }
 
     #[test]
-    fn hash_vec_sync_after_add() {
+    fn parallel_vecs_sync_after_add() {
         let entries: Vec<String> = vec!["aaa".into(), "bbb".into(), "ccc".into()];
         let mut h = History::from_entries(entries);
-        assert_eq!(h.hash_vec.len(), 3);
         assert_eq!(h.offsets.len(), 3);
         assert_eq!(h.timestamps.len(), 3);
 
         // Add duplicate — should remove old and append new
         h.add("bbb");
         assert_eq!(h.offsets.len(), 3); // aaa, ccc, bbb
-        assert_eq!(h.hash_vec.len(), 3);
         assert_eq!(h.timestamps.len(), 3);
         assert_eq!(h.get(h.len() - 1), "bbb");
 
         // Add new
         h.add("ddd");
         assert_eq!(h.offsets.len(), 4);
-        assert_eq!(h.hash_vec.len(), 4);
         assert_eq!(h.timestamps.len(), 4);
     }
 
@@ -775,5 +845,43 @@ mod tests {
         let after = now_secs();
         let ts = h.timestamp(h.len() - 1);
         assert!(ts >= before && ts <= after);
+    }
+
+    #[test]
+    fn v3_round_trip() {
+        let entries: Vec<String> = vec!["ls -la".into(), "git status".into(), "cargo test".into()];
+        let hist = History::from_entries(entries);
+
+        // Serialize to v3 format
+        let entry_count = hist.offsets.len();
+        let mut arena_buf = Vec::new();
+        for &(start, len) in &hist.offsets {
+            arena_buf.extend_from_slice(
+                &hist.arena.as_bytes()[start as usize..start as usize + len as usize],
+            );
+            arena_buf.push(0);
+        }
+        let arena_size = arena_buf.len();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(CACHE_MAGIC_V3);
+        buf.extend_from_slice(&(entry_count as u32).to_le_bytes());
+        buf.extend_from_slice(&(arena_size as u32).to_le_bytes());
+        for &ts in &hist.timestamps {
+            buf.extend_from_slice(&ts.wrapping_sub(TS_EPOCH).to_le_bytes());
+        }
+        buf.extend_from_slice(&arena_buf);
+
+        // Parse it back
+        let path = PathBuf::from("/dev/null");
+        let parsed = History::parse_v3(&buf, &path).expect("v3 round-trip failed");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.get(0), "ls -la");
+        assert_eq!(parsed.get(1), "git status");
+        assert_eq!(parsed.get(2), "cargo test");
+        // Timestamps survive the round-trip
+        for i in 0..3 {
+            assert_eq!(parsed.timestamp(i), hist.timestamp(i));
+        }
     }
 }

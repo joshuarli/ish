@@ -267,6 +267,10 @@ fn main() {
                                             shell.history.compact();
                                             shell.last_status = 0;
                                         }
+                                        Some("rebuild") => {
+                                            shell.history.rebuild();
+                                            shell.last_status = 0;
+                                        }
                                         Some(other) => {
                                             eprintln!("ish: history: unknown subcommand: {other}");
                                             shell.last_status = 1;
