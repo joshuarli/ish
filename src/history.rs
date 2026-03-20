@@ -38,27 +38,40 @@ pub struct History {
     /// this shell session (`add()`). Up-arrow navigation uses only local
     /// entries; Ctrl+R and autosuggestion search everything.
     local: Vec<bool>,
+    /// Set when the cache was corrupt at load time. Prevents overwriting the
+    /// (possibly recoverable) cache file until the user resolves it.
+    cache_dirty: bool,
 }
 
 impl History {
     pub fn load() -> Self {
         let path = history_path();
 
-        // Try loading binary cache, then sync any new entries from the text file
-        if let Some(mut hist) = Self::load_from_cache(&path) {
-            // file_pos starts at 0 — sync reads the entire text tail
-            hist.sync();
-            return hist;
+        match Self::load_from_cache(&path) {
+            Ok(Some(mut hist)) => {
+                // Cache loaded — sync any new entries from the text file
+                hist.sync();
+                hist
+            }
+            Ok(None) => {
+                // No cache file (first launch) — build from text, write cache
+                let mut hist = Self::load_from_text(&path);
+                hist.file_pos = fs::metadata(&hist.path).map(|m| m.len()).unwrap_or(0);
+                if !hist.offsets.is_empty() {
+                    hist.save_cache();
+                }
+                hist
+            }
+            Err(()) => {
+                // Cache corrupt — load text file but do NOT write cache or
+                // truncate the text file. The corrupt cache is left for the
+                // user to inspect/delete manually.
+                let mut hist = Self::load_from_text(&path);
+                hist.file_pos = fs::metadata(&hist.path).map(|m| m.len()).unwrap_or(0);
+                hist.cache_dirty = true;
+                hist
+            }
         }
-
-        // No cache or corrupt — full text parse, then write cache + truncate text
-        let mut hist = Self::load_from_text(&path);
-        hist.file_pos = fs::metadata(&hist.path).map(|m| m.len()).unwrap_or(0);
-        if !hist.offsets.is_empty() {
-            hist.save_cache();
-        }
-
-        hist
     }
 
     fn load_from_text(path: &Path) -> Self {
@@ -112,12 +125,35 @@ impl History {
             path: path.to_path_buf(),
             file_pos: 0,
             local: vec![true; count],
+            cache_dirty: false,
         }
     }
 
-    fn load_from_cache(path: &Path) -> Option<Self> {
-        let data = fs::read(cache_path()).ok()?;
+    /// Returns `Ok(Some)` on success, `Ok(None)` if no cache file exists,
+    /// `Err(())` if the cache exists but is corrupt or unreadable.
+    fn load_from_cache(path: &Path) -> Result<Option<Self>, ()> {
+        let data = match fs::read(cache_path()) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                eprintln!("ish: history cache unreadable: {e}");
+                return Err(());
+            }
+        };
 
+        match Self::parse_cache(&data, path) {
+            Some(hist) => Ok(Some(hist)),
+            None => {
+                eprintln!(
+                    "ish: history cache corrupt ({} bytes) — loading text file only",
+                    data.len()
+                );
+                Err(())
+            }
+        }
+    }
+
+    fn parse_cache(data: &[u8], path: &Path) -> Option<Self> {
         if data.len() < CACHE_HEADER_SIZE {
             return None;
         }
@@ -192,6 +228,7 @@ impl History {
             path: path.to_path_buf(),
             file_pos: 0,
             local: vec![true; count],
+            cache_dirty: false,
         })
     }
 
@@ -281,6 +318,9 @@ impl History {
     /// Write binary cache (v2 with timestamps), then truncate text file.
     /// Atomic: writes cache to .tmp then renames.
     pub fn save_cache(&self) {
+        if self.cache_dirty {
+            return;
+        }
         let cache = cache_path();
         let tmp = cache.with_extension("bin.tmp");
 
@@ -319,6 +359,22 @@ impl History {
         // Arena
         buf.extend_from_slice(arena_bytes);
 
+        // Guard: refuse to overwrite a larger cache with a much smaller one.
+        // This prevents catastrophic data loss from bugs or corruption.
+        if let Ok(existing) = fs::read(&cache)
+            && existing.len() >= CACHE_HEADER_SIZE
+        {
+            let old_count =
+                u32::from_le_bytes(existing[12..16].try_into().unwrap_or_default()) as usize;
+            if entry_count < old_count / 2 && old_count > 100 {
+                eprintln!(
+                    "ish: refusing to shrink history cache from {old_count} to {entry_count} entries"
+                );
+                let _ = fs::remove_file(&tmp);
+                return;
+            }
+        }
+
         if fs::write(&tmp, &buf).is_ok() && fs::rename(&tmp, &cache).is_ok() {
             // Cache written — truncate text file since its contents
             // are now in the cache. New commands append to a fresh file.
@@ -342,6 +398,8 @@ impl History {
         {
             Ok(f) => f,
             Err(_) => {
+                self.file_pos = 0;
+                self.sync();
                 self.save_cache();
                 return;
             }
@@ -351,6 +409,8 @@ impl History {
         // Try non-blocking lock — skip if another shell is compacting
         let rc = unsafe { libc::flock(lock_fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
+            self.file_pos = 0;
+            self.sync();
             self.save_cache();
             return;
         }
@@ -392,6 +452,7 @@ impl History {
             path: PathBuf::from("/dev/null"),
             file_pos: 0,
             local: vec![true; count],
+            cache_dirty: false,
         }
     }
 

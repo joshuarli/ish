@@ -250,7 +250,7 @@ fn main() {
                                             .map(|s| parse::unescape(s))
                                             .and_then(|s| s.parse().ok())
                                             .unwrap_or(0);
-                                        shell.history.save_cache();
+                                        shell.history.compact();
                                         std::process::exit(code);
                                     }
                                 }
