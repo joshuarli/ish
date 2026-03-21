@@ -212,6 +212,7 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) 
 }
 
 /// Render the Ctrl+R history search pager.
+#[allow(clippy::too_many_arguments)]
 pub fn render_history_pager(
     tw: &mut TermWriter,
     query: &str,
@@ -220,6 +221,7 @@ pub fn render_history_pager(
     selected: usize,
     term_rows: u16,
     term_cols: u16,
+    query_cursor: usize,
 ) {
     tw.hide_cursor();
 
@@ -280,10 +282,11 @@ pub fn render_history_pager(
     // Clear remaining lines
     tw.clear_to_end_of_screen();
 
-    // Position cursor at end of search field
-    let up = matches.len().min(max_results) + 1;
+    // Position cursor in search field
+    let displayed = matches.len().min(max_results);
+    let up = displayed + 1;
     tw.move_cursor_up(up as u16);
     tw.carriage_return();
-    tw.move_cursor_right((8 + query.len()) as u16); // "search: " = 8 chars
+    tw.move_cursor_right((8 + query_cursor) as u16); // "search: " = 8 chars
     tw.show_cursor();
 }

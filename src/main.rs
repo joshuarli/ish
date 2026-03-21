@@ -42,7 +42,7 @@ enum Mode {
     Normal,
     Completion(CompletionState),
     HistorySearch {
-        query: String,
+        query: LineBuffer,
         matches: Vec<FuzzyMatch>,
         selected: usize,
         saved_line: String,
@@ -594,7 +594,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     let mut matches = std::mem::take(&mut shell.match_buf);
                                     shell.history.fuzzy_search_into("", &mut matches, 200);
                                     mode = Mode::HistorySearch {
-                                        query: String::new(),
+                                        query: LineBuffer::new(),
                                         matches,
                                         selected: 0,
                                         saved_line: saved_line.clone(),
@@ -1439,47 +1439,84 @@ enum HistAction {
 
 fn handle_history_search_key(
     key: KeyEvent,
-    query: &mut String,
+    query: &mut LineBuffer,
     matches: &mut Vec<FuzzyMatch>,
     selected: &mut usize,
     shell: &Shell,
 ) -> HistAction {
-    match key.key {
-        Key::Escape => HistAction::Cancel,
-        Key::Char('c') if key.mods.ctrl => HistAction::Cancel,
-        Key::Enter => {
-            if let Some(m) = matches.get(*selected) {
+    let mut re_search = false;
+    match (key.key, key.mods.ctrl, key.mods.alt) {
+        (Key::Escape, _, _) => return HistAction::Cancel,
+        (Key::Char('c'), true, _) => return HistAction::Cancel,
+        (Key::Enter, _, _) => {
+            return if let Some(m) = matches.get(*selected) {
                 HistAction::Accept(shell.history.get(m.entry_idx).to_string())
             } else {
                 HistAction::Cancel
-            }
+            };
         }
-        Key::Up | Key::Char('p') if key.key == Key::Up || key.mods.ctrl => {
-            if *selected > 0 {
-                *selected -= 1;
-            }
-            HistAction::Continue
+        (Key::Up, _, _) | (Key::Char('p'), true, _) if *selected > 0 => {
+            *selected -= 1;
         }
-        Key::Down | Key::Char('n') if key.key == Key::Down || key.mods.ctrl => {
-            if *selected + 1 < matches.len() {
-                *selected += 1;
-            }
-            HistAction::Continue
+        (Key::Down, _, _) | (Key::Char('n'), true, _) if *selected + 1 < matches.len() => {
+            *selected += 1;
         }
-        Key::Backspace => {
-            query.pop();
-            shell.history.fuzzy_search_into(query, matches, 200);
-            *selected = 0;
-            HistAction::Continue
+
+        // Query editing — cursor movement
+        (Key::Left, _, false) if key.mods.ctrl => {
+            query.move_word_left();
         }
-        Key::Char(c) if !key.mods.ctrl => {
-            query.push(c);
-            shell.history.fuzzy_search_into(query, matches, 200);
-            *selected = 0;
-            HistAction::Continue
+        (Key::Right, _, false) if key.mods.ctrl => {
+            query.move_word_right();
         }
-        _ => HistAction::Continue,
+        (Key::Left, _, _) => {
+            query.move_left();
+        }
+        (Key::Right, _, _) => {
+            query.move_right();
+        }
+        (Key::Home, _, _) | (Key::Char('a'), true, _) => query.move_home(),
+        (Key::End, _, _) | (Key::Char('e'), true, _) => query.move_end(),
+        (Key::Char('b'), _, true) => query.move_word_left(),
+        (Key::Char('f'), _, true) => query.move_word_right(),
+
+        // Query editing — text modification
+        (Key::Backspace, _, _) => {
+            query.delete_back();
+            re_search = true;
+        }
+        (Key::Delete, _, _) | (Key::Char('d'), true, _) => {
+            query.delete_forward();
+            re_search = true;
+        }
+        (Key::Char('u'), true, _) => {
+            query.kill_to_start();
+            re_search = true;
+        }
+        (Key::Char('k'), true, _) => {
+            query.kill_to_end();
+            re_search = true;
+        }
+        (Key::Char('w'), true, _) => {
+            query.kill_word_back();
+            re_search = true;
+        }
+        (Key::Char('y'), true, _) => {
+            query.yank();
+            re_search = true;
+        }
+        (Key::Char(c), false, false) => {
+            query.insert_char(c);
+            re_search = true;
+        }
+
+        _ => {}
     }
+    if re_search {
+        shell.history.fuzzy_search_into(query.text(), matches, 200);
+        *selected = 0;
+    }
+    HistAction::Continue
 }
 
 fn render_history_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
@@ -1492,12 +1529,13 @@ fn render_history_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
     {
         render::render_history_pager(
             tw,
-            query,
+            query.text(),
             matches,
             &shell.history,
             *selected,
             shell.rows,
             shell.cols,
+            query.display_cursor_pos(),
         );
     }
 }
