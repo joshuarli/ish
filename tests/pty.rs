@@ -956,6 +956,27 @@ fn alias_list() {
 }
 
 #[test]
+fn alias_with_command_substitution() {
+    let sh = PtyShell::spawn();
+    sh.run_command(r#"alias grt echo "$(echo hello_subst)""#);
+    // Type "grt" then space to trigger try_alias_expand, then Enter.
+    // The $(echo hello_subst) must survive re-parsing as a single token.
+    sh.type_str("grt");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    sh.type_str(" \n");
+    let out = sh.read_timeout(2000);
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("hello_subst"),
+        "expected command substitution in alias to work: {text:?}"
+    );
+    assert!(
+        !text.contains("bad substitution"),
+        "alias with command substitution should not error: {text:?}"
+    );
+}
+
+#[test]
 fn which_builtin() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("w echo");

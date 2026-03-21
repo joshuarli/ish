@@ -863,11 +863,35 @@ fn first_command_word(cmdline: &parse::CommandLine) -> Option<String> {
         .find(|s| exec::var_assignment_pos(s).is_none())
 }
 
+/// Join alias expansion words, quoting any that contain whitespace so the
+/// result re-parses into the same tokens.
+fn shell_quote_join(words: &[String]) -> String {
+    let mut result = String::new();
+    for (i, word) in words.iter().enumerate() {
+        if i > 0 {
+            result.push(' ');
+        }
+        if word.contains(|c: char| c == ' ' || c == '\t' || c == '\n') {
+            result.push('"');
+            for c in word.chars() {
+                if c == '"' || c == '\\' {
+                    result.push('\\');
+                }
+                result.push(c);
+            }
+            result.push('"');
+        } else {
+            result.push_str(word);
+        }
+    }
+    result
+}
+
 fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
     let trimmed = line.trim();
     let first_word = trimmed.split_whitespace().next().unwrap_or("");
     if let Some(expansion) = aliases.get(first_word) {
-        let expanded_str = expansion.join(" ");
+        let expanded_str = shell_quote_join(expansion);
         if trimmed.starts_with(&expanded_str) {
             return line.to_string();
         }
@@ -1050,7 +1074,7 @@ fn try_alias_expand(line: &mut LineBuffer, aliases: &AliasMap) {
 
     if let Some(expansion) = aliases.get(trimmed) {
         let rest = &text[trimmed.len()..];
-        let expanded_str = expansion.join(" ");
+        let expanded_str = shell_quote_join(expansion);
         let new_text = format!("{expanded_str}{rest}");
         line.set(&new_text);
     }
