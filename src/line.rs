@@ -54,7 +54,7 @@ impl LineBuffer {
         if self.buf.is_ascii() {
             self.cursor
         } else {
-            self.buf[..self.cursor].chars().count()
+            str_width(&self.buf[..self.cursor])
         }
     }
 
@@ -63,7 +63,7 @@ impl LineBuffer {
         if self.buf.is_ascii() {
             self.buf.len()
         } else {
-            self.buf.chars().count()
+            str_width(&self.buf)
         }
     }
 
@@ -260,9 +260,163 @@ impl LineBuffer {
     }
 }
 
+/// Display width of a string in terminal columns.
+pub fn str_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// Display width of a character in terminal columns.
+pub fn char_width(c: char) -> usize {
+    let cp = c as u32;
+    if cp < 0x7F {
+        return if cp >= 0x20 { 1 } else { 0 };
+    }
+    // Control chars, soft hyphen
+    if cp < 0xA0 || cp == 0xAD {
+        return 0;
+    }
+    // Zero-width characters
+    if matches!(cp, 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064 | 0xFEFF) {
+        return 0;
+    }
+    // Combining marks
+    if matches!(cp,
+        0x0300..=0x036F   // Combining Diacritical Marks
+        | 0x1AB0..=0x1AFF // Combining Diacritical Marks Extended
+        | 0x1DC0..=0x1DFF // Combining Diacritical Marks Supplement
+        | 0x20D0..=0x20FF // Combining Marks for Symbols
+        | 0xFE20..=0xFE2F // Combining Half Marks
+    ) {
+        return 0;
+    }
+    if is_wide(cp) { 2 } else { 1 }
+}
+
+fn is_wide(cp: u32) -> bool {
+    matches!(cp,
+        0x1100..=0x115F   // Hangul Jamo
+        | 0x231A..=0x231B // Watch, Hourglass
+        | 0x2329..=0x232A // Angle brackets
+        | 0x23E9..=0x23F3 // Various symbols
+        | 0x23F8..=0x23FA
+        | 0x25FD..=0x25FE
+        | 0x2614..=0x2615
+        | 0x2648..=0x2653
+        | 0x267F
+        | 0x2693
+        | 0x26A1
+        | 0x26AA..=0x26AB
+        | 0x26BD..=0x26BE
+        | 0x26C4..=0x26C5
+        | 0x26CE
+        | 0x26D4
+        | 0x26EA
+        | 0x26F2..=0x26F3
+        | 0x26F5
+        | 0x26FA
+        | 0x26FD
+        | 0x2702
+        | 0x2705
+        | 0x2708..=0x270D
+        | 0x270F
+        | 0x2712
+        | 0x2714
+        | 0x2716
+        | 0x271D
+        | 0x2721
+        | 0x2728
+        | 0x2733..=0x2734
+        | 0x2744
+        | 0x2747
+        | 0x274C
+        | 0x274E
+        | 0x2753..=0x2755
+        | 0x2757
+        | 0x2763..=0x2764
+        | 0x2795..=0x2797
+        | 0x27A1
+        | 0x27B0
+        | 0x27BF
+        | 0x2934..=0x2935
+        | 0x2B05..=0x2B07
+        | 0x2B1B..=0x2B1C
+        | 0x2B50
+        | 0x2B55
+        | 0x2E80..=0x303E  // CJK Radicals, Kangxi, Ideographic, CJK Symbols
+        | 0x3040..=0x33BF  // Hiragana, Katakana, Bopomofo, Hangul Compat, Kanbun
+        | 0x3400..=0x4DBF  // CJK Extension A
+        | 0x4E00..=0xA4CF  // CJK Unified, Yi
+        | 0xA960..=0xA97C  // Hangul Jamo Extended-A
+        | 0xAC00..=0xD7A3  // Hangul Syllables
+        | 0xF900..=0xFAFF  // CJK Compatibility Ideographs
+        | 0xFE10..=0xFE19  // Vertical Forms
+        | 0xFE30..=0xFE6B  // CJK Compatibility Forms
+        | 0xFF01..=0xFF60  // Fullwidth Forms
+        | 0xFFE0..=0xFFE6  // Fullwidth Signs
+        | 0x1F004
+        | 0x1F0CF
+        | 0x1F170..=0x1F171
+        | 0x1F17E..=0x1F17F
+        | 0x1F18E
+        | 0x1F191..=0x1F19A
+        | 0x1F1E0..=0x1F1FF // Regional Indicators (flags)
+        | 0x1F200..=0x1F202
+        | 0x1F210..=0x1F23B
+        | 0x1F240..=0x1F248
+        | 0x1F250..=0x1F251
+        | 0x1F260..=0x1F265
+        | 0x1F300..=0x1F9FF // Misc Symbols, Emoticons, Transport, etc.
+        | 0x1FA00..=0x1FA6F
+        | 0x1FA70..=0x1FAFF
+        | 0x20000..=0x2FA1F // CJK Extension B-F + Compatibility
+        | 0x30000..=0x3134F // CJK Extension G
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn char_widths() {
+        // ASCII
+        assert_eq!(char_width('a'), 1);
+        assert_eq!(char_width(' '), 1);
+        // Control
+        assert_eq!(char_width('\0'), 0);
+        assert_eq!(char_width('\x1b'), 0);
+        // Fullwidth
+        assert_eq!(char_width('｜'), 2); // U+FF5C fullwidth vertical bar
+        assert_eq!(char_width('Ａ'), 2); // U+FF21 fullwidth A
+        // CJK
+        assert_eq!(char_width('漢'), 2);
+        assert_eq!(char_width('ア'), 2); // katakana
+        // Regular non-ASCII (Latin extended, etc.)
+        assert_eq!(char_width('é'), 1);
+        assert_eq!(char_width('ñ'), 1);
+        // Combining marks
+        assert_eq!(char_width('\u{0301}'), 0); // combining acute accent
+    }
+
+    #[test]
+    fn str_widths() {
+        assert_eq!(str_width("hello"), 5);
+        assert_eq!(str_width("a｜b"), 4); // 1 + 2 + 1
+        assert_eq!(str_width("漢字"), 4);
+        assert_eq!(str_width("café"), 4); // all width-1
+    }
+
+    #[test]
+    fn display_with_fullwidth() {
+        let mut lb = LineBuffer::new();
+        lb.set("a｜b"); // 'a'(1) + '｜'(2) + 'b'(1) = 4 columns
+        assert_eq!(lb.display_len(), 4);
+        assert_eq!(lb.display_cursor_pos(), 4); // cursor at end
+        lb.move_left(); // before 'b'
+        assert_eq!(lb.display_cursor_pos(), 3); // 1 + 2 = 3
+        lb.move_left(); // before '｜'
+        assert_eq!(lb.display_cursor_pos(), 1); // just 'a' = 1
+    }
 
     #[test]
     fn insert_and_cursor() {

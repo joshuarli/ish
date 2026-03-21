@@ -60,7 +60,7 @@ pub fn render_line(
         tw.write_str("\x1b[38;5;8m");
         tw.write_str(opts.suggestion);
         tw.write_str("\x1b[0m");
-        opts.suggestion.len()
+        crate::line::str_width(opts.suggestion)
     };
 
     // Calculate cursor position
@@ -252,11 +252,14 @@ pub fn render_history_pager(
         // Write entry with matching chars highlighted.
         // Use a sorted position index instead of HashSet to avoid allocation.
         let max_width = term_cols as usize - 2;
+        let mut col = 0;
         let mut pi = 0; // index into match_positions
         for (ci, ch) in text.chars().enumerate() {
-            if ci >= max_width {
+            let w = crate::line::char_width(ch);
+            if col + w > max_width {
                 break;
             }
+            col += w;
             let is_match = pi < m.match_count as usize && m.match_positions[pi] == ci as u16;
             if is_match {
                 pi += 1;

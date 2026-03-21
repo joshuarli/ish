@@ -306,7 +306,7 @@ fn line_buffer_utf8_handling() {
     assert!(lb.delete_back());
     assert_eq!(lb.text(), "日本");
     lb.move_left();
-    assert_eq!(lb.display_cursor_pos(), 1);
+    assert_eq!(lb.display_cursor_pos(), 2); // '日' is 2 columns wide
     lb.insert_char('x');
     assert_eq!(lb.text(), "日x本");
 }
@@ -1947,7 +1947,7 @@ fn line_buffer_display_len() {
     lb.set("hello");
     assert_eq!(lb.display_len(), 5);
     lb.set("日本語");
-    assert_eq!(lb.display_len(), 3);
+    assert_eq!(lb.display_len(), 6); // 3 CJK chars * 2 columns each
 }
 
 #[test]

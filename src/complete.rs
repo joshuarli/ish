@@ -1,14 +1,15 @@
-/// Completion entry — 8 bytes per entry (u32 offset + u8 len + u8 flags).
+/// Completion entry — u32 offset + u8 len + u8 display_width + u8 flags.
 /// name_len is u8: NAME_MAX is 255 on Linux/macOS.
 pub struct CompEntry {
     name_start: u32,
     name_len: u8,
+    name_display_width: u8,
     flags: u8, // bit 0: is_dir, bit 1: is_link, bit 2: is_exec, bit 3: is_host
 }
 
 impl CompEntry {
     pub fn display_width(&self) -> usize {
-        self.name_len as usize
+        self.name_display_width as usize
             + if self.is_dir() || self.is_host() {
                 1
             } else {
@@ -96,6 +97,7 @@ impl Completions {
         self.entries.push(CompEntry {
             name_start: start,
             name_len: name.len().min(255) as u8,
+            name_display_width: crate::line::str_width(name).min(255) as u8,
             flags: pack_flags(is_dir, is_link, is_exec),
         });
     }
@@ -108,10 +110,13 @@ impl Completions {
 
     /// Finish an entry whose name starts at `start` in the arena.
     pub fn finish_entry(&mut self, start: u32, is_dir: bool, is_link: bool, is_exec: bool) {
-        let name_len = (self.names.len() - start as usize).min(255) as u8;
+        let name = &self.names[start as usize..];
+        let name_len = name.len().min(255) as u8;
+        let name_display_width = crate::line::str_width(name).min(255) as u8;
         self.entries.push(CompEntry {
             name_start: start,
             name_len,
+            name_display_width,
             flags: pack_flags(is_dir, is_link, is_exec),
         });
     }
@@ -728,7 +733,8 @@ pub fn complete_hostnames(prefix: &str, home: &str, comp: &mut Completions) {
             comp.entries.push(CompEntry {
                 name_start: start,
                 name_len: host.len().min(255) as u8,
-                flags: 8, // is_host
+                name_display_width: host.len().min(255) as u8, // hostnames are ASCII
+                flags: 8,                                      // is_host
             });
         }
     }
@@ -865,6 +871,7 @@ mod tests {
         comp.entries.push(CompEntry {
             name_start: start,
             name_len: 6,
+            name_display_width: 6,
             flags: 8,
         });
         assert!(comp.entries[0].is_host());
