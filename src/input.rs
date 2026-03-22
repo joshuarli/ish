@@ -202,7 +202,13 @@ impl InputReader {
 
         match byte {
             0x00 => None,
-            0x08 => Some(KeyEvent::key(Key::Backspace)),
+            0x08 => Some(KeyEvent::with_mods(
+                Key::Backspace,
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::NONE
+                },
+            )),
             0x09 => Some(KeyEvent::key(Key::Tab)),
             0x0a | 0x0d => Some(KeyEvent::key(Key::Enter)),
             0x1b => self.decode_escape(),

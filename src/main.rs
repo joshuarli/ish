@@ -871,7 +871,7 @@ fn shell_quote_join(words: &[String]) -> String {
         if i > 0 {
             result.push(' ');
         }
-        if word.contains(|c: char| c == ' ' || c == '\t' || c == '\n') {
+        if word.contains([' ', '\t', '\n']) {
             result.push('"');
             for c in word.chars() {
                 if c == '"' || c == '\\' {
@@ -971,6 +971,10 @@ fn handle_normal_key(
         (Key::Home, _, _) => line.move_home(),
         (Key::End, _, _) => line.move_end(),
 
+        (Key::Backspace, true, _) => {
+            line.kill_word_back();
+            *history_idx = None;
+        }
         (Key::Backspace, _, _) => {
             if line.cursor() == 0 && !full_input.is_empty() {
                 return KeyAction::Unwind;
