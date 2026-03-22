@@ -407,9 +407,6 @@ fn read_line(shell: &mut Shell) -> ReadResult {
 
     let mut tw = TermWriter::new();
     let mut reader = InputReader::new(shell.signal_fd);
-    let mut full_input = String::new();
-    let mut cont_stack: Vec<(String, u16, String)> = Vec::new(); // (line_text, rows_above, full_input_before)
-    let mut rows_above: u16 = 0;
     let mut line = LineBuffer::new();
     let mut mode = Mode::Normal;
     let mut history_idx: Option<usize> = None;
@@ -466,7 +463,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                 }
                 // Re-render
                 if let Mode::Normal = &mode {
-                    let (p, pdl) = active_prompt(&prompt_str, prompt_display_len, &full_input);
+                    let (p, pdl) = active_prompt(&prompt_str, prompt_display_len);
                     let info = render::render_line(
                         &mut tw,
                         p,
@@ -484,22 +481,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
             InputEvent::Key(key) => {
                 match &mut mode {
                     Mode::Normal => {
-                        // Bracketed paste: convert bare newlines to spaces
-                        // instead of executing immediately. Continuations
-                        // (trailing \, unclosed quotes, trailing operators)
-                        // still go through the normal path.
-                        let paste_sep = key.key == Key::Enter && reader.in_paste() && {
-                            let text = line.text();
-                            let combined = if full_input.is_empty() {
-                                text.to_string()
-                            } else {
-                                format!("{full_input} {text}")
-                            };
-                            !parse::needs_continuation(&combined)
-                        };
-
-                        if paste_sep {
-                            handle_paste_newline(&mut line, &mut full_input);
+                        // Bracketed paste: insert newlines into the buffer
+                        // rather than executing or splitting into continuations.
+                        if key.key == Key::Enter && reader.in_paste() {
+                            line.insert_char('\n');
                         } else {
                             match handle_normal_key(
                                 key,
@@ -507,7 +492,6 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 &mut history_idx,
                                 &mut saved_line,
                                 shell,
-                                &full_input,
                             ) {
                                 KeyAction::Continue => {}
                                 KeyAction::Execute(text) => {
@@ -518,69 +502,16 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     tw.write_str("\r\n");
                                     let _ = tw.flush_to_stdout();
                                     shell.prompt_buf = prompt_str;
-                                    if full_input.is_empty() {
-                                        return if text.is_empty() {
-                                            ReadResult::Empty
-                                        } else {
-                                            ReadResult::Line(text)
-                                        };
+                                    let joined = join_continuation_lines(&text);
+                                    return if joined.is_empty() {
+                                        ReadResult::Empty
                                     } else {
-                                        full_input.push(' ');
-                                        full_input.push_str(&text);
-                                        return ReadResult::Line(full_input);
-                                    }
+                                        ReadResult::Line(joined)
+                                    };
                                 }
-                                KeyAction::Continuation(text) => {
-                                    cont_stack.push((text.clone(), rows_above, full_input.clone()));
-                                    rows_above += cursor_row + 1;
-                                    if full_input.is_empty() {
-                                        full_input = text;
-                                    } else {
-                                        full_input.push(' ');
-                                        full_input.push_str(&text);
-                                    }
-                                    if parse::ends_with_line_continuation(&full_input) {
-                                        let end = full_input.trim_end().len();
-                                        full_input.truncate(end - 1);
-                                    }
-                                    line = LineBuffer::new();
+                                KeyAction::Continuation => {
+                                    line.insert_char('\n');
                                     history_idx = None;
-                                    tw.write_str("\r\n");
-                                    let info = render::render_line(
-                                        &mut tw,
-                                        "  ",
-                                        2,
-                                        &line,
-                                        shell.cols,
-                                        0,
-                                        &render::RenderOpts::default(),
-                                    );
-                                    cursor_row = info.cursor_row;
-                                    let _ = tw.flush_to_stdout();
-                                    continue;
-                                }
-                                KeyAction::Unwind => {
-                                    if let Some((prev_text, prev_rows_above, prev_full_input)) =
-                                        cont_stack.pop()
-                                    {
-                                        let current = line.text().to_string();
-                                        let mut prev = prev_text;
-                                        // Strip trailing `\` continuation marker
-                                        if parse::ends_with_line_continuation(&prev) {
-                                            let end = prev.trim_end().len();
-                                            prev.truncate(end - 1);
-                                        }
-                                        let join_pos = prev.len();
-                                        if !current.is_empty() {
-                                            prev.push(' ');
-                                            prev.push_str(&current);
-                                        }
-                                        line.set_with_cursor(&prev, join_pos);
-                                        full_input = prev_full_input;
-                                        cursor_row = rows_above + cursor_row - prev_rows_above;
-                                        rows_above = prev_rows_above;
-                                        history_idx = None;
-                                    }
                                 }
                                 KeyAction::Cancel => {
                                     tw.write_str("^C\r\n");
@@ -597,10 +528,6 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 KeyAction::ClearScreen => {
                                     tw.clear_screen();
                                     cursor_row = 0;
-                                    rows_above = 0;
-                                    for entry in &mut cont_stack {
-                                        entry.1 = 0;
-                                    }
                                 }
                                 KeyAction::StartHistorySearch => {
                                     shell.history.sync();
@@ -659,11 +586,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
 
                         match &mode {
                             Mode::Normal => {
-                                let (p, pdl) =
-                                    active_prompt(&prompt_str, prompt_display_len, &full_input);
+                                let (p, pdl) = active_prompt(&prompt_str, prompt_display_len);
 
                                 // Command word coloring: green if valid, red if not
-                                let cmd_color = if full_input.is_empty() {
+                                let cmd_color = if !line.has_newlines() {
                                     let first = line.text().split_whitespace().next().unwrap_or("");
                                     if first.is_empty() {
                                         None
@@ -676,13 +602,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         Some(shell.path_cache.contains(first))
                                     }
                                 } else {
-                                    None // continuation line — no coloring
+                                    None // multiline — no coloring
                                 };
 
                                 // Autosuggestion: gray ghost from history
                                 let text = line.text();
                                 let suggestion = if text.len() >= 3
-                                    && full_input.is_empty()
+                                    && !line.has_newlines()
                                     && line.cursor() == text.len()
                                 {
                                     shell
@@ -704,8 +630,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 cursor_row = info.cursor_row;
                             }
                             Mode::Completion(state) => {
-                                let (p, pdl) =
-                                    active_prompt(&prompt_str, prompt_display_len, &full_input);
+                                let (p, pdl) = active_prompt(&prompt_str, prompt_display_len);
                                 let info = render::render_line(
                                     &mut tw,
                                     p,
@@ -724,7 +649,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                     }
 
                     Mode::Completion(state) => {
-                        let (p, pdl) = active_prompt(&prompt_str, prompt_display_len, &full_input);
+                        let (p, pdl) = active_prompt(&prompt_str, prompt_display_len);
                         match handle_completion_key(key, state, &mut line) {
                             CompAction::Navigate => {
                                 // Cursor is on prompt line — repaint grid in-place
@@ -917,23 +842,14 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     }
 }
 
-fn active_prompt<'a>(
-    prompt_str: &'a str,
-    prompt_display_len: usize,
-    full_input: &str,
-) -> (&'a str, usize) {
-    if full_input.is_empty() {
-        (prompt_str, prompt_display_len)
-    } else {
-        ("  ", 2)
-    }
+fn active_prompt(prompt_str: &str, prompt_display_len: usize) -> (&str, usize) {
+    (prompt_str, prompt_display_len)
 }
 
 enum KeyAction {
     Continue,
     Execute(String),
-    Continuation(String),
-    Unwind,
+    Continuation,
     Cancel,
     Exit,
     ClearScreen,
@@ -998,17 +914,28 @@ fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
     }
 }
 
-fn handle_paste_newline(line: &mut LineBuffer, full_input: &mut String) {
-    if !full_input.is_empty() {
-        let text = line.text().to_string();
-        full_input.push(' ');
-        full_input.push_str(&text);
-        line.set(full_input);
-        *full_input = String::new();
+/// Join continuation lines for execution: strip `\<newline>` sequences,
+/// replace remaining newlines with spaces.
+fn join_continuation_lines(input: &str) -> String {
+    if !input.contains('\n') {
+        return input.to_string();
     }
-    if !line.text().is_empty() {
-        line.insert_char(' ');
+    let mut result = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+            // Line continuation: skip \ and \n
+            i += 2;
+        } else if bytes[i] == b'\n' {
+            result.push(' ');
+            i += 1;
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
     }
+    result
 }
 
 fn handle_normal_key(
@@ -1017,12 +944,11 @@ fn handle_normal_key(
     history_idx: &mut Option<usize>,
     saved_line: &mut String,
     shell: &Shell,
-    full_input: &str,
 ) -> KeyAction {
     match (key.key, key.mods.ctrl, key.mods.alt) {
         (Key::Char('c'), true, _) => return KeyAction::Cancel,
         (Key::Char('d'), true, _) => {
-            if line.is_empty() && full_input.is_empty() {
+            if line.is_empty() {
                 return KeyAction::Exit;
             }
             line.delete_forward();
@@ -1041,13 +967,18 @@ fn handle_normal_key(
         (Key::Char('f'), false, true) => line.move_word_right(),
 
         (Key::Up, _, _) if !key.mods.ctrl => {
-            if !full_input.is_empty() {
-                return KeyAction::Unwind;
+            if line.has_newlines() && !line.on_first_line() {
+                line.move_line_up();
+            } else {
+                navigate_history(line, history_idx, saved_line, shell, true);
             }
-            navigate_history(line, history_idx, saved_line, shell, true);
         }
         (Key::Down, _, _) if !key.mods.ctrl => {
-            navigate_history(line, history_idx, saved_line, shell, false);
+            if line.has_newlines() && !line.on_last_line() {
+                line.move_line_down();
+            } else {
+                navigate_history(line, history_idx, saved_line, shell, false);
+            }
         }
         (Key::Left, _, _) if key.mods.ctrl || key.mods.alt => line.move_word_left(),
         (Key::Right, _, _) if key.mods.ctrl || key.mods.alt => line.move_word_right(),
@@ -1055,7 +986,7 @@ fn handle_normal_key(
             line.move_left();
         }
         (Key::Right, _, _) => {
-            if line.cursor() >= line.text().len() && full_input.is_empty() {
+            if line.cursor() >= line.text().len() && !line.has_newlines() {
                 // At end of line — accept autosuggestion from history
                 if let Some(entry) = shell.history.prefix_search(line.text(), 0) {
                     let owned = entry.to_string();
@@ -1073,9 +1004,6 @@ fn handle_normal_key(
             *history_idx = None;
         }
         (Key::Backspace, _, _) => {
-            if line.cursor() == 0 && !full_input.is_empty() {
-                return KeyAction::Unwind;
-            }
             line.delete_back();
             *history_idx = None;
         }
@@ -1089,16 +1017,11 @@ fn handle_normal_key(
             return KeyAction::StartCompletion;
         }
         (Key::Enter, _, _) => {
-            let text = line.text().to_string();
-            let combined = if full_input.is_empty() {
-                text.clone()
-            } else {
-                format!("{full_input} {text}")
-            };
-            if parse::needs_continuation(&combined) {
-                return KeyAction::Continuation(text);
+            let text = join_continuation_lines(line.text());
+            if parse::needs_continuation(&text) {
+                return KeyAction::Continuation;
             }
-            return KeyAction::Execute(text);
+            return KeyAction::Execute(line.text().to_string());
         }
 
         (Key::Char(c), false, false) => {

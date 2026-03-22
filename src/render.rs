@@ -37,10 +37,17 @@ pub fn render_line(
     tw.carriage_return();
     tw.clear_to_end_of_screen();
 
+    let text = line.text();
+    let cols = term_cols as usize;
+
+    // Multiline path: buffer contains explicit newlines
+    if text.contains('\n') {
+        return render_line_multiline(tw, prompt, prompt_display_len, line, cols, opts);
+    }
+
     tw.write_str(prompt);
 
     // Write line text with optional command-word coloring
-    let text = line.text();
     match opts.cmd_color {
         Some(valid) => {
             let color = if valid { "\x1b[32m" } else { "\x1b[31m" };
@@ -66,11 +73,107 @@ pub fn render_line(
     // Calculate cursor position
     let total_before_cursor = prompt_display_len + line.display_cursor_pos();
     let total_full = prompt_display_len + line.display_len() + suggestion_display_len;
-    let cols = term_cols as usize;
 
     let cursor_row = total_before_cursor / cols;
     let cursor_col = total_before_cursor % cols;
     let total_rows = total_full / cols;
+
+    // Move cursor from end of text to correct position
+    let rows_back = total_rows - cursor_row;
+    if rows_back > 0 {
+        tw.move_cursor_up(rows_back as u16);
+    }
+    tw.carriage_return();
+    if cursor_col > 0 {
+        tw.move_cursor_right(cursor_col as u16);
+    }
+
+    tw.show_cursor();
+    PromptInfo {
+        total_rows: (total_rows + 1) as u16,
+        cursor_row: cursor_row as u16,
+        cursor_col: cursor_col as u16,
+    }
+}
+
+/// Render a multiline buffer (contains `\n`). First line gets the main prompt,
+/// subsequent lines get a continuation prompt "  ".
+fn render_line_multiline(
+    tw: &mut TermWriter,
+    prompt: &str,
+    prompt_display_len: usize,
+    line: &LineBuffer,
+    cols: usize,
+    opts: &RenderOpts,
+) -> PromptInfo {
+    let text = line.text();
+    let cursor_byte = line.cursor();
+    let cont_prompt = "  ";
+    let cont_prompt_len = 2;
+
+    let mut row: usize = 0;
+    let mut cursor_row: usize = 0;
+    let mut cursor_col: usize = 0;
+    let mut line_idx = 0;
+
+    for (i, segment) in text.split('\n').enumerate() {
+        if i == 0 {
+            tw.write_str(prompt);
+
+            // Command-word coloring on first line
+            match opts.cmd_color {
+                Some(valid) => {
+                    let color = if valid { "\x1b[32m" } else { "\x1b[31m" };
+                    let first_end = segment
+                        .find(|c: char| c.is_whitespace())
+                        .unwrap_or(segment.len());
+                    tw.write_str(color);
+                    tw.write_str(&segment[..first_end]);
+                    tw.write_str("\x1b[0m");
+                    tw.write_str(&segment[first_end..]);
+                }
+                None => tw.write_str(segment),
+            }
+        } else {
+            tw.write_str("\r\n");
+            row += 1;
+            tw.write_str(cont_prompt);
+            tw.write_str(segment);
+        }
+
+        // Track cursor position within this segment
+        let seg_start = line_idx;
+        let seg_end = seg_start + segment.len();
+
+        if cursor_byte >= seg_start && cursor_byte <= seg_end {
+            let prefix = if i == 0 {
+                prompt_display_len
+            } else {
+                cont_prompt_len
+            };
+            let cursor_in_seg = cursor_byte - seg_start;
+            let display_before = crate::line::str_width(&segment[..cursor_in_seg]);
+            let total = prefix + display_before;
+            cursor_row = row + total / cols;
+            cursor_col = total % cols;
+        }
+
+        // Track total display rows for this segment (wrapping)
+        let prefix = if i == 0 {
+            prompt_display_len
+        } else {
+            cont_prompt_len
+        };
+        let seg_width = prefix + crate::line::str_width(segment);
+        if seg_width > 0 {
+            row += (seg_width - 1) / cols; // additional rows from wrapping
+        }
+
+        // Advance line_idx past segment + the \n separator
+        line_idx = seg_end + 1; // +1 for the \n
+    }
+
+    let total_rows = row;
 
     // Move cursor from end of text to correct position
     let rows_back = total_rows - cursor_row;

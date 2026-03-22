@@ -151,6 +151,71 @@ impl LineBuffer {
         }
     }
 
+    // -- Multiline Navigation --
+
+    /// Whether the buffer contains newline characters.
+    pub fn has_newlines(&self) -> bool {
+        self.buf.contains('\n')
+    }
+
+    /// True if cursor is on the first line (no `\n` before it).
+    pub fn on_first_line(&self) -> bool {
+        !self.buf[..self.cursor].contains('\n')
+    }
+
+    /// True if cursor is on the last line (no `\n` after it).
+    pub fn on_last_line(&self) -> bool {
+        !self.buf[self.cursor..].contains('\n')
+    }
+
+    /// Move cursor up one line, preserving column position.
+    /// Returns false if already on the first line.
+    pub fn move_line_up(&mut self) -> bool {
+        // Find start of current line
+        let cur_line_start = match self.buf[..self.cursor].rfind('\n') {
+            Some(i) => i + 1,
+            None => return false, // already on first line
+        };
+        let col = self.cursor - cur_line_start;
+
+        // Find start of previous line
+        let prev_line_start = self.buf[..cur_line_start - 1]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let prev_line_len = (cur_line_start - 1) - prev_line_start;
+
+        self.cursor = prev_line_start + col.min(prev_line_len);
+        true
+    }
+
+    /// Move cursor down one line, preserving column position.
+    /// Returns false if already on the last line.
+    pub fn move_line_down(&mut self) -> bool {
+        // Find start of current line
+        let cur_line_start = self.buf[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let col = self.cursor - cur_line_start;
+
+        // Find end of current line (\n position)
+        let cur_line_end = match self.buf[self.cursor..].find('\n') {
+            Some(i) => self.cursor + i,
+            None => return false, // already on last line
+        };
+
+        let next_line_start = cur_line_end + 1;
+        let next_line_end = self.buf[next_line_start..]
+            .find('\n')
+            .map(|i| next_line_start + i)
+            .unwrap_or(self.buf.len());
+        let next_line_len = next_line_end - next_line_start;
+
+        self.cursor = next_line_start + col.min(next_line_len);
+        true
+    }
+
     // -- Kill Ring Operations --
 
     /// Kill from cursor to end of line (Ctrl+K).
