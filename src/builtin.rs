@@ -14,7 +14,6 @@ const SPECIAL_BUILTINS: &[&str] = &[
     "alias",
     "z",
     "copy-scrollback",
-    "history",
 ];
 
 /// All builtins.

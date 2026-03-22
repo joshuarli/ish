@@ -718,6 +718,26 @@ impl History {
         &self.arena[start as usize..start as usize + len as usize]
     }
 
+    /// Write all entries to the text file so a forked child can read them.
+    /// Used before `history > file` or `history | cmd`.
+    pub fn flush_for_read(&self) {
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+        {
+            use std::io::Write;
+            for &(start, len) in &self.offsets {
+                let entry = &self.arena[start as usize..start as usize + len as usize];
+                let _ = writeln!(f, "{entry}");
+            }
+        }
+    }
+
     fn append_to_file(&mut self, line: &str) {
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);

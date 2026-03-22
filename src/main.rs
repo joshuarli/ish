@@ -288,8 +288,10 @@ fn main() {
                                             true
                                         }
                                         None => {
-                                            // Has redirects: fall through to exec so
-                                            // redirects are applied (history > file)
+                                            // Has redirects or in pipeline: write full
+                                            // history to the text file, then fall through
+                                            // to exec so redirects/pipes are applied.
+                                            shell.history.flush_for_read();
                                             false
                                         }
                                         Some("compact") => {
@@ -378,6 +380,20 @@ fn main() {
                             first_command_word(&cmdline).as_deref(),
                             Some("cd") | Some("z")
                         );
+
+                        // If any command in the pipeline is `history`, flush
+                        // all entries to the text file so the forked child can
+                        // read the full history.
+                        if cmdline.segments.iter().any(|(pipeline, _)| {
+                            pipeline.commands.iter().any(|pc| {
+                                pc.cmd
+                                    .argv
+                                    .first()
+                                    .is_some_and(|w| parse::unescape(w) == "history")
+                            })
+                        }) {
+                            shell.history.flush_for_read();
+                        }
 
                         let t0 = std::time::Instant::now();
                         shell.last_status = exec::execute(
