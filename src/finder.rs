@@ -11,7 +11,9 @@ use std::path::Path;
 /// - `hidden`: if true, include hidden files and skip gitignore filtering
 /// - `limit`: maximum number of results to return
 ///
-/// Returns relative paths from `root`, sorted by path.
+/// Results are sorted by depth (shallowest first) so shallow matches appear
+/// before deep ones. This prevents a deep directory like `target/debug/deps/`
+/// from flooding results before showing nearby files.
 pub fn find(root: &str, pattern: &str, hidden: bool, limit: usize) -> Vec<String> {
     let pattern_lower: Vec<u8> = pattern.bytes().map(|b| b.to_ascii_lowercase()).collect();
     let root_path = Path::new(root);
@@ -27,7 +29,10 @@ pub fn find(root: &str, pattern: &str, hidden: bool, limit: usize) -> Vec<String
         .threads(1) // single-threaded — we're in an interactive shell
         .build();
 
-    let mut results = Vec::with_capacity(limit.min(256));
+    // Collect more than `limit` to ensure diversity after depth-sorting.
+    // Cap at 5x limit to bound scan time on huge trees.
+    let scan_cap = limit.saturating_mul(5).max(1000);
+    let mut entries: Vec<(usize, String)> = Vec::with_capacity(scan_cap.min(4096));
 
     for entry in walker {
         let entry = match entry {
@@ -50,21 +55,28 @@ pub fn find(root: &str, pattern: &str, hidden: bool, limit: usize) -> Vec<String
             continue;
         }
 
-        // Build relative path from root
+        let depth = entry.depth();
         let path = entry.path();
         let rel = path
             .strip_prefix(root_path)
             .unwrap_or(path)
             .to_string_lossy();
 
-        results.push(rel.into_owned());
+        entries.push((depth, rel.into_owned()));
 
-        if results.len() >= limit {
+        if entries.len() >= scan_cap {
             break;
         }
     }
 
-    results
+    // Sort by depth (shallowest first), then alphabetically within same depth
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    entries
+        .into_iter()
+        .take(limit)
+        .map(|(_, path)| path)
+        .collect()
 }
 
 /// Case-insensitive byte substring search.
@@ -108,6 +120,23 @@ mod tests {
     fn find_respects_limit() {
         let results = find(".", "", false, 5);
         assert!(results.len() <= 5);
+    }
+
+    #[test]
+    fn find_shallow_results_first() {
+        // Depth-sorted: files in src/ should appear before files in src/subdir/
+        let results = find(".", "rs", false, 100);
+        if results.len() >= 2 {
+            // Count path components as a proxy for depth
+            let first_depth = results[0].matches('/').count();
+            let last_depth = results.last().unwrap().matches('/').count();
+            assert!(
+                first_depth <= last_depth,
+                "shallow results should come first: first={} (depth {first_depth}), last={} (depth {last_depth})",
+                results[0],
+                results.last().unwrap()
+            );
+        }
     }
 
     #[test]
