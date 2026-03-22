@@ -16,6 +16,7 @@ pub mod denv;
 pub mod error;
 pub mod exec;
 pub mod expand;
+pub mod finder;
 pub mod history;
 pub mod input;
 pub mod job;

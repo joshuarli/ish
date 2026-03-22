@@ -293,3 +293,106 @@ pub fn render_history_pager(
     tw.move_cursor_right((8 + query_cursor) as u16); // "search: " = 8 chars
     tw.show_cursor();
 }
+
+/// Render the file picker pager (Ctrl+F).
+/// In query phase (`query_phase` true), shows "find: " prompt.
+/// In results phase, shows the selectable file list.
+#[allow(clippy::too_many_arguments)]
+pub fn render_file_picker(
+    tw: &mut TermWriter,
+    query: &str,
+    entries: &[String],
+    selected: usize,
+    term_rows: u16,
+    term_cols: u16,
+    query_cursor: usize,
+    query_phase: bool,
+    hidden: bool,
+) {
+    tw.hide_cursor();
+
+    // Header: "find: " or "find (hidden): "
+    tw.carriage_return();
+    tw.clear_to_end_of_line();
+    tw.write_str("\x1b[1m"); // bold
+    if hidden {
+        tw.write_str("find \x1b[33m(hidden)\x1b[0;1m: ");
+    } else if query_phase && query.is_empty() {
+        tw.write_str("find \x1b[2m(↓ toggle hidden)\x1b[0;1m: ");
+    } else {
+        tw.write_str("find: ");
+    }
+    tw.write_str("\x1b[0m");
+    tw.write_str(query);
+
+    if !query_phase && entries.is_empty() {
+        tw.write_str("  \x1b[2m(no matches)\x1b[0m");
+    }
+
+    tw.clear_to_end_of_line();
+
+    let max_results = (term_rows as usize).saturating_sub(2).min(20);
+    let max_width = term_cols as usize - 2;
+
+    // Scroll window: keep selected visible
+    let total = entries.len();
+    let scroll = if total <= max_results || selected < max_results / 2 {
+        0
+    } else if selected + max_results / 2 >= total {
+        total.saturating_sub(max_results)
+    } else {
+        selected - max_results / 2
+    };
+
+    tw.write_str("\n");
+
+    let visible = entries.iter().skip(scroll).take(max_results).enumerate();
+    let mut displayed = 0;
+    for (i, path) in visible {
+        let abs_idx = scroll + i;
+        tw.carriage_return();
+        tw.clear_to_end_of_line();
+
+        let is_selected = abs_idx == selected;
+        if is_selected {
+            tw.write_str("\x1b[7m"); // reverse video
+        }
+
+        // Truncate to terminal width
+        let mut col = 0;
+        for ch in path.chars() {
+            let w = crate::line::char_width(ch);
+            if col + w > max_width {
+                break;
+            }
+            col += w;
+            let mut buf = [0u8; 4];
+            tw.write_str(ch.encode_utf8(&mut buf));
+        }
+
+        if is_selected {
+            tw.write_str("\x1b[0m");
+        }
+        tw.clear_to_end_of_line();
+        tw.write_str("\n");
+        displayed += 1;
+    }
+
+    // Clear remaining lines
+    tw.clear_to_end_of_screen();
+
+    // Position cursor in the query field
+    let up = displayed + 1;
+    tw.move_cursor_up(up as u16);
+    tw.carriage_return();
+    // "find (hidden): " = 16, "find (↓ toggle hidden): " = 24, "find: " = 6
+    let prefix_len = if hidden {
+        16
+    } else if query_phase && query.is_empty() {
+        24
+    } else {
+        6
+    };
+    tw.move_cursor_right((prefix_len + query_cursor) as u16);
+    tw.show_cursor();
+}

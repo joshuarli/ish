@@ -484,7 +484,7 @@ fn execute_pipeline(
 /// Execute a command string and capture its stdout (for command substitution).
 /// Uses posix_spawn to avoid fork's page-table copy — on Linux this uses
 /// clone(CLONE_VFORK|CLONE_VM) internally.
-fn capture_command_output(cmd: &str, _orig_termios: &libc::termios) -> Result<String, Error> {
+pub fn capture_command_output(cmd: &str, _orig_termios: &libc::termios) -> Result<String, Error> {
     let (pid, pipe_r) = sys::spawn_command_subst(cmd)
         .map_err(|e| Error::msg(format!("command substitution: {e}")))?;
 

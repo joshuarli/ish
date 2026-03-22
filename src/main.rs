@@ -5,7 +5,9 @@ use ish::input::{InputEvent, InputReader, Key, KeyEvent};
 use ish::job::Job;
 use ish::line::LineBuffer;
 use ish::term::TermWriter;
-use ish::{builtin, complete, config, denv, exec, history, parse, prompt, render, signal, term};
+use ish::{
+    builtin, complete, config, denv, exec, finder, history, parse, prompt, render, signal, term,
+};
 use std::os::fd::RawFd;
 
 struct Shell {
@@ -46,6 +48,14 @@ enum Mode {
         matches: Vec<FuzzyMatch>,
         selected: usize,
         saved_line: String,
+    },
+    FilePicker {
+        query: LineBuffer,
+        entries: Vec<String>,
+        selected: usize,
+        saved_line: String,
+        saved_cursor: usize,
+        hidden: bool,
     },
 }
 
@@ -340,9 +350,7 @@ fn main() {
                             shell.last_status,
                         );
 
-                        // Don't record commands that don't exist (127) or
-                        // aren't executable (126) — they're just typos.
-                        if !matches!(shell.last_status, 126 | 127) && history_line.trim() != "l" {
+                        if history_line.trim() != "l" {
                             shell.history.add(&history_line);
                         }
 
@@ -614,6 +622,20 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     let _ = tw.flush_to_stdout();
                                     continue;
                                 }
+                                KeyAction::StartFilePicker => {
+                                    saved_line = line.text().to_string();
+                                    mode = Mode::FilePicker {
+                                        query: LineBuffer::new(),
+                                        entries: Vec::new(),
+                                        selected: 0,
+                                        saved_line: saved_line.clone(),
+                                        saved_cursor: line.cursor(),
+                                        hidden: false,
+                                    };
+                                    render_file_picker_mode(&mut tw, &mode, shell);
+                                    let _ = tw.flush_to_stdout();
+                                    continue;
+                                }
                                 KeyAction::StartCompletion => {
                                     let comp = std::mem::take(&mut shell.comp_buf);
                                     let cs = start_completion(
@@ -696,7 +718,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 cursor_row = info.cursor_row;
                                 render::render_completions(&mut tw, state, &info, true);
                             }
-                            Mode::HistorySearch { .. } => {}
+                            Mode::HistorySearch { .. } | Mode::FilePicker { .. } => {}
                         }
                         let _ = tw.flush_to_stdout();
                     }
@@ -827,6 +849,68 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             let _ = tw.flush_to_stdout();
                         }
                     },
+
+                    Mode::FilePicker {
+                        query,
+                        entries,
+                        selected,
+                        saved_line,
+                        saved_cursor,
+                        hidden,
+                    } => {
+                        let action = handle_file_picker_key(
+                            key,
+                            query,
+                            entries,
+                            selected,
+                            hidden,
+                            &shell.orig_termios,
+                        );
+                        match action {
+                            FilePickerAction::Continue => {
+                                render_file_picker_mode(&mut tw, &mode, shell);
+                                let _ = tw.flush_to_stdout();
+                            }
+                            FilePickerAction::Accept(path) => {
+                                // Insert path at the saved cursor position
+                                let mut text = saved_line.clone();
+                                text.insert_str(*saved_cursor, &path);
+                                let new_cursor = *saved_cursor + path.len();
+                                line.set_with_cursor(&text, new_cursor);
+                                mode = Mode::Normal;
+                                tw.carriage_return();
+                                tw.clear_to_end_of_screen();
+                                let info = render::render_line(
+                                    &mut tw,
+                                    &prompt_str,
+                                    prompt_display_len,
+                                    &line,
+                                    shell.cols,
+                                    0,
+                                    &render::RenderOpts::default(),
+                                );
+                                cursor_row = info.cursor_row;
+                                let _ = tw.flush_to_stdout();
+                            }
+                            FilePickerAction::Cancel => {
+                                line.set(saved_line);
+                                mode = Mode::Normal;
+                                tw.carriage_return();
+                                tw.clear_to_end_of_screen();
+                                let info = render::render_line(
+                                    &mut tw,
+                                    &prompt_str,
+                                    prompt_display_len,
+                                    &line,
+                                    shell.cols,
+                                    0,
+                                    &render::RenderOpts::default(),
+                                );
+                                cursor_row = info.cursor_row;
+                                let _ = tw.flush_to_stdout();
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -854,6 +938,7 @@ enum KeyAction {
     Exit,
     ClearScreen,
     StartHistorySearch,
+    StartFilePicker,
     StartCompletion,
 }
 
@@ -950,6 +1035,7 @@ fn handle_normal_key(
         (Key::Char('y'), true, _) => line.yank(),
         (Key::Char('l'), true, _) => return KeyAction::ClearScreen,
         (Key::Char('r'), true, _) => return KeyAction::StartHistorySearch,
+        (Key::Char('f'), true, _) => return KeyAction::StartFilePicker,
 
         (Key::Char('b'), false, true) => line.move_word_left(),
         (Key::Char('f'), false, true) => line.move_word_right(),
@@ -1577,6 +1663,116 @@ fn render_history_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
             shell.rows,
             shell.cols,
             query.display_cursor_pos(),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File picker (Ctrl+F)
+// ---------------------------------------------------------------------------
+
+enum FilePickerAction {
+    Continue,
+    Accept(String),
+    Cancel,
+}
+
+fn handle_file_picker_key(
+    key: KeyEvent,
+    query: &mut LineBuffer,
+    entries: &mut Vec<String>,
+    selected: &mut usize,
+    hidden: &mut bool,
+    _orig_termios: &libc::termios,
+) -> FilePickerAction {
+    // Phase 2: browsing results
+    if !entries.is_empty() {
+        match (key.key, key.mods.ctrl) {
+            (Key::Escape, _) | (Key::Char('c'), true) => return FilePickerAction::Cancel,
+            (Key::Enter, _) => {
+                return if let Some(path) = entries.get(*selected) {
+                    FilePickerAction::Accept(path.clone())
+                } else {
+                    FilePickerAction::Cancel
+                };
+            }
+            (Key::Up, _) | (Key::Char('p'), true) if *selected > 0 => {
+                *selected -= 1;
+            }
+            (Key::Down, _) | (Key::Char('n'), true) if *selected + 1 < entries.len() => {
+                *selected += 1;
+            }
+            (Key::Backspace, _) => {
+                // Go back to query phase
+                entries.clear();
+                *selected = 0;
+            }
+            _ => {}
+        }
+        return FilePickerAction::Continue;
+    }
+
+    // Phase 1: typing the fd query
+    match (key.key, key.mods.ctrl, key.mods.alt) {
+        (Key::Escape, _, _) | (Key::Char('c'), true, _) => return FilePickerAction::Cancel,
+        (Key::Down, _, _) => {
+            *hidden = !*hidden;
+        }
+        (Key::Enter, _, _) => {
+            let pattern = query.text().trim().to_string();
+            if pattern.is_empty() {
+                return FilePickerAction::Cancel;
+            }
+            *entries = finder::find(".", &pattern, *hidden, 1000);
+            *selected = 0;
+        }
+
+        // Query editing
+        (Key::Backspace, _, _) => {
+            query.delete_back();
+        }
+        (Key::Delete, _, _) | (Key::Char('d'), true, _) => {
+            query.delete_forward();
+        }
+        (Key::Left, _, false) if key.mods.ctrl => query.move_word_left(),
+        (Key::Right, _, false) if key.mods.ctrl => query.move_word_right(),
+        (Key::Left, _, _) => {
+            query.move_left();
+        }
+        (Key::Right, _, _) => {
+            query.move_right();
+        }
+        (Key::Home, _, _) | (Key::Char('a'), true, _) => query.move_home(),
+        (Key::End, _, _) | (Key::Char('e'), true, _) => query.move_end(),
+        (Key::Char('u'), true, _) => query.kill_to_start(),
+        (Key::Char('k'), true, _) => query.kill_to_end(),
+        (Key::Char('w'), true, _) => query.kill_word_back(),
+        (Key::Char('y'), true, _) => query.yank(),
+        (Key::Char(c), false, false) => query.insert_char(c),
+        _ => {}
+    }
+    FilePickerAction::Continue
+}
+
+fn render_file_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
+    if let Mode::FilePicker {
+        query,
+        entries,
+        selected,
+        hidden,
+        ..
+    } = mode
+    {
+        render::render_file_picker(
+            tw,
+            query.text(),
+            entries,
+            *selected,
+            shell.rows,
+            shell.cols,
+            query.display_cursor_pos(),
+            entries.is_empty(),
+            *hidden,
         );
     }
 }
