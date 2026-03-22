@@ -1,7 +1,10 @@
-//! Native file finder — libc readdir, gitignore parsing, std::thread
-//! for parallel hidden-mode walks. Zero external dependencies beyond libc.
+//! Native file finder — libc readdir, gitignore parsing, background walk
+//! with channel-based streaming for live filtering. Zero external deps beyond libc.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 const MAX_DEPTH: usize = 8;
 const VISIT_CAP: usize = 10_000;
@@ -54,6 +57,224 @@ pub fn find(root: &str, pattern: &str, hidden: bool, limit: usize) -> Vec<String
         .take(limit)
         .map(|(_, path)| path)
         .collect()
+}
+
+/// Handle for a background filesystem walk. Entries stream in via the receiver.
+/// Drop or call `stop()` to terminate the walk thread early.
+pub struct FinderHandle {
+    pub receiver: mpsc::Receiver<(usize, String)>, // (depth, rel_path)
+    stop: Arc<AtomicBool>,
+}
+
+impl FinderHandle {
+    /// Signal the walk thread to stop.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Drain all available entries without blocking.
+    pub fn drain_into(&self, buf: &mut Vec<(usize, String)>) {
+        while let Ok(entry) = self.receiver.try_recv() {
+            buf.push(entry);
+        }
+    }
+}
+
+impl Drop for FinderHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Start a background filesystem walk. Returns a handle to receive entries.
+/// The walk begins immediately — call `drain_into` to collect results.
+pub fn find_async(root: &str, hidden: bool) -> FinderHandle {
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let root_path = PathBuf::from(root);
+
+    std::thread::spawn(move || {
+        if hidden {
+            walk_hidden_async(&root_path, "", 0, &tx, &stop_clone);
+        } else {
+            let mut ignores = load_gitignores(&root_path);
+            walk_async(&root_path, "", 0, &mut ignores, &tx, &stop_clone);
+        }
+    });
+
+    FinderHandle { receiver: rx, stop }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_async(
+    root: &Path,
+    rel_prefix: &str,
+    depth: usize,
+    ignores: &mut Vec<GitIgnore>,
+    tx: &mpsc::Sender<(usize, String)>,
+    stop: &AtomicBool,
+) {
+    if depth > MAX_DEPTH || stop.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let full_path = if rel_prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_prefix)
+    };
+
+    let gi_pushed = try_push_gitignore(&full_path, rel_prefix, ignores);
+
+    let mut path_buf = full_path.as_os_str().as_encoded_bytes().to_vec();
+    path_buf.push(0);
+
+    let dp = unsafe { libc::opendir(path_buf.as_ptr() as *const libc::c_char) };
+    if dp.is_null() {
+        if gi_pushed {
+            ignores.pop();
+        }
+        return;
+    }
+
+    let mut subdirs: Vec<String> = Vec::new();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let ent = unsafe { libc::readdir(dp) };
+        if ent.is_null() {
+            break;
+        }
+
+        let name_cstr = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let name_bytes = name_cstr.to_bytes();
+
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        let name = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if name == ".git" {
+            continue;
+        }
+        if name_bytes.first() == Some(&b'.') {
+            continue;
+        }
+
+        let d_type = unsafe { (*ent).d_type };
+        let is_dir = d_type == libc::DT_DIR;
+
+        let rel = if rel_prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{rel_prefix}/{name}")
+        };
+
+        if is_ignored(&rel, is_dir, ignores) {
+            continue;
+        }
+
+        // Send entry; if receiver is dropped, stop walking
+        if tx.send((depth + 1, rel.clone())).is_err() {
+            break;
+        }
+
+        if is_dir {
+            subdirs.push(rel);
+        }
+    }
+
+    unsafe { libc::closedir(dp) };
+
+    for subdir in subdirs {
+        walk_async(root, &subdir, depth + 1, ignores, tx, stop);
+    }
+
+    if gi_pushed {
+        ignores.pop();
+    }
+}
+
+fn walk_hidden_async(
+    root: &Path,
+    rel_prefix: &str,
+    depth: usize,
+    tx: &mpsc::Sender<(usize, String)>,
+    stop: &AtomicBool,
+) {
+    if depth > MAX_DEPTH || stop.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let full_path = if rel_prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_prefix)
+    };
+
+    let mut path_buf = full_path.as_os_str().as_encoded_bytes().to_vec();
+    path_buf.push(0);
+
+    let dp = unsafe { libc::opendir(path_buf.as_ptr() as *const libc::c_char) };
+    if dp.is_null() {
+        return;
+    }
+
+    let mut subdirs: Vec<String> = Vec::new();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let ent = unsafe { libc::readdir(dp) };
+        if ent.is_null() {
+            break;
+        }
+
+        let name_cstr = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let name_bytes = name_cstr.to_bytes();
+
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        let name = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if name == ".git" {
+            continue;
+        }
+
+        let d_type = unsafe { (*ent).d_type };
+        let is_dir = d_type == libc::DT_DIR;
+
+        let rel = if rel_prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{rel_prefix}/{name}")
+        };
+
+        if tx.send((depth + 1, rel.clone())).is_err() {
+            break;
+        }
+
+        if is_dir {
+            subdirs.push(rel);
+        }
+    }
+
+    unsafe { libc::closedir(dp) };
+
+    for subdir in subdirs {
+        walk_hidden_async(root, &subdir, depth + 1, tx, stop);
+    }
 }
 
 /// Recursive directory walk using libc opendir/readdir.
@@ -464,6 +685,11 @@ fn glob_match_bytes(pat: &[u8], txt: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Public wrapper for case-insensitive substring search (used by filter_entries).
+pub fn contains_icase_pub(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    contains_icase(haystack, needle_lower)
+}
 
 fn contains_icase(haystack: &[u8], needle_lower: &[u8]) -> bool {
     if needle_lower.is_empty() {

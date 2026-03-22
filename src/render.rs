@@ -428,7 +428,7 @@ pub fn render_file_picker(
     tw.write_str("\x1b[0m");
     tw.write_str(query);
 
-    if !query_phase && entries.is_empty() {
+    if !query_phase && entries.is_empty() && !query.is_empty() {
         tw.write_str("  \x1b[2m(no matches)\x1b[0m");
     }
 

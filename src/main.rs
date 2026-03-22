@@ -51,11 +51,15 @@ enum Mode {
     },
     FilePicker {
         query: LineBuffer,
-        entries: Vec<String>,
+        /// All entries from the background walk (depth, rel_path).
+        all_entries: Vec<(usize, String)>,
+        /// Filtered + sorted results for display.
+        filtered: Vec<String>,
         selected: usize,
         saved_line: String,
         saved_cursor: usize,
         hidden: bool,
+        handle: finder::FinderHandle,
     },
 }
 
@@ -453,7 +457,36 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     let _ = tw.flush_to_stdout();
 
     loop {
-        let event = reader.read_event();
+        // In file picker mode, use a short timeout so we periodically drain
+        // the background walk channel and re-render as results stream in.
+        let event = if matches!(mode, Mode::FilePicker { .. }) {
+            match reader.read_event_timeout(50) {
+                Some(ev) => ev,
+                None => {
+                    // Timeout: drain channel, re-filter, re-render
+                    if let Mode::FilePicker {
+                        query,
+                        all_entries,
+                        filtered,
+                        selected,
+                        handle,
+                        ..
+                    } = &mut mode
+                    {
+                        let before = all_entries.len();
+                        handle.drain_into(all_entries);
+                        if all_entries.len() != before {
+                            filter_entries(query.text(), all_entries, filtered, selected);
+                            render_file_picker_mode(&mut tw, &mode, shell);
+                            let _ = tw.flush_to_stdout();
+                        }
+                    }
+                    continue;
+                }
+            }
+        } else {
+            reader.read_event()
+        };
         match event {
             InputEvent::Signal(sig) => {
                 if sig == libc::SIGWINCH {
@@ -551,13 +584,16 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 }
                                 KeyAction::StartFilePicker => {
                                     saved_line = line.text().to_string();
+                                    let handle = finder::find_async(".", false);
                                     mode = Mode::FilePicker {
                                         query: LineBuffer::new(),
-                                        entries: Vec::new(),
+                                        all_entries: Vec::new(),
+                                        filtered: Vec::new(),
                                         selected: 0,
                                         saved_line: saved_line.clone(),
                                         saved_cursor: line.cursor(),
                                         hidden: false,
+                                        handle,
                                     };
                                     render_file_picker_mode(&mut tw, &mode, shell);
                                     let _ = tw.flush_to_stdout();
@@ -777,19 +813,24 @@ fn read_line(shell: &mut Shell) -> ReadResult {
 
                     Mode::FilePicker {
                         query,
-                        entries,
+                        all_entries,
+                        filtered,
                         selected,
                         saved_line,
                         saved_cursor,
                         hidden,
+                        handle,
                     } => {
+                        // Drain new entries from the background walk
+                        handle.drain_into(all_entries);
                         let action = handle_file_picker_key(
                             key,
                             query,
-                            entries,
+                            all_entries,
+                            filtered,
                             selected,
                             hidden,
-                            &shell.orig_termios,
+                            handle,
                         );
                         match action {
                             FilePickerAction::Continue => {
@@ -1603,59 +1644,55 @@ enum FilePickerAction {
 fn handle_file_picker_key(
     key: KeyEvent,
     query: &mut LineBuffer,
-    entries: &mut Vec<String>,
+    all_entries: &mut Vec<(usize, String)>,
+    filtered: &mut Vec<String>,
     selected: &mut usize,
     hidden: &mut bool,
-    _orig_termios: &libc::termios,
+    handle: &mut finder::FinderHandle,
 ) -> FilePickerAction {
-    // Phase 2: browsing results
-    if !entries.is_empty() {
-        match (key.key, key.mods.ctrl) {
-            (Key::Escape, _) | (Key::Char('c'), true) => return FilePickerAction::Cancel,
-            (Key::Enter, _) => {
-                return if let Some(path) = entries.get(*selected) {
-                    FilePickerAction::Accept(path.clone())
-                } else {
-                    FilePickerAction::Cancel
-                };
-            }
-            (Key::Up, _) | (Key::Char('p'), true) if *selected > 0 => {
-                *selected -= 1;
-            }
-            (Key::Down, _) | (Key::Char('n'), true) if *selected + 1 < entries.len() => {
-                *selected += 1;
-            }
-            (Key::Backspace, _) => {
-                // Go back to query phase
-                entries.clear();
-                *selected = 0;
-            }
-            _ => {}
-        }
-        return FilePickerAction::Continue;
-    }
+    let mut refilter = false;
 
-    // Phase 1: typing the fd query
     match (key.key, key.mods.ctrl, key.mods.alt) {
         (Key::Escape, _, _) | (Key::Char('c'), true, _) => return FilePickerAction::Cancel,
-        (Key::Down, _, _) => {
-            *hidden = !*hidden;
-        }
+
+        // Accept selected result
         (Key::Enter, _, _) => {
-            let pattern = query.text().trim().to_string();
-            if pattern.is_empty() {
-                return FilePickerAction::Cancel;
-            }
-            *entries = finder::find(".", &pattern, *hidden, 1000);
+            return if let Some(path) = filtered.get(*selected) {
+                FilePickerAction::Accept(path.clone())
+            } else {
+                FilePickerAction::Cancel
+            };
+        }
+
+        // Navigate results
+        (Key::Up, _, _) | (Key::Char('p'), true, _) if *selected > 0 => {
+            *selected -= 1;
+        }
+        (Key::Down, _, _) | (Key::Char('n'), true, _)
+            if !filtered.is_empty() && *selected + 1 < filtered.len() =>
+        {
+            *selected += 1;
+        }
+
+        // Hidden mode toggle (Down when query is empty)
+        (Key::Down, _, _) if query.text().is_empty() => {
+            *hidden = !*hidden;
+            // Restart the walk with new hidden setting
+            handle.stop();
+            all_entries.clear();
+            filtered.clear();
             *selected = 0;
+            *handle = finder::find_async(".", *hidden);
         }
 
         // Query editing
         (Key::Backspace, _, _) => {
             query.delete_back();
+            refilter = true;
         }
         (Key::Delete, _, _) | (Key::Char('d'), true, _) => {
             query.delete_forward();
+            refilter = true;
         }
         (Key::Left, _, false) if key.mods.ctrl => query.move_word_left(),
         (Key::Right, _, false) if key.mods.ctrl => query.move_word_right(),
@@ -1667,34 +1704,91 @@ fn handle_file_picker_key(
         }
         (Key::Home, _, _) | (Key::Char('a'), true, _) => query.move_home(),
         (Key::End, _, _) | (Key::Char('e'), true, _) => query.move_end(),
-        (Key::Char('u'), true, _) => query.kill_to_start(),
-        (Key::Char('k'), true, _) => query.kill_to_end(),
-        (Key::Char('w'), true, _) => query.kill_word_back(),
-        (Key::Char('y'), true, _) => query.yank(),
-        (Key::Char(c), false, false) => query.insert_char(c),
+        (Key::Char('u'), true, _) => {
+            query.kill_to_start();
+            refilter = true;
+        }
+        (Key::Char('k'), true, _) => {
+            query.kill_to_end();
+            refilter = true;
+        }
+        (Key::Char('w'), true, _) => {
+            query.kill_word_back();
+            refilter = true;
+        }
+        (Key::Char('y'), true, _) => {
+            query.yank();
+            refilter = true;
+        }
+        (Key::Char(c), false, false) => {
+            query.insert_char(c);
+            refilter = true;
+        }
         _ => {}
     }
+
+    if refilter {
+        filter_entries(query.text(), all_entries, filtered, selected);
+    }
+
     FilePickerAction::Continue
+}
+
+/// Filter accumulated entries against the current query, sort by depth.
+fn filter_entries(
+    query: &str,
+    all_entries: &[(usize, String)],
+    filtered: &mut Vec<String>,
+    selected: &mut usize,
+) {
+    filtered.clear();
+    *selected = 0;
+
+    if query.len() < 3 {
+        return;
+    }
+
+    let pattern: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
+
+    // Collect matching entries with depth for sorting
+    let mut matches: Vec<(usize, &str)> = all_entries
+        .iter()
+        .filter(|(_, path)| {
+            let filename = path.rsplit('/').next().unwrap_or(path);
+            finder::contains_icase_pub(filename.as_bytes(), &pattern)
+        })
+        .map(|(depth, path)| (*depth, path.as_str()))
+        .collect();
+
+    matches.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+
+    *filtered = matches
+        .into_iter()
+        .take(1000)
+        .map(|(_, path)| path.to_string())
+        .collect();
 }
 
 fn render_file_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
     if let Mode::FilePicker {
         query,
-        entries,
+        filtered,
         selected,
         hidden,
         ..
     } = mode
     {
+        let query_text = query.text();
+        let in_query = query_text.len() < 3;
         render::render_file_picker(
             tw,
-            query.text(),
-            entries,
+            query_text,
+            filtered,
             *selected,
             shell.rows,
             shell.cols,
             query.display_cursor_pos(),
-            entries.is_empty(),
+            in_query,
             *hidden,
         );
     }

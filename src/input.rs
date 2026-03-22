@@ -129,6 +129,24 @@ impl InputReader {
         }
     }
 
+    /// Like `read_event` but returns `None` if no event arrives within `timeout_ms`.
+    pub fn read_event_timeout(&mut self, timeout_ms: i32) -> Option<InputEvent> {
+        match self.poll(timeout_ms) {
+            PollResult::Stdin => {
+                if let Some(key) = self.decode_key() {
+                    return Some(InputEvent::Key(key));
+                }
+            }
+            PollResult::Signal => {
+                if let Some(sig) = signal::read_signal() {
+                    return Some(InputEvent::Signal(sig));
+                }
+            }
+            PollResult::Timeout | PollResult::Error => {}
+        }
+        None
+    }
+
     fn poll(&self, timeout_ms: i32) -> PollResult {
         let mut fds = [
             libc::pollfd {
