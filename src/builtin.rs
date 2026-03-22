@@ -146,6 +146,26 @@ pub fn run_output(name: &str, args: &[String], _redirects: &[Redirect]) -> i32 {
             eprintln!("ish: copy-scrollback: not yet implemented");
             1
         }
+        // history in a pipeline: read the text file directly (no access to History struct)
+        "history" => {
+            let path = if let Ok(data) = std::env::var("XDG_DATA_HOME") {
+                std::path::PathBuf::from(data).join("ish/history")
+            } else if let Ok(home) = std::env::var("HOME") {
+                std::path::PathBuf::from(home).join(".local/share/ish/history")
+            } else {
+                std::path::PathBuf::from("/tmp/ish_history")
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    print!("{content}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("ish: history: {e}");
+                    1
+                }
+            }
+        }
         // Special builtins in a pipeline context (forked) — these shouldn't modify state
         "cd" | "exit" | "export" | "fg" | "set" | "unset" | "alias" => {
             eprintln!("ish: {name}: cannot use in a pipeline");
