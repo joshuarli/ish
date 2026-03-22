@@ -52,9 +52,13 @@ pub struct History {
 
 impl History {
     pub fn load() -> Self {
-        let path = history_path();
+        Self::load_from(history_path())
+    }
 
-        match Self::load_from_cache(&path) {
+    pub fn load_from(path: PathBuf) -> Self {
+        let cache = cache_path_for(&path);
+
+        match Self::load_from_cache(&path, &cache) {
             Ok(Some(mut hist)) => {
                 // Cache loaded — sync any new entries from the text file
                 hist.sync();
@@ -147,8 +151,8 @@ impl History {
 
     /// Returns `Ok(Some)` on success, `Ok(None)` if no cache file exists,
     /// `Err(())` if the cache exists but is corrupt or unreadable.
-    fn load_from_cache(path: &Path) -> Result<Option<Self>, ()> {
-        let data = match fs::read(cache_path()) {
+    fn load_from_cache(path: &Path, cache: &Path) -> Result<Option<Self>, ()> {
+        let data = match fs::read(cache) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
@@ -400,7 +404,7 @@ impl History {
         if self.cache_dirty {
             return;
         }
-        let cache = cache_path();
+        let cache = cache_path_for(&self.path);
         let tmp = cache.with_extension("bin.tmp");
 
         let entry_count = self.offsets.len();
@@ -463,7 +467,7 @@ impl History {
     /// Merge text tail into cache, dedup, rewrite cache + truncate text.
     /// Uses flock to serialize across concurrent shells.
     pub fn compact(&mut self) {
-        let lock = lock_path();
+        let lock = lock_path_for(&self.path);
         if let Some(parent) = lock.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -1056,16 +1060,16 @@ fn history_path() -> PathBuf {
     }
 }
 
-fn cache_path() -> PathBuf {
-    let mut p = history_path();
+fn cache_path_for(path: &Path) -> PathBuf {
+    let mut p = path.to_path_buf();
     let mut name = p.file_name().unwrap_or_default().to_os_string();
     name.push(".bin");
     p.set_file_name(name);
     p
 }
 
-fn lock_path() -> PathBuf {
-    let mut p = history_path();
+fn lock_path_for(path: &Path) -> PathBuf {
+    let mut p = path.to_path_buf();
     let mut name = p.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     p.set_file_name(name);

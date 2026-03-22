@@ -2523,15 +2523,10 @@ fn prompt_shorten_pwd_dotfiles_in_middle() {
 #[test]
 fn history_file_io() {
     let dir = tempdir_with_files(&[]);
-    let hist_dir = dir.join("ish");
-    std::fs::create_dir_all(&hist_dir).unwrap();
-    let hist_file = hist_dir.join("history");
-
-    let old = std::env::var("XDG_DATA_HOME").ok();
-    unsafe { std::env::set_var("XDG_DATA_HOME", dir.to_str().unwrap()) };
+    let hist_file = dir.join("history");
 
     // Write history
-    let mut h = History::load();
+    let mut h = History::load_from(hist_file.clone());
     h.add("test command 1");
     h.add("test command 2");
     h.add("test command 1"); // dup — should be deduped in memory
@@ -2542,14 +2537,8 @@ fn history_file_io() {
     assert!(content.contains("test command 2"));
 
     // Reload and verify dedup
-    let h2 = History::load();
+    let h2 = History::load_from(hist_file);
     assert!(h2.len() >= 2);
-
-    // Restore
-    match old {
-        Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
-        None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
-    }
 }
 
 // ---------------------------------------------------------------------------
