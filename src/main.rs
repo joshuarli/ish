@@ -14,7 +14,6 @@ use std::os::fd::RawFd;
 struct Shell {
     aliases: AliasMap,
     last_status: i32,
-    last_duration_ms: u128,
     prev_dir: Option<String>,
     dir_stack: Vec<String>,
     rows: u16,
@@ -161,7 +160,6 @@ fn main() {
     let mut shell = Shell {
         aliases: AliasMap::new(),
         last_status: 0,
-        last_duration_ms: 0,
         prev_dir: None,
         dir_stack: Vec::with_capacity(32),
         rows,
@@ -395,7 +393,6 @@ fn main() {
                             shell.history.flush_for_read();
                         }
 
-                        let t0 = std::time::Instant::now();
                         shell.last_status = exec::execute(
                             &cmdline,
                             None,
@@ -407,7 +404,6 @@ fn main() {
                             &mut shell.session_log,
                             shell.last_status,
                         );
-                        shell.last_duration_ms = t0.elapsed().as_millis();
 
                         if history_line.trim() != "l" {
                             shell.history.add(&history_line);
@@ -494,13 +490,9 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     // Take ownership so prompt_str can be borrowed independently of shell.
     let pwd = getenv_str(c"PWD");
     let denv_dirty = getenv_str(c"__DENV_DIRTY") == "1";
-    shell.prompt.render_into(
-        &mut shell.prompt_buf,
-        shell.last_status,
-        pwd,
-        denv_dirty,
-        shell.last_duration_ms,
-    );
+    shell
+        .prompt
+        .render_into(&mut shell.prompt_buf, shell.last_status, pwd, denv_dirty);
     let prompt_str = std::mem::take(&mut shell.prompt_buf);
     let prompt_display_len = shell.prompt.display_len(&prompt_str);
 
