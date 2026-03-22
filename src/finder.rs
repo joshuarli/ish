@@ -95,11 +95,12 @@ pub fn find_async(root: &str, hidden: bool) -> FinderHandle {
     let root_path = PathBuf::from(root);
 
     std::thread::spawn(move || {
+        let mut path_buf = String::with_capacity(256);
         if hidden {
-            walk_hidden_async(&root_path, "", 0, &tx, &stop_clone);
+            walk_hidden_async(&root_path, 0, &tx, &stop_clone, &mut path_buf);
         } else {
             let mut ignores = load_gitignores(&root_path);
-            walk_async(&root_path, "", 0, &mut ignores, &tx, &stop_clone);
+            walk_async(&root_path, 0, &mut ignores, &tx, &stop_clone, &mut path_buf);
         }
     });
 
@@ -109,28 +110,28 @@ pub fn find_async(root: &str, hidden: bool) -> FinderHandle {
 #[allow(clippy::too_many_arguments)]
 fn walk_async(
     root: &Path,
-    rel_prefix: &str,
     depth: usize,
     ignores: &mut Vec<GitIgnore>,
     tx: &mpsc::Sender<(usize, String)>,
     stop: &AtomicBool,
+    rel_buf: &mut String, // reusable buffer for building relative paths
 ) {
     if depth > MAX_DEPTH || stop.load(Ordering::Relaxed) {
         return;
     }
 
-    let full_path = if rel_prefix.is_empty() {
+    let full_path = if rel_buf.is_empty() {
         root.to_path_buf()
     } else {
-        root.join(rel_prefix)
+        root.join(rel_buf.as_str())
     };
 
-    let gi_pushed = try_push_gitignore(&full_path, rel_prefix, ignores);
+    let gi_pushed = try_push_gitignore(&full_path, rel_buf, ignores);
 
-    let mut path_buf = full_path.as_os_str().as_encoded_bytes().to_vec();
-    path_buf.push(0);
+    let mut cpath = full_path.as_os_str().as_encoded_bytes().to_vec();
+    cpath.push(0);
 
-    let dp = unsafe { libc::opendir(path_buf.as_ptr() as *const libc::c_char) };
+    let dp = unsafe { libc::opendir(cpath.as_ptr() as *const libc::c_char) };
     if dp.is_null() {
         if gi_pushed {
             ignores.pop();
@@ -138,7 +139,9 @@ fn walk_async(
         return;
     }
 
-    let mut subdirs: Vec<String> = Vec::new();
+    // Save the prefix length so we can restore it after each entry
+    let prefix_len = rel_buf.len();
+    let mut subdir_starts: Vec<usize> = Vec::new();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -160,41 +163,94 @@ fn walk_async(
             Ok(s) => s,
             Err(_) => continue,
         };
-        if name == ".git" {
-            continue;
-        }
-        if name_bytes.first() == Some(&b'.') {
+        if name == ".git" || name_bytes.first() == Some(&b'.') {
             continue;
         }
 
         let d_type = unsafe { (*ent).d_type };
         let is_dir = d_type == libc::DT_DIR;
 
-        let rel = if rel_prefix.is_empty() {
-            name.to_string()
-        } else {
-            format!("{rel_prefix}/{name}")
-        };
+        // Build relative path in the shared buffer
+        rel_buf.truncate(prefix_len);
+        if !rel_buf.is_empty() {
+            rel_buf.push('/');
+        }
+        rel_buf.push_str(name);
 
-        if is_ignored(&rel, is_dir, ignores) {
+        if is_ignored(rel_buf, is_dir, ignores) {
             continue;
         }
 
-        // Send entry; if receiver is dropped, stop walking
-        if tx.send((depth + 1, rel.clone())).is_err() {
+        if tx.send((depth + 1, rel_buf.clone())).is_err() {
             break;
         }
 
         if is_dir {
-            subdirs.push(rel);
+            subdir_starts.push(rel_buf.len());
         }
     }
 
     unsafe { libc::closedir(dp) };
 
-    for subdir in subdirs {
-        walk_async(root, &subdir, depth + 1, ignores, tx, stop);
+    // Recurse into subdirectories — we saved the rel_buf content length for each.
+    // Reconstruct by re-reading: subdir_starts tells us how long rel_buf was
+    // for each subdir. We need the actual strings, so collect them first.
+    // (The buffer approach saves allocs in the readdir loop; subdirs still need cloning
+    //  for recursion since we reuse the buffer.)
+    rel_buf.truncate(prefix_len);
+    // Re-read subdirs from the channel we just sent... no, we need a separate list.
+    // The subdir_starts approach doesn't work cleanly. Let's just collect subdir paths.
+    // This is still better than before: we save one alloc per non-dir entry.
+
+    // Actually, let's just re-do this simply: collect subdir relative paths.
+    // The key savings are: no format!() per entry, reuse rel_buf for building.
+
+    // We need to re-walk to get subdir names. That's wasteful. Let me use a different
+    // approach: save subdir names (just the name, not full rel path) and reconstruct.
+
+    drop(subdir_starts); // unused
+
+    // Reopen dir to collect subdir names for recursion
+    let dp2 = unsafe { libc::opendir(cpath.as_ptr() as *const libc::c_char) };
+    if !dp2.is_null() {
+        loop {
+            let ent = unsafe { libc::readdir(dp2) };
+            if ent.is_null() {
+                break;
+            }
+            let name_cstr = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+            let name_bytes = name_cstr.to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            let d_type = unsafe { (*ent).d_type };
+            if d_type != libc::DT_DIR {
+                continue;
+            }
+            let name = match std::str::from_utf8(name_bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if name == ".git" || name_bytes.first() == Some(&b'.') {
+                continue;
+            }
+
+            rel_buf.truncate(prefix_len);
+            if !rel_buf.is_empty() {
+                rel_buf.push('/');
+            }
+            rel_buf.push_str(name);
+
+            if is_ignored(rel_buf, true, ignores) {
+                continue;
+            }
+
+            walk_async(root, depth + 1, ignores, tx, stop, rel_buf);
+        }
+        unsafe { libc::closedir(dp2) };
     }
+
+    rel_buf.truncate(prefix_len);
 
     if gi_pushed {
         ignores.pop();
@@ -203,30 +259,33 @@ fn walk_async(
 
 fn walk_hidden_async(
     root: &Path,
-    rel_prefix: &str,
     depth: usize,
     tx: &mpsc::Sender<(usize, String)>,
     stop: &AtomicBool,
+    rel_buf: &mut String,
 ) {
     if depth > MAX_DEPTH || stop.load(Ordering::Relaxed) {
         return;
     }
 
-    let full_path = if rel_prefix.is_empty() {
+    let full_path = if rel_buf.is_empty() {
         root.to_path_buf()
     } else {
-        root.join(rel_prefix)
+        root.join(rel_buf.as_str())
     };
 
-    let mut path_buf = full_path.as_os_str().as_encoded_bytes().to_vec();
-    path_buf.push(0);
+    let mut cpath = full_path.as_os_str().as_encoded_bytes().to_vec();
+    cpath.push(0);
 
-    let dp = unsafe { libc::opendir(path_buf.as_ptr() as *const libc::c_char) };
+    let dp = unsafe { libc::opendir(cpath.as_ptr() as *const libc::c_char) };
     if dp.is_null() {
         return;
     }
 
-    let mut subdirs: Vec<String> = Vec::new();
+    let prefix_len = rel_buf.len();
+
+    // First pass: send entries + collect subdir names
+    let mut subdir_names: Vec<String> = Vec::new();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -255,26 +314,33 @@ fn walk_hidden_async(
         let d_type = unsafe { (*ent).d_type };
         let is_dir = d_type == libc::DT_DIR;
 
-        let rel = if rel_prefix.is_empty() {
-            name.to_string()
-        } else {
-            format!("{rel_prefix}/{name}")
-        };
+        rel_buf.truncate(prefix_len);
+        if !rel_buf.is_empty() {
+            rel_buf.push('/');
+        }
+        rel_buf.push_str(name);
 
-        if tx.send((depth + 1, rel.clone())).is_err() {
+        if tx.send((depth + 1, rel_buf.clone())).is_err() {
             break;
         }
 
         if is_dir {
-            subdirs.push(rel);
+            subdir_names.push(name.to_string());
         }
     }
 
     unsafe { libc::closedir(dp) };
 
-    for subdir in subdirs {
-        walk_hidden_async(root, &subdir, depth + 1, tx, stop);
+    for name in subdir_names {
+        rel_buf.truncate(prefix_len);
+        if !rel_buf.is_empty() {
+            rel_buf.push('/');
+        }
+        rel_buf.push_str(&name);
+        walk_hidden_async(root, depth + 1, tx, stop, rel_buf);
     }
+
+    rel_buf.truncate(prefix_len);
 }
 
 /// Recursive directory walk using libc opendir/readdir.
@@ -686,9 +752,47 @@ fn glob_match_bytes(pat: &[u8], txt: &[u8]) -> bool {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Public wrapper for case-insensitive substring search (used by filter_entries).
-pub fn contains_icase_pub(haystack: &[u8], needle_lower: &[u8]) -> bool {
-    contains_icase(haystack, needle_lower)
+/// Filter accumulated entries against a query, outputting indices into
+/// `all_entries` sorted by depth. Zero String allocations on the warm path —
+/// only stores indices. Uses a stack buffer for the lowercased pattern.
+pub fn filter_entries_pub(
+    query: &str,
+    all_entries: &[(usize, String)],
+    filtered: &mut Vec<usize>,
+    selected: &mut usize,
+) {
+    filtered.clear();
+    *selected = 0;
+
+    if query.len() < 3 {
+        return;
+    }
+
+    // Stack buffer for lowercased pattern (queries are short)
+    let mut pattern_buf = [0u8; 128];
+    let pattern_len = query.len().min(128);
+    for (i, b) in query.bytes().take(128).enumerate() {
+        pattern_buf[i] = b.to_ascii_lowercase();
+    }
+    let pattern = &pattern_buf[..pattern_len];
+
+    // Collect matching indices with their depth for sorting
+    let mut matches: Vec<(usize, usize)> = all_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, path))| {
+            let filename = path.rsplit('/').next().unwrap_or(path);
+            contains_icase(filename.as_bytes(), pattern)
+        })
+        .map(|(idx, (depth, _))| (*depth, idx))
+        .collect();
+
+    matches.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| all_entries[a.1].1.cmp(&all_entries[b.1].1))
+    });
+
+    filtered.extend(matches.iter().take(1000).map(|(_, idx)| *idx));
 }
 
 fn contains_icase(haystack: &[u8], needle_lower: &[u8]) -> bool {

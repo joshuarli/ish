@@ -954,6 +954,46 @@ fn bench_alloc_audit(c: &mut Criterion) {
         });
         eprintln!("  [alloc] denv_parse_3_directives:   {stats}");
 
+        // Finder: sync find
+        let stats = measure_allocs(|| {
+            black_box(ish::finder::find(".", "main", false, 100));
+        });
+        eprintln!("  [alloc] finder_normal:              {stats}");
+
+        // Finder: async drain
+        {
+            let stats = measure_allocs(|| {
+                let handle = ish::finder::find_async(".", false);
+                let mut buf = Vec::new();
+                loop {
+                    handle.drain_into(&mut buf);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    handle.drain_into(&mut buf);
+                    if buf.len() > 10 {
+                        break;
+                    }
+                }
+                black_box(buf.len());
+            });
+            eprintln!("  [alloc] finder_async_drain:         {stats}");
+        }
+
+        // Finder: client-side filter (the hot path on each keystroke)
+        {
+            let entries: Vec<(usize, String)> = (0..500)
+                .map(|i| (i % 5, format!("src/module_{i}/main.rs")))
+                .collect();
+            let mut filtered = Vec::new();
+            let mut selected = 0usize;
+            // Warm the Vec
+            ish::finder::filter_entries_pub("mai", &entries, &mut filtered, &mut selected);
+            let stats = measure_allocs(|| {
+                ish::finder::filter_entries_pub("mai", &entries, &mut filtered, &mut selected);
+                black_box(&filtered);
+            });
+            eprintln!("  [alloc] finder_filter_warm:         {stats}");
+        }
+
         eprintln!();
     }
 
@@ -1168,6 +1208,44 @@ fn bench_finder(c: &mut Criterion) {
 
     group.bench_function("find_all_normal", |b| {
         b.iter(|| black_box(ish::finder::find(".", "", false, 1000)));
+    });
+
+    // Async finder: measure time to spawn + drain all entries
+    group.bench_function("find_async_normal_drain", |b| {
+        b.iter(|| {
+            let handle = ish::finder::find_async(".", false);
+            let mut buf = Vec::new();
+            loop {
+                handle.drain_into(&mut buf);
+                if handle.receiver.try_recv().is_err() {
+                    // Channel empty + no more coming = walk done
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    handle.drain_into(&mut buf);
+                    if handle.receiver.try_recv().is_err() {
+                        break;
+                    }
+                }
+            }
+            black_box(buf.len());
+        });
+    });
+
+    group.bench_function("find_async_hidden_drain", |b| {
+        b.iter(|| {
+            let handle = ish::finder::find_async(".", true);
+            let mut buf = Vec::new();
+            loop {
+                handle.drain_into(&mut buf);
+                if handle.receiver.try_recv().is_err() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    handle.drain_into(&mut buf);
+                    if handle.receiver.try_recv().is_err() {
+                        break;
+                    }
+                }
+            }
+            black_box(buf.len());
+        });
     });
 
     group.finish();

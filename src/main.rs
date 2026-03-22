@@ -53,8 +53,8 @@ enum Mode {
         query: LineBuffer,
         /// All entries from the background walk (depth, rel_path).
         all_entries: Vec<(usize, String)>,
-        /// Filtered + sorted results for display.
-        filtered: Vec<String>,
+        /// Filtered + sorted results: indices into `all_entries`.
+        filtered: Vec<usize>,
         selected: usize,
         saved_line: String,
         saved_cursor: usize,
@@ -1645,7 +1645,7 @@ fn handle_file_picker_key(
     key: KeyEvent,
     query: &mut LineBuffer,
     all_entries: &mut Vec<(usize, String)>,
-    filtered: &mut Vec<String>,
+    filtered: &mut Vec<usize>,
     selected: &mut usize,
     hidden: &mut bool,
     handle: &mut finder::FinderHandle,
@@ -1657,8 +1657,8 @@ fn handle_file_picker_key(
 
         // Accept selected result
         (Key::Enter, _, _) => {
-            return if let Some(path) = filtered.get(*selected) {
-                FilePickerAction::Accept(path.clone())
+            return if let Some(&entry_idx) = filtered.get(*selected) {
+                FilePickerAction::Accept(all_entries[entry_idx].1.clone())
             } else {
                 FilePickerAction::Cancel
             };
@@ -1674,8 +1674,8 @@ fn handle_file_picker_key(
             *selected += 1;
         }
 
-        // Hidden mode toggle (Down when query is empty)
-        (Key::Down, _, _) if query.text().is_empty() => {
+        // Hidden mode toggle (Ctrl+F again)
+        (Key::Char('f'), true, _) => {
             *hidden = !*hidden;
             // Restart the walk with new hidden setting
             handle.stop();
@@ -1734,44 +1734,19 @@ fn handle_file_picker_key(
     FilePickerAction::Continue
 }
 
-/// Filter accumulated entries against the current query, sort by depth.
 fn filter_entries(
     query: &str,
     all_entries: &[(usize, String)],
-    filtered: &mut Vec<String>,
+    filtered: &mut Vec<usize>,
     selected: &mut usize,
 ) {
-    filtered.clear();
-    *selected = 0;
-
-    if query.len() < 3 {
-        return;
-    }
-
-    let pattern: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
-
-    // Collect matching entries with depth for sorting
-    let mut matches: Vec<(usize, &str)> = all_entries
-        .iter()
-        .filter(|(_, path)| {
-            let filename = path.rsplit('/').next().unwrap_or(path);
-            finder::contains_icase_pub(filename.as_bytes(), &pattern)
-        })
-        .map(|(depth, path)| (*depth, path.as_str()))
-        .collect();
-
-    matches.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
-
-    *filtered = matches
-        .into_iter()
-        .take(1000)
-        .map(|(_, path)| path.to_string())
-        .collect();
+    finder::filter_entries_pub(query, all_entries, filtered, selected);
 }
 
 fn render_file_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
     if let Mode::FilePicker {
         query,
+        all_entries,
         filtered,
         selected,
         hidden,
@@ -1783,6 +1758,7 @@ fn render_file_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
         render::render_file_picker(
             tw,
             query_text,
+            all_entries,
             filtered,
             *selected,
             shell.rows,

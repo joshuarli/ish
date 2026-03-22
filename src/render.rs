@@ -404,7 +404,8 @@ pub fn render_history_pager(
 pub fn render_file_picker(
     tw: &mut TermWriter,
     query: &str,
-    entries: &[String],
+    all_entries: &[(usize, String)],
+    filtered: &[usize],
     selected: usize,
     term_rows: u16,
     term_cols: u16,
@@ -421,14 +422,14 @@ pub fn render_file_picker(
     if hidden {
         tw.write_str("find \x1b[33m(hidden)\x1b[0;1m: ");
     } else if query_phase && query.is_empty() {
-        tw.write_str("find \x1b[2m(↓ toggle hidden)\x1b[0;1m: ");
+        tw.write_str("find \x1b[2m(ctrl+f toggle hidden)\x1b[0;1m: ");
     } else {
         tw.write_str("find: ");
     }
     tw.write_str("\x1b[0m");
     tw.write_str(query);
 
-    if !query_phase && entries.is_empty() && !query.is_empty() {
+    if !query_phase && filtered.is_empty() && !query.is_empty() {
         tw.write_str("  \x1b[2m(no matches)\x1b[0m");
     }
 
@@ -438,7 +439,7 @@ pub fn render_file_picker(
     let max_width = term_cols as usize - 2;
 
     // Scroll window: keep selected visible
-    let total = entries.len();
+    let total = filtered.len();
     let scroll = if total <= max_results || selected < max_results / 2 {
         0
     } else if selected + max_results / 2 >= total {
@@ -449,10 +450,11 @@ pub fn render_file_picker(
 
     tw.write_str("\n");
 
-    let visible = entries.iter().skip(scroll).take(max_results).enumerate();
+    let visible = filtered.iter().skip(scroll).take(max_results).enumerate();
     let mut displayed = 0;
-    for (i, path) in visible {
+    for (i, &entry_idx) in visible {
         let abs_idx = scroll + i;
+        let path = &all_entries[entry_idx].1;
         tw.carriage_return();
         tw.clear_to_end_of_line();
 
@@ -488,11 +490,11 @@ pub fn render_file_picker(
     let up = displayed + 1;
     tw.move_cursor_up(up as u16);
     tw.carriage_return();
-    // "find (hidden): " = 16, "find (↓ toggle hidden): " = 24, "find: " = 6
+    // "find (hidden): " = 16, "find (ctrl+f toggle hidden): " = 30, "find: " = 6
     let prefix_len = if hidden {
         16
     } else if query_phase && query.is_empty() {
-        24
+        30
     } else {
         6
     };
