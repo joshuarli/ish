@@ -4,7 +4,6 @@ version = "0.1.13"
 edition = "2024"
 
 [dependencies]
-ignore = "0.4"
 libc = "0.2"
 
 [dev-dependencies]

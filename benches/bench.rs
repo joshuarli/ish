@@ -1139,6 +1139,40 @@ fn fast_config() -> Criterion {
         .measurement_time(Duration::from_secs(1))
 }
 
+// ---------------------------------------------------------------------------
+// Finder benchmarks (real filesystem searches against this repo)
+// ---------------------------------------------------------------------------
+
+fn bench_finder(c: &mut Criterion) {
+    let mut group = c.benchmark_group("finder");
+
+    group.bench_function("find_rs_normal", |b| {
+        b.iter(|| black_box(ish::finder::find(".", "rs", false, 100)));
+    });
+
+    group.bench_function("find_main_normal", |b| {
+        b.iter(|| black_box(ish::finder::find(".", "main", false, 100)));
+    });
+
+    group.bench_function("find_ish_normal", |b| {
+        b.iter(|| black_box(ish::finder::find(".", "ish", false, 1000)));
+    });
+
+    group.bench_function("find_ish_hidden", |b| {
+        b.iter(|| black_box(ish::finder::find(".", "ish", true, 1000)));
+    });
+
+    group.bench_function("find_all_hidden", |b| {
+        b.iter(|| black_box(ish::finder::find(".", "", true, 1000)));
+    });
+
+    group.bench_function("find_all_normal", |b| {
+        b.iter(|| black_box(ish::finder::find(".", "", false, 1000)));
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = fast_config();
@@ -1161,5 +1195,6 @@ criterion_group!(
         bench_alloc_audit,
         bench_autosuggestion,
         bench_command_coloring,
+        bench_finder,
 );
 criterion_main!(benches);

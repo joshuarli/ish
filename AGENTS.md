@@ -6,7 +6,7 @@ ish is a minimal interactive-only shell written in Rust, inspired by fish-shell.
 
 **Hard constraints:**
 
-- **Two dependencies**: `libc` (system calls) and `ignore` (gitignore-aware directory walking for the file finder).
+- **Single dependency**: `libc` (for system calls). No other crates at runtime.
 - **No subprocessing for shell operations**: Directory listing, git branch detection, glob expansion, prompt rendering — all implemented natively. Only user commands get fork/exec'd.
 - **Interactive only**: No scripting, no POSIX compatibility, no `source`, no control flow (`if`/`for`/`while`/`function`). Refuses to run script files.
 - **Single binary crate**: No workspace, no proc macros.
@@ -35,7 +35,7 @@ src/
   render.rs    — Composites prompt + line + completions + history pager → VT100 sequences
   parse.rs     — Single-pass tokenizer/parser → CommandLine (flat, no AST)
   expand.rs    — Tilde, $VAR, $(), glob expansion (*, ?, **)
-  finder.rs    — Native file finder (Ctrl+F): gitignore-aware walk via `ignore` crate, substring matching
+  finder.rs    — Native file finder (Ctrl+F): libc readdir, gitignore parsing, depth-sorted results
   exec.rs      — fork/exec, pipe plumbing, redirections, process groups, zero-alloc PATH scan
   builtin.rs   — cd, exit, fg, set, unset, alias, l, c, w/which/type, echo, pwd, true, false
   ls.rs        — Native directory listing (l builtin): stat, permissions, color — like ls -plAhG
