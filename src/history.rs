@@ -621,9 +621,14 @@ impl History {
     }
 
     /// Fuzzy (subsequence) search: every char of `query` appears in the entry
-    /// in order, case-insensitive. Returns matching entries most-recent-first,
-    /// with entry index and indices of matching chars.
+    /// in order, case-insensitive. Returns matching entries scored by match
+    /// quality (best first), with recency as tiebreaker.
     pub fn fuzzy_search(&self, query: &str) -> Vec<FuzzyMatch> {
+        self.fuzzy_search_scored(query, "")
+    }
+
+    /// Like `fuzzy_search` but accepts a PWD basename for context scoring.
+    pub fn fuzzy_search_scored(&self, query: &str, pwd_basename: &str) -> Vec<FuzzyMatch> {
         if query.is_empty() {
             return (0..self.offsets.len())
                 .rev()
@@ -631,6 +636,7 @@ impl History {
                     entry_idx: idx,
                     match_positions: [0; 32],
                     match_count: 0,
+                    score: 0,
                 })
                 .collect();
         }
@@ -641,20 +647,32 @@ impl History {
         for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
             let entry = &self.arena[start as usize..start as usize + len as usize];
             if let Some((positions, count)) = subsequence_match(&query_lower, entry) {
+                let score = score_match(&positions, count, entry, pwd_basename);
                 results.push(FuzzyMatch {
                     entry_idx: idx,
                     match_positions: positions,
                     match_count: count,
+                    score,
                 });
             }
         }
+
+        results.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx)));
 
         results
     }
 
     /// Like `fuzzy_search` but appends into a caller-owned Vec (zero-alloc reuse).
     /// Caps at `limit` results since the pager only shows a screenful.
-    pub fn fuzzy_search_into(&self, query: &str, results: &mut Vec<FuzzyMatch>, limit: usize) {
+    /// `pwd_basename` is the basename of the current directory (e.g., "ish") for
+    /// context-aware scoring. Pass "" to disable the PWD bonus.
+    pub fn fuzzy_search_into(
+        &self,
+        query: &str,
+        results: &mut Vec<FuzzyMatch>,
+        limit: usize,
+        pwd_basename: &str,
+    ) {
         results.clear();
 
         if query.is_empty() {
@@ -663,6 +681,7 @@ impl History {
                     entry_idx: idx,
                     match_positions: [0; 32],
                     match_count: 0,
+                    score: 0,
                 });
                 if results.len() >= limit {
                     break;
@@ -676,16 +695,21 @@ impl History {
         for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
             let entry = &self.arena[start as usize..start as usize + len as usize];
             if let Some((positions, count)) = subsequence_match(&query_lower, entry) {
+                let score = score_match(&positions, count, entry, pwd_basename);
                 results.push(FuzzyMatch {
                     entry_idx: idx,
                     match_positions: positions,
                     match_count: count,
+                    score,
                 });
                 if results.len() >= limit {
                     break;
                 }
             }
         }
+
+        // Sort by score descending, then by recency (entry_idx descending) as tiebreaker
+        results.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx)));
     }
 
     /// Get entry text by index.
@@ -722,9 +746,14 @@ pub struct FuzzyMatch {
     /// Matched character indices (as u16 — entries are always <64K chars).
     pub match_positions: [u16; 32],
     pub match_count: u8,
+    /// Match quality score. Higher = better match.
+    /// Contiguity (+16), word boundary (+8), gap penalty (-1..=-3), PWD bonus (+20).
+    pub score: i16,
 }
 
 /// Check if `query` chars appear in `text` in order (case-insensitive).
+/// Uses a forward-then-backward scan to find the tightest match window,
+/// then a final forward pass within that window for optimal positions.
 /// Returns a fixed-size array of matched character indices and the count.
 /// Zero heap allocations — uses stack arrays only.
 pub fn subsequence_match(query: &[char], text: &str) -> Option<([u16; 32], u8)> {
@@ -732,41 +761,264 @@ pub fn subsequence_match(query: &[char], text: &str) -> Option<([u16; 32], u8)> 
         return Some(([0; 32], 0));
     }
 
-    let mut positions = [0u16; 32];
-
     // ASCII fast path: if both query and text are ASCII, operate on bytes directly.
-    // This avoids char decoding and to_lowercase() overhead for the common case.
     if text.is_ascii() && query.iter().all(|c| c.is_ascii()) {
-        let bytes = text.as_bytes();
-        let mut qi = 0;
-        let mut target = query[qi] as u8; // already lowercase from caller
+        return subsequence_match_ascii(query, text);
+    }
 
-        for (ti, &b) in bytes.iter().enumerate() {
-            if b.to_ascii_lowercase() == target {
-                positions[qi] = ti as u16;
-                qi += 1;
-                if qi == query.len() {
-                    return Some((positions, qi as u8));
-                }
-                target = query[qi] as u8;
+    subsequence_match_unicode(query, text)
+}
+
+/// ASCII fast path — operates on bytes directly, no char decoding.
+fn subsequence_match_ascii(query: &[char], text: &str) -> Option<([u16; 32], u8)> {
+    let bytes = text.as_bytes();
+    let qlen = query.len();
+    let last_qchar = query[qlen - 1] as u8;
+
+    // 1) Forward pass: find the first complete match to confirm it exists.
+    let mut qi = 0;
+    let mut first_end = 0usize; // index of the first endpoint (last query char match)
+    for (ti, &b) in bytes.iter().enumerate() {
+        if b.to_ascii_lowercase() == query[qi] as u8 {
+            qi += 1;
+            if qi == qlen {
+                first_end = ti;
+                break;
             }
         }
+    }
+    if qi < qlen {
         return None;
     }
 
-    let mut qi = 0;
+    // 2) Find the last occurrence of the last query char beyond the first endpoint.
+    let mut last_end = first_end;
+    for (ti, &b) in bytes.iter().enumerate().skip(first_end + 1) {
+        if b.to_ascii_lowercase() == last_qchar {
+            last_end = ti;
+        }
+    }
 
-    for (ti, tc) in text.chars().enumerate() {
-        if tc.to_lowercase().next() == Some(query[qi]) {
-            positions[qi] = ti as u16;
-            qi += 1;
-            if qi == query.len() {
-                return Some((positions, qi as u8));
+    // 3) Backward pass from both endpoints; pick the tighter window.
+    let (window_start, window_end) = if last_end == first_end {
+        (backward_ascii(bytes, query, first_end), first_end)
+    } else {
+        let start1 = backward_ascii(bytes, query, first_end);
+        let start2 = backward_ascii(bytes, query, last_end);
+        let span1 = first_end - start1;
+        let span2 = last_end - start2;
+        if span2 < span1 {
+            (start2, last_end)
+        } else {
+            (start1, first_end)
+        }
+    };
+
+    // 4) Forward pass within the tight window to record optimal positions.
+    let mut positions = [0u16; 32];
+    let mut qi2 = 0;
+    for (ti, &b) in bytes
+        .iter()
+        .enumerate()
+        .take(window_end + 1)
+        .skip(window_start)
+    {
+        if b.to_ascii_lowercase() == query[qi2] as u8 {
+            positions[qi2] = ti as u16;
+            qi2 += 1;
+            if qi2 == qlen {
+                break;
             }
         }
     }
 
-    None
+    Some((positions, qlen as u8))
+}
+
+/// Backward scan from `end` (inclusive) to find the tightest window start.
+fn backward_ascii(bytes: &[u8], query: &[char], end: usize) -> usize {
+    let mut qi = query.len();
+    for ti in (0..=end).rev() {
+        if bytes[ti].to_ascii_lowercase() == query[qi - 1] as u8 {
+            qi -= 1;
+            if qi == 0 {
+                return ti;
+            }
+        }
+    }
+    0 // unreachable if forward pass confirmed the match
+}
+
+/// Unicode path — operates on chars.
+fn subsequence_match_unicode(query: &[char], text: &str) -> Option<([u16; 32], u8)> {
+    let qlen = query.len();
+    let last_qchar = query[qlen - 1];
+
+    // 1) Forward pass to confirm match exists and find first endpoint.
+    let mut qi = 0;
+    let mut first_end = 0usize;
+    for (ti, tc) in text.chars().enumerate() {
+        if tc.to_lowercase().next() == Some(query[qi]) {
+            qi += 1;
+            if qi == qlen {
+                first_end = ti;
+                break;
+            }
+        }
+    }
+    if qi < qlen {
+        return None;
+    }
+
+    // 2) Find last occurrence of the last query char.
+    let mut last_end = first_end;
+    for (ti, tc) in text.chars().enumerate() {
+        if ti > first_end && tc.to_lowercase().next() == Some(last_qchar) {
+            last_end = ti;
+        }
+    }
+
+    // 3) Backward pass from both endpoints; pick tighter window.
+    // Collect (char_idx, char) pairs up to max(first_end, last_end) for reverse scanning.
+    let max_end = first_end.max(last_end);
+    // Use a Vec here since this is the non-ASCII slow path (rare).
+    let chars_vec: Vec<(usize, char)> = text.chars().enumerate().take(max_end + 1).collect();
+
+    let start1 = backward_unicode(&chars_vec, query, first_end);
+    let (window_start, window_end) = if last_end == first_end {
+        (start1, first_end)
+    } else {
+        let start2 = backward_unicode(&chars_vec, query, last_end);
+        let span1 = first_end - start1;
+        let span2 = last_end - start2;
+        if span2 < span1 {
+            (start2, last_end)
+        } else {
+            (start1, first_end)
+        }
+    };
+
+    // 4) Forward pass within the tight window to record optimal positions.
+    let mut positions = [0u16; 32];
+    let mut qi2 = 0;
+    for (ti, tc) in text.chars().enumerate() {
+        if ti < window_start {
+            continue;
+        }
+        if ti > window_end {
+            break;
+        }
+        if tc.to_lowercase().next() == Some(query[qi2]) {
+            positions[qi2] = ti as u16;
+            qi2 += 1;
+            if qi2 == qlen {
+                break;
+            }
+        }
+    }
+
+    Some((positions, qlen as u8))
+}
+
+/// Backward scan through collected chars to find tightest window start.
+fn backward_unicode(chars: &[(usize, char)], query: &[char], end: usize) -> usize {
+    let mut qi = query.len();
+    for &(ci, ch) in chars.iter().rev() {
+        if ci > end {
+            continue;
+        }
+        if ch.to_lowercase().next() == Some(query[qi - 1]) {
+            qi -= 1;
+            if qi == 0 {
+                return ci;
+            }
+        }
+    }
+    0
+}
+
+/// Score a fuzzy match based on match quality. O(count) for ASCII, O(text_len) for non-ASCII.
+/// Zero allocations — uses only the positions array already computed by `subsequence_match`.
+///
+/// Scoring:
+/// - Contiguity: +16 per consecutive matched char (adjacent positions)
+/// - Word boundary: +8 when a match is at position 0 or after `/`, `-`, `_`, `.`, whitespace
+/// - First-match: +4 when the first query char matches position 0 of the entry
+/// - Gap penalty: -1 per skipped char between consecutive matches, capped at -3 per gap
+/// - PWD context: +20 if the entry contains the current directory's basename
+pub fn score_match(positions: &[u16; 32], count: u8, text: &str, pwd_basename: &str) -> i16 {
+    let n = count as usize;
+    if n == 0 {
+        return 0;
+    }
+
+    let mut score: i16 = 0;
+    let bytes = text.as_bytes();
+
+    // First-match bonus: query starts at the very beginning of the entry
+    if positions[0] == 0 {
+        score += 4;
+    }
+
+    // Contiguity + gap penalties — positions-only, O(n)
+    for i in 1..n {
+        let prev = positions[i - 1];
+        let curr = positions[i];
+        if curr == prev + 1 {
+            score += 16; // consecutive characters
+        } else {
+            let gap = (curr - prev - 1) as i16;
+            score -= gap.min(3); // gap penalty capped at -3
+        }
+    }
+
+    // Word boundary bonus
+    if text.is_ascii() {
+        // ASCII fast path: char index == byte index, O(n)
+        for &pos in positions.iter().take(n) {
+            let pos = pos as usize;
+            if pos == 0 || is_word_boundary(bytes[pos - 1]) {
+                score += 8;
+            }
+        }
+    } else {
+        // Non-ASCII: walk chars to find the byte preceding each matched position
+        let mut pi = 0;
+        let mut prev_byte = 0u8;
+        for (char_idx, ch) in text.chars().enumerate() {
+            if pi < n && char_idx as u16 == positions[pi] {
+                if char_idx == 0 || is_word_boundary(prev_byte) {
+                    score += 8;
+                }
+                pi += 1;
+                if pi >= n {
+                    break;
+                }
+            }
+            // Track the last byte of this char for boundary detection
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf);
+            prev_byte = encoded.as_bytes()[encoded.len() - 1];
+        }
+    }
+
+    // PWD basename bonus
+    if !pwd_basename.is_empty() {
+        let needle = pwd_basename.as_bytes();
+        if needle.len() <= bytes.len()
+            && bytes
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle))
+        {
+            score += 20;
+        }
+    }
+
+    score
+}
+
+fn is_word_boundary(b: u8) -> bool {
+    matches!(b, b'/' | b'-' | b'_' | b'.' | b' ' | b'\t')
 }
 
 /// Count occurrences of a byte in a slice.
@@ -816,6 +1068,96 @@ mod tests {
     fn subsequence_no_match() {
         let q: Vec<char> = "xyz".chars().collect();
         assert!(subsequence_match(&q, "hello").is_none());
+    }
+
+    #[test]
+    fn score_contiguous_match() {
+        // "target" found contiguously at positions 0-5
+        let positions = {
+            let mut p = [0u16; 32];
+            p[0] = 0;
+            p[1] = 1;
+            p[2] = 2;
+            p[3] = 3;
+            p[4] = 4;
+            p[5] = 5;
+            p
+        };
+        let score = score_match(&positions, 6, "target/release", "");
+        // 5 contiguity bonuses (16 each) = 80
+        // position 0 is word boundary = +8
+        assert!(score >= 88, "contiguous match should score high: {score}");
+    }
+
+    #[test]
+    fn score_scattered_match() {
+        // "target" scattered across "git remote add origin https://...smtp-server.git"
+        // Positions would be something like t(3) a(12) r(14) g(42) e(50) t(65)
+        let positions = {
+            let mut p = [0u16; 32];
+            p[0] = 3;
+            p[1] = 12;
+            p[2] = 14;
+            p[3] = 42;
+            p[4] = 50;
+            p[5] = 65;
+            p
+        };
+        let text = "git remote add origin https://github.com/joshuarli/smtp-server.git";
+        let score = score_match(&positions, 6, text, "");
+        // One contiguity (14 = 12+2? no, 14 != 13). Actually r at 14, a at 12: gap.
+        // Large gaps, few boundaries. Score should be low/negative.
+        assert!(score < 30, "scattered match should score low: {score}");
+    }
+
+    #[test]
+    fn score_word_boundary_bonus() {
+        // "dc" matching "docker compose" at positions 0, 7
+        // Both are word boundaries: d at start, c after space
+        let positions = {
+            let mut p = [0u16; 32];
+            p[0] = 0;
+            p[1] = 7;
+            p
+        };
+        let score = score_match(&positions, 2, "docker compose up", "");
+        // first-match: position 0 (+4)
+        // boundary bonus: 0 is start (+8), 7 is after space (+8)
+        // gap: 7 - 0 - 1 = 6, capped at -3
+        // total: 4 + 16 - 3 = 17
+        assert_eq!(score, 17, "expected boundary bonuses: {score}");
+    }
+
+    #[test]
+    fn score_pwd_bonus() {
+        let positions = {
+            let mut p = [0u16; 32];
+            p[0] = 0;
+            p[1] = 1;
+            p[2] = 2;
+            p
+        };
+        let score_without = score_match(&positions, 3, "cat ish/src/main.rs", "");
+        let score_with = score_match(&positions, 3, "cat ish/src/main.rs", "ish");
+        assert_eq!(score_with - score_without, 20, "PWD bonus should be +20");
+    }
+
+    #[test]
+    fn score_gap_penalty_capped() {
+        // Two chars with a huge gap — penalty should cap at -3
+        let positions = {
+            let mut p = [0u16; 32];
+            p[0] = 0;
+            p[1] = 100;
+            p
+        };
+        let text = &"x".repeat(101);
+        let score = score_match(&positions, 2, text, "");
+        // first-match at 0: +4
+        // boundary at 0: +8
+        // gap: 100 - 0 - 1 = 99, capped at -3
+        // total: 4 + 8 - 3 = 9
+        assert_eq!(score, 9, "gap penalty should be capped: {score}");
     }
 
     #[test]

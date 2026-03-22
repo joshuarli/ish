@@ -361,10 +361,76 @@ fn bench_history(c: &mut Criterion) {
 
     group.bench_function("fuzzy_search_into_45k", |b| {
         let mut results = Vec::with_capacity(200);
-        history.fuzzy_search_into("gco", &mut results, 200);
+        history.fuzzy_search_into("gco", &mut results, 200, "");
         b.iter(|| {
-            history.fuzzy_search_into("gco", &mut results, 200);
+            history.fuzzy_search_into("gco", &mut results, 200, "");
             black_box(&results);
+        });
+    });
+
+    group.bench_function("fuzzy_search_into_pwd_45k", |b| {
+        let mut results = Vec::with_capacity(200);
+        history.fuzzy_search_into("gco", &mut results, 200, "myproject");
+        b.iter(|| {
+            history.fuzzy_search_into("gco", &mut results, 200, "myproject");
+            black_box(&results);
+        });
+    });
+
+    // Subsequence match only — measures the optimal alignment overhead
+    group.bench_function("subsequence_match_hit", |b| {
+        let query: Vec<char> = "gco".chars().collect();
+        b.iter(|| black_box(ish::history::subsequence_match(&query, "git checkout main")));
+    });
+
+    group.bench_function("subsequence_match_miss", |b| {
+        let query: Vec<char> = "zzz".chars().collect();
+        b.iter(|| black_box(ish::history::subsequence_match(&query, "git checkout main")));
+    });
+
+    // Optimal alignment: query chars appear early AND late — exercises the
+    // backward pass from two endpoints.
+    group.bench_function("subsequence_match_alignment", |b| {
+        let query: Vec<char> = "test".chars().collect();
+        b.iter(|| {
+            black_box(ish::history::subsequence_match(
+                &query,
+                "the best integration test suite",
+            ))
+        });
+    });
+
+    // Score match in isolation — measures scoring overhead per result
+    group.bench_function("score_match_contiguous", |b| {
+        let mut positions = [0u16; 32];
+        positions[0] = 10;
+        positions[1] = 11;
+        positions[2] = 12;
+        positions[3] = 13;
+        positions[4] = 14;
+        positions[5] = 15;
+        b.iter(|| {
+            black_box(ish::history::score_match(
+                &positions,
+                6,
+                "cd /home/target/release/bin",
+                "myproject",
+            ))
+        });
+    });
+
+    group.bench_function("score_match_scattered", |b| {
+        let mut positions = [0u16; 32];
+        positions[0] = 3;
+        positions[1] = 12;
+        positions[2] = 18;
+        b.iter(|| {
+            black_box(ish::history::score_match(
+                &positions,
+                3,
+                "git remote add origin https://example.com",
+                "",
+            ))
         });
     });
 
@@ -804,9 +870,9 @@ fn bench_alloc_audit(c: &mut Criterion) {
         // Warm: reuse pre-allocated Vec — should be 0 allocs
         {
             let mut results = Vec::with_capacity(200);
-            history.fuzzy_search_into("cmd99", &mut results, 200);
+            history.fuzzy_search_into("cmd99", &mut results, 200, "");
             let stats = measure_allocs(|| {
-                history.fuzzy_search_into("cmd99", &mut results, 200);
+                history.fuzzy_search_into("cmd99", &mut results, 200, "");
                 black_box(&results);
             });
             eprintln!("  [alloc] fuzzy_search_warm:         {stats}");

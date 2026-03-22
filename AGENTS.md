@@ -38,8 +38,8 @@ src/
   exec.rs      — fork/exec, pipe plumbing, redirections, process groups, zero-alloc PATH scan
   builtin.rs   — cd, exit, fg, set, unset, alias, l, c, w/which/type, echo, pwd, true, false
   ls.rs        — Native directory listing (l builtin): stat, permissions, color — like ls -plAhG
-  history.rs   — Append-only file, in-memory Vec, prefix search, zero-alloc fuzzy subsequence search
-  complete.rs  — Arena-backed file completion via libc readdir/stat, grid layout, arrow navigation
+  history.rs   — Append-only file, in-memory Vec, prefix search, scored fuzzy search with PWD context (see docs/SEARCH.md)
+  complete.rs  — Arena-backed file completion via libc readdir/stat, grid layout, arrow navigation (see docs/SEARCH.md)
   alias.rs     — AliasMap (HashMap wrapper), inline expansion on space
   config.rs    — Parse ~/.config/ish/config.ish (set + alias directives)
   job.rs       — Single suspended job (Ctrl+Z / fg)
@@ -66,9 +66,11 @@ src/
 4. Arrow keys navigate the grid; Enter accepts; Escape cancels. Refilter on typing reuses the arena buffer.
 
 **History search (Ctrl+R):**
-1. `history::fuzzy_search_into()` does subsequence matching into a pooled `Vec<FuzzyMatch>` — zero allocation per keystroke. Results capped at 200. ASCII fast path avoids char decoding.
+1. `history::fuzzy_search_into()` does subsequence matching with quality scoring (contiguity, word boundaries, PWD context) into a pooled `Vec<FuzzyMatch>` — zero allocation per keystroke. Results sorted by score (best match first), capped at 200. ASCII fast path avoids char decoding.
 2. `render::render_history_pager()` shows results with highlighted match positions
 3. Up/Down cycle through matches; Enter accepts; Escape cancels
+
+See [docs/SEARCH.md](docs/SEARCH.md) for the ranking/scoring design and roadmap.
 
 ## Key Data Structures
 
@@ -84,7 +86,7 @@ Connector   = And | Or | Semi
 LineBuffer { text: String, cursor: usize, kill_ring: String }
 
 // history.rs — Search results (fixed-size, zero-alloc per match)
-FuzzyMatch { entry_idx: usize, match_positions: [u16; 32], match_count: u8 }
+FuzzyMatch { entry_idx: usize, match_positions: [u16; 32], match_count: u8, score: i16 }
 
 // complete.rs — Arena-backed completions (all names in one contiguous String)
 Completions { names: String, entries: Vec<CompEntry> }
@@ -136,7 +138,7 @@ Shell { aliases, last_status, prev_dir, rows, cols, history, prompt, prompt_buf,
 |-----|--------|
 | Ctrl+A / Home | Move to start |
 | Ctrl+E / End | Move to end |
-| Ctrl+W | Delete word backward |
+| Ctrl+W / Ctrl+Backspace | Delete word backward |
 | Ctrl+U | Delete to start |
 | Ctrl+K | Delete to end |
 | Ctrl+Y | Yank (paste kill ring) |

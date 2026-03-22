@@ -1,6 +1,7 @@
-/// Completion entry — u32 offset + u8 len + u8 display_width + u8 flags.
+/// Completion entry — mtime + u32 offset + u8 len + u8 display_width + u8 flags.
 /// name_len is u8: NAME_MAX is 255 on Linux/macOS.
 pub struct CompEntry {
+    mtime: i64, // st_mtime from stat(), 0 for non-path entries (hosts, builtins)
     name_start: u32,
     name_len: u8,
     name_display_width: u8,
@@ -92,9 +93,21 @@ impl Completions {
     }
 
     pub fn push(&mut self, name: &str, is_dir: bool, is_link: bool, is_exec: bool) {
+        self.push_with_mtime(name, is_dir, is_link, is_exec, 0);
+    }
+
+    pub fn push_with_mtime(
+        &mut self,
+        name: &str,
+        is_dir: bool,
+        is_link: bool,
+        is_exec: bool,
+        mtime: i64,
+    ) {
         let start = self.names.len() as u32;
         self.names.push_str(name);
         self.entries.push(CompEntry {
+            mtime,
             name_start: start,
             name_len: name.len().min(255) as u8,
             name_display_width: crate::line::str_width(name).min(255) as u8,
@@ -110,10 +123,22 @@ impl Completions {
 
     /// Finish an entry whose name starts at `start` in the arena.
     pub fn finish_entry(&mut self, start: u32, is_dir: bool, is_link: bool, is_exec: bool) {
+        self.finish_entry_with_mtime(start, is_dir, is_link, is_exec, 0);
+    }
+
+    pub fn finish_entry_with_mtime(
+        &mut self,
+        start: u32,
+        is_dir: bool,
+        is_link: bool,
+        is_exec: bool,
+        mtime: i64,
+    ) {
         let name = &self.names[start as usize..];
         let name_len = name.len().min(255) as u8;
         let name_display_width = crate::line::str_width(name).min(255) as u8;
         self.entries.push(CompEntry {
+            mtime,
             name_start: start,
             name_len,
             name_display_width,
@@ -144,6 +169,16 @@ impl Completions {
             self.entries
                 .sort_unstable_by(|a, b| cmp_icase_arena(names, a, b));
         }
+    }
+
+    /// Sort entries by modification time (most recent first), alphabetical tiebreaker.
+    pub fn sort_by_mtime(&mut self) {
+        let names = self.names.as_bytes();
+        self.entries.sort_unstable_by(|a, b| {
+            b.mtime
+                .cmp(&a.mtime)
+                .then_with(|| cmp_icase_arena(names, a, b))
+        });
     }
 
     /// Remove duplicate adjacent entries (by exact name). Call after `sort_entries`.
@@ -418,7 +453,7 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
             Err(_) => continue,
         };
 
-        comp.push(name, is_dir, is_link, is_exec);
+        comp.push_with_mtime(name, is_dir, is_link, is_exec, st.st_mtime);
         if is_prefix {
             prefix_count += 1;
         }
@@ -442,7 +477,7 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
         }
     }
 
-    comp.sort_entries();
+    comp.sort_by_mtime();
 }
 
 /// Fish-style partial path completion: each intermediate directory component
@@ -731,6 +766,7 @@ pub fn complete_hostnames(prefix: &str, home: &str, comp: &mut Completions) {
             let start = comp.names.len() as u32;
             comp.names.push_str(&host);
             comp.entries.push(CompEntry {
+                mtime: 0,
                 name_start: start,
                 name_len: host.len().min(255) as u8,
                 name_display_width: host.len().min(255) as u8, // hostnames are ASCII
@@ -869,6 +905,7 @@ mod tests {
         let start = comp.names.len() as u32;
         comp.names.push_str("myhost");
         comp.entries.push(CompEntry {
+            mtime: 0,
             name_start: start,
             name_len: 6,
             name_display_width: 6,

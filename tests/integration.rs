@@ -428,7 +428,8 @@ fn history_fuzzy_search_ordering() {
     ]);
     let matches = h.fuzzy_search("gc");
     // "gc" matches "git checkout" and "git commit", not "ls -la"
-    // Most recent first
+    // Both have the same score (g at boundary, c at boundary, same contiguity),
+    // so recency breaks the tie.
     assert_eq!(matches.len(), 2);
     assert_eq!(h.get(matches[0].entry_idx), "git commit -m fix");
     assert_eq!(h.get(matches[1].entry_idx), "git checkout main");
@@ -445,7 +446,7 @@ fn history_fuzzy_empty_query_returns_all() {
     let h = History::from_entries(vec!["a".into(), "b".into(), "c".into()]);
     let matches = h.fuzzy_search("");
     assert_eq!(matches.len(), 3);
-    // Most recent first
+    // Empty query: all scores are 0, so most-recent-first
     assert_eq!(h.get(matches[0].entry_idx), "c");
 }
 
@@ -455,6 +456,296 @@ fn history_fuzzy_match_positions_correct() {
     let (positions, count) = history::subsequence_match(&q, "git checkout").unwrap();
     assert_eq!(count, 3);
     assert_eq!(&positions[..3], &[0, 4, 9]); // g=0, c=4, o=9
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy search scoring — real-world scenarios
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scoring_contiguous_beats_scattered() {
+    // The motivating bug: searching "target" should prefer the entry that
+    // contains the literal word "target" over one where t-a-r-g-e-t are
+    // scattered across a long URL.
+    let h = History::from_entries(vec![
+        "/Users/josh/d/ish/target/release/ish".into(), // older, but "target" is contiguous
+        "git remote add origin https://github.com/joshuarli/smtp-server.git".into(), // more recent, scattered match
+    ]);
+    let matches = h.fuzzy_search("target");
+    assert_eq!(matches.len(), 2);
+    // The contiguous match must rank first despite being older
+    assert_eq!(
+        h.get(matches[0].entry_idx),
+        "/Users/josh/d/ish/target/release/ish"
+    );
+}
+
+#[test]
+fn scoring_word_boundary_preferred() {
+    // "debug" should prefer the entry where it's a contiguous word at a
+    // boundary over one where d-e-b-u-g are scattered.
+    let h = History::from_entries(vec![
+        "ls target/debug/".into(), // older, "debug" contiguous after /
+        "docker exec -it bash ubuntu_gateway".into(), // more recent, d-e-b-u-g scattered
+    ]);
+    let matches = h.fuzzy_search("debug");
+    assert_eq!(matches.len(), 2);
+    assert_eq!(h.get(matches[0].entry_idx), "ls target/debug/");
+}
+
+#[test]
+fn scoring_exact_command_name() {
+    // Searching for a common command name. "cargo" should prefer entries
+    // where "cargo" appears as a contiguous word over scattered c-a-r-g-o.
+    let h = History::from_entries(vec![
+        "cargo test --release".into(), // older, literal "cargo"
+        "cat /var/log/syslog | rg 'error|warning'".into(), // more recent, scattered c-a-r-g-o
+    ]);
+    let matches = h.fuzzy_search("cargo");
+    assert_eq!(matches.len(), 2);
+    assert_eq!(h.get(matches[0].entry_idx), "cargo test --release");
+}
+
+#[test]
+fn scoring_path_components() {
+    // Searching for a path component. "src" should rank entries containing
+    // /src/ higher than those with scattered s-r-c.
+    let h = History::from_entries(vec![
+        "vim src/main.rs".into(),    // "src" is contiguous at word boundary
+        "ssh remote_cluster".into(), // s-r-c scattered
+    ]);
+    let matches = h.fuzzy_search("src");
+    assert_eq!(matches.len(), 2);
+    assert_eq!(h.get(matches[0].entry_idx), "vim src/main.rs");
+}
+
+#[test]
+fn scoring_flag_matching() {
+    // "--verbose" should match entries with the literal flag, not scattered chars.
+    let h = History::from_entries(vec![
+        "curl --verbose https://api.example.com".into(), // literal --verbose
+        "vagrant exec rebuild_host_svc_01; echo started".into(), // v-e-r-b-o-s-e scattered
+    ]);
+    let matches = h.fuzzy_search("verbose");
+    assert_eq!(matches.len(), 2);
+    assert_eq!(
+        h.get(matches[0].entry_idx),
+        "curl --verbose https://api.example.com"
+    );
+}
+
+#[test]
+fn scoring_pwd_bonus() {
+    // When working in the "ish" directory, entries mentioning "ish" should
+    // get a context bonus.
+    let h = History::from_entries(vec![
+        "cargo build".into(),                 // older, no "ish"
+        "npm install".into(),                 // more recent, no "ish"
+        "./target/release/ish --help".into(), // oldest, but contains "ish"
+    ]);
+    // With PWD basename "ish"
+    let matches = h.fuzzy_search_scored("build", "ish");
+    // "cargo build" has contiguous "build" → high score
+    // "./target/release/ish --help" doesn't match "build" at all
+    // so PWD bonus only matters among entries that match
+    assert!(!matches.is_empty());
+    assert_eq!(h.get(matches[0].entry_idx), "cargo build");
+
+    // Now test where PWD actually breaks a tie
+    let h2 = History::from_entries(vec![
+        "cd /tmp/ish && make".into(), // older, contains "ish"
+        "cd /tmp/foo && make".into(), // more recent, no "ish"
+    ]);
+    let matches2 = h2.fuzzy_search_scored("make", "ish");
+    assert_eq!(matches2.len(), 2);
+    // Both have the same "make" match quality, but "ish" entry gets PWD bonus
+    assert_eq!(h2.get(matches2[0].entry_idx), "cd /tmp/ish && make");
+}
+
+#[test]
+fn scoring_git_workflow() {
+    // Real git workflow: searching "push" in a history full of git commands.
+    let h = History::from_entries(vec![
+        "git push -u origin main".into(),
+        "git pull --rebase".into(),
+        "git status".into(),
+        "pushd /tmp".into(), // "push" also matches here, contiguous + boundary
+    ]);
+    let matches = h.fuzzy_search("push");
+    assert_eq!(matches.len(), 2); // only "git push" and "pushd" match
+    // Both have contiguous "push" at word boundary. "pushd" is more recent.
+    assert_eq!(h.get(matches[0].entry_idx), "pushd /tmp");
+    assert_eq!(h.get(matches[1].entry_idx), "git push -u origin main");
+}
+
+#[test]
+fn scoring_docker_compose() {
+    // Searching "compose" should prefer the entry with literal "compose"
+    // over scattered c-o-m-p-o-s-e.
+    let h = History::from_entries(vec![
+        "docker compose up -d".into(), // literal "compose"
+        "cp /opt/myconfig /opt/provisioner/settings.env".into(), // c-o-m-p-o-s-e scattered
+    ]);
+    let matches = h.fuzzy_search("compose");
+    assert_eq!(matches.len(), 2);
+    assert_eq!(h.get(matches[0].entry_idx), "docker compose up -d");
+}
+
+#[test]
+fn scoring_equal_quality_uses_recency() {
+    // When match quality is identical, most-recent should win.
+    let h = History::from_entries(vec![
+        "echo hello".into(),
+        "echo world".into(),
+        "echo goodbye".into(),
+    ]);
+    let matches = h.fuzzy_search("echo");
+    assert_eq!(matches.len(), 3);
+    // All have identical scores (contiguous "echo" at position 0), so recency wins
+    assert_eq!(h.get(matches[0].entry_idx), "echo goodbye");
+    assert_eq!(h.get(matches[1].entry_idx), "echo world");
+    assert_eq!(h.get(matches[2].entry_idx), "echo hello");
+}
+
+#[test]
+fn scoring_long_path_not_destroyed_by_gaps() {
+    // A match in a long path shouldn't be destroyed by the gap penalty cap.
+    // The -3 cap per gap ensures that one long gap between matches doesn't
+    // overwhelm the contiguity bonuses from the matched portion.
+    let h = History::from_entries(vec![
+        "/very/long/deeply/nested/path/to/target/release/binary".into(),
+        "stat /tmp/a/really/great/example/thing".into(), // t-a-r-g-e-t scattered over many path components
+    ]);
+    let matches = h.fuzzy_search("target");
+    assert_eq!(matches.len(), 2);
+    assert_eq!(
+        h.get(matches[0].entry_idx),
+        "/very/long/deeply/nested/path/to/target/release/binary"
+    );
+}
+
+#[test]
+fn scoring_npm_scripts() {
+    // "test" should prefer "npm test" over entries with scattered t-e-s-t.
+    let h = History::from_entries(vec![
+        "npm test".into(),
+        "git remote set-url origin https://example.com".into(), // t-e-s-t scattered
+    ]);
+    let matches = h.fuzzy_search("test");
+    assert_eq!(matches.len(), 2);
+    assert_eq!(h.get(matches[0].entry_idx), "npm test");
+}
+
+#[test]
+fn optimal_alignment_finds_tight_window() {
+    // The greedy forward pass would match d(1) e(7) b(12) in "cd target/debug"
+    // (the 'd' in 'cd', the 'e' in 'target', the 'b' in 'debug').
+    // The backward pass should find the tighter window d(10) e(11) b(12)
+    // (all three contiguous in "debug").
+    let q: Vec<char> = "deb".chars().collect();
+    let (positions, count) = history::subsequence_match(&q, "cd target/debug").unwrap();
+    assert_eq!(count, 3);
+    // Optimal: d(10) e(11) b(12) — contiguous in "debug"
+    assert_eq!(
+        &positions[..3],
+        &[10, 11, 12],
+        "should find tight window in 'debug', not scattered across 'cd target/debug'"
+    );
+}
+
+#[test]
+fn optimal_alignment_prefers_contiguous_suffix() {
+    // "test" appears scattered early AND contiguous late in the string.
+    // Forward greedy: t(0) e(3) s(6) t(9) — scattered in "the best test"
+    // Optimal: t(9) e(10) s(11) t(12) — contiguous "test"
+    let q: Vec<char> = "test".chars().collect();
+    let (positions, count) = history::subsequence_match(&q, "the best test").unwrap();
+    assert_eq!(count, 4);
+    assert_eq!(
+        &positions[..4],
+        &[9, 10, 11, 12],
+        "should find contiguous 'test' at end, not scattered across 'the best'"
+    );
+}
+
+#[test]
+fn optimal_alignment_single_char() {
+    // Single char query — backward pass is trivial, should still work.
+    let q: Vec<char> = "t".chars().collect();
+    let (positions, count) = history::subsequence_match(&q, "cat").unwrap();
+    assert_eq!(count, 1);
+    // Greedy finds t(2), backward pass starts there, window is [2,2]
+    assert_eq!(positions[0], 2);
+}
+
+#[test]
+fn optimal_alignment_full_string_match() {
+    // Query matches the entire string — no ambiguity.
+    let q: Vec<char> = "abc".chars().collect();
+    let (positions, count) = history::subsequence_match(&q, "abc").unwrap();
+    assert_eq!(count, 3);
+    assert_eq!(&positions[..3], &[0, 1, 2]);
+}
+
+#[test]
+fn optimal_alignment_real_world_path() {
+    // Searching "main" in a path where "main" appears literally but 'm' occurs earlier.
+    let q: Vec<char> = "main".chars().collect();
+    let (positions, count) =
+        history::subsequence_match(&q, "cmake -B build && make -j8 && ./main").unwrap();
+    assert_eq!(count, 4);
+    // "main" appears contiguously at positions 32-35 ("./main")
+    // Greedy would pick m(1) from "cmake", but optimal should find tighter window
+    assert_eq!(
+        &positions[..4],
+        &[32, 33, 34, 35],
+        "should find contiguous 'main' at end"
+    );
+}
+
+#[test]
+fn scoring_first_match_bonus() {
+    // Entries starting with the query char should get a first-match bonus.
+    let h = History::from_entries(vec![
+        "git status".into(), // starts with 'g'
+        "rg pattern".into(), // 'g' is mid-word
+    ]);
+    let matches = h.fuzzy_search("g");
+    assert_eq!(matches.len(), 2);
+    // "git status" has first-match bonus (+4), "rg pattern" doesn't
+    assert_eq!(h.get(matches[0].entry_idx), "git status");
+}
+
+#[test]
+fn scoring_first_match_with_optimal_alignment() {
+    // Combining both: optimal alignment should find the contiguous match,
+    // and first-match bonus helps entries starting with the query.
+    let h = History::from_entries(vec![
+        "cargo build --release".into(), // "cargo" at start, first-match bonus
+        "echo cargo".into(),            // "cargo" contiguous but not at start, more recent
+    ]);
+    let matches = h.fuzzy_search("cargo");
+    assert_eq!(matches.len(), 2);
+    // Both have contiguous "cargo" with boundary bonus.
+    // "cargo build" gets first-match bonus (+4), "echo cargo" doesn't.
+    assert_eq!(h.get(matches[0].entry_idx), "cargo build --release");
+}
+
+#[test]
+fn scoring_into_matches_search() {
+    // Verify fuzzy_search_into produces the same ranking as fuzzy_search
+    let h = History::from_entries(vec![
+        "/Users/josh/d/ish/target/release/ish".into(),
+        "git remote add origin https://github.com/joshuarli/smtp-server.git".into(),
+    ]);
+    let search_results = h.fuzzy_search("target");
+    let mut into_results = Vec::new();
+    h.fuzzy_search_into("target", &mut into_results, 200, "");
+    assert_eq!(search_results.len(), into_results.len());
+    for (a, b) in search_results.iter().zip(into_results.iter()) {
+        assert_eq!(a.entry_idx, b.entry_idx);
+        assert_eq!(a.score, b.score);
+    }
 }
 
 #[test]
