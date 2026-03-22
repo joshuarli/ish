@@ -205,7 +205,9 @@ fn main() {
 
                 // Expand aliases before recording in history so "g status"
                 // becomes "git status" — matches what actually runs.
-                let history_line = expand_aliases_for_history(&line, &shell.aliases);
+                // Resolve relative cd paths to absolute so `z` can use them.
+                let history_line =
+                    resolve_cd_for_history(&expand_aliases_for_history(&line, &shell.aliases));
 
                 // Log for session transcript
                 shell.session_log.push_str(&line);
@@ -1076,6 +1078,43 @@ fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
     } else {
         line.to_string()
     }
+}
+
+/// Resolve relative cd/z paths to absolute for history, so `z` can match them.
+/// "cd src" → "cd /Users/josh/d/ish/src", "cd ~/d" stays as-is.
+fn resolve_cd_for_history(line: &str) -> String {
+    let trimmed = line.trim();
+    let (prefix, rest) = if let Some(r) = trimmed.strip_prefix("cd ") {
+        ("cd ", r.trim_start())
+    } else if let Some(r) = trimmed.strip_prefix("z ") {
+        ("z ", r.trim_start())
+    } else {
+        return line.to_string();
+    };
+
+    // Already absolute or tilde-prefixed — no resolution needed
+    if rest.starts_with('/') || rest.starts_with('~') || rest == "-" || rest.is_empty() {
+        return line.to_string();
+    }
+
+    // Split at first whitespace/operator to get just the path argument
+    let (path_arg, suffix) =
+        match rest.find(|c: char| c.is_whitespace() || c == '&' || c == '|' || c == ';') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        };
+
+    // Resolve relative to PWD
+    if let Ok(pwd) = std::env::current_dir() {
+        let resolved = pwd.join(path_arg);
+        if let Ok(canonical) = resolved.canonicalize() {
+            return format!("{prefix}{}{suffix}", canonical.display());
+        }
+        // canonicalize failed (dir doesn't exist yet?) — use joined path
+        return format!("{prefix}{}{suffix}", resolved.display());
+    }
+
+    line.to_string()
 }
 
 /// Join continuation lines for execution: strip `\<newline>` sequences,
