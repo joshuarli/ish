@@ -27,7 +27,7 @@ josh@mac ~/d/ish* main $
 | Ctrl+E / End | End of line |
 | Ctrl+K | Kill to end of line |
 | Ctrl+U | Kill to start of line |
-| Ctrl+W | Kill word backward |
+| Ctrl+W / Ctrl+Backspace | Kill word backward |
 | Ctrl+Y | Yank (paste) killed text |
 | Ctrl+D | Delete forward / exit on empty line |
 | Ctrl+C | Cancel line |
@@ -38,6 +38,8 @@ josh@mac ~/d/ish* main $
 
 Single kill ring shared across Ctrl+K/U/W. Full UTF-8 support.
 
+**Multiline editing**: paste a multi-line command (with `\` continuations or unclosed quotes) and move freely with Up/Down between lines. No more unwinding — the entire command lives in one buffer with free cursor movement.
+
 ### History
 
 | Key | Action |
@@ -47,7 +49,26 @@ Single kill ring shared across Ctrl+K/U/W. Full UTF-8 support.
 
 Fuzzy search opens a pager with matching characters highlighted in yellow. Up/Down to navigate, Enter to accept, Escape to cancel.
 
+**Scored ranking**: results are ranked by match quality, not just recency. Contiguous matches (searching "target" finds literal `target/release/` first), word-boundary alignment (`deb` prefers `debug/` over scattered d-e-b), and PWD context (entries mentioning the current project rank higher). Optimal alignment via forward+backward scan finds the tightest match window — "test" in "the best test" finds the contiguous "test" at the end, not scattered letters.
+
 Stored at `~/.local/share/ish/history` (or `$XDG_DATA_HOME/ish/history`). Deduplicated on add.
+
+### File Finder
+
+| Key | Action |
+|---|---|
+| Ctrl+F | Open file finder |
+| Down (in query) | Toggle hidden mode |
+| Enter | Search / accept selection |
+| Up / Down (in results) | Navigate |
+| Backspace (in results) | Back to query |
+| Escape | Cancel |
+
+Type a pattern, press Enter, pick from results. The selected path is inserted at the cursor position — type `vim `, press Ctrl+F, pick a file, get `vim src/main.rs`.
+
+Native implementation: recursive readdir with gitignore support, no external dependencies. Results sorted by depth (shallowest first) so nearby files appear before deeply nested ones. Normal mode respects `.gitignore`; hidden mode shows everything except `.git/`.
+
+Sub-millisecond for gitignore-respecting searches (~0.85ms). No indexes, no background processes.
 
 ### Tab Completion
 
@@ -58,7 +79,7 @@ Stored at `~/.local/share/ish/history` (or `$XDG_DATA_HOME/ish/history`). Dedupl
 | `$` prefix | Environment variables |
 | Everything else | Files and directories |
 
-Completions display in a column-major grid (up to 6 columns, 10 visible rows). Navigate with arrow keys or Tab, accept with Enter, cancel with Escape. Typing filters live.
+Completions display in a column-major grid (up to 6 columns, 10 visible rows). Navigate with arrow keys or Tab, accept with Enter, cancel with Escape. Typing filters live. Path completions sorted by modification time (most recent first) so recently-built or recently-edited files appear at the top.
 
 Colors: blue for directories, cyan for symlinks, green for executables.
 

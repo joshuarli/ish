@@ -73,6 +73,12 @@ src/
 
 See [docs/SEARCH.md](docs/SEARCH.md) for the ranking/scoring design and roadmap.
 
+**File finder (Ctrl+F):**
+1. Two-phase UI: query entry → result selection. Accepted path inserted at cursor position.
+2. `finder::find()` walks the filesystem with `libc::opendir`/`readdir`, uses `d_type` for directory detection (no stat calls), parses `.gitignore` for filtering. Results depth-sorted (shallowest first).
+3. Hidden mode (Down arrow toggle) disables gitignore filtering and shows dotfiles.
+4. Sub-millisecond for normal searches (~0.85ms). No external dependencies.
+
 ## Key Data Structures
 
 ```rust
@@ -145,7 +151,7 @@ Shell { aliases, last_status, prev_dir, rows, cols, history, prompt, prompt_buf,
 | Ctrl+Y | Yank (paste kill ring) |
 | Ctrl+L | Clear screen |
 | Ctrl+R | Fuzzy history search |
-| Ctrl+F | File picker (fd search) |
+| Ctrl+F | File finder (native, gitignore-aware) |
 | Ctrl+C | Cancel current line |
 | Ctrl+D | Exit (empty line) or delete forward |
 | Alt+B / Ctrl+Left | Move word left |
