@@ -6,14 +6,17 @@ use ish::job::Job;
 use ish::line::LineBuffer;
 use ish::term::TermWriter;
 use ish::{
-    builtin, complete, config, denv, exec, finder, history, parse, prompt, render, signal, term,
+    builtin, complete, config, denv, exec, finder, frecency, history, parse, prompt, render,
+    signal, term,
 };
 use std::os::fd::RawFd;
 
 struct Shell {
     aliases: AliasMap,
     last_status: i32,
+    last_duration_ms: u128,
     prev_dir: Option<String>,
+    dir_stack: Vec<String>,
     rows: u16,
     cols: u16,
     history: history::History,
@@ -60,6 +63,10 @@ enum Mode {
         saved_cursor: usize,
         hidden: bool,
         handle: finder::FinderHandle,
+    },
+    DirPicker {
+        entries: Vec<String>,
+        selected: usize,
     },
 }
 
@@ -154,7 +161,9 @@ fn main() {
     let mut shell = Shell {
         aliases: AliasMap::new(),
         last_status: 0,
+        last_duration_ms: 0,
         prev_dir: None,
+        dir_stack: Vec::with_capacity(32),
         rows,
         cols,
         history: history::History::load(),
@@ -314,6 +323,20 @@ fn main() {
                                     run_continuation(&mut shell, cont);
                                     true
                                 }
+                                "z" => {
+                                    let args: Vec<String> =
+                                        cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
+                                    shell.last_status =
+                                        frecency::builtin_z(&args, &shell.history, &shell.home);
+                                    if shell.last_status == 0 {
+                                        push_dir_stack(&mut shell.dir_stack);
+                                        shell.prompt.invalidate_git();
+                                        if *shell.denv_active.get_or_insert_with(denv::init) {
+                                            denv::on_cd();
+                                        }
+                                    }
+                                    true
+                                }
                                 "w" | "which" | "type" => {
                                     let args: Vec<String> =
                                         cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
@@ -340,8 +363,12 @@ fn main() {
                             continue;
                         }
 
-                        let is_cd = first_command_word(&cmdline).as_deref() == Some("cd");
+                        let is_cd = matches!(
+                            first_command_word(&cmdline).as_deref(),
+                            Some("cd") | Some("z")
+                        );
 
+                        let t0 = std::time::Instant::now();
                         shell.last_status = exec::execute(
                             &cmdline,
                             None,
@@ -353,12 +380,14 @@ fn main() {
                             &mut shell.session_log,
                             shell.last_status,
                         );
+                        shell.last_duration_ms = t0.elapsed().as_millis();
 
                         if history_line.trim() != "l" {
                             shell.history.add(&history_line);
                         }
 
                         if is_cd {
+                            push_dir_stack(&mut shell.dir_stack);
                             shell.prompt.invalidate_git();
                             if *shell.denv_active.get_or_insert_with(denv::init) {
                                 denv::on_cd();
@@ -438,9 +467,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     // Take ownership so prompt_str can be borrowed independently of shell.
     let pwd = getenv_str(c"PWD");
     let denv_dirty = getenv_str(c"__DENV_DIRTY") == "1";
-    shell
-        .prompt
-        .render_into(&mut shell.prompt_buf, shell.last_status, pwd, denv_dirty);
+    shell.prompt.render_into(
+        &mut shell.prompt_buf,
+        shell.last_status,
+        pwd,
+        denv_dirty,
+        shell.last_duration_ms,
+    );
     let prompt_str = std::mem::take(&mut shell.prompt_buf);
     let prompt_display_len = shell.prompt.display_len(&prompt_str);
 
@@ -599,6 +632,31 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     let _ = tw.flush_to_stdout();
                                     continue;
                                 }
+                                KeyAction::StartDirPicker => {
+                                    // Show dir stack in reverse (most recent first),
+                                    // excluding the current directory
+                                    let pwd = std::env::current_dir()
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    let entries: Vec<String> = shell
+                                        .dir_stack
+                                        .iter()
+                                        .rev()
+                                        .filter(|d| *d != &pwd)
+                                        .cloned()
+                                        .collect();
+                                    if entries.is_empty() {
+                                        // No history yet — stay in normal mode
+                                    } else {
+                                        mode = Mode::DirPicker {
+                                            entries,
+                                            selected: 0,
+                                        };
+                                        render_dir_picker_mode(&mut tw, &mode, shell);
+                                        let _ = tw.flush_to_stdout();
+                                        continue;
+                                    }
+                                }
                                 KeyAction::StartCompletion => {
                                     let comp = std::mem::take(&mut shell.comp_buf);
                                     let cs = start_completion(
@@ -679,7 +737,9 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 cursor_row = info.cursor_row;
                                 render::render_completions(&mut tw, state, &info, true);
                             }
-                            Mode::HistorySearch { .. } | Mode::FilePicker { .. } => {}
+                            Mode::HistorySearch { .. }
+                            | Mode::FilePicker { .. }
+                            | Mode::DirPicker { .. } => {}
                         }
                         let _ = tw.flush_to_stdout();
                     }
@@ -877,6 +937,68 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             }
                         }
                     }
+
+                    Mode::DirPicker { entries, selected } => match (key.key, key.mods.ctrl) {
+                        (Key::Escape, _) | (Key::Char('c'), true) => {
+                            mode = Mode::Normal;
+                            tw.carriage_return();
+                            tw.clear_to_end_of_screen();
+                            let info = render::render_line(
+                                &mut tw,
+                                &prompt_str,
+                                prompt_display_len,
+                                &line,
+                                shell.cols,
+                                0,
+                                &render::RenderOpts::default(),
+                            );
+                            cursor_row = info.cursor_row;
+                            let _ = tw.flush_to_stdout();
+                        }
+                        (Key::Enter, _) => {
+                            if let Some(dir) = entries.get(*selected) {
+                                let dir = dir.clone();
+                                eprintln!("{dir}");
+                                if let Err(e) = std::env::set_current_dir(&dir) {
+                                    eprintln!("ish: cd: {dir}: {e}");
+                                } else {
+                                    if let Ok(pwd) = std::env::current_dir() {
+                                        ish::shell_setenv("PWD", &pwd.to_string_lossy());
+                                    }
+                                    push_dir_stack(&mut shell.dir_stack);
+                                    shell.prompt.invalidate_git();
+                                    if *shell.denv_active.get_or_insert_with(denv::init) {
+                                        denv::on_cd();
+                                    }
+                                }
+                            }
+                            mode = Mode::Normal;
+                            tw.carriage_return();
+                            tw.clear_to_end_of_screen();
+                            let info = render::render_line(
+                                &mut tw,
+                                &prompt_str,
+                                prompt_display_len,
+                                &line,
+                                shell.cols,
+                                0,
+                                &render::RenderOpts::default(),
+                            );
+                            cursor_row = info.cursor_row;
+                            let _ = tw.flush_to_stdout();
+                        }
+                        (Key::Up, _) if *selected > 0 => {
+                            *selected -= 1;
+                            render_dir_picker_mode(&mut tw, &mode, shell);
+                            let _ = tw.flush_to_stdout();
+                        }
+                        (Key::Down, _) if *selected + 1 < entries.len() => {
+                            *selected += 1;
+                            render_dir_picker_mode(&mut tw, &mode, shell);
+                            let _ = tw.flush_to_stdout();
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -896,6 +1018,7 @@ enum KeyAction {
     ClearScreen,
     StartHistorySearch,
     StartFilePicker,
+    StartDirPicker,
     StartCompletion,
 }
 
@@ -1040,10 +1163,7 @@ fn handle_normal_key(
         (Key::Home, _, _) => line.move_home(),
         (Key::End, _, _) => line.move_end(),
 
-        (Key::Backspace, true, _) => {
-            line.kill_word_back();
-            *history_idx = None;
-        }
+        (Key::Backspace, true, _) => return KeyAction::StartDirPicker,
         (Key::Backspace, _, _) => {
             line.delete_back();
             *history_idx = None;
@@ -1767,6 +1887,87 @@ fn render_file_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
             in_query,
             *hidden,
         );
+    }
+}
+
+/// Push the current directory onto the dir stack (deduplicating the top).
+fn push_dir_stack(dir_stack: &mut Vec<String>) {
+    if let Ok(pwd) = std::env::current_dir() {
+        let pwd = pwd.to_string_lossy().into_owned();
+        // Don't push duplicates at the top
+        if dir_stack.last().map(|s| s.as_str()) != Some(&pwd) {
+            dir_stack.push(pwd);
+            // Cap at 50 entries
+            if dir_stack.len() > 50 {
+                dir_stack.remove(0);
+            }
+        }
+    }
+}
+
+fn render_dir_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
+    if let Mode::DirPicker { entries, selected } = mode {
+        // Reuse file picker renderer with a dummy "dirs:" header
+        tw.hide_cursor();
+        tw.carriage_return();
+        tw.clear_to_end_of_line();
+        tw.write_str("\x1b[1mdirs:\x1b[0m");
+        tw.clear_to_end_of_line();
+
+        let max_results = (shell.rows as usize).saturating_sub(2).min(20);
+        let max_width = shell.cols as usize - 2;
+        let total = entries.len();
+        let scroll = if total <= max_results || *selected < max_results / 2 {
+            0
+        } else if *selected + max_results / 2 >= total {
+            total.saturating_sub(max_results)
+        } else {
+            *selected - max_results / 2
+        };
+
+        tw.write_str("\n");
+        let mut displayed = 0;
+        for (i, dir) in entries.iter().skip(scroll).take(max_results).enumerate() {
+            let abs_idx = scroll + i;
+            tw.carriage_return();
+            tw.clear_to_end_of_line();
+
+            if abs_idx == *selected {
+                tw.write_str("\x1b[7m");
+            }
+
+            // Shorten home prefix to ~
+            let display = if let Some(rest) = dir.strip_prefix(&shell.home) {
+                format!("~{rest}")
+            } else {
+                dir.clone()
+            };
+
+            let mut col = 0;
+            for ch in display.chars() {
+                let w = ish::line::char_width(ch);
+                if col + w > max_width {
+                    break;
+                }
+                col += w;
+                let mut buf = [0u8; 4];
+                tw.write_str(ch.encode_utf8(&mut buf));
+            }
+
+            if abs_idx == *selected {
+                tw.write_str("\x1b[0m");
+            }
+            tw.clear_to_end_of_line();
+            tw.write_str("\n");
+            displayed += 1;
+        }
+
+        tw.clear_to_end_of_screen();
+        let up = displayed + 1;
+        tw.move_cursor_up(up as u16);
+        tw.carriage_return();
+        tw.move_cursor_right(5); // "dirs:" = 5
+        tw.show_cursor();
     }
 }
 

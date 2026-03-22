@@ -12,6 +12,7 @@ const SPECIAL_BUILTINS: &[&str] = &[
     "set",
     "unset",
     "alias",
+    "z",
     "copy-scrollback",
     "history",
 ];
@@ -25,6 +26,7 @@ pub const ALL_BUILTINS: &[&str] = &[
     "set",
     "unset",
     "alias",
+    "z",
     "l",
     "c",
     "w",

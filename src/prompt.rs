@@ -41,9 +41,16 @@ impl Prompt {
     }
 
     /// Render the prompt into a caller-owned buffer (zero allocation steady-state).
-    /// Layout: `user@host colored_pwd[*][ branch] $ `
+    /// Layout: `user@host colored_pwd[*][ branch][ [Xs]] $ `
     /// `pwd` and `denv_dirty` are passed in to avoid env var reads.
-    pub fn render_into(&mut self, out: &mut String, last_status: i32, pwd: &str, denv_dirty: bool) {
+    pub fn render_into(
+        &mut self,
+        out: &mut String,
+        last_status: i32,
+        pwd: &str,
+        denv_dirty: bool,
+        duration_ms: u128,
+    ) {
         let color = if last_status == 0 {
             "\x1b[38;5;10m" // bright green
         } else {
@@ -76,6 +83,19 @@ impl Prompt {
             out.push_str(&self.branch_buf);
         }
 
+        // Command duration (grey, only for commands ≥500ms)
+        if duration_ms >= 500 {
+            let secs = duration_ms as f64 / 1000.0;
+            out.push_str(" \x1b[38;5;8m[");
+            // Format to 1 decimal place without pulling in fmt machinery
+            let whole = secs as u64;
+            let frac = ((secs - whole as f64) * 10.0) as u8;
+            let mut buf = [0u8; 20];
+            let n = format_duration(whole, frac, &mut buf);
+            out.push_str(std::str::from_utf8(&buf[..n]).unwrap_or("?"));
+            out.push_str("s]\x1b[0m");
+        }
+
         out.push_str(" $ ");
     }
 
@@ -84,7 +104,7 @@ impl Prompt {
         let pwd = std::env::var("PWD").unwrap_or_default();
         let denv_dirty = std::env::var("__DENV_DIRTY").as_deref() == Ok("1");
         let mut out = String::with_capacity(128);
-        self.render_into(&mut out, last_status, &pwd, denv_dirty);
+        self.render_into(&mut out, last_status, &pwd, denv_dirty, 0);
         out
     }
 
@@ -213,6 +233,40 @@ fn shorten_pwd_into(pwd: &str, home: &str, out: &mut String) {
 }
 
 // -- Git helpers --
+
+/// Format "N.D" into a fixed buffer. Returns bytes written.
+fn format_duration(whole: u64, frac: u8, buf: &mut [u8; 20]) -> usize {
+    let mut i = 20;
+    // Fractional part
+    buf[{
+        i -= 1;
+        i
+    }] = b'0' + frac;
+    buf[{
+        i -= 1;
+        i
+    }] = b'.';
+    // Whole part
+    if whole == 0 {
+        buf[{
+            i -= 1;
+            i
+        }] = b'0';
+    } else {
+        let mut v = whole;
+        while v > 0 {
+            buf[{
+                i -= 1;
+                i
+            }] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+    // Shift to start
+    let len = 20 - i;
+    buf.copy_within(i..20, 0);
+    len
+}
 
 fn find_git_dir(start: &Path, ceiling: Option<&PathBuf>) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
