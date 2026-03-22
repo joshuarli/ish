@@ -279,26 +279,35 @@ fn main() {
                                 "history" => {
                                     let sub = cmd.argv.get(1).map(|s| parse::unescape(s));
                                     match sub.as_deref() {
-                                        None => {
+                                        None if cmd.redirects.is_empty() => {
+                                            // No redirects: print directly (avoids fork)
                                             for i in 0..shell.history.len() {
                                                 println!("{}", shell.history.get(i));
                                             }
                                             shell.last_status = 0;
+                                            true
+                                        }
+                                        None => {
+                                            // Has redirects: fall through to exec so
+                                            // redirects are applied (history > file)
+                                            false
                                         }
                                         Some("compact") => {
                                             shell.history.compact();
                                             shell.last_status = 0;
+                                            true
                                         }
                                         Some("rebuild") => {
                                             shell.history.rebuild();
                                             shell.last_status = 0;
+                                            true
                                         }
                                         Some(other) => {
                                             eprintln!("ish: history: unknown subcommand: {other}");
                                             shell.last_status = 1;
+                                            true
                                         }
                                     }
-                                    true
                                 }
                                 "copy-scrollback" => {
                                     use std::io::Write;
