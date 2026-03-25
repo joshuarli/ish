@@ -128,6 +128,11 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, &'static str> {
                     return Err("unexpected '!', did you mean '!='?");
                 }
             }
+            // 'x' / 'X' as a word-friendly multiply alias (e.g. `math 4 x 3`)
+            b'x' | b'X' => {
+                tokens.push(Token::Star);
+                i += 1;
+            }
             b'0'..=b'9' | b'.' => {
                 let start = i;
                 while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
@@ -272,6 +277,15 @@ mod tests {
         assert_eq!(eval("3 * 4").unwrap(), "12");
         assert_eq!(eval("15 / 4").unwrap(), "3.75");
         assert_eq!(eval("7 % 3").unwrap(), "1");
+    }
+
+    #[test]
+    fn x_as_multiply() {
+        // word-friendly alias: `math 4 x 3` avoids glob expansion of `*`
+        assert_eq!(eval("4 x 3").unwrap(), "12");
+        assert_eq!(eval("4 X 3").unwrap(), "12");
+        assert_eq!(eval("4x3").unwrap(), "12");
+        assert_eq!(eval("2 x 3 + 1").unwrap(), "7");
     }
 
     #[test]
