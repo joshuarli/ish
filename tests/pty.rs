@@ -710,7 +710,7 @@ fn l_builtin_lists_files() {
 #[test]
 fn set_and_echo_var() {
     let sh = PtyShell::spawn();
-    sh.run_command("set MY_VAR hello_world");
+    sh.run_command("export MY_VAR=hello_world");
     let out = sh.run_command("echo $MY_VAR");
     let text = PtyShell::strip_ansi(&out);
     assert!(
@@ -1053,13 +1053,14 @@ fn script_mode_refused() {
 }
 
 #[test]
-fn source_refused() {
+fn source_nonexistent_error() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("source foo.sh");
     let text = PtyShell::strip_ansi(&out);
+    // epsh handles source natively — nonexistent file gives an error
     assert!(
-        text.contains("not supported"),
-        "expected source refusal: {text:?}"
+        text.contains("No such file") || text.contains("not found") || text.contains("error"),
+        "expected file-not-found error: {text:?}"
     );
 }
 

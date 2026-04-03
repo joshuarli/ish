@@ -3,8 +3,9 @@ use std::path::PathBuf;
 
 /// Load config from the given path, or the default config path.
 /// Supports: `set VAR "value"` and `alias name cmd [args...]`.
+/// Also sources `init.sh` from the config directory via epsh.
 /// Warns on bad lines, continues processing.
-pub fn load(aliases: &mut AliasMap, path_override: Option<&str>) {
+pub fn load(aliases: &mut AliasMap, epsh: &mut epsh::eval::Shell, path_override: Option<&str>) {
     let path = match path_override {
         Some(p) => PathBuf::from(p),
         None => config_path(),
@@ -27,7 +28,7 @@ pub fn load(aliases: &mut AliasMap, path_override: Option<&str>) {
         }
 
         if let Some(rest) = line.strip_prefix("set ") {
-            parse_set(rest.trim(), lineno + 1, &path);
+            parse_set(rest.trim(), lineno + 1, &path, epsh);
         } else if let Some(rest) = line.strip_prefix("alias ") {
             parse_alias(rest.trim(), lineno + 1, &path, aliases);
         } else {
@@ -38,9 +39,25 @@ pub fn load(aliases: &mut AliasMap, path_override: Option<&str>) {
             );
         }
     }
+
+    // Source init.sh from the same config directory
+    let init_path = path.with_file_name("init.sh");
+    if init_path.exists() {
+        match std::fs::read_to_string(&init_path) {
+            Ok(script) => {
+                let status = epsh.run_script(&script);
+                if status != 0 {
+                    eprintln!("ish: {}: exited with status {status}", init_path.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("ish: {}: {e}", init_path.display());
+            }
+        }
+    }
 }
 
-fn parse_set(rest: &str, lineno: usize, path: &std::path::Path) {
+fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh::eval::Shell) {
     // set VAR "value" or set VAR value
     let (name, value) = match rest.split_once(char::is_whitespace) {
         Some((n, v)) => (n.trim(), unquote(v.trim())),
@@ -59,6 +76,8 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path) {
     // Expand variables in value
     let expanded = expand_vars_simple(&value);
     crate::shell_setenv(name, &expanded);
+    // Sync to epsh's variable store
+    let _ = epsh.vars.set(name, &expanded);
 }
 
 fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut AliasMap) {

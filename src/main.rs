@@ -5,10 +5,7 @@ use ish::input::{InputEvent, InputReader, Key, KeyEvent};
 use ish::job::Job;
 use ish::line::LineBuffer;
 use ish::term::TermWriter;
-use ish::{
-    builtin, complete, config, denv, exec, finder, frecency, history, parse, prompt, render,
-    signal, term,
-};
+use ish::{builtin, complete, config, denv, finder, frecency, history, path, prompt, render, signal, term};
 use std::os::fd::RawFd;
 
 struct Shell {
@@ -27,13 +24,14 @@ struct Shell {
     /// Reusable fuzzy match buffer — avoids allocation per Ctrl+R keystroke.
     match_buf: Vec<history::FuzzyMatch>,
     job: Option<Job>,
-    path_cache: exec::PathCache,
+    path_cache: path::PathCache,
     exit_warned: bool,
     denv_active: Option<bool>, // None = unchecked, defers scan_path to first use
-    orig_termios: libc::termios,
     signal_fd: RawFd,
     home: String,
     session_log: String,
+    epsh: epsh::eval::Shell,
+    shell_pid: i32,
 }
 
 enum ReadResult {
@@ -133,15 +131,6 @@ fn main() {
         ish::shell_setenv("PWD", &cwd.to_string_lossy());
     }
 
-    // Save original termios
-    let orig_termios = match term::save_termios() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("ish: cannot get terminal settings: {e}");
-            std::process::exit(1);
-        }
-    };
-
     // SAFETY: Set shell as its own process group leader and take foreground
     // control of the terminal. Called once at startup, single-threaded.
     unsafe {
@@ -157,6 +146,14 @@ fn main() {
     let (rows, cols) = term::term_size();
     let home = std::env::var("HOME").unwrap_or_default();
 
+    let shell_pid = unsafe { libc::getpid() };
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let epsh = epsh::eval::Shell::builder()
+        .cwd(cwd)
+        .interactive(true)
+        .build();
+
     let mut shell = Shell {
         aliases: AliasMap::new(),
         last_status: 0,
@@ -170,18 +167,19 @@ fn main() {
         comp_buf: complete::Completions::with_capacity(2048, 64),
         match_buf: Vec::with_capacity(200),
         job: None,
-        path_cache: exec::PathCache::new(),
+        path_cache: path::PathCache::new(),
         exit_warned: false,
         denv_active: None,
-        orig_termios,
         signal_fd,
         home: home.clone(),
         session_log: String::new(),
+        epsh,
+        shell_pid,
     };
 
     // Load config
     if !cli.no_config {
-        config::load(&mut shell.aliases, cli.config.as_deref());
+        config::load(&mut shell.aliases, &mut shell.epsh, cli.config.as_deref());
     }
 
     // denv init is deferred — scan_path("denv") runs on first cd, not startup
@@ -211,216 +209,159 @@ fn main() {
                 shell.session_log.push_str(&line);
                 shell.session_log.push('\n');
 
-                match parse::parse(&line) {
-                    Ok(cmdline) => {
-                        // Single simple command: handle shell-level builtins
-                        let handled = if let Some(first) = first_command_word(&cmdline) {
-                            let cmd = &cmdline.segments[0].0.commands[0].cmd;
-                            match first.as_str() {
-                                "source" | "." => {
-                                    eprintln!("ish: {first}: sourcing is not supported");
-                                    shell.last_status = 1;
-                                    true
-                                }
-                                "alias" => {
-                                    let args: Vec<String> =
-                                        cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
-                                    if args.len() >= 2 {
-                                        let name = args[0].clone();
-                                        let expansion = args[1..].to_vec();
-                                        shell.aliases.set(name, expansion);
-                                        shell.last_status = 0;
-                                    } else if args.len() == 1 {
-                                        if let Some(exp) = shell.aliases.get(&args[0]) {
-                                            println!("alias {} {}", args[0], exp.join(" "));
-                                        } else {
-                                            eprintln!("ish: alias: not found: {}", args[0]);
-                                            shell.last_status = 1;
-                                        }
-                                    } else {
-                                        for (name, exp) in shell.aliases.iter() {
-                                            println!("alias {name} {}", exp.join(" "));
-                                        }
-                                        shell.last_status = 0;
-                                    }
-                                    true
-                                }
-                                "exit" => {
-                                    if shell.job.is_some() {
-                                        if shell.exit_warned {
-                                            if let Some(job) = shell.job.take() {
-                                                // SAFETY: Send SIGTERM to job's pgid before exit.
-                                                unsafe {
-                                                    libc::killpg(job.pgid, libc::SIGTERM);
-                                                }
-                                            }
-                                            break;
-                                        } else {
-                                            eprintln!(
-                                                "ish: there is a suspended job. Exit again to force quit."
-                                            );
-                                            shell.exit_warned = true;
-                                            shell.last_status = 1;
-                                            true
-                                        }
-                                    } else {
-                                        let code: i32 = cmd
-                                            .argv
-                                            .get(1)
-                                            .map(|s| parse::unescape(s))
-                                            .and_then(|s| s.parse().ok())
-                                            .unwrap_or(0);
-                                        shell.history.compact();
-                                        std::process::exit(code);
-                                    }
-                                }
-                                "history" => {
-                                    let sub = cmd.argv.get(1).map(|s| parse::unescape(s));
-                                    match sub.as_deref() {
-                                        None if cmd.redirects.is_empty() => {
-                                            // No redirects: print directly (avoids fork)
-                                            for i in 0..shell.history.len() {
-                                                println!("{}", shell.history.get(i));
-                                            }
-                                            shell.last_status = 0;
-                                            true
-                                        }
-                                        None => {
-                                            // Has redirects or in pipeline: write full
-                                            // history to the text file, then fall through
-                                            // to exec so redirects/pipes are applied.
-                                            shell.history.flush_for_read();
-                                            false
-                                        }
-                                        Some("compact") => {
-                                            shell.history.compact();
-                                            shell.last_status = 0;
-                                            true
-                                        }
-                                        Some("rebuild") => {
-                                            shell.history.rebuild();
-                                            shell.last_status = 0;
-                                            true
-                                        }
-                                        Some(other) => {
-                                            eprintln!("ish: history: unknown subcommand: {other}");
-                                            shell.last_status = 1;
-                                            true
-                                        }
-                                    }
-                                }
-                                "copy-scrollback" => {
-                                    use std::io::Write;
-                                    let encoded = base64_encode(shell.session_log.as_bytes());
-                                    let osc = format!("\x1b]52;c;{encoded}\x07");
-                                    let _ = std::io::stdout().write_all(osc.as_bytes());
-                                    let _ = std::io::stdout().flush();
-                                    shell.last_status = 0;
-                                    true
-                                }
-                                "denv" if *shell.denv_active.get_or_insert_with(denv::init) => {
-                                    let args: Vec<String> =
-                                        cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
-                                    if let Some(_path_modified) = denv::command(&args) {
-                                        shell.last_status = 0;
-                                        true
-                                    } else {
-                                        false // not allow/deny/reload — fall through to exec
-                                    }
-                                }
-                                "fg" => {
-                                    let (status, cont) = exec::resume_job(&mut shell.job);
-                                    shell.last_status = status;
-                                    run_continuation(&mut shell, cont);
-                                    true
-                                }
-                                "z" => {
-                                    let args: Vec<String> =
-                                        cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
-                                    shell.last_status =
-                                        frecency::builtin_z(&args, &shell.history, &shell.home);
-                                    if shell.last_status == 0 {
-                                        push_dir_stack(&mut shell.dir_stack);
-                                        shell.prompt.invalidate_git();
-                                        if *shell.denv_active.get_or_insert_with(denv::init) {
-                                            denv::on_cd();
-                                        }
-                                    }
-                                    true
-                                }
-                                "w" | "which" | "type" => {
-                                    let args: Vec<String> =
-                                        cmd.argv[1..].iter().map(|s| parse::unescape(s)).collect();
-                                    if let Some(name) = args.first()
-                                        && let Some(exp) = shell.aliases.get(name.as_str())
-                                    {
-                                        println!("alias: {} {}", name, exp.join(" "));
-                                        shell.last_status = 0;
-                                        true
-                                    } else {
-                                        false // fall through to exec for builtin/PATH check
-                                    }
-                                }
-                                _ => false,
-                            }
+                // Handle ish-level commands that must be intercepted before epsh
+                let first_word = line.trim().split_whitespace().next().unwrap_or("");
+                let handled = match first_word {
+                    "alias" => {
+                        handle_alias(&line, &mut shell);
+                        true
+                    }
+                    "exit" => {
+                        if handle_exit_command(&line, &mut shell) {
+                            break;
+                        }
+                        true
+                    }
+                    "history" => handle_history(&line, &mut shell),
+                    "copy-scrollback" => {
+                        use std::io::Write;
+                        let encoded = base64_encode(shell.session_log.as_bytes());
+                        let osc = format!("\x1b]52;c;{encoded}\x07");
+                        let _ = std::io::stdout().write_all(osc.as_bytes());
+                        let _ = std::io::stdout().flush();
+                        shell.last_status = 0;
+                        true
+                    }
+                    "denv" if *shell.denv_active.get_or_insert_with(denv::init) => {
+                        let args: Vec<String> = line
+                            .trim()
+                            .split_whitespace()
+                            .skip(1)
+                            .map(String::from)
+                            .collect();
+                        if let Some(_path_modified) = denv::command(&args) {
+                            sync_env_to_epsh(&mut shell.epsh);
+                            shell.last_status = 0;
+                            true
                         } else {
                             false
-                        };
-
-                        if handled {
-                            if history_line.trim() != "l" {
-                                shell.history.add(&history_line);
-                            }
-                            continue;
                         }
-
-                        let is_cd = matches!(
-                            first_command_word(&cmdline).as_deref(),
-                            Some("cd") | Some("z")
-                        );
-
-                        // If any command in the pipeline is `history`, flush
-                        // all entries to the text file so the forked child can
-                        // read the full history.
-                        if cmdline.segments.iter().any(|(pipeline, _)| {
-                            pipeline.commands.iter().any(|pc| {
-                                pc.cmd
-                                    .argv
-                                    .first()
-                                    .is_some_and(|w| parse::unescape(w) == "history")
-                            })
-                        }) {
-                            shell.history.flush_for_read();
-                        }
-
-                        shell.last_status = exec::execute(
-                            &cmdline,
-                            None,
-                            &shell.aliases,
-                            &mut shell.job,
-                            &shell.orig_termios,
-                            &shell.home,
-                            &mut shell.prev_dir,
-                            &mut shell.session_log,
-                            shell.last_status,
-                        );
-
-                        if history_line.trim() != "l" {
-                            shell.history.add(&history_line);
-                        }
-
-                        if is_cd {
+                    }
+                    "fg" => {
+                        shell.last_status = ish::job::resume_job(&mut shell.job);
+                        true
+                    }
+                    "z" => {
+                        let args: Vec<String> = line
+                            .trim()
+                            .split_whitespace()
+                            .skip(1)
+                            .map(String::from)
+                            .collect();
+                        shell.last_status =
+                            frecency::builtin_z(&args, &shell.history, &shell.home);
+                        if shell.last_status == 0 {
                             push_dir_stack(&mut shell.dir_stack);
                             shell.prompt.invalidate_git();
+                            let new_cwd =
+                                std::env::current_dir().unwrap_or_default();
+                            let old = shell.epsh.cwd.to_string_lossy().into_owned();
+                            ish::shell_setenv("OLDPWD", &old);
+                            let _ = shell.epsh.vars.set("OLDPWD", &old);
+                            shell.epsh.set_cwd(new_cwd);
                             if *shell.denv_active.get_or_insert_with(denv::init) {
                                 denv::on_cd();
+                                sync_env_to_epsh(&mut shell.epsh);
                             }
                         }
+                        true
                     }
-                    Err(e) => {
-                        eprintln!("ish: {e}");
-                        shell.last_status = 1;
+                    "w" | "which" | "type" => {
+                        let args: Vec<String> = line
+                            .trim()
+                            .split_whitespace()
+                            .skip(1)
+                            .map(String::from)
+                            .collect();
+                        shell.last_status =
+                            builtin::builtin_w(&args, &shell.aliases, &shell.epsh.functions);
+                        true
                     }
+                    "l" => {
+                        let args: Vec<String> = line
+                            .trim()
+                            .split_whitespace()
+                            .skip(1)
+                            .map(String::from)
+                            .collect();
+                        shell.last_status = builtin::builtin_l(&args);
+                        true
+                    }
+                    "c" => {
+                        print!("\x1b[H\x1b[2J");
+                        shell.last_status = 0;
+                        true
+                    }
+                    _ => false,
+                };
+
+                if handled {
+                    if history_line.trim() != "l" {
+                        shell.history.add(&history_line);
+                    }
+                    continue;
+                }
+
+                // Expand aliases and run through epsh
+                let expanded = shell.aliases.expand_line(&line);
+
+                // If any command in the line is `history`, flush entries
+                // to the text file so forked children can read them.
+                if expanded.contains("history") {
+                    shell.history.flush_for_read();
+                }
+
+                // Save cwd before execution to detect cd
+                let prev_cwd = shell.epsh.cwd.clone();
+
+                // Set up external handler for ish-specific builtins
+                let shell_pid = shell.shell_pid;
+                let handler = make_external_handler(shell_pid);
+                shell.epsh.set_external_handler(handler);
+
+                shell.last_status = shell.epsh.run_script(&expanded);
+
+                // Detect cwd change (cd, pushd, etc.)
+                let cwd_changed = shell.epsh.cwd != prev_cwd;
+                if cwd_changed {
+                    // Sync process cwd with epsh
+                    let _ = std::env::set_current_dir(&shell.epsh.cwd);
+                    ish::shell_setenv("PWD", &shell.epsh.cwd.to_string_lossy());
+                    let old = prev_cwd.to_string_lossy().into_owned();
+                    ish::shell_setenv("OLDPWD", &old);
+                    let _ = shell.epsh.vars.set("OLDPWD", &old);
+                    shell.prev_dir = Some(old);
+                    push_dir_stack(&mut shell.dir_stack);
+                    shell.prompt.invalidate_git();
+                }
+
+                // Trigger denv on any cd command, even if cwd didn't change (e.g. cd .)
+                let is_cd = first_word == "cd" || cwd_changed;
+                if is_cd {
+                    if *shell.denv_active.get_or_insert_with(denv::init) {
+                        denv::on_cd();
+                        sync_env_to_epsh(&mut shell.epsh);
+                    }
+                }
+
+                // Detect job suspension (status 148 = 128 + SIGTSTP)
+                if shell.last_status == 148 {
+                    // TODO: save Job from epsh's stopped process info
+                    // For now, the external handler stores it
+                }
+
+                if history_line.trim() != "l" {
+                    shell.history.add(&history_line);
                 }
             }
             ReadResult::Exit => {
@@ -988,6 +929,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     shell.prompt.invalidate_git();
                                     if *shell.denv_active.get_or_insert_with(denv::init) {
                                         denv::on_cd();
+                                        sync_env_to_epsh(&mut shell.epsh);
                                     }
                                 }
                             }
@@ -1046,55 +988,8 @@ enum KeyAction {
 /// Expand the first word of each ;/&&/||-separated segment through aliases.
 /// Used to record expanded commands in history (e.g., "g status" → "git status").
 /// Get the first non-assignment command word from a single-command cmdline.
-fn first_command_word(cmdline: &parse::CommandLine) -> Option<String> {
-    if cmdline.segments.len() != 1 || cmdline.segments[0].0.commands.len() != 1 {
-        return None;
-    }
-    cmdline.segments[0].0.commands[0]
-        .cmd
-        .argv
-        .iter()
-        .map(|s| parse::unescape(s))
-        .find(|s| exec::var_assignment_pos(s).is_none())
-}
-
-/// Join alias expansion words, quoting any that contain whitespace so the
-/// result re-parses into the same tokens.
-fn shell_quote_join(words: &[String]) -> String {
-    let mut result = String::new();
-    for (i, word) in words.iter().enumerate() {
-        if i > 0 {
-            result.push(' ');
-        }
-        if word.contains([' ', '\t', '\n']) {
-            result.push('"');
-            for c in word.chars() {
-                if c == '"' || c == '\\' {
-                    result.push('\\');
-                }
-                result.push(c);
-            }
-            result.push('"');
-        } else {
-            result.push_str(word);
-        }
-    }
-    result
-}
-
 fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
-    let trimmed = line.trim();
-    let first_word = trimmed.split_whitespace().next().unwrap_or("");
-    if let Some(expansion) = aliases.get(first_word) {
-        let expanded_str = shell_quote_join(expansion);
-        if trimmed.starts_with(&expanded_str) {
-            return line.to_string();
-        }
-        let rest = &trimmed[first_word.len()..];
-        format!("{expanded_str}{rest}")
-    } else {
-        line.to_string()
-    }
+    aliases.expand_line(line).into_owned()
 }
 
 /// Resolve relative cd/z paths to absolute for history, so `z` can match them.
@@ -1235,7 +1130,7 @@ fn handle_normal_key(
         }
         (Key::Enter, _, _) => {
             let text = join_continuation_lines(line.text());
-            if parse::needs_continuation(&text) {
+            if needs_continuation(&text) {
                 return KeyAction::Continuation;
             }
             return KeyAction::Execute(line.text().to_string());
@@ -1313,10 +1208,8 @@ fn try_alias_expand(line: &mut LineBuffer, aliases: &AliasMap) {
         return;
     }
 
-    if let Some(expansion) = aliases.get(trimmed) {
-        let rest = &text[trimmed.len()..];
-        let expanded_str = shell_quote_join(expansion);
-        let new_text = format!("{expanded_str}{rest}");
+    let expanded = aliases.expand_line(text);
+    if let std::borrow::Cow::Owned(new_text) = expanded {
         line.set(&new_text);
     }
 }
@@ -1439,7 +1332,7 @@ fn start_completion(
         && !partial.contains('/')
         && is_command_position(before_cursor, word_start)
     {
-        for &b in builtin::ALL_BUILTINS {
+        for b in builtin::all_builtin_names() {
             if b.starts_with(partial.as_str()) {
                 comp.push(b, false, false, false);
             }
@@ -1449,7 +1342,7 @@ fn start_completion(
                 comp.push(name, false, false, false);
             }
         }
-        exec::complete_commands(&partial, &mut comp);
+        path::complete_commands(&partial, &mut comp);
         // Directories are valid commands (implicit cd)
         complete::complete_path_into(&partial, true, &mut comp);
         comp.sort_entries();
@@ -1947,6 +1840,29 @@ fn render_file_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
 }
 
 /// Push the current directory onto the dir stack (deduplicating the top).
+/// Sync process environment variables into epsh's Variables store.
+/// Called after operations that modify the process environment (denv, set config).
+/// Handles both additions/changes and removals.
+fn sync_env_to_epsh(epsh: &mut epsh::eval::Shell) {
+    let env_vars: std::collections::HashSet<String> =
+        std::env::vars().map(|(k, _)| k).collect();
+
+    // Set or update vars present in process env
+    for (key, value) in std::env::vars() {
+        if epsh.vars.get(&key) != Some(value.as_str()) {
+            let _ = epsh.vars.set(&key, &value);
+            epsh.vars.export(&key);
+        }
+    }
+
+    // Unset vars present in epsh but not in process env
+    for (key, _) in epsh.vars.exported_env() {
+        if !env_vars.contains(&key) {
+            let _ = epsh.vars.unset(&key);
+        }
+    }
+}
+
 fn push_dir_stack(dir_stack: &mut Vec<String>) {
     if let Ok(pwd) = std::env::current_dir() {
         let pwd = pwd.to_string_lossy().into_owned();
@@ -2027,6 +1943,228 @@ fn render_dir_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
     }
 }
 
+/// Handle the "exit" command typed at the prompt. Returns true if the shell should break.
+fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
+    if shell.job.is_some() {
+        if shell.exit_warned {
+            if let Some(job) = shell.job.take() {
+                unsafe {
+                    libc::killpg(job.pgid, libc::SIGTERM);
+                }
+            }
+            return true; // break
+        } else {
+            eprintln!("ish: there is a suspended job. Exit again to force quit.");
+            shell.exit_warned = true;
+            shell.last_status = 1;
+            return false;
+        }
+    }
+    let code: i32 = line
+        .trim()
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    shell.history.compact();
+    std::process::exit(code);
+}
+
+/// Handle the "alias" command typed at the prompt.
+fn handle_alias(line: &str, shell: &mut Shell) {
+    let args: Vec<&str> = line.trim().split_whitespace().skip(1).collect();
+    if args.len() >= 2 {
+        let name = args[0].to_string();
+        let expansion: Vec<String> = args[1..].iter().map(|s| s.to_string()).collect();
+        shell.aliases.set(name, expansion);
+        shell.last_status = 0;
+    } else if args.len() == 1 {
+        if let Some(exp) = shell.aliases.get(args[0]) {
+            println!("alias {} {}", args[0], exp.join(" "));
+            shell.last_status = 0;
+        } else {
+            eprintln!("ish: alias: not found: {}", args[0]);
+            shell.last_status = 1;
+        }
+    } else {
+        for (name, exp) in shell.aliases.iter() {
+            println!("alias {name} {}", exp.join(" "));
+        }
+        shell.last_status = 0;
+    }
+}
+
+/// Handle the "history" command. Returns true if handled (no fallthrough needed).
+fn handle_history(line: &str, shell: &mut Shell) -> bool {
+    let sub = line.trim().split_whitespace().nth(1);
+    match sub {
+        None => {
+            for i in 0..shell.history.len() {
+                println!("{}", shell.history.get(i));
+            }
+            shell.last_status = 0;
+            true
+        }
+        Some("compact") => {
+            shell.history.compact();
+            shell.last_status = 0;
+            true
+        }
+        Some("rebuild") => {
+            shell.history.rebuild();
+            shell.last_status = 0;
+            true
+        }
+        Some(other) => {
+            eprintln!("ish: history: unknown subcommand: {other}");
+            shell.last_status = 1;
+            true
+        }
+    }
+}
+
+/// Build the external handler for epsh. Handles ish-specific builtins
+/// and fork/exec with job control for external commands.
+fn make_external_handler(
+    shell_pid: i32,
+) -> epsh::eval::ExternalHandler {
+    Box::new(move |args: &[String], env_pairs: &[(String, String)]| {
+        let name = &args[0];
+
+        // ish interactive builtins
+        match name.as_str() {
+            "l" => {
+                let status = builtin::builtin_l(&args[1..]);
+                return Ok(epsh::error::ExitStatus::from(status));
+            }
+            "c" => {
+                print!("\x1b[H\x1b[2J");
+                return Ok(epsh::error::ExitStatus::SUCCESS);
+            }
+            "history" => {
+                // In a pipeline context — read from text file
+                let path = if let Ok(data) = std::env::var("XDG_DATA_HOME") {
+                    std::path::PathBuf::from(data).join("ish/history")
+                } else if let Ok(home) = std::env::var("HOME") {
+                    std::path::PathBuf::from(home).join(".local/share/ish/history")
+                } else {
+                    std::path::PathBuf::from("/tmp/ish_history")
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        print!("{content}");
+                        return Ok(epsh::error::ExitStatus::SUCCESS);
+                    }
+                    Err(e) => {
+                        eprintln!("ish: history: {e}");
+                        return Ok(epsh::error::ExitStatus::FAILURE);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // External command: fork/exec with job control
+        let is_main = unsafe { libc::getpid() } == shell_pid;
+
+        let mut cmd = std::process::Command::new(&args[0]);
+        cmd.args(&args[1..]);
+
+        // Apply prefix env assignments
+        for (k, v) in env_pairs {
+            cmd.env(k, v);
+        }
+
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let child_id = child.id() as i32;
+
+                if is_main {
+                    // Main process: set up process group and give terminal
+                    unsafe {
+                        libc::setpgid(child_id, child_id);
+                        libc::tcsetpgrp(0, child_id);
+                    }
+
+                    // Wait with WUNTRACED for job control
+                    let mut status = 0i32;
+                    unsafe {
+                        libc::waitpid(child_id, &mut status, libc::WUNTRACED);
+                    }
+
+                    // Reclaim terminal
+                    unsafe {
+                        libc::tcsetpgrp(0, libc::getpgrp());
+                    }
+
+                    if libc::WIFSTOPPED(status) {
+                        return Err(epsh::error::ShellError::Stopped {
+                            pid: child_id,
+                            pgid: child_id,
+                        });
+                    } else if libc::WIFEXITED(status) {
+                        Ok(epsh::error::ExitStatus::from(libc::WEXITSTATUS(status)))
+                    } else if libc::WIFSIGNALED(status) {
+                        Ok(epsh::error::ExitStatus::from(128 + libc::WTERMSIG(status)))
+                    } else {
+                        Ok(epsh::error::ExitStatus::FAILURE)
+                    }
+                } else {
+                    // Pipeline child: just wait normally
+                    match child.wait() {
+                        Ok(s) => Ok(epsh::error::ExitStatus::from(s.code().unwrap_or(128))),
+                        Err(e) => Err(epsh::error::ShellError::Io(e)),
+                    }
+                }
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    eprintln!("{}: not found", args[0]);
+                    Ok(epsh::error::ExitStatus::NOT_FOUND)
+                } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    eprintln!("{}: permission denied", args[0]);
+                    Ok(epsh::error::ExitStatus::NOT_EXECUTABLE)
+                } else {
+                    Err(epsh::error::ShellError::Io(e))
+                }
+            }
+        }
+    })
+}
+
+/// Check if input needs a continuation line (open quotes, trailing operator, etc.)
+fn needs_continuation(input: &str) -> bool {
+    let trimmed = input.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let (in_single, in_double, escape) = scan_quote_state(trimmed.as_bytes());
+    if in_single || in_double || escape {
+        return true;
+    }
+    trimmed.ends_with('|') || trimmed.ends_with("&&") || trimmed.ends_with("||")
+}
+
+fn scan_quote_state(input: &[u8]) -> (bool, bool, bool) {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    for &b in input {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match b {
+            b'\\' if !in_single => escape = true,
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            _ => {}
+        }
+    }
+    (in_single, in_double, escape)
+}
+
+/// Handle Ctrl+D exit (from read_line).
 fn handle_exit(shell: &mut Shell) -> ReadResult {
     if shell.job.is_some() {
         if shell.exit_warned {
@@ -2047,29 +2185,6 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
     }
 }
 
-/// Execute remaining segments from a compound command after job resume.
-/// E.g., `sleep 2 && echo hi` suspended during sleep — after fg, runs `echo hi`.
-fn run_continuation(shell: &mut Shell, cont: Option<ish::job::Continuation>) {
-    let Some(cont) = cont else { return };
-
-    let remaining = parse::CommandLine {
-        segments: cont.segments,
-    };
-    shell.last_status = exec::execute(
-        &remaining,
-        Some((shell.last_status, cont.connector)),
-        &shell.aliases,
-        &mut shell.job,
-        &shell.orig_termios,
-        &shell.home,
-        &mut shell.prev_dir,
-        &mut shell.session_log,
-        shell.last_status,
-    );
-    // If the continuation itself suspended, any further continuation is
-    // already saved on the job by execute(). Nothing more to do here.
-}
-
 /// Rewrite shorthand cd forms:
 ///   ".." → "cd ..", "..." → "cd ../..", "...." → "cd ../../..", etc.
 ///   single-arg that is a directory (and not an alias/builtin/executable) → "cd <arg>"
@@ -2080,6 +2195,22 @@ fn maybe_rewrite_cd(line: &str, aliases: &AliasMap) -> String {
         Some(w) => w,
         None => return line.to_string(),
     };
+
+    // cd - → cd $OLDPWD (epsh's cd doesn't handle - natively)
+    if first == "cd" {
+        if let Some(arg) = words.next() {
+            if arg == "-" && words.next().is_none() {
+                if let Some(prev) = std::env::var("OLDPWD").ok().filter(|s| !s.is_empty()) {
+                    eprintln!("{prev}");
+                    return format!("cd {prev}");
+                } else {
+                    eprintln!("ish: cd: no previous directory");
+                    return "false".to_string();
+                }
+            }
+        }
+        return line.to_string();
+    }
 
     // Dot-dot shorthand: ".." is already valid, "..." → "../..", etc.
     if first.len() >= 2 && first.bytes().all(|b| b == b'.') {

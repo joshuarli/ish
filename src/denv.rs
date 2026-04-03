@@ -8,7 +8,7 @@ use std::path::Path;
 
 /// Initialize denv. Returns true if denv is available and active.
 pub fn init() -> bool {
-    if crate::exec::scan_path("denv").is_none() {
+    if crate::path::scan_path("denv").is_none() {
         return false;
     }
 

@@ -1,8 +1,8 @@
 //! Integration tests for ish shell.
 //!
 //! Tests the public API at a higher level than unit tests — verifying that
-//! modules compose correctly (parse → expand, line editing sequences,
-//! history search, completion, config parsing, etc.).
+//! modules compose correctly (line editing sequences, history search,
+//! completion, config parsing, etc.).
 
 use std::collections::HashSet;
 
@@ -10,266 +10,11 @@ use ish::alias::AliasMap;
 use ish::builtin;
 use ish::complete::{self, CompletionState, Completions};
 use ish::config;
-use ish::error::Error;
-use ish::expand;
 use ish::history::{self, History};
 use ish::input;
 use ish::line::LineBuffer;
 use ish::ls;
-use ish::parse::{self, Connector, LITERAL, RedirectKind};
 use ish::prompt;
-
-// ---------------------------------------------------------------------------
-// Parse → Expand pipeline
-// ---------------------------------------------------------------------------
-
-fn no_subst(_cmd: &str) -> Result<String, Error> {
-    Ok(String::new())
-}
-
-#[test]
-fn parse_expand_simple_command() {
-    let cmd = parse::parse("echo hello world").unwrap();
-    let argv: Vec<&str> = cmd.segments[0].0.commands[0]
-        .cmd
-        .argv
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let expanded = expand::expand_argv(
-        &argv.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        "/home/test",
-        &mut no_subst,
-        0,
-    )
-    .unwrap();
-    assert_eq!(expanded, ["echo", "hello", "world"]);
-}
-
-#[test]
-fn parse_expand_tilde() {
-    let cmd = parse::parse("ls ~/docs").unwrap();
-    let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-    let expanded = expand::expand_argv(argv, "/home/josh", &mut no_subst, 0).unwrap();
-    assert_eq!(expanded, ["ls", "/home/josh/docs"]);
-}
-
-#[test]
-fn parse_expand_variable() {
-    unsafe { std::env::set_var("ISH_INTEG_VAR", "myval") };
-    let cmd = parse::parse("echo $ISH_INTEG_VAR").unwrap();
-    let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-    let expanded = expand::expand_argv(argv, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(expanded, ["echo", "myval"]);
-}
-
-#[test]
-fn parse_expand_single_quote_prevents_expansion() {
-    unsafe { std::env::set_var("ISH_INTEG_VAR", "should_not_appear") };
-    let cmd = parse::parse("echo '$ISH_INTEG_VAR'").unwrap();
-    let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-    let expanded = expand::expand_argv(argv, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(expanded, ["echo", "$ISH_INTEG_VAR"]);
-}
-
-#[test]
-fn parse_expand_double_quote_expands_vars() {
-    unsafe { std::env::set_var("ISH_DQ_TEST", "value") };
-    let cmd = parse::parse(r#"echo "$ISH_DQ_TEST""#).unwrap();
-    let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-    let expanded = expand::expand_argv(argv, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(expanded, ["echo", "value"]);
-}
-
-#[test]
-fn parse_expand_command_substitution() {
-    // The parser treats $(cmd) as a single word only if there are no spaces.
-    // Test with no-space command substitution via expand_word directly.
-    let mut exec_subst = |cmd: &str| -> Result<String, Error> {
-        assert_eq!(cmd, "pwd");
-        Ok("/home/test\n".to_string())
-    };
-    let result = expand::expand_word("$(pwd)", "/home/test", &mut exec_subst, 0).unwrap();
-    assert_eq!(result, ["/home/test"]);
-}
-
-#[test]
-fn parse_expand_backtick_substitution() {
-    let cmd = parse::parse("echo `pwd`").unwrap();
-    let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-    let mut exec_subst = |cmd: &str| -> Result<String, Error> {
-        assert_eq!(cmd, "pwd");
-        Ok("/home/test\n".to_string())
-    };
-    let expanded = expand::expand_argv(argv, "/home/test", &mut exec_subst, 0).unwrap();
-    assert_eq!(expanded, ["echo", "/home/test"]);
-}
-
-// ---------------------------------------------------------------------------
-// Parser: comprehensive syntax tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn parse_pipe_with_stderr() {
-    let cmd = parse::parse("cmd1 &| cmd2").unwrap();
-    let pipeline = &cmd.segments[0].0;
-    assert_eq!(pipeline.commands.len(), 2);
-    assert!(pipeline.commands[0].pipe_stderr);
-}
-
-#[test]
-fn parse_all_redirect_kinds() {
-    let cmd = parse::parse("cmd > out >> app < in 2> err &> all").unwrap();
-    let redirects = &cmd.segments[0].0.commands[0].cmd.redirects;
-    assert_eq!(redirects.len(), 5);
-    assert_eq!(redirects[0].kind, RedirectKind::Out);
-    assert_eq!(redirects[0].target, "out");
-    assert_eq!(redirects[1].kind, RedirectKind::Append);
-    assert_eq!(redirects[2].kind, RedirectKind::In);
-    assert_eq!(redirects[3].kind, RedirectKind::Err);
-    assert_eq!(redirects[4].kind, RedirectKind::All);
-}
-
-#[test]
-fn parse_complex_pipeline_chain() {
-    let cmd = parse::parse("a | b && c || d ; e").unwrap();
-    assert_eq!(cmd.segments.len(), 4);
-    assert_eq!(cmd.segments[0].0.commands.len(), 2); // a | b
-    assert_eq!(cmd.segments[0].1, Some(Connector::And));
-    assert_eq!(cmd.segments[1].1, Some(Connector::Or));
-    assert_eq!(cmd.segments[2].1, Some(Connector::Semi));
-    assert_eq!(cmd.segments[3].1, None);
-}
-
-#[test]
-fn parse_comments_ignored() {
-    let cmd = parse::parse("echo hello # this is a comment").unwrap();
-    assert_eq!(cmd.segments[0].0.commands[0].cmd.argv, ["echo", "hello"]);
-}
-
-#[test]
-fn parse_empty_input_is_error() {
-    assert!(parse::parse("").is_err());
-    assert!(parse::parse("   ").is_err());
-    assert!(parse::parse("# comment only").is_err());
-}
-
-#[test]
-fn parse_unclosed_single_quote_is_error() {
-    assert!(parse::parse("echo 'unclosed").is_err());
-}
-
-#[test]
-fn parse_unclosed_double_quote_is_error() {
-    assert!(parse::parse(r#"echo "unclosed"#).is_err());
-}
-
-#[test]
-fn parse_trailing_pipe_redirect_is_error() {
-    assert!(parse::parse("echo >").is_err());
-}
-
-#[test]
-fn parse_backslash_escape_in_unquoted() {
-    let cmd = parse::parse(r"echo hello\ world").unwrap();
-    let word = &cmd.segments[0].0.commands[0].cmd.argv[1];
-    let clean = parse::unescape(word);
-    assert_eq!(clean, "hello world");
-}
-
-#[test]
-fn parse_double_quote_escape_sequences() {
-    // In double quotes: \$ \\ \" \` are escape sequences
-    let cmd = parse::parse(r#"echo "a\$b\\c\"d""#).unwrap();
-    let word = &cmd.segments[0].0.commands[0].cmd.argv[1];
-    let clean = parse::unescape(word);
-    assert_eq!(clean, r#"a$b\c"d"#);
-}
-
-#[test]
-fn parse_mixed_quoting() {
-    let cmd = parse::parse(r#"echo 'single'"double"unquoted"#).unwrap();
-    let word = &cmd.segments[0].0.commands[0].cmd.argv[1];
-    let clean = parse::unescape(word);
-    assert_eq!(clean, "singledoubleunquoted");
-}
-
-#[test]
-fn continuation_detection_comprehensive() {
-    // Needs continuation
-    assert!(parse::needs_continuation("ls |"));
-    assert!(parse::needs_continuation("cmd &&"));
-    assert!(parse::needs_continuation("cmd ||"));
-    assert!(parse::needs_continuation("echo 'unclosed"));
-    assert!(parse::needs_continuation(r#"echo "unclosed"#));
-
-    // Trailing backslash = line continuation
-    assert!(parse::needs_continuation("echo \\"));
-    assert!(parse::needs_continuation("python3 script.py \\"));
-    assert!(parse::needs_continuation("cmd --flag \\"));
-
-    // Does NOT need continuation
-    assert!(!parse::needs_continuation("ls -la"));
-    assert!(!parse::needs_continuation("a && b"));
-    assert!(!parse::needs_continuation("echo 'closed'"));
-    assert!(!parse::needs_continuation(""));
-    assert!(!parse::needs_continuation("   "));
-    // Escaped backslash (\\) is a literal, not a continuation
-    assert!(!parse::needs_continuation("echo \\\\"));
-    assert!(!parse::needs_continuation("path\\\\"));
-}
-
-#[test]
-fn backslash_line_continuation() {
-    // ends_with_line_continuation: unquoted trailing backslash only
-    assert!(parse::ends_with_line_continuation("echo \\"));
-    assert!(parse::ends_with_line_continuation("cmd --flag \\"));
-    assert!(parse::ends_with_line_continuation("  \\"));
-    // Escaped backslash at end — NOT a continuation
-    assert!(!parse::ends_with_line_continuation("echo \\\\"));
-    // Backslash inside double quote — NOT a line continuation
-    assert!(!parse::ends_with_line_continuation(r#"echo "hello \"#));
-    // Backslash inside single quote — NOT a line continuation
-    assert!(!parse::ends_with_line_continuation("echo 'hello \\"));
-    // No backslash at all
-    assert!(!parse::ends_with_line_continuation("ls -la"));
-    assert!(!parse::ends_with_line_continuation(""));
-    assert!(!parse::ends_with_line_continuation("   "));
-}
-
-#[test]
-fn backslash_continuation_joined_parses() {
-    // Simulate what the shell does: two lines joined after stripping the
-    // trailing backslash, separated by a space.
-    let line1 = "python3 script.py"; // trailing \ already stripped
-    let line2 = "--coverage-db /tmp/x"; // trailing \ already stripped
-    let line3 = "--output /tmp/out.txt";
-    let combined = format!("{line1} {line2} {line3}");
-    let cmd = parse::parse(&combined).unwrap();
-    let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-    assert_eq!(
-        argv.iter().map(|w| parse::unescape(w)).collect::<Vec<_>>(),
-        [
-            "python3",
-            "script.py",
-            "--coverage-db",
-            "/tmp/x",
-            "--output",
-            "/tmp/out.txt"
-        ],
-    );
-}
-
-#[test]
-fn trailing_backslash_does_not_hang_tokenizer() {
-    // Defensive: a lone trailing backslash must not infinite-loop the parser.
-    // (Before the fix, scan_word spun on this input.)
-    let cmd = parse::parse("echo \\").unwrap();
-    let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-    assert_eq!(argv.len(), 2);
-    assert_eq!(parse::unescape(&argv[0]), "echo");
-    assert_eq!(parse::unescape(&argv[1]), "\\");
-}
 
 // ---------------------------------------------------------------------------
 // Line buffer: complex editing sequences
@@ -1049,207 +794,8 @@ fn input_modifier_combinations() {
 }
 
 // ---------------------------------------------------------------------------
-// Expand: edge cases
-// ---------------------------------------------------------------------------
-
-#[test]
-fn expand_braced_var() {
-    // SAFETY: single-threaded tests
-    unsafe { std::env::set_var("ISH_TEST_BRACE", "world") };
-    // ${VAR} basic
-    let result = expand::expand_word("${ISH_TEST_BRACE}", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["world"]);
-    // ${VAR} concatenated
-    let result =
-        expand::expand_word("hello_${ISH_TEST_BRACE}!", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["hello_world!"]);
-}
-
-#[test]
-fn expand_braced_var_default() {
-    unsafe { std::env::set_var("ISH_TEST_SET", "val") };
-    unsafe { std::env::remove_var("ISH_TEST_UNSET") };
-    let result = expand::expand_word(
-        "${ISH_TEST_UNSET:-fallback}",
-        "/home/test",
-        &mut no_subst,
-        0,
-    )
-    .unwrap();
-    assert_eq!(result, ["fallback"]);
-    let result =
-        expand::expand_word("${ISH_TEST_SET:-fallback}", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["val"]);
-}
-
-#[test]
-fn expand_var_in_double_quotes() {
-    // Variables inside double quotes should expand (parser passes $ through)
-    unsafe { std::env::set_var("ISH_TEST_DQ", "quoted") };
-    let cmd = parse::parse(r#"echo "$ISH_TEST_DQ""#).unwrap();
-    let argv = cmd.segments[0].0.commands[0].cmd.argv.to_vec();
-    let expanded = expand::expand_argv(&argv, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(expanded, ["echo", "quoted"]);
-
-    // ${VAR} inside double quotes
-    let cmd = parse::parse(r#"echo "${ISH_TEST_DQ}""#).unwrap();
-    let argv = cmd.segments[0].0.commands[0].cmd.argv.to_vec();
-    let expanded = expand::expand_argv(&argv, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(expanded, ["echo", "quoted"]);
-}
-
-#[test]
-fn expand_undefined_var_is_empty() {
-    let result =
-        expand::expand_word("$UNDEFINED_ISH_VAR_XYZ", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, [""]);
-}
-
-#[test]
-fn expand_tilde_alone() {
-    let result = expand::expand_word("~", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["/home/test"]);
-}
-
-#[test]
-fn expand_tilde_with_path() {
-    let result = expand::expand_word("~/docs/file.txt", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["/home/test/docs/file.txt"]);
-}
-
-#[test]
-fn expand_tilde_not_at_start() {
-    let result = expand::expand_word("foo~bar", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["foo~bar"]);
-}
-
-#[test]
-fn expand_dollar_sign_alone() {
-    let result = expand::expand_word("$", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["$"]);
-}
-
-#[test]
-fn expand_unclosed_command_subst_is_error() {
-    let result = expand::expand_word("$(unclosed", "/home/test", &mut no_subst, 0);
-    assert!(result.is_err());
-}
-
-#[test]
-fn expand_unclosed_backtick_is_error() {
-    let result = expand::expand_word("`unclosed", "/home/test", &mut no_subst, 0);
-    assert!(result.is_err());
-}
-
-// ---------------------------------------------------------------------------
-// Expand: glob (uses real filesystem)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn expand_glob_star() {
-    let dir = tempdir_with_files(&["test_a.rs", "test_b.rs", "other.txt"]);
-    // Canonicalize to resolve symlinks (e.g. /var -> /private/var on macOS)
-    let dir = std::fs::canonicalize(&dir).unwrap();
-    let pattern = format!("{}/test_*.rs", dir.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result.len(), 2);
-    assert!(result.iter().any(|r| r.ends_with("test_a.rs")));
-    assert!(result.iter().any(|r| r.ends_with("test_b.rs")));
-}
-
-#[test]
-fn expand_glob_question_mark() {
-    let dir = tempdir_with_files(&["a1", "a2", "ab"]);
-    let dir = std::fs::canonicalize(&dir).unwrap();
-    let pattern = format!("{}/a?", dir.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result.len(), 3);
-}
-
-#[test]
-fn expand_glob_no_match_is_error() {
-    let result = expand::expand_word("/nonexistent/*.xyz", "/home/test", &mut no_subst, 0);
-    assert!(result.is_err());
-}
-
-// ---------------------------------------------------------------------------
-// Alias
-// ---------------------------------------------------------------------------
-
-#[test]
-fn alias_set_get() {
-    let mut aliases = AliasMap::new();
-    aliases.set("ll".into(), vec!["ls".into(), "-la".into()]);
-    let exp = aliases.get("ll").unwrap();
-    assert_eq!(exp.len(), 2);
-    assert_eq!(exp[0], "ls");
-    assert_eq!(exp[1], "-la");
-    assert_eq!(aliases.get("nonexistent"), None);
-}
-
-#[test]
-fn alias_override() {
-    let mut aliases = AliasMap::new();
-    aliases.set("g".into(), vec!["git".into()]);
-    aliases.set("g".into(), vec!["git".into(), "status".into()]);
-    let exp = aliases.get("g").unwrap();
-    assert_eq!(exp[0], "git");
-    assert_eq!(exp[1], "status");
-}
-
-#[test]
-fn alias_iter() {
-    let mut aliases = AliasMap::new();
-    aliases.set("a".into(), vec!["alpha".into()]);
-    aliases.set("b".into(), vec!["beta".into()]);
-    let collected: HashSet<_> = aliases.iter().map(|(k, _)| k.to_string()).collect();
-    assert!(collected.contains("a"));
-    assert!(collected.contains("b"));
-}
-
-// ---------------------------------------------------------------------------
 // Security-relevant tests
 // ---------------------------------------------------------------------------
-
-#[test]
-fn parse_null_bytes_in_input() {
-    // Null bytes should not crash the parser
-    let result = parse::parse("echo \x00hello");
-    // May succeed or fail, but must not panic
-    let _ = result;
-}
-
-#[test]
-fn parse_extremely_long_input() {
-    let long = "a ".repeat(10_000);
-    let result = parse::parse(&long);
-    assert!(result.is_ok());
-    // Verify it parsed all the words
-    let cmd = result.unwrap();
-    let argv_len = cmd.segments[0].0.commands[0].cmd.argv.len();
-    assert_eq!(argv_len, 10_000);
-}
-
-#[test]
-fn parse_deeply_nested_quotes_no_stack_overflow() {
-    // Alternating quote types shouldn't cause issues
-    let input = r#"echo 'a'"b"'c'"d"'e'"f""#;
-    let result = parse::parse(input);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn expand_nested_parens_no_panic() {
-    // Nested parens — the paren matcher should handle depth correctly
-    let word = "$(echo $(pwd))";
-    let mut call_count = 0;
-    let mut exec_subst = |_cmd: &str| -> Result<String, Error> {
-        call_count += 1;
-        Ok("val\n".to_string())
-    };
-    // Should not panic regardless of whether nesting works correctly
-    let _ = expand::expand_word(word, "/home/test", &mut exec_subst, 0);
-}
 
 #[test]
 fn line_buffer_boundary_conditions() {
@@ -1311,42 +857,6 @@ fn prompt_shorten_pwd_adversarial() {
 }
 
 // ---------------------------------------------------------------------------
-// Error: Display and From impls
-// ---------------------------------------------------------------------------
-
-#[test]
-fn error_display_msg() {
-    let e = Error::msg("something failed");
-    assert_eq!(format!("{e}"), "something failed");
-}
-
-#[test]
-fn error_display_glob_no_match() {
-    let e = Error::glob_no_match("*.xyz");
-    assert_eq!(format!("{e}"), "no matches for glob: *.xyz");
-}
-
-#[test]
-fn error_display_bad_substitution() {
-    let e = Error::bad_substitution("unclosed $(");
-    assert_eq!(format!("{e}"), "bad substitution: unclosed $(");
-}
-
-#[test]
-fn error_display_io() {
-    let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-    let e: Error = io_err.into();
-    assert_eq!(format!("{e}"), "file not found");
-}
-
-#[test]
-fn error_is_std_error() {
-    let e = Error::msg("test");
-    // Verify it implements std::error::Error
-    let _: &dyn std::error::Error = &e;
-}
-
-// ---------------------------------------------------------------------------
 // Config: load, parse_set, parse_alias, config_path
 // ---------------------------------------------------------------------------
 
@@ -1359,7 +869,8 @@ fn config_load_all_paths() {
     let empty_dir = tempdir_with_files(&[]);
     unsafe { std::env::set_var("XDG_CONFIG_HOME", empty_dir.to_str().unwrap()) };
     let mut aliases = AliasMap::new();
-    config::load(&mut aliases, None);
+    let mut epsh = epsh::eval::Shell::new();
+    config::load(&mut aliases, &mut epsh, None);
 
     // 2. Full config with set, alias, comments, bad lines
     let dir = tempdir_with_files(&[]);
@@ -1376,7 +887,8 @@ fn config_load_all_paths() {
     .unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.to_str().unwrap()) };
     let mut aliases = AliasMap::new();
-    config::load(&mut aliases, None);
+    let mut epsh = epsh::eval::Shell::new();
+    config::load(&mut aliases, &mut epsh, None);
     assert_eq!(
         std::env::var("ISH_TEST_CFG_LOAD_VAR").unwrap(),
         "hello world"
@@ -1390,7 +902,8 @@ fn config_load_all_paths() {
     std::fs::write(config_dir2.join("config.ish"), "set  \n").unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", dir2.to_str().unwrap()) };
     let mut aliases = AliasMap::new();
-    config::load(&mut aliases, None);
+    let mut epsh = epsh::eval::Shell::new();
+    config::load(&mut aliases, &mut epsh, None);
 
     // 4. Alias without expansion — should not be added
     let dir3 = tempdir_with_files(&[]);
@@ -1399,7 +912,8 @@ fn config_load_all_paths() {
     std::fs::write(config_dir3.join("config.ish"), "alias myalias\n").unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", dir3.to_str().unwrap()) };
     let mut aliases = AliasMap::new();
-    config::load(&mut aliases, None);
+    let mut epsh = epsh::eval::Shell::new();
+    config::load(&mut aliases, &mut epsh, None);
     assert!(aliases.get("myalias").is_none());
 
     // 5. set VAR with no value → empty string
@@ -1409,7 +923,8 @@ fn config_load_all_paths() {
     std::fs::write(config_dir4.join("config.ish"), "set ISH_TEST_CFG_NOVAL\n").unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", dir4.to_str().unwrap()) };
     let mut aliases = AliasMap::new();
-    config::load(&mut aliases, None);
+    let mut epsh = epsh::eval::Shell::new();
+    config::load(&mut aliases, &mut epsh, None);
     assert_eq!(std::env::var("ISH_TEST_CFG_NOVAL").unwrap(), "");
 
     // Restore
@@ -1525,7 +1040,7 @@ fn prompt_render_multiple() {
 }
 
 // ---------------------------------------------------------------------------
-// Builtin: is_builtin, is_special_builtin
+// Builtin: is_builtin, is_ish_builtin
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1556,334 +1071,50 @@ fn builtin_is_builtin_unknown() {
     assert!(!builtin::is_builtin("nonexistent"));
 }
 
+// ---------------------------------------------------------------------------
+// Alias
+// ---------------------------------------------------------------------------
+
 #[test]
-fn builtin_is_special_known() {
-    assert!(builtin::is_special_builtin("cd"));
-    assert!(builtin::is_special_builtin("exit"));
-    assert!(builtin::is_special_builtin("fg"));
-    assert!(builtin::is_special_builtin("set"));
-    assert!(builtin::is_special_builtin("unset"));
-    assert!(builtin::is_special_builtin("alias"));
-    assert!(builtin::is_special_builtin("copy-scrollback"));
+fn alias_set_get() {
+    let mut aliases = AliasMap::new();
+    aliases.set("ll".into(), vec!["ls".into(), "-la".into()]);
+    let exp = aliases.get("ll").unwrap();
+    assert_eq!(exp.len(), 2);
+    assert_eq!(exp[0], "ls");
+    assert_eq!(exp[1], "-la");
+    assert_eq!(aliases.get("nonexistent"), None);
 }
 
 #[test]
-fn builtin_is_special_not_special() {
-    assert!(!builtin::is_special_builtin("l"));
-    assert!(!builtin::is_special_builtin("echo"));
-    assert!(!builtin::is_special_builtin("pwd"));
-    assert!(!builtin::is_special_builtin("true"));
+fn alias_override() {
+    let mut aliases = AliasMap::new();
+    aliases.set("g".into(), vec!["git".into()]);
+    aliases.set("g".into(), vec!["git".into(), "status".into()]);
+    let exp = aliases.get("g").unwrap();
+    assert_eq!(exp[0], "git");
+    assert_eq!(exp[1], "status");
 }
 
 #[test]
-fn builtin_run_output_echo() {
-    let args = vec!["hello".to_string(), "world".to_string()];
-    let status = builtin::run_output("echo", &args, &[]);
-    assert_eq!(status, 0);
+fn alias_iter() {
+    let mut aliases = AliasMap::new();
+    aliases.set("a".into(), vec!["alpha".into()]);
+    aliases.set("b".into(), vec!["beta".into()]);
+    let collected: HashSet<_> = aliases.iter().map(|(k, _)| k.to_string()).collect();
+    assert!(collected.contains("a"));
+    assert!(collected.contains("b"));
 }
 
-#[test]
-fn builtin_run_output_true_false() {
-    assert_eq!(builtin::run_output("true", &[], &[]), 0);
-    assert_eq!(builtin::run_output("false", &[], &[]), 1);
-}
+// ---------------------------------------------------------------------------
+// Alias: Default impl
+// ---------------------------------------------------------------------------
 
 #[test]
-fn builtin_run_output_pwd() {
-    // pwd should succeed or fail gracefully (CWD may be changed by other tests)
-    let status = builtin::run_output("pwd", &[], &[]);
-    assert!(status == 0 || status == 1);
-}
-
-#[test]
-fn builtin_run_output_l_cwd() {
-    let dir = tempdir_with_files(&["a.txt"]);
-    let status = builtin::run_output("l", &[dir.to_str().unwrap().to_string()], &[]);
-    assert_eq!(status, 0);
-}
-
-#[test]
-fn builtin_run_output_l_file() {
-    let dir = tempdir_with_files(&["test_file.txt"]);
-    let file_path = dir.join("test_file.txt");
-    let status = builtin::run_output("l", &[file_path.to_str().unwrap().to_string()], &[]);
-    assert_eq!(status, 0);
-}
-
-#[test]
-fn builtin_run_output_l_nonexistent() {
-    let status = builtin::run_output("l", &["/nonexistent/path".to_string()], &[]);
-    assert_eq!(status, 1);
-}
-
-#[test]
-fn builtin_run_output_c_clear() {
-    let status = builtin::run_output("c", &[], &[]);
-    assert_eq!(status, 0);
-}
-
-#[test]
-fn builtin_run_output_w_no_args() {
-    let status = builtin::run_output("w", &[], &[]);
-    assert_eq!(status, 1);
-}
-
-#[test]
-fn builtin_run_output_w_builtin() {
-    let status = builtin::run_output("w", &["cd".to_string()], &[]);
-    assert_eq!(status, 0);
-}
-
-#[test]
-fn builtin_run_output_w_which_type_aliases() {
-    // "which" and "type" should work like "w"
-    assert_eq!(builtin::run_output("which", &["echo".to_string()], &[]), 0);
-    assert_eq!(builtin::run_output("type", &["echo".to_string()], &[]), 0);
-}
-
-#[test]
-fn builtin_run_output_w_not_found() {
-    let status = builtin::run_output("w", &["nonexistent_cmd_xyz".to_string()], &[]);
-    assert_eq!(status, 1);
-}
-
-#[test]
-fn builtin_run_output_copy_scrollback() {
-    let status = builtin::run_output("copy-scrollback", &[], &[]);
-    assert_eq!(status, 1); // "not yet implemented"
-}
-
-#[test]
-fn builtin_run_output_special_in_pipeline() {
-    // Special builtins shouldn't work in pipeline context (via run_output)
-    assert_eq!(builtin::run_output("cd", &[], &[]), 1);
-    assert_eq!(builtin::run_output("exit", &[], &[]), 1);
-    assert_eq!(builtin::run_output("set", &[], &[]), 1);
-}
-
-#[test]
-fn builtin_run_output_unknown() {
-    assert_eq!(builtin::run_output("notabuiltin", &[], &[]), 1);
-}
-
-#[test]
-fn builtin_run_special_cd_target() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    let dir = tempdir_with_files(&[]);
-    let old_dir = std::env::current_dir().unwrap();
-    let status = builtin::run_special(
-        "cd",
-        &[dir.to_str().unwrap().to_string()],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut log,
-    );
-    assert_eq!(status, 0);
-    assert!(prev_dir.is_some());
-
-    // Restore
-    let _ = std::env::set_current_dir(&old_dir);
-}
-
-#[test]
-fn builtin_run_special_cd_dash_no_prev() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    let status = builtin::run_special(
-        "cd",
-        &["-".to_string()],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut log,
-    );
-    assert_eq!(status, 1); // no previous directory
-}
-
-#[test]
-fn builtin_run_special_cd_dash_with_prev() {
-    let dir = tempdir_with_files(&[]);
-    let mut prev_dir = Some(dir.to_str().unwrap().to_string());
-    let mut job = None;
-    let mut log = String::new();
-
-    let old_dir = std::env::current_dir().unwrap();
-    let status = builtin::run_special(
-        "cd",
-        &["-".to_string()],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut log,
-    );
-    assert_eq!(status, 0);
-
-    let _ = std::env::set_current_dir(&old_dir);
-}
-
-#[test]
-fn builtin_run_special_cd_nonexistent() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    let status = builtin::run_special(
-        "cd",
-        &["/nonexistent_dir_xyz".to_string()],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut log,
-    );
-    assert_eq!(status, 1);
-}
-
-#[test]
-fn builtin_run_special_set_print_all() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    // set with no args prints all env vars
-    let status = builtin::run_special("set", &[], &[], &mut prev_dir, "/tmp", &mut job, &mut log);
-    assert_eq!(status, 0);
-}
-
-#[test]
-fn builtin_run_special_set_var() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    let status = builtin::run_special(
-        "set",
-        &["ISH_TEST_BUILTIN_SET".to_string(), "myvalue".to_string()],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut log,
-    );
-    assert_eq!(status, 0);
-    assert_eq!(std::env::var("ISH_TEST_BUILTIN_SET").unwrap(), "myvalue");
-    unsafe { std::env::remove_var("ISH_TEST_BUILTIN_SET") };
-}
-
-#[test]
-fn builtin_run_special_set_no_value() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    let status = builtin::run_special(
-        "set",
-        &["ISH_TEST_BUILTIN_SET_EMPTY".to_string()],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut log,
-    );
-    assert_eq!(status, 0);
-    assert_eq!(std::env::var("ISH_TEST_BUILTIN_SET_EMPTY").unwrap(), "");
-    unsafe { std::env::remove_var("ISH_TEST_BUILTIN_SET_EMPTY") };
-}
-
-#[test]
-fn builtin_run_special_unset() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    unsafe { std::env::set_var("ISH_TEST_UNSET_ME", "value") };
-    let status = builtin::run_special(
-        "unset",
-        &["ISH_TEST_UNSET_ME".to_string()],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut log,
-    );
-    assert_eq!(status, 0);
-    assert!(std::env::var("ISH_TEST_UNSET_ME").is_err());
-}
-
-#[test]
-fn builtin_run_special_unset_no_args() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    let status = builtin::run_special("unset", &[], &[], &mut prev_dir, "/tmp", &mut job, &mut log);
-    assert_eq!(status, 1);
-}
-
-#[test]
-fn builtin_run_special_alias_error() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    let status = builtin::run_special("alias", &[], &[], &mut prev_dir, "/tmp", &mut job, &mut log);
-    assert_eq!(status, 1);
-}
-
-#[test]
-fn builtin_run_special_copy_scrollback() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    let status = builtin::run_special(
-        "copy-scrollback",
-        &[],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut log,
-    );
-    assert_eq!(status, 0);
-}
-
-#[test]
-fn builtin_run_special_unknown() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    let status = builtin::run_special(
-        "notabuiltin",
-        &[],
-        &[],
-        &mut prev_dir,
-        "/tmp",
-        &mut job,
-        &mut log,
-    );
-    assert_eq!(status, 1);
-}
-
-#[test]
-fn builtin_run_special_exit() {
-    let mut prev_dir = None;
-    let mut job = None;
-    let mut log = String::new();
-
-    // exit in pipeline context returns 1
-    let status = builtin::run_special("exit", &[], &[], &mut prev_dir, "/tmp", &mut job, &mut log);
-    assert_eq!(status, 1);
+fn alias_default_impl() {
+    let aliases = AliasMap::default();
+    assert!(aliases.get("anything").is_none());
+    assert_eq!(aliases.iter().count(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1983,241 +1214,6 @@ fn ls_list_dir_symlink() {
     let link_path = dir.join("link.txt");
     std::os::unix::fs::symlink(dir.join("target.txt"), &link_path).unwrap();
     assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
-}
-
-// ---------------------------------------------------------------------------
-// Expand: more edge cases
-// ---------------------------------------------------------------------------
-
-#[test]
-fn expand_variable_in_middle_of_word() {
-    unsafe { std::env::set_var("ISH_MID_VAR", "world") };
-    let result = expand::expand_word("hello$ISH_MID_VAR!", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["helloworld!"]);
-}
-
-#[test]
-fn expand_multiple_variables() {
-    unsafe { std::env::set_var("ISH_A", "foo") };
-    unsafe { std::env::set_var("ISH_B", "bar") };
-    let result = expand::expand_word("$ISH_A-$ISH_B", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["foo-bar"]);
-}
-
-#[test]
-fn expand_dollar_paren_pass_through_in_variables() {
-    // $(cmd) should be left for command substitution pass
-    let mut exec = |cmd: &str| -> Result<String, Error> {
-        assert_eq!(cmd, "echo hi");
-        Ok("hi\n".to_string())
-    };
-    let result = expand::expand_word("$(echo hi)", "/home/test", &mut exec, 0).unwrap();
-    assert_eq!(result, ["hi"]);
-}
-
-#[test]
-fn expand_glob_recursive_star() {
-    let dir = tempdir_with_files(&[]);
-    let dir = std::fs::canonicalize(&dir).unwrap();
-    let sub = dir.join("sub");
-    std::fs::create_dir(&sub).unwrap();
-    std::fs::write(sub.join("deep.txt"), "").unwrap();
-
-    let pattern = format!("{}/**/*.txt", dir.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
-    assert!(result.iter().any(|r| r.ends_with("deep.txt")));
-}
-
-#[test]
-fn expand_literal_in_word() {
-    // LITERAL markers should be stripped in output
-    let word = format!("{LITERAL}$plain");
-    let result = expand::expand_word(&word, "/home/test", &mut no_subst, 0).unwrap();
-    // The LITERAL $ should be kept as literal, not expanded
-    assert_eq!(result, ["$plain"]);
-}
-
-#[test]
-fn expand_argv_multiple_words() {
-    let words: Vec<String> = vec!["hello".into(), "~".into(), "plain".into()];
-    let result = expand::expand_argv(&words, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["hello", "/home/test", "plain"]);
-}
-
-#[test]
-fn expand_glob_hidden_skip() {
-    // Glob should skip hidden files unless pattern starts with .
-    let dir = tempdir_with_files(&[".hidden", "visible"]);
-    let dir = std::fs::canonicalize(&dir).unwrap();
-    let pattern = format!("{}/v*", dir.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result.len(), 1);
-    assert!(result[0].ends_with("visible"));
-}
-
-#[test]
-fn expand_glob_dot_pattern_includes_hidden() {
-    let dir = tempdir_with_files(&[".hidden", "visible"]);
-    let dir = std::fs::canonicalize(&dir).unwrap();
-    let pattern = format!("{}/.h*", dir.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result.len(), 1);
-    assert!(result[0].ends_with(".hidden"));
-}
-
-#[test]
-fn expand_glob_through_symlink() {
-    // Glob must follow symlinks when traversing intermediate path segments.
-    // On macOS /var -> /private/var, so globs like /var/.../* would fail
-    // if the traversal used lstat (file_type) instead of stat (metadata).
-    let dir = tempdir_with_files(&["a.txt", "b.txt"]);
-    let dir = std::fs::canonicalize(&dir).unwrap();
-
-    // Create a symlink pointing to the temp dir
-    let link_parent = dir.parent().unwrap();
-    let link_path = link_parent.join(format!(
-        "{}_link",
-        dir.file_name().unwrap().to_string_lossy()
-    ));
-    let _ = std::fs::remove_file(&link_path);
-    std::os::unix::fs::symlink(&dir, &link_path).unwrap();
-
-    // Glob through the symlink
-    let pattern = format!("{}/*.txt", link_path.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result.len(), 2);
-    assert!(result.iter().any(|r| r.ends_with("a.txt")));
-    assert!(result.iter().any(|r| r.ends_with("b.txt")));
-
-    // Cleanup
-    let _ = std::fs::remove_file(&link_path);
-}
-
-#[test]
-fn expand_glob_through_nested_symlink() {
-    // Symlink as an intermediate segment: real_dir/sub/ with link -> real_dir,
-    // then glob link/sub/*
-    let dir = tempdir_with_files(&[]);
-    let dir = std::fs::canonicalize(&dir).unwrap();
-    let sub = dir.join("sub");
-    std::fs::create_dir_all(&sub).unwrap();
-    std::fs::write(sub.join("file.rs"), "").unwrap();
-
-    let link_path = dir.parent().unwrap().join(format!(
-        "{}_nested_link",
-        dir.file_name().unwrap().to_string_lossy()
-    ));
-    let _ = std::fs::remove_file(&link_path);
-    std::os::unix::fs::symlink(&dir, &link_path).unwrap();
-
-    let pattern = format!("{}/sub/*.rs", link_path.display());
-    let result = expand::expand_word(&pattern, "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result.len(), 1);
-    assert!(result[0].ends_with("file.rs"));
-
-    let _ = std::fs::remove_file(&link_path);
-}
-
-// ---------------------------------------------------------------------------
-// Parse: more error paths
-// ---------------------------------------------------------------------------
-
-#[test]
-fn parse_background_amp_alone() {
-    let result = parse::parse("echo hello &");
-    assert!(result.is_err());
-    assert!(format!("{}", result.unwrap_err()).contains("background"));
-}
-
-#[test]
-fn parse_redirect_without_target() {
-    // Redirect followed by a connector instead of a word
-    let result = parse::parse("echo >");
-    assert!(result.is_err());
-}
-
-#[test]
-fn parse_trailing_connector_and() {
-    // "a &&" — needs_continuation detects the trailing &&
-    assert!(parse::needs_continuation("a &&"));
-}
-
-#[test]
-fn parse_trailing_connector_or() {
-    assert!(parse::needs_continuation("a ||"));
-}
-
-#[test]
-fn parse_trailing_pipe() {
-    let result = parse::parse("a |");
-    assert!(result.is_err());
-}
-
-#[test]
-fn parse_unescape_with_literal() {
-    let s = format!("hello{LITERAL}world");
-    assert_eq!(parse::unescape(&s), "helloworld");
-}
-
-#[test]
-fn parse_unescape_no_literal() {
-    assert_eq!(parse::unescape("hello world"), "hello world");
-}
-
-#[test]
-fn parse_needs_continuation_escaped_quote() {
-    // Backslash-escaped quote should not count as open
-    assert!(!parse::needs_continuation(r"echo \'"));
-}
-
-#[test]
-fn parse_needs_continuation_double_quote_escaped() {
-    assert!(!parse::needs_continuation(r#"echo \""#));
-}
-
-#[test]
-fn parse_2_redirect() {
-    let cmd = parse::parse("cmd 2> errfile").unwrap();
-    let r = &cmd.segments[0].0.commands[0].cmd.redirects;
-    assert_eq!(r.len(), 1);
-    assert_eq!(r[0].kind, RedirectKind::Err);
-    assert_eq!(r[0].target, "errfile");
-}
-
-#[test]
-fn parse_append_redirect() {
-    let cmd = parse::parse("echo hi >> log.txt").unwrap();
-    assert_eq!(
-        cmd.segments[0].0.commands[0].cmd.redirects[0].kind,
-        RedirectKind::Append
-    );
-}
-
-#[test]
-fn parse_input_redirect() {
-    let cmd = parse::parse("cmd < input.txt").unwrap();
-    assert_eq!(
-        cmd.segments[0].0.commands[0].cmd.redirects[0].kind,
-        RedirectKind::In
-    );
-}
-
-#[test]
-fn parse_semicolon_separator() {
-    let cmd = parse::parse("a ; b").unwrap();
-    assert_eq!(cmd.segments.len(), 2);
-    assert_eq!(cmd.segments[0].1, Some(Connector::Semi));
-}
-
-// ---------------------------------------------------------------------------
-// Alias: Default impl
-// ---------------------------------------------------------------------------
-
-#[test]
-fn alias_default_impl() {
-    let aliases = AliasMap::default();
-    assert!(aliases.get("anything").is_none());
-    assert_eq!(aliases.iter().count(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -2539,48 +1535,6 @@ fn history_file_io() {
     // Reload and verify dedup
     let h2 = History::load_from(hist_file);
     assert!(h2.len() >= 2);
-}
-
-// ---------------------------------------------------------------------------
-// Expand: LITERAL marker handling
-// ---------------------------------------------------------------------------
-
-#[test]
-fn expand_strip_literal_no_markers() {
-    // expand_word with no special chars should fast-path
-    let result = expand::expand_word("plain_word", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["plain_word"]);
-}
-
-#[test]
-fn expand_backtick_subst() {
-    let mut exec = |cmd: &str| -> Result<String, Error> {
-        assert_eq!(cmd, "date");
-        Ok("2024-01-01\n".to_string())
-    };
-    let result = expand::expand_word("`date`", "/home/test", &mut exec, 0).unwrap();
-    assert_eq!(result, ["2024-01-01"]);
-}
-
-#[test]
-fn expand_nested_command_subst() {
-    let mut exec = |_cmd: &str| -> Result<String, Error> { Ok("inner\n".to_string()) };
-    let result = expand::expand_word("$(echo $(pwd))", "/home/test", &mut exec, 0).unwrap();
-    assert_eq!(result, ["inner"]);
-}
-
-#[test]
-fn expand_tilde_not_prefix() {
-    // ~ not at start should not expand
-    let result = expand::expand_word("path/~/file", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["path/~/file"]);
-}
-
-#[test]
-fn expand_tilde_user_not_supported() {
-    // ~otheruser should pass through unchanged
-    let result = expand::expand_word("~otheruser/file", "/home/test", &mut no_subst, 0).unwrap();
-    assert_eq!(result, ["~otheruser/file"]);
 }
 
 // ---------------------------------------------------------------------------
