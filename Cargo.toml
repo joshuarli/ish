@@ -4,7 +4,7 @@ version = "0.2.1"
 edition = "2024"
 
 [dependencies]
-epsh = { path = "../epsh" }
+epsh = "0.0.1"
 libc = "0.2"
 
 [dev-dependencies]
