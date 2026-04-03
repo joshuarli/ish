@@ -6,6 +6,12 @@
 
 use std::path::Path;
 
+/// A single environment variable change from denv.
+pub enum EnvChange {
+    Set(String, String),
+    Unset(String),
+}
+
 /// Initialize denv. Returns true if denv is available and active.
 pub fn init() -> bool {
     if crate::path::scan_path("denv").is_none() {
@@ -29,16 +35,16 @@ pub fn init() -> bool {
 }
 
 /// Called after cd. Checks fast-path, runs export if needed.
-/// Returns true if PATH was modified.
-pub fn on_cd() -> bool {
+/// Returns environment changes (already applied to process env).
+pub fn on_cd() -> Vec<EnvChange> {
     if fast_path_ok() {
-        return false;
+        return Vec::new();
     }
     run_export()
 }
 
-/// Handle `denv allow|deny|reload`. Returns Some(path_modified) if handled.
-pub fn command(args: &[String]) -> Option<bool> {
+/// Handle `denv allow|deny|reload`. Returns Some(changes) if handled.
+pub fn command(args: &[String]) -> Option<Vec<EnvChange>> {
     match args.first().map(|s| s.as_str()) {
         Some("allow" | "deny" | "reload") => Some(run_denv_and_apply(args)),
         _ => None,
@@ -121,25 +127,23 @@ fn file_mtime(path: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn run_export() -> bool {
+fn run_export() -> Vec<EnvChange> {
     run_denv_and_apply(&["export".to_string(), "bash".to_string()])
 }
 
-/// Run `denv <args>`, capture stdout, apply export/unset lines.
-/// Returns true if PATH was modified.
+/// Run `denv <args>`, capture stdout, parse and apply export/unset lines.
+/// Returns the list of changes (already applied to process env).
 ///
 /// Uses fork+exec directly (not std::process::Command) because the shell's
 /// signal handlers and process group setup require explicit cleanup in the child.
-fn run_denv_and_apply(args: &[String]) -> bool {
-    let old_path = std::env::var("PATH").ok();
-
+fn run_denv_and_apply(args: &[String]) -> Vec<EnvChange> {
     // Build command string for /bin/sh -c
     let cmd = format!("denv {}", args.join(" "));
 
     // Create pipe for capturing stdout
     let (pipe_r, pipe_w) = match crate::sys::pipe_cloexec() {
         Ok(fds) => fds,
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
 
     // SAFETY: fork() in single-threaded process. Child inherits fds/memory.
@@ -149,7 +153,7 @@ fn run_denv_and_apply(args: &[String]) -> bool {
             libc::close(pipe_r);
             libc::close(pipe_w);
         }
-        return false;
+        return Vec::new();
     }
 
     if pid == 0 {
@@ -212,43 +216,38 @@ fn run_denv_and_apply(args: &[String]) -> bool {
         libc::waitpid(pid, std::ptr::null_mut(), 0);
     }
 
-    apply_bash_output(&output);
-    std::env::var("PATH").ok() != old_path
+    let changes = parse_bash_output(&output);
+    for change in &changes {
+        match change {
+            EnvChange::Set(k, v) => crate::shell_setenv(k, v),
+            EnvChange::Unset(k) => crate::shell_unsetenv(k),
+        }
+    }
+    changes
 }
 
-/// Parse `export KEY='value';` and `unset KEY;` lines, apply to env.
-fn apply_bash_output(output: &str) {
+/// Parse `export KEY='value';` and `unset KEY;` lines into changes.
+fn parse_bash_output(output: &str) -> Vec<EnvChange> {
+    let mut changes = Vec::new();
     for line in output.lines() {
         let line = line.trim_end_matches(';');
         if let Some(rest) = line.strip_prefix("export ") {
             if let Some(eq) = rest.find('=') {
-                let key = &rest[..eq];
+                let key = rest[..eq].to_string();
                 let value = unquote_bash(&rest[eq + 1..]);
-                crate::shell_setenv(key, &value);
+                changes.push(EnvChange::Set(key, value));
             }
         } else if let Some(key) = line.strip_prefix("unset ") {
-            crate::shell_unsetenv(key.trim());
+            changes.push(EnvChange::Unset(key.trim().to_string()));
         }
     }
+    changes
 }
 
 /// Benchmark-only: parse denv output lines without mutating environment.
 /// Returns the number of directives parsed.
 pub fn apply_bash_output_bench(output: &str) -> usize {
-    let mut count = 0;
-    for line in output.lines() {
-        let line = line.trim_end_matches(';');
-        if let Some(rest) = line.strip_prefix("export ") {
-            if let Some(eq) = rest.find('=') {
-                let _key = &rest[..eq];
-                let _value = unquote_bash(&rest[eq + 1..]);
-                count += 1;
-            }
-        } else if line.strip_prefix("unset ").is_some() {
-            count += 1;
-        }
-    }
-    count
+    parse_bash_output(output).len()
 }
 
 /// Unquote a bash single-quoted string: `'value'` → `value`, `'\''` → `'`.
@@ -293,43 +292,66 @@ mod tests {
     }
 
     #[test]
-    fn apply_export_sets_var() {
-        apply_bash_output("export _DENV_TEST_A='hello_world';");
-        assert_eq!(std::env::var("_DENV_TEST_A").unwrap(), "hello_world");
-        crate::shell_unsetenv("_DENV_TEST_A");
+    fn parse_export() {
+        let changes = parse_bash_output("export _DENV_TEST_A='hello_world';");
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            EnvChange::Set(k, v) => {
+                assert_eq!(k, "_DENV_TEST_A");
+                assert_eq!(v, "hello_world");
+            }
+            _ => panic!("expected Set"),
+        }
     }
 
     #[test]
-    fn apply_unset_removes_var() {
-        crate::shell_setenv("_DENV_TEST_B", "exists");
-        apply_bash_output("unset _DENV_TEST_B;");
-        assert!(std::env::var("_DENV_TEST_B").is_err());
+    fn parse_unset() {
+        let changes = parse_bash_output("unset _DENV_TEST_B;");
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            EnvChange::Unset(k) => assert_eq!(k, "_DENV_TEST_B"),
+            _ => panic!("expected Unset"),
+        }
     }
 
     #[test]
-    fn apply_multi_line() {
-        apply_bash_output(
+    fn parse_multi_line() {
+        let changes = parse_bash_output(
             "export _DENV_TEST_C='one';\nexport _DENV_TEST_D='two';\nunset _DENV_TEST_E;",
         );
-        assert_eq!(std::env::var("_DENV_TEST_C").unwrap(), "one");
-        assert_eq!(std::env::var("_DENV_TEST_D").unwrap(), "two");
-        assert!(std::env::var("_DENV_TEST_E").is_err());
-        crate::shell_unsetenv("_DENV_TEST_C");
-        crate::shell_unsetenv("_DENV_TEST_D");
+        assert_eq!(changes.len(), 3);
+        match &changes[0] {
+            EnvChange::Set(k, v) => { assert_eq!(k, "_DENV_TEST_C"); assert_eq!(v, "one"); }
+            _ => panic!("expected Set"),
+        }
+        match &changes[1] {
+            EnvChange::Set(k, v) => { assert_eq!(k, "_DENV_TEST_D"); assert_eq!(v, "two"); }
+            _ => panic!("expected Set"),
+        }
+        match &changes[2] {
+            EnvChange::Unset(k) => assert_eq!(k, "_DENV_TEST_E"),
+            _ => panic!("expected Unset"),
+        }
     }
 
     #[test]
-    fn apply_value_with_embedded_quote() {
-        apply_bash_output("export _DENV_TEST_F='it'\\''s here';");
-        assert_eq!(std::env::var("_DENV_TEST_F").unwrap(), "it's here");
-        unsafe { std::env::remove_var("_DENV_TEST_F") };
+    fn parse_value_with_embedded_quote() {
+        let changes = parse_bash_output("export _DENV_TEST_F='it'\\''s here';");
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            EnvChange::Set(_, v) => assert_eq!(v, "it's here"),
+            _ => panic!("expected Set"),
+        }
     }
 
     #[test]
-    fn apply_empty_value() {
-        apply_bash_output("export _DENV_TEST_G='';");
-        assert_eq!(std::env::var("_DENV_TEST_G").unwrap(), "");
-        unsafe { std::env::remove_var("_DENV_TEST_G") };
+    fn parse_empty_value() {
+        let changes = parse_bash_output("export _DENV_TEST_G='';");
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            EnvChange::Set(_, v) => assert_eq!(v, ""),
+            _ => panic!("expected Set"),
+        }
     }
 
     #[test]

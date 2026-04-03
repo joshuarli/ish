@@ -222,6 +222,26 @@ fn main() {
                         }
                         true
                     }
+                    "cd" => {
+                        let rest = line.trim().strip_prefix("cd").unwrap_or("").trim();
+                        // Only intercept simple cd (no operators — compound commands go to epsh)
+                        if rest.contains('|') || rest.contains('&') || rest.contains(';') {
+                            false
+                        } else if rest == "-" {
+                            if let Some(prev) = std::env::var("OLDPWD").ok().filter(|s| !s.is_empty()) {
+                                eprintln!("{prev}");
+                                shell.last_status = do_cd(&prev, &mut shell);
+                            } else {
+                                eprintln!("ish: cd: no previous directory");
+                                shell.last_status = 1;
+                            }
+                            true
+                        } else {
+                            let target = if rest.is_empty() { &shell.home.clone() } else { rest };
+                            shell.last_status = do_cd(target, &mut shell);
+                            true
+                        }
+                    }
                     "history" => handle_history(&line, &mut shell),
                     "copy-scrollback" => {
                         use std::io::Write;
@@ -239,8 +259,8 @@ fn main() {
                             .skip(1)
                             .map(String::from)
                             .collect();
-                        if let Some(_path_modified) = denv::command(&args) {
-                            sync_env_to_epsh(&mut shell.epsh);
+                        if let Some(changes) = denv::command(&args) {
+                            apply_denv_changes(&changes, &mut shell.epsh);
                             shell.last_status = 0;
                             true
                         } else {
@@ -261,17 +281,20 @@ fn main() {
                         shell.last_status =
                             frecency::builtin_z(&args, &shell.history, &shell.home);
                         if shell.last_status == 0 {
-                            push_dir_stack(&mut shell.dir_stack);
-                            shell.prompt.invalidate_git();
-                            let new_cwd =
-                                std::env::current_dir().unwrap_or_default();
+                            // z already did chdir — run post-cd hooks
+                            let new_cwd = std::env::current_dir().unwrap_or_default();
                             let old = shell.epsh.cwd.to_string_lossy().into_owned();
                             ish::shell_setenv("OLDPWD", &old);
                             let _ = shell.epsh.vars.set("OLDPWD", &old);
+                            ish::shell_setenv("PWD", &new_cwd.to_string_lossy());
+                            let _ = shell.epsh.vars.set("PWD", &new_cwd.to_string_lossy());
+                            shell.prev_dir = Some(old);
                             shell.epsh.set_cwd(new_cwd);
+                            push_dir_stack(&mut shell.dir_stack);
+                            shell.prompt.invalidate_git();
                             if *shell.denv_active.get_or_insert_with(denv::init) {
-                                denv::on_cd();
-                                sync_env_to_epsh(&mut shell.epsh);
+                                let changes = denv::on_cd();
+                                apply_denv_changes(&changes, &mut shell.epsh);
                             }
                         }
                         true
@@ -331,10 +354,8 @@ fn main() {
 
                 shell.last_status = shell.epsh.run_script(&expanded);
 
-                // Detect cwd change (cd, pushd, etc.)
-                let cwd_changed = shell.epsh.cwd != prev_cwd;
-                if cwd_changed {
-                    // Sync process cwd with epsh
+                // Detect cwd change from epsh (compound commands with cd, pushd, etc.)
+                if shell.epsh.cwd != prev_cwd {
                     let _ = std::env::set_current_dir(&shell.epsh.cwd);
                     ish::shell_setenv("PWD", &shell.epsh.cwd.to_string_lossy());
                     let old = prev_cwd.to_string_lossy().into_owned();
@@ -343,14 +364,9 @@ fn main() {
                     shell.prev_dir = Some(old);
                     push_dir_stack(&mut shell.dir_stack);
                     shell.prompt.invalidate_git();
-                }
-
-                // Trigger denv on any cd command, even if cwd didn't change (e.g. cd .)
-                let is_cd = first_word == "cd" || cwd_changed;
-                if is_cd {
                     if *shell.denv_active.get_or_insert_with(denv::init) {
-                        denv::on_cd();
-                        sync_env_to_epsh(&mut shell.epsh);
+                        let changes = denv::on_cd();
+                        apply_denv_changes(&changes, &mut shell.epsh);
                     }
                 }
 
@@ -919,19 +935,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             if let Some(dir) = entries.get(*selected) {
                                 let dir = dir.clone();
                                 eprintln!("{dir}");
-                                if let Err(e) = std::env::set_current_dir(&dir) {
-                                    eprintln!("ish: cd: {dir}: {e}");
-                                } else {
-                                    if let Ok(pwd) = std::env::current_dir() {
-                                        ish::shell_setenv("PWD", &pwd.to_string_lossy());
-                                    }
-                                    push_dir_stack(&mut shell.dir_stack);
-                                    shell.prompt.invalidate_git();
-                                    if *shell.denv_active.get_or_insert_with(denv::init) {
-                                        denv::on_cd();
-                                        sync_env_to_epsh(&mut shell.epsh);
-                                    }
-                                }
+                                do_cd(&dir, shell);
                             }
                             mode = Mode::Normal;
                             tw.carriage_return();
@@ -1839,28 +1843,60 @@ fn render_file_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
     }
 }
 
-/// Push the current directory onto the dir stack (deduplicating the top).
-/// Sync process environment variables into epsh's Variables store.
-/// Called after operations that modify the process environment (denv, set config).
-/// Handles both additions/changes and removals.
-fn sync_env_to_epsh(epsh: &mut epsh::eval::Shell) {
-    let env_vars: std::collections::HashSet<String> =
-        std::env::vars().map(|(k, _)| k).collect();
-
-    // Set or update vars present in process env
-    for (key, value) in std::env::vars() {
-        if epsh.vars.get(&key) != Some(value.as_str()) {
-            let _ = epsh.vars.set(&key, &value);
-            epsh.vars.export(&key);
+/// Apply denv environment changes to epsh's variable store.
+/// The changes are already applied to process env by denv.
+fn apply_denv_changes(changes: &[denv::EnvChange], epsh: &mut epsh::eval::Shell) {
+    for change in changes {
+        match change {
+            denv::EnvChange::Set(k, v) => {
+                let _ = epsh.vars.set(k, v);
+                epsh.vars.export(k);
+            }
+            denv::EnvChange::Unset(k) => {
+                let _ = epsh.vars.unset(k);
+            }
         }
     }
+}
 
-    // Unset vars present in epsh but not in process env
-    for (key, _) in epsh.vars.exported_env() {
-        if !env_vars.contains(&key) {
-            let _ = epsh.vars.unset(&key);
-        }
+/// Change directory and run all post-cd hooks (OLDPWD, epsh sync, dir stack, denv, prompt).
+/// Returns 0 on success, 1 on failure.
+fn do_cd(target: &str, shell: &mut Shell) -> i32 {
+    // Resolve ~ prefix
+    let resolved = if target == "~" || target.is_empty() {
+        shell.home.clone()
+    } else if let Some(rest) = target.strip_prefix("~/") {
+        format!("{}{rest}", shell.home)
+    } else {
+        target.to_string()
+    };
+
+    if let Err(e) = std::env::set_current_dir(&resolved) {
+        eprintln!("ish: cd: {target}: {e}");
+        return 1;
     }
+
+    let new_cwd = std::env::current_dir().unwrap_or_default();
+    let old = shell.epsh.cwd.to_string_lossy().into_owned();
+
+    // Set OLDPWD/PWD in both process env and epsh
+    ish::shell_setenv("OLDPWD", &old);
+    let _ = shell.epsh.vars.set("OLDPWD", &old);
+    ish::shell_setenv("PWD", &new_cwd.to_string_lossy());
+    let _ = shell.epsh.vars.set("PWD", &new_cwd.to_string_lossy());
+
+    shell.prev_dir = Some(old);
+    shell.epsh.set_cwd(new_cwd);
+    push_dir_stack(&mut shell.dir_stack);
+    shell.prompt.invalidate_git();
+
+    // Trigger denv
+    if *shell.denv_active.get_or_insert_with(denv::init) {
+        let changes = denv::on_cd();
+        apply_denv_changes(&changes, &mut shell.epsh);
+    }
+
+    0
 }
 
 fn push_dir_stack(dir_stack: &mut Vec<String>) {
@@ -2196,19 +2232,8 @@ fn maybe_rewrite_cd(line: &str, aliases: &AliasMap) -> String {
         None => return line.to_string(),
     };
 
-    // cd - → cd $OLDPWD (epsh's cd doesn't handle - natively)
+    // Plain cd commands pass through — intercepted in main loop
     if first == "cd" {
-        if let Some(arg) = words.next() {
-            if arg == "-" && words.next().is_none() {
-                if let Some(prev) = std::env::var("OLDPWD").ok().filter(|s| !s.is_empty()) {
-                    eprintln!("{prev}");
-                    return format!("cd {prev}");
-                } else {
-                    eprintln!("ish: cd: no previous directory");
-                    return "false".to_string();
-                }
-            }
-        }
         return line.to_string();
     }
 
