@@ -95,6 +95,8 @@ enum PollResult {
     Signal,
     Timeout,
     Error,
+    /// stdin fd has POLLHUP without POLLIN — master side closed, treat as EOF.
+    StdinHup,
 }
 
 impl InputReader {
@@ -125,6 +127,11 @@ impl InputReader {
                     }
                 }
                 PollResult::Timeout | PollResult::Error => {}
+                PollResult::StdinHup => {
+                    // PTY master closed (or stdin EOF) — synthesise Ctrl+D so the
+                    // shell exits cleanly rather than spinning in poll forever.
+                    return InputEvent::Key(KeyEvent::ctrl('d'));
+                }
             }
         }
     }
@@ -143,6 +150,9 @@ impl InputReader {
                 }
             }
             PollResult::Timeout | PollResult::Error => {}
+            PollResult::StdinHup => {
+                return Some(InputEvent::Key(KeyEvent::ctrl('d')));
+            }
         }
         None
     }
@@ -179,6 +189,11 @@ impl InputReader {
             }
             if fds[0].revents & libc::POLLIN != 0 {
                 return PollResult::Stdin;
+            }
+            // POLLHUP on stdin without POLLIN: PTY master was closed (or similar).
+            // Treat as EOF so the shell exits rather than spinning.
+            if fds[0].revents & libc::POLLHUP != 0 {
+                return PollResult::StdinHup;
             }
             return PollResult::Error;
         }

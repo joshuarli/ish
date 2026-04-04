@@ -543,7 +543,9 @@ fn exit_with_ctrl_d() {
     let sh = PtyShell::spawn();
     std::thread::sleep(std::time::Duration::from_millis(100));
     sh.ctrl_d();
-    assert_child_exits(sh.child, 3000);
+    // Use a generous timeout: on loaded CI runners (macOS-15 in particular)
+    // process scheduling can delay the shell processing the ^D by several seconds.
+    assert_child_exits(sh.child, 10_000);
     std::mem::forget(sh);
 }
 
