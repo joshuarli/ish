@@ -1870,7 +1870,7 @@ fn do_cd(target: &str, shell: &mut Shell) -> i32 {
     let resolved = if target == "~" || target.is_empty() {
         shell.home.clone()
     } else if let Some(rest) = target.strip_prefix("~/") {
-        format!("{}{rest}", shell.home)
+        format!("{}/{rest}", shell.home)
     } else {
         target.to_string()
     };

@@ -1147,6 +1147,20 @@ fn cd_minus_goes_back() {
 }
 
 #[test]
+fn cd_tilde_subdir() {
+    // Regression: `cd ~/subdir` was broken because do_cd used format!("{}{rest}", home)
+    // (missing slash), producing e.g. `/tmp/homedir` instead of `/tmp/home/dir`.
+    let sh = PtyShell::spawn_with_opts(&[("subdir/.keep", "")], &[]);
+    sh.run_command("cd ~/subdir");
+    let out = sh.run_command("pwd");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("subdir"),
+        "cd ~/subdir should land in subdir: {text:?}"
+    );
+}
+
+#[test]
 fn unset_variable() {
     let sh = PtyShell::spawn();
     sh.run_command("set TMPVAR abc");
