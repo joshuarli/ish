@@ -11,13 +11,10 @@ use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main
 
 use ish::alias::AliasMap;
 use ish::complete;
-use ish::error::Error;
-use ish::exec;
-use ish::expand;
 use ish::history::History;
 use ish::line::LineBuffer;
 use ish::ls;
-use ish::parse;
+use ish::path as exec;
 use ish::prompt;
 
 // ---------------------------------------------------------------------------
@@ -115,114 +112,6 @@ fn measure_allocs<F: FnOnce()>(f: F) -> AllocStats {
         count: alloc_count(),
         bytes: alloc_bytes(),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Parse benchmarks
-// ---------------------------------------------------------------------------
-
-fn bench_parse(c: &mut Criterion) {
-    let mut group = c.benchmark_group("parse");
-
-    group.bench_function("simple_command", |b| {
-        b.iter(|| black_box(parse::parse("ls -la")));
-    });
-
-    group.bench_function("pipeline_3_stage", |b| {
-        b.iter(|| black_box(parse::parse("find . -name '*.rs' | grep main | wc -l")));
-    });
-
-    group.bench_function("complex_chain", |b| {
-        b.iter(|| {
-            black_box(parse::parse(
-                "make build && ./test --all || echo fail ; echo done",
-            ))
-        });
-    });
-
-    group.bench_function("heavy_redirects", |b| {
-        b.iter(|| black_box(parse::parse("cmd < input > output 2> err >> append &> all")));
-    });
-
-    group.bench_function("quoted_strings", |b| {
-        b.iter(|| {
-            black_box(parse::parse(
-                r#"echo "hello $USER" 'literal $HOME' "escaped \" quote""#,
-            ))
-        });
-    });
-
-    // Long command line — measures parser scaling
-    let long_cmd = (0..100)
-        .map(|i| format!("arg{i}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let long_cmd_str = format!("echo {long_cmd}");
-    group.bench_function("100_args", |b| {
-        b.iter(|| black_box(parse::parse(&long_cmd_str)));
-    });
-
-    group.bench_function("needs_continuation", |b| {
-        b.iter(|| {
-            black_box(parse::needs_continuation("ls |"));
-            black_box(parse::needs_continuation("echo 'unclosed"));
-            black_box(parse::needs_continuation("ls -la"));
-        });
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// Expand benchmarks
-// ---------------------------------------------------------------------------
-
-fn bench_expand(c: &mut Criterion) {
-    let mut group = c.benchmark_group("expand");
-
-    let mut no_subst = |_: &str| -> Result<String, Error> { Ok(String::new()) };
-
-    group.bench_function("tilde_expand", |b| {
-        b.iter(|| {
-            black_box(expand::expand_word(
-                "~/src/project",
-                "/home/user",
-                &mut no_subst,
-                0,
-            ))
-        });
-    });
-
-    group.bench_function("variable_expand", |b| {
-        unsafe { std::env::set_var("ISH_BENCH_VAR", "benchmark_value") };
-        b.iter(|| {
-            black_box(expand::expand_word(
-                "$ISH_BENCH_VAR",
-                "/home/user",
-                &mut no_subst,
-                0,
-            ))
-        });
-    });
-
-    group.bench_function("no_expansion_needed", |b| {
-        b.iter(|| {
-            black_box(expand::expand_word(
-                "simple_word",
-                "/home/user",
-                &mut no_subst,
-                0,
-            ))
-        });
-    });
-
-    // Multi-word expansion
-    let words: Vec<String> = (0..50).map(|i| format!("word{i}")).collect();
-    group.bench_function("expand_argv_50_words", |b| {
-        b.iter(|| black_box(expand::expand_argv(&words, "/home/user", &mut no_subst, 0)));
-    });
-
-    group.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -553,70 +442,6 @@ fn bench_prompt(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// End-to-end: parse → expand (the Enter-key hot path)
-// ---------------------------------------------------------------------------
-
-fn bench_parse_expand(c: &mut Criterion) {
-    let mut group = c.benchmark_group("parse_expand");
-    let mut no_subst = |_: &str| -> Result<String, Error> { Ok(String::new()) };
-
-    unsafe { std::env::set_var("ISH_BENCH_HOME", "/home/user") };
-    unsafe { std::env::set_var("ISH_BENCH_DIR", "/tmp/build") };
-
-    // Typical: simple command with tilde
-    group.bench_function("simple_with_tilde", |b| {
-        b.iter(|| {
-            let cmd = parse::parse("ls ~/projects").unwrap();
-            let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst, 0))
-        });
-    });
-
-    // Typical: pipeline with variables
-    group.bench_function("pipeline_with_vars", |b| {
-        b.iter(|| {
-            let cmd = parse::parse("grep -r $ISH_BENCH_DIR | sort | head -20").unwrap();
-            let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst, 0))
-        });
-    });
-
-    // Realistic: git workflow command
-    group.bench_function("git_workflow", |b| {
-        b.iter(|| {
-            let cmd = parse::parse(
-                "git add -A && git commit -m 'fix: resolve issue' && git push origin main",
-            )
-            .unwrap();
-            for (pipeline, _) in &cmd.segments {
-                for pcmd in &pipeline.commands {
-                    let _ = black_box(expand::expand_argv(
-                        &pcmd.cmd.argv,
-                        "/home/user",
-                        &mut no_subst,
-                        0,
-                    ));
-                }
-            }
-        });
-    });
-
-    // Worst case: many words with mixed expansion
-    group.bench_function("mixed_expansion_20_words", |b| {
-        b.iter(|| {
-            let cmd = parse::parse(
-                r#"echo ~/file $ISH_BENCH_DIR "quoted $ISH_BENCH_HOME" plain 'literal $X' a b c d e f g h i j k l m n"#,
-            )
-            .unwrap();
-            let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-            black_box(expand::expand_argv(argv, "/home/user", &mut no_subst, 0))
-        });
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
 // Prompt render (full — the before-every-command hot path)
 // ---------------------------------------------------------------------------
 
@@ -834,22 +659,6 @@ fn bench_alloc_audit(c: &mut Criterion) {
         eprintln!("  -- allocation audit --");
 
         let stats = measure_allocs(|| {
-            let _ = black_box(parse::parse("find . -name '*.rs' | grep main | wc -l"));
-        });
-        eprintln!("  [alloc] parse_pipeline:            {stats}");
-
-        let stats = measure_allocs(|| {
-            let mut no_subst = |_: &str| -> Result<String, Error> { Ok(String::new()) };
-            let _ = black_box(expand::expand_word(
-                "~/src/project",
-                "/home/user",
-                &mut no_subst,
-                0,
-            ));
-        });
-        eprintln!("  [alloc] expand_tilde:              {stats}");
-
-        let stats = measure_allocs(|| {
             let mut lb = LineBuffer::new();
             for c in "echo hello world this is a test".chars() {
                 lb.insert_char(c);
@@ -887,14 +696,6 @@ fn bench_alloc_audit(c: &mut Criterion) {
         eprintln!("  [alloc] shorten_pwd:               {stats}");
 
         // --- New practical operation audits ---
-
-        let stats = measure_allocs(|| {
-            let cmd = parse::parse("grep -r ~/src | sort | head -20").unwrap();
-            let mut no_subst = |_: &str| -> Result<String, Error> { Ok(String::new()) };
-            let argv = &cmd.segments[0].0.commands[0].cmd.argv;
-            let _ = black_box(expand::expand_argv(argv, "/home/user", &mut no_subst, 0));
-        });
-        eprintln!("  [alloc] parse_expand_pipeline:     {stats}");
 
         // Cold start (includes Prompt::new allocations)
         let stats = measure_allocs(|| {
@@ -998,12 +799,6 @@ fn bench_alloc_audit(c: &mut Criterion) {
     }
 
     // Criterion timing for the same operations
-    group.bench_function("parse_pipeline", |b| {
-        b.iter(|| {
-            let _ = black_box(parse::parse("find . -name '*.rs' | grep main | wc -l"));
-        });
-    });
-
     group.bench_function("line_buffer_30_chars", |b| {
         b.iter(|| {
             let mut lb = LineBuffer::new();
@@ -1033,7 +828,7 @@ fn bench_startup(c: &mut Criterion) {
             let _history = black_box(History::load());
 
             let mut aliases = AliasMap::new();
-            ish::config::load(&mut aliases, None);
+            ish::config::load(&mut aliases, &mut epsh::eval::Shell::new(), None);
 
             // Fresh prompt — git cache is cold
             let mut p = prompt::Prompt::new();
@@ -1050,7 +845,7 @@ fn bench_startup(c: &mut Criterion) {
             let _history = black_box(History::load());
 
             let mut aliases = AliasMap::new();
-            ish::config::load(&mut aliases, None);
+            ish::config::load(&mut aliases, &mut epsh::eval::Shell::new(), None);
 
             let mut p = prompt::Prompt::new();
             black_box(p.render(0));
@@ -1256,13 +1051,10 @@ criterion_group!(
     config = fast_config();
     targets =
         bench_startup,
-        bench_parse,
-        bench_expand,
         bench_line_buffer,
         bench_history,
         bench_completion,
         bench_prompt,
-        bench_parse_expand,
         bench_prompt_render,
         bench_history_add,
         bench_ls,

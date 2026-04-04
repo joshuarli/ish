@@ -5,7 +5,9 @@ use ish::input::{InputEvent, InputReader, Key, KeyEvent};
 use ish::job::Job;
 use ish::line::LineBuffer;
 use ish::term::TermWriter;
-use ish::{builtin, complete, config, denv, finder, frecency, history, path, prompt, render, signal, term};
+use ish::{
+    builtin, complete, config, denv, finder, frecency, history, path, prompt, render, signal, term,
+};
 use std::os::fd::RawFd;
 
 struct Shell {
@@ -210,7 +212,7 @@ fn main() {
                 shell.session_log.push('\n');
 
                 // Handle ish-level commands that must be intercepted before epsh
-                let first_word = line.trim().split_whitespace().next().unwrap_or("");
+                let first_word = line.split_whitespace().next().unwrap_or("");
                 let handled = match first_word {
                     "alias" => {
                         handle_alias(&line, &mut shell);
@@ -228,7 +230,9 @@ fn main() {
                         if rest.contains('|') || rest.contains('&') || rest.contains(';') {
                             false
                         } else if rest == "-" {
-                            if let Some(prev) = std::env::var("OLDPWD").ok().filter(|s| !s.is_empty()) {
+                            if let Some(prev) =
+                                std::env::var("OLDPWD").ok().filter(|s| !s.is_empty())
+                            {
                                 eprintln!("{prev}");
                                 shell.last_status = do_cd(&prev, &mut shell);
                             } else {
@@ -237,7 +241,11 @@ fn main() {
                             }
                             true
                         } else {
-                            let target = if rest.is_empty() { &shell.home.clone() } else { rest };
+                            let target = if rest.is_empty() {
+                                &shell.home.clone()
+                            } else {
+                                rest
+                            };
                             shell.last_status = do_cd(target, &mut shell);
                             true
                         }
@@ -253,12 +261,8 @@ fn main() {
                         true
                     }
                     "denv" if *shell.denv_active.get_or_insert_with(denv::init) => {
-                        let args: Vec<String> = line
-                            .trim()
-                            .split_whitespace()
-                            .skip(1)
-                            .map(String::from)
-                            .collect();
+                        let args: Vec<String> =
+                            line.split_whitespace().skip(1).map(String::from).collect();
                         if let Some(changes) = denv::command(&args) {
                             apply_denv_changes(&changes, &mut shell.epsh);
                             shell.last_status = 0;
@@ -272,22 +276,17 @@ fn main() {
                         true
                     }
                     "z" => {
-                        let args: Vec<String> = line
-                            .trim()
-                            .split_whitespace()
-                            .skip(1)
-                            .map(String::from)
-                            .collect();
-                        shell.last_status =
-                            frecency::builtin_z(&args, &shell.history, &shell.home);
+                        let args: Vec<String> =
+                            line.split_whitespace().skip(1).map(String::from).collect();
+                        shell.last_status = frecency::builtin_z(&args, &shell.history, &shell.home);
                         if shell.last_status == 0 {
                             // z already did chdir — run post-cd hooks
                             let new_cwd = std::env::current_dir().unwrap_or_default();
-                            let old = shell.epsh.cwd.to_string_lossy().into_owned();
+                            let old = shell.epsh.cwd().to_string_lossy().into_owned();
                             ish::shell_setenv("OLDPWD", &old);
-                            let _ = shell.epsh.vars.set("OLDPWD", &old);
+                            let _ = shell.epsh.vars_mut().set("OLDPWD", &old);
                             ish::shell_setenv("PWD", &new_cwd.to_string_lossy());
-                            let _ = shell.epsh.vars.set("PWD", &new_cwd.to_string_lossy());
+                            let _ = shell.epsh.vars_mut().set("PWD", &new_cwd.to_string_lossy());
                             shell.prev_dir = Some(old);
                             shell.epsh.set_cwd(new_cwd);
                             push_dir_stack(&mut shell.dir_stack);
@@ -300,23 +299,15 @@ fn main() {
                         true
                     }
                     "w" | "which" | "type" => {
-                        let args: Vec<String> = line
-                            .trim()
-                            .split_whitespace()
-                            .skip(1)
-                            .map(String::from)
-                            .collect();
+                        let args: Vec<String> =
+                            line.split_whitespace().skip(1).map(String::from).collect();
                         shell.last_status =
-                            builtin::builtin_w(&args, &shell.aliases, &shell.epsh.functions);
+                            builtin::builtin_w(&args, &shell.aliases, shell.epsh.functions());
                         true
                     }
                     "l" => {
-                        let args: Vec<String> = line
-                            .trim()
-                            .split_whitespace()
-                            .skip(1)
-                            .map(String::from)
-                            .collect();
+                        let args: Vec<String> =
+                            line.split_whitespace().skip(1).map(String::from).collect();
                         shell.last_status = builtin::builtin_l(&args);
                         true
                     }
@@ -345,7 +336,7 @@ fn main() {
                 }
 
                 // Save cwd before execution to detect cd
-                let prev_cwd = shell.epsh.cwd.clone();
+                let prev_cwd = shell.epsh.cwd().to_path_buf();
 
                 // Set up external handler for ish-specific builtins
                 let shell_pid = shell.shell_pid;
@@ -355,12 +346,12 @@ fn main() {
                 shell.last_status = shell.epsh.run_script(&expanded);
 
                 // Detect cwd change from epsh (compound commands with cd, pushd, etc.)
-                if shell.epsh.cwd != prev_cwd {
-                    let _ = std::env::set_current_dir(&shell.epsh.cwd);
-                    ish::shell_setenv("PWD", &shell.epsh.cwd.to_string_lossy());
+                if shell.epsh.cwd() != prev_cwd {
+                    let _ = std::env::set_current_dir(shell.epsh.cwd());
+                    ish::shell_setenv("PWD", &shell.epsh.cwd().to_string_lossy());
                     let old = prev_cwd.to_string_lossy().into_owned();
                     ish::shell_setenv("OLDPWD", &old);
-                    let _ = shell.epsh.vars.set("OLDPWD", &old);
+                    let _ = shell.epsh.vars_mut().set("OLDPWD", &old);
                     shell.prev_dir = Some(old);
                     push_dir_stack(&mut shell.dir_stack);
                     shell.prompt.invalidate_git();
@@ -1849,11 +1840,11 @@ fn apply_denv_changes(changes: &[denv::EnvChange], epsh: &mut epsh::eval::Shell)
     for change in changes {
         match change {
             denv::EnvChange::Set(k, v) => {
-                let _ = epsh.vars.set(k, v);
-                epsh.vars.export(k);
+                let _ = epsh.vars_mut().set(k, v);
+                epsh.vars_mut().export(k);
             }
             denv::EnvChange::Unset(k) => {
-                let _ = epsh.vars.unset(k);
+                let _ = epsh.vars_mut().unset(k);
             }
         }
     }
@@ -1877,13 +1868,13 @@ fn do_cd(target: &str, shell: &mut Shell) -> i32 {
     }
 
     let new_cwd = std::env::current_dir().unwrap_or_default();
-    let old = shell.epsh.cwd.to_string_lossy().into_owned();
+    let old = shell.epsh.cwd().to_string_lossy().into_owned();
 
     // Set OLDPWD/PWD in both process env and epsh
     ish::shell_setenv("OLDPWD", &old);
-    let _ = shell.epsh.vars.set("OLDPWD", &old);
+    let _ = shell.epsh.vars_mut().set("OLDPWD", &old);
     ish::shell_setenv("PWD", &new_cwd.to_string_lossy());
-    let _ = shell.epsh.vars.set("PWD", &new_cwd.to_string_lossy());
+    let _ = shell.epsh.vars_mut().set("PWD", &new_cwd.to_string_lossy());
 
     shell.prev_dir = Some(old);
     shell.epsh.set_cwd(new_cwd);
@@ -1997,7 +1988,6 @@ fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
         }
     }
     let code: i32 = line
-        .trim()
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -2008,7 +1998,7 @@ fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
 
 /// Handle the "alias" command typed at the prompt.
 fn handle_alias(line: &str, shell: &mut Shell) {
-    let args: Vec<&str> = line.trim().split_whitespace().skip(1).collect();
+    let args: Vec<&str> = line.split_whitespace().skip(1).collect();
     if args.len() >= 2 {
         let name = args[0].to_string();
         let expansion: Vec<String> = args[1..].iter().map(|s| s.to_string()).collect();
@@ -2032,7 +2022,7 @@ fn handle_alias(line: &str, shell: &mut Shell) {
 
 /// Handle the "history" command. Returns true if handled (no fallthrough needed).
 fn handle_history(line: &str, shell: &mut Shell) -> bool {
-    let sub = line.trim().split_whitespace().nth(1);
+    let sub = line.split_whitespace().nth(1);
     match sub {
         None => {
             for i in 0..shell.history.len() {
@@ -2061,9 +2051,7 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
 
 /// Build the external handler for epsh. Handles ish-specific builtins
 /// and fork/exec with job control for external commands.
-fn make_external_handler(
-    shell_pid: i32,
-) -> epsh::eval::ExternalHandler {
+fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
     Box::new(move |args: &[String], env_pairs: &[(String, String)]| {
         let name = &args[0];
 
@@ -2134,10 +2122,10 @@ fn make_external_handler(
                     }
 
                     if libc::WIFSTOPPED(status) {
-                        return Err(epsh::error::ShellError::Stopped {
+                        Err(epsh::error::ShellError::Stopped {
                             pid: child_id,
                             pgid: child_id,
-                        });
+                        })
                     } else if libc::WIFEXITED(status) {
                         Ok(epsh::error::ExitStatus::from(libc::WEXITSTATUS(status)))
                     } else if libc::WIFSIGNALED(status) {

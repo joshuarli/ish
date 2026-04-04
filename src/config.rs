@@ -77,8 +77,8 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh:
     let expanded = expand_vars_simple(&value);
     crate::shell_setenv(name, &expanded);
     // Sync to epsh's variable store (set + export so it's visible to subprocesses)
-    let _ = epsh.vars.set(name, &expanded);
-    epsh.vars.export(name);
+    let _ = epsh.vars_mut().set(name, &expanded);
+    epsh.vars_mut().export(name);
 }
 
 fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut AliasMap) {

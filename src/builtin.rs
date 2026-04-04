@@ -3,9 +3,17 @@ use crate::path;
 
 /// Builtins handled by ish's interactive layer (not by epsh).
 const ISH_BUILTINS: &[&str] = &[
-    "fg", "z", "l", "c", "w", "which", "type",
-    "copy-scrollback", "history",
-    "alias", "denv",
+    "fg",
+    "z",
+    "l",
+    "c",
+    "w",
+    "which",
+    "type",
+    "copy-scrollback",
+    "history",
+    "alias",
+    "denv",
 ];
 
 pub fn is_ish_builtin(name: &str) -> bool {

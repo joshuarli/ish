@@ -174,9 +174,9 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "epsh"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70ec6e09e42c925d3104e25006b5e2ce3d776a6ae9c1f95126564609f19283aa"
+checksum = "c15ca8d4d532d0d5fbdf854f0f68392f96ecabda5971bf0f262189b92ccfa0f3"
 dependencies = [
  "libc",
 ]

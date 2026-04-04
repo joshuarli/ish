@@ -321,11 +321,17 @@ mod tests {
         );
         assert_eq!(changes.len(), 3);
         match &changes[0] {
-            EnvChange::Set(k, v) => { assert_eq!(k, "_DENV_TEST_C"); assert_eq!(v, "one"); }
+            EnvChange::Set(k, v) => {
+                assert_eq!(k, "_DENV_TEST_C");
+                assert_eq!(v, "one");
+            }
             _ => panic!("expected Set"),
         }
         match &changes[1] {
-            EnvChange::Set(k, v) => { assert_eq!(k, "_DENV_TEST_D"); assert_eq!(v, "two"); }
+            EnvChange::Set(k, v) => {
+                assert_eq!(k, "_DENV_TEST_D");
+                assert_eq!(v, "two");
+            }
             _ => panic!("expected Set"),
         }
         match &changes[2] {
