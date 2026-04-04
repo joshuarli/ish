@@ -8,7 +8,16 @@ use ish::term::TermWriter;
 use ish::{
     builtin, complete, config, denv, finder, frecency, history, path, prompt, render, signal, term,
 };
+use std::cell::RefCell;
 use std::os::fd::RawFd;
+
+// Thread-local storage for a stopped job's info, written by the external handler
+// and consumed by the main loop. Avoids needing to thread state through epsh's
+// callback boundary.
+thread_local! {
+    static STOPPED_JOB: RefCell<Option<(libc::pid_t, String, libc::termios)>> =
+        const { RefCell::new(None) };
+}
 
 struct Shell {
     aliases: AliasMap,
@@ -362,9 +371,12 @@ fn main() {
                 }
 
                 // Detect job suspension (status 148 = 128 + SIGTSTP)
-                if shell.last_status == 148 {
-                    // TODO: save Job from epsh's stopped process info
-                    // For now, the external handler stores it
+                if shell.last_status == 148
+                    && let Some((pgid, cmd, termios)) =
+                        STOPPED_JOB.with(|cell| cell.borrow_mut().take())
+                {
+                    eprintln!("ish: stopped: {} (pgid={})", cmd, pgid);
+                    shell.job = Some(Job { pgid, cmd, termios });
                 }
 
                 if history_line.trim() != "l" {
@@ -2122,6 +2134,14 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                     }
 
                     if libc::WIFSTOPPED(status) {
+                        // Capture the terminal state the stopped process left behind,
+                        // then save it in the thread-local so the main loop can build a Job.
+                        let mut saved_termios: libc::termios = unsafe { std::mem::zeroed() };
+                        unsafe { libc::tcgetattr(0, &mut saved_termios) };
+                        let cmd = args[0].clone();
+                        STOPPED_JOB.with(|cell| {
+                            *cell.borrow_mut() = Some((child_id, cmd, saved_termios));
+                        });
                         Err(epsh::error::ShellError::Stopped {
                             pid: child_id,
                             pgid: child_id,
