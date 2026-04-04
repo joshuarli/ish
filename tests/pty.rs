@@ -222,6 +222,11 @@ impl PtyShell {
         self.send(b"\x03");
     }
 
+    /// Send Ctrl+Z (suspend).
+    fn ctrl_z(&self) {
+        self.send(b"\x1a");
+    }
+
     /// Send Ctrl+D.
     fn ctrl_d(&self) {
         self.send(b"\x04");
@@ -1399,5 +1404,54 @@ fn denv_no_error_without_denv() {
     assert!(
         text.contains("works"),
         "shell should work without denv: {text:?}"
+    );
+}
+
+#[test]
+fn job_suspend_and_resume() {
+    let sh = PtyShell::spawn();
+
+    // Start a long-running foreground process.
+    sh.type_str("sleep 60");
+    sh.enter();
+
+    // Give sleep a moment to start, then suspend it with Ctrl+Z.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.ctrl_z();
+
+    // Shell should report the stop and return a prompt.
+    let out = sh.wait_for("stopped:", 3000);
+    assert!(
+        out.contains("stopped:") && out.contains("sleep"),
+        "expected stop notification: {out:?}"
+    );
+    sh.wait_for_prompt(3000);
+
+    // Resume the job with fg.
+    sh.type_str("fg");
+    sh.enter();
+
+    let out = sh.wait_for("resuming:", 3000);
+    assert!(
+        out.contains("resuming:") && out.contains("sleep"),
+        "expected resume notification: {out:?}"
+    );
+
+    // sleep is now in the foreground again — kill it so the shell returns.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.ctrl_c();
+
+    // Shell must return a prompt, confirming it regained control.
+    let out = sh.wait_for_prompt(3000);
+    assert!(
+        out.contains("$ "),
+        "shell did not return a prompt after fg: {out:?}"
+    );
+
+    // Confirm the shell is fully interactive again.
+    let out = sh.run_command("echo alive");
+    assert!(
+        out.contains("alive"),
+        "shell unresponsive after job resume: {out:?}"
     );
 }

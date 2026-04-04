@@ -10,6 +10,7 @@ use ish::{
 };
 use std::cell::RefCell;
 use std::os::fd::RawFd;
+use std::os::unix::process::CommandExt;
 
 // Thread-local storage for a stopped job's info, written by the external handler
 // and consumed by the main loop. Avoids needing to thread state through epsh's
@@ -2111,12 +2112,31 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
             cmd.env(k, v);
         }
 
+        if is_main {
+            // In the child: become its own process group leader and restore
+            // signal dispositions that the shell overrode (especially SIGTSTP,
+            // which the shell ignores — children must inherit SIG_DFL or
+            // Ctrl+Z will never stop them).
+            //
+            // setpgid(0, 0) here (in the child, before exec) is race-free;
+            // the parent's setpgid(child_id, child_id) after spawn() is a
+            // belt-and-suspenders duplicate for the parent-side view.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setpgid(0, 0);
+                    ish::signal::restore_defaults();
+                    Ok(())
+                });
+            }
+        }
+
         match cmd.spawn() {
             Ok(mut child) => {
                 let child_id = child.id() as i32;
 
                 if is_main {
-                    // Main process: set up process group and give terminal
+                    // Parent: duplicate setpgid (child did it too — no race)
+                    // and hand the terminal to the new process group.
                     unsafe {
                         libc::setpgid(child_id, child_id);
                         libc::tcsetpgrp(0, child_id);
