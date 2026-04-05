@@ -681,50 +681,6 @@ fn tempdir_with_files(files: &[&str]) -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Config: word splitting and quoting
-// ---------------------------------------------------------------------------
-
-#[test]
-fn config_shell_words_simple() {
-    assert_eq!(config::shell_words("a b c"), vec!["a", "b", "c"]);
-}
-
-#[test]
-fn config_shell_words_quoted() {
-    assert_eq!(config::shell_words(r#"a "b c" d"#), vec!["a", "b c", "d"]);
-    assert_eq!(config::shell_words("a 'b c' d"), vec!["a", "b c", "d"]);
-}
-
-#[test]
-fn config_shell_words_escaped() {
-    assert_eq!(config::shell_words(r"a b\ c d"), vec!["a", "b c", "d"]);
-}
-
-#[test]
-fn config_shell_words_empty_input() {
-    assert!(config::shell_words("").is_empty());
-    assert!(config::shell_words("   ").is_empty());
-}
-
-#[test]
-fn config_unquote() {
-    assert_eq!(config::unquote(r#""hello""#), "hello");
-    assert_eq!(config::unquote("'hello'"), "hello");
-    assert_eq!(config::unquote("hello"), "hello");
-    assert_eq!(config::unquote(r#""mixed'"#), r#""mixed'"#); // mismatched
-}
-
-#[test]
-fn config_expand_vars_simple() {
-    unsafe { std::env::set_var("ISH_CFG_TEST", "expanded") };
-    assert_eq!(config::expand_vars_simple("$ISH_CFG_TEST"), "expanded");
-    assert_eq!(
-        config::expand_vars_simple("prefix/$ISH_CFG_TEST/suffix"),
-        "prefix/expanded/suffix"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Prompt: PWD shortening
 // ---------------------------------------------------------------------------
 
@@ -817,21 +773,6 @@ fn history_subsequence_no_infinite_loop() {
     let long_text = "a".repeat(100_000);
     let result = history::subsequence_match(&q, &long_text);
     assert!(result.is_none());
-}
-
-#[test]
-fn config_shell_words_adversarial() {
-    // Unclosed quotes — should not panic, just include the rest
-    let result = config::shell_words("a 'unclosed");
-    assert!(!result.is_empty());
-
-    // Only whitespace
-    let result = config::shell_words("   \t  ");
-    assert!(result.is_empty());
-
-    // Escaped at end
-    let result = config::shell_words("a b\\");
-    assert!(!result.is_empty());
 }
 
 #[test]
@@ -932,19 +873,6 @@ fn config_load_all_paths() {
         Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
         None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
     }
-}
-
-#[test]
-fn config_expand_vars_trailing_dollar() {
-    // Trailing $ with no variable name
-    let result = config::expand_vars_simple("hello$");
-    assert_eq!(result, "hello");
-}
-
-#[test]
-fn config_expand_vars_dollar_followed_by_non_alnum() {
-    let result = config::expand_vars_simple("price is $!00");
-    assert_eq!(result, "price is !00");
 }
 
 // ---------------------------------------------------------------------------

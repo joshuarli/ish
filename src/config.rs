@@ -1,4 +1,6 @@
 use crate::alias::AliasMap;
+use epsh::ast::Word;
+use epsh::lexer::{Lexer, Token};
 use std::path::PathBuf;
 
 /// Load config from the given path, or the default config path.
@@ -58,10 +60,10 @@ pub fn load(aliases: &mut AliasMap, epsh: &mut epsh::eval::Shell, path_override:
 }
 
 fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh::eval::Shell) {
-    // set VAR "value" or set VAR value
-    let (name, value) = match rest.split_once(char::is_whitespace) {
-        Some((n, v)) => (n.trim(), unquote(v.trim())),
-        None => (rest, String::new()),
+    // set VAR "value with $EXPANSION" — lex the rest to get name then value word
+    let (name, value_src) = match rest.split_once(char::is_whitespace) {
+        Some((n, v)) => (n.trim(), v.trim()),
+        None => (rest, ""),
     };
 
     if name.is_empty() {
@@ -73,8 +75,33 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh:
         return;
     }
 
-    // Expand variables in value
-    let expanded = expand_vars_simple(&value);
+    // Parse value_src through epsh's lexer to get a fully-typed Word, then
+    // expand it (tilde, $VAR, ${VAR:-default}, $(cmd), etc.) via epsh.
+    let expanded = if value_src.is_empty() {
+        String::new()
+    } else {
+        let mut lex = Lexer::new(value_src);
+        // Disable reserved-word recognition — we just want word tokens.
+        lex.recognize_reserved = false;
+        match lex.next_token() {
+            Ok((Token::Word(parts, _), span)) => {
+                let word = Word { parts, span };
+                match epsh::expand::expand_word_to_string(&word, epsh) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!(
+                            "ish: {}:{}: set {name}: expansion error: {e}",
+                            path.display(),
+                            lineno
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => value_src.to_string(),
+        }
+    };
+
     crate::shell_setenv(name, &expanded);
     // Sync to epsh's variable store (set + export so it's visible to subprocesses)
     let _ = epsh.vars_mut().set(name, &expanded);
@@ -82,21 +109,27 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh:
 }
 
 fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut AliasMap) {
-    // alias name cmd [args...]
-    let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
-    if parts.is_empty() {
+    // alias name cmd [args...] — lex the whole line with epsh's lexer
+    let mut lex = Lexer::new(rest);
+    lex.recognize_reserved = false;
+    let mut words: Vec<String> = Vec::new();
+    loop {
+        match lex.next_token() {
+            Ok((Token::Word(parts, _), _)) => {
+                words.push(epsh::lexer::parts_to_text(&parts));
+            }
+            Ok((Token::Eof, _)) | Err(_) => break,
+            Ok(_) => break,
+        }
+    }
+
+    if words.is_empty() {
         eprintln!("ish: {}:{}: alias: missing name", path.display(), lineno);
         return;
     }
 
-    let name = parts[0].to_string();
-    let expansion: Vec<String> = if parts.len() > 1 {
-        shell_words(parts[1])
-    } else {
-        Vec::new()
-    };
-
-    if expansion.is_empty() {
+    let name = words.remove(0);
+    if words.is_empty() {
         eprintln!(
             "ish: {}:{}: alias: missing expansion for '{name}'",
             path.display(),
@@ -105,77 +138,7 @@ fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut 
         return;
     }
 
-    aliases.set(name, expansion);
-}
-
-/// Remove surrounding quotes from a value.
-pub fn unquote(s: &str) -> String {
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
-    }
-}
-
-/// Simple $VAR expansion for config values.
-pub fn expand_vars_simple(s: &str) -> String {
-    let mut result = String::new();
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if chars[i] == '$' {
-            i += 1;
-            let mut name = String::new();
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                name.push(chars[i]);
-                i += 1;
-            }
-            if let Ok(val) = std::env::var(&name) {
-                result.push_str(&val);
-            }
-        } else {
-            result.push(chars[i]);
-            i += 1;
-        }
-    }
-
-    result
-}
-
-/// Simple word splitting respecting quotes.
-pub fn shell_words(s: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escape = false;
-
-    for c in s.chars() {
-        if escape {
-            current.push(c);
-            escape = false;
-            continue;
-        }
-        match c {
-            '\\' if !in_single => escape = true,
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            ' ' | '\t' if !in_single && !in_double => {
-                if !current.is_empty() {
-                    words.push(current.clone());
-                    current.clear();
-                }
-            }
-            _ => current.push(c),
-        }
-    }
-
-    if !current.is_empty() {
-        words.push(current);
-    }
-
-    words
+    aliases.set(name, words);
 }
 
 fn config_path() -> PathBuf {
