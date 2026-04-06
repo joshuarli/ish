@@ -74,6 +74,14 @@ pub fn render_line(
     let total_before_cursor = prompt_display_len + line.display_cursor_pos();
     let total_full = prompt_display_len + line.display_len() + suggestion_display_len;
 
+    // When text fills to an exact multiple of the terminal width, the cursor
+    // sits in "pending wrap" (autowrap) state — it hasn't actually advanced to
+    // the next row yet.  Force the wrap so cursor-movement arithmetic is
+    // correct (same trick readline/zsh use).
+    if total_full > 0 && total_full % cols == 0 {
+        tw.write_str(" \r");
+    }
+
     let cursor_row = total_before_cursor / cols;
     let cursor_col = total_before_cursor % cols;
     let total_rows = total_full / cols;
@@ -115,6 +123,7 @@ fn render_line_multiline(
     let mut cursor_row: usize = 0;
     let mut cursor_col: usize = 0;
     let mut line_idx = 0;
+    let mut last_seg_width: usize = 0;
 
     for (i, segment) in text.split('\n').enumerate() {
         if i == 0 {
@@ -168,9 +177,16 @@ fn render_line_multiline(
         if seg_width > 0 {
             row += (seg_width - 1) / cols; // additional rows from wrapping
         }
+        last_seg_width = seg_width;
 
         // Advance line_idx past segment + the \n separator
         line_idx = seg_end + 1; // +1 for the \n
+    }
+
+    // Force pending wrap to resolve on the last segment (same as single-line path).
+    if last_seg_width > 0 && last_seg_width % cols == 0 {
+        tw.write_str(" \r");
+        row += 1;
     }
 
     let total_rows = row;
@@ -500,4 +516,128 @@ pub fn render_file_picker(
     };
     tw.move_cursor_right((prefix_len + query_cursor) as u16);
     tw.show_cursor();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_line(s: &str) -> LineBuffer {
+        let mut lb = LineBuffer::new();
+        for c in s.chars() {
+            lb.insert_char(c);
+        }
+        lb
+    }
+
+    fn render_simple(prompt: &str, text: &str, cols: u16) -> (PromptInfo, Vec<u8>) {
+        render_with_suggestion(prompt, text, "", cols)
+    }
+
+    fn render_with_suggestion(
+        prompt: &str,
+        text: &str,
+        suggestion: &str,
+        cols: u16,
+    ) -> (PromptInfo, Vec<u8>) {
+        let mut tw = TermWriter::new();
+        let line = make_line(text);
+        let pdl = crate::line::str_width(prompt);
+        let opts = RenderOpts {
+            suggestion,
+            ..Default::default()
+        };
+        let info = render_line(&mut tw, prompt, pdl, &line, cols, 0, &opts);
+        let buf = tw.as_bytes().to_vec();
+        (info, buf)
+    }
+
+    // When total display width is NOT a multiple of cols, no force-wrap needed.
+    #[test]
+    fn prompt_info_no_wrap() {
+        // "$ " (2) + "hi" (2) = 4 in 10-col terminal → row 0
+        let (info, buf) = render_simple("$ ", "hi", 10);
+        assert_eq!(info.total_rows, 1);
+        assert_eq!(info.cursor_row, 0);
+        assert_eq!(info.cursor_col, 4);
+        assert!(!buf.windows(2).any(|w| w == b" \r"), "should not force-wrap");
+    }
+
+    // When total display width wraps but doesn't land on exact boundary.
+    #[test]
+    fn prompt_info_partial_wrap() {
+        // "$ " (2) + 9 chars = 11 in 10-col terminal → rows 0-1
+        let (info, _) = render_simple("$ ", "123456789", 10);
+        assert_eq!(info.total_rows, 2);
+        assert_eq!(info.cursor_row, 1);
+        assert_eq!(info.cursor_col, 1);
+    }
+
+    // Exact multiple of cols → force-wrap triggers, total_rows accounts for it.
+    #[test]
+    fn prompt_info_exact_boundary() {
+        // "$ " (2) + "12345678" (8) = 10 in 10-col terminal → fills row 0 exactly
+        let (info, buf) = render_simple("$ ", "12345678", 10);
+        // Force-wrap adds an extra row for the cursor
+        assert_eq!(info.total_rows, 2);
+        assert_eq!(info.cursor_row, 1);
+        assert_eq!(info.cursor_col, 0);
+        assert!(buf.windows(2).any(|w| w == b" \r"), "should force-wrap");
+    }
+
+    // Exact multiple with suggestion — cursor in the middle, not at pending-wrap.
+    #[test]
+    fn prompt_info_exact_boundary_with_suggestion() {
+        // "$ " (2) + "ab" (2) = 4 before cursor; + suggestion "123456" (6) → 10 total
+        let (info, buf) = render_with_suggestion("$ ", "ab", "123456", 10);
+        assert_eq!(info.total_rows, 2);
+        // Cursor at position 4 → row 0, col 4
+        assert_eq!(info.cursor_row, 0);
+        assert_eq!(info.cursor_col, 4);
+        assert!(buf.windows(2).any(|w| w == b" \r"), "should force-wrap");
+    }
+
+    // Two full rows (2 * cols) — force-wrap triggers.
+    #[test]
+    fn prompt_info_two_full_rows() {
+        // "$ " (2) + 18 chars = 20, cols = 10 → 2 full rows
+        let (info, buf) = render_simple("$ ", "abcdefghijklmnopqr", 10);
+        assert_eq!(info.total_rows, 3); // 2 content rows + 1 cursor row from force-wrap
+        assert_eq!(info.cursor_row, 2);
+        assert_eq!(info.cursor_col, 0);
+        assert!(buf.windows(2).any(|w| w == b" \r"), "should force-wrap");
+    }
+
+    // Multiline buffer with last segment filling exact boundary.
+    #[test]
+    fn multiline_exact_boundary() {
+        // First segment: "$ " (2) + "ab" (2) = 4, then newline
+        // Second segment: "  " (2) + "12345678" (8) = 10 fills cols exactly
+        let mut tw = TermWriter::new();
+        let mut line = LineBuffer::new();
+        for c in "ab\n12345678".chars() {
+            line.insert_char(c);
+        }
+        let info = render_line(&mut tw, "$ ", 2, &line, 10, 0, &RenderOpts::default());
+        let buf = tw.as_bytes();
+        // Row 0: "$ ab" (4 cols), row 1: "  12345678" (10 cols, exact boundary)
+        // Force-wrap adds row 2 for the cursor
+        assert_eq!(info.total_rows, 3);
+        assert!(buf.windows(2).any(|w| w == b" \r"), "should force-wrap");
+    }
+
+    // Multiline buffer where last segment does NOT hit exact boundary → no force-wrap.
+    #[test]
+    fn multiline_no_force_wrap() {
+        let mut tw = TermWriter::new();
+        let mut line = LineBuffer::new();
+        for c in "ab\n1234567".chars() {
+            line.insert_char(c);
+        }
+        let info = render_line(&mut tw, "$ ", 2, &line, 10, 0, &RenderOpts::default());
+        let buf = tw.as_bytes();
+        // Row 0: "$ ab" (4), row 1: "  1234567" (9) — no exact boundary
+        assert_eq!(info.total_rows, 2);
+        assert!(!buf.windows(2).any(|w| w == b" \r"), "should not force-wrap");
+    }
 }

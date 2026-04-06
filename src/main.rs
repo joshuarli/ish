@@ -585,6 +585,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         200,
                                         pwd_basename(),
                                     );
+                                    // Clear the current prompt before drawing the pager
+                                    tw.move_cursor_up(cursor_row);
+                                    tw.carriage_return();
+                                    tw.clear_to_end_of_screen();
                                     mode = Mode::HistorySearch {
                                         query: LineBuffer::new(),
                                         matches,
@@ -598,6 +602,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 KeyAction::StartFilePicker => {
                                     saved_line = line.text().to_string();
                                     let handle = finder::find_async(".", false);
+                                    // Clear the current prompt before drawing the pager
+                                    tw.move_cursor_up(cursor_row);
+                                    tw.carriage_return();
+                                    tw.clear_to_end_of_screen();
                                     mode = Mode::FilePicker {
                                         query: LineBuffer::new(),
                                         all_entries: Vec::new(),
@@ -628,6 +636,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     if entries.is_empty() {
                                         // No history yet — stay in normal mode
                                     } else {
+                                        // Clear the current prompt before drawing the pager
+                                        tw.move_cursor_up(cursor_row);
+                                        tw.carriage_return();
+                                        tw.clear_to_end_of_screen();
                                         mode = Mode::DirPicker {
                                             entries,
                                             selected: 0,

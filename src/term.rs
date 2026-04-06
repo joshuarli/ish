@@ -188,6 +188,11 @@ impl TermWriter {
         self.buf.extend_from_slice(&tmp[i..]);
         self.buf.push(suffix);
     }
+
+    #[cfg(test)]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
 }
 
 impl Write for TermWriter {
