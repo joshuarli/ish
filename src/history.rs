@@ -648,10 +648,12 @@ impl History {
         let query_lower = lowercase_query(query);
         let mut results = Vec::new();
 
+        let total = self.offsets.len();
         for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
             let entry = &self.arena[start as usize..start as usize + len as usize];
             if let Some((positions, count)) = subsequence_match(&query_lower, entry) {
-                let score = score_match(&positions, count, entry, pwd_basename);
+                let score =
+                    score_match(&positions, count, entry, pwd_basename) + recency_bonus(idx, total);
                 results.push(FuzzyMatch {
                     entry_idx: idx,
                     match_positions: positions,
@@ -695,11 +697,13 @@ impl History {
         }
 
         let query_lower = lowercase_query(query);
+        let total = self.offsets.len();
 
         for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
             let entry = &self.arena[start as usize..start as usize + len as usize];
             if let Some((positions, count)) = subsequence_match(&query_lower, entry) {
-                let score = score_match(&positions, count, entry, pwd_basename);
+                let score =
+                    score_match(&positions, count, entry, pwd_basename) + recency_bonus(idx, total);
                 results.push(FuzzyMatch {
                     entry_idx: idx,
                     match_positions: positions,
@@ -771,7 +775,8 @@ pub struct FuzzyMatch {
     pub match_positions: [u16; 32],
     pub match_count: u8,
     /// Match quality score. Higher = better match.
-    /// Contiguity (+16), word boundary (+8), gap penalty (-1..=-3), PWD bonus (+20).
+    /// Contiguity (+16), word boundary (+8), gap penalty (-1..=-3), PWD bonus (+20),
+    /// recency bonus (up to +32, decays with sqrt of age).
     pub score: i16,
 }
 
@@ -959,6 +964,27 @@ fn backward_unicode(chars: &[(usize, char)], query: &[char], end: usize) -> usiz
         }
     }
     0
+}
+
+/// Recency bonus for fuzzy search. Decays as 32 / (1 + isqrt(age)) where age
+/// is the number of entries between this entry and the most recent one.
+/// Most recent: +32, ~4 ago: +10, ~25 ago: +5, ~100 ago: +2, ~1000 ago: 0.
+fn recency_bonus(idx: usize, total: usize) -> i16 {
+    if total == 0 {
+        return 0;
+    }
+    let age = (total - 1 - idx) as u32;
+    if age == 0 {
+        return 32;
+    }
+    // Integer square root via Newton's method — converges in ~5 iterations for u32.
+    let mut x = age;
+    let mut y = (x + 1) >> 1;
+    while y < x {
+        x = y;
+        y = (x + age / x) >> 1;
+    }
+    (32 / (1 + x)) as i16
 }
 
 /// Score a fuzzy match based on match quality. O(count) for ASCII, O(text_len) for non-ASCII.
@@ -1182,6 +1208,60 @@ mod tests {
         // gap: 100 - 0 - 1 = 99, capped at -3
         // total: 4 + 8 - 3 = 9
         assert_eq!(score, 9, "gap penalty should be capped: {score}");
+    }
+
+    #[test]
+    fn recency_bonus_decay() {
+        assert_eq!(recency_bonus(999, 1000), 32); // most recent
+        assert_eq!(recency_bonus(998, 1000), 16); // age 1
+        assert_eq!(recency_bonus(995, 1000), 10); // age 4
+        assert_eq!(recency_bonus(975, 1000), 6); // age 24
+        assert_eq!(recency_bonus(900, 1000), 3); // age 99
+        assert_eq!(recency_bonus(0, 1000), 1); // age 999
+        assert_eq!(recency_bonus(0, 0), 0); // empty history
+    }
+
+    #[test]
+    fn recency_boosts_recent_match() {
+        // Two entries with identical match quality — recent one should win
+        let entries: Vec<String> = (0..100).map(|i| format!("cargo test {i}")).collect();
+        let h = History::from_entries(entries);
+        let results = h.fuzzy_search("ct");
+        // Most recent entry should be first (highest score due to recency)
+        assert_eq!(results[0].entry_idx, 99);
+    }
+
+    #[test]
+    fn recency_beats_moderate_quality_gap() {
+        // A recent entry with a worse match should still beat an old entry
+        // when the match quality difference is moderate.
+        // "cargo build" at position 0 gets first-match (+4) + boundary (+8) + contiguity,
+        // but "echo cargo" is much more recent so its recency bonus compensates.
+        let mut entries: Vec<String> = vec!["cargo build".into()];
+        // 50 filler entries to push "cargo build" far back
+        for i in 0..50 {
+            entries.push(format!("unrelated command {i}"));
+        }
+        entries.push("echo cargo".into()); // recent, weaker match
+        let h = History::from_entries(entries);
+        let results = h.fuzzy_search("cargo");
+        assert_eq!(h.get(results[0].entry_idx), "echo cargo");
+    }
+
+    #[test]
+    fn quality_beats_recency_when_gap_is_large() {
+        // A much better match should still win even if it's old, as long as the
+        // quality gap is large enough to overcome the recency bonus.
+        // "cargo build --release" has contiguous "cargo" at pos 0 (first-match + boundary + contiguity).
+        // "c_a_r_g_o" has scattered chars (gaps, no contiguity, no boundary).
+        let mut entries: Vec<String> = vec!["cargo build --release".into()];
+        for i in 0..30 {
+            entries.push(format!("unrelated {i}"));
+        }
+        entries.push("xcxaxrxgxo".into()); // recent but terrible match
+        let h = History::from_entries(entries);
+        let results = h.fuzzy_search("cargo");
+        assert_eq!(h.get(results[0].entry_idx), "cargo build --release");
     }
 
     #[test]

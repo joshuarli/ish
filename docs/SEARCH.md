@@ -58,12 +58,18 @@ it gets a flat bonus. This surfaces commands relevant to the current project
 without requiring explicit path tracking. The basename is extracted from
 `$PWD` via `getenv` (zero allocation).
 
+**Recency bonus (up to +32, sqrt decay)**
+Recent entries get a strong bonus: `32 / (1 + isqrt(age))` where age is the
+distance from the most recent entry. The most recent command gets +32 (two
+contiguity bonuses worth), decaying to +10 at ~4 ago, +5 at ~25 ago, +2 at
+~100 ago, and 0 beyond ~1000. This ensures that commands you just ran
+dominate the top of the list even if an older entry has slightly better match
+quality.
+
 ### Sort Order
 
 Results are collected most-recent-first up to the limit (200), then sorted
-by score descending with recency (entry index) as tiebreaker. A great match
-from 20 commands ago beats a terrible match from 2 commands ago, but two
-equally-scored matches sort by recency.
+by score descending with recency (entry index) as tiebreaker.
 
 ### Comparison to fzf
 

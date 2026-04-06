@@ -451,13 +451,14 @@ fn optimal_alignment_real_world_path() {
 #[test]
 fn scoring_first_match_bonus() {
     // Entries starting with the query char should get a first-match bonus.
+    // "git status" is most recent so recency and first-match bonus both favor it.
     let h = History::from_entries(vec![
-        "git status".into(), // starts with 'g'
         "rg pattern".into(), // 'g' is mid-word
+        "git status".into(), // starts with 'g'
     ]);
     let matches = h.fuzzy_search("g");
     assert_eq!(matches.len(), 2);
-    // "git status" has first-match bonus (+4), "rg pattern" doesn't
+    // "git status" has first-match bonus (+4) and recency
     assert_eq!(h.get(matches[0].entry_idx), "git status");
 }
 
@@ -466,13 +467,13 @@ fn scoring_first_match_with_optimal_alignment() {
     // Combining both: optimal alignment should find the contiguous match,
     // and first-match bonus helps entries starting with the query.
     let h = History::from_entries(vec![
-        "cargo build --release".into(), // "cargo" at start, first-match bonus
-        "echo cargo".into(),            // "cargo" contiguous but not at start, more recent
+        "echo cargo".into(),            // "cargo" contiguous but not at start
+        "cargo build --release".into(), // "cargo" at start, first-match bonus + most recent
     ]);
     let matches = h.fuzzy_search("cargo");
     assert_eq!(matches.len(), 2);
     // Both have contiguous "cargo" with boundary bonus.
-    // "cargo build" gets first-match bonus (+4), "echo cargo" doesn't.
+    // "cargo build" gets first-match bonus (+4) and recency.
     assert_eq!(h.get(matches[0].entry_idx), "cargo build --release");
 }
 
