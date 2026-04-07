@@ -1161,6 +1161,19 @@ fn cd_tilde_subdir() {
 }
 
 #[test]
+fn l_tilde_subdir() {
+    // Regression: `l ~/subdir` passed the literal "~/subdir" to builtin_l without tilde
+    // expansion, producing "No such file or directory".
+    let sh = PtyShell::spawn_with_opts(&[("subdir/file.txt", "hello")], &[]);
+    let out = sh.run_command("l ~/subdir");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("file.txt"),
+        "l ~/subdir should list subdir contents: {text:?}"
+    );
+}
+
+#[test]
 fn unset_variable() {
     let sh = PtyShell::spawn();
     sh.run_command("set TMPVAR abc");

@@ -316,8 +316,20 @@ fn main() {
                         true
                     }
                     "l" => {
-                        let args: Vec<String> =
-                            line.split_whitespace().skip(1).map(String::from).collect();
+                        let home = shell.home.clone();
+                        let args: Vec<String> = line
+                            .split_whitespace()
+                            .skip(1)
+                            .map(|a| {
+                                if a == "~" {
+                                    home.clone()
+                                } else if let Some(rest) = a.strip_prefix("~/") {
+                                    format!("{home}/{rest}")
+                                } else {
+                                    a.to_string()
+                                }
+                            })
+                            .collect();
                         shell.last_status = builtin::builtin_l(&args);
                         true
                     }
