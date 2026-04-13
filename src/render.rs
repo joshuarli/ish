@@ -324,7 +324,9 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) 
             }
 
             let display_w = entry.display_width();
-            let pad = col_w.saturating_sub(display_w) + 2;
+            let has_next = (col + 1..state.cols)
+                .any(|next_col| next_col * state.rows + row < state.comp.entries.len());
+            let pad = col_w.saturating_sub(display_w) + if has_next { 2 } else { 0 };
             for _ in 0..pad {
                 tw.write_str(" ");
             }
@@ -636,6 +638,22 @@ mod tests {
         (info, tw.as_bytes().to_vec())
     }
 
+    fn completion_state(entries: &[&str], cols: usize, rows: usize) -> CompletionState {
+        let mut comp = crate::complete::Completions::new();
+        for entry in entries {
+            comp.push(entry, false, false, false);
+        }
+        CompletionState {
+            comp,
+            selected: usize::MAX,
+            cols,
+            rows,
+            scroll: 0,
+            dir_prefix: String::new(),
+            in_quote: false,
+        }
+    }
+
     // When total display width is NOT a multiple of cols, no force-wrap needed.
     #[test]
     fn prompt_info_no_wrap() {
@@ -763,5 +781,16 @@ mod tests {
         let (info, _) = render_file_query("", 80, 0, true, true);
         assert_eq!(info.cursor_row, 0);
         assert_eq!(info.cursor_col, 15);
+    }
+
+    #[test]
+    fn completion_grid_does_not_pad_last_column() {
+        let state = completion_state(&["12345678"], 1, 1);
+        let mut tw = TermWriter::new();
+        draw_grid(&mut tw, &state, 1);
+        assert!(
+            tw.as_bytes().ends_with(b"12345678"),
+            "last column should not add trailing padding"
+        );
     }
 }
