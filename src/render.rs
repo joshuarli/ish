@@ -3,17 +3,19 @@ use crate::history::{FuzzyMatch, History};
 use crate::line::LineBuffer;
 use crate::term::TermWriter;
 
-/// Cursor position info returned by render_line, needed by completion rendering.
-pub struct PromptInfo {
-    pub total_rows: u16,
+/// Geometry for a rendered region, relative to the region's top row.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RenderedRegion {
+    pub painted_rows: u16,
     pub cursor_row: u16,
     pub cursor_col: u16,
 }
-
-/// Cursor position within a rendered region, relative to that region's top row.
-pub struct CursorInfo {
-    pub cursor_row: u16,
-    pub cursor_col: u16,
+impl RenderedRegion {
+    pub fn clear(self, tw: &mut TermWriter) {
+        tw.move_cursor_up(self.cursor_row);
+        tw.carriage_return();
+        tw.clear_to_end_of_screen();
+    }
 }
 
 /// Optional display hints for render_line.
@@ -35,13 +37,11 @@ pub fn render_line(
     prompt_display_len: usize,
     line: &LineBuffer,
     term_cols: u16,
-    prev_cursor_row: u16,
+    prev: RenderedRegion,
     opts: &RenderOpts,
-) -> PromptInfo {
+) -> RenderedRegion {
     tw.hide_cursor();
-    tw.move_cursor_up(prev_cursor_row);
-    tw.carriage_return();
-    tw.clear_to_end_of_screen();
+    prev.clear(tw);
 
     let text = line.text();
     let cols = term_cols as usize;
@@ -103,8 +103,8 @@ pub fn render_line(
     }
 
     tw.show_cursor();
-    PromptInfo {
-        total_rows: (total_rows + 1) as u16,
+    RenderedRegion {
+        painted_rows: (total_rows + 1) as u16,
         cursor_row: cursor_row as u16,
         cursor_col: cursor_col as u16,
     }
@@ -119,7 +119,7 @@ fn render_line_multiline(
     line: &LineBuffer,
     cols: usize,
     opts: &RenderOpts,
-) -> PromptInfo {
+) -> RenderedRegion {
     let text = line.text();
     let cursor_byte = line.cursor();
     let cont_prompt = "  ";
@@ -208,8 +208,8 @@ fn render_line_multiline(
     }
 
     tw.show_cursor();
-    PromptInfo {
-        total_rows: (total_rows + 1) as u16,
+    RenderedRegion {
+        painted_rows: (total_rows + 1) as u16,
         cursor_row: cursor_row as u16,
         cursor_col: cursor_col as u16,
     }
@@ -221,7 +221,7 @@ fn render_line_multiline(
 pub fn render_completions(
     tw: &mut TermWriter,
     state: &CompletionState,
-    info: &PromptInfo,
+    info: RenderedRegion,
     initial: bool,
 ) {
     let visible_rows = grid_visible_rows(state);
@@ -233,7 +233,7 @@ pub fn render_completions(
     if initial {
         // Pre-create grid rows below the prompt. The \n's may scroll
         // the terminal, so we do this before save_cursor.
-        let rows_below = info.total_rows - 1 - info.cursor_row;
+        let rows_below = info.painted_rows - 1 - info.cursor_row;
         if rows_below > 0 {
             tw.move_cursor_down(rows_below);
         }
@@ -252,7 +252,7 @@ pub fn render_completions(
     // Save cursor, draw grid, restore — works for both initial and
     // repaint because all scrolling is already done above.
     tw.save_cursor();
-    tw.move_cursor_down(info.total_rows - info.cursor_row);
+    tw.move_cursor_down(info.painted_rows - info.cursor_row);
     draw_grid(tw, state, visible_rows);
     tw.restore_cursor();
 
@@ -349,12 +349,10 @@ pub fn render_history_pager(
     term_rows: u16,
     term_cols: u16,
     query_cursor: usize,
-    prev_cursor_row: u16,
-) -> CursorInfo {
+    prev: RenderedRegion,
+) -> RenderedRegion {
     tw.hide_cursor();
-    tw.move_cursor_up(prev_cursor_row);
-    tw.carriage_return();
-    tw.clear_to_end_of_screen();
+    prev.clear(tw);
 
     // Search field at top. The query can wrap on narrow terminals, so track
     // both the full display width and the cursor position within it.
@@ -438,7 +436,8 @@ pub fn render_history_pager(
     }
     tw.show_cursor();
 
-    CursorInfo {
+    RenderedRegion {
+        painted_rows: (header_rows + displayed) as u16,
         cursor_row: cursor_row as u16,
         cursor_col: cursor_col as u16,
     }
@@ -459,12 +458,10 @@ pub fn render_file_picker(
     query_cursor: usize,
     query_phase: bool,
     hidden: bool,
-    prev_cursor_row: u16,
-) -> CursorInfo {
+    prev: RenderedRegion,
+) -> RenderedRegion {
     tw.hide_cursor();
-    tw.move_cursor_up(prev_cursor_row);
-    tw.carriage_return();
-    tw.clear_to_end_of_screen();
+    prev.clear(tw);
 
     let cols = term_cols as usize;
     let prefix = if hidden {
@@ -567,7 +564,8 @@ pub fn render_file_picker(
     }
     tw.show_cursor();
 
-    CursorInfo {
+    RenderedRegion {
+        painted_rows: (header_rows + displayed) as u16,
         cursor_row: cursor_row as u16,
         cursor_col: cursor_col as u16,
     }
@@ -585,7 +583,7 @@ mod tests {
         lb
     }
 
-    fn render_simple(prompt: &str, text: &str, cols: u16) -> (PromptInfo, Vec<u8>) {
+    fn render_simple(prompt: &str, text: &str, cols: u16) -> (RenderedRegion, Vec<u8>) {
         render_with_suggestion(prompt, text, "", cols)
     }
 
@@ -594,7 +592,7 @@ mod tests {
         text: &str,
         suggestion: &str,
         cols: u16,
-    ) -> (PromptInfo, Vec<u8>) {
+    ) -> (RenderedRegion, Vec<u8>) {
         let mut tw = TermWriter::new();
         let line = make_line(text);
         let pdl = crate::line::str_width(prompt);
@@ -602,15 +600,37 @@ mod tests {
             suggestion,
             ..Default::default()
         };
-        let info = render_line(&mut tw, prompt, pdl, &line, cols, 0, &opts);
+        let info = render_line(
+            &mut tw,
+            prompt,
+            pdl,
+            &line,
+            cols,
+            RenderedRegion::default(),
+            &opts,
+        );
         let buf = tw.as_bytes().to_vec();
         (info, buf)
     }
 
-    fn render_history_query(query: &str, cols: u16, query_cursor: usize) -> (CursorInfo, Vec<u8>) {
+    fn render_history_query(
+        query: &str,
+        cols: u16,
+        query_cursor: usize,
+    ) -> (RenderedRegion, Vec<u8>) {
         let mut tw = TermWriter::new();
         let hist = History::load_from(std::path::PathBuf::from("/tmp/ish_render_history_test"));
-        let info = render_history_pager(&mut tw, query, &[], &hist, 0, 24, cols, query_cursor, 0);
+        let info = render_history_pager(
+            &mut tw,
+            query,
+            &[],
+            &hist,
+            0,
+            24,
+            cols,
+            query_cursor,
+            RenderedRegion::default(),
+        );
         (info, tw.as_bytes().to_vec())
     }
 
@@ -620,7 +640,7 @@ mod tests {
         query_cursor: usize,
         query_phase: bool,
         hidden: bool,
-    ) -> (CursorInfo, Vec<u8>) {
+    ) -> (RenderedRegion, Vec<u8>) {
         let mut tw = TermWriter::new();
         let info = render_file_picker(
             &mut tw,
@@ -633,7 +653,7 @@ mod tests {
             query_cursor,
             query_phase,
             hidden,
-            0,
+            RenderedRegion::default(),
         );
         (info, tw.as_bytes().to_vec())
     }
@@ -659,7 +679,7 @@ mod tests {
     fn prompt_info_no_wrap() {
         // "$ " (2) + "hi" (2) = 4 in 10-col terminal → row 0
         let (info, buf) = render_simple("$ ", "hi", 10);
-        assert_eq!(info.total_rows, 1);
+        assert_eq!(info.painted_rows, 1);
         assert_eq!(info.cursor_row, 0);
         assert_eq!(info.cursor_col, 4);
         assert!(
@@ -673,7 +693,7 @@ mod tests {
     fn prompt_info_partial_wrap() {
         // "$ " (2) + 9 chars = 11 in 10-col terminal → rows 0-1
         let (info, _) = render_simple("$ ", "123456789", 10);
-        assert_eq!(info.total_rows, 2);
+        assert_eq!(info.painted_rows, 2);
         assert_eq!(info.cursor_row, 1);
         assert_eq!(info.cursor_col, 1);
     }
@@ -684,7 +704,7 @@ mod tests {
         // "$ " (2) + "12345678" (8) = 10 in 10-col terminal → fills row 0 exactly
         let (info, buf) = render_simple("$ ", "12345678", 10);
         // Force-wrap adds an extra row for the cursor
-        assert_eq!(info.total_rows, 2);
+        assert_eq!(info.painted_rows, 2);
         assert_eq!(info.cursor_row, 1);
         assert_eq!(info.cursor_col, 0);
         assert!(buf.windows(2).any(|w| w == b" \r"), "should force-wrap");
@@ -695,7 +715,7 @@ mod tests {
     fn prompt_info_exact_boundary_with_suggestion() {
         // "$ " (2) + "ab" (2) = 4 before cursor; + suggestion "123456" (6) → 10 total
         let (info, buf) = render_with_suggestion("$ ", "ab", "123456", 10);
-        assert_eq!(info.total_rows, 2);
+        assert_eq!(info.painted_rows, 2);
         // Cursor at position 4 → row 0, col 4
         assert_eq!(info.cursor_row, 0);
         assert_eq!(info.cursor_col, 4);
@@ -707,7 +727,7 @@ mod tests {
     fn prompt_info_two_full_rows() {
         // "$ " (2) + 18 chars = 20, cols = 10 → 2 full rows
         let (info, buf) = render_simple("$ ", "abcdefghijklmnopqr", 10);
-        assert_eq!(info.total_rows, 3); // 2 content rows + 1 cursor row from force-wrap
+        assert_eq!(info.painted_rows, 3); // 2 content rows + 1 cursor row from force-wrap
         assert_eq!(info.cursor_row, 2);
         assert_eq!(info.cursor_col, 0);
         assert!(buf.windows(2).any(|w| w == b" \r"), "should force-wrap");
@@ -723,11 +743,19 @@ mod tests {
         for c in "ab\n12345678".chars() {
             line.insert_char(c);
         }
-        let info = render_line(&mut tw, "$ ", 2, &line, 10, 0, &RenderOpts::default());
+        let info = render_line(
+            &mut tw,
+            "$ ",
+            2,
+            &line,
+            10,
+            RenderedRegion::default(),
+            &RenderOpts::default(),
+        );
         let buf = tw.as_bytes();
         // Row 0: "$ ab" (4 cols), row 1: "  12345678" (10 cols, exact boundary)
         // Force-wrap adds row 2 for the cursor
-        assert_eq!(info.total_rows, 3);
+        assert_eq!(info.painted_rows, 3);
         assert!(buf.windows(2).any(|w| w == b" \r"), "should force-wrap");
     }
 
@@ -739,10 +767,18 @@ mod tests {
         for c in "ab\n1234567".chars() {
             line.insert_char(c);
         }
-        let info = render_line(&mut tw, "$ ", 2, &line, 10, 0, &RenderOpts::default());
+        let info = render_line(
+            &mut tw,
+            "$ ",
+            2,
+            &line,
+            10,
+            RenderedRegion::default(),
+            &RenderOpts::default(),
+        );
         let buf = tw.as_bytes();
         // Row 0: "$ ab" (4), row 1: "  1234567" (9) — no exact boundary
-        assert_eq!(info.total_rows, 2);
+        assert_eq!(info.painted_rows, 2);
         assert!(
             !buf.windows(2).any(|w| w == b" \r"),
             "should not force-wrap"
@@ -760,7 +796,21 @@ mod tests {
     fn history_pager_clears_from_top_on_wrapped_rerender() {
         let mut tw = TermWriter::new();
         let hist = History::load_from(std::path::PathBuf::from("/tmp/ish_render_history_test"));
-        let info = render_history_pager(&mut tw, "abc", &[], &hist, 0, 24, 10, 3, 1);
+        let info = render_history_pager(
+            &mut tw,
+            "abc",
+            &[],
+            &hist,
+            0,
+            24,
+            10,
+            3,
+            RenderedRegion {
+                painted_rows: 2,
+                cursor_row: 1,
+                cursor_col: 0,
+            },
+        );
         let buf = tw.as_bytes();
         assert_eq!(info.cursor_row, 1);
         assert!(

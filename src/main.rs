@@ -475,10 +475,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
         prompt_display_len,
         &line,
         shell.cols,
-        0,
+        render::RenderedRegion::default(),
         &render::RenderOpts::default(),
     );
-    let mut cursor_row = info.cursor_row;
+    let mut region = info;
     let _ = tw.flush_to_stdout();
 
     loop {
@@ -502,7 +502,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         handle.drain_into(all_entries);
                         if all_entries.len() != before {
                             filter_entries(query.text(), all_entries, filtered, selected);
-                            cursor_row = render_file_picker_mode(&mut tw, &mode, shell, cursor_row);
+                            region = render_file_picker_mode(&mut tw, &mode, shell, region);
                             let _ = tw.flush_to_stdout();
                         }
                     }
@@ -528,10 +528,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         pdl,
                         &line,
                         shell.cols,
-                        cursor_row,
+                        region,
                         &render::RenderOpts::default(),
                     );
-                    cursor_row = info.cursor_row;
+                    region = info;
                 }
                 let _ = tw.flush_to_stdout();
                 continue;
@@ -585,7 +585,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 }
                                 KeyAction::ClearScreen => {
                                     tw.clear_screen();
-                                    cursor_row = 0;
+                                    region = render::RenderedRegion::default();
                                 }
                                 KeyAction::StartHistorySearch => {
                                     shell.history.sync();
@@ -597,27 +597,26 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         200,
                                         pwd_basename(),
                                     );
-                                    // Clear the current prompt before drawing the pager
-                                    tw.move_cursor_up(cursor_row);
-                                    tw.carriage_return();
-                                    tw.clear_to_end_of_screen();
+                                    region.clear(&mut tw);
                                     mode = Mode::HistorySearch {
                                         query: LineBuffer::new(),
                                         matches,
                                         selected: 0,
                                         saved_line: saved_line.clone(),
                                     };
-                                    cursor_row = render_history_mode(&mut tw, &mode, shell, 0);
+                                    region = render_history_mode(
+                                        &mut tw,
+                                        &mode,
+                                        shell,
+                                        render::RenderedRegion::default(),
+                                    );
                                     let _ = tw.flush_to_stdout();
                                     continue;
                                 }
                                 KeyAction::StartFilePicker => {
                                     saved_line = line.text().to_string();
                                     let handle = finder::find_async(".", false);
-                                    // Clear the current prompt before drawing the pager
-                                    tw.move_cursor_up(cursor_row);
-                                    tw.carriage_return();
-                                    tw.clear_to_end_of_screen();
+                                    region.clear(&mut tw);
                                     mode = Mode::FilePicker {
                                         query: LineBuffer::new(),
                                         all_entries: Vec::new(),
@@ -628,7 +627,12 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         hidden: false,
                                         handle,
                                     };
-                                    cursor_row = render_file_picker_mode(&mut tw, &mode, shell, 0);
+                                    region = render_file_picker_mode(
+                                        &mut tw,
+                                        &mode,
+                                        shell,
+                                        render::RenderedRegion::default(),
+                                    );
                                     let _ = tw.flush_to_stdout();
                                     continue;
                                 }
@@ -648,16 +652,12 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     if entries.is_empty() {
                                         // No history yet — stay in normal mode
                                     } else {
-                                        // Clear the current prompt before drawing the pager
-                                        tw.move_cursor_up(cursor_row);
-                                        tw.carriage_return();
-                                        tw.clear_to_end_of_screen();
+                                        region.clear(&mut tw);
                                         mode = Mode::DirPicker {
                                             entries,
                                             selected: 0,
                                         };
-                                        render_dir_picker_mode(&mut tw, &mode, shell);
-                                        cursor_row = 0;
+                                        region = render_dir_picker_mode(&mut tw, &mode, shell);
                                         let _ = tw.flush_to_stdout();
                                         continue;
                                     }
@@ -724,9 +724,9 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     suggestion,
                                 };
                                 let info = render::render_line(
-                                    &mut tw, p, pdl, &line, shell.cols, cursor_row, &opts,
+                                    &mut tw, p, pdl, &line, shell.cols, region, &opts,
                                 );
-                                cursor_row = info.cursor_row;
+                                region = info;
                             }
                             Mode::Completion(state) => {
                                 let (p, pdl) = active_prompt(&prompt_str, prompt_display_len);
@@ -736,11 +736,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     pdl,
                                     &line,
                                     shell.cols,
-                                    cursor_row,
+                                    region,
                                     &render::RenderOpts::default(),
                                 );
-                                cursor_row = info.cursor_row;
-                                render::render_completions(&mut tw, state, &info, true);
+                                region = info;
+                                render::render_completions(&mut tw, state, info, true);
                             }
                             Mode::HistorySearch { .. }
                             | Mode::FilePicker { .. }
@@ -760,11 +760,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     pdl,
                                     &line,
                                     shell.cols,
-                                    cursor_row,
+                                    region,
                                     &render::RenderOpts::default(),
                                 );
-                                cursor_row = info.cursor_row;
-                                render::render_completions(&mut tw, state, &info, false);
+                                region = info;
+                                render::render_completions(&mut tw, state, info, false);
                                 let _ = tw.flush_to_stdout();
                                 continue;
                             }
@@ -789,11 +789,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         pdl,
                                         &line,
                                         shell.cols,
-                                        cursor_row,
+                                        region,
                                         &render::RenderOpts::default(),
                                     );
-                                    cursor_row = info.cursor_row;
-                                    render::render_completions(&mut tw, &cs, &info, true);
+                                    region = info;
+                                    render::render_completions(&mut tw, &cs, info, true);
                                     mode = Mode::Completion(cs);
                                     let _ = tw.flush_to_stdout();
                                     continue;
@@ -821,10 +821,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             pdl,
                             &line,
                             shell.cols,
-                            cursor_row,
+                            region,
                             &render::RenderOpts::default(),
                         );
-                        cursor_row = info.cursor_row;
+                        region = info;
                         let _ = tw.flush_to_stdout();
                     }
 
@@ -835,45 +835,41 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         saved_line,
                     } => match handle_history_search_key(key, query, matches, selected, shell) {
                         HistAction::Continue => {
-                            cursor_row = render_history_mode(&mut tw, &mode, shell, cursor_row);
+                            region = render_history_mode(&mut tw, &mode, shell, region);
                             let _ = tw.flush_to_stdout();
                         }
                         HistAction::Accept(text) => {
                             line.set(&text);
                             shell.match_buf = std::mem::take(matches);
                             mode = Mode::Normal;
-                            tw.move_cursor_up(cursor_row);
-                            tw.carriage_return();
-                            tw.clear_to_end_of_screen();
+                            region.clear(&mut tw);
                             let info = render::render_line(
                                 &mut tw,
                                 &prompt_str,
                                 prompt_display_len,
                                 &line,
                                 shell.cols,
-                                0,
+                                render::RenderedRegion::default(),
                                 &render::RenderOpts::default(),
                             );
-                            cursor_row = info.cursor_row;
+                            region = info;
                             let _ = tw.flush_to_stdout();
                         }
                         HistAction::Cancel => {
                             line.set(saved_line);
                             shell.match_buf = std::mem::take(matches);
                             mode = Mode::Normal;
-                            tw.move_cursor_up(cursor_row);
-                            tw.carriage_return();
-                            tw.clear_to_end_of_screen();
+                            region.clear(&mut tw);
                             let info = render::render_line(
                                 &mut tw,
                                 &prompt_str,
                                 prompt_display_len,
                                 &line,
                                 shell.cols,
-                                0,
+                                render::RenderedRegion::default(),
                                 &render::RenderOpts::default(),
                             );
-                            cursor_row = info.cursor_row;
+                            region = info;
                             let _ = tw.flush_to_stdout();
                         }
                     },
@@ -901,8 +897,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         );
                         match action {
                             FilePickerAction::Continue => {
-                                cursor_row =
-                                    render_file_picker_mode(&mut tw, &mode, shell, cursor_row);
+                                region = render_file_picker_mode(&mut tw, &mode, shell, region);
                                 let _ = tw.flush_to_stdout();
                             }
                             FilePickerAction::Accept(path) => {
@@ -912,37 +907,33 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 let new_cursor = *saved_cursor + path.len();
                                 line.set_with_cursor(&text, new_cursor);
                                 mode = Mode::Normal;
-                                tw.move_cursor_up(cursor_row);
-                                tw.carriage_return();
-                                tw.clear_to_end_of_screen();
+                                region.clear(&mut tw);
                                 let info = render::render_line(
                                     &mut tw,
                                     &prompt_str,
                                     prompt_display_len,
                                     &line,
                                     shell.cols,
-                                    0,
+                                    render::RenderedRegion::default(),
                                     &render::RenderOpts::default(),
                                 );
-                                cursor_row = info.cursor_row;
+                                region = info;
                                 let _ = tw.flush_to_stdout();
                             }
                             FilePickerAction::Cancel => {
                                 line.set(saved_line);
                                 mode = Mode::Normal;
-                                tw.move_cursor_up(cursor_row);
-                                tw.carriage_return();
-                                tw.clear_to_end_of_screen();
+                                region.clear(&mut tw);
                                 let info = render::render_line(
                                     &mut tw,
                                     &prompt_str,
                                     prompt_display_len,
                                     &line,
                                     shell.cols,
-                                    0,
+                                    render::RenderedRegion::default(),
                                     &render::RenderOpts::default(),
                                 );
-                                cursor_row = info.cursor_row;
+                                region = info;
                                 let _ = tw.flush_to_stdout();
                             }
                         }
@@ -951,18 +942,17 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                     Mode::DirPicker { entries, selected } => match (key.key, key.mods.ctrl) {
                         (Key::Escape, _) | (Key::Char('c'), true) => {
                             mode = Mode::Normal;
-                            tw.carriage_return();
-                            tw.clear_to_end_of_screen();
+                            region.clear(&mut tw);
                             let info = render::render_line(
                                 &mut tw,
                                 &prompt_str,
                                 prompt_display_len,
                                 &line,
                                 shell.cols,
-                                0,
+                                render::RenderedRegion::default(),
                                 &render::RenderOpts::default(),
                             );
-                            cursor_row = info.cursor_row;
+                            region = info;
                             let _ = tw.flush_to_stdout();
                         }
                         (Key::Enter, _) => {
@@ -972,28 +962,27 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 do_cd(&dir, shell);
                             }
                             mode = Mode::Normal;
-                            tw.carriage_return();
-                            tw.clear_to_end_of_screen();
+                            region.clear(&mut tw);
                             let info = render::render_line(
                                 &mut tw,
                                 &prompt_str,
                                 prompt_display_len,
                                 &line,
                                 shell.cols,
-                                0,
+                                render::RenderedRegion::default(),
                                 &render::RenderOpts::default(),
                             );
-                            cursor_row = info.cursor_row;
+                            region = info;
                             let _ = tw.flush_to_stdout();
                         }
                         (Key::Up, _) if *selected > 0 => {
                             *selected -= 1;
-                            render_dir_picker_mode(&mut tw, &mode, shell);
+                            region = render_dir_picker_mode(&mut tw, &mode, shell);
                             let _ = tw.flush_to_stdout();
                         }
                         (Key::Down, _) if *selected + 1 < entries.len() => {
                             *selected += 1;
-                            render_dir_picker_mode(&mut tw, &mode, shell);
+                            region = render_dir_picker_mode(&mut tw, &mode, shell);
                             let _ = tw.flush_to_stdout();
                         }
                         _ => {}
@@ -1721,8 +1710,8 @@ fn render_history_mode(
     tw: &mut TermWriter,
     mode: &Mode,
     shell: &Shell,
-    prev_cursor_row: u16,
-) -> u16 {
+    prev: render::RenderedRegion,
+) -> render::RenderedRegion {
     if let Mode::HistorySearch {
         query,
         matches,
@@ -1739,11 +1728,10 @@ fn render_history_mode(
             shell.rows,
             shell.cols,
             query.display_cursor_pos(),
-            prev_cursor_row,
+            prev,
         )
-        .cursor_row
     } else {
-        0
+        render::RenderedRegion::default()
     }
 }
 
@@ -1863,8 +1851,8 @@ fn render_file_picker_mode(
     tw: &mut TermWriter,
     mode: &Mode,
     shell: &Shell,
-    prev_cursor_row: u16,
-) -> u16 {
+    prev: render::RenderedRegion,
+) -> render::RenderedRegion {
     if let Mode::FilePicker {
         query,
         all_entries,
@@ -1887,11 +1875,10 @@ fn render_file_picker_mode(
             query.display_cursor_pos(),
             in_query,
             *hidden,
-            prev_cursor_row,
+            prev,
         )
-        .cursor_row
     } else {
-        0
+        render::RenderedRegion::default()
     }
 }
 
@@ -1965,7 +1952,11 @@ fn push_dir_stack(dir_stack: &mut Vec<String>) {
     }
 }
 
-fn render_dir_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
+fn render_dir_picker_mode(
+    tw: &mut TermWriter,
+    mode: &Mode,
+    shell: &Shell,
+) -> render::RenderedRegion {
     if let Mode::DirPicker { entries, selected } = mode {
         // Reuse file picker renderer with a dummy "dirs:" header
         tw.hide_cursor();
@@ -2028,6 +2019,13 @@ fn render_dir_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
         tw.carriage_return();
         tw.move_cursor_right(5); // "dirs:" = 5
         tw.show_cursor();
+        render::RenderedRegion {
+            painted_rows: (displayed + 1) as u16,
+            cursor_row: 0,
+            cursor_col: 5,
+        }
+    } else {
+        render::RenderedRegion::default()
     }
 }
 
