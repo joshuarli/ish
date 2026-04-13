@@ -10,6 +10,12 @@ pub struct PromptInfo {
     pub cursor_col: u16,
 }
 
+/// Cursor position within a rendered region, relative to that region's top row.
+pub struct CursorInfo {
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+}
+
 /// Optional display hints for render_line.
 #[derive(Default)]
 pub struct RenderOpts<'a> {
@@ -78,7 +84,7 @@ pub fn render_line(
     // sits in "pending wrap" (autowrap) state — it hasn't actually advanced to
     // the next row yet.  Force the wrap so cursor-movement arithmetic is
     // correct (same trick readline/zsh use).
-    if total_full > 0 && total_full % cols == 0 {
+    if total_full > 0 && total_full.is_multiple_of(cols) {
         tw.write_str(" \r");
     }
 
@@ -184,7 +190,7 @@ fn render_line_multiline(
     }
 
     // Force pending wrap to resolve on the last segment (same as single-line path).
-    if last_seg_width > 0 && last_seg_width % cols == 0 {
+    if last_seg_width > 0 && last_seg_width.is_multiple_of(cols) {
         tw.write_str(" \r");
         row += 1;
     }
@@ -341,21 +347,37 @@ pub fn render_history_pager(
     term_rows: u16,
     term_cols: u16,
     query_cursor: usize,
-) {
+    prev_cursor_row: u16,
+) -> CursorInfo {
     tw.hide_cursor();
-
-    // Search field at top
+    tw.move_cursor_up(prev_cursor_row);
     tw.carriage_return();
-    tw.clear_to_end_of_line();
+    tw.clear_to_end_of_screen();
+
+    // Search field at top. The query can wrap on narrow terminals, so track
+    // both the full display width and the cursor position within it.
+    let cols = term_cols as usize;
+    let prefix = "search: ";
+    let prefix_width = crate::line::str_width(prefix);
+    let header_before_cursor = prefix_width + query_cursor;
+    let header_full = prefix_width + crate::line::str_width(query);
+    let header_rows = header_full.saturating_sub(1) / cols + 1;
+    let cursor_row = header_before_cursor / cols;
+    let cursor_col = header_before_cursor % cols;
+
     tw.write_str("\x1b[1m"); // bold
-    tw.write_str("search: ");
+    tw.write_str(prefix);
     tw.write_str("\x1b[0m");
     tw.write_str(query);
-    tw.clear_to_end_of_line();
 
     // Matches below
     let max_results = (term_rows as usize).saturating_sub(2).min(20);
-    tw.write_str("\n");
+    if header_full > 0 && header_full.is_multiple_of(cols) {
+        tw.write_str(" \r");
+        tw.clear_to_end_of_line();
+    } else {
+        tw.write_str("\n");
+    }
 
     for (i, m) in matches.iter().take(max_results).enumerate() {
         tw.carriage_return();
@@ -406,11 +428,18 @@ pub fn render_history_pager(
 
     // Position cursor in search field
     let displayed = matches.len().min(max_results);
-    let up = displayed + 1;
-    tw.move_cursor_up(up as u16);
+    let rows_back = header_rows + displayed - cursor_row;
+    tw.move_cursor_up(rows_back as u16);
     tw.carriage_return();
-    tw.move_cursor_right((8 + query_cursor) as u16); // "search: " = 8 chars
+    if cursor_col > 0 {
+        tw.move_cursor_right(cursor_col as u16);
+    }
     tw.show_cursor();
+
+    CursorInfo {
+        cursor_row: cursor_row as u16,
+        cursor_col: cursor_col as u16,
+    }
 }
 
 /// Render the file picker pager (Ctrl+F).
@@ -428,12 +457,34 @@ pub fn render_file_picker(
     query_cursor: usize,
     query_phase: bool,
     hidden: bool,
-) {
+    prev_cursor_row: u16,
+) -> CursorInfo {
     tw.hide_cursor();
+    tw.move_cursor_up(prev_cursor_row);
+    tw.carriage_return();
+    tw.clear_to_end_of_screen();
+
+    let cols = term_cols as usize;
+    let prefix = if hidden {
+        "find (hidden): "
+    } else if query_phase && query.is_empty() {
+        "find (ctrl+f toggle hidden): "
+    } else {
+        "find: "
+    };
+    let suffix = if !query_phase && filtered.is_empty() && !query.is_empty() {
+        "  (no matches)"
+    } else {
+        ""
+    };
+    let prefix_width = crate::line::str_width(prefix);
+    let header_before_cursor = prefix_width + query_cursor;
+    let header_full = prefix_width + crate::line::str_width(query) + crate::line::str_width(suffix);
+    let header_rows = header_full.saturating_sub(1) / cols + 1;
+    let cursor_row = header_before_cursor / cols;
+    let cursor_col = header_before_cursor % cols;
 
     // Header: "find: " or "find (hidden): "
-    tw.carriage_return();
-    tw.clear_to_end_of_line();
     tw.write_str("\x1b[1m"); // bold
     if hidden {
         tw.write_str("find \x1b[33m(hidden)\x1b[0;1m: ");
@@ -449,8 +500,6 @@ pub fn render_file_picker(
         tw.write_str("  \x1b[2m(no matches)\x1b[0m");
     }
 
-    tw.clear_to_end_of_line();
-
     let max_results = (term_rows as usize).saturating_sub(2).min(20);
     let max_width = term_cols as usize - 2;
 
@@ -464,7 +513,12 @@ pub fn render_file_picker(
         selected - max_results / 2
     };
 
-    tw.write_str("\n");
+    if header_full > 0 && header_full.is_multiple_of(cols) {
+        tw.write_str(" \r");
+        tw.clear_to_end_of_line();
+    } else {
+        tw.write_str("\n");
+    }
 
     let visible = filtered.iter().skip(scroll).take(max_results).enumerate();
     let mut displayed = 0;
@@ -503,19 +557,18 @@ pub fn render_file_picker(
     tw.clear_to_end_of_screen();
 
     // Position cursor in the query field
-    let up = displayed + 1;
-    tw.move_cursor_up(up as u16);
+    let rows_back = header_rows + displayed - cursor_row;
+    tw.move_cursor_up(rows_back as u16);
     tw.carriage_return();
-    // "find (hidden): " = 16, "find (ctrl+f toggle hidden): " = 30, "find: " = 6
-    let prefix_len = if hidden {
-        16
-    } else if query_phase && query.is_empty() {
-        30
-    } else {
-        6
-    };
-    tw.move_cursor_right((prefix_len + query_cursor) as u16);
+    if cursor_col > 0 {
+        tw.move_cursor_right(cursor_col as u16);
+    }
     tw.show_cursor();
+
+    CursorInfo {
+        cursor_row: cursor_row as u16,
+        cursor_col: cursor_col as u16,
+    }
 }
 
 #[cfg(test)]
@@ -552,6 +605,37 @@ mod tests {
         (info, buf)
     }
 
+    fn render_history_query(query: &str, cols: u16, query_cursor: usize) -> (CursorInfo, Vec<u8>) {
+        let mut tw = TermWriter::new();
+        let hist = History::load_from(std::path::PathBuf::from("/tmp/ish_render_history_test"));
+        let info = render_history_pager(&mut tw, query, &[], &hist, 0, 24, cols, query_cursor, 0);
+        (info, tw.as_bytes().to_vec())
+    }
+
+    fn render_file_query(
+        query: &str,
+        cols: u16,
+        query_cursor: usize,
+        query_phase: bool,
+        hidden: bool,
+    ) -> (CursorInfo, Vec<u8>) {
+        let mut tw = TermWriter::new();
+        let info = render_file_picker(
+            &mut tw,
+            query,
+            &[],
+            &[],
+            0,
+            24,
+            cols,
+            query_cursor,
+            query_phase,
+            hidden,
+            0,
+        );
+        (info, tw.as_bytes().to_vec())
+    }
+
     // When total display width is NOT a multiple of cols, no force-wrap needed.
     #[test]
     fn prompt_info_no_wrap() {
@@ -560,7 +644,10 @@ mod tests {
         assert_eq!(info.total_rows, 1);
         assert_eq!(info.cursor_row, 0);
         assert_eq!(info.cursor_col, 4);
-        assert!(!buf.windows(2).any(|w| w == b" \r"), "should not force-wrap");
+        assert!(
+            !buf.windows(2).any(|w| w == b" \r"),
+            "should not force-wrap"
+        );
     }
 
     // When total display width wraps but doesn't land on exact boundary.
@@ -638,6 +725,43 @@ mod tests {
         let buf = tw.as_bytes();
         // Row 0: "$ ab" (4), row 1: "  1234567" (9) — no exact boundary
         assert_eq!(info.total_rows, 2);
-        assert!(!buf.windows(2).any(|w| w == b" \r"), "should not force-wrap");
+        assert!(
+            !buf.windows(2).any(|w| w == b" \r"),
+            "should not force-wrap"
+        );
+    }
+
+    #[test]
+    fn history_pager_tracks_wrapped_query_cursor_row() {
+        let (info, _) = render_history_query("abc", 10, 3);
+        assert_eq!(info.cursor_row, 1);
+        assert_eq!(info.cursor_col, 1);
+    }
+
+    #[test]
+    fn history_pager_clears_from_top_on_wrapped_rerender() {
+        let mut tw = TermWriter::new();
+        let hist = History::load_from(std::path::PathBuf::from("/tmp/ish_render_history_test"));
+        let info = render_history_pager(&mut tw, "abc", &[], &hist, 0, 24, 10, 3, 1);
+        let buf = tw.as_bytes();
+        assert_eq!(info.cursor_row, 1);
+        assert!(
+            buf.windows(4).any(|w| w == b"\x1b[1A"),
+            "expected rerender to move back to the top first"
+        );
+    }
+
+    #[test]
+    fn file_picker_tracks_wrapped_query_cursor_row() {
+        let (info, _) = render_file_query("abcdef", 10, 6, false, false);
+        assert_eq!(info.cursor_row, 1);
+        assert_eq!(info.cursor_col, 2);
+    }
+
+    #[test]
+    fn file_picker_uses_visible_prefix_widths() {
+        let (info, _) = render_file_query("", 80, 0, true, true);
+        assert_eq!(info.cursor_row, 0);
+        assert_eq!(info.cursor_col, 15);
     }
 }

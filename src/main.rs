@@ -502,7 +502,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         handle.drain_into(all_entries);
                         if all_entries.len() != before {
                             filter_entries(query.text(), all_entries, filtered, selected);
-                            render_file_picker_mode(&mut tw, &mode, shell);
+                            cursor_row = render_file_picker_mode(&mut tw, &mode, shell, cursor_row);
                             let _ = tw.flush_to_stdout();
                         }
                     }
@@ -607,7 +607,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         selected: 0,
                                         saved_line: saved_line.clone(),
                                     };
-                                    render_history_mode(&mut tw, &mode, shell);
+                                    cursor_row = render_history_mode(&mut tw, &mode, shell, 0);
                                     let _ = tw.flush_to_stdout();
                                     continue;
                                 }
@@ -628,7 +628,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         hidden: false,
                                         handle,
                                     };
-                                    render_file_picker_mode(&mut tw, &mode, shell);
+                                    cursor_row = render_file_picker_mode(&mut tw, &mode, shell, 0);
                                     let _ = tw.flush_to_stdout();
                                     continue;
                                 }
@@ -657,6 +657,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                             selected: 0,
                                         };
                                         render_dir_picker_mode(&mut tw, &mode, shell);
+                                        cursor_row = 0;
                                         let _ = tw.flush_to_stdout();
                                         continue;
                                     }
@@ -834,13 +835,14 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         saved_line,
                     } => match handle_history_search_key(key, query, matches, selected, shell) {
                         HistAction::Continue => {
-                            render_history_mode(&mut tw, &mode, shell);
+                            cursor_row = render_history_mode(&mut tw, &mode, shell, cursor_row);
                             let _ = tw.flush_to_stdout();
                         }
                         HistAction::Accept(text) => {
                             line.set(&text);
                             shell.match_buf = std::mem::take(matches);
                             mode = Mode::Normal;
+                            tw.move_cursor_up(cursor_row);
                             tw.carriage_return();
                             tw.clear_to_end_of_screen();
                             let info = render::render_line(
@@ -859,6 +861,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             line.set(saved_line);
                             shell.match_buf = std::mem::take(matches);
                             mode = Mode::Normal;
+                            tw.move_cursor_up(cursor_row);
                             tw.carriage_return();
                             tw.clear_to_end_of_screen();
                             let info = render::render_line(
@@ -898,7 +901,8 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         );
                         match action {
                             FilePickerAction::Continue => {
-                                render_file_picker_mode(&mut tw, &mode, shell);
+                                cursor_row =
+                                    render_file_picker_mode(&mut tw, &mode, shell, cursor_row);
                                 let _ = tw.flush_to_stdout();
                             }
                             FilePickerAction::Accept(path) => {
@@ -908,6 +912,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 let new_cursor = *saved_cursor + path.len();
                                 line.set_with_cursor(&text, new_cursor);
                                 mode = Mode::Normal;
+                                tw.move_cursor_up(cursor_row);
                                 tw.carriage_return();
                                 tw.clear_to_end_of_screen();
                                 let info = render::render_line(
@@ -925,6 +930,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             FilePickerAction::Cancel => {
                                 line.set(saved_line);
                                 mode = Mode::Normal;
+                                tw.move_cursor_up(cursor_row);
                                 tw.carriage_return();
                                 tw.clear_to_end_of_screen();
                                 let info = render::render_line(
@@ -1711,7 +1717,12 @@ fn handle_history_search_key(
     HistAction::Continue
 }
 
-fn render_history_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
+fn render_history_mode(
+    tw: &mut TermWriter,
+    mode: &Mode,
+    shell: &Shell,
+    prev_cursor_row: u16,
+) -> u16 {
     if let Mode::HistorySearch {
         query,
         matches,
@@ -1728,7 +1739,11 @@ fn render_history_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
             shell.rows,
             shell.cols,
             query.display_cursor_pos(),
-        );
+            prev_cursor_row,
+        )
+        .cursor_row
+    } else {
+        0
     }
 }
 
@@ -1844,7 +1859,12 @@ fn filter_entries(
     finder::filter_entries_pub(query, all_entries, filtered, selected);
 }
 
-fn render_file_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
+fn render_file_picker_mode(
+    tw: &mut TermWriter,
+    mode: &Mode,
+    shell: &Shell,
+    prev_cursor_row: u16,
+) -> u16 {
     if let Mode::FilePicker {
         query,
         all_entries,
@@ -1867,7 +1887,11 @@ fn render_file_picker_mode(tw: &mut TermWriter, mode: &Mode, shell: &Shell) {
             query.display_cursor_pos(),
             in_query,
             *hidden,
-        );
+            prev_cursor_row,
+        )
+        .cursor_row
+    } else {
+        0
     }
 }
 
