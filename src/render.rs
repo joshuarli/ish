@@ -18,6 +18,38 @@ impl RenderedRegion {
     }
 }
 
+struct PromptLayout {
+    region: RenderedRegion,
+    rows_back: u16,
+    needs_forced_wrap: bool,
+}
+
+struct PagerLayout {
+    region: RenderedRegion,
+    rows_back: u16,
+    needs_forced_wrap: bool,
+    max_results: usize,
+    max_width: usize,
+    scroll: usize,
+}
+
+struct PagerInput {
+    prefix_width: usize,
+    query_width: usize,
+    suffix_width: usize,
+    query_cursor: usize,
+    total_entries: usize,
+    selected: usize,
+    term_rows: u16,
+    term_cols: u16,
+}
+
+struct CompletionGridLayout {
+    visible_rows: usize,
+    scroll_start: usize,
+    col_widths: [usize; 6],
+}
+
 /// Optional display hints for render_line.
 #[derive(Default)]
 pub struct RenderOpts<'a> {
@@ -27,9 +59,162 @@ pub struct RenderOpts<'a> {
     pub suggestion: &'a str,
 }
 
+fn layout_single_line_prompt(
+    prompt_display_len: usize,
+    line: &LineBuffer,
+    suggestion_display_len: usize,
+    cols: usize,
+) -> PromptLayout {
+    let total_before_cursor = prompt_display_len + line.display_cursor_pos();
+    let total_full = prompt_display_len + line.display_len() + suggestion_display_len;
+    let cursor_row = total_before_cursor / cols;
+    let cursor_col = total_before_cursor % cols;
+    let total_rows = total_full / cols;
+
+    PromptLayout {
+        region: RenderedRegion {
+            painted_rows: (total_rows + 1) as u16,
+            cursor_row: cursor_row as u16,
+            cursor_col: cursor_col as u16,
+        },
+        rows_back: (total_rows - cursor_row) as u16,
+        needs_forced_wrap: total_full > 0 && total_full.is_multiple_of(cols),
+    }
+}
+
+fn layout_multiline_prompt(
+    prompt_display_len: usize,
+    line: &LineBuffer,
+    cols: usize,
+) -> PromptLayout {
+    let text = line.text();
+    let cursor_byte = line.cursor();
+    let cont_prompt_len = 2;
+    let segment_count = text.split('\n').count();
+
+    let mut row: usize = 0;
+    let mut cursor_row: usize = 0;
+    let mut cursor_col: usize = 0;
+    let mut line_idx = 0;
+    let mut last_seg_width: usize = 0;
+
+    for (i, segment) in text.split('\n').enumerate() {
+        let seg_start = line_idx;
+        let seg_end = seg_start + segment.len();
+
+        if cursor_byte >= seg_start && cursor_byte <= seg_end {
+            let prefix = if i == 0 {
+                prompt_display_len
+            } else {
+                cont_prompt_len
+            };
+            let cursor_in_seg = cursor_byte - seg_start;
+            let display_before = crate::line::str_width(&segment[..cursor_in_seg]);
+            let total = prefix + display_before;
+            cursor_row = row + total / cols;
+            cursor_col = total % cols;
+        }
+
+        let prefix = if i == 0 {
+            prompt_display_len
+        } else {
+            cont_prompt_len
+        };
+        let seg_width = prefix + crate::line::str_width(segment);
+        if seg_width > 0 {
+            row += (seg_width - 1) / cols;
+        }
+        last_seg_width = seg_width;
+        line_idx = seg_end + 1;
+
+        if i + 1 < segment_count {
+            row += 1;
+        }
+    }
+
+    let needs_forced_wrap = last_seg_width > 0 && last_seg_width.is_multiple_of(cols);
+    if needs_forced_wrap {
+        row += 1;
+    }
+
+    PromptLayout {
+        region: RenderedRegion {
+            painted_rows: (row + 1) as u16,
+            cursor_row: cursor_row as u16,
+            cursor_col: cursor_col as u16,
+        },
+        rows_back: (row - cursor_row) as u16,
+        needs_forced_wrap,
+    }
+}
+
+fn layout_pager(input: PagerInput) -> PagerLayout {
+    let cols = input.term_cols as usize;
+    let header_before_cursor = input.prefix_width + input.query_cursor;
+    let header_full = input.prefix_width + input.query_width + input.suffix_width;
+    let header_rows = header_full.saturating_sub(1) / cols + 1;
+    let cursor_row = header_before_cursor / cols;
+    let cursor_col = header_before_cursor % cols;
+    let max_results = (input.term_rows as usize).saturating_sub(2).min(20);
+    let displayed = input.total_entries.min(max_results);
+    let scroll = if input.total_entries <= max_results || input.selected < max_results / 2 {
+        0
+    } else if input.selected + max_results / 2 >= input.total_entries {
+        input.total_entries.saturating_sub(max_results)
+    } else {
+        input.selected - max_results / 2
+    };
+
+    PagerLayout {
+        region: RenderedRegion {
+            painted_rows: (header_rows + displayed) as u16,
+            cursor_row: cursor_row as u16,
+            cursor_col: cursor_col as u16,
+        },
+        rows_back: (header_rows + displayed - cursor_row) as u16,
+        needs_forced_wrap: header_full > 0 && header_full.is_multiple_of(cols),
+        max_results,
+        max_width: input.term_cols as usize - 2,
+        scroll,
+    }
+}
+
+fn layout_completion_grid(state: &CompletionState) -> CompletionGridLayout {
+    let visible_rows = grid_visible_rows(state);
+    if visible_rows == 0 {
+        return CompletionGridLayout {
+            visible_rows: 0,
+            scroll_start: 0,
+            col_widths: [0; 6],
+        };
+    }
+    let mut col_widths = [0usize; 6];
+    for (i, entry) in state.comp.entries.iter().enumerate() {
+        let col = i / state.rows;
+        if col < state.cols {
+            col_widths[col] = col_widths[col].max(entry.display_width());
+        }
+    }
+
+    let selected_row = state.selected % state.rows;
+    let scroll_start = if selected_row < state.scroll {
+        selected_row
+    } else if selected_row >= state.scroll + visible_rows {
+        selected_row + 1 - visible_rows
+    } else {
+        state.scroll
+    };
+
+    CompletionGridLayout {
+        visible_rows,
+        scroll_start,
+        col_widths,
+    }
+}
+
 /// Render the prompt + line buffer. Positions cursor correctly.
-/// `prev_cursor_row` is the cursor row from the previous render — needed to
-/// move back to the top of the prompt area before clearing.
+/// `prev` is the geometry from the previous render of this region. It lets us
+/// move back to the top before clearing.
 /// Returns prompt geometry so completion rendering can restore cursor.
 pub fn render_line(
     tw: &mut TermWriter,
@@ -51,6 +236,13 @@ pub fn render_line(
         return render_line_multiline(tw, prompt, prompt_display_len, line, cols, opts);
     }
 
+    let layout = layout_single_line_prompt(
+        prompt_display_len,
+        line,
+        crate::line::str_width(opts.suggestion),
+        cols,
+    );
+
     tw.write_str(prompt);
 
     // Write line text with optional command-word coloring
@@ -67,47 +259,27 @@ pub fn render_line(
     }
 
     // Autosuggestion ghost text (dim gray, after line content)
-    let suggestion_display_len = if opts.suggestion.is_empty() {
-        0
-    } else {
+    if !opts.suggestion.is_empty() {
         tw.write_str("\x1b[38;5;8m");
         tw.write_str(opts.suggestion);
         tw.write_str("\x1b[0m");
-        crate::line::str_width(opts.suggestion)
-    };
+    }
 
-    // Calculate cursor position
-    let total_before_cursor = prompt_display_len + line.display_cursor_pos();
-    let total_full = prompt_display_len + line.display_len() + suggestion_display_len;
-
-    // When text fills to an exact multiple of the terminal width, the cursor
-    // sits in "pending wrap" (autowrap) state — it hasn't actually advanced to
-    // the next row yet.  Force the wrap so cursor-movement arithmetic is
-    // correct (same trick readline/zsh use).
-    if total_full > 0 && total_full.is_multiple_of(cols) {
+    if layout.needs_forced_wrap {
         tw.write_str(" \r");
     }
 
-    let cursor_row = total_before_cursor / cols;
-    let cursor_col = total_before_cursor % cols;
-    let total_rows = total_full / cols;
-
     // Move cursor from end of text to correct position
-    let rows_back = total_rows - cursor_row;
-    if rows_back > 0 {
-        tw.move_cursor_up(rows_back as u16);
+    if layout.rows_back > 0 {
+        tw.move_cursor_up(layout.rows_back);
     }
     tw.carriage_return();
-    if cursor_col > 0 {
-        tw.move_cursor_right(cursor_col as u16);
+    if layout.region.cursor_col > 0 {
+        tw.move_cursor_right(layout.region.cursor_col);
     }
 
     tw.show_cursor();
-    RenderedRegion {
-        painted_rows: (total_rows + 1) as u16,
-        cursor_row: cursor_row as u16,
-        cursor_col: cursor_col as u16,
-    }
+    layout.region
 }
 
 /// Render a multiline buffer (contains `\n`). First line gets the main prompt,
@@ -121,15 +293,8 @@ fn render_line_multiline(
     opts: &RenderOpts,
 ) -> RenderedRegion {
     let text = line.text();
-    let cursor_byte = line.cursor();
     let cont_prompt = "  ";
-    let cont_prompt_len = 2;
-
-    let mut row: usize = 0;
-    let mut cursor_row: usize = 0;
-    let mut cursor_col: usize = 0;
-    let mut line_idx = 0;
-    let mut last_seg_width: usize = 0;
+    let layout = layout_multiline_prompt(prompt_display_len, line, cols);
 
     for (i, segment) in text.split('\n').enumerate() {
         if i == 0 {
@@ -151,68 +316,26 @@ fn render_line_multiline(
             }
         } else {
             tw.write_str("\r\n");
-            row += 1;
             tw.write_str(cont_prompt);
             tw.write_str(segment);
         }
-
-        // Track cursor position within this segment
-        let seg_start = line_idx;
-        let seg_end = seg_start + segment.len();
-
-        if cursor_byte >= seg_start && cursor_byte <= seg_end {
-            let prefix = if i == 0 {
-                prompt_display_len
-            } else {
-                cont_prompt_len
-            };
-            let cursor_in_seg = cursor_byte - seg_start;
-            let display_before = crate::line::str_width(&segment[..cursor_in_seg]);
-            let total = prefix + display_before;
-            cursor_row = row + total / cols;
-            cursor_col = total % cols;
-        }
-
-        // Track total display rows for this segment (wrapping)
-        let prefix = if i == 0 {
-            prompt_display_len
-        } else {
-            cont_prompt_len
-        };
-        let seg_width = prefix + crate::line::str_width(segment);
-        if seg_width > 0 {
-            row += (seg_width - 1) / cols; // additional rows from wrapping
-        }
-        last_seg_width = seg_width;
-
-        // Advance line_idx past segment + the \n separator
-        line_idx = seg_end + 1; // +1 for the \n
     }
 
-    // Force pending wrap to resolve on the last segment (same as single-line path).
-    if last_seg_width > 0 && last_seg_width.is_multiple_of(cols) {
+    if layout.needs_forced_wrap {
         tw.write_str(" \r");
-        row += 1;
     }
-
-    let total_rows = row;
 
     // Move cursor from end of text to correct position
-    let rows_back = total_rows - cursor_row;
-    if rows_back > 0 {
-        tw.move_cursor_up(rows_back as u16);
+    if layout.rows_back > 0 {
+        tw.move_cursor_up(layout.rows_back);
     }
     tw.carriage_return();
-    if cursor_col > 0 {
-        tw.move_cursor_right(cursor_col as u16);
+    if layout.region.cursor_col > 0 {
+        tw.move_cursor_right(layout.region.cursor_col);
     }
 
     tw.show_cursor();
-    RenderedRegion {
-        painted_rows: (total_rows + 1) as u16,
-        cursor_row: cursor_row as u16,
-        cursor_col: cursor_col as u16,
-    }
+    layout.region
 }
 
 /// Render the completion grid below the current line.
@@ -224,8 +347,8 @@ pub fn render_completions(
     info: RenderedRegion,
     initial: bool,
 ) {
-    let visible_rows = grid_visible_rows(state);
-    if visible_rows == 0 {
+    let layout = layout_completion_grid(state);
+    if layout.visible_rows == 0 {
         return;
     }
     tw.hide_cursor();
@@ -237,12 +360,12 @@ pub fn render_completions(
         if rows_below > 0 {
             tw.move_cursor_down(rows_below);
         }
-        for _ in 0..visible_rows {
+        for _ in 0..layout.visible_rows {
             tw.write_str("\n");
         }
         // Return to cursor position — total relative movement was
         // rows_below (down) + visible_rows (down via \n), so reverse it.
-        tw.move_cursor_up(rows_below + visible_rows as u16);
+        tw.move_cursor_up(rows_below + layout.visible_rows as u16);
         tw.carriage_return();
         if info.cursor_col > 0 {
             tw.move_cursor_right(info.cursor_col);
@@ -253,7 +376,7 @@ pub fn render_completions(
     // repaint because all scrolling is already done above.
     tw.save_cursor();
     tw.move_cursor_down(info.painted_rows - info.cursor_row);
-    draw_grid(tw, state, visible_rows);
+    draw_grid(tw, state, &layout);
     tw.restore_cursor();
 
     tw.show_cursor();
@@ -266,31 +389,13 @@ pub fn grid_visible_rows(state: &CompletionState) -> usize {
     state.rows.min(10)
 }
 
-fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) {
-    // Stack array — max 6 columns, no heap allocation per grid draw.
-    let mut col_widths = [0usize; 6];
-    for (i, entry) in state.comp.entries.iter().enumerate() {
-        let col = i / state.rows;
-        if col < state.cols {
-            col_widths[col] = col_widths[col].max(entry.display_width());
-        }
-    }
-
-    let selected_row = state.selected % state.rows;
-    let scroll_start = if selected_row < state.scroll {
-        selected_row
-    } else if selected_row >= state.scroll + visible_rows {
-        selected_row + 1 - visible_rows
-    } else {
-        state.scroll
-    };
-
-    for vr in 0..visible_rows {
-        let row = scroll_start + vr;
+fn draw_grid(tw: &mut TermWriter, state: &CompletionState, layout: &CompletionGridLayout) {
+    for vr in 0..layout.visible_rows {
+        let row = layout.scroll_start + vr;
         tw.carriage_return();
         tw.clear_to_end_of_line();
 
-        for (col, &col_w) in col_widths[..state.cols].iter().enumerate() {
+        for (col, &col_w) in layout.col_widths[..state.cols].iter().enumerate() {
             let idx = col * state.rows + row;
             if idx >= state.comp.entries.len() {
                 break;
@@ -332,7 +437,7 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, visible_rows: usize) 
             }
         }
 
-        if vr + 1 < visible_rows {
+        if vr + 1 < layout.visible_rows {
             tw.write_str("\n");
         }
     }
@@ -354,32 +459,31 @@ pub fn render_history_pager(
     tw.hide_cursor();
     prev.clear(tw);
 
-    // Search field at top. The query can wrap on narrow terminals, so track
-    // both the full display width and the cursor position within it.
-    let cols = term_cols as usize;
     let prefix = "search: ";
-    let prefix_width = crate::line::str_width(prefix);
-    let header_before_cursor = prefix_width + query_cursor;
-    let header_full = prefix_width + crate::line::str_width(query);
-    let header_rows = header_full.saturating_sub(1) / cols + 1;
-    let cursor_row = header_before_cursor / cols;
-    let cursor_col = header_before_cursor % cols;
+    let layout = layout_pager(PagerInput {
+        prefix_width: crate::line::str_width(prefix),
+        query_width: crate::line::str_width(query),
+        suffix_width: 0,
+        query_cursor,
+        total_entries: matches.len(),
+        selected,
+        term_rows,
+        term_cols,
+    });
 
     tw.write_str("\x1b[1m"); // bold
     tw.write_str(prefix);
     tw.write_str("\x1b[0m");
     tw.write_str(query);
 
-    // Matches below
-    let max_results = (term_rows as usize).saturating_sub(2).min(20);
-    if header_full > 0 && header_full.is_multiple_of(cols) {
+    if layout.needs_forced_wrap {
         tw.write_str(" \r");
         tw.clear_to_end_of_line();
     } else {
         tw.write_str("\n");
     }
 
-    for (i, m) in matches.iter().take(max_results).enumerate() {
+    for (i, m) in matches.iter().take(layout.max_results).enumerate() {
         tw.carriage_return();
         tw.clear_to_end_of_line();
 
@@ -392,12 +496,11 @@ pub fn render_history_pager(
 
         // Write entry with matching chars highlighted.
         // Use a sorted position index instead of HashSet to avoid allocation.
-        let max_width = term_cols as usize - 2;
         let mut col = 0;
         let mut pi = 0; // index into match_positions
         for (ci, ch) in text.chars().enumerate() {
             let w = crate::line::char_width(ch);
-            if col + w > max_width {
+            if col + w > layout.max_width {
                 break;
             }
             col += w;
@@ -427,20 +530,14 @@ pub fn render_history_pager(
     tw.clear_to_end_of_screen();
 
     // Position cursor in search field
-    let displayed = matches.len().min(max_results);
-    let rows_back = header_rows + displayed - cursor_row;
-    tw.move_cursor_up(rows_back as u16);
+    tw.move_cursor_up(layout.rows_back);
     tw.carriage_return();
-    if cursor_col > 0 {
-        tw.move_cursor_right(cursor_col as u16);
+    if layout.region.cursor_col > 0 {
+        tw.move_cursor_right(layout.region.cursor_col);
     }
     tw.show_cursor();
 
-    RenderedRegion {
-        painted_rows: (header_rows + displayed) as u16,
-        cursor_row: cursor_row as u16,
-        cursor_col: cursor_col as u16,
-    }
+    layout.region
 }
 
 /// Render the file picker pager (Ctrl+F).
@@ -463,7 +560,6 @@ pub fn render_file_picker(
     tw.hide_cursor();
     prev.clear(tw);
 
-    let cols = term_cols as usize;
     let prefix = if hidden {
         "find (hidden): "
     } else if query_phase && query.is_empty() {
@@ -476,12 +572,16 @@ pub fn render_file_picker(
     } else {
         ""
     };
-    let prefix_width = crate::line::str_width(prefix);
-    let header_before_cursor = prefix_width + query_cursor;
-    let header_full = prefix_width + crate::line::str_width(query) + crate::line::str_width(suffix);
-    let header_rows = header_full.saturating_sub(1) / cols + 1;
-    let cursor_row = header_before_cursor / cols;
-    let cursor_col = header_before_cursor % cols;
+    let layout = layout_pager(PagerInput {
+        prefix_width: crate::line::str_width(prefix),
+        query_width: crate::line::str_width(query),
+        suffix_width: crate::line::str_width(suffix),
+        query_cursor,
+        total_entries: filtered.len(),
+        selected,
+        term_rows,
+        term_cols,
+    });
 
     // Header: "find: " or "find (hidden): "
     tw.write_str("\x1b[1m"); // bold
@@ -499,30 +599,20 @@ pub fn render_file_picker(
         tw.write_str("  \x1b[2m(no matches)\x1b[0m");
     }
 
-    let max_results = (term_rows as usize).saturating_sub(2).min(20);
-    let max_width = term_cols as usize - 2;
-
-    // Scroll window: keep selected visible
-    let total = filtered.len();
-    let scroll = if total <= max_results || selected < max_results / 2 {
-        0
-    } else if selected + max_results / 2 >= total {
-        total.saturating_sub(max_results)
-    } else {
-        selected - max_results / 2
-    };
-
-    if header_full > 0 && header_full.is_multiple_of(cols) {
+    if layout.needs_forced_wrap {
         tw.write_str(" \r");
         tw.clear_to_end_of_line();
     } else {
         tw.write_str("\n");
     }
 
-    let visible = filtered.iter().skip(scroll).take(max_results).enumerate();
-    let mut displayed = 0;
+    let visible = filtered
+        .iter()
+        .skip(layout.scroll)
+        .take(layout.max_results)
+        .enumerate();
     for (i, &entry_idx) in visible {
-        let abs_idx = scroll + i;
+        let abs_idx = layout.scroll + i;
         let path = &all_entries[entry_idx].1;
         tw.carriage_return();
         tw.clear_to_end_of_line();
@@ -536,7 +626,7 @@ pub fn render_file_picker(
         let mut col = 0;
         for ch in path.chars() {
             let w = crate::line::char_width(ch);
-            if col + w > max_width {
+            if col + w > layout.max_width {
                 break;
             }
             col += w;
@@ -549,26 +639,20 @@ pub fn render_file_picker(
         }
         tw.clear_to_end_of_line();
         tw.write_str("\n");
-        displayed += 1;
     }
 
     // Clear remaining lines
     tw.clear_to_end_of_screen();
 
     // Position cursor in the query field
-    let rows_back = header_rows + displayed - cursor_row;
-    tw.move_cursor_up(rows_back as u16);
+    tw.move_cursor_up(layout.rows_back);
     tw.carriage_return();
-    if cursor_col > 0 {
-        tw.move_cursor_right(cursor_col as u16);
+    if layout.region.cursor_col > 0 {
+        tw.move_cursor_right(layout.region.cursor_col);
     }
     tw.show_cursor();
 
-    RenderedRegion {
-        painted_rows: (header_rows + displayed) as u16,
-        cursor_row: cursor_row as u16,
-        cursor_col: cursor_col as u16,
-    }
+    layout.region
 }
 
 #[cfg(test)]
@@ -698,7 +782,7 @@ mod tests {
         assert_eq!(info.cursor_col, 1);
     }
 
-    // Exact multiple of cols → force-wrap triggers, total_rows accounts for it.
+    // Exact multiple of cols → force-wrap triggers, painted_rows accounts for it.
     #[test]
     fn prompt_info_exact_boundary() {
         // "$ " (2) + "12345678" (8) = 10 in 10-col terminal → fills row 0 exactly
@@ -837,7 +921,8 @@ mod tests {
     fn completion_grid_does_not_pad_last_column() {
         let state = completion_state(&["12345678"], 1, 1);
         let mut tw = TermWriter::new();
-        draw_grid(&mut tw, &state, 1);
+        let layout = layout_completion_grid(&state);
+        draw_grid(&mut tw, &state, &layout);
         assert!(
             tw.as_bytes().ends_with(b"12345678"),
             "last column should not add trailing padding"
