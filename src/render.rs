@@ -655,6 +655,96 @@ pub fn render_file_picker(
     layout.region
 }
 
+/// Render the directory picker pager.
+pub fn render_dir_picker(
+    tw: &mut TermWriter,
+    entries: &[String],
+    selected: usize,
+    home: &str,
+    term_rows: u16,
+    term_cols: u16,
+    prev: RenderedRegion,
+) -> RenderedRegion {
+    tw.hide_cursor();
+    prev.clear(tw);
+
+    let prefix = "dirs:";
+    let layout = layout_pager(PagerInput {
+        prefix_width: crate::line::str_width(prefix),
+        query_width: 0,
+        suffix_width: 0,
+        query_cursor: 0,
+        total_entries: entries.len(),
+        selected,
+        term_rows,
+        term_cols,
+    });
+
+    tw.write_str("\x1b[1mdirs:\x1b[0m");
+    if layout.needs_forced_wrap {
+        tw.write_str(" \r");
+        tw.clear_to_end_of_line();
+    } else {
+        tw.write_str("\n");
+    }
+
+    let visible = entries
+        .iter()
+        .skip(layout.scroll)
+        .take(layout.max_results)
+        .enumerate();
+    for (i, dir) in visible {
+        let abs_idx = layout.scroll + i;
+        tw.carriage_return();
+        tw.clear_to_end_of_line();
+
+        if abs_idx == selected {
+            tw.write_str("\x1b[7m");
+        }
+
+        let mut col = 0;
+        if let Some(rest) = dir.strip_prefix(home) {
+            if col < layout.max_width {
+                tw.write_str("~");
+                col += 1;
+            }
+            for ch in rest.chars() {
+                let w = crate::line::char_width(ch);
+                if col + w > layout.max_width {
+                    break;
+                }
+                col += w;
+                let mut buf = [0u8; 4];
+                tw.write_str(ch.encode_utf8(&mut buf));
+            }
+        } else {
+            for ch in dir.chars() {
+                let w = crate::line::char_width(ch);
+                if col + w > layout.max_width {
+                    break;
+                }
+                col += w;
+                let mut buf = [0u8; 4];
+                tw.write_str(ch.encode_utf8(&mut buf));
+            }
+        }
+
+        if abs_idx == selected {
+            tw.write_str("\x1b[0m");
+        }
+        tw.clear_to_end_of_line();
+        tw.write_str("\n");
+    }
+
+    tw.clear_to_end_of_screen();
+    tw.move_cursor_up(layout.rows_back);
+    tw.carriage_return();
+    tw.move_cursor_right(layout.region.cursor_col);
+    tw.show_cursor();
+
+    layout.region
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,6 +827,25 @@ mod tests {
             query_cursor,
             query_phase,
             hidden,
+            RenderedRegion::default(),
+        );
+        (info, tw.as_bytes().to_vec())
+    }
+
+    fn render_dir_entries(
+        entries: &[&str],
+        cols: u16,
+        selected: usize,
+    ) -> (RenderedRegion, Vec<u8>) {
+        let mut tw = TermWriter::new();
+        let entries = entries.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let info = render_dir_picker(
+            &mut tw,
+            &entries,
+            selected,
+            "/tmp/home",
+            24,
+            cols,
             RenderedRegion::default(),
         );
         (info, tw.as_bytes().to_vec())
@@ -870,6 +979,48 @@ mod tests {
     }
 
     #[test]
+    fn multiline_trailing_newline_keeps_cursor_on_empty_continuation() {
+        let mut tw = TermWriter::new();
+        let mut line = LineBuffer::new();
+        for c in "ab\n".chars() {
+            line.insert_char(c);
+        }
+        let info = render_line(
+            &mut tw,
+            "$ ",
+            2,
+            &line,
+            10,
+            RenderedRegion::default(),
+            &RenderOpts::default(),
+        );
+        assert_eq!(info.painted_rows, 2);
+        assert_eq!(info.cursor_row, 1);
+        assert_eq!(info.cursor_col, 2);
+    }
+
+    #[test]
+    fn multiline_cursor_accounts_for_wrapped_first_segment() {
+        let mut tw = TermWriter::new();
+        let mut line = LineBuffer::new();
+        for c in "123456789\nx".chars() {
+            line.insert_char(c);
+        }
+        let info = render_line(
+            &mut tw,
+            "$ ",
+            2,
+            &line,
+            10,
+            RenderedRegion::default(),
+            &RenderOpts::default(),
+        );
+        assert_eq!(info.painted_rows, 3);
+        assert_eq!(info.cursor_row, 2);
+        assert_eq!(info.cursor_col, 3);
+    }
+
+    #[test]
     fn history_pager_tracks_wrapped_query_cursor_row() {
         let (info, _) = render_history_query("abc", 10, 3);
         assert_eq!(info.cursor_row, 1);
@@ -915,6 +1066,14 @@ mod tests {
         let (info, _) = render_file_query("", 80, 0, true, true);
         assert_eq!(info.cursor_row, 0);
         assert_eq!(info.cursor_col, 15);
+    }
+
+    #[test]
+    fn dir_picker_places_cursor_after_header() {
+        let (info, buf) = render_dir_entries(&["/tmp/home/project", "/tmp/home/other"], 20, 0);
+        assert_eq!(info.cursor_row, 0);
+        assert_eq!(info.cursor_col, 5);
+        assert!(buf.windows(5).any(|w| w == b"dirs:"));
     }
 
     #[test]

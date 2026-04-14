@@ -652,7 +652,8 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                             entries,
                                             selected: 0,
                                         };
-                                        region = render_dir_picker_mode(&mut tw, &mode, shell);
+                                        region =
+                                            render_dir_picker_mode(&mut tw, &mode, shell, region);
                                         let _ = tw.flush_to_stdout();
                                         continue;
                                     }
@@ -918,12 +919,12 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         }
                         (Key::Up, _) if *selected > 0 => {
                             *selected -= 1;
-                            region = render_dir_picker_mode(&mut tw, &mode, shell);
+                            region = render_dir_picker_mode(&mut tw, &mode, shell, region);
                             let _ = tw.flush_to_stdout();
                         }
                         (Key::Down, _) if *selected + 1 < entries.len() => {
                             *selected += 1;
-                            region = render_dir_picker_mode(&mut tw, &mode, shell);
+                            region = render_dir_picker_mode(&mut tw, &mode, shell, region);
                             let _ = tw.flush_to_stdout();
                         }
                         _ => {}
@@ -1011,7 +1012,7 @@ fn render_active_mode(
         }
         Mode::HistorySearch { .. } => render_history_mode(tw, mode, shell, region),
         Mode::FilePicker { .. } => render_file_picker_mode(tw, mode, shell, region),
-        Mode::DirPicker { .. } => render_dir_picker_mode(tw, mode, shell),
+        Mode::DirPicker { .. } => render_dir_picker_mode(tw, mode, shell, region),
     }
 }
 
@@ -1316,7 +1317,7 @@ fn find_comp_word_start(s: &str) -> (usize, bool) {
             b'\\' if !in_single && i + 1 < bytes.len() => {
                 i += 2;
             }
-            b' ' | b'\t' if !in_single && !in_double => {
+            b' ' | b'\t' | b'\n' if !in_single && !in_double => {
                 i += 1;
                 word_start = i;
             }
@@ -1983,74 +1984,18 @@ fn render_dir_picker_mode(
     tw: &mut TermWriter,
     mode: &Mode,
     shell: &Shell,
+    prev: render::RenderedRegion,
 ) -> render::RenderedRegion {
     if let Mode::DirPicker { entries, selected } = mode {
-        // Reuse file picker renderer with a dummy "dirs:" header
-        tw.hide_cursor();
-        tw.carriage_return();
-        tw.clear_to_end_of_line();
-        tw.write_str("\x1b[1mdirs:\x1b[0m");
-        tw.clear_to_end_of_line();
-
-        let max_results = (shell.rows as usize).saturating_sub(2).min(20);
-        let max_width = shell.cols as usize - 2;
-        let total = entries.len();
-        let scroll = if total <= max_results || *selected < max_results / 2 {
-            0
-        } else if *selected + max_results / 2 >= total {
-            total.saturating_sub(max_results)
-        } else {
-            *selected - max_results / 2
-        };
-
-        tw.write_str("\n");
-        let mut displayed = 0;
-        for (i, dir) in entries.iter().skip(scroll).take(max_results).enumerate() {
-            let abs_idx = scroll + i;
-            tw.carriage_return();
-            tw.clear_to_end_of_line();
-
-            if abs_idx == *selected {
-                tw.write_str("\x1b[7m");
-            }
-
-            // Shorten home prefix to ~
-            let display = if let Some(rest) = dir.strip_prefix(&shell.home) {
-                format!("~{rest}")
-            } else {
-                dir.clone()
-            };
-
-            let mut col = 0;
-            for ch in display.chars() {
-                let w = ish::line::char_width(ch);
-                if col + w > max_width {
-                    break;
-                }
-                col += w;
-                let mut buf = [0u8; 4];
-                tw.write_str(ch.encode_utf8(&mut buf));
-            }
-
-            if abs_idx == *selected {
-                tw.write_str("\x1b[0m");
-            }
-            tw.clear_to_end_of_line();
-            tw.write_str("\n");
-            displayed += 1;
-        }
-
-        tw.clear_to_end_of_screen();
-        let up = displayed + 1;
-        tw.move_cursor_up(up as u16);
-        tw.carriage_return();
-        tw.move_cursor_right(5); // "dirs:" = 5
-        tw.show_cursor();
-        render::RenderedRegion {
-            painted_rows: (displayed + 1) as u16,
-            cursor_row: 0,
-            cursor_col: 5,
-        }
+        render::render_dir_picker(
+            tw,
+            entries,
+            *selected,
+            &shell.home,
+            shell.rows,
+            shell.cols,
+            prev,
+        )
     } else {
         render::RenderedRegion::default()
     }

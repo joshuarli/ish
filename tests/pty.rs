@@ -318,6 +318,11 @@ impl PtyShell {
         self.send(b"\x7f");
     }
 
+    /// Send Ctrl+Backspace.
+    fn ctrl_backspace(&self) {
+        self.send(b"\x08");
+    }
+
     fn resize(&self, rows: u16, cols: u16) {
         let ws = libc::winsize {
             ws_row: rows,
@@ -1474,15 +1479,23 @@ fn source_nonexistent_error() {
 #[test]
 fn ctrl_l_clears_screen() {
     let sh = PtyShell::spawn();
-    sh.type_str("echo before_clear");
-    sh.enter();
-    sh.wait_for_prompt(2000);
+    let mut out = sh.run_command("echo before_clear");
+    let _ = sh.read_timeout(200);
+    sh.type_str("echo after_clear");
     sh.ctrl_l();
-    let out = sh.read_timeout(500);
-    // Screen clear is ESC[H ESC[2J
+    out.push_str(&sh.read_timeout(500));
+    let screen = Screen::render(&out, 24, 80);
     assert!(
         out.contains("\x1b[H") || out.contains("\x1b[2J"),
         "expected screen clear sequence: {out:?}"
+    );
+    assert!(
+        !screen.contains("before_clear"),
+        "clear should remove prior output from visible screen: {screen:?}"
+    );
+    assert!(
+        screen.contains("echo after_clear"),
+        "current line should be preserved after clear: {screen:?}"
     );
 }
 
@@ -1502,6 +1515,53 @@ fn multiline_continuation() {
         text.contains("HELLO"),
         "expected uppercased output: {text:?}"
     );
+}
+
+#[test]
+fn multiline_completion_on_continuation_line() {
+    let sh = PtyShell::spawn_with_opts(&[("bin/upper", "#!/bin/sh\ntr a-z A-Z\n")], &[]);
+    sh.type_str("echo hello |");
+    sh.enter();
+    sh.read_timeout(300);
+    sh.type_str("./bin/up");
+    sh.tab();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let out = sh.read_timeout(600);
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("./bin/upper"),
+        "expected multiline completion to expand on continuation line: {text:?}"
+    );
+    sh.ctrl_c();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
+fn dir_picker_narrow_repaint_does_not_stack_rows() {
+    let sh = PtyShell::spawn_with_size(
+        &[("one/.keep", ""), ("two/.keep", ""), ("three/.keep", "")],
+        &[],
+        24,
+        40,
+    );
+    sh.run_command("cd one");
+    sh.run_command("cd ../two");
+    sh.run_command("cd ../three");
+    sh.ctrl_backspace();
+    sh.wait_for("dirs:", 2000);
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    sh.down();
+    sh.up();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let out = sh.read_timeout(800);
+    let screen = Screen::render(&out, 24, 40);
+    assert_screen_contains_once(&screen, "dirs:");
+    assert_screen_contains_once(&screen, "one");
+    assert_screen_contains_once(&screen, "two");
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
 }
 
 #[test]
