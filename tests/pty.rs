@@ -56,12 +56,17 @@ fn ish_binary() -> PathBuf {
 impl PtyShell {
     /// Spawn ish in a PTY with an isolated HOME directory.
     fn spawn() -> Self {
-        Self::spawn_with_env(&[], &[], &[])
+        Self::spawn_with_size_env(&[], &[], &[], 24, 80)
     }
 
     /// Spawn with files pre-created in HOME and optional history entries.
     fn spawn_with_opts(files: &[(&str, &str)], history: &[&str]) -> Self {
-        Self::spawn_with_env(files, history, &[])
+        Self::spawn_with_size_env(files, history, &[], 24, 80)
+    }
+
+    /// Spawn with a custom terminal size.
+    fn spawn_with_size(files: &[(&str, &str)], history: &[&str], rows: u16, cols: u16) -> Self {
+        Self::spawn_with_size_env(files, history, &[], rows, cols)
     }
 
     /// Spawn with files, history, and extra environment variables.
@@ -70,6 +75,16 @@ impl PtyShell {
         files: &[(&str, &str)],
         history: &[&str],
         extra_env: &[(&str, &str)],
+    ) -> Self {
+        Self::spawn_with_size_env(files, history, extra_env, 24, 80)
+    }
+
+    fn spawn_with_size_env(
+        files: &[(&str, &str)],
+        history: &[&str],
+        extra_env: &[(&str, &str)],
+        rows: u16,
+        cols: u16,
     ) -> Self {
         let home = TempDir::new("ish_pty_test");
         let home_path = home.path().to_str().unwrap().to_string();
@@ -114,10 +129,10 @@ impl PtyShell {
         };
         assert_eq!(ret, 0, "openpty failed");
 
-        // Set terminal size to 80x24
+        // Set terminal size
         let ws = libc::winsize {
-            ws_row: 24,
-            ws_col: 80,
+            ws_row: rows,
+            ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
@@ -237,6 +252,11 @@ impl PtyShell {
         self.send(b"\x12");
     }
 
+    /// Send Ctrl+F.
+    fn ctrl_f(&self) {
+        self.send(b"\x06");
+    }
+
     /// Send Ctrl+L.
     fn ctrl_l(&self) {
         self.send(b"\x0c");
@@ -296,6 +316,19 @@ impl PtyShell {
     /// Send Backspace.
     fn backspace(&self) {
         self.send(b"\x7f");
+    }
+
+    fn resize(&self, rows: u16, cols: u16) {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe {
+            libc::ioctl(self.master_fd(), libc::TIOCSWINSZ, &ws);
+            libc::kill(self.child, libc::SIGWINCH);
+        }
     }
 
     /// Read all available output, waiting up to `timeout_ms` for data.
@@ -445,6 +478,216 @@ impl PtyShell {
         }
         result
     }
+}
+
+struct Screen {
+    rows: usize,
+    cols: usize,
+    cells: Vec<Vec<char>>,
+    row: usize,
+    col: usize,
+    saved: Option<(usize, usize)>,
+}
+
+impl Screen {
+    fn new(rows: u16, cols: u16) -> Self {
+        let rows = rows as usize;
+        let cols = cols as usize;
+        Self {
+            rows,
+            cols,
+            cells: vec![vec![' '; cols]; rows],
+            row: 0,
+            col: 0,
+            saved: None,
+        }
+    }
+
+    fn render(output: &str, rows: u16, cols: u16) -> String {
+        let mut screen = Self::new(rows, cols);
+        let bytes = output.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\r' => {
+                    screen.col = 0;
+                    i += 1;
+                }
+                b'\n' => {
+                    screen.line_feed();
+                    i += 1;
+                }
+                0x1b => {
+                    i += 1;
+                    if i >= bytes.len() {
+                        break;
+                    }
+                    match bytes[i] {
+                        b'[' => {
+                            i += 1;
+                            let start = i;
+                            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                                i += 1;
+                            }
+                            if i >= bytes.len() {
+                                break;
+                            }
+                            screen.apply_csi(&bytes[start..i], bytes[i]);
+                            i += 1;
+                        }
+                        b']' => {
+                            i += 1;
+                            while i < bytes.len() {
+                                if bytes[i] == 0x07 {
+                                    i += 1;
+                                    break;
+                                }
+                                if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\'
+                                {
+                                    i += 2;
+                                    break;
+                                }
+                                i += 1;
+                            }
+                        }
+                        b'7' => {
+                            screen.saved = Some((screen.row, screen.col));
+                            i += 1;
+                        }
+                        b'8' => {
+                            if let Some((row, col)) = screen.saved {
+                                screen.row = row.min(screen.rows.saturating_sub(1));
+                                screen.col = col.min(screen.cols.saturating_sub(1));
+                            }
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                b if b < b' ' => {
+                    i += 1;
+                }
+                _ => {
+                    let ch = output[i..].chars().next().unwrap();
+                    screen.put_char(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+
+        let mut lines: Vec<String> = screen
+            .cells
+            .into_iter()
+            .map(|row| row.into_iter().collect::<String>().trim_end().to_string())
+            .collect();
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
+    fn apply_csi(&mut self, params: &[u8], final_byte: u8) {
+        match final_byte {
+            b'A' => {
+                let n = parse_csi_n(params).max(1);
+                self.row = self.row.saturating_sub(n as usize);
+            }
+            b'B' => {
+                let n = parse_csi_n(params).max(1) as usize;
+                self.row = (self.row + n).min(self.rows.saturating_sub(1));
+            }
+            b'C' => {
+                let n = parse_csi_n(params).max(1) as usize;
+                self.col = (self.col + n).min(self.cols.saturating_sub(1));
+            }
+            b'D' => {
+                let n = parse_csi_n(params).max(1);
+                self.col = self.col.saturating_sub(n as usize);
+            }
+            b'H' => {
+                let (row, col) = parse_csi_pos(params);
+                self.row = row.min(self.rows.saturating_sub(1));
+                self.col = col.min(self.cols.saturating_sub(1));
+            }
+            b'J' => {
+                let mode = parse_csi_n(params);
+                if mode == 2 {
+                    for row in &mut self.cells {
+                        row.fill(' ');
+                    }
+                } else {
+                    self.clear_to_end_of_screen();
+                }
+            }
+            b'K' => self.clear_to_end_of_line(),
+            _ => {}
+        }
+    }
+
+    fn put_char(&mut self, ch: char) {
+        if self.rows == 0 || self.cols == 0 {
+            return;
+        }
+        if self.col >= self.cols {
+            self.col = 0;
+            self.line_feed();
+        }
+        self.cells[self.row][self.col] = ch;
+        self.col += 1;
+        if self.col >= self.cols {
+            self.col = 0;
+            self.line_feed();
+        }
+    }
+
+    fn line_feed(&mut self) {
+        if self.row + 1 >= self.rows {
+            self.cells.rotate_left(1);
+            self.cells[self.rows - 1].fill(' ');
+        } else {
+            self.row += 1;
+        }
+    }
+
+    fn clear_to_end_of_line(&mut self) {
+        if self.rows == 0 || self.cols == 0 {
+            return;
+        }
+        for col in self.col..self.cols {
+            self.cells[self.row][col] = ' ';
+        }
+    }
+
+    fn clear_to_end_of_screen(&mut self) {
+        self.clear_to_end_of_line();
+        for row in self.row + 1..self.rows {
+            self.cells[row].fill(' ');
+        }
+    }
+}
+
+fn parse_csi_n(params: &[u8]) -> u16 {
+    std::str::from_utf8(params)
+        .ok()
+        .and_then(|s| s.split(';').next())
+        .and_then(|s| s.trim_start_matches('?').parse().ok())
+        .unwrap_or(0)
+}
+
+fn parse_csi_pos(params: &[u8]) -> (usize, usize) {
+    let mut parts = std::str::from_utf8(params)
+        .ok()
+        .unwrap_or("")
+        .split(';')
+        .map(|s| s.trim_start_matches('?').parse::<usize>().unwrap_or(1));
+    let row = parts.next().unwrap_or(1).saturating_sub(1);
+    let col = parts.next().unwrap_or(1).saturating_sub(1);
+    (row, col)
+}
+
+fn assert_screen_contains_once(screen: &str, needle: &str) {
+    let count = screen.matches(needle).count();
+    assert_eq!(count, 1, "expected {needle:?} once in screen: {screen:?}");
 }
 
 impl Drop for PtyShell {
@@ -793,6 +1036,34 @@ fn history_ctrl_r_escape_cancels() {
 }
 
 #[test]
+fn history_ctrl_r_narrow_repaint_does_not_stack_rows() {
+    let sh = PtyShell::spawn_with_size(&[], &["abc1", "abc2", "abc3"], 24, 10);
+    sh.ctrl_r();
+    sh.wait_for("search:", 2000);
+    sh.type_str("ab");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.type_str("c");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.backspace();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.type_str("c");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.down();
+    sh.up();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let out = sh.read_timeout(600);
+    let screen = Screen::render(&out, 24, 10);
+    assert_screen_contains_once(&screen, "search:");
+    assert_screen_contains_once(&screen, "abc1");
+    assert_screen_contains_once(&screen, "abc2");
+    assert_screen_contains_once(&screen, "abc3");
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
 fn tab_completion_files() {
     let sh = PtyShell::spawn_with_opts(
         &[("alpha.txt", ""), ("bravo.txt", ""), ("charlie.txt", "")],
@@ -830,6 +1101,33 @@ fn tab_completion_shows_grid() {
 }
 
 #[test]
+fn tab_completion_narrow_repaint_does_not_stack_rows() {
+    let sh = PtyShell::spawn_with_size(
+        &[("aaa.txt", ""), ("aab.txt", ""), ("aac.txt", "")],
+        &[],
+        24,
+        12,
+    );
+    sh.type_str("echo a");
+    sh.tab();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    sh.type_str("a");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.down();
+    sh.up();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let out = sh.read_timeout(600);
+    let screen = Screen::render(&out, 24, 12);
+    assert_screen_contains_once(&screen, "aaa.txt");
+    assert_screen_contains_once(&screen, "aab.txt");
+    assert_screen_contains_once(&screen, "aac.txt");
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
 fn tab_completion_directory() {
     let sh = PtyShell::spawn_with_opts(&[("mydir/.keep", "")], &[]);
     sh.type_str("cd my");
@@ -842,6 +1140,108 @@ fn tab_completion_directory() {
     let out2 = sh.run_command("pwd");
     let text = PtyShell::strip_ansi(&out2);
     assert!(text.contains("mydir"), "expected to be in mydir: {text:?}");
+}
+
+#[test]
+fn file_picker_narrow_repaint_does_not_stack_rows() {
+    let sh = PtyShell::spawn_with_size(&[("abc1", ""), ("abc2", ""), ("abc3", "")], &[], 24, 8);
+    sh.ctrl_f();
+    sh.wait_for("find", 2000);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.type_str("ab");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.type_str("c");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.backspace();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.type_str("c");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.down();
+    sh.up();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let out = sh.read_timeout(800);
+    let screen = Screen::render(&out, 24, 8);
+    assert_screen_contains_once(&screen, "find:");
+    assert_screen_contains_once(&screen, "abc1");
+    assert_screen_contains_once(&screen, "abc2");
+    assert_screen_contains_once(&screen, "abc3");
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
+fn completion_resize_rerenders_grid() {
+    let sh = PtyShell::spawn_with_size(
+        &[("aaa.txt", ""), ("aab.txt", ""), ("aac.txt", "")],
+        &[],
+        24,
+        20,
+    );
+    sh.type_str("echo a");
+    sh.tab();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.read_timeout(300);
+
+    sh.resize(24, 12);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let out = sh.read_timeout(800);
+    let screen = Screen::render(&out, 24, 12);
+    assert_screen_contains_once(&screen, "aaa.txt");
+    assert_screen_contains_once(&screen, "aab.txt");
+    assert_screen_contains_once(&screen, "aac.txt");
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
+fn history_resize_rerenders_pager() {
+    let sh = PtyShell::spawn_with_size(&[], &["abc1", "abc2", "abc3"], 24, 20);
+    sh.ctrl_r();
+    sh.wait_for("search:", 2000);
+    sh.type_str("abc");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.read_timeout(300);
+
+    sh.resize(24, 10);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let out = sh.read_timeout(800);
+    let screen = Screen::render(&out, 24, 10);
+    assert_screen_contains_once(&screen, "search:");
+    assert_screen_contains_once(&screen, "abc1");
+    assert_screen_contains_once(&screen, "abc2");
+    assert_screen_contains_once(&screen, "abc3");
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
+fn file_picker_resize_rerenders_pager() {
+    let sh = PtyShell::spawn_with_size(&[("abc1", ""), ("abc2", ""), ("abc3", "")], &[], 24, 20);
+    sh.ctrl_f();
+    sh.wait_for("find", 2000);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.type_str("abc");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    sh.read_timeout(300);
+
+    sh.resize(24, 8);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let out = sh.read_timeout(800);
+    let screen = Screen::render(&out, 24, 8);
+    assert_screen_contains_once(&screen, "find:");
+    assert_screen_contains_once(&screen, "abc1");
+    assert_screen_contains_once(&screen, "abc2");
+    assert_screen_contains_once(&screen, "abc3");
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
 }
 
 #[test]

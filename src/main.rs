@@ -469,14 +469,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     let prompt_str = std::mem::take(&mut shell.prompt_buf);
     let prompt_display_len = shell.prompt.display_len(&prompt_str);
 
-    let info = render::render_line(
+    let info = render_prompt_region(
         &mut tw,
+        shell,
+        &line,
         &prompt_str,
         prompt_display_len,
-        &line,
-        shell.cols,
         render::RenderedRegion::default(),
-        &render::RenderOpts::default(),
     );
     let mut region = info;
     let _ = tw.flush_to_stdout();
@@ -518,21 +517,17 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                     let (rows, cols) = term::term_size();
                     shell.rows = rows;
                     shell.cols = cols;
+                    update_mode_layout_for_resize(&mut mode, shell);
                 }
-                // Re-render
-                if let Mode::Normal = &mode {
-                    let (p, pdl) = active_prompt(&prompt_str, prompt_display_len);
-                    let info = render::render_line(
-                        &mut tw,
-                        p,
-                        pdl,
-                        &line,
-                        shell.cols,
-                        region,
-                        &render::RenderOpts::default(),
-                    );
-                    region = info;
-                }
+                region = render_active_mode(
+                    &mut tw,
+                    &mode,
+                    shell,
+                    &line,
+                    &prompt_str,
+                    prompt_display_len,
+                    region,
+                );
                 let _ = tw.flush_to_stdout();
                 continue;
             }
@@ -683,69 +678,15 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             }
                         }
 
-                        match &mode {
-                            Mode::Normal => {
-                                let (p, pdl) = active_prompt(&prompt_str, prompt_display_len);
-
-                                // Command word coloring: green if valid, red if not
-                                let cmd_color = if !line.has_newlines() {
-                                    let first = line.text().split_whitespace().next().unwrap_or("");
-                                    if first.is_empty() {
-                                        None
-                                    } else if builtin::is_builtin(first)
-                                        || shell.aliases.get(first).is_some()
-                                        || first.contains('/')
-                                    {
-                                        Some(true)
-                                    } else {
-                                        Some(shell.path_cache.contains(first))
-                                    }
-                                } else {
-                                    None // multiline — no coloring
-                                };
-
-                                // Autosuggestion: gray ghost from history
-                                let text = line.text();
-                                let suggestion = if text.len() >= 3
-                                    && !line.has_newlines()
-                                    && line.cursor() == text.len()
-                                {
-                                    shell
-                                        .history
-                                        .prefix_search(text, 0)
-                                        .and_then(|entry| entry.strip_prefix(text))
-                                        .unwrap_or("")
-                                } else {
-                                    ""
-                                };
-
-                                let opts = render::RenderOpts {
-                                    cmd_color,
-                                    suggestion,
-                                };
-                                let info = render::render_line(
-                                    &mut tw, p, pdl, &line, shell.cols, region, &opts,
-                                );
-                                region = info;
-                            }
-                            Mode::Completion(state) => {
-                                let (p, pdl) = active_prompt(&prompt_str, prompt_display_len);
-                                let info = render::render_line(
-                                    &mut tw,
-                                    p,
-                                    pdl,
-                                    &line,
-                                    shell.cols,
-                                    region,
-                                    &render::RenderOpts::default(),
-                                );
-                                region = info;
-                                render::render_completions(&mut tw, state, info, true);
-                            }
-                            Mode::HistorySearch { .. }
-                            | Mode::FilePicker { .. }
-                            | Mode::DirPicker { .. } => {}
-                        }
+                        region = render_active_mode(
+                            &mut tw,
+                            &mode,
+                            shell,
+                            &line,
+                            &prompt_str,
+                            prompt_display_len,
+                            region,
+                        );
                         let _ = tw.flush_to_stdout();
                     }
 
@@ -995,6 +936,92 @@ fn read_line(shell: &mut Shell) -> ReadResult {
 
 fn active_prompt(prompt_str: &str, prompt_display_len: usize) -> (&str, usize) {
     (prompt_str, prompt_display_len)
+}
+
+fn render_prompt_region(
+    tw: &mut TermWriter,
+    shell: &mut Shell,
+    line: &LineBuffer,
+    prompt_str: &str,
+    prompt_display_len: usize,
+    region: render::RenderedRegion,
+) -> render::RenderedRegion {
+    let (p, pdl) = active_prompt(prompt_str, prompt_display_len);
+
+    let cmd_color = if !line.has_newlines() {
+        let first = line.text().split_whitespace().next().unwrap_or("");
+        if first.is_empty() {
+            None
+        } else if builtin::is_builtin(first)
+            || shell.aliases.get(first).is_some()
+            || first.contains('/')
+        {
+            Some(true)
+        } else {
+            Some(shell.path_cache.contains(first))
+        }
+    } else {
+        None
+    };
+
+    let text = line.text();
+    let suggestion = if text.len() >= 3 && !line.has_newlines() && line.cursor() == text.len() {
+        shell
+            .history
+            .prefix_search(text, 0)
+            .and_then(|entry| entry.strip_prefix(text))
+            .unwrap_or("")
+    } else {
+        ""
+    };
+
+    let opts = render::RenderOpts {
+        cmd_color,
+        suggestion,
+    };
+    render::render_line(tw, p, pdl, line, shell.cols, region, &opts)
+}
+
+fn render_active_mode(
+    tw: &mut TermWriter,
+    mode: &Mode,
+    shell: &mut Shell,
+    line: &LineBuffer,
+    prompt_str: &str,
+    prompt_display_len: usize,
+    region: render::RenderedRegion,
+) -> render::RenderedRegion {
+    match mode {
+        Mode::Normal => {
+            render_prompt_region(tw, shell, line, prompt_str, prompt_display_len, region)
+        }
+        Mode::Completion(state) => {
+            let (p, pdl) = active_prompt(prompt_str, prompt_display_len);
+            let info = render::render_line(
+                tw,
+                p,
+                pdl,
+                line,
+                shell.cols,
+                region,
+                &render::RenderOpts::default(),
+            );
+            render::render_completions(tw, state, info, true);
+            info
+        }
+        Mode::HistorySearch { .. } => render_history_mode(tw, mode, shell, region),
+        Mode::FilePicker { .. } => render_file_picker_mode(tw, mode, shell, region),
+        Mode::DirPicker { .. } => render_dir_picker_mode(tw, mode, shell),
+    }
+}
+
+fn update_mode_layout_for_resize(mode: &mut Mode, shell: &Shell) {
+    if let Mode::Completion(state) = mode {
+        let (cols, rows) = complete::compute_grid(&state.comp.entries, shell.cols);
+        state.cols = cols;
+        state.rows = rows;
+        state.scroll = state.scroll.min(rows.saturating_sub(1));
+    }
 }
 
 enum KeyAction {
