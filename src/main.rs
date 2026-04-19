@@ -252,11 +252,11 @@ fn main() {
                             true
                         } else {
                             let target = if rest.is_empty() {
-                                &shell.home.clone()
+                                shell.home.clone()
                             } else {
-                                rest
+                                unquote_arg(rest)
                             };
-                            shell.last_status = do_cd(target, &mut shell);
+                            shell.last_status = do_cd(&target, &mut shell);
                             true
                         }
                     }
@@ -1941,6 +1941,30 @@ fn apply_denv_changes(changes: &[denv::EnvChange], epsh: &mut epsh::eval::Shell)
             }
         }
     }
+}
+
+/// Strip shell quoting from a single argument: single-quoted, double-quoted, or backslash-escaped.
+fn unquote_arg(s: &str) -> String {
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        let inner = &s[1..s.len() - 1];
+        return inner.replace("'\\''", "'");
+    }
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        return s[1..s.len() - 1].to_string();
+    }
+    // Handle backslash escapes in unquoted strings
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                result.push(next);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Change directory and run all post-cd hooks (OLDPWD, epsh sync, dir stack, denv, prompt).
