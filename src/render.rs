@@ -6,27 +6,73 @@ use crate::term::TermWriter;
 /// Geometry for a rendered region, relative to the region's top row.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RenderedRegion {
+    pub anchored: bool,
     pub painted_rows: u16,
     pub cursor_row: u16,
     pub cursor_col: u16,
 }
 impl RenderedRegion {
     pub fn clear(self, tw: &mut TermWriter) {
-        tw.move_cursor_up(self.cursor_row);
-        tw.carriage_return();
+        if !self.anchored {
+            return;
+        }
+        tw.restore_cursor();
         tw.clear_to_end_of_screen();
+    }
+}
+
+fn reserve_rows_below(tw: &mut TermWriter, rows_below: u16) {
+    if rows_below == 0 {
+        return;
+    }
+    for _ in 0..rows_below {
+        tw.write_str("\n");
+    }
+    tw.move_cursor_up(rows_below);
+    tw.carriage_return();
+}
+
+fn begin_region_render(tw: &mut TermWriter, prev: RenderedRegion, region: RenderedRegion) {
+    tw.hide_cursor();
+    if prev.anchored {
+        prev.clear(tw);
+
+        let prev_rows_below = prev.painted_rows.saturating_sub(1);
+        let new_rows_below = region.painted_rows.saturating_sub(1);
+        if new_rows_below > prev_rows_below {
+            if prev_rows_below > 0 {
+                tw.move_cursor_down(prev_rows_below);
+            }
+            reserve_rows_below(tw, new_rows_below - prev_rows_below);
+            if prev_rows_below > 0 {
+                tw.move_cursor_up(prev_rows_below);
+                tw.carriage_return();
+            }
+        }
+    } else {
+        reserve_rows_below(tw, region.painted_rows.saturating_sub(1));
+    }
+    tw.save_cursor();
+}
+
+fn restore_region_cursor(tw: &mut TermWriter, region: RenderedRegion) {
+    tw.restore_cursor();
+    if region.cursor_row > 0 {
+        tw.move_cursor_down(region.cursor_row);
+    }
+    tw.carriage_return();
+    if region.cursor_col > 0 {
+        tw.move_cursor_right(region.cursor_col);
     }
 }
 
 struct PromptLayout {
     region: RenderedRegion,
-    rows_back: u16,
     needs_forced_wrap: bool,
 }
 
 struct PagerLayout {
     region: RenderedRegion,
-    rows_back: u16,
     needs_forced_wrap: bool,
     max_results: usize,
     max_width: usize,
@@ -73,11 +119,11 @@ fn layout_single_line_prompt(
 
     PromptLayout {
         region: RenderedRegion {
+            anchored: false,
             painted_rows: (total_rows + 1) as u16,
             cursor_row: cursor_row as u16,
             cursor_col: cursor_col as u16,
         },
-        rows_back: (total_rows - cursor_row) as u16,
         needs_forced_wrap: total_full > 0 && total_full.is_multiple_of(cols),
     }
 }
@@ -139,11 +185,11 @@ fn layout_multiline_prompt(
 
     PromptLayout {
         region: RenderedRegion {
+            anchored: false,
             painted_rows: (row + 1) as u16,
             cursor_row: cursor_row as u16,
             cursor_col: cursor_col as u16,
         },
-        rows_back: (row - cursor_row) as u16,
         needs_forced_wrap,
     }
 }
@@ -167,11 +213,11 @@ fn layout_pager(input: PagerInput) -> PagerLayout {
 
     PagerLayout {
         region: RenderedRegion {
+            anchored: false,
             painted_rows: (header_rows + displayed) as u16,
             cursor_row: cursor_row as u16,
             cursor_col: cursor_col as u16,
         },
-        rows_back: (header_rows + displayed - cursor_row) as u16,
         needs_forced_wrap: header_full > 0 && header_full.is_multiple_of(cols),
         max_results,
         max_width: input.term_cols as usize - 2,
@@ -225,15 +271,12 @@ pub fn render_line(
     prev: RenderedRegion,
     opts: &RenderOpts,
 ) -> RenderedRegion {
-    tw.hide_cursor();
-    prev.clear(tw);
-
     let text = line.text();
     let cols = term_cols as usize;
 
     // Multiline path: buffer contains explicit newlines
     if text.contains('\n') {
-        return render_line_multiline(tw, prompt, prompt_display_len, line, cols, opts);
+        return render_line_multiline(tw, prompt, prompt_display_len, line, cols, prev, opts);
     }
 
     let layout = layout_single_line_prompt(
@@ -242,6 +285,7 @@ pub fn render_line(
         crate::line::str_width(opts.suggestion),
         cols,
     );
+    begin_region_render(tw, prev, layout.region);
 
     tw.write_str(prompt);
 
@@ -269,17 +313,13 @@ pub fn render_line(
         tw.write_str(" \r");
     }
 
-    // Move cursor from end of text to correct position
-    if layout.rows_back > 0 {
-        tw.move_cursor_up(layout.rows_back);
-    }
-    tw.carriage_return();
-    if layout.region.cursor_col > 0 {
-        tw.move_cursor_right(layout.region.cursor_col);
-    }
+    restore_region_cursor(tw, layout.region);
 
     tw.show_cursor();
-    layout.region
+    RenderedRegion {
+        anchored: true,
+        ..layout.region
+    }
 }
 
 /// Render a multiline buffer (contains `\n`). First line gets the main prompt,
@@ -290,11 +330,13 @@ fn render_line_multiline(
     prompt_display_len: usize,
     line: &LineBuffer,
     cols: usize,
+    prev: RenderedRegion,
     opts: &RenderOpts,
 ) -> RenderedRegion {
     let text = line.text();
     let cont_prompt = "  ";
     let layout = layout_multiline_prompt(prompt_display_len, line, cols);
+    begin_region_render(tw, prev, layout.region);
 
     for (i, segment) in text.split('\n').enumerate() {
         if i == 0 {
@@ -325,17 +367,13 @@ fn render_line_multiline(
         tw.write_str(" \r");
     }
 
-    // Move cursor from end of text to correct position
-    if layout.rows_back > 0 {
-        tw.move_cursor_up(layout.rows_back);
-    }
-    tw.carriage_return();
-    if layout.region.cursor_col > 0 {
-        tw.move_cursor_right(layout.region.cursor_col);
-    }
+    restore_region_cursor(tw, layout.region);
 
     tw.show_cursor();
-    layout.region
+    RenderedRegion {
+        anchored: true,
+        ..layout.region
+    }
 }
 
 /// Render the completion grid below the current line.
@@ -355,29 +393,22 @@ pub fn render_completions(
 
     if initial {
         // Pre-create grid rows below the prompt. The \n's may scroll
-        // the terminal, so we do this before save_cursor.
-        let rows_below = info.painted_rows - 1 - info.cursor_row;
-        if rows_below > 0 {
-            tw.move_cursor_down(rows_below);
+        // the terminal, so do the scrolling from the prompt anchor.
+        tw.restore_cursor();
+        if info.painted_rows > 1 {
+            tw.move_cursor_down(info.painted_rows - 1);
         }
         for _ in 0..layout.visible_rows {
             tw.write_str("\n");
         }
-        // Return to cursor position — total relative movement was
-        // rows_below (down) + visible_rows (down via \n), so reverse it.
-        tw.move_cursor_up(rows_below + layout.visible_rows as u16);
-        tw.carriage_return();
-        if info.cursor_col > 0 {
-            tw.move_cursor_right(info.cursor_col);
-        }
+        restore_region_cursor(tw, info);
     }
 
-    // Save cursor, draw grid, restore — works for both initial and
-    // repaint because all scrolling is already done above.
-    tw.save_cursor();
-    tw.move_cursor_down(info.painted_rows - info.cursor_row);
-    draw_grid(tw, state, &layout);
     tw.restore_cursor();
+    tw.move_cursor_down(info.painted_rows);
+    tw.carriage_return();
+    draw_grid(tw, state, &layout);
+    restore_region_cursor(tw, info);
 
     tw.show_cursor();
 }
@@ -456,9 +487,6 @@ pub fn render_history_pager(
     query_cursor: usize,
     prev: RenderedRegion,
 ) -> RenderedRegion {
-    tw.hide_cursor();
-    prev.clear(tw);
-
     let prefix = "search: ";
     let layout = layout_pager(PagerInput {
         prefix_width: crate::line::str_width(prefix),
@@ -470,6 +498,7 @@ pub fn render_history_pager(
         term_rows,
         term_cols,
     });
+    begin_region_render(tw, prev, layout.region);
 
     tw.write_str("\x1b[1m"); // bold
     tw.write_str(prefix);
@@ -483,6 +512,7 @@ pub fn render_history_pager(
         tw.write_str("\n");
     }
 
+    let displayed = matches.len().min(layout.max_results);
     for (i, m) in matches.iter().take(layout.max_results).enumerate() {
         tw.carriage_return();
         tw.clear_to_end_of_line();
@@ -523,21 +553,22 @@ pub fn render_history_pager(
             tw.write_str("\x1b[0m");
         }
         tw.clear_to_end_of_line();
-        tw.write_str("\n");
+        if i + 1 < displayed {
+            tw.write_str("\n");
+        }
     }
 
     // Clear remaining lines
     tw.clear_to_end_of_screen();
 
     // Position cursor in search field
-    tw.move_cursor_up(layout.rows_back);
-    tw.carriage_return();
-    if layout.region.cursor_col > 0 {
-        tw.move_cursor_right(layout.region.cursor_col);
-    }
+    restore_region_cursor(tw, layout.region);
     tw.show_cursor();
 
-    layout.region
+    RenderedRegion {
+        anchored: true,
+        ..layout.region
+    }
 }
 
 /// Render the file picker pager (Ctrl+F).
@@ -557,9 +588,6 @@ pub fn render_file_picker(
     hidden: bool,
     prev: RenderedRegion,
 ) -> RenderedRegion {
-    tw.hide_cursor();
-    prev.clear(tw);
-
     let prefix = if hidden {
         "find (hidden): "
     } else if query_phase && query.is_empty() {
@@ -582,6 +610,7 @@ pub fn render_file_picker(
         term_rows,
         term_cols,
     });
+    begin_region_render(tw, prev, layout.region);
 
     // Header: "find: " or "find (hidden): "
     tw.write_str("\x1b[1m"); // bold
@@ -606,6 +635,7 @@ pub fn render_file_picker(
         tw.write_str("\n");
     }
 
+    let displayed = filtered.len().min(layout.max_results);
     let visible = filtered
         .iter()
         .skip(layout.scroll)
@@ -638,21 +668,22 @@ pub fn render_file_picker(
             tw.write_str("\x1b[0m");
         }
         tw.clear_to_end_of_line();
-        tw.write_str("\n");
+        if i + 1 < displayed {
+            tw.write_str("\n");
+        }
     }
 
     // Clear remaining lines
     tw.clear_to_end_of_screen();
 
     // Position cursor in the query field
-    tw.move_cursor_up(layout.rows_back);
-    tw.carriage_return();
-    if layout.region.cursor_col > 0 {
-        tw.move_cursor_right(layout.region.cursor_col);
-    }
+    restore_region_cursor(tw, layout.region);
     tw.show_cursor();
 
-    layout.region
+    RenderedRegion {
+        anchored: true,
+        ..layout.region
+    }
 }
 
 /// Render the directory picker pager.
@@ -665,9 +696,6 @@ pub fn render_dir_picker(
     term_cols: u16,
     prev: RenderedRegion,
 ) -> RenderedRegion {
-    tw.hide_cursor();
-    prev.clear(tw);
-
     let prefix = "dirs:";
     let layout = layout_pager(PagerInput {
         prefix_width: crate::line::str_width(prefix),
@@ -679,6 +707,7 @@ pub fn render_dir_picker(
         term_rows,
         term_cols,
     });
+    begin_region_render(tw, prev, layout.region);
 
     tw.write_str("\x1b[1mdirs:\x1b[0m");
     if layout.needs_forced_wrap {
@@ -688,6 +717,7 @@ pub fn render_dir_picker(
         tw.write_str("\n");
     }
 
+    let displayed = entries.len().min(layout.max_results);
     let visible = entries
         .iter()
         .skip(layout.scroll)
@@ -733,16 +763,19 @@ pub fn render_dir_picker(
             tw.write_str("\x1b[0m");
         }
         tw.clear_to_end_of_line();
-        tw.write_str("\n");
+        if i + 1 < displayed {
+            tw.write_str("\n");
+        }
     }
 
     tw.clear_to_end_of_screen();
-    tw.move_cursor_up(layout.rows_back);
-    tw.carriage_return();
-    tw.move_cursor_right(layout.region.cursor_col);
+    restore_region_cursor(tw, layout.region);
     tw.show_cursor();
 
-    layout.region
+    RenderedRegion {
+        anchored: true,
+        ..layout.region
+    }
 }
 
 #[cfg(test)]
@@ -1041,6 +1074,7 @@ mod tests {
             10,
             3,
             RenderedRegion {
+                anchored: true,
                 painted_rows: 2,
                 cursor_row: 1,
                 cursor_col: 0,
@@ -1049,8 +1083,8 @@ mod tests {
         let buf = tw.as_bytes();
         assert_eq!(info.cursor_row, 1);
         assert!(
-            buf.windows(4).any(|w| w == b"\x1b[1A"),
-            "expected rerender to move back to the top first"
+            buf.windows(2).any(|w| w == b"\x1b8"),
+            "expected rerender to restore the saved anchor first"
         );
     }
 

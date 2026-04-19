@@ -485,6 +485,7 @@ impl PtyShell {
     }
 }
 
+#[derive(Clone)]
 struct Screen {
     rows: usize,
     cols: usize,
@@ -510,16 +511,21 @@ impl Screen {
 
     fn render(output: &str, rows: u16, cols: u16) -> String {
         let mut screen = Self::new(rows, cols);
+        screen.apply_output(output);
+        screen.visible_text()
+    }
+
+    fn apply_output(&mut self, output: &str) {
         let bytes = output.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
                 b'\r' => {
-                    screen.col = 0;
+                    self.col = 0;
                     i += 1;
                 }
                 b'\n' => {
-                    screen.line_feed();
+                    self.line_feed();
                     i += 1;
                 }
                 0x1b => {
@@ -537,7 +543,7 @@ impl Screen {
                             if i >= bytes.len() {
                                 break;
                             }
-                            screen.apply_csi(&bytes[start..i], bytes[i]);
+                            self.apply_csi(&bytes[start..i], bytes[i]);
                             i += 1;
                         }
                         b']' => {
@@ -556,13 +562,13 @@ impl Screen {
                             }
                         }
                         b'7' => {
-                            screen.saved = Some((screen.row, screen.col));
+                            self.saved = Some((self.row, self.col));
                             i += 1;
                         }
                         b'8' => {
-                            if let Some((row, col)) = screen.saved {
-                                screen.row = row.min(screen.rows.saturating_sub(1));
-                                screen.col = col.min(screen.cols.saturating_sub(1));
+                            if let Some((row, col)) = self.saved {
+                                self.row = row.min(self.rows.saturating_sub(1));
+                                self.col = col.min(self.cols.saturating_sub(1));
                             }
                             i += 1;
                         }
@@ -574,14 +580,17 @@ impl Screen {
                 }
                 _ => {
                     let ch = output[i..].chars().next().unwrap();
-                    screen.put_char(ch);
+                    self.put_char(ch);
                     i += ch.len_utf8();
                 }
             }
         }
+    }
 
-        let mut lines: Vec<String> = screen
+    fn visible_text(&self) -> String {
+        let mut lines: Vec<String> = self
             .cells
+            .clone()
             .into_iter()
             .map(|row| row.into_iter().collect::<String>().trim_end().to_string())
             .collect();
@@ -669,6 +678,74 @@ impl Screen {
             self.cells[row].fill(' ');
         }
     }
+
+    fn snapshot(&self) -> ScreenSnapshot {
+        ScreenSnapshot {
+            visible: self.visible_text(),
+            cursor_row: self.row,
+            cursor_col: self.col,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScreenSnapshot {
+    visible: String,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TraceFrame {
+    label: &'static str,
+    raw: String,
+    snapshot: ScreenSnapshot,
+}
+
+#[derive(Clone, Copy)]
+enum TraceInput<'a> {
+    Bytes(&'a [u8]),
+    Text(&'a str),
+}
+
+#[derive(Clone, Copy)]
+struct TraceStep<'a> {
+    label: &'static str,
+    input: TraceInput<'a>,
+    settle_ms: u64,
+    read_ms: u64,
+}
+
+fn run_trace(sh: &PtyShell, rows: u16, cols: u16, steps: &[TraceStep<'_>]) -> Vec<TraceFrame> {
+    let mut screen = Screen::new(rows, cols);
+    let mut frames = Vec::with_capacity(steps.len());
+
+    for step in steps {
+        let raw = match step.input {
+            TraceInput::Bytes(bytes) => {
+                sh.send(bytes);
+                if step.settle_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(step.settle_ms));
+                }
+                sh.read_timeout(step.read_ms)
+            }
+            TraceInput::Text(text) => {
+                sh.type_str(text);
+                if step.settle_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(step.settle_ms));
+                }
+                sh.read_timeout(step.read_ms)
+            }
+        };
+        screen.apply_output(&raw);
+        frames.push(TraceFrame {
+            label: step.label,
+            raw,
+            snapshot: screen.snapshot(),
+        });
+    }
+
+    frames
 }
 
 fn parse_csi_n(params: &[u8]) -> u16 {
@@ -693,6 +770,15 @@ fn parse_csi_pos(params: &[u8]) -> (usize, usize) {
 fn assert_screen_contains_once(screen: &str, needle: &str) {
     let count = screen.matches(needle).count();
     assert_eq!(count, 1, "expected {needle:?} once in screen: {screen:?}");
+}
+
+fn assert_frame_contains_once(frame: &TraceFrame, needle: &str) {
+    let count = frame.snapshot.visible.matches(needle).count();
+    assert_eq!(
+        count, 1,
+        "expected {needle:?} once in frame {}: {:?}",
+        frame.label, frame.snapshot.visible
+    );
 }
 
 impl Drop for PtyShell {
@@ -999,6 +1085,37 @@ fn history_up_arrow() {
 }
 
 #[test]
+fn history_up_narrow_repaint_clears_wrapped_rows() {
+    let sh = PtyShell::spawn_with_size(
+        &[],
+        &["echo ok", "echo WRAPMARK12345678901234567890", "echo newer"],
+        24,
+        12,
+    );
+    sh.up();
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    sh.up();
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    sh.up();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    let out = sh.read_timeout(800);
+    let screen = Screen::render(&out, 24, 12);
+    assert!(
+        screen.contains("$ echo\nok"),
+        "expected final prompt to show wrapped `echo ok`: {screen:?}"
+    );
+    assert!(
+        !screen.contains("WRAPMARK"),
+        "wrapped history entry leaked into final screen: {screen:?}"
+    );
+    assert!(
+        !screen.contains("newer"),
+        "newer history entry leaked into final screen: {screen:?}"
+    );
+}
+
+#[test]
 fn history_ctrl_r_search() {
     let sh = PtyShell::spawn_with_opts(&[], &["echo alpha", "echo beta", "echo gamma"]);
     sh.ctrl_r();
@@ -1063,6 +1180,161 @@ fn history_ctrl_r_narrow_repaint_does_not_stack_rows() {
     assert_screen_contains_once(&screen, "abc1");
     assert_screen_contains_once(&screen, "abc2");
     assert_screen_contains_once(&screen, "abc3");
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
+fn history_ctrl_r_near_bottom_keeps_pager_stable() {
+    let history = &[
+        "hist01", "hist02", "hist03", "hist04", "hist05", "hist06", "hist07", "hist08", "hist09",
+        "hist10", "hist11", "hist12",
+    ];
+    let sh = PtyShell::spawn_with_size(&[], history, 24, 20);
+
+    let fill_cmd = (1..=14)
+        .map(|i| format!("echo fill{i:02}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    sh.run_command(&fill_cmd);
+
+    sh.ctrl_r();
+    let mut out = sh.wait_for("search:", 2000);
+    out.push_str(&sh.read_timeout(400));
+
+    let screen = Screen::render(&out, 24, 20);
+    assert_screen_contains_once(&screen, "search:");
+    assert!(
+        screen.contains("hist12"),
+        "expected recent history entry in pager: {screen:?}"
+    );
+    assert!(
+        screen.contains("hist11"),
+        "expected second recent history entry in pager: {screen:?}"
+    );
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
+fn history_ctrl_r_near_bottom_query_edits_do_not_stack_headers() {
+    let history = &[
+        "gh auth login",
+        "gh api repos/openai/openai/contents",
+        "gh api user",
+        "gh pr status",
+        "gh api rate_limit",
+        "gh api notifications",
+        "gh api orgs/openai/repos",
+        "gh api repos/openai/openai/pulls",
+        "gh api repos/openai/openai/issues",
+        "gh api repos/openai/openai/actions/runs",
+        "gh api repos/openai/openai/releases",
+        "gh api repos/openai/openai/branches",
+    ];
+    let sh = PtyShell::spawn_with_size(&[], history, 24, 20);
+
+    let fill_cmd = (1..=14)
+        .map(|i| format!("echo fill{i:02}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    sh.run_command(&fill_cmd);
+
+    let frames = run_trace(
+        &sh,
+        24,
+        20,
+        &[
+            TraceStep {
+                label: "open search",
+                input: TraceInput::Bytes(b"\x12"),
+                settle_ms: 0,
+                read_ms: 500,
+            },
+            TraceStep {
+                label: "type g",
+                input: TraceInput::Text("g"),
+                settle_ms: 100,
+                read_ms: 400,
+            },
+            TraceStep {
+                label: "type h",
+                input: TraceInput::Text("h"),
+                settle_ms: 100,
+                read_ms: 400,
+            },
+            TraceStep {
+                label: "type space",
+                input: TraceInput::Text(" "),
+                settle_ms: 100,
+                read_ms: 400,
+            },
+            TraceStep {
+                label: "type a",
+                input: TraceInput::Text("a"),
+                settle_ms: 100,
+                read_ms: 400,
+            },
+            TraceStep {
+                label: "type p",
+                input: TraceInput::Text("p"),
+                settle_ms: 100,
+                read_ms: 400,
+            },
+            TraceStep {
+                label: "type i",
+                input: TraceInput::Text("i"),
+                settle_ms: 150,
+                read_ms: 500,
+            },
+        ],
+    );
+
+    let expected_queries = [
+        "search:",
+        "search: g",
+        "search: gh",
+        "search: gh",
+        "search: gh a",
+        "search: gh ap",
+        "search: gh api",
+    ];
+    let expected_cursor_cols = [8, 9, 10, 11, 12, 13, 14];
+
+    for ((frame, expected_query), expected_col) in frames
+        .iter()
+        .zip(expected_queries.iter())
+        .zip(expected_cursor_cols.iter())
+    {
+        assert_frame_contains_once(frame, expected_query);
+        assert_eq!(
+            frame.snapshot.visible.matches("search:").count(),
+            1,
+            "stale intermediate headers leaked into frame {}: raw={:?} screen={:?}",
+            frame.label,
+            frame.raw,
+            frame.snapshot.visible
+        );
+        assert_eq!(
+            frame.snapshot.cursor_row, 0,
+            "search cursor moved off header row in frame {}: {:?}",
+            frame.label, frame.snapshot
+        );
+        assert_eq!(
+            frame.snapshot.cursor_col, *expected_col,
+            "unexpected search cursor col in frame {}: {:?}",
+            frame.label, frame.snapshot
+        );
+    }
+
+    let final_frame = frames.last().unwrap();
+    assert!(
+        final_frame.snapshot.visible.contains("gh api user"),
+        "expected filtered history entry in pager: {:?}",
+        final_frame.snapshot.visible
+    );
 
     sh.escape();
     sh.wait_for_prompt(2000);
