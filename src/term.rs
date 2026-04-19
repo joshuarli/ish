@@ -105,6 +105,14 @@ impl TermWriter {
         }
     }
 
+    pub fn clear_buffer(&mut self) {
+        self.buf.clear();
+    }
+
+    pub fn buffer_len(&self) -> usize {
+        self.buf.len()
+    }
+
     pub fn flush_to_stdout(&mut self) -> io::Result<()> {
         if !self.buf.is_empty() {
             let mut stdout = io::stdout().lock();

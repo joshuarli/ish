@@ -2,6 +2,7 @@ use crate::complete::CompletionState;
 use crate::history::{FuzzyMatch, History};
 use crate::line::LineBuffer;
 use crate::term::TermWriter;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Geometry for a rendered region, relative to the region's top row.
 #[derive(Clone, Copy, Debug, Default)]
@@ -32,14 +33,23 @@ fn reserve_rows_below(tw: &mut TermWriter, rows_below: u16) {
     tw.carriage_return();
 }
 
+fn clear_from_cursor(tw: &mut TermWriter, region: RenderedRegion) {
+    if region.cursor_row > 0 {
+        tw.move_cursor_up(region.cursor_row);
+    }
+    tw.carriage_return();
+    tw.clear_to_end_of_screen();
+}
+
 fn begin_region_render(tw: &mut TermWriter, prev: RenderedRegion, region: RenderedRegion) {
     tw.hide_cursor();
     if prev.anchored {
-        prev.clear(tw);
-
         let prev_rows_below = prev.painted_rows.saturating_sub(1);
         let new_rows_below = region.painted_rows.saturating_sub(1);
-        if new_rows_below > prev_rows_below {
+        if new_rows_below <= prev_rows_below {
+            clear_from_cursor(tw, prev);
+        } else {
+            prev.clear(tw);
             if prev_rows_below > 0 {
                 tw.move_cursor_down(prev_rows_below);
             }
@@ -55,24 +65,148 @@ fn begin_region_render(tw: &mut TermWriter, prev: RenderedRegion, region: Render
     tw.save_cursor();
 }
 
-fn restore_region_cursor(tw: &mut TermWriter, region: RenderedRegion) {
-    tw.restore_cursor();
-    if region.cursor_row > 0 {
-        tw.move_cursor_down(region.cursor_row);
+fn restore_cursor_from_end(tw: &mut TermWriter, rows_up: u16, cursor_col: u16) {
+    if rows_up > 0 {
+        tw.move_cursor_up(rows_up);
     }
     tw.carriage_return();
-    if region.cursor_col > 0 {
-        tw.move_cursor_right(region.cursor_col);
+    if cursor_col > 0 {
+        tw.move_cursor_right(cursor_col);
+    }
+}
+
+fn cursor_move_seq_len(n: u16) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut digits = 1;
+    let mut value = n;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    3 + digits
+}
+
+fn restore_cursor_smart(tw: &mut TermWriter, region: RenderedRegion, rows_up_from_end: u16) {
+    let anchor_cost = 2 + cursor_move_seq_len(region.cursor_row);
+    let end_cost = cursor_move_seq_len(rows_up_from_end);
+    if anchor_cost < end_cost {
+        tw.restore_cursor();
+        if region.cursor_row > 0 {
+            tw.move_cursor_down(region.cursor_row);
+        }
+        tw.carriage_return();
+        if region.cursor_col > 0 {
+            tw.move_cursor_right(region.cursor_col);
+        }
+    } else {
+        restore_cursor_from_end(tw, rows_up_from_end, region.cursor_col);
+    }
+}
+
+fn write_history_row(
+    tw: &mut TermWriter,
+    text: &str,
+    m: &FuzzyMatch,
+    max_width: usize,
+    is_selected: bool,
+) {
+    let mut col = 0;
+    let mut pi = 0;
+    let mut in_match = false;
+    for (ci, ch) in text.chars().enumerate() {
+        let w = crate::line::char_width(ch);
+        if col + w > max_width {
+            break;
+        }
+        col += w;
+        let is_match = pi < m.match_count as usize && m.match_positions[pi] == ci as u16;
+        if is_match {
+            pi += 1;
+        }
+        if !is_selected {
+            if is_match && !in_match {
+                tw.write_str("\x1b[1;33m"); // bold yellow
+                in_match = true;
+            } else if !is_match && in_match {
+                tw.write_str("\x1b[0m");
+                in_match = false;
+            }
+        }
+        let mut buf = [0u8; 4];
+        tw.write_str(ch.encode_utf8(&mut buf));
+    }
+    if in_match {
+        tw.write_str("\x1b[0m");
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HistoryHeaderKey {
+    query_hash: u64,
+    query_len: usize,
+    query_cursor: usize,
+    header_rows: u16,
+    needs_forced_wrap: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HistoryRowKey {
+    entry_idx: usize,
+    selected: bool,
+    match_positions: [u16; 32],
+    match_count: u8,
+}
+
+#[derive(Default)]
+pub struct HistoryPagerCache {
+    header: Option<HistoryHeaderKey>,
+    rows: Vec<HistoryRowKey>,
+}
+
+impl HistoryPagerCache {
+    pub fn clear(&mut self) {
+        self.header = None;
+        self.rows.clear();
+    }
+}
+
+fn hash_text(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn history_header_key(query: &str, query_cursor: usize, layout: &PagerLayout) -> HistoryHeaderKey {
+    HistoryHeaderKey {
+        query_hash: hash_text(query),
+        query_len: query.len(),
+        query_cursor,
+        header_rows: layout.header_rows,
+        needs_forced_wrap: layout.needs_forced_wrap,
+    }
+}
+
+fn history_row_key(m: &FuzzyMatch, selected: bool) -> HistoryRowKey {
+    HistoryRowKey {
+        entry_idx: m.entry_idx,
+        selected,
+        match_positions: m.match_positions,
+        match_count: m.match_count,
     }
 }
 
 struct PromptLayout {
     region: RenderedRegion,
+    rows_up_from_end: u16,
     needs_forced_wrap: bool,
 }
 
 struct PagerLayout {
     region: RenderedRegion,
+    rows_up_from_end: u16,
+    header_rows: u16,
     needs_forced_wrap: bool,
     max_results: usize,
     max_width: usize,
@@ -124,6 +258,7 @@ fn layout_single_line_prompt(
             cursor_row: cursor_row as u16,
             cursor_col: cursor_col as u16,
         },
+        rows_up_from_end: total_rows.saturating_sub(cursor_row) as u16,
         needs_forced_wrap: total_full > 0 && total_full.is_multiple_of(cols),
     }
 }
@@ -190,6 +325,7 @@ fn layout_multiline_prompt(
             cursor_row: cursor_row as u16,
             cursor_col: cursor_col as u16,
         },
+        rows_up_from_end: row.saturating_sub(cursor_row) as u16,
         needs_forced_wrap,
     }
 }
@@ -203,6 +339,7 @@ fn layout_pager(input: PagerInput) -> PagerLayout {
     let cursor_col = header_before_cursor % cols;
     let max_results = (input.term_rows as usize).saturating_sub(2).min(20);
     let displayed = input.total_entries.min(max_results);
+    let last_row = header_rows + displayed.saturating_sub(1);
     let scroll = if input.total_entries <= max_results || input.selected < max_results / 2 {
         0
     } else if input.selected + max_results / 2 >= input.total_entries {
@@ -218,6 +355,8 @@ fn layout_pager(input: PagerInput) -> PagerLayout {
             cursor_row: cursor_row as u16,
             cursor_col: cursor_col as u16,
         },
+        rows_up_from_end: last_row.saturating_sub(cursor_row) as u16,
+        header_rows: header_rows as u16,
         needs_forced_wrap: header_full > 0 && header_full.is_multiple_of(cols),
         max_results,
         max_width: input.term_cols as usize - 2,
@@ -313,7 +452,7 @@ pub fn render_line(
         tw.write_str(" \r");
     }
 
-    restore_region_cursor(tw, layout.region);
+    restore_cursor_from_end(tw, layout.rows_up_from_end, layout.region.cursor_col);
 
     tw.show_cursor();
     RenderedRegion {
@@ -367,7 +506,7 @@ fn render_line_multiline(
         tw.write_str(" \r");
     }
 
-    restore_region_cursor(tw, layout.region);
+    restore_cursor_from_end(tw, layout.rows_up_from_end, layout.region.cursor_col);
 
     tw.show_cursor();
     RenderedRegion {
@@ -392,23 +531,27 @@ pub fn render_completions(
     tw.hide_cursor();
 
     if initial {
-        // Pre-create grid rows below the prompt. The \n's may scroll
-        // the terminal, so do the scrolling from the prompt anchor.
-        tw.restore_cursor();
-        if info.painted_rows > 1 {
-            tw.move_cursor_down(info.painted_rows - 1);
+        let rows_below = info.painted_rows.saturating_sub(1 + info.cursor_row);
+        if rows_below > 0 {
+            tw.move_cursor_down(rows_below);
         }
         for _ in 0..layout.visible_rows {
             tw.write_str("\n");
         }
-        restore_region_cursor(tw, info);
+        restore_cursor_from_end(tw, rows_below + layout.visible_rows as u16, info.cursor_col);
     }
 
-    tw.restore_cursor();
-    tw.move_cursor_down(info.painted_rows);
+    let down_to_grid = info.painted_rows.saturating_sub(info.cursor_row);
+    if down_to_grid > 0 {
+        tw.move_cursor_down(down_to_grid);
+    }
     tw.carriage_return();
     draw_grid(tw, state, &layout);
-    restore_region_cursor(tw, info);
+    restore_cursor_from_end(
+        tw,
+        down_to_grid + layout.visible_rows.saturating_sub(1) as u16,
+        info.cursor_col,
+    );
 
     tw.show_cursor();
 }
@@ -487,6 +630,34 @@ pub fn render_history_pager(
     query_cursor: usize,
     prev: RenderedRegion,
 ) -> RenderedRegion {
+    let mut cache = HistoryPagerCache::default();
+    render_history_pager_cached(
+        tw,
+        query,
+        matches,
+        history,
+        selected,
+        term_rows,
+        term_cols,
+        query_cursor,
+        prev,
+        &mut cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_history_pager_cached(
+    tw: &mut TermWriter,
+    query: &str,
+    matches: &[FuzzyMatch],
+    history: &History,
+    selected: usize,
+    term_rows: u16,
+    term_cols: u16,
+    query_cursor: usize,
+    prev: RenderedRegion,
+    cache: &mut HistoryPagerCache,
+) -> RenderedRegion {
     let prefix = "search: ";
     let layout = layout_pager(PagerInput {
         prefix_width: crate::line::str_width(prefix),
@@ -498,6 +669,46 @@ pub fn render_history_pager(
         term_rows,
         term_cols,
     });
+    let displayed = matches.len().min(layout.max_results);
+    let header_key = history_header_key(query, query_cursor, &layout);
+    let can_diff = prev.anchored
+        && prev.painted_rows == layout.region.painted_rows
+        && cache.header == Some(header_key)
+        && cache.rows.len() == displayed;
+
+    if can_diff {
+        tw.hide_cursor();
+        for (i, m) in matches.iter().take(layout.max_results).enumerate() {
+            let row_key = history_row_key(m, i == selected);
+            if cache.rows[i] == row_key {
+                continue;
+            }
+            tw.restore_cursor();
+            let row = layout.header_rows + i as u16;
+            if row > 0 {
+                tw.move_cursor_down(row);
+            }
+            tw.carriage_return();
+            tw.clear_to_end_of_line();
+            if row_key.selected {
+                tw.write_str("\x1b[7m"); // reverse video
+            }
+            let text = history.get(m.entry_idx);
+            write_history_row(tw, text, m, layout.max_width, row_key.selected);
+            if row_key.selected {
+                tw.write_str("\x1b[0m");
+            }
+            tw.clear_to_end_of_line();
+            cache.rows[i] = row_key;
+        }
+        restore_cursor_from_end(tw, layout.rows_up_from_end, layout.region.cursor_col);
+        tw.show_cursor();
+        return RenderedRegion {
+            anchored: true,
+            ..layout.region
+        };
+    }
+
     begin_region_render(tw, prev, layout.region);
 
     tw.write_str("\x1b[1m"); // bold
@@ -512,58 +723,35 @@ pub fn render_history_pager(
         tw.write_str("\n");
     }
 
-    let displayed = matches.len().min(layout.max_results);
+    cache.rows.clear();
     for (i, m) in matches.iter().take(layout.max_results).enumerate() {
         tw.carriage_return();
         tw.clear_to_end_of_line();
 
-        let is_selected = i == selected;
-        if is_selected {
+        let row_key = history_row_key(m, i == selected);
+        if row_key.selected {
             tw.write_str("\x1b[7m"); // reverse video
         }
 
         let text = history.get(m.entry_idx);
-
-        // Write entry with matching chars highlighted.
-        // Use a sorted position index instead of HashSet to avoid allocation.
-        let mut col = 0;
-        let mut pi = 0; // index into match_positions
-        for (ci, ch) in text.chars().enumerate() {
-            let w = crate::line::char_width(ch);
-            if col + w > layout.max_width {
-                break;
-            }
-            col += w;
-            let is_match = pi < m.match_count as usize && m.match_positions[pi] == ci as u16;
-            if is_match {
-                pi += 1;
-            }
-            if is_match && !is_selected {
-                tw.write_str("\x1b[1;33m"); // bold yellow
-                let mut buf = [0u8; 4];
-                tw.write_str(ch.encode_utf8(&mut buf));
-                tw.write_str("\x1b[0m");
-            } else {
-                let mut buf = [0u8; 4];
-                tw.write_str(ch.encode_utf8(&mut buf));
-            }
-        }
-
-        if is_selected {
+        write_history_row(tw, text, m, layout.max_width, row_key.selected);
+        if row_key.selected {
             tw.write_str("\x1b[0m");
         }
         tw.clear_to_end_of_line();
         if i + 1 < displayed {
             tw.write_str("\n");
         }
+        cache.rows.push(row_key);
     }
 
     // Clear remaining lines
     tw.clear_to_end_of_screen();
 
     // Position cursor in search field
-    restore_region_cursor(tw, layout.region);
+    restore_cursor_from_end(tw, layout.rows_up_from_end, layout.region.cursor_col);
     tw.show_cursor();
+    cache.header = Some(header_key);
 
     RenderedRegion {
         anchored: true,
@@ -677,7 +865,7 @@ pub fn render_file_picker(
     tw.clear_to_end_of_screen();
 
     // Position cursor in the query field
-    restore_region_cursor(tw, layout.region);
+    restore_cursor_smart(tw, layout.region, layout.rows_up_from_end);
     tw.show_cursor();
 
     RenderedRegion {
@@ -769,7 +957,7 @@ pub fn render_dir_picker(
     }
 
     tw.clear_to_end_of_screen();
-    restore_region_cursor(tw, layout.region);
+    restore_cursor_smart(tw, layout.region, layout.rows_up_from_end);
     tw.show_cursor();
 
     RenderedRegion {
@@ -1083,9 +1271,58 @@ mod tests {
         let buf = tw.as_bytes();
         assert_eq!(info.cursor_row, 1);
         assert!(
-            buf.windows(2).any(|w| w == b"\x1b8"),
-            "expected rerender to restore the saved anchor first"
+            buf.windows(8).any(|w| w == b"\x1b[1A\r\x1b[J"),
+            "expected rerender to move to the top row and clear from there"
         );
+    }
+
+    #[test]
+    fn smart_restore_prefers_anchor_when_query_stays_on_first_row() {
+        let mut tw = TermWriter::new();
+        restore_cursor_smart(
+            &mut tw,
+            RenderedRegion {
+                anchored: true,
+                painted_rows: 6,
+                cursor_row: 0,
+                cursor_col: 4,
+            },
+            5,
+        );
+        assert!(tw.as_bytes().starts_with(b"\x1b8\r\x1b[4C"));
+    }
+
+    #[test]
+    fn smart_restore_prefers_end_when_cursor_is_deeper_in_region() {
+        let mut tw = TermWriter::new();
+        restore_cursor_smart(
+            &mut tw,
+            RenderedRegion {
+                anchored: true,
+                painted_rows: 6,
+                cursor_row: 3,
+                cursor_col: 2,
+            },
+            2,
+        );
+        assert!(tw.as_bytes().starts_with(b"\x1b[2A\r\x1b[2C"));
+    }
+
+    #[test]
+    fn history_row_groups_contiguous_match_highlights() {
+        let mut tw = TermWriter::new();
+        let mut positions = [0u16; 32];
+        positions[..5].copy_from_slice(&[0, 1, 3, 4, 5]);
+        let m = FuzzyMatch {
+            entry_idx: 0,
+            match_positions: positions,
+            match_count: 5,
+            score: 0,
+        };
+        write_history_row(&mut tw, "gh api", &m, 80, false);
+        let buf = tw.as_bytes();
+        let opens = buf.windows(7).filter(|w| *w == b"\x1b[1;33m").count();
+        assert_eq!(opens, 2);
     }
 
     #[test]

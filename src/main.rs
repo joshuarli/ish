@@ -478,6 +478,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
         render::RenderedRegion::default(),
     );
     let mut region = info;
+    let mut history_cache = render::HistoryPagerCache::default();
     let _ = tw.flush_to_stdout();
 
     loop {
@@ -527,6 +528,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                     &prompt_str,
                     prompt_display_len,
                     region,
+                    &mut history_cache,
                 );
                 let _ = tw.flush_to_stdout();
                 continue;
@@ -599,11 +601,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         selected: 0,
                                         saved_line: saved_line.clone(),
                                     };
+                                    history_cache.clear();
                                     region = render_history_mode(
                                         &mut tw,
                                         &mode,
                                         shell,
                                         render::RenderedRegion::default(),
+                                        &mut history_cache,
                                     );
                                     let _ = tw.flush_to_stdout();
                                     continue;
@@ -687,6 +691,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             &prompt_str,
                             prompt_display_len,
                             region,
+                            &mut history_cache,
                         );
                         let _ = tw.flush_to_stdout();
                     }
@@ -777,12 +782,19 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         saved_line,
                     } => match handle_history_search_key(key, query, matches, selected, shell) {
                         HistAction::Continue => {
-                            region = render_history_mode(&mut tw, &mode, shell, region);
+                            region = render_history_mode(
+                                &mut tw,
+                                &mode,
+                                shell,
+                                region,
+                                &mut history_cache,
+                            );
                             let _ = tw.flush_to_stdout();
                         }
                         HistAction::Accept(text) => {
                             line.set(&text);
                             shell.match_buf = std::mem::take(matches);
+                            history_cache.clear();
                             mode = Mode::Normal;
                             region.clear(&mut tw);
                             let info = render::render_line(
@@ -800,6 +812,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         HistAction::Cancel => {
                             line.set(saved_line);
                             shell.match_buf = std::mem::take(matches);
+                            history_cache.clear();
                             mode = Mode::Normal;
                             region.clear(&mut tw);
                             let info = render::render_line(
@@ -983,6 +996,7 @@ fn render_prompt_region(
     render::render_line(tw, p, pdl, line, shell.cols, region, &opts)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_active_mode(
     tw: &mut TermWriter,
     mode: &Mode,
@@ -991,6 +1005,7 @@ fn render_active_mode(
     prompt_str: &str,
     prompt_display_len: usize,
     region: render::RenderedRegion,
+    history_cache: &mut render::HistoryPagerCache,
 ) -> render::RenderedRegion {
     match mode {
         Mode::Normal => {
@@ -1010,7 +1025,7 @@ fn render_active_mode(
             render::render_completions(tw, state, info, true);
             info
         }
-        Mode::HistorySearch { .. } => render_history_mode(tw, mode, shell, region),
+        Mode::HistorySearch { .. } => render_history_mode(tw, mode, shell, region, history_cache),
         Mode::FilePicker { .. } => render_file_picker_mode(tw, mode, shell, region),
         Mode::DirPicker { .. } => render_dir_picker_mode(tw, mode, shell, region),
     }
@@ -1739,6 +1754,7 @@ fn render_history_mode(
     mode: &Mode,
     shell: &Shell,
     prev: render::RenderedRegion,
+    cache: &mut render::HistoryPagerCache,
 ) -> render::RenderedRegion {
     if let Mode::HistorySearch {
         query,
@@ -1747,7 +1763,7 @@ fn render_history_mode(
         ..
     } = mode
     {
-        render::render_history_pager(
+        render::render_history_pager_cached(
             tw,
             query.text(),
             matches,
@@ -1757,6 +1773,7 @@ fn render_history_mode(
             shell.cols,
             query.display_cursor_pos(),
             prev,
+            cache,
         )
     } else {
         render::RenderedRegion::default()

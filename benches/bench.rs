@@ -16,6 +16,8 @@ use ish::line::LineBuffer;
 use ish::ls;
 use ish::path as exec;
 use ish::prompt;
+use ish::render;
+use ish::term::TermWriter;
 
 // ---------------------------------------------------------------------------
 // Counting allocator — tracks allocations and live bytes
@@ -111,6 +113,16 @@ fn measure_allocs<F: FnOnce()>(f: F) -> AllocStats {
     AllocStats {
         count: alloc_count(),
         bytes: alloc_bytes(),
+    }
+}
+
+fn format_bytes(n: usize) -> String {
+    if n >= 1_048_576 {
+        format!("{:.1} MiB", n as f64 / 1_048_576.0)
+    } else if n >= 1024 {
+        format!("{:.1} KiB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
     }
 }
 
@@ -471,6 +483,298 @@ fn bench_prompt_render(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Interactive render hot paths (VT repaint only)
+// ---------------------------------------------------------------------------
+
+fn make_line(s: &str) -> LineBuffer {
+    let mut lb = LineBuffer::new();
+    for ch in s.chars() {
+        lb.insert_char(ch);
+    }
+    lb
+}
+
+fn sample_history() -> History {
+    History::from_entries(vec![
+        "gh auth login".to_string(),
+        "gh api repos/openai/openai/contents".to_string(),
+        "gh api user".to_string(),
+        "gh pr status".to_string(),
+        "gh api rate_limit".to_string(),
+        "gh api notifications".to_string(),
+        "gh api orgs/openai/repos".to_string(),
+        "gh api repos/openai/openai/pulls".to_string(),
+        "gh api repos/openai/openai/issues".to_string(),
+        "gh api repos/openai/openai/actions/runs".to_string(),
+        "gh api repos/openai/openai/releases".to_string(),
+        "gh api repos/openai/openai/branches".to_string(),
+    ])
+}
+
+fn sample_completion_state(cols: u16) -> complete::CompletionState {
+    let mut comp = complete::Completions::new();
+    for entry in [
+        "aaa.txt", "aab.txt", "aac.txt", "aad.txt", "aae.txt", "aaf.txt", "aag.txt", "aah.txt",
+    ] {
+        comp.push(entry, false, false, false);
+    }
+    let (grid_cols, grid_rows) = complete::compute_grid(&comp.entries, cols);
+    complete::CompletionState {
+        comp,
+        selected: 0,
+        cols: grid_cols,
+        rows: grid_rows,
+        scroll: 0,
+        dir_prefix: String::new(),
+        in_quote: false,
+    }
+}
+
+fn sample_file_picker_entries() -> Vec<(usize, String)> {
+    vec![
+        (0, "abc1".to_string()),
+        (0, "abc2".to_string()),
+        (0, "abc3".to_string()),
+        (0, "abd1".to_string()),
+        (0, "abd2".to_string()),
+    ]
+}
+
+fn bench_interactive_render(c: &mut Criterion) {
+    let mut group = c.benchmark_group("interactive_render");
+
+    group.bench_function("prompt_initial_single_line", |b| {
+        let line = make_line("gh api repos/openai/openai/issues");
+        let opts = render::RenderOpts::default();
+        let mut tw = TermWriter::new();
+        b.iter(|| {
+            tw.clear_buffer();
+            let info = render::render_line(
+                &mut tw,
+                "$ ",
+                2,
+                &line,
+                80,
+                render::RenderedRegion::default(),
+                &opts,
+            );
+            black_box(info);
+            black_box(&tw);
+        });
+    });
+
+    group.bench_function("prompt_rerender_same_rows", |b| {
+        let line_a = make_line("gh api");
+        let line_b = make_line("gh api?");
+        let opts = render::RenderOpts::default();
+        let mut tw = TermWriter::new();
+        let mut prev = render::render_line(
+            &mut tw,
+            "$ ",
+            2,
+            &line_a,
+            80,
+            render::RenderedRegion::default(),
+            &opts,
+        );
+        tw.clear_buffer();
+        let mut toggle = false;
+        b.iter(|| {
+            let line = if toggle { &line_a } else { &line_b };
+            toggle = !toggle;
+            tw.clear_buffer();
+            prev = render::render_line(&mut tw, "$ ", 2, line, 80, prev, &opts);
+            black_box(prev);
+            black_box(&tw);
+        });
+    });
+
+    group.bench_function("prompt_rerender_grow_rows", |b| {
+        let line_short = make_line("gh api");
+        let line_long = make_line("gh api repos/openai/openai/issues/123/comments");
+        let opts = render::RenderOpts::default();
+        let mut tw = TermWriter::new();
+        let mut prev = render::render_line(
+            &mut tw,
+            "$ ",
+            2,
+            &line_short,
+            20,
+            render::RenderedRegion::default(),
+            &opts,
+        );
+        tw.clear_buffer();
+        let mut toggle = false;
+        b.iter(|| {
+            let line = if toggle { &line_short } else { &line_long };
+            toggle = !toggle;
+            tw.clear_buffer();
+            prev = render::render_line(&mut tw, "$ ", 2, line, 20, prev, &opts);
+            black_box(prev);
+            black_box(&tw);
+        });
+    });
+
+    group.bench_function("history_pager_query_edit", |b| {
+        let history = sample_history();
+        let query_a = "gh ap";
+        let query_b = "gh api";
+        let mut tw = TermWriter::new();
+        let mut cache = render::HistoryPagerCache::default();
+        let mut prev = render::render_history_pager_cached(
+            &mut tw,
+            query_a,
+            &history.fuzzy_search(query_a),
+            &history,
+            0,
+            24,
+            20,
+            query_a.len(),
+            render::RenderedRegion::default(),
+            &mut cache,
+        );
+        tw.clear_buffer();
+        let mut toggle = false;
+        b.iter(|| {
+            let query = if toggle { query_a } else { query_b };
+            toggle = !toggle;
+            let matches = history.fuzzy_search(query);
+            tw.clear_buffer();
+            prev = render::render_history_pager_cached(
+                &mut tw,
+                query,
+                &matches,
+                &history,
+                0,
+                24,
+                20,
+                query.len(),
+                prev,
+                &mut cache,
+            );
+            black_box(prev);
+            black_box(&tw);
+        });
+    });
+
+    group.bench_function("history_pager_selection_move", |b| {
+        let history = sample_history();
+        let query = "gh api";
+        let matches = history.fuzzy_search(query);
+        let mut tw = TermWriter::new();
+        let mut cache = render::HistoryPagerCache::default();
+        let mut selected = 0usize;
+        let mut prev = render::render_history_pager_cached(
+            &mut tw,
+            query,
+            &matches,
+            &history,
+            selected,
+            24,
+            20,
+            query.len(),
+            render::RenderedRegion::default(),
+            &mut cache,
+        );
+        tw.clear_buffer();
+        b.iter(|| {
+            selected = if selected == 0 { 1 } else { 0 };
+            tw.clear_buffer();
+            prev = render::render_history_pager_cached(
+                &mut tw,
+                query,
+                &matches,
+                &history,
+                selected,
+                24,
+                20,
+                query.len(),
+                prev,
+                &mut cache,
+            );
+            black_box(prev);
+            black_box(selected);
+            black_box(&tw);
+        });
+    });
+
+    group.bench_function("file_picker_query_edit", |b| {
+        let all_entries = sample_file_picker_entries();
+        let filtered_a = vec![0usize, 1, 2, 3, 4];
+        let filtered_b = vec![0usize, 1, 2];
+        let mut tw = TermWriter::new();
+        let mut prev = render::render_file_picker(
+            &mut tw,
+            "ab",
+            &all_entries,
+            &filtered_a,
+            0,
+            24,
+            20,
+            2,
+            false,
+            false,
+            render::RenderedRegion::default(),
+        );
+        tw.clear_buffer();
+        let mut toggle = false;
+        b.iter(|| {
+            let (query, filtered, cursor) = if toggle {
+                ("ab", &filtered_a, 2)
+            } else {
+                ("abc", &filtered_b, 3)
+            };
+            toggle = !toggle;
+            tw.clear_buffer();
+            prev = render::render_file_picker(
+                &mut tw,
+                query,
+                &all_entries,
+                filtered,
+                0,
+                24,
+                20,
+                cursor,
+                false,
+                false,
+                prev,
+            );
+            black_box(prev);
+            black_box(&tw);
+        });
+    });
+
+    group.bench_function("completion_repaint_navigation", |b| {
+        let line = make_line("echo aa");
+        let opts = render::RenderOpts::default();
+        let mut state = sample_completion_state(20);
+        let mut tw = TermWriter::new();
+        let mut info = render::render_line(
+            &mut tw,
+            "$ ",
+            2,
+            &line,
+            20,
+            render::RenderedRegion::default(),
+            &opts,
+        );
+        render::render_completions(&mut tw, &state, info, true);
+        tw.clear_buffer();
+        b.iter(|| {
+            state.selected = (state.selected + 1) % state.comp.entries.len();
+            tw.clear_buffer();
+            info = render::render_line(&mut tw, "$ ", 2, &line, 20, info, &opts);
+            render::render_completions(&mut tw, &state, info, false);
+            black_box(info);
+            black_box(state.selected);
+            black_box(&tw);
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // History add (dedup on every command)
 // ---------------------------------------------------------------------------
 
@@ -795,6 +1099,179 @@ fn bench_alloc_audit(c: &mut Criterion) {
             eprintln!("  [alloc] finder_filter_warm:         {stats}");
         }
 
+        {
+            let line = make_line("gh api");
+            let opts = render::RenderOpts::default();
+            let mut tw = TermWriter::new();
+            let mut prev = render::render_line(
+                &mut tw,
+                "$ ",
+                2,
+                &line,
+                80,
+                render::RenderedRegion::default(),
+                &opts,
+            );
+            tw.clear_buffer();
+            let stats = measure_allocs(|| {
+                prev = render::render_line(&mut tw, "$ ", 2, &line, 80, prev, &opts);
+                black_box(prev);
+                black_box(&tw);
+            });
+            eprintln!("  [alloc] render_line_warm:          {stats}");
+            tw.clear_buffer();
+            let _ = render::render_line(&mut tw, "$ ", 2, &line, 80, prev, &opts);
+            eprintln!(
+                "  [bytes] render_line_warm:          {}",
+                format_bytes(tw.buffer_len())
+            );
+        }
+
+        {
+            let history = sample_history();
+            let query = "gh api";
+            let matches = history.fuzzy_search(query);
+            let mut tw = TermWriter::new();
+            let mut cache = render::HistoryPagerCache::default();
+            let mut prev = render::render_history_pager_cached(
+                &mut tw,
+                query,
+                &matches,
+                &history,
+                0,
+                24,
+                20,
+                query.len(),
+                render::RenderedRegion::default(),
+                &mut cache,
+            );
+            tw.clear_buffer();
+            let stats = measure_allocs(|| {
+                prev = render::render_history_pager_cached(
+                    &mut tw,
+                    query,
+                    &matches,
+                    &history,
+                    0,
+                    24,
+                    20,
+                    query.len(),
+                    prev,
+                    &mut cache,
+                );
+                black_box(prev);
+                black_box(&tw);
+            });
+            eprintln!("  [alloc] render_history_warm:       {stats}");
+            tw.clear_buffer();
+            let _ = render::render_history_pager_cached(
+                &mut tw,
+                query,
+                &matches,
+                &history,
+                0,
+                24,
+                20,
+                query.len(),
+                prev,
+                &mut cache,
+            );
+            eprintln!(
+                "  [bytes] render_history_warm:       {}",
+                format_bytes(tw.buffer_len())
+            );
+        }
+
+        {
+            let all_entries = sample_file_picker_entries();
+            let filtered = vec![0usize, 1, 2];
+            let mut tw = TermWriter::new();
+            let mut prev = render::render_file_picker(
+                &mut tw,
+                "abc",
+                &all_entries,
+                &filtered,
+                0,
+                24,
+                20,
+                3,
+                false,
+                false,
+                render::RenderedRegion::default(),
+            );
+            tw.clear_buffer();
+            let stats = measure_allocs(|| {
+                prev = render::render_file_picker(
+                    &mut tw,
+                    "abc",
+                    &all_entries,
+                    &filtered,
+                    0,
+                    24,
+                    20,
+                    3,
+                    false,
+                    false,
+                    prev,
+                );
+                black_box(prev);
+                black_box(&tw);
+            });
+            eprintln!("  [alloc] render_file_picker_warm:   {stats}");
+            tw.clear_buffer();
+            let _ = render::render_file_picker(
+                &mut tw,
+                "abc",
+                &all_entries,
+                &filtered,
+                0,
+                24,
+                20,
+                3,
+                false,
+                false,
+                prev,
+            );
+            eprintln!(
+                "  [bytes] render_file_picker_warm:   {}",
+                format_bytes(tw.buffer_len())
+            );
+        }
+
+        {
+            let line = make_line("echo aa");
+            let opts = render::RenderOpts::default();
+            let mut state = sample_completion_state(20);
+            let mut tw = TermWriter::new();
+            let mut info = render::render_line(
+                &mut tw,
+                "$ ",
+                2,
+                &line,
+                20,
+                render::RenderedRegion::default(),
+                &opts,
+            );
+            render::render_completions(&mut tw, &state, info, true);
+            tw.clear_buffer();
+            let stats = measure_allocs(|| {
+                state.selected = 1;
+                info = render::render_line(&mut tw, "$ ", 2, &line, 20, info, &opts);
+                render::render_completions(&mut tw, &state, info, false);
+                black_box(info);
+                black_box(state.selected);
+                black_box(&tw);
+            });
+            eprintln!("  [alloc] render_completion_warm:    {stats}");
+            tw.clear_buffer();
+            info = render::render_line(&mut tw, "$ ", 2, &line, 20, info, &opts);
+            render::render_completions(&mut tw, &state, info, false);
+            eprintln!(
+                "  [bytes] render_completion_warm:    {}",
+                format_bytes(tw.buffer_len())
+            );
+        }
+
         eprintln!();
     }
 
@@ -1056,6 +1533,7 @@ criterion_group!(
         bench_completion,
         bench_prompt,
         bench_prompt_render,
+        bench_interactive_render,
         bench_history_add,
         bench_ls,
         bench_path_lookup,
