@@ -255,6 +255,23 @@ impl LineBuffer {
         }
     }
 
+    /// Kill word forward (Ctrl+Delete / Alt+D).
+    pub fn kill_word_forward(&mut self) {
+        let start = self.cursor;
+        let len = self.buf.len();
+        while self.cursor < len && self.char_at_cursor().is_some_and(|c| c.is_whitespace()) {
+            self.cursor = self.next_char_boundary();
+        }
+        while self.cursor < len && self.char_at_cursor().is_some_and(|c| !c.is_whitespace()) {
+            self.cursor = self.next_char_boundary();
+        }
+        if start < self.cursor {
+            self.kill_ring = self.buf[start..self.cursor].to_string();
+            self.buf.drain(start..self.cursor);
+            self.cursor = start;
+        }
+    }
+
     /// Yank (paste) from kill ring (Ctrl+Y).
     pub fn yank(&mut self) {
         if !self.kill_ring.is_empty() {
@@ -533,6 +550,16 @@ mod tests {
         lb.set("hello world");
         lb.kill_word_back();
         assert_eq!(lb.text(), "hello ");
+    }
+
+    #[test]
+    fn kill_word_forward() {
+        let mut lb = LineBuffer::new();
+        lb.set("hello world");
+        lb.move_home();
+        lb.kill_word_forward();
+        assert_eq!(lb.text(), " world");
+        assert_eq!(lb.cursor(), 0);
     }
 
     #[test]

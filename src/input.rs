@@ -330,6 +330,16 @@ impl InputReader {
                 }
                 _ => None,
             },
+            b'^' => match params.first().copied().unwrap_or(0) {
+                3 => Some(KeyEvent::with_mods(
+                    Key::Delete,
+                    Modifiers {
+                        ctrl: true,
+                        ..Modifiers::NONE
+                    },
+                )),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -394,5 +404,23 @@ mod tests {
         assert!(!m.ctrl);
         assert!(m.alt);
         assert!(!m.shift);
+    }
+
+    #[test]
+    fn csi_delete_with_ctrl_modifier_maps_to_ctrl_delete() {
+        let mut reader = InputReader::new(-1);
+        let key = reader.csi_to_key(b'~', &[3, 5]).expect("ctrl-delete");
+        assert_eq!(key.key, Key::Delete);
+        assert!(key.mods.ctrl);
+        assert!(!key.mods.alt);
+    }
+
+    #[test]
+    fn csi_delete_with_caret_suffix_maps_to_ctrl_delete() {
+        let mut reader = InputReader::new(-1);
+        let key = reader.csi_to_key(b'^', &[3]).expect("ctrl-delete");
+        assert_eq!(key.key, Key::Delete);
+        assert!(key.mods.ctrl);
+        assert!(!key.mods.alt);
     }
 }

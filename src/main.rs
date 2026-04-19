@@ -1143,6 +1143,7 @@ fn handle_normal_key(
         (Key::Char('k'), true, _) => line.kill_to_end(),
         (Key::Char('u'), true, _) => line.kill_to_start(),
         (Key::Char('w'), true, _) => line.kill_word_back(),
+        (Key::Char('d'), false, true) => line.kill_word_forward(),
         (Key::Char('y'), true, _) => line.yank(),
         (Key::Char('l'), true, _) => return KeyAction::ClearScreen,
         (Key::Char('r'), true, _) => return KeyAction::StartHistorySearch,
@@ -1187,6 +1188,10 @@ fn handle_normal_key(
         (Key::Backspace, true, _) => return KeyAction::StartDirPicker,
         (Key::Backspace, _, _) => {
             line.delete_back();
+            *history_idx = None;
+        }
+        (Key::Delete, true, _) => {
+            line.kill_word_back();
             *history_idx = None;
         }
         (Key::Delete, _, _) => {
@@ -1713,6 +1718,10 @@ fn handle_history_search_key(
             query.delete_back();
             re_search = true;
         }
+        (Key::Delete, true, _) | (Key::Char('d'), false, true) => {
+            query.kill_word_back();
+            re_search = true;
+        }
         (Key::Delete, _, _) | (Key::Char('d'), true, _) => {
             query.delete_forward();
             re_search = true;
@@ -1837,6 +1846,10 @@ fn handle_file_picker_key(
         // Query editing
         (Key::Backspace, _, _) => {
             query.delete_back();
+            refilter = true;
+        }
+        (Key::Delete, true, _) | (Key::Char('d'), false, true) => {
+            query.kill_word_back();
             refilter = true;
         }
         (Key::Delete, _, _) | (Key::Char('d'), true, _) => {

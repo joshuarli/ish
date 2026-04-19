@@ -69,6 +69,19 @@ fn line_buffer_word_operations_complex() {
 }
 
 #[test]
+fn line_buffer_kill_word_forward() {
+    let mut lb = LineBuffer::new();
+    lb.set("foo   bar   baz");
+    lb.move_home();
+    lb.kill_word_forward();
+    assert_eq!(lb.text(), "   bar   baz");
+    assert_eq!(lb.cursor(), 0);
+    lb.kill_word_forward();
+    assert_eq!(lb.text(), "   baz");
+    assert_eq!(lb.cursor(), 0);
+}
+
+#[test]
 fn line_buffer_kill_yank_cycle() {
     let mut lb = LineBuffer::new();
     lb.set("one two three");

@@ -323,6 +323,11 @@ impl PtyShell {
         self.send(b"\x08");
     }
 
+    /// Send Ctrl+Delete as xterm `ESC [ 3 ; 5 ~`.
+    fn ctrl_delete(&self) {
+        self.send(b"\x1b[3;5~");
+    }
+
     fn resize(&self, rows: u16, cols: u16) {
         let ws = libc::winsize {
             ws_row: rows,
@@ -968,6 +973,20 @@ fn line_editing_ctrl_w() {
     let out = sh.wait_for_prompt(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(text.contains("keep"), "expected 'keep' in output: {text:?}");
+}
+
+#[test]
+fn line_editing_ctrl_delete() {
+    let sh = PtyShell::spawn();
+    sh.type_str("echo alpha beta");
+    sh.ctrl_delete();
+    sh.enter();
+    let out = sh.wait_for_prompt(2000);
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("\r\nalpha\r\n"),
+        "expected command output after ctrl-delete: {text:?}"
+    );
 }
 
 #[test]
