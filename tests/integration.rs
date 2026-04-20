@@ -294,30 +294,25 @@ fn scoring_flag_matching() {
 
 #[test]
 fn scoring_pwd_bonus() {
-    // When working in the "ish" directory, entries mentioning "ish" should
-    // get a context bonus.
+    // Current directory should not bias Ctrl+R results; recency and match tier
+    // are easier to reason about.
     let h = History::from_entries(vec![
         "cargo build".into(),                 // older, no "ish"
         "npm install".into(),                 // more recent, no "ish"
         "./target/release/ish --help".into(), // oldest, but contains "ish"
     ]);
-    // With PWD basename "ish"
     let matches = h.fuzzy_search_scored("build", "ish");
-    // "cargo build" has contiguous "build" → high score
-    // "./target/release/ish --help" doesn't match "build" at all
-    // so PWD bonus only matters among entries that match
     assert!(!matches.is_empty());
     assert_eq!(h.get(matches[0].entry_idx), "cargo build");
 
-    // Now test where PWD actually breaks a tie
+    // Identical match tier falls back to recency, not PWD context.
     let h2 = History::from_entries(vec![
         "cd /tmp/ish && make".into(), // older, contains "ish"
         "cd /tmp/foo && make".into(), // more recent, no "ish"
     ]);
     let matches2 = h2.fuzzy_search_scored("make", "ish");
     assert_eq!(matches2.len(), 2);
-    // Both have the same "make" match quality, but "ish" entry gets PWD bonus
-    assert_eq!(h2.get(matches2[0].entry_idx), "cd /tmp/ish && make");
+    assert_eq!(h2.get(matches2[0].entry_idx), "cd /tmp/foo && make");
 }
 
 #[test]

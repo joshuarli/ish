@@ -3,86 +3,47 @@
 This document covers the ranking and scoring strategies for history search
 and tab completion.
 
-## History Fuzzy Search
+## History Search
 
 ### Matching
 
-`history.rs` uses **subsequence matching** with optimal alignment: every
-character of the query must appear in the entry in order (case-insensitive).
-The matcher uses a three-pass approach to find the tightest match window:
+`history.rs` now uses a **tiered literal-first search** for Ctrl+R:
 
-1. **Forward pass**: greedy scan to confirm the query is a subsequence and
-   find the first endpoint where the last query character matches.
-2. **Last-endpoint scan**: find the last occurrence of the last query char
-   in the text. If different from the first endpoint, try both.
-3. **Backward pass**: from each endpoint, scan backward matching query chars
-   in reverse to find the tightest (shortest span) window.
-4. **Final forward pass**: within the winning window, record positions.
+1. **Prefix match**: entry starts with the query
+2. **Boundary substring**: entry contains the query after `/`, `-`, `_`, `.`, or whitespace
+3. **Substring match**: entry contains the query anywhere
+4. **Subsequence fallback**: only if there is no literal substring match in that entry
 
-This finds contiguous matches that a greedy-only approach would miss. For
-example, searching "test" in "the best test" finds the contiguous "test" at
-the end (positions 9-12), not the scattered t(0)-e(2)-s(6)-t(7) that a
-greedy forward pass would produce. Similarly, "deb" in "cd target/debug"
-finds the contiguous d(10)-e(11)-b(12) in "debug".
+The first three tiers are easy to reason about and align better with shell
+history use: if you type a literal command fragment, the most recent literal
+match should surface first. Subsequence matching remains as a fallback for
+short abbreviations like `gc`.
 
-ASCII fast path avoids char decoding overhead. The Unicode path collects
-chars into a Vec for the backward scan (rare path, short entries).
+When the search falls back to subsequence matching, it still uses the
+forward/backward alignment pass to highlight the tightest window.
 
 ### Scoring
 
-Each `FuzzyMatch` carries a `score: i16` computed by `score_match()` from
-the positions array. Scoring signals, in order of impact:
+Each `FuzzyMatch` carries a simple tier score:
 
-**First-match bonus (+4)**
-Extra weight when the first query character matches position 0 of the
-entry. Typing `g` strongly prefers entries starting with `g`.
+- `3` prefix
+- `2` boundary substring
+- `1` substring
+- `0` subsequence fallback
 
-**Contiguity bonus (+16 per consecutive match)**
-The most important signal. If matched characters are adjacent in the entry,
-the query is likely a substring or near-substring. Six contiguous matches
-(like "target" appearing literally) score 80+ from this alone. Scattered
-matches across a long string score near 0.
-
-**Word boundary bonus (+8)**
-A matched character at the start of a word — after `/`, `-`, `_`, `.`,
-whitespace, or at position 0 — is worth more than one mid-word. This makes
-path-component matching and command-name matching work naturally.
-
-**Gap penalty (-1 per skipped char, capped at -3 per gap)**
-Penalizes distance between consecutive matches, but the cap prevents a
-single long gap (common in paths) from destroying an otherwise good match.
-
-**PWD context bonus (+20)**
-If the entry contains the current directory's basename (case-insensitive),
-it gets a flat bonus. This surfaces commands relevant to the current project
-without requiring explicit path tracking. The basename is extracted from
-`$PWD` via `getenv` (zero allocation).
-
-**Recency bonus (up to +32, sqrt decay)**
-Recent entries get a strong bonus: `32 / (1 + isqrt(age))` where age is the
-distance from the most recent entry. The most recent command gets +32 (two
-contiguity bonuses worth), decaying to +10 at ~4 ago, +5 at ~25 ago, +2 at
-~100 ago, and 0 beyond ~1000. This ensures that commands you just ran
-dominate the top of the list even if an older entry has slightly better match
-quality.
+Within a tier, newer entries win. There is no current-directory bonus and no
+weighted reranking pass.
 
 ### Sort Order
 
-Results are collected most-recent-first up to the limit (200), then sorted
-by score descending with recency (entry index) as tiebreaker.
+Results are ranked by tier first, then by recency. The full result set is
+ranked before truncation, so an older but stronger literal match is not
+dropped just because 200 newer weak matches appeared first.
 
 ### Comparison to fzf
 
-The matching and scoring approach is similar to fzf v2: forward+backward
-alignment to find tight windows, contiguity bonuses, word boundary bonuses.
-Key differences:
-
-- fzf supports extended syntax (`^prefix`, `suffix$`, `!exclude`, `'exact`)
-  with boolean composition. We only support plain fuzzy queries.
-- fzf uses a DP-based scoring pass within the window for globally optimal
-  alignment. We use a simpler two-endpoint approach (try the first and last
-  possible endpoints, pick the tighter window). This covers most real-world
-  cases without O(m*n) cost.
+This is intentionally less ambitious than fzf-style scoring. The design goal
+is predictability, not maximum fuzzy cleverness.
 
 ## Tab Completion
 
@@ -127,11 +88,8 @@ a unified relevance model.
 
 All search and ranking code respects ish's core invariants:
 
-- **Zero allocation on warm paths.** Scoring uses the existing `[u16; 32]`
-  positions array and a fixed `i16` score field. No allocations per match.
-  `pwd_basename` is a borrowed `&str` from the env block.
 - **Single dependency (libc).** No external fuzzy matching libraries.
-- **Bounded work.** History search caps at 200 results. Completion caps at
-  readdir output. Scoring is O(match_count) for ASCII text per candidate.
-- **Predictable.** Users can reason about why a result ranks where it does.
-  Contiguity + word boundaries + recency is intuitive.
+- **Bounded work.** History search ranks the full match set, then caps the
+  displayed results at 200. Completion caps at readdir output.
+- **Predictable.** Users can reason about why a result ranks where it does:
+  literal matches first, then recency.

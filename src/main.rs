@@ -405,12 +405,6 @@ fn main() {
     }
 }
 
-/// Basename of $PWD for history search context scoring. Zero allocation.
-fn pwd_basename() -> &'static str {
-    let pwd = getenv_str(c"PWD");
-    pwd.rsplit('/').next().unwrap_or("")
-}
-
 /// Read an env var via libc::getenv — zero allocation (returns &str into env block).
 /// SAFETY: Only safe in a single-threaded context (which ish is).
 fn getenv_str(name: &std::ffi::CStr) -> &'static str {
@@ -588,12 +582,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     shell.history.sync();
                                     saved_line = line.text().to_string();
                                     let mut matches = std::mem::take(&mut shell.match_buf);
-                                    shell.history.fuzzy_search_into(
-                                        "",
-                                        &mut matches,
-                                        200,
-                                        pwd_basename(),
-                                    );
+                                    shell.history.fuzzy_search_into("", &mut matches, 200, "");
                                     region.clear(&mut tw);
                                     mode = Mode::HistorySearch {
                                         query: LineBuffer::new(),
@@ -1752,7 +1741,7 @@ fn handle_history_search_key(
     if re_search {
         shell
             .history
-            .fuzzy_search_into(query.text(), matches, 200, pwd_basename());
+            .fuzzy_search_into(query.text(), matches, 200, "");
         *selected = 0;
     }
     HistAction::Continue

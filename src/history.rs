@@ -624,100 +624,42 @@ impl History {
             .nth(skip)
     }
 
-    /// Fuzzy (subsequence) search: every char of `query` appears in the entry
-    /// in order, case-insensitive. Returns matching entries scored by match
-    /// quality (best first), with recency as tiebreaker.
+    /// History search used by Ctrl+R.
+    ///
+    /// Ranking is intentionally simple and recency-friendly:
+    /// 1. prefix match
+    /// 2. substring match at a word boundary
+    /// 3. other substring match
+    /// 4. subsequence fallback
+    ///
+    /// Within a tier, newer entries win.
     pub fn fuzzy_search(&self, query: &str) -> Vec<FuzzyMatch> {
         self.fuzzy_search_scored(query, "")
     }
 
-    /// Like `fuzzy_search` but accepts a PWD basename for context scoring.
-    pub fn fuzzy_search_scored(&self, query: &str, pwd_basename: &str) -> Vec<FuzzyMatch> {
-        if query.is_empty() {
-            return (0..self.offsets.len())
-                .rev()
-                .map(|idx| FuzzyMatch {
-                    entry_idx: idx,
-                    match_positions: [0; 32],
-                    match_count: 0,
-                    score: 0,
-                })
-                .collect();
-        }
-
-        let query_lower = lowercase_query(query);
+    /// Like `fuzzy_search` but keeps the old signature used by callers/tests.
+    /// `pwd_basename` is ignored; current-directory bias made Ctrl+R less
+    /// predictable than recency-first history search.
+    pub fn fuzzy_search_scored(&self, query: &str, _pwd_basename: &str) -> Vec<FuzzyMatch> {
         let mut results = Vec::new();
-
-        let total = self.offsets.len();
-        for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
-            let entry = &self.arena[start as usize..start as usize + len as usize];
-            if let Some((positions, count)) = subsequence_match(&query_lower, entry) {
-                let score =
-                    score_match(&positions, count, entry, pwd_basename) + recency_bonus(idx, total);
-                results.push(FuzzyMatch {
-                    entry_idx: idx,
-                    match_positions: positions,
-                    match_count: count,
-                    score,
-                });
-            }
-        }
-
-        results.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx)));
-
+        self.fill_search_results(query, &mut results);
         results
     }
 
     /// Like `fuzzy_search` but appends into a caller-owned Vec (zero-alloc reuse).
     /// Caps at `limit` results since the pager only shows a screenful.
-    /// `pwd_basename` is the basename of the current directory (e.g., "ish") for
-    /// context-aware scoring. Pass "" to disable the PWD bonus.
+    /// `pwd_basename` is ignored; see `fuzzy_search_scored`.
     pub fn fuzzy_search_into(
         &self,
         query: &str,
         results: &mut Vec<FuzzyMatch>,
         limit: usize,
-        pwd_basename: &str,
+        _pwd_basename: &str,
     ) {
-        results.clear();
-
-        if query.is_empty() {
-            for idx in (0..self.offsets.len()).rev() {
-                results.push(FuzzyMatch {
-                    entry_idx: idx,
-                    match_positions: [0; 32],
-                    match_count: 0,
-                    score: 0,
-                });
-                if results.len() >= limit {
-                    break;
-                }
-            }
-            return;
+        self.fill_search_results(query, results);
+        if results.len() > limit {
+            results.truncate(limit);
         }
-
-        let query_lower = lowercase_query(query);
-        let total = self.offsets.len();
-
-        for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
-            let entry = &self.arena[start as usize..start as usize + len as usize];
-            if let Some((positions, count)) = subsequence_match(&query_lower, entry) {
-                let score =
-                    score_match(&positions, count, entry, pwd_basename) + recency_bonus(idx, total);
-                results.push(FuzzyMatch {
-                    entry_idx: idx,
-                    match_positions: positions,
-                    match_count: count,
-                    score,
-                });
-                if results.len() >= limit {
-                    break;
-                }
-            }
-        }
-
-        // Sort by score descending, then by recency (entry_idx descending) as tiebreaker
-        results.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx)));
     }
 
     /// Get entry text by index.
@@ -762,6 +704,30 @@ impl History {
             }
         }
     }
+
+    fn fill_search_results(&self, query: &str, results: &mut Vec<FuzzyMatch>) {
+        results.clear();
+
+        if query.is_empty() {
+            results.extend((0..self.offsets.len()).rev().map(|idx| FuzzyMatch {
+                entry_idx: idx,
+                match_positions: [0; 32],
+                match_count: 0,
+                score: 0,
+            }));
+            return;
+        }
+
+        let query_lower = lowercase_query(query);
+        for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
+            let entry = &self.arena[start as usize..start as usize + len as usize];
+            if let Some(m) = classify_match(&query_lower, entry, idx) {
+                results.push(m);
+            }
+        }
+
+        results.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx)));
+    }
 }
 
 /// Lowercase a query into a fixed stack buffer, returning the used slice.
@@ -774,10 +740,84 @@ pub struct FuzzyMatch {
     /// Matched character indices (as u16 — entries are always <64K chars).
     pub match_positions: [u16; 32],
     pub match_count: u8,
-    /// Match quality score. Higher = better match.
-    /// Contiguity (+16), word boundary (+8), gap penalty (-1..=-3), PWD bonus (+20),
-    /// recency bonus (up to +32, decays with sqrt of age).
+    /// Match tier. Higher = stronger literal match.
+    /// 3 = prefix, 2 = boundary substring, 1 = substring, 0 = subsequence fallback.
     pub score: i16,
+}
+
+fn classify_match(query: &[char], text: &str, entry_idx: usize) -> Option<FuzzyMatch> {
+    if starts_with_icase(query, text) {
+        return Some(contiguous_match(entry_idx, 3, 0, query.len()));
+    }
+
+    if let Some(start) = find_substring_icase(query, text, true) {
+        return Some(contiguous_match(entry_idx, 2, start, query.len()));
+    }
+
+    if let Some(start) = find_substring_icase(query, text, false) {
+        return Some(contiguous_match(entry_idx, 1, start, query.len()));
+    }
+
+    let (positions, count) = subsequence_match(query, text)?;
+    Some(FuzzyMatch {
+        entry_idx,
+        match_positions: positions,
+        match_count: count,
+        score: 0,
+    })
+}
+
+fn contiguous_match(entry_idx: usize, score: i16, start: usize, len: usize) -> FuzzyMatch {
+    let mut positions = [0u16; 32];
+    let count = len.min(positions.len()).min(u8::MAX as usize);
+    for (offset, slot) in positions.iter_mut().take(count).enumerate() {
+        *slot = (start + offset) as u16;
+    }
+    FuzzyMatch {
+        entry_idx,
+        match_positions: positions,
+        match_count: count as u8,
+        score,
+    }
+}
+
+fn starts_with_icase(query: &[char], text: &str) -> bool {
+    let mut chars = text.chars();
+    for &q in query {
+        let Some(tc) = chars.next() else {
+            return false;
+        };
+        if tc.to_lowercase().next() != Some(q) {
+            return false;
+        }
+    }
+    true
+}
+
+fn find_substring_icase(query: &[char], text: &str, boundary_only: bool) -> Option<usize> {
+    if query.is_empty() {
+        return Some(0);
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    if query.len() > chars.len() {
+        return None;
+    }
+
+    for start in 0..=chars.len() - query.len() {
+        if boundary_only && start > 0 && !is_word_boundary_char(chars[start - 1]) {
+            continue;
+        }
+        if chars[start..start + query.len()]
+            .iter()
+            .zip(query.iter())
+            .all(|(&tc, &q)| tc.to_lowercase().next() == Some(q))
+        {
+            return Some(start);
+        }
+    }
+
+    None
 }
 
 /// Check if `query` chars appear in `text` in order (case-insensitive).
@@ -966,109 +1006,36 @@ fn backward_unicode(chars: &[(usize, char)], query: &[char], end: usize) -> usiz
     0
 }
 
-/// Recency bonus for fuzzy search. Decays as 32 / (1 + isqrt(age)) where age
-/// is the number of entries between this entry and the most recent one.
-/// Most recent: +32, ~4 ago: +10, ~25 ago: +5, ~100 ago: +2, ~1000 ago: 0.
-fn recency_bonus(idx: usize, total: usize) -> i16 {
-    if total == 0 {
-        return 0;
-    }
-    let age = (total - 1 - idx) as u32;
-    if age == 0 {
-        return 32;
-    }
-    // Integer square root via Newton's method — converges in ~5 iterations for u32.
-    let mut x = age;
-    let mut y = (x + 1) >> 1;
-    while y < x {
-        x = y;
-        y = (x + age / x) >> 1;
-    }
-    (32 / (1 + x)) as i16
+fn is_word_boundary_char(c: char) -> bool {
+    matches!(c, '/' | '-' | '_' | '.' | ' ' | '\t')
 }
 
-/// Score a fuzzy match based on match quality. O(count) for ASCII, O(text_len) for non-ASCII.
-/// Zero allocations — uses only the positions array already computed by `subsequence_match`.
-///
-/// Scoring:
-/// - Contiguity: +16 per consecutive matched char (adjacent positions)
-/// - Word boundary: +8 when a match is at position 0 or after `/`, `-`, `_`, `.`, whitespace
-/// - First-match: +4 when the first query char matches position 0 of the entry
-/// - Gap penalty: -1 per skipped char between consecutive matches, capped at -3 per gap
-/// - PWD context: +20 if the entry contains the current directory's basename
-pub fn score_match(positions: &[u16; 32], count: u8, text: &str, pwd_basename: &str) -> i16 {
+/// Compatibility helper retained for benchmarks.
+/// Returns the literal-match tier for a precomputed match window.
+pub fn score_match(positions: &[u16; 32], count: u8, text: &str, _pwd_basename: &str) -> i16 {
     let n = count as usize;
     if n == 0 {
         return 0;
     }
 
-    let mut score: i16 = 0;
-    let bytes = text.as_bytes();
-
-    // First-match bonus: query starts at the very beginning of the entry
-    if positions[0] == 0 {
-        score += 4;
-    }
-
-    // Contiguity + gap penalties — positions-only, O(n)
+    let start = positions[0] as usize;
     for i in 1..n {
-        let prev = positions[i - 1];
-        let curr = positions[i];
-        if curr == prev + 1 {
-            score += 16; // consecutive characters
-        } else {
-            let gap = (curr - prev - 1) as i16;
-            score -= gap.min(3); // gap penalty capped at -3
+        if positions[i] != positions[i - 1] + 1 {
+            return 0;
         }
     }
 
-    // Word boundary bonus
-    if text.is_ascii() {
-        // ASCII fast path: char index == byte index, O(n)
-        for &pos in positions.iter().take(n) {
-            let pos = pos as usize;
-            if pos == 0 || is_word_boundary(bytes[pos - 1]) {
-                score += 8;
-            }
-        }
+    if start == 0 {
+        3
+    } else if text
+        .chars()
+        .nth(start.saturating_sub(1))
+        .is_some_and(is_word_boundary_char)
+    {
+        2
     } else {
-        // Non-ASCII: walk chars to find the byte preceding each matched position
-        let mut pi = 0;
-        let mut prev_byte = 0u8;
-        for (char_idx, ch) in text.chars().enumerate() {
-            if pi < n && char_idx as u16 == positions[pi] {
-                if char_idx == 0 || is_word_boundary(prev_byte) {
-                    score += 8;
-                }
-                pi += 1;
-                if pi >= n {
-                    break;
-                }
-            }
-            // Track the last byte of this char for boundary detection
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            prev_byte = encoded.as_bytes()[encoded.len() - 1];
-        }
+        1
     }
-
-    // PWD basename bonus
-    if !pwd_basename.is_empty() {
-        let needle = pwd_basename.as_bytes();
-        if needle.len() <= bytes.len()
-            && bytes
-                .windows(needle.len())
-                .any(|w| w.eq_ignore_ascii_case(needle))
-        {
-            score += 20;
-        }
-    }
-
-    score
-}
-
-fn is_word_boundary(b: u8) -> bool {
-    matches!(b, b'/' | b'-' | b'_' | b'.' | b' ' | b'\t')
 }
 
 /// Count occurrences of a byte in a slice.
@@ -1121,147 +1088,46 @@ mod tests {
     }
 
     #[test]
-    fn score_contiguous_match() {
-        // "target" found contiguously at positions 0-5
-        let positions = {
-            let mut p = [0u16; 32];
-            p[0] = 0;
-            p[1] = 1;
-            p[2] = 2;
-            p[3] = 3;
-            p[4] = 4;
-            p[5] = 5;
-            p
-        };
-        let score = score_match(&positions, 6, "target/release", "");
-        // 5 contiguity bonuses (16 each) = 80
-        // position 0 is word boundary = +8
-        assert!(score >= 88, "contiguous match should score high: {score}");
-    }
-
-    #[test]
-    fn score_scattered_match() {
-        // "target" scattered across "git remote add origin https://...smtp-server.git"
-        // Positions would be something like t(3) a(12) r(14) g(42) e(50) t(65)
-        let positions = {
-            let mut p = [0u16; 32];
-            p[0] = 3;
-            p[1] = 12;
-            p[2] = 14;
-            p[3] = 42;
-            p[4] = 50;
-            p[5] = 65;
-            p
-        };
-        let text = "git remote add origin https://github.com/joshuarli/smtp-server.git";
-        let score = score_match(&positions, 6, text, "");
-        // One contiguity (14 = 12+2? no, 14 != 13). Actually r at 14, a at 12: gap.
-        // Large gaps, few boundaries. Score should be low/negative.
-        assert!(score < 30, "scattered match should score low: {score}");
-    }
-
-    #[test]
-    fn score_word_boundary_bonus() {
-        // "dc" matching "docker compose" at positions 0, 7
-        // Both are word boundaries: d at start, c after space
-        let positions = {
-            let mut p = [0u16; 32];
-            p[0] = 0;
-            p[1] = 7;
-            p
-        };
-        let score = score_match(&positions, 2, "docker compose up", "");
-        // first-match: position 0 (+4)
-        // boundary bonus: 0 is start (+8), 7 is after space (+8)
-        // gap: 7 - 0 - 1 = 6, capped at -3
-        // total: 4 + 16 - 3 = 17
-        assert_eq!(score, 17, "expected boundary bonuses: {score}");
-    }
-
-    #[test]
-    fn score_pwd_bonus() {
-        let positions = {
-            let mut p = [0u16; 32];
-            p[0] = 0;
-            p[1] = 1;
-            p[2] = 2;
-            p
-        };
-        let score_without = score_match(&positions, 3, "cat ish/src/main.rs", "");
-        let score_with = score_match(&positions, 3, "cat ish/src/main.rs", "ish");
-        assert_eq!(score_with - score_without, 20, "PWD bonus should be +20");
-    }
-
-    #[test]
-    fn score_gap_penalty_capped() {
-        // Two chars with a huge gap — penalty should cap at -3
-        let positions = {
-            let mut p = [0u16; 32];
-            p[0] = 0;
-            p[1] = 100;
-            p
-        };
-        let text = &"x".repeat(101);
-        let score = score_match(&positions, 2, text, "");
-        // first-match at 0: +4
-        // boundary at 0: +8
-        // gap: 100 - 0 - 1 = 99, capped at -3
-        // total: 4 + 8 - 3 = 9
-        assert_eq!(score, 9, "gap penalty should be capped: {score}");
-    }
-
-    #[test]
-    fn recency_bonus_decay() {
-        assert_eq!(recency_bonus(999, 1000), 32); // most recent
-        assert_eq!(recency_bonus(998, 1000), 16); // age 1
-        assert_eq!(recency_bonus(995, 1000), 10); // age 4
-        assert_eq!(recency_bonus(975, 1000), 6); // age 24
-        assert_eq!(recency_bonus(900, 1000), 3); // age 99
-        assert_eq!(recency_bonus(0, 1000), 1); // age 999
-        assert_eq!(recency_bonus(0, 0), 0); // empty history
-    }
-
-    #[test]
-    fn recency_boosts_recent_match() {
-        // Two entries with identical match quality — recent one should win
+    fn recency_breaks_ties_within_same_tier() {
         let entries: Vec<String> = (0..100).map(|i| format!("cargo test {i}")).collect();
         let h = History::from_entries(entries);
-        let results = h.fuzzy_search("ct");
-        // Most recent entry should be first (highest score due to recency)
+        let results = h.fuzzy_search("cargo");
         assert_eq!(results[0].entry_idx, 99);
     }
 
     #[test]
-    fn recency_beats_moderate_quality_gap() {
-        // A recent entry with a worse match should still beat an old entry
-        // when the match quality difference is moderate.
-        // "cargo build" at position 0 gets first-match (+4) + boundary (+8) + contiguity,
-        // but "echo cargo" is much more recent so its recency bonus compensates.
-        let mut entries: Vec<String> = vec!["cargo build".into()];
-        // 50 filler entries to push "cargo build" far back
-        for i in 0..50 {
-            entries.push(format!("unrelated command {i}"));
-        }
-        entries.push("echo cargo".into()); // recent, weaker match
-        let h = History::from_entries(entries);
+    fn prefix_tier_beats_boundary_substring() {
+        let h = History::from_entries(vec!["echo cargo".into(), "cargo build".into()]);
+        let results = h.fuzzy_search("cargo");
+        assert_eq!(h.get(results[0].entry_idx), "cargo build");
+    }
+
+    #[test]
+    fn boundary_substring_tier_beats_plain_substring() {
+        let h = History::from_entries(vec!["foocargobar".into(), "echo cargo".into()]);
         let results = h.fuzzy_search("cargo");
         assert_eq!(h.get(results[0].entry_idx), "echo cargo");
     }
 
     #[test]
-    fn quality_beats_recency_when_gap_is_large() {
-        // A much better match should still win even if it's old, as long as the
-        // quality gap is large enough to overcome the recency bonus.
-        // "cargo build --release" has contiguous "cargo" at pos 0 (first-match + boundary + contiguity).
-        // "c_a_r_g_o" has scattered chars (gaps, no contiguity, no boundary).
-        let mut entries: Vec<String> = vec!["cargo build --release".into()];
-        for i in 0..30 {
-            entries.push(format!("unrelated {i}"));
-        }
-        entries.push("xcxaxrxgxo".into()); // recent but terrible match
+    fn substring_tier_beats_subsequence_fallback() {
+        let h = History::from_entries(vec![
+            "git remote add origin https://github.com/joshuarli/smtp-server.git".into(),
+            "ls target/debug/".into(),
+        ]);
+        let results = h.fuzzy_search("target");
+        assert_eq!(h.get(results[0].entry_idx), "ls target/debug/");
+    }
+
+    #[test]
+    fn search_into_sorts_before_limit() {
+        let mut entries = vec!["cargo build".to_string()];
+        entries.extend((0..220).map(|i| format!("c-x-{i}-a-x-r-x-g-x-o")));
         let h = History::from_entries(entries);
-        let results = h.fuzzy_search("cargo");
-        assert_eq!(h.get(results[0].entry_idx), "cargo build --release");
+        let mut results = Vec::new();
+        h.fuzzy_search_into("cargo", &mut results, 200, "ish");
+        assert_eq!(h.get(results[0].entry_idx), "cargo build");
+        assert!(results.iter().any(|m| h.get(m.entry_idx) == "cargo build"));
     }
 
     #[test]
