@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Cached prompt state — reused across renders.
@@ -27,9 +28,13 @@ impl Default for Prompt {
 
 impl Prompt {
     pub fn new() -> Self {
-        let user = std::env::var("USER").unwrap_or_default();
+        let user = std::env::var_os("USER")
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let host = hostname();
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = std::env::var_os("HOME")
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Self {
             user_host: format!("{user}@{host} "),
             home,
@@ -81,8 +86,10 @@ impl Prompt {
 
     /// Legacy render — allocates. Used by benchmarks and tests.
     pub fn render(&mut self, last_status: i32) -> String {
-        let pwd = std::env::var("PWD").unwrap_or_default();
-        let denv_dirty = std::env::var("__DENV_DIRTY").as_deref() == Ok("1");
+        let pwd = std::env::var_os("PWD")
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let denv_dirty = std::env::var_os("__DENV_DIRTY").as_deref() == Some(OsStr::new("1"));
         let mut out = String::with_capacity(128);
         self.render_into(&mut out, last_status, &pwd, denv_dirty);
         out

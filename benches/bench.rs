@@ -1013,7 +1013,9 @@ fn bench_alloc_audit(c: &mut Criterion) {
         {
             let mut p = prompt::Prompt::new();
             let mut buf = String::with_capacity(128);
-            let pwd = std::env::var("PWD").unwrap_or_default();
+            let pwd = std::env::var_os("PWD")
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             p.render_into(&mut buf, 0, &pwd, false); // warm up caches
             let stats = measure_allocs(|| {
                 p.render_into(&mut buf, 0, &pwd, false);

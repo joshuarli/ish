@@ -118,7 +118,7 @@ fn extract_cd_target(entry: &str) -> Option<&str> {
 
 fn update_pwd() {
     if let Ok(pwd) = std::env::current_dir() {
-        crate::shell_setenv("PWD", &pwd.to_string_lossy());
+        crate::shell_setenv_os("PWD", pwd.as_os_str());
     }
 }
 

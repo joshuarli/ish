@@ -7,8 +7,8 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -322,9 +322,10 @@ fn parse_denv_state(s: &str) -> Option<(u64, u64, &str)> {
 }
 
 fn state_var_fast_path_ok(cwd: &Path) -> bool {
-    let Ok(state) = env::var("__DENV_STATE") else {
+    let Some(state) = env::var_os("__DENV_STATE") else {
         return false;
     };
+    let state = state.to_string_lossy();
     let Some((envrc_mtime, dotenv_mtime, dir)) = parse_denv_state(&state) else {
         return false;
     };
@@ -360,9 +361,10 @@ fn set_probe_path(probe: &mut PathBuf, dir: &Path, name: &str) {
 fn state_var_matches(found: &EnvFiles) -> bool {
     let envrc_mtime = found.envrc.as_ref().map(|(_, m)| *m).unwrap_or(0);
     let dotenv_mtime = found.dotenv.as_ref().map(|(_, m)| *m).unwrap_or(0);
-    let Ok(state) = env::var("__DENV_STATE") else {
+    let Some(state) = env::var_os("__DENV_STATE") else {
         return false;
     };
+    let state = state.to_string_lossy();
     let Some((st_envrc, st_dotenv, st_dir)) = parse_denv_state(&state) else {
         return false;
     };
@@ -659,7 +661,7 @@ fn parse_dotenv(content: &str) -> Vec<(&str, Cow<'_, str>)> {
 fn diff_dotenv_only(dotenv_entries: &[(String, String)]) -> EnvDiff {
     let mut set = Vec::new();
     for (key, value) in dotenv_entries {
-        if !env::var(key).is_ok_and(|cur| cur == *value) {
+        if env::var_os(key).is_none_or(|cur| cur != OsStr::new(value)) {
             set.push((key.clone(), value.clone()));
         }
     }
@@ -766,15 +768,18 @@ fn envrc_interpreter(envrc: &Path) -> Result<EnvRcInterpreter, String> {
     }
 }
 
-fn capture_process_env() -> HashMap<String, String> {
-    env::vars().collect()
+fn capture_process_env() -> Vec<(OsString, OsString)> {
+    env::vars_os().collect()
 }
 
-fn filtered_env_from_map(map: &HashMap<String, String>) -> Vec<(&str, &str)> {
-    let mut filtered: Vec<(&str, &str)> = map
+fn filtered_env_from_snapshot(entries: &[(OsString, OsString)]) -> Vec<(&str, &str)> {
+    let mut filtered: Vec<(&str, &str)> = entries
         .iter()
-        .filter(|(key, _)| !is_ignored_env_key(key))
-        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .filter_map(|(key, value)| {
+            let key = key.to_str()?;
+            let value = value.to_str()?;
+            (!is_ignored_env_key(key)).then_some((key, value))
+        })
         .collect();
     filtered.sort_unstable_by(|a, b| a.0.cmp(b.0));
     filtered
@@ -790,14 +795,20 @@ fn filtered_env_from_owned(entries: &[(String, String)]) -> Vec<(&str, &str)> {
     filtered
 }
 
-fn restore_process_env(snapshot: &HashMap<String, String>) {
-    for key in env::vars().map(|(key, _)| key).collect::<Vec<_>>() {
-        if !snapshot.contains_key(&key) {
-            crate::shell_unsetenv(&key);
+fn restore_process_env(snapshot: &[(OsString, OsString)]) {
+    for key in env::vars_os().map(|(key, _)| key).collect::<Vec<_>>() {
+        if !snapshot.iter().any(|(saved_key, _)| saved_key == &key) {
+            // SAFETY: ish is single-threaded.
+            unsafe {
+                env::remove_var(&key);
+            }
         }
     }
     for (key, value) in snapshot {
-        crate::shell_setenv(key, value);
+        // SAFETY: ish is single-threaded.
+        unsafe {
+            env::set_var(key, value);
+        }
     }
 }
 
@@ -969,7 +980,7 @@ fn eval_env_epsh(
         return Err(".envrc evaluation failed".to_string());
     }
 
-    let before = filtered_env_from_map(&before_process);
+    let before = filtered_env_from_snapshot(&before_process);
     let after = filtered_env_from_owned(&after_process);
     Ok(diff_sorted_env(&before, &after))
 }
@@ -977,14 +988,20 @@ fn eval_env_epsh(
 fn capture_prev(diff: &EnvDiff) -> Vec<PrevVar> {
     let mut prev = Vec::new();
     for (key, _) in &diff.set {
-        match env::var(key) {
-            Ok(value) => prev.push(PrevVar::Restore(key.clone(), value)),
-            Err(_) => prev.push(PrevVar::Unset(key.clone())),
+        match env::var_os(key) {
+            Some(value) => prev.push(PrevVar::Restore(
+                key.clone(),
+                value.to_string_lossy().into_owned(),
+            )),
+            None => prev.push(PrevVar::Unset(key.clone())),
         }
     }
     for key in &diff.unset {
-        if let Ok(value) = env::var(key) {
-            prev.push(PrevVar::Restore(key.clone(), value));
+        if let Some(value) = env::var_os(key) {
+            prev.push(PrevVar::Restore(
+                key.clone(),
+                value.to_string_lossy().into_owned(),
+            ));
         }
     }
     prev
@@ -1070,6 +1087,8 @@ pub fn apply_bash_output_bench(output: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir(PathBuf);
@@ -1220,7 +1239,39 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err, ".envrc evaluation failed");
-        assert!(std::env::var("DENV_TMP_SHOULD_ROLLBACK").is_err());
+        assert!(std::env::var_os("DENV_TMP_SHOULD_ROLLBACK").is_none());
+    }
+
+    #[test]
+    fn restore_process_env_preserves_non_utf8_entries() {
+        let key = OsString::from_vec(vec![b'D', b'E', b'N', b'V', b'_', 0xf0, 0x80, b'K']);
+        let value = OsString::from_vec(vec![b'v', b'a', b'l', 0xff]);
+        let extra = "DENV_TMP_SHOULD_BE_REMOVED";
+
+        let saved_key = std::env::var_os(&key);
+        let saved_extra = std::env::var_os(extra);
+        let snapshot = vec![(key.clone(), value.clone())];
+
+        crate::shell_setenv(extra, "1");
+        restore_process_env(&snapshot);
+
+        assert_eq!(std::env::var_os(&key), Some(value.clone()));
+        assert!(std::env::var_os(extra).is_none());
+
+        if let Some(saved) = saved_key {
+            unsafe {
+                std::env::set_var(&key, saved);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(&key);
+            }
+        }
+        if let Some(saved) = saved_extra {
+            crate::shell_setenv_os(extra, saved);
+        } else {
+            crate::shell_unsetenv(extra);
+        }
     }
 
     #[test]

@@ -1,13 +1,14 @@
 use crate::alias::AliasMap;
 use epsh::ast::Word;
 use epsh::lexer::{Lexer, Token};
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 /// Load config from the given path, or the default config path.
 /// Supports: `set VAR "value"` and `alias name cmd [args...]`.
 /// Also sources `init.sh` from the config directory via epsh.
 /// Warns on bad lines, continues processing.
-pub fn load(aliases: &mut AliasMap, epsh: &mut epsh::eval::Shell, path_override: Option<&str>) {
+pub fn load(aliases: &mut AliasMap, epsh: &mut epsh::eval::Shell, path_override: Option<&OsStr>) {
     let path = match path_override {
         Some(p) => PathBuf::from(p),
         None => config_path(),
@@ -142,11 +143,36 @@ fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut 
 }
 
 fn config_path() -> PathBuf {
-    if let Ok(config) = std::env::var("XDG_CONFIG_HOME") {
+    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(config).join("ish/config.ish")
-    } else if let Ok(home) = std::env::var("HOME") {
+    } else if let Some(home) = std::env::var_os("HOME") {
         PathBuf::from(home).join(".config/ish/config.ish")
     } else {
         PathBuf::from("/etc/ish/config.ish")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn config_path_uses_non_utf8_xdg_config_home() {
+        let key = "XDG_CONFIG_HOME";
+        let saved = std::env::var_os(key);
+        let raw = OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xf0, 0x80, 0x80, b'x']);
+
+        crate::shell_setenv_os(key, &raw);
+        let path = config_path();
+
+        if let Some(saved) = saved {
+            crate::shell_setenv_os(key, saved);
+        } else {
+            crate::shell_unsetenv(key);
+        }
+
+        assert_eq!(path, PathBuf::from(raw).join("ish/config.ish"));
     }
 }

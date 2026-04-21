@@ -9,8 +9,10 @@ use ish::{
     builtin, complete, config, denv, finder, frecency, history, path, prompt, render, signal, term,
 };
 use std::cell::RefCell;
+use std::ffi::OsString;
 use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 
 // Thread-local storage for a stopped job's info, written by the external handler
 // and consumed by the main loop. Avoids needing to thread state through epsh's
@@ -79,8 +81,8 @@ enum Mode {
 }
 
 struct Args {
-    config: Option<String>, // -c <path>: custom config file
-    no_config: bool,        // --no-config: skip config loading
+    config: Option<OsString>, // -c <path>: custom config file
+    no_config: bool,          // --no-config: skip config loading
 }
 
 fn parse_args() -> Args {
@@ -88,25 +90,25 @@ fn parse_args() -> Args {
         config: None,
         no_config: false,
     };
-    let mut argv = std::env::args().skip(1);
+    let mut argv = std::env::args_os().skip(1);
     while let Some(arg) = argv.next() {
-        match arg.as_str() {
-            "-V" | "--version" => {
+        match arg.to_str() {
+            Some("-V") | Some("--version") => {
                 println!("ish {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
-            "-h" | "--help" => {
+            Some("-h") | Some("--help") => {
                 print_help();
                 std::process::exit(0);
             }
-            "-c" => match argv.next() {
+            Some("-c") => match argv.next() {
                 Some(path) => args.config = Some(path),
                 None => {
                     eprintln!("ish: -c requires a config file path");
                     std::process::exit(1);
                 }
             },
-            "--no-config" => args.no_config = true,
+            Some("--no-config") => args.no_config = true,
             _ => {
                 eprintln!("ish: this shell is interactive-only and does not run scripts");
                 eprintln!("usage: ish [-c config] [--no-config] [-h|--help]");
@@ -134,12 +136,12 @@ fn main() {
 
     // Set $SHELL to ish binary path
     if let Ok(exe) = std::env::current_exe() {
-        ish::shell_setenv("SHELL", &exe.to_string_lossy());
+        ish::shell_setenv_os("SHELL", exe.as_os_str());
     }
 
     // Set $PWD — parent process (terminal emulator) may not provide it
     if let Ok(cwd) = std::env::current_dir() {
-        ish::shell_setenv("PWD", &cwd.to_string_lossy());
+        ish::shell_setenv_os("PWD", cwd.as_os_str());
     }
 
     // SAFETY: Set shell as its own process group leader and take foreground
@@ -155,7 +157,9 @@ fn main() {
     let signal_fd = signal::init();
 
     let (rows, cols) = term::term_size();
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
     let shell_pid = unsafe { libc::getpid() };
 
@@ -240,11 +244,10 @@ fn main() {
                         if rest.contains('|') || rest.contains('&') || rest.contains(';') {
                             false
                         } else if rest == "-" {
-                            if let Some(prev) =
-                                std::env::var("OLDPWD").ok().filter(|s| !s.is_empty())
+                            if let Some(prev) = std::env::var_os("OLDPWD").filter(|s| !s.is_empty())
                             {
-                                eprintln!("{prev}");
-                                shell.last_status = do_cd(&prev, &mut shell);
+                                eprintln!("{}", Path::new(&prev).display());
+                                shell.last_status = do_cd_path(Path::new(&prev), &mut shell);
                             } else {
                                 eprintln!("ish: cd: no previous directory");
                                 shell.last_status = 1;
@@ -288,18 +291,9 @@ fn main() {
                         shell.last_status = frecency::builtin_z(&args, &shell.history, &shell.home);
                         if shell.last_status == 0 {
                             // z already did chdir — run post-cd hooks
+                            let old_cwd = shell.epsh.cwd().to_path_buf();
                             let new_cwd = std::env::current_dir().unwrap_or_default();
-                            let old = shell.epsh.cwd().to_string_lossy().into_owned();
-                            ish::shell_setenv("OLDPWD", &old);
-                            let _ = shell.epsh.vars_mut().set("OLDPWD", &old);
-                            ish::shell_setenv("PWD", &new_cwd.to_string_lossy());
-                            let _ = shell.epsh.vars_mut().set("PWD", &new_cwd.to_string_lossy());
-                            shell.prev_dir = Some(old);
-                            shell.epsh.set_cwd(new_cwd);
-                            push_dir_stack(&mut shell.dir_stack);
-                            shell.prompt.invalidate_git();
-                            let changes = denv::on_cd();
-                            apply_denv_changes(&changes, &mut shell.epsh);
+                            sync_cwd_change(&mut shell, &old_cwd, new_cwd);
                         }
                         true
                     }
@@ -364,16 +358,9 @@ fn main() {
 
                 // Detect cwd change from epsh (compound commands with cd, pushd, etc.)
                 if shell.epsh.cwd() != prev_cwd {
-                    let _ = std::env::set_current_dir(shell.epsh.cwd());
-                    ish::shell_setenv("PWD", &shell.epsh.cwd().to_string_lossy());
-                    let old = prev_cwd.to_string_lossy().into_owned();
-                    ish::shell_setenv("OLDPWD", &old);
-                    let _ = shell.epsh.vars_mut().set("OLDPWD", &old);
-                    shell.prev_dir = Some(old);
-                    push_dir_stack(&mut shell.dir_stack);
-                    shell.prompt.invalidate_git();
-                    let changes = denv::on_cd();
-                    apply_denv_changes(&changes, &mut shell.epsh);
+                    let new_cwd = shell.epsh.cwd().to_path_buf();
+                    let _ = std::env::set_current_dir(&new_cwd);
+                    sync_cwd_change(&mut shell, &prev_cwd, new_cwd);
                 }
 
                 // Detect job suspension (status 148 = 128 + SIGTSTP)
@@ -1944,6 +1931,25 @@ fn apply_denv_changes(changes: &[denv::EnvChange], epsh: &mut epsh::eval::Shell)
     }
 }
 
+fn sync_path_var(epsh: &mut epsh::eval::Shell, name: &str, path: &Path) {
+    ish::shell_setenv_os(name, path.as_os_str());
+    let _ = epsh.vars_mut().set_bytes(
+        name,
+        epsh::shell_bytes::ShellBytes::from_os_str(path.as_os_str()),
+    );
+}
+
+fn sync_cwd_change(shell: &mut Shell, old_cwd: &Path, new_cwd: std::path::PathBuf) {
+    sync_path_var(&mut shell.epsh, "OLDPWD", old_cwd);
+    sync_path_var(&mut shell.epsh, "PWD", &new_cwd);
+    shell.prev_dir = Some(old_cwd.to_string_lossy().into_owned());
+    shell.epsh.set_cwd(new_cwd);
+    push_dir_stack(&mut shell.dir_stack);
+    shell.prompt.invalidate_git();
+    let changes = denv::on_cd();
+    apply_denv_changes(&changes, &mut shell.epsh);
+}
+
 /// Strip shell quoting from a single argument: single-quoted, double-quoted, or backslash-escaped.
 fn unquote_arg(s: &str) -> String {
     if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
@@ -1980,29 +1986,18 @@ fn do_cd(target: &str, shell: &mut Shell) -> i32 {
         target.to_string()
     };
 
-    if let Err(e) = std::env::set_current_dir(&resolved) {
-        eprintln!("ish: cd: {target}: {e}");
+    do_cd_path(Path::new(&resolved), shell)
+}
+
+fn do_cd_path(target: &Path, shell: &mut Shell) -> i32 {
+    if let Err(e) = std::env::set_current_dir(target) {
+        eprintln!("ish: cd: {}: {e}", target.display());
         return 1;
     }
 
+    let old_cwd = shell.epsh.cwd().to_path_buf();
     let new_cwd = std::env::current_dir().unwrap_or_default();
-    let old = shell.epsh.cwd().to_string_lossy().into_owned();
-
-    // Set OLDPWD/PWD in both process env and epsh
-    ish::shell_setenv("OLDPWD", &old);
-    let _ = shell.epsh.vars_mut().set("OLDPWD", &old);
-    ish::shell_setenv("PWD", &new_cwd.to_string_lossy());
-    let _ = shell.epsh.vars_mut().set("PWD", &new_cwd.to_string_lossy());
-
-    shell.prev_dir = Some(old);
-    shell.epsh.set_cwd(new_cwd);
-    push_dir_stack(&mut shell.dir_stack);
-    shell.prompt.invalidate_git();
-
-    // Trigger denv
-    let changes = denv::on_cd();
-    apply_denv_changes(&changes, &mut shell.epsh);
-
+    sync_cwd_change(shell, &old_cwd, new_cwd);
     0
 }
 
@@ -2142,9 +2137,9 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                 }
                 "history" => {
                     // In a pipeline context — read from text file
-                    let path = if let Ok(data) = std::env::var("XDG_DATA_HOME") {
+                    let path = if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
                         std::path::PathBuf::from(data).join("ish/history")
-                    } else if let Ok(home) = std::env::var("HOME") {
+                    } else if let Some(home) = std::env::var_os("HOME") {
                         std::path::PathBuf::from(home).join(".local/share/ish/history")
                     } else {
                         std::path::PathBuf::from("/tmp/ish_history")
@@ -2350,7 +2345,9 @@ fn maybe_rewrite_cd(line: &str, aliases: &AliasMap) -> String {
     {
         // Resolve ~ prefix
         let expanded = if let Some(rest) = first.strip_prefix('~') {
-            let home = std::env::var("HOME").unwrap_or_default();
+            let home = std::env::var_os("HOME")
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             format!("{home}{rest}")
         } else {
             first.to_string()

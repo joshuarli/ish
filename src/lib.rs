@@ -1,5 +1,12 @@
+use std::ffi::OsStr;
+
 /// Set an environment variable. Single-threaded shell -- always safe.
 pub fn shell_setenv(key: &str, val: &str) {
+    unsafe { std::env::set_var(key, val) }
+}
+
+/// Set an environment variable from an OS string. Single-threaded shell -- always safe.
+pub fn shell_setenv_os(key: &str, val: impl AsRef<OsStr>) {
     unsafe { std::env::set_var(key, val) }
 }
 

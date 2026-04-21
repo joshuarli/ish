@@ -815,7 +815,7 @@ fn prompt_shorten_pwd_adversarial() {
 #[test]
 fn config_load_all_paths() {
     // Consolidate config load tests into one to avoid XDG_CONFIG_HOME races.
-    let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
 
     // 1. Nonexistent config — should not panic
     let empty_dir = tempdir_with_files(&[]);
@@ -842,7 +842,9 @@ fn config_load_all_paths() {
     let mut epsh = epsh::eval::Shell::new();
     config::load(&mut aliases, &mut epsh, None);
     assert_eq!(
-        std::env::var("ISH_TEST_CFG_LOAD_VAR").unwrap(),
+        std::env::var_os("ISH_TEST_CFG_LOAD_VAR")
+            .unwrap()
+            .to_string_lossy(),
         "hello world"
     );
     assert_eq!(aliases.get("ll").unwrap(), &["ls", "-la"]);
@@ -877,7 +879,12 @@ fn config_load_all_paths() {
     let mut aliases = AliasMap::new();
     let mut epsh = epsh::eval::Shell::new();
     config::load(&mut aliases, &mut epsh, None);
-    assert_eq!(std::env::var("ISH_TEST_CFG_NOVAL").unwrap(), "");
+    assert_eq!(
+        std::env::var_os("ISH_TEST_CFG_NOVAL")
+            .unwrap()
+            .to_string_lossy(),
+        ""
+    );
 
     // Restore
     match old_xdg {

@@ -4,6 +4,8 @@
 //! macOS: falls back to pipe+fcntl, getdtablesize loop.
 
 use std::os::fd::RawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 
 /// Create a pipe with O_CLOEXEC on both ends.
 /// Linux: 1 syscall (pipe2). macOS: 3 syscalls (pipe + 2x fcntl).
@@ -115,8 +117,8 @@ pub unsafe fn exec_command(cmd: &std::ffi::CStr, argv: *const *const libc::c_cha
 
         // Search PATH using execveat: open each dir as fd, try exec relative to it.
         // No path string allocation — the kernel resolves cmd within the directory.
-        if let Ok(path_var) = std::env::var("PATH") {
-            for dir in path_var.split(':') {
+        if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in path_var.as_os_str().as_bytes().split(|&b| b == b':') {
                 if dir.is_empty() {
                     continue;
                 }
