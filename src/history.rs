@@ -824,32 +824,29 @@ impl History {
         results.clear();
 
         if query.is_empty() {
-            results.extend(
-                (0..self.offsets.len())
-                    .rev()
-                    .filter(|&idx| self.is_session_visible(idx))
-                    .map(|idx| FuzzyMatch {
-                        entry_idx: idx,
-                        match_positions: [0; 32],
-                        match_count: 0,
-                        score: 0,
-                    }),
-            );
+            results.extend((0..self.offsets.len()).rev().map(|idx| FuzzyMatch {
+                entry_idx: idx,
+                match_positions: [0; 32],
+                match_count: 0,
+                score: 0,
+            }));
             return;
         }
 
         let query_lower = lowercase_query(query);
         for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
-            if !self.is_session_visible(idx) {
-                continue;
-            }
             let entry = &self.arena[start as usize..start as usize + len as usize];
             if let Some(m) = classify_match(&query_lower, entry, idx) {
                 results.push(m);
             }
         }
 
-        results.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx)));
+        results.sort_unstable_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then(self.local[b.entry_idx].cmp(&self.local[a.entry_idx]))
+                .then(b.entry_idx.cmp(&a.entry_idx))
+        });
     }
 
     fn is_session_visible(&self, idx: usize) -> bool {
