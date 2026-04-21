@@ -167,8 +167,6 @@ impl PtyShell {
                 .env("PWD", &cwd_str)
                 .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
                 .env("TERM", "xterm-256color")
-                .env("XDG_CONFIG_HOME", format!("{home_path}/.config"))
-                .env("XDG_DATA_HOME", format!("{home_path}/.local/share"))
                 .current_dir(&cwd);
             for (key, value) in extra_env {
                 cmd.env(key, value);

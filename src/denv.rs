@@ -392,10 +392,7 @@ fn data_dir() -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("DENV_DATA_DIR") {
         return Ok(PathBuf::from(path));
     }
-    if let Some(path) = env::var_os("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(path).join("denv"));
-    }
-    let home = env::var_os("HOME").ok_or("HOME, XDG_DATA_HOME, and DENV_DATA_DIR are all unset")?;
+    let home = env::var_os("HOME").ok_or("HOME and DENV_DATA_DIR are unset")?;
     Ok(PathBuf::from(home).join(".local/share/denv"))
 }
 

@@ -7,8 +7,8 @@
 
 set -euo pipefail
 
-fish_history="${XDG_DATA_HOME:-$HOME/.local/share}/fish/fish_history"
-ish_history="${XDG_DATA_HOME:-$HOME/.local/share}/ish/history"
+fish_history="$HOME/.local/share/fish/fish_history"
+ish_history="$HOME/.local/share/ish/history"
 
 if [[ ! -f "$fish_history" ]]; then
     printf 'error: fish history not found at %s\n' "$fish_history" >&2

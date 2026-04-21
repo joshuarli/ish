@@ -1044,9 +1044,11 @@ fn memchr_count(needle: u8, haystack: &[u8]) -> usize {
 }
 
 fn history_path() -> PathBuf {
-    if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(data).join("ish/history")
-    } else if let Some(home) = std::env::var_os("HOME") {
+    history_path_for_home(std::env::var_os("HOME").as_deref())
+}
+
+fn history_path_for_home(home: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(home) = home {
         PathBuf::from(home).join(".local/share/ish/history")
     } else {
         PathBuf::from("/tmp/ish_history")
@@ -1090,21 +1092,10 @@ mod tests {
     }
 
     #[test]
-    fn history_path_uses_non_utf8_xdg_data_home() {
-        let key = "XDG_DATA_HOME";
-        let saved = std::env::var_os(key);
+    fn history_path_uses_non_utf8_home() {
         let raw = OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xf0, 0x80, 0x80, b'h']);
-
-        crate::shell_setenv_os(key, &raw);
-        let path = history_path();
-
-        if let Some(saved) = saved {
-            crate::shell_setenv_os(key, saved);
-        } else {
-            crate::shell_unsetenv(key);
-        }
-
-        assert_eq!(path, PathBuf::from(raw).join("ish/history"));
+        let path = history_path_for_home(Some(raw.as_os_str()));
+        assert_eq!(path, PathBuf::from(raw).join(".local/share/ish/history"));
     }
 
     #[test]

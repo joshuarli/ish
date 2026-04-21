@@ -51,7 +51,7 @@ Fuzzy search opens a pager with matching characters highlighted in yellow. Up/Do
 
 **Scored ranking**: results are ranked by match quality, not just recency. Contiguous matches (searching "target" finds literal `target/release/` first), word-boundary alignment (`deb` prefers `debug/` over scattered d-e-b), and PWD context (entries mentioning the current project rank higher). Optimal alignment via forward+backward scan finds the tightest match window — "test" in "the best test" finds the contiguous "test" at the end, not scattered letters.
 
-Stored at `~/.local/share/ish/history` (or `$XDG_DATA_HOME/ish/history`). Deduplicated on add.
+Stored at `~/.local/share/ish/history`. Deduplicated on add.
 
 ### File Finder
 
@@ -172,7 +172,7 @@ Automatic `.envrc`/`.env` loading when [denv](https://github.com/joshuarli/denv)
 
 ### Config
 
-`~/.config/ish/config.ish` (or `$XDG_CONFIG_HOME/ish/config.ish`):
+`~/.config/ish/config.ish`:
 
 ```
 # Environment

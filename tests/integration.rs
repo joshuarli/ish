@@ -814,22 +814,19 @@ fn prompt_shorten_pwd_adversarial() {
 
 #[test]
 fn config_load_all_paths() {
-    // Consolidate config load tests into one to avoid XDG_CONFIG_HOME races.
-    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-
     // 1. Nonexistent config — should not panic
     let empty_dir = tempdir_with_files(&[]);
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", empty_dir.to_str().unwrap()) };
+    let missing_config = empty_dir.join("missing.ish");
     let mut aliases = AliasMap::new();
     let mut epsh = epsh::eval::Shell::new();
-    config::load(&mut aliases, &mut epsh, None);
+    config::load(&mut aliases, &mut epsh, Some(missing_config.as_os_str()));
 
     // 2. Full config with set, alias, comments, bad lines
     let dir = tempdir_with_files(&[]);
-    let config_dir = dir.join("ish");
-    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = dir.join(".config/ish/config.ish");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
     std::fs::write(
-        config_dir.join("config.ish"),
+        &config_path,
         "# comment line\n\
          set ISH_TEST_CFG_LOAD_VAR \"hello world\"\n\
          alias ll ls -la\n\
@@ -837,10 +834,9 @@ fn config_load_all_paths() {
          badline\n",
     )
     .unwrap();
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.to_str().unwrap()) };
     let mut aliases = AliasMap::new();
     let mut epsh = epsh::eval::Shell::new();
-    config::load(&mut aliases, &mut epsh, None);
+    config::load(&mut aliases, &mut epsh, Some(config_path.as_os_str()));
     assert_eq!(
         std::env::var_os("ISH_TEST_CFG_LOAD_VAR")
             .unwrap()
@@ -851,46 +847,37 @@ fn config_load_all_paths() {
 
     // 3. Empty set name — error but no panic
     let dir2 = tempdir_with_files(&[]);
-    let config_dir2 = dir2.join("ish");
-    std::fs::create_dir_all(&config_dir2).unwrap();
-    std::fs::write(config_dir2.join("config.ish"), "set  \n").unwrap();
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", dir2.to_str().unwrap()) };
+    let config_path2 = dir2.join(".config/ish/config.ish");
+    std::fs::create_dir_all(config_path2.parent().unwrap()).unwrap();
+    std::fs::write(&config_path2, "set  \n").unwrap();
     let mut aliases = AliasMap::new();
     let mut epsh = epsh::eval::Shell::new();
-    config::load(&mut aliases, &mut epsh, None);
+    config::load(&mut aliases, &mut epsh, Some(config_path2.as_os_str()));
 
     // 4. Alias without expansion — should not be added
     let dir3 = tempdir_with_files(&[]);
-    let config_dir3 = dir3.join("ish");
-    std::fs::create_dir_all(&config_dir3).unwrap();
-    std::fs::write(config_dir3.join("config.ish"), "alias myalias\n").unwrap();
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", dir3.to_str().unwrap()) };
+    let config_path3 = dir3.join(".config/ish/config.ish");
+    std::fs::create_dir_all(config_path3.parent().unwrap()).unwrap();
+    std::fs::write(&config_path3, "alias myalias\n").unwrap();
     let mut aliases = AliasMap::new();
     let mut epsh = epsh::eval::Shell::new();
-    config::load(&mut aliases, &mut epsh, None);
+    config::load(&mut aliases, &mut epsh, Some(config_path3.as_os_str()));
     assert!(aliases.get("myalias").is_none());
 
     // 5. set VAR with no value → empty string
     let dir4 = tempdir_with_files(&[]);
-    let config_dir4 = dir4.join("ish");
-    std::fs::create_dir_all(&config_dir4).unwrap();
-    std::fs::write(config_dir4.join("config.ish"), "set ISH_TEST_CFG_NOVAL\n").unwrap();
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", dir4.to_str().unwrap()) };
+    let config_path4 = dir4.join(".config/ish/config.ish");
+    std::fs::create_dir_all(config_path4.parent().unwrap()).unwrap();
+    std::fs::write(&config_path4, "set ISH_TEST_CFG_NOVAL\n").unwrap();
     let mut aliases = AliasMap::new();
     let mut epsh = epsh::eval::Shell::new();
-    config::load(&mut aliases, &mut epsh, None);
+    config::load(&mut aliases, &mut epsh, Some(config_path4.as_os_str()));
     assert_eq!(
         std::env::var_os("ISH_TEST_CFG_NOVAL")
             .unwrap()
             .to_string_lossy(),
         ""
     );
-
-    // Restore
-    match old_xdg {
-        Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-        None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-    }
 }
 
 // ---------------------------------------------------------------------------

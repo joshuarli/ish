@@ -143,9 +143,11 @@ fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut 
 }
 
 fn config_path() -> PathBuf {
-    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(config).join("ish/config.ish")
-    } else if let Some(home) = std::env::var_os("HOME") {
+    config_path_for_home(std::env::var_os("HOME").as_deref())
+}
+
+fn config_path_for_home(home: Option<&OsStr>) -> PathBuf {
+    if let Some(home) = home {
         PathBuf::from(home).join(".config/ish/config.ish")
     } else {
         PathBuf::from("/etc/ish/config.ish")
@@ -159,20 +161,9 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     #[test]
-    fn config_path_uses_non_utf8_xdg_config_home() {
-        let key = "XDG_CONFIG_HOME";
-        let saved = std::env::var_os(key);
+    fn config_path_uses_non_utf8_home() {
         let raw = OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xf0, 0x80, 0x80, b'x']);
-
-        crate::shell_setenv_os(key, &raw);
-        let path = config_path();
-
-        if let Some(saved) = saved {
-            crate::shell_setenv_os(key, saved);
-        } else {
-            crate::shell_unsetenv(key);
-        }
-
-        assert_eq!(path, PathBuf::from(raw).join("ish/config.ish"));
+        let path = config_path_for_home(Some(raw.as_os_str()));
+        assert_eq!(path, PathBuf::from(raw).join(".config/ish/config.ish"));
     }
 }

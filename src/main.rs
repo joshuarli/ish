@@ -2137,9 +2137,7 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                 }
                 "history" => {
                     // In a pipeline context — read from text file
-                    let path = if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
-                        std::path::PathBuf::from(data).join("ish/history")
-                    } else if let Some(home) = std::env::var_os("HOME") {
+                    let path = if let Some(home) = std::env::var_os("HOME") {
                         std::path::PathBuf::from(home).join(".local/share/ish/history")
                     } else {
                         std::path::PathBuf::from("/tmp/ish_history")
