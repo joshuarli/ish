@@ -124,8 +124,15 @@ fn current_dir_from_env() -> PathBuf {
 
 fn refresh(force: bool) -> Result<Vec<EnvChange>, String> {
     let cwd = current_dir_from_env();
-    let found = find_env_files(&cwd);
     let pid = std::process::id().to_string();
+
+    // Fast path: skip the parent-directory walk entirely. Go straight to the
+    // cached dir and stat only files that previously existed.
+    if !force && state_var_fast_path_ok(&cwd) {
+        return Ok(Vec::new());
+    }
+
+    let found = find_env_files(&cwd);
 
     if !force && let Some(ref found) = found {
         if state_var_matches(found) {
@@ -299,6 +306,36 @@ fn parse_denv_state(s: &str) -> Option<(u64, u64, &str)> {
     let (envrc_str, rest) = s.split_once(' ')?;
     let (dotenv_str, dir) = rest.split_once(' ')?;
     Some((envrc_str.parse().ok()?, dotenv_str.parse().ok()?, dir))
+}
+
+fn state_var_fast_path_ok(cwd: &Path) -> bool {
+    let Ok(state) = env::var("__DENV_STATE") else {
+        return false;
+    };
+    let Some((envrc_mtime, dotenv_mtime, dir)) = parse_denv_state(&state) else {
+        return false;
+    };
+    let cached = Path::new(dir);
+    if !cwd.starts_with(cached) {
+        return false;
+    }
+
+    let envrc_ok = envrc_mtime == 0
+        || cached
+            .join(".envrc")
+            .metadata()
+            .ok()
+            .is_some_and(|meta| meta.is_file() && meta.mtime() as u64 == envrc_mtime);
+    if !envrc_ok {
+        return false;
+    }
+
+    dotenv_mtime == 0
+        || cached
+            .join(".env")
+            .metadata()
+            .ok()
+            .is_some_and(|meta| meta.is_file() && meta.mtime() as u64 == dotenv_mtime)
 }
 
 fn state_var_matches(found: &EnvFiles) -> bool {
@@ -815,6 +852,32 @@ pub fn apply_bash_output_bench(output: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("{prefix}_{}_{}", std::process::id(), unique));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn parse_dotenv_skips_empty_and_comments() {
@@ -896,5 +959,32 @@ mod tests {
     fn apply_bash_output_bench_counts_directives() {
         let count = apply_bash_output_bench("export A='1';\nunset B;\nexport C='3';");
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn state_var_fast_path_ok_uses_cached_dir() {
+        let tmp = TempDir::new("ish_denv_fast_path");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let envrc = project.join(".envrc");
+        std::fs::write(&envrc, "export OK=1\n").unwrap();
+        let mtime = std::fs::metadata(&envrc).unwrap().mtime() as u64;
+        let state = format!("{mtime} 0 {}", project.display());
+
+        // SAFETY: tests run in a single process; this test sets and restores
+        // only the env vars it uses.
+        unsafe {
+            std::env::set_var("__DENV_STATE", &state);
+        }
+        assert!(state_var_fast_path_ok(&project));
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&envrc, "export OK=2\n").unwrap();
+        assert!(!state_var_fast_path_ok(&project));
+
+        // SAFETY: see comment above.
+        unsafe {
+            std::env::remove_var("__DENV_STATE");
+        }
     }
 }
