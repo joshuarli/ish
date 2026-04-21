@@ -1042,6 +1042,10 @@ fn find_substring_icase(query: &[char], text: &str, boundary_only: bool) -> Opti
         return Some(0);
     }
 
+    if text.is_ascii() && query.iter().all(|c| c.is_ascii()) {
+        return find_substring_icase_ascii(query, text.as_bytes(), boundary_only);
+    }
+
     let chars: Vec<char> = text.chars().collect();
     if query.len() > chars.len() {
         return None;
@@ -1058,6 +1062,26 @@ fn find_substring_icase(query: &[char], text: &str, boundary_only: bool) -> Opti
         {
             return Some(start);
         }
+    }
+
+    None
+}
+
+fn find_substring_icase_ascii(query: &[char], text: &[u8], boundary_only: bool) -> Option<usize> {
+    if query.len() > text.len() {
+        return None;
+    }
+
+    'start: for start in 0..=text.len() - query.len() {
+        if boundary_only && start > 0 && !is_word_boundary_byte(text[start - 1]) {
+            continue;
+        }
+        for (offset, &q) in query.iter().enumerate() {
+            if text[start + offset].to_ascii_lowercase() != q as u8 {
+                continue 'start;
+            }
+        }
+        return Some(start);
     }
 
     None
@@ -1251,6 +1275,10 @@ fn backward_unicode(chars: &[(usize, char)], query: &[char], end: usize) -> usiz
 
 fn is_word_boundary_char(c: char) -> bool {
     matches!(c, '/' | '-' | '_' | '.' | ' ' | '\t')
+}
+
+fn is_word_boundary_byte(b: u8) -> bool {
+    matches!(b, b'/' | b'-' | b'_' | b'.' | b' ' | b'\t')
 }
 
 /// Compatibility helper retained for benchmarks.
