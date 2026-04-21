@@ -64,6 +64,7 @@ enum Mode {
         matches: Vec<FuzzyMatch>,
         candidates: Vec<usize>,
         scratch: Vec<usize>,
+        candidate_stack: Vec<(usize, Vec<usize>)>,
         selected: usize,
         saved_line: String,
     },
@@ -602,6 +603,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         matches,
                                         candidates,
                                         scratch,
+                                        candidate_stack: Vec::new(),
                                         selected: 0,
                                         saved_line: saved_line.clone(),
                                     };
@@ -799,10 +801,18 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         matches,
                         candidates,
                         scratch,
+                        candidate_stack,
                         selected,
                         saved_line,
                     } => match handle_history_search_key(
-                        key, query, matches, candidates, scratch, selected, shell,
+                        key,
+                        query,
+                        matches,
+                        candidates,
+                        scratch,
+                        candidate_stack,
+                        selected,
+                        shell,
                     ) {
                         HistAction::Continue => {
                             region = render_history_mode(
@@ -1706,6 +1716,7 @@ fn handle_history_search_key(
     matches: &mut Vec<FuzzyMatch>,
     candidates: &mut Vec<usize>,
     scratch: &mut Vec<usize>,
+    candidate_stack: &mut Vec<(usize, Vec<usize>)>,
     selected: &mut usize,
     shell: &Shell,
 ) -> HistAction {
@@ -1789,12 +1800,47 @@ fn handle_history_search_key(
             && query.cursor() == new_text.len()
             && new_text.len() > prev_text.len()
             && new_text.starts_with(&prev_text);
+        let delete_at_end = prev_cursor == prev_text.len()
+            && query.cursor() == new_text.len()
+            && new_text.len() < prev_text.len()
+            && prev_text.starts_with(new_text);
         if append_at_end {
-            shell
-                .history
-                .fuzzy_search_subset_into(new_text, candidates, scratch, matches, 200);
+            candidate_stack.push((prev_text.len(), std::mem::take(candidates)));
+            shell.history.fuzzy_search_subset_into(
+                new_text,
+                &candidate_stack.last().unwrap().1,
+                scratch,
+                matches,
+                200,
+            );
             std::mem::swap(candidates, scratch);
+        } else if delete_at_end {
+            while candidate_stack
+                .last()
+                .is_some_and(|(len, _)| *len > new_text.len())
+            {
+                if let Some((_, old_candidates)) = candidate_stack.pop() {
+                    *scratch = old_candidates;
+                }
+            }
+            if let Some((len, _)) = candidate_stack.last()
+                && *len == new_text.len()
+            {
+                let (_, old_candidates) = candidate_stack.pop().unwrap();
+                *candidates = old_candidates;
+                shell
+                    .history
+                    .fuzzy_search_subset_into(new_text, candidates, scratch, matches, 200);
+            } else {
+                candidate_stack.clear();
+                shell.history.visible_entry_indices_into(scratch);
+                shell
+                    .history
+                    .fuzzy_search_subset_into(new_text, scratch, candidates, matches, 200);
+                std::mem::swap(candidates, scratch);
+            }
         } else {
+            candidate_stack.clear();
             shell.history.visible_entry_indices_into(scratch);
             shell
                 .history
