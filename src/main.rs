@@ -1412,6 +1412,7 @@ fn start_completion(
             cols,
             rows,
             scroll: 0,
+            term_cols,
             dir_prefix: String::new(),
             in_quote: false,
         };
@@ -1442,6 +1443,7 @@ fn start_completion(
                     cols,
                     rows,
                     scroll: 0,
+                    term_cols,
                     dir_prefix,
                     in_quote,
                 };
@@ -1460,6 +1462,7 @@ fn start_completion(
                     cols,
                     rows,
                     scroll: 0,
+                    term_cols,
                     dir_prefix: String::new(),
                     in_quote,
                 };
@@ -1492,6 +1495,7 @@ fn start_completion(
             cols,
             rows,
             scroll: 0,
+            term_cols,
             dir_prefix,
             in_quote,
         };
@@ -1537,6 +1541,7 @@ fn start_completion(
             cols,
             rows,
             scroll: 0,
+            term_cols,
             dir_prefix: user_root,
             in_quote,
         };
@@ -1549,6 +1554,7 @@ fn start_completion(
         cols: 0,
         rows: 0,
         scroll: 0,
+        term_cols,
         dir_prefix: String::new(),
         in_quote,
     }

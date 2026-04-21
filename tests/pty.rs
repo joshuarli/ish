@@ -1445,6 +1445,81 @@ fn tab_completion_directory() {
 }
 
 #[test]
+fn tab_completion_with_wide_dir_name_restores_prompt_cursor() {
+    let sh = PtyShell::spawn_with_size(
+        &[
+            ("Sync/M/Music/bandcamp/Altered States/.keep", ""),
+            ("Sync/M/Music/bandcamp/Another Language/.keep", ""),
+            ("Sync/M/Music/bandcamp/Dreamage/.keep", ""),
+            (
+                "Sync/M/Music/bandcamp/黑馬河的兒子 The Son of Black Horse River/.keep",
+                "",
+            ),
+            ("Sync/M/Music/bandcamp/Arigto - Lungs/.keep", ""),
+            (
+                "Sync/M/Music/bandcamp/01 - Charlotte de Witte - Sehnsucht (Original Mix) [56812652].mp3",
+                "",
+            ),
+            (
+                "Sync/M/Music/bandcamp/Floating Points, Pharoah Sanders & The London Symphony Orchestra - Promises [Movement 6] [FQdLWlvgHOg].m4a",
+                "",
+            ),
+        ],
+        &[],
+        24,
+        80,
+    );
+
+    let cmd = "/Applications/Play.app/Contents/MacOS/play ~/Sync/M/Music/bandcamp/";
+    let frames = run_trace(
+        &sh,
+        24,
+        80,
+        &[
+            TraceStep {
+                label: "type cmd",
+                input: TraceInput::Text(cmd),
+                settle_ms: 150,
+                read_ms: 600,
+            },
+            TraceStep {
+                label: "tab",
+                input: TraceInput::Bytes(b"\t"),
+                settle_ms: 200,
+                read_ms: 800,
+            },
+        ],
+    );
+
+    let before_tab = &frames[0];
+    let frame = frames.last().unwrap();
+    assert_frame_contains_once(frame, "Altered States/");
+    assert_frame_contains_once(frame, "Another Language/");
+    assert_frame_contains_once(frame, "Dreamage/");
+    assert!(
+        frame
+            .snapshot
+            .visible
+            .contains("黑馬河的兒子 The Son of Black Horse River/"),
+        "expected wide directory entry in completion grid: {:?}",
+        frame.snapshot
+    );
+    assert_eq!(
+        frame.snapshot.cursor_row, before_tab.snapshot.cursor_row,
+        "expected prompt cursor row to be restored after completion render: before={:?} after={:?}",
+        before_tab.snapshot, frame.snapshot
+    );
+    assert_eq!(
+        frame.snapshot.cursor_col, before_tab.snapshot.cursor_col,
+        "expected prompt cursor column to be restored after completion render: before={:?} after={:?}",
+        before_tab.snapshot, frame.snapshot
+    );
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
 fn file_picker_narrow_repaint_does_not_stack_rows() {
     let sh = PtyShell::spawn_with_size(&[("abc1", ""), ("abc2", ""), ("abc3", "")], &[], 24, 8);
     sh.ctrl_f();
