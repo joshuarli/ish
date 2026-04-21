@@ -2264,6 +2264,36 @@ fn history_persisted_across_commands() {
 }
 
 #[test]
+fn history_autosuggest_ignores_later_global_entries() {
+    use std::io::Write;
+
+    let sh = PtyShell::spawn_with_opts(&[], &["echo startup"]);
+    let hist_path = sh.home_path().join(".local/share/ish/history");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&hist_path)
+        .unwrap()
+        .write_all(b"echo later_global\n")
+        .unwrap();
+
+    sh.ctrl_r();
+    sh.wait_for("search:", 2000);
+    sh.escape();
+    sh.wait_for_prompt(2000);
+
+    sh.type_str("echo l");
+    sh.right();
+    sh.enter();
+    let out = sh.wait_for_prompt(2000);
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        !text.contains("later_global"),
+        "later global history entry leaked into autosuggest acceptance: {text:?}"
+    );
+}
+
+#[test]
 fn true_and_false_builtins() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("true && echo ok");

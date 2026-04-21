@@ -987,7 +987,7 @@ fn render_prompt_region(
     let suggestion = if text.len() >= 3 && !line.has_newlines() && line.cursor() == text.len() {
         shell
             .history
-            .prefix_search(text, 0)
+            .session_prefix_search(text, 0)
             .and_then(|entry| entry.strip_prefix(text))
             .unwrap_or("")
     } else {
@@ -1179,7 +1179,7 @@ fn handle_normal_key(
         (Key::Right, _, _) => {
             if line.cursor() >= line.text().len() && !line.has_newlines() {
                 // At end of line — accept autosuggestion from history
-                if let Some(entry) = shell.history.prefix_search(line.text(), 0) {
+                if let Some(entry) = shell.history.session_prefix_search(line.text(), 0) {
                     let owned = entry.to_string();
                     line.set(&owned);
                 }
