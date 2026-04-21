@@ -53,7 +53,7 @@ test-ci:
 	@OUT=$$(cargo test --quiet --release 2>&1) || { echo "$$OUT"; exit 1; }
 
 setup:
-	prek install --install-hooks
+	prek install --prepare-hooks -f
 
 pc:
 	prek --quiet run --all-files
