@@ -1138,25 +1138,27 @@ fn tilde_expansion() {
 
 #[test]
 fn history_up_arrow() {
-    let sh = PtyShell::spawn_with_opts(&[], &["echo from_history"]);
+    let sh = PtyShell::spawn_with_opts(&[], &["echo from_global"]);
+    sh.run_command("echo local_one");
+    sh.run_command("echo local_two");
+    sh.up();
+    sh.up();
     sh.up();
     sh.enter();
     let out = sh.wait_for_prompt(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
-        text.contains("from_history"),
-        "expected 'from_history' in output: {text:?}"
+        text.contains("from_global"),
+        "expected startup history entry after local entries: {text:?}"
     );
 }
 
 #[test]
 fn history_up_narrow_repaint_clears_wrapped_rows() {
-    let sh = PtyShell::spawn_with_size(
-        &[],
-        &["echo ok", "echo WRAPMARK12345678901234567890", "echo newer"],
-        24,
-        12,
-    );
+    let sh = PtyShell::spawn_with_size(&[], &[], 24, 12);
+    sh.run_command("echo ok");
+    sh.run_command("echo WRAPMARK12345678901234567890");
+    sh.run_command("echo newer");
     sh.up();
     sh.up();
     sh.up();

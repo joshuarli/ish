@@ -5,6 +5,7 @@
 //! completion, config parsing, etc.).
 
 use std::collections::HashSet;
+use std::io::Write;
 
 use ish::alias::AliasMap;
 use ish::builtin;
@@ -1474,6 +1475,46 @@ fn history_file_io() {
     // Reload and verify dedup
     let h2 = History::load_from(hist_file);
     assert!(h2.len() >= 2);
+}
+
+#[test]
+fn history_up_arrow_uses_session_start_boundary() {
+    let dir = tempdir_with_files(&[]);
+    let hist_file = dir.join("history");
+    std::fs::write(&hist_file, "echo global one\necho global two\n").unwrap();
+
+    let mut h = History::load_from(hist_file.clone());
+    assert_eq!(h.session_get(0), Some("echo global two"));
+    assert_eq!(
+        h.session_prefix_search("echo global", 0),
+        Some("echo global two")
+    );
+
+    h.add("echo local one");
+    assert_eq!(h.session_get(0), Some("echo local one"));
+    assert_eq!(h.session_get(1), Some("echo global two"));
+    assert_eq!(
+        h.session_prefix_search("echo local", 0),
+        Some("echo local one")
+    );
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&hist_file)
+        .unwrap()
+        .write_all(b"echo global three\n")
+        .unwrap();
+    h.sync();
+
+    assert_eq!(h.session_get(0), Some("echo local one"));
+    assert_eq!(h.session_get(1), Some("echo global two"));
+    assert_eq!(
+        h.session_prefix_search("echo global", 0),
+        Some("echo global two")
+    );
+    assert_eq!(h.prefix_search("echo global", 0), Some("echo global three"));
 }
 
 // ---------------------------------------------------------------------------

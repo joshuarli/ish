@@ -41,10 +41,13 @@ pub struct History {
     /// Byte offset into the text file we've read up to. Enables incremental
     /// sync — only new bytes appended by other shells are read.
     file_pos: u64,
-    /// Per-entry flag: true if the entry was loaded at startup or added by
-    /// this shell session (`add()`). Up-arrow navigation uses only local
-    /// entries; Ctrl+R and autosuggestion search everything.
+    /// Per-entry flag: true if the entry was added by this shell session
+    /// (`add()`).
     local: Vec<bool>,
+    /// Entries with timestamps at or before this boundary are considered part
+    /// of the session-visible history. Up-arrow sees those entries plus any
+    /// entry added by this shell.
+    session_cutoff: u32,
     /// Set when the cache was corrupt at load time. Prevents overwriting the
     /// (possibly recoverable) cache file until the user resolves it.
     cache_dirty: bool,
@@ -62,6 +65,7 @@ impl History {
             Ok(Some(mut hist)) => {
                 // Cache loaded — sync any new entries from the text file
                 hist.sync();
+                hist.session_cutoff = now_secs();
                 hist
             }
             Ok(None) => {
@@ -71,6 +75,7 @@ impl History {
                 if !hist.offsets.is_empty() {
                     hist.save_cache();
                 }
+                hist.session_cutoff = now_secs();
                 hist
             }
             Err(()) => {
@@ -80,6 +85,7 @@ impl History {
                 let mut hist = Self::load_from_text(&path);
                 hist.file_pos = fs::metadata(&hist.path).map(|m| m.len()).unwrap_or(0);
                 hist.cache_dirty = true;
+                hist.session_cutoff = now_secs();
                 hist
             }
         }
@@ -91,6 +97,7 @@ impl History {
         let mut fresh = Self::load_from_text(&self.path);
         fresh.file_pos = fs::metadata(&fresh.path).map(|m| m.len()).unwrap_or(0);
         fresh.cache_dirty = false;
+        fresh.session_cutoff = now_secs();
         fresh.save_cache();
         eprintln!(
             "ish: rebuilt history cache — {} entries",
@@ -144,7 +151,8 @@ impl History {
             hashes,
             path: path.to_path_buf(),
             file_pos: 0,
-            local: vec![true; count],
+            local: vec![false; count],
+            session_cutoff: 0,
             cache_dirty: false,
         }
     }
@@ -241,7 +249,8 @@ impl History {
             hashes,
             path: path.to_path_buf(),
             file_pos: 0,
-            local: vec![true; count],
+            local: vec![false; count],
+            session_cutoff: 0,
             cache_dirty: false,
         })
     }
@@ -311,7 +320,8 @@ impl History {
             hashes,
             path: path.to_path_buf(),
             file_pos: 0,
-            local: vec![true; count],
+            local: vec![false; count],
+            session_cutoff: 0,
             cache_dirty: false,
         })
     }
@@ -359,21 +369,16 @@ impl History {
             }
             let h = hash_str(line);
             if self.hashes.contains(&h) {
-                // If a local entry already has this command, skip —
-                // don't disturb the session's up-arrow timeline.
-                let any_local =
-                    self.offsets
-                        .iter()
-                        .zip(self.local.iter())
-                        .any(|(&(start, len), &is_local)| {
-                            is_local
-                                && &self.arena[start as usize..start as usize + len as usize]
-                                    == line
-                        });
-                if any_local {
+                // Don't let a newer hidden duplicate disturb the entries this
+                // session can still recall with Up-arrow.
+                if self.offsets.iter().enumerate().any(|(i, &(start, len))| {
+                    self.is_session_visible(i)
+                        && &self.arena[start as usize..start as usize + len as usize] == line
+                }) {
                     continue;
                 }
-                // Remove old non-local duplicate, re-add at end
+                // Remove old hidden duplicate, re-add at end with fresh
+                // recency for global searches.
                 let mut i = 0;
                 while i < self.offsets.len() {
                     let (start, len) = self.offsets[i];
@@ -530,7 +535,8 @@ impl History {
             hashes,
             path: PathBuf::from("/dev/null"),
             file_pos: 0,
-            local: vec![true; count],
+            local: vec![false; count],
+            session_cutoff: ts,
             cache_dirty: false,
         }
     }
@@ -598,26 +604,28 @@ impl History {
             .nth(skip)
     }
 
-    /// Get the `skip`'th local entry from the end (for up-arrow navigation).
-    /// Local entries are those loaded at startup or added by this session.
-    pub fn local_get(&self, skip: usize) -> Option<&str> {
+    /// Get the `skip`'th session-visible entry from the end (for up-arrow
+    /// navigation). Session-visible entries are those present when the shell
+    /// started plus those added by this shell.
+    pub fn session_get(&self, skip: usize) -> Option<&str> {
         self.offsets
             .iter()
-            .zip(self.local.iter())
+            .enumerate()
             .rev()
-            .filter(|&(_, &is_local)| is_local)
+            .filter(|&(i, _)| self.is_session_visible(i))
             .nth(skip)
-            .map(|(&(start, len), _)| &self.arena[start as usize..start as usize + len as usize])
+            .map(|(_, &(start, len))| &self.arena[start as usize..start as usize + len as usize])
     }
 
-    /// Prefix search over local entries only (for up-arrow with partial input).
-    pub fn local_prefix_search(&self, prefix: &str, skip: usize) -> Option<&str> {
+    /// Prefix search over session-visible entries only (for up-arrow with
+    /// partial input).
+    pub fn session_prefix_search(&self, prefix: &str, skip: usize) -> Option<&str> {
         self.offsets
             .iter()
-            .zip(self.local.iter())
+            .enumerate()
             .rev()
-            .filter(|&(_, &is_local)| is_local)
-            .filter_map(|(&(start, len), _)| {
+            .filter(|&(i, _)| self.is_session_visible(i))
+            .filter_map(|(_, &(start, len))| {
                 let s = &self.arena[start as usize..start as usize + len as usize];
                 s.starts_with(prefix).then_some(s)
             })
@@ -727,6 +735,10 @@ impl History {
         }
 
         results.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx)));
+    }
+
+    fn is_session_visible(&self, idx: usize) -> bool {
+        self.local[idx] || self.timestamps[idx] <= self.session_cutoff
     }
 }
 
