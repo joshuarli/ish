@@ -568,10 +568,13 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, layout: &CompletionGr
         let row = layout.scroll_start + vr;
         tw.carriage_return();
         tw.clear_to_end_of_line();
+        // Avoid writing into the terminal's last column: exact-edge writes can
+        // leave the cursor in a terminal-dependent pending-wrap state.
+        let mut remaining_width = state.term_cols.saturating_sub(1) as usize;
 
         for (col, &col_w) in layout.col_widths[..state.cols].iter().enumerate() {
             let idx = col * state.rows + row;
-            if idx >= state.comp.entries.len() {
+            if idx >= state.comp.entries.len() || remaining_width == 0 {
                 break;
             }
             let entry = &state.comp.entries[idx];
@@ -592,7 +595,11 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, layout: &CompletionGr
                 tw.write_str("\x1b[32m");
             }
 
-            state.write_display_name(idx, tw);
+            let has_next = (col + 1..state.cols)
+                .any(|next_col| next_col * state.rows + row < state.comp.entries.len());
+            let reserved_gap = if has_next { 2 } else { 0 };
+            let content_width = col_w.min(remaining_width.saturating_sub(reserved_gap));
+            let written_width = write_completion_name(tw, state, idx, content_width);
 
             if entry.is_host() || entry.is_link() || entry.is_dir() || entry.is_exec() {
                 tw.write_str("\x1b[0m");
@@ -602,19 +609,64 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, layout: &CompletionGr
                 tw.write_str("\x1b[0m");
             }
 
-            let display_w = entry.display_width();
-            let has_next = (col + 1..state.cols)
-                .any(|next_col| next_col * state.rows + row < state.comp.entries.len());
-            let pad = col_w.saturating_sub(display_w) + if has_next { 2 } else { 0 };
+            let desired_pad = if has_next {
+                col_w.saturating_sub(written_width) + reserved_gap
+            } else {
+                0
+            };
+            let pad = desired_pad.min(remaining_width.saturating_sub(written_width));
             for _ in 0..pad {
                 tw.write_str(" ");
             }
+            remaining_width = remaining_width.saturating_sub(written_width + pad);
         }
 
         if vr + 1 < layout.visible_rows {
             tw.write_str("\n");
         }
     }
+}
+
+fn write_completion_name(
+    tw: &mut TermWriter,
+    state: &CompletionState,
+    idx: usize,
+    max_width: usize,
+) -> usize {
+    if max_width == 0 {
+        return 0;
+    }
+
+    let entry = &state.comp.entries[idx];
+    let name = state.comp.entry_name(entry);
+    let mut written = 0;
+
+    for ch in name.chars() {
+        let w = crate::line::char_width(ch);
+        if written + w > max_width {
+            break;
+        }
+        let mut buf = [0u8; 4];
+        tw.write_str(ch.encode_utf8(&mut buf));
+        written += w;
+    }
+
+    let suffix = if entry.is_dir() {
+        Some('/')
+    } else if entry.is_host() {
+        Some(':')
+    } else {
+        None
+    };
+    if let Some(ch) = suffix
+        && written < max_width
+    {
+        let mut buf = [0u8; 4];
+        tw.write_str(ch.encode_utf8(&mut buf));
+        written += 1;
+    }
+
+    written
 }
 
 /// Render the Ctrl+R history search pager.
@@ -1072,7 +1124,12 @@ mod tests {
         (info, tw.as_bytes().to_vec())
     }
 
-    fn completion_state(entries: &[&str], cols: usize, rows: usize) -> CompletionState {
+    fn completion_state(
+        entries: &[&str],
+        cols: usize,
+        rows: usize,
+        term_cols: u16,
+    ) -> CompletionState {
         let mut comp = crate::complete::Completions::new();
         for entry in entries {
             comp.push(entry, false, false, false);
@@ -1083,6 +1140,7 @@ mod tests {
             cols,
             rows,
             scroll: 0,
+            term_cols,
             dir_prefix: String::new(),
             in_quote: false,
         }
@@ -1349,7 +1407,7 @@ mod tests {
 
     #[test]
     fn completion_grid_does_not_pad_last_column() {
-        let state = completion_state(&["12345678"], 1, 1);
+        let state = completion_state(&["12345678"], 1, 1, 80);
         let mut tw = TermWriter::new();
         let layout = layout_completion_grid(&state);
         draw_grid(&mut tw, &state, &layout);
@@ -1357,5 +1415,14 @@ mod tests {
             tw.as_bytes().ends_with(b"12345678"),
             "last column should not add trailing padding"
         );
+    }
+
+    #[test]
+    fn completion_grid_truncates_entry_to_terminal_width() {
+        let state = completion_state(&["123456789"], 1, 1, 8);
+        let mut tw = TermWriter::new();
+        let layout = layout_completion_grid(&state);
+        draw_grid(&mut tw, &state, &layout);
+        assert_eq!(tw.as_bytes(), b"\r\x1b[K1234567");
     }
 }

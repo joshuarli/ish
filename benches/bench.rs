@@ -525,6 +525,7 @@ fn sample_completion_state(cols: u16) -> complete::CompletionState {
         cols: grid_cols,
         rows: grid_rows,
         scroll: 0,
+        term_cols: cols,
         dir_prefix: String::new(),
         in_quote: false,
     }
