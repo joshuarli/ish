@@ -504,6 +504,20 @@ fn scoring_into_matches_search() {
 }
 
 #[test]
+fn scoring_into_respects_limit_without_changing_order() {
+    let entries: Vec<String> = (0..300).map(|i| format!("echo cmd{i:03}")).collect();
+    let h = History::from_entries(entries);
+    let search_results = h.fuzzy_search("echo");
+    let mut into_results = Vec::new();
+    h.fuzzy_search_into("echo", &mut into_results, 200, "");
+    assert_eq!(into_results.len(), 200);
+    for (a, b) in search_results.iter().take(200).zip(into_results.iter()) {
+        assert_eq!(a.entry_idx, b.entry_idx);
+        assert_eq!(a.score, b.score);
+    }
+}
+
+#[test]
 fn history_add_whitespace_only_ignored() {
     let mut h = History::from_entries(vec![]);
     h.add("   ");

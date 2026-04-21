@@ -769,10 +769,7 @@ impl History {
         limit: usize,
         _pwd_basename: &str,
     ) {
-        self.fill_search_results(query, results);
-        if results.len() > limit {
-            results.truncate(limit);
-        }
+        self.fill_search_results_limited(query, results, limit);
     }
 
     /// Get entry text by index.
@@ -849,7 +846,57 @@ impl History {
             }
         }
 
-        results.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx)));
+        results.sort_unstable_by(compare_fuzzy_match);
+    }
+
+    fn fill_search_results_limited(
+        &self,
+        query: &str,
+        results: &mut Vec<FuzzyMatch>,
+        limit: usize,
+    ) {
+        results.clear();
+        if limit == 0 {
+            return;
+        }
+
+        if query.is_empty() {
+            results.extend(
+                (0..self.offsets.len())
+                    .rev()
+                    .filter(|&idx| self.is_session_visible(idx))
+                    .take(limit)
+                    .map(|idx| FuzzyMatch {
+                        entry_idx: idx,
+                        match_positions: [0; 32],
+                        match_count: 0,
+                        score: 0,
+                    }),
+            );
+            return;
+        }
+
+        let query_lower = lowercase_query(query);
+        for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
+            if !self.is_session_visible(idx) {
+                continue;
+            }
+            let entry = &self.arena[start as usize..start as usize + len as usize];
+            let Some(m) = classify_match(&query_lower, entry, idx) else {
+                continue;
+            };
+
+            let insert_at = results
+                .binary_search_by(|existing| compare_fuzzy_match(existing, &m))
+                .unwrap_or_else(|pos| pos);
+            if insert_at >= limit {
+                continue;
+            }
+            results.insert(insert_at, m);
+            if results.len() > limit {
+                results.pop();
+            }
+        }
     }
 
     fn is_session_visible(&self, idx: usize) -> bool {
@@ -905,6 +952,10 @@ impl History {
                 .insert(hash_str(self.entry_text(idx)), idx);
         }
     }
+}
+
+fn compare_fuzzy_match(a: &FuzzyMatch, b: &FuzzyMatch) -> std::cmp::Ordering {
+    b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx))
 }
 
 pub fn render_history_file(path: &Path) -> std::io::Result<String> {
