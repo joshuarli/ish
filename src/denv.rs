@@ -284,9 +284,10 @@ fn deny_current_dir() -> Result<Vec<EnvChange>, String> {
 
 fn find_env_files(start: &Path) -> Option<EnvFiles> {
     let mut dir = start.to_path_buf();
+    let mut probe = PathBuf::new();
     loop {
-        let envrc = stat_file(&dir, ".envrc");
-        let dotenv = stat_file(&dir, ".env");
+        let envrc = stat_file_with_probe(&dir, ".envrc", &mut probe);
+        let dotenv = stat_file_with_probe(&dir, ".env", &mut probe);
         if envrc.is_some() || dotenv.is_some() {
             return Some(EnvFiles { dir, envrc, dotenv });
         }
@@ -296,9 +297,10 @@ fn find_env_files(start: &Path) -> Option<EnvFiles> {
     }
 }
 
-fn stat_file(dir: &Path, name: &str) -> Option<(PathBuf, u64)> {
-    let path = dir.join(name);
-    Some((path.clone(), stat_regular_file_mtime(&path)?))
+fn stat_file_with_probe(dir: &Path, name: &str, probe: &mut PathBuf) -> Option<(PathBuf, u64)> {
+    set_probe_path(probe, dir, name);
+    let mtime = stat_regular_file_mtime(probe)?;
+    Some((probe.clone(), mtime))
 }
 
 fn paths_match(a: &Path, b: &Path) -> bool {
@@ -331,15 +333,28 @@ fn state_var_fast_path_ok(cwd: &Path) -> bool {
         return false;
     }
 
+    let mut probe = PathBuf::new();
     let envrc_ok = envrc_mtime == 0
-        || stat_regular_file_mtime(&cached.join(".envrc"))
+        || stat_file_mtime_with_probe(cached, ".envrc", &mut probe)
             .is_some_and(|mtime| mtime == envrc_mtime);
     if !envrc_ok {
         return false;
     }
 
     dotenv_mtime == 0
-        || stat_regular_file_mtime(&cached.join(".env")).is_some_and(|mtime| mtime == dotenv_mtime)
+        || stat_file_mtime_with_probe(cached, ".env", &mut probe)
+            .is_some_and(|mtime| mtime == dotenv_mtime)
+}
+
+fn stat_file_mtime_with_probe(dir: &Path, name: &str, probe: &mut PathBuf) -> Option<u64> {
+    set_probe_path(probe, dir, name);
+    stat_regular_file_mtime(probe)
+}
+
+fn set_probe_path(probe: &mut PathBuf, dir: &Path, name: &str) {
+    probe.clear();
+    probe.push(dir);
+    probe.push(name);
 }
 
 fn state_var_matches(found: &EnvFiles) -> bool {
