@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
@@ -81,8 +81,8 @@ pub struct History {
     timestamps: Vec<u64>,
     /// Session ids parallel to `offsets`. Zero means unknown/legacy.
     session_ids: Vec<u64>,
-    /// Hash index for O(1) duplicate checks in add().
-    hashes: HashSet<u64>,
+    /// Maps command hash to its current in-memory position.
+    index_by_hash: HashMap<u64, usize>,
     path: PathBuf,
     /// Byte offset into the text file we've read up to. Enables incremental
     /// sync — only new bytes appended by other shells are read.
@@ -156,7 +156,7 @@ impl History {
     }
 
     fn load_from_text(path: &Path) -> Self {
-        let (arena, offsets, timestamps, session_ids, hashes) = match fs::read(path) {
+        let (arena, offsets, timestamps, session_ids, index_by_hash) = match fs::read(path) {
             Ok(data) => {
                 let line_count = memchr_count(b'\n', &data);
                 let mut seen = HashSet::with_capacity(line_count);
@@ -192,14 +192,19 @@ impl History {
                     session_ids.push(*session_id);
                 }
 
-                (arena, offsets, timestamps, session_ids, seen)
+                let mut index_by_hash = HashMap::with_capacity(deduped.len());
+                for (idx, (line, _, _)) in deduped.iter().enumerate() {
+                    index_by_hash.insert(hash_str(line), idx);
+                }
+
+                (arena, offsets, timestamps, session_ids, index_by_hash)
             }
             Err(_) => (
                 String::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
-                HashSet::new(),
+                HashMap::new(),
             ),
         };
         let count = offsets.len();
@@ -209,7 +214,7 @@ impl History {
             offsets,
             timestamps,
             session_ids,
-            hashes,
+            index_by_hash,
             path: path.to_path_buf(),
             file_pos: 0,
             local: vec![false; count],
@@ -333,7 +338,7 @@ impl History {
 
         let mut arena = String::with_capacity(arena_size);
         let mut offsets = Vec::with_capacity(entry_count);
-        let mut hashes = HashSet::with_capacity(entry_count);
+        let mut index_by_hash = HashMap::with_capacity(entry_count);
         let mut count = 0;
         for entry in arena_str.split('\0') {
             if entry.is_empty() {
@@ -342,7 +347,7 @@ impl History {
             let start = arena.len() as u32;
             arena.push_str(entry);
             offsets.push((start, entry.len() as u16));
-            hashes.insert(hash_str(entry));
+            index_by_hash.insert(hash_str(entry), count);
             count += 1;
         }
 
@@ -355,7 +360,7 @@ impl History {
             offsets,
             timestamps,
             session_ids: vec![0; count],
-            hashes,
+            index_by_hash,
             path: path.to_path_buf(),
             file_pos: 0,
             local: vec![false; count],
@@ -385,7 +390,7 @@ impl History {
         let mut pos = V2_HEADER_SIZE;
 
         // Skip hashes (no longer stored in-memory)
-        let mut hashes = HashSet::with_capacity(entry_count);
+        let mut index_by_hash = HashMap::with_capacity(entry_count);
         pos += entry_count * 8;
 
         // Read timestamps (v2+) or default to 0 (v1)
@@ -419,7 +424,12 @@ impl History {
             if s + l > arena.len() {
                 return None;
             }
-            hashes.insert(hash_str(&arena[s..s + l]));
+        }
+        for (idx, &(start, len)) in offsets.iter().enumerate() {
+            index_by_hash.insert(
+                hash_str(&arena[start as usize..start as usize + len as usize]),
+                idx,
+            );
         }
 
         let count = offsets.len();
@@ -428,7 +438,7 @@ impl History {
             offsets,
             timestamps,
             session_ids: vec![0; count],
-            hashes,
+            index_by_hash,
             path: path.to_path_buf(),
             file_pos: 0,
             local: vec![false; count],
@@ -480,31 +490,13 @@ impl History {
                 continue;
             };
             let h = hash_str(parsed.command);
-            if self.hashes.contains(&h) {
+            if let Some(idx) = self.find_entry_index(h, parsed.command) {
                 // Don't let a newer hidden duplicate disturb the entries this
                 // session can still recall with Up-arrow.
-                if self.offsets.iter().enumerate().any(|(i, &(start, len))| {
-                    self.is_session_visible(i)
-                        && &self.arena[start as usize..start as usize + len as usize]
-                            == parsed.command
-                }) {
+                if self.is_session_visible(idx) {
                     continue;
                 }
-                // Remove old hidden duplicate, re-add at end with fresh
-                // recency for global searches.
-                let mut i = 0;
-                while i < self.offsets.len() {
-                    let (start, len) = self.offsets[i];
-                    if &self.arena[start as usize..start as usize + len as usize] == parsed.command
-                    {
-                        self.offsets.remove(i);
-                        self.timestamps.remove(i);
-                        self.session_ids.remove(i);
-                        self.local.remove(i);
-                    } else {
-                        i += 1;
-                    }
-                }
+                self.remove_entry_at(idx);
             }
             let start = self.arena.len() as u32;
             self.arena.push_str(parsed.command);
@@ -512,7 +504,7 @@ impl History {
             self.timestamps.push(parsed.timestamp);
             self.session_ids.push(parsed.session_id);
             self.local.push(false);
-            self.hashes.insert(h);
+            self.index_by_hash.insert(h, self.offsets.len() - 1);
         }
 
         self.file_pos = file_size;
@@ -638,7 +630,7 @@ impl History {
         let mut offsets = Vec::with_capacity(entries.len());
         let mut timestamps = Vec::with_capacity(entries.len());
         let mut session_ids = Vec::with_capacity(entries.len());
-        let mut hashes = HashSet::with_capacity(entries.len());
+        let mut index_by_hash = HashMap::with_capacity(entries.len());
         for e in &entries {
             let start = arena.len() as u32;
             let h = hash_str(e);
@@ -646,7 +638,7 @@ impl History {
             offsets.push((start, e.len() as u16));
             timestamps.push(ts);
             session_ids.push(0);
-            hashes.insert(h);
+            index_by_hash.insert(h, offsets.len() - 1);
         }
         let count = offsets.len();
         Self {
@@ -654,7 +646,7 @@ impl History {
             offsets,
             timestamps,
             session_ids,
-            hashes,
+            index_by_hash,
             path: PathBuf::from("/dev/null"),
             file_pos: 0,
             local: vec![false; count],
@@ -674,20 +666,8 @@ impl History {
         }
 
         let h = hash_str(line);
-        if self.hashes.contains(&h) {
-            // Likely duplicate — remove prior occurrence from all parallel vecs
-            let mut i = 0;
-            while i < self.offsets.len() {
-                let (start, len) = self.offsets[i];
-                if &self.arena[start as usize..start as usize + len as usize] == line {
-                    self.offsets.remove(i);
-                    self.timestamps.remove(i);
-                    self.session_ids.remove(i);
-                    self.local.remove(i);
-                } else {
-                    i += 1;
-                }
-            }
+        if self.index_by_hash.contains_key(&h) {
+            self.remove_entries_matching(line);
         }
         // Truncate entries that exceed u16 max (64KB) — shouldn't happen in practice
         let len = line.len().min(u16::MAX as usize);
@@ -697,7 +677,7 @@ impl History {
         self.timestamps.push(now_millis());
         self.session_ids.push(self.session_id);
         self.local.push(true);
-        self.hashes.insert(h);
+        self.index_by_hash.insert(h, self.offsets.len() - 1);
 
         // Append to file
         self.append_to_file(line);
@@ -866,6 +846,56 @@ impl History {
 
     fn is_session_visible(&self, idx: usize) -> bool {
         self.local[idx] || self.timestamps[idx] <= self.session_cutoff
+    }
+
+    fn entry_text(&self, idx: usize) -> &str {
+        let (start, len) = self.offsets[idx];
+        &self.arena[start as usize..start as usize + len as usize]
+    }
+
+    fn find_entry_index(&self, hash: u64, text: &str) -> Option<usize> {
+        self.index_by_hash
+            .get(&hash)
+            .copied()
+            .filter(|&idx| self.entry_text(idx) == text)
+            .or_else(|| {
+                self.offsets
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, _)| (self.entry_text(idx) == text).then_some(idx))
+            })
+    }
+
+    fn remove_entry_at(&mut self, idx: usize) {
+        self.offsets.remove(idx);
+        self.timestamps.remove(idx);
+        self.session_ids.remove(idx);
+        self.local.remove(idx);
+        self.rebuild_index();
+    }
+
+    fn remove_entries_matching(&mut self, text: &str) {
+        let mut matches = Vec::new();
+        for idx in 0..self.offsets.len() {
+            if self.entry_text(idx) == text {
+                matches.push(idx);
+            }
+        }
+        for idx in matches.into_iter().rev() {
+            self.offsets.remove(idx);
+            self.timestamps.remove(idx);
+            self.session_ids.remove(idx);
+            self.local.remove(idx);
+        }
+        self.rebuild_index();
+    }
+
+    fn rebuild_index(&mut self) {
+        self.index_by_hash.clear();
+        for idx in 0..self.offsets.len() {
+            self.index_by_hash
+                .insert(hash_str(self.entry_text(idx)), idx);
+        }
     }
 }
 
