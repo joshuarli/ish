@@ -55,7 +55,10 @@ enum ReadResult {
 
 enum Mode {
     Normal,
-    Completion(CompletionState),
+    Completion {
+        state: CompletionState,
+        base_line: LineBuffer,
+    },
     HistorySearch {
         query: LineBuffer,
         matches: Vec<FuzzyMatch>,
@@ -651,18 +654,24 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 }
                                 KeyAction::StartCompletion => {
                                     let comp = std::mem::take(&mut shell.comp_buf);
-                                    let cs = start_completion(
-                                        &line,
+                                    let base_line = line.clone();
+                                    let mut cs = start_completion(
+                                        &base_line,
                                         shell.cols,
                                         &shell.home,
                                         &shell.aliases,
                                         comp,
                                     );
                                     if cs.comp.len() == 1 {
-                                        accept_completion(&mut line, &cs);
+                                        preview_completion(&mut line, &cs, &base_line);
                                         shell.comp_buf = cs.comp;
                                     } else if !cs.comp.is_empty() {
-                                        mode = Mode::Completion(cs);
+                                        cs.selected = usize::MAX;
+                                        preview_completion(&mut line, &cs, &base_line);
+                                        mode = Mode::Completion {
+                                            state: cs,
+                                            base_line,
+                                        };
                                     } else {
                                         shell.comp_buf = cs.comp;
                                     }
@@ -683,10 +692,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         let _ = tw.flush_to_stdout();
                     }
 
-                    Mode::Completion(state) => {
+                    Mode::Completion { state, base_line } => {
                         let (p, pdl) = active_prompt(&prompt_str, prompt_display_len);
-                        match handle_completion_key(key, state, &mut line) {
+                        match handle_completion_key(key, state, base_line) {
                             CompAction::Navigate => {
+                                preview_completion(&mut line, state, base_line);
                                 // Cursor is on prompt line — repaint grid in-place
                                 let info = render::render_line(
                                     &mut tw,
@@ -704,19 +714,22 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             }
                             CompAction::Refilter => {
                                 // Reclaim buffer from current state, re-run completion
+                                let selected = state.selected;
                                 let comp = std::mem::take(&mut state.comp);
-                                let cs = start_completion(
-                                    &line,
+                                let mut cs = start_completion(
+                                    base_line,
                                     shell.cols,
                                     &shell.home,
                                     &shell.aliases,
                                     comp,
                                 );
-                                if cs.comp.len() == 1 {
-                                    accept_completion(&mut line, &cs);
-                                    shell.comp_buf = cs.comp;
-                                    mode = Mode::Normal;
-                                } else if !cs.comp.is_empty() {
+                                if !cs.comp.is_empty() {
+                                    cs.selected = if selected == usize::MAX {
+                                        usize::MAX
+                                    } else {
+                                        selected.min(cs.comp.len() - 1)
+                                    };
+                                    preview_completion(&mut line, &cs, base_line);
                                     let info = render::render_line(
                                         &mut tw,
                                         p,
@@ -728,20 +741,25 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     );
                                     region = info;
                                     render::render_completions(&mut tw, &cs, info, true);
-                                    mode = Mode::Completion(cs);
+                                    mode = Mode::Completion {
+                                        state: cs,
+                                        base_line: base_line.clone(),
+                                    };
                                     let _ = tw.flush_to_stdout();
                                     continue;
                                 } else {
+                                    line = base_line.clone();
                                     shell.comp_buf = cs.comp;
                                     mode = Mode::Normal;
                                 }
                             }
                             CompAction::Accept => {
-                                accept_completion(&mut line, state);
+                                preview_completion(&mut line, state, base_line);
                                 shell.comp_buf = std::mem::take(&mut state.comp);
                                 mode = Mode::Normal;
                             }
                             CompAction::Cancel => {
+                                line = base_line.clone();
                                 shell.comp_buf = std::mem::take(&mut state.comp);
                                 mode = Mode::Normal;
                             }
@@ -998,7 +1016,7 @@ fn render_active_mode(
         Mode::Normal => {
             render_prompt_region(tw, shell, line, prompt_str, prompt_display_len, region)
         }
-        Mode::Completion(state) => {
+        Mode::Completion { state, .. } => {
             let (p, pdl) = active_prompt(prompt_str, prompt_display_len);
             let info = render::render_line(
                 tw,
@@ -1019,7 +1037,7 @@ fn render_active_mode(
 }
 
 fn update_mode_layout_for_resize(mode: &mut Mode, shell: &Shell) {
-    if let Mode::Completion(state) = mode {
+    if let Mode::Completion { state, .. } = mode {
         let (cols, rows) = complete::compute_grid(&state.comp.entries, shell.cols);
         state.cols = cols;
         state.rows = rows;
@@ -1606,20 +1624,26 @@ fn handle_completion_key(
     }
 }
 
-fn accept_completion(line: &mut LineBuffer, state: &CompletionState) {
+fn preview_completion(line: &mut LineBuffer, state: &CompletionState, base_line: &LineBuffer) {
     let entry = match state.selected_entry() {
         Some(e) => e,
-        None => return,
+        None => {
+            *line = base_line.clone();
+            return;
+        }
     };
     let name = match state.selected_name() {
         Some(n) => n,
-        None => return,
+        None => {
+            *line = base_line.clone();
+            return;
+        }
     };
 
-    let text = line.text().to_string();
-    let before_cursor = &text[..line.cursor()];
+    let text = base_line.text().to_string();
+    let before_cursor = &text[..base_line.cursor()];
     let (word_start, _) = find_comp_word_start(before_cursor);
-    let after_cursor = &text[line.cursor()..];
+    let after_cursor = &text[base_line.cursor()..];
 
     let mut inner = state.dir_prefix.clone();
     inner.push_str(name);
@@ -1646,13 +1670,8 @@ fn accept_completion(line: &mut LineBuffer, state: &CompletionState) {
     };
 
     let new_text = format!("{}{}{}", &text[..word_start], replacement, after_cursor);
-    let new_cursor_chars = text[..word_start].chars().count() + replacement.chars().count();
-    line.set(&new_text);
-    // Position cursor after the completion
-    line.move_home();
-    for _ in 0..new_cursor_chars {
-        line.move_right();
-    }
+    let new_cursor = word_start + replacement.len();
+    line.set_with_cursor(&new_text, new_cursor);
 }
 
 // -- History Search --

@@ -1414,7 +1414,6 @@ fn tab_completion_files() {
     );
     sh.type_str("echo al");
     sh.tab();
-    // Single match — should auto-complete to alpha.txt
     std::thread::sleep(std::time::Duration::from_millis(300));
     sh.enter();
     let out = sh.wait_for_prompt(2000);
@@ -1444,6 +1443,32 @@ fn tab_completion_shows_grid() {
 }
 
 #[test]
+fn tab_completion_first_tab_has_no_selection_second_tab_selects_first() {
+    let sh = PtyShell::spawn_with_opts(&[("aaa.txt", ""), ("aab.txt", ""), ("aac.txt", "")], &[]);
+    sh.type_str("echo aa");
+    sh.tab();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let first = Screen::render(&sh.read_timeout(400), 24, 80);
+    assert_eq!(
+        first.matches("aaa.txt").count(),
+        1,
+        "first tab should show the grid without previewing the first item into the prompt line: {first:?}"
+    );
+
+    sh.tab();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let second = Screen::render(&sh.read_timeout(400), 24, 80);
+    assert_eq!(
+        second.matches("aaa.txt").count(),
+        2,
+        "second tab should activate selection on the first item and preview it in the prompt line: {second:?}"
+    );
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
 fn tab_completion_narrow_repaint_does_not_stack_rows() {
     let sh = PtyShell::spawn_with_size(
         &[("aaa.txt", ""), ("aab.txt", ""), ("aac.txt", "")],
@@ -1457,12 +1482,17 @@ fn tab_completion_narrow_repaint_does_not_stack_rows() {
     sh.type_str("a");
     std::thread::sleep(std::time::Duration::from_millis(100));
     sh.down();
+    sh.down();
     sh.up();
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let out = sh.read_timeout(600);
     let screen = Screen::render(&out, 24, 12);
-    assert_screen_contains_once(&screen, "aaa.txt");
+    assert_eq!(
+        screen.matches("aaa.txt").count(),
+        2,
+        "selected completion should appear once in the preview line and once in the grid: {screen:?}"
+    );
     assert_screen_contains_once(&screen, "aab.txt");
     assert_screen_contains_once(&screen, "aac.txt");
 
@@ -1475,7 +1505,6 @@ fn tab_completion_directory() {
     let sh = PtyShell::spawn_with_opts(&[("mydir/.keep", "")], &[]);
     sh.type_str("cd my");
     sh.tab();
-    // Should complete to mydir/
     std::thread::sleep(std::time::Duration::from_millis(300));
     sh.enter();
     sh.wait_for_prompt(2000);
@@ -1483,6 +1512,52 @@ fn tab_completion_directory() {
     let out2 = sh.run_command("pwd");
     let text = PtyShell::strip_ansi(&out2);
     assert!(text.contains("mydir"), "expected to be in mydir: {text:?}");
+}
+
+#[test]
+fn tab_completion_escape_restores_typed_prefix() {
+    let sh = PtyShell::spawn_with_opts(&[("alpha.txt", ""), ("alpine.txt", "")], &[]);
+    sh.type_str("echo al");
+    sh.tab();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.escape();
+    sh.type_str("x");
+    sh.enter();
+    let out = sh.wait_for_prompt(2000);
+    let screen = Screen::render(&out, 24, 80);
+    let text = normalize_screen_text(&screen);
+    assert!(
+        text.contains("al"),
+        "escape should restore the typed prefix, not keep the preview: {screen:?}"
+    );
+    assert!(
+        !text.contains("alpha.txt") && !text.contains("alpine.txt"),
+        "completion preview should not remain committed after escape: {screen:?}"
+    );
+}
+
+#[test]
+fn tab_completion_narrowing_does_not_autoaccept() {
+    let sh = PtyShell::spawn_with_opts(&[("signal.rs", ""), ("sys.rs", "")], &[]);
+    sh.type_str("echo s");
+    sh.tab();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    sh.type_str("y");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    sh.escape();
+    sh.type_str("x");
+    sh.enter();
+    let out = sh.wait_for_prompt(2000);
+    let screen = Screen::render(&out, 24, 80);
+    let text = normalize_screen_text(&screen);
+    assert!(
+        text.contains("sy"),
+        "typing should refine the base text without auto-accepting the remaining match: {screen:?}"
+    );
+    assert!(
+        !text.contains("sys.rs"),
+        "the single remaining match should stay a preview until Enter confirms it: {screen:?}"
+    );
 }
 
 #[test]
@@ -1529,31 +1604,61 @@ fn tab_completion_with_wide_dir_name_restores_prompt_cursor() {
                 settle_ms: 200,
                 read_ms: 800,
             },
+            TraceStep {
+                label: "tab again",
+                input: TraceInput::Bytes(b"\t"),
+                settle_ms: 200,
+                read_ms: 800,
+            },
         ],
     );
 
     let before_tab = &frames[0];
-    let frame = frames.last().unwrap();
-    assert_frame_contains_once(frame, "Altered States/");
-    assert_frame_contains_once(frame, "Another Language/");
-    assert_frame_contains_once(frame, "Dreamage/");
+    let first_tab = &frames[1];
+    let second_tab = frames.last().unwrap();
+    assert_frame_contains_once(first_tab, "Altered States/");
+    assert_frame_contains_once(first_tab, "Another Language/");
+    assert_frame_contains_once(first_tab, "Dreamage/");
     assert!(
-        frame
+        first_tab
             .snapshot
             .visible
             .contains("黑馬河的兒子 The Son of Black Horse River/"),
         "expected wide directory entry in completion grid: {:?}",
-        frame.snapshot
+        first_tab.snapshot
     );
     assert_eq!(
-        frame.snapshot.cursor_row, before_tab.snapshot.cursor_row,
-        "expected prompt cursor row to be restored after completion render: before={:?} after={:?}",
-        before_tab.snapshot, frame.snapshot
+        first_tab.snapshot.cursor_row, before_tab.snapshot.cursor_row,
+        "expected prompt cursor row to stay on the typed line after the first tab: before={:?} after={:?}",
+        before_tab.snapshot, first_tab.snapshot
     );
     assert_eq!(
-        frame.snapshot.cursor_col, before_tab.snapshot.cursor_col,
-        "expected prompt cursor column to be restored after completion render: before={:?} after={:?}",
-        before_tab.snapshot, frame.snapshot
+        first_tab.snapshot.cursor_col, before_tab.snapshot.cursor_col,
+        "first tab should not preview a selection into the prompt line: before={:?} after={:?}",
+        before_tab.snapshot, first_tab.snapshot
+    );
+
+    assert_frame_contains_once(second_tab, "Altered States/");
+    assert_frame_contains_once(second_tab, "Another Language/");
+    assert_frame_contains_once(second_tab, "Dreamage/");
+    assert!(
+        second_tab
+            .snapshot
+            .visible
+            .contains("黑馬河的兒子 The Son of Black Horse River/"),
+        "expected wide directory entry in completion grid after second tab: {:?}",
+        second_tab.snapshot
+    );
+    assert_eq!(
+        second_tab.snapshot.cursor_row, before_tab.snapshot.cursor_row,
+        "expected prompt cursor row to remain on the prompt line after the second tab: before={:?} after={:?}",
+        before_tab.snapshot, second_tab.snapshot
+    );
+    assert!(
+        second_tab.snapshot.cursor_col > before_tab.snapshot.cursor_col,
+        "second tab should activate selection and move the prompt cursor to the end of the live preview: before={:?} after={:?}",
+        before_tab.snapshot,
+        second_tab.snapshot
     );
 
     sh.escape();

@@ -1,4 +1,5 @@
 /// Line editing buffer with cursor and kill ring.
+#[derive(Clone)]
 pub struct LineBuffer {
     buf: String,
     cursor: usize, // byte offset into buf

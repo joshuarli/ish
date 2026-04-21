@@ -263,7 +263,11 @@ impl CompletionState {
     }
 
     pub fn move_up(&mut self) {
-        if self.rows == 0 {
+        if self.rows == 0 || self.comp.entries.is_empty() {
+            return;
+        }
+        if self.selected >= self.comp.entries.len() {
+            self.selected = self.comp.entries.len() - 1;
             return;
         }
         let row = self.selected % self.rows;
@@ -286,7 +290,11 @@ impl CompletionState {
     }
 
     pub fn move_down(&mut self) {
-        if self.rows == 0 {
+        if self.rows == 0 || self.comp.entries.is_empty() {
+            return;
+        }
+        if self.selected >= self.comp.entries.len() {
+            self.selected = 0;
             return;
         }
         let row = self.selected % self.rows;
@@ -306,7 +314,11 @@ impl CompletionState {
     }
 
     pub fn move_left(&mut self) {
-        if self.rows == 0 {
+        if self.rows == 0 || self.comp.entries.is_empty() {
+            return;
+        }
+        if self.selected >= self.comp.entries.len() {
+            self.selected = self.comp.entries.len() - 1;
             return;
         }
         let col = self.selected / self.rows;
@@ -322,7 +334,11 @@ impl CompletionState {
     }
 
     pub fn move_right(&mut self) {
-        if self.rows == 0 {
+        if self.rows == 0 || self.comp.entries.is_empty() {
+            return;
+        }
+        if self.selected >= self.comp.entries.len() {
+            self.selected = 0;
             return;
         }
         let col = self.selected / self.rows;

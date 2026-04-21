@@ -381,13 +381,17 @@ fn layout_completion_grid(state: &CompletionState) -> CompletionGridLayout {
         }
     }
 
-    let selected_row = state.selected % state.rows;
-    let scroll_start = if selected_row < state.scroll {
-        selected_row
-    } else if selected_row >= state.scroll + visible_rows {
-        selected_row + 1 - visible_rows
+    let scroll_start = if state.selected >= state.comp.entries.len() {
+        state.scroll.min(state.rows.saturating_sub(visible_rows))
     } else {
-        state.scroll
+        let selected_row = state.selected % state.rows;
+        if selected_row < state.scroll {
+            selected_row
+        } else if selected_row >= state.scroll + visible_rows {
+            selected_row + 1 - visible_rows
+        } else {
+            state.scroll
+        }
     };
 
     CompletionGridLayout {
