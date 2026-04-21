@@ -13,7 +13,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -299,8 +298,7 @@ fn find_env_files(start: &Path) -> Option<EnvFiles> {
 
 fn stat_file(dir: &Path, name: &str) -> Option<(PathBuf, u64)> {
     let path = dir.join(name);
-    let meta = fs::metadata(&path).ok().filter(|m| m.is_file())?;
-    Some((path, meta.mtime() as u64))
+    Some((path.clone(), stat_regular_file_mtime(&path)?))
 }
 
 fn paths_match(a: &Path, b: &Path) -> bool {
@@ -334,21 +332,14 @@ fn state_var_fast_path_ok(cwd: &Path) -> bool {
     }
 
     let envrc_ok = envrc_mtime == 0
-        || cached
-            .join(".envrc")
-            .metadata()
-            .ok()
-            .is_some_and(|meta| meta.is_file() && meta.mtime() as u64 == envrc_mtime);
+        || stat_regular_file_mtime(&cached.join(".envrc"))
+            .is_some_and(|mtime| mtime == envrc_mtime);
     if !envrc_ok {
         return false;
     }
 
     dotenv_mtime == 0
-        || cached
-            .join(".env")
-            .metadata()
-            .ok()
-            .is_some_and(|meta| meta.is_file() && meta.mtime() as u64 == dotenv_mtime)
+        || stat_regular_file_mtime(&cached.join(".env")).is_some_and(|mtime| mtime == dotenv_mtime)
 }
 
 fn state_var_matches(found: &EnvFiles) -> bool {
@@ -399,6 +390,26 @@ fn active_path(pid: &str) -> Result<PathBuf, String> {
     Ok(data_dir()?.join(format!("active_{pid}")))
 }
 
+fn stat_regular_file_mtime(path: &Path) -> Option<u64> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut buf = Vec::with_capacity(bytes.len() + 1);
+    buf.extend_from_slice(bytes);
+    buf.push(0);
+
+    // SAFETY: buf is NUL-terminated and lives for the duration of the call.
+    // stat is zero-initialized before libc fills it.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::stat(buf.as_ptr() as *const libc::c_char, &mut st) != 0 {
+            return None;
+        }
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return None;
+        }
+        Some(st.st_mtime as u64)
+    }
+}
+
 fn is_allowed(envrc: &Path) -> bool {
     let allow_dir = match allow_dir() {
         Ok(dir) => dir,
@@ -417,9 +428,9 @@ fn is_allowed(envrc: &Path) -> bool {
             }
         }
     };
-    let current = match canonicalize_fallback(envrc).metadata() {
-        Ok(meta) => meta.mtime() as u64,
-        Err(_) => return false,
+    let current = match stat_regular_file_mtime(&canonicalize_fallback(envrc)) {
+        Some(mtime) => mtime,
+        None => return false,
     };
     stored.trim().parse::<u64>() == Ok(current)
 }
@@ -427,10 +438,8 @@ fn is_allowed(envrc: &Path) -> bool {
 fn allow_envrc(envrc: &Path) -> Result<(), String> {
     let dir = allow_dir()?;
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create allow dir: {e}"))?;
-    let mtime = envrc
-        .metadata()
-        .map(|meta| meta.mtime() as u64)
-        .map_err(|e| format!("failed to read .envrc mtime: {e}"))?;
+    let mtime =
+        stat_regular_file_mtime(envrc).ok_or("failed to read .envrc mtime: not a regular file")?;
     fs::write(dir.join(trust_key(envrc)), mtime.to_string())
         .map_err(|e| format!("failed to write trust file: {e}"))?;
     eprintln!("denv: allowed {}", envrc.display());
@@ -1193,7 +1202,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let envrc = project.join(".envrc");
         std::fs::write(&envrc, "export OK=1\n").unwrap();
-        let mtime = std::fs::metadata(&envrc).unwrap().mtime() as u64;
+        let mtime = stat_regular_file_mtime(&envrc).unwrap();
         let state = format!("{mtime} 0 {}", project.display());
 
         // SAFETY: tests run in a single process; this test sets and restores
