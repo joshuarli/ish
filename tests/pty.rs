@@ -1898,6 +1898,7 @@ fn ctrl_l_clears_screen() {
     sh.ctrl_l();
     out.push_str(&sh.read_timeout(500));
     let screen = Screen::render(&out, 24, 80);
+    let normalized = normalize_screen_text(&screen);
     assert!(
         out.contains("\x1b[H") || out.contains("\x1b[2J"),
         "expected screen clear sequence: {out:?}"
@@ -1907,7 +1908,7 @@ fn ctrl_l_clears_screen() {
         "clear should remove prior output from visible screen: {screen:?}"
     );
     assert!(
-        screen.contains("echo after_clear"),
+        normalized.contains("echo after_clear"),
         "current line should be preserved after clear: {screen:?}"
     );
 }
