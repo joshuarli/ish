@@ -62,6 +62,8 @@ enum Mode {
     HistorySearch {
         query: LineBuffer,
         matches: Vec<FuzzyMatch>,
+        candidates: Vec<usize>,
+        scratch: Vec<usize>,
         selected: usize,
         saved_line: String,
     },
@@ -582,12 +584,24 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 KeyAction::StartHistorySearch => {
                                     shell.history.sync();
                                     saved_line = line.text().to_string();
+                                    let mut candidates = Vec::new();
+                                    shell.history.visible_entry_indices_into(&mut candidates);
+                                    let mut scratch = Vec::new();
                                     let mut matches = std::mem::take(&mut shell.match_buf);
-                                    shell.history.fuzzy_search_into("", &mut matches, 200, "");
+                                    shell.history.fuzzy_search_subset_into(
+                                        "",
+                                        &candidates,
+                                        &mut scratch,
+                                        &mut matches,
+                                        200,
+                                    );
+                                    std::mem::swap(&mut candidates, &mut scratch);
                                     region.clear(&mut tw);
                                     mode = Mode::HistorySearch {
                                         query: LineBuffer::new(),
                                         matches,
+                                        candidates,
+                                        scratch,
                                         selected: 0,
                                         saved_line: saved_line.clone(),
                                     };
@@ -783,9 +797,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                     Mode::HistorySearch {
                         query,
                         matches,
+                        candidates,
+                        scratch,
                         selected,
                         saved_line,
-                    } => match handle_history_search_key(key, query, matches, selected, shell) {
+                    } => match handle_history_search_key(
+                        key, query, matches, candidates, scratch, selected, shell,
+                    ) {
                         HistAction::Continue => {
                             region = render_history_mode(
                                 &mut tw,
@@ -1686,10 +1704,14 @@ fn handle_history_search_key(
     key: KeyEvent,
     query: &mut LineBuffer,
     matches: &mut Vec<FuzzyMatch>,
+    candidates: &mut Vec<usize>,
+    scratch: &mut Vec<usize>,
     selected: &mut usize,
     shell: &Shell,
 ) -> HistAction {
     let mut re_search = false;
+    let prev_text = query.text().to_string();
+    let prev_cursor = query.cursor();
     match (key.key, key.mods.ctrl, key.mods.alt) {
         (Key::Escape, _, _) => return HistAction::Cancel,
         (Key::Char('c'), true, _) => return HistAction::Cancel,
@@ -1762,9 +1784,23 @@ fn handle_history_search_key(
         _ => {}
     }
     if re_search {
-        shell
-            .history
-            .fuzzy_search_into(query.text(), matches, 200, "");
+        let new_text = query.text();
+        let append_at_end = prev_cursor == prev_text.len()
+            && query.cursor() == new_text.len()
+            && new_text.len() > prev_text.len()
+            && new_text.starts_with(&prev_text);
+        if append_at_end {
+            shell
+                .history
+                .fuzzy_search_subset_into(new_text, candidates, scratch, matches, 200);
+            std::mem::swap(candidates, scratch);
+        } else {
+            shell.history.visible_entry_indices_into(scratch);
+            shell
+                .history
+                .fuzzy_search_subset_into(new_text, scratch, candidates, matches, 200);
+            std::mem::swap(candidates, scratch);
+        }
         *selected = 0;
     }
     HistAction::Continue

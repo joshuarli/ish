@@ -772,6 +772,63 @@ impl History {
         self.fill_search_results_limited(query, results, limit);
     }
 
+    /// Fill `out` with session-visible entry indices in recency order.
+    pub fn visible_entry_indices_into(&self, out: &mut Vec<usize>) {
+        out.clear();
+        out.extend(
+            (0..self.offsets.len())
+                .rev()
+                .filter(|&idx| self.is_session_visible(idx)),
+        );
+    }
+
+    /// Search within an existing candidate set, preserving all matches in
+    /// `matched_indices` and the best `limit` ranked results in `results`.
+    pub fn fuzzy_search_subset_into(
+        &self,
+        query: &str,
+        candidates: &[usize],
+        matched_indices: &mut Vec<usize>,
+        results: &mut Vec<FuzzyMatch>,
+        limit: usize,
+    ) {
+        matched_indices.clear();
+        results.clear();
+        if limit == 0 {
+            return;
+        }
+
+        if query.is_empty() {
+            matched_indices.extend_from_slice(candidates);
+            results.extend(candidates.iter().take(limit).map(|&idx| FuzzyMatch {
+                entry_idx: idx,
+                match_positions: [0; 32],
+                match_count: 0,
+                score: 0,
+            }));
+            return;
+        }
+
+        let query_lower = lowercase_query(query);
+        for &idx in candidates {
+            let entry = self.entry_text(idx);
+            let Some(m) = classify_match(&query_lower, entry, idx) else {
+                continue;
+            };
+            matched_indices.push(idx);
+            let insert_at = results
+                .binary_search_by(|existing| compare_fuzzy_match(existing, &m))
+                .unwrap_or_else(|pos| pos);
+            if insert_at >= limit {
+                continue;
+            }
+            results.insert(insert_at, m);
+            if results.len() > limit {
+                results.pop();
+            }
+        }
+    }
+
     /// Get entry text by index.
     pub fn get(&self, idx: usize) -> &str {
         let (start, len) = self.offsets[idx];
