@@ -165,21 +165,15 @@ fn refresh(force: bool) -> Result<Vec<EnvChange>, String> {
 
     let envrc_mtime = found.envrc.as_ref().map(|(_, m)| *m).unwrap_or(0);
     let dotenv_mtime = found.dotenv.as_ref().map(|(_, m)| *m).unwrap_or(0);
-    let dir = found
-        .dir
-        .canonicalize()
-        .unwrap_or_else(|_| found.dir.clone());
-    let envrc = found
-        .envrc
-        .as_ref()
-        .map(|(path, _)| path.canonicalize().unwrap_or_else(|_| path.clone()));
 
-    if let Some(ref envrc_path) = envrc
+    if let Some((envrc_path, _)) = found.envrc.as_ref()
         && !is_allowed(envrc_path)
     {
+        let dir = canonicalize_fallback(&found.dir);
+        let envrc = canonicalize_fallback(envrc_path);
         eprintln!(
             "denv: {} is blocked. Run `denv allow` to trust it.",
-            envrc_path.display()
+            envrc.display()
         );
         set_change(
             &mut changes,
@@ -195,19 +189,25 @@ fn refresh(force: bool) -> Result<Vec<EnvChange>, String> {
     }
 
     let dotenv_entries = load_dotenv_entries(&found)?;
-    if envrc.is_some() {
+    if found.envrc.is_some() {
         eprintln!("denv: loading .envrc");
     }
     if found.dotenv.is_some() {
         eprintln!("denv: loading .env");
     }
 
-    let diff = if envrc.is_none() {
+    let diff = if found.envrc.is_none() {
         diff_dotenv_only(&dotenv_entries)
     } else {
+        let dir = canonicalize_fallback(&found.dir);
+        let envrc = found
+            .envrc
+            .as_ref()
+            .map(|(path, _)| canonicalize_fallback(path));
         match eval_env(&dir, envrc.as_deref(), &dotenv_entries, &pid) {
             Ok(diff) => diff,
             Err(err) => {
+                let dir = canonicalize_fallback(&found.dir);
                 eprintln!("denv: {err}");
                 set_change(
                     &mut changes,
@@ -223,6 +223,7 @@ fn refresh(force: bool) -> Result<Vec<EnvChange>, String> {
 
     let prev = capture_prev(&diff);
     apply_diff(&diff, &mut changes);
+    let dir = canonicalize_fallback(&found.dir);
     set_change(
         &mut changes,
         "__DENV_DIR",
@@ -300,6 +301,10 @@ fn paths_match(a: &Path, b: &Path) -> bool {
             .ok()
             .zip(b.canonicalize().ok())
             .is_some_and(|(left, right)| left == right)
+}
+
+fn canonicalize_fallback(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn parse_denv_state(s: &str) -> Option<(u64, u64, &str)> {
@@ -387,15 +392,24 @@ fn active_path(pid: &str) -> Result<PathBuf, String> {
 }
 
 fn is_allowed(envrc: &Path) -> bool {
-    let trust_file = match allow_dir() {
-        Ok(dir) => dir.join(trust_key(envrc)),
+    let allow_dir = match allow_dir() {
+        Ok(dir) => dir,
         Err(_) => return false,
     };
-    let stored = match fs::read_to_string(trust_file) {
+    let stored = match fs::read_to_string(allow_dir.join(trust_key(envrc))) {
         Ok(stored) => stored,
-        Err(_) => return false,
+        Err(_) => {
+            let canonical = canonicalize_fallback(envrc);
+            if canonical == envrc {
+                return false;
+            }
+            match fs::read_to_string(allow_dir.join(trust_key(&canonical))) {
+                Ok(stored) => stored,
+                Err(_) => return false,
+            }
+        }
     };
-    let current = match envrc.metadata() {
+    let current = match canonicalize_fallback(envrc).metadata() {
         Ok(meta) => meta.mtime() as u64,
         Err(_) => return false,
     };
