@@ -227,6 +227,7 @@ fn main() {
 
                 // Handle ish-level commands that must be intercepted before epsh
                 let first_word = line.split_whitespace().next().unwrap_or("");
+                let simple_words = parse_simple_command_words(&line);
                 let handled = match first_word {
                     "alias" => {
                         handle_alias(&line, &mut shell);
@@ -239,28 +240,36 @@ fn main() {
                         true
                     }
                     "cd" => {
-                        let rest = line.trim().strip_prefix("cd").unwrap_or("").trim();
-                        // Only intercept simple cd (no operators — compound commands go to epsh)
-                        if rest.contains('|') || rest.contains('&') || rest.contains(';') {
-                            false
-                        } else if rest == "-" {
-                            if let Some(prev) = std::env::var_os("OLDPWD").filter(|s| !s.is_empty())
-                            {
-                                eprintln!("{}", Path::new(&prev).display());
-                                shell.last_status = do_cd_path(Path::new(&prev), &mut shell);
-                            } else {
-                                eprintln!("ish: cd: no previous directory");
-                                shell.last_status = 1;
+                        if let Some(words) = simple_words.as_deref() {
+                            match expand_builtin_args(&words[1..], &mut shell, "cd") {
+                                Some(args) if args.len() > 1 => {
+                                    eprintln!("ish: cd: too many arguments");
+                                    shell.last_status = 1;
+                                    true
+                                }
+                                Some(args) if args.first().map(String::as_str) == Some("-") => {
+                                    if let Some(prev) =
+                                        std::env::var_os("OLDPWD").filter(|s| !s.is_empty())
+                                    {
+                                        eprintln!("{}", Path::new(&prev).display());
+                                        shell.last_status =
+                                            do_cd_path(Path::new(&prev), &mut shell);
+                                    } else {
+                                        eprintln!("ish: cd: no previous directory");
+                                        shell.last_status = 1;
+                                    }
+                                    true
+                                }
+                                Some(args) => {
+                                    let target =
+                                        args.first().cloned().unwrap_or_else(|| shell.home.clone());
+                                    shell.last_status = do_cd(&target, &mut shell);
+                                    true
+                                }
+                                None => true,
                             }
-                            true
                         } else {
-                            let target = if rest.is_empty() {
-                                shell.home.clone()
-                            } else {
-                                unquote_arg(rest)
-                            };
-                            shell.last_status = do_cd(&target, &mut shell);
-                            true
+                            false
                         }
                     }
                     "history" => handle_history(&line, &mut shell),
@@ -274,8 +283,12 @@ fn main() {
                         true
                     }
                     "denv" => {
-                        let args: Vec<String> =
-                            line.split_whitespace().skip(1).map(String::from).collect();
+                        let args = simple_words
+                            .as_deref()
+                            .and_then(|words| expand_builtin_args(&words[1..], &mut shell, "denv"))
+                            .unwrap_or_else(|| {
+                                line.split_whitespace().skip(1).map(String::from).collect()
+                            });
                         let outcome = denv::command(&args);
                         apply_denv_changes(&outcome.changes, &mut shell.epsh);
                         shell.last_status = outcome.status;
@@ -286,8 +299,12 @@ fn main() {
                         true
                     }
                     "z" => {
-                        let args: Vec<String> =
-                            line.split_whitespace().skip(1).map(String::from).collect();
+                        let args = simple_words
+                            .as_deref()
+                            .and_then(|words| expand_builtin_args(&words[1..], &mut shell, "z"))
+                            .unwrap_or_else(|| {
+                                line.split_whitespace().skip(1).map(String::from).collect()
+                            });
                         shell.last_status = frecency::builtin_z(&args, &shell.history, &shell.home);
                         if shell.last_status == 0 {
                             // z already did chdir — run post-cd hooks
@@ -298,29 +315,30 @@ fn main() {
                         true
                     }
                     "w" | "which" | "type" => {
-                        let args: Vec<String> =
-                            line.split_whitespace().skip(1).map(String::from).collect();
+                        let args = simple_words
+                            .as_deref()
+                            .and_then(|words| {
+                                expand_builtin_args(&words[1..], &mut shell, first_word)
+                            })
+                            .unwrap_or_else(|| {
+                                line.split_whitespace().skip(1).map(String::from).collect()
+                            });
                         shell.last_status =
                             builtin::builtin_w(&args, &shell.aliases, shell.epsh.functions());
                         true
                     }
                     "l" => {
-                        let home = shell.home.clone();
-                        let args: Vec<String> = line
-                            .split_whitespace()
-                            .skip(1)
-                            .map(|a| {
-                                if a == "~" {
-                                    home.clone()
-                                } else if let Some(rest) = a.strip_prefix("~/") {
-                                    format!("{home}/{rest}")
-                                } else {
-                                    a.to_string()
+                        if let Some(words) = simple_words.as_deref() {
+                            match expand_builtin_args(&words[1..], &mut shell, "l") {
+                                Some(args) => {
+                                    shell.last_status = builtin::builtin_l(&args);
+                                    true
                                 }
-                            })
-                            .collect();
-                        shell.last_status = builtin::builtin_l(&args);
-                        true
+                                None => true,
+                            }
+                        } else {
+                            false
+                        }
                     }
                     "c" => {
                         print!("\x1b[H\x1b[2J");
@@ -1950,28 +1968,45 @@ fn sync_cwd_change(shell: &mut Shell, old_cwd: &Path, new_cwd: std::path::PathBu
     apply_denv_changes(&changes, &mut shell.epsh);
 }
 
-/// Strip shell quoting from a single argument: single-quoted, double-quoted, or backslash-escaped.
-fn unquote_arg(s: &str) -> String {
-    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
-        let inner = &s[1..s.len() - 1];
-        return inner.replace("'\\''", "'");
-    }
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        return s[1..s.len() - 1].to_string();
-    }
-    // Handle backslash escapes in unquoted strings
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(next) = chars.next() {
-                result.push(next);
+/// Parse a command line into shell words only.
+/// Returns `None` if the line contains operators, redirections, or lexer errors.
+fn parse_simple_command_words(line: &str) -> Option<Vec<epsh::ast::Word>> {
+    let mut lex = epsh::lexer::Lexer::new(line);
+    lex.recognize_reserved = false;
+
+    let mut words = Vec::new();
+    loop {
+        match lex.next_token() {
+            Ok((epsh::lexer::Token::Word(parts, _), span)) => {
+                words.push(epsh::ast::Word { parts, span });
             }
-        } else {
-            result.push(c);
+            Ok((epsh::lexer::Token::Eof, _)) => break,
+            Ok(_) | Err(_) => return None,
         }
     }
-    result
+
+    (!words.is_empty()).then_some(words)
+}
+
+/// Expand intercepted builtin arguments with epsh so top-level builtins honor
+/// quoting, variables, command substitution, and globbing like normal commands.
+fn expand_builtin_args(
+    words: &[epsh::ast::Word],
+    shell: &mut Shell,
+    name: &str,
+) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    for word in words {
+        match epsh::expand::expand_word_to_fields(word, &mut shell.epsh) {
+            Ok(fields) => args.extend(fields),
+            Err(e) => {
+                eprintln!("ish: {name}: expansion error: {e}");
+                shell.last_status = 1;
+                return None;
+            }
+        }
+    }
+    Some(args)
 }
 
 /// Change directory and run all post-cd hooks (OLDPWD, epsh sync, dir stack, denv, prompt).

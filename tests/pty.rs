@@ -2071,6 +2071,32 @@ fn glob_expansion() {
 }
 
 #[test]
+fn builtin_l_glob_expansion() {
+    let sh = PtyShell::spawn_with_opts(
+        &[
+            ("rust-toolchain.toml", ""),
+            ("toolbox.txt", ""),
+            ("Cargo.toml", ""),
+        ],
+        &[],
+    );
+    let out = sh.run_command("l *tool*");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("rust-toolchain.toml") && text.contains("toolbox.txt"),
+        "expected builtin glob expansion: {text:?}"
+    );
+    assert!(
+        !text.contains("Cargo.toml"),
+        "builtin glob should not include non-matching files: {text:?}"
+    );
+    assert!(
+        !text.contains("No such file or directory"),
+        "builtin glob should not pass the literal pattern through: {text:?}"
+    );
+}
+
+#[test]
 fn quoted_string_preserves_spaces() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("echo \"hello   world\"");
