@@ -2153,7 +2153,8 @@ fn denv_unloads_on_leave() {
     let text = PtyShell::strip_ansi(&sh.run_command("echo $DENV_TEST_VAR"));
     assert!(text.contains("active"), "should be loaded: {text:?}");
 
-    let text = PtyShell::strip_ansi(&sh.run_command("cd ..\necho =$DENV_TEST_VAR="));
+    sh.run_command("cd ..");
+    let text = PtyShell::strip_ansi(&sh.run_command("echo =$DENV_TEST_VAR="));
     assert!(
         text.contains("=="),
         "var should be unset after leaving: {text:?}"
@@ -2166,7 +2167,8 @@ fn denv_allow_applies_env() {
         &[("project/.envrc", "export DENV_TEST_VAR='allowed'\n")],
         &[],
     );
-    let blocked = PtyShell::strip_ansi(&sh.run_command("cd project\necho =$__DENV_DIRTY="));
+    sh.run_command("cd project");
+    let blocked = PtyShell::strip_ansi(&sh.run_command("echo =$__DENV_DIRTY="));
     assert!(
         blocked.contains("=1="),
         "expected dirty state before allow: {blocked:?}"
@@ -2187,8 +2189,8 @@ fn denv_deny_removes_env_and_marks_dirty() {
         "project/.envrc",
     );
     sh.run_command("cd project");
-    let text =
-        PtyShell::strip_ansi(&sh.run_command("denv deny\necho =$DENV_TEST_VAR=:$__DENV_DIRTY="));
+    sh.run_command("denv deny");
+    let text = PtyShell::strip_ansi(&sh.run_command("echo =$DENV_TEST_VAR=:$__DENV_DIRTY="));
     assert!(
         text.contains("==:1"),
         "expected var unset and dirty after deny: {text:?}"
@@ -2320,7 +2322,8 @@ fn denv_restores_preexisting_var_on_leave() {
         "expected overridden value in project: {inside:?}"
     );
 
-    let outside = PtyShell::strip_ansi(&sh.run_command("cd ..\necho $EXISTING"));
+    sh.run_command("cd ..");
+    let outside = PtyShell::strip_ansi(&sh.run_command("echo $EXISTING"));
     assert!(
         outside.contains("outside"),
         "expected original value restored: {outside:?}"
@@ -2369,7 +2372,8 @@ fn denv_dotenv_helper_loads_env_file() {
 #[test]
 fn denv_allow_requires_envrc() {
     let sh = PtyShell::spawn_with_opts(&[("project/.env", "DENV_TEST_VAR=loaded\n")], &[]);
-    let text = PtyShell::strip_ansi(&sh.run_command("cd project\ndenv allow"));
+    sh.run_command("cd project");
+    let text = PtyShell::strip_ansi(&sh.run_command("denv allow"));
     assert!(
         text.contains("no .envrc"),
         "expected allow failure without envrc: {text:?}"
