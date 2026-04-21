@@ -2123,135 +2123,140 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
 /// Build the external handler for epsh. Handles ish-specific builtins
 /// and fork/exec with job control for external commands.
 fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
-    Box::new(move |args: &[String], env_pairs: &[(String, String)]| {
-        let name = &args[0];
+    Box::new(
+        move |args: &[epsh::shell_bytes::ShellBytes],
+              env_pairs: &[(String, epsh::shell_bytes::ShellBytes)]| {
+            let name = args[0].to_shell_string();
 
-        // ish interactive builtins
-        match name.as_str() {
-            "l" => {
-                let status = builtin::builtin_l(&args[1..]);
-                return Ok(epsh::error::ExitStatus::from(status));
-            }
-            "c" => {
-                print!("\x1b[H\x1b[2J");
-                return Ok(epsh::error::ExitStatus::SUCCESS);
-            }
-            "history" => {
-                // In a pipeline context — read from text file
-                let path = if let Ok(data) = std::env::var("XDG_DATA_HOME") {
-                    std::path::PathBuf::from(data).join("ish/history")
-                } else if let Ok(home) = std::env::var("HOME") {
-                    std::path::PathBuf::from(home).join(".local/share/ish/history")
-                } else {
-                    std::path::PathBuf::from("/tmp/ish_history")
-                };
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => {
-                        print!("{content}");
-                        return Ok(epsh::error::ExitStatus::SUCCESS);
-                    }
-                    Err(e) => {
-                        eprintln!("ish: history: {e}");
-                        return Ok(epsh::error::ExitStatus::FAILURE);
-                    }
+            // ish interactive builtins
+            match name.as_str() {
+                "l" => {
+                    let l_args: Vec<String> =
+                        args[1..].iter().map(|arg| arg.to_shell_string()).collect();
+                    let status = builtin::builtin_l(&l_args);
+                    return Ok(epsh::error::ExitStatus::from(status));
                 }
-            }
-            _ => {}
-        }
-
-        // External command: fork/exec with job control
-        let is_main = unsafe { libc::getpid() } == shell_pid;
-
-        let mut cmd = std::process::Command::new(&args[0]);
-        cmd.args(&args[1..]);
-
-        // Apply prefix env assignments
-        for (k, v) in env_pairs {
-            cmd.env(k, v);
-        }
-
-        if is_main {
-            // In the child: become its own process group leader and restore
-            // signal dispositions that the shell overrode (especially SIGTSTP,
-            // which the shell ignores — children must inherit SIG_DFL or
-            // Ctrl+Z will never stop them).
-            //
-            // setpgid(0, 0) here (in the child, before exec) is race-free;
-            // the parent's setpgid(child_id, child_id) after spawn() is a
-            // belt-and-suspenders duplicate for the parent-side view.
-            unsafe {
-                cmd.pre_exec(|| {
-                    libc::setpgid(0, 0);
-                    ish::signal::restore_defaults();
-                    Ok(())
-                });
-            }
-        }
-
-        match cmd.spawn() {
-            Ok(mut child) => {
-                let child_id = child.id() as i32;
-
-                if is_main {
-                    // Parent: duplicate setpgid (child did it too — no race)
-                    // and hand the terminal to the new process group.
-                    unsafe {
-                        libc::setpgid(child_id, child_id);
-                        libc::tcsetpgrp(0, child_id);
-                    }
-
-                    // Wait with WUNTRACED for job control
-                    let mut status = 0i32;
-                    unsafe {
-                        libc::waitpid(child_id, &mut status, libc::WUNTRACED);
-                    }
-
-                    // Reclaim terminal
-                    unsafe {
-                        libc::tcsetpgrp(0, libc::getpgrp());
-                    }
-
-                    if libc::WIFSTOPPED(status) {
-                        // Capture the terminal state the stopped process left behind,
-                        // then save it in the thread-local so the main loop can build a Job.
-                        let mut saved_termios: libc::termios = unsafe { std::mem::zeroed() };
-                        unsafe { libc::tcgetattr(0, &mut saved_termios) };
-                        let cmd = args[0].clone();
-                        STOPPED_JOB.with(|cell| {
-                            *cell.borrow_mut() = Some((child_id, cmd, saved_termios));
-                        });
-                        Err(epsh::error::ShellError::Stopped {
-                            pid: child_id,
-                            pgid: child_id,
-                        })
-                    } else if libc::WIFEXITED(status) {
-                        Ok(epsh::error::ExitStatus::from(libc::WEXITSTATUS(status)))
-                    } else if libc::WIFSIGNALED(status) {
-                        Ok(epsh::error::ExitStatus::from(128 + libc::WTERMSIG(status)))
+                "c" => {
+                    print!("\x1b[H\x1b[2J");
+                    return Ok(epsh::error::ExitStatus::SUCCESS);
+                }
+                "history" => {
+                    // In a pipeline context — read from text file
+                    let path = if let Ok(data) = std::env::var("XDG_DATA_HOME") {
+                        std::path::PathBuf::from(data).join("ish/history")
+                    } else if let Ok(home) = std::env::var("HOME") {
+                        std::path::PathBuf::from(home).join(".local/share/ish/history")
                     } else {
-                        Ok(epsh::error::ExitStatus::FAILURE)
+                        std::path::PathBuf::from("/tmp/ish_history")
+                    };
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => {
+                            print!("{content}");
+                            return Ok(epsh::error::ExitStatus::SUCCESS);
+                        }
+                        Err(e) => {
+                            eprintln!("ish: history: {e}");
+                            return Ok(epsh::error::ExitStatus::FAILURE);
+                        }
                     }
-                } else {
-                    // Pipeline child: just wait normally
-                    match child.wait() {
-                        Ok(s) => Ok(epsh::error::ExitStatus::from(s.code().unwrap_or(128))),
-                        Err(e) => Err(epsh::error::ShellError::Io(e)),
+                }
+                _ => {}
+            }
+
+            // External command: fork/exec with job control
+            let is_main = unsafe { libc::getpid() } == shell_pid;
+
+            let mut cmd = std::process::Command::new(args[0].to_os_string());
+            cmd.args(args[1..].iter().map(|arg| arg.to_os_string()));
+
+            // Apply prefix env assignments
+            for (k, v) in env_pairs {
+                cmd.env(k, v.to_os_string());
+            }
+
+            if is_main {
+                // In the child: become its own process group leader and restore
+                // signal dispositions that the shell overrode (especially SIGTSTP,
+                // which the shell ignores — children must inherit SIG_DFL or
+                // Ctrl+Z will never stop them).
+                //
+                // setpgid(0, 0) here (in the child, before exec) is race-free;
+                // the parent's setpgid(child_id, child_id) after spawn() is a
+                // belt-and-suspenders duplicate for the parent-side view.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        libc::setpgid(0, 0);
+                        ish::signal::restore_defaults();
+                        Ok(())
+                    });
+                }
+            }
+
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let child_id = child.id() as i32;
+
+                    if is_main {
+                        // Parent: duplicate setpgid (child did it too — no race)
+                        // and hand the terminal to the new process group.
+                        unsafe {
+                            libc::setpgid(child_id, child_id);
+                            libc::tcsetpgrp(0, child_id);
+                        }
+
+                        // Wait with WUNTRACED for job control
+                        let mut status = 0i32;
+                        unsafe {
+                            libc::waitpid(child_id, &mut status, libc::WUNTRACED);
+                        }
+
+                        // Reclaim terminal
+                        unsafe {
+                            libc::tcsetpgrp(0, libc::getpgrp());
+                        }
+
+                        if libc::WIFSTOPPED(status) {
+                            // Capture the terminal state the stopped process left behind,
+                            // then save it in the thread-local so the main loop can build a Job.
+                            let mut saved_termios: libc::termios = unsafe { std::mem::zeroed() };
+                            unsafe { libc::tcgetattr(0, &mut saved_termios) };
+                            let cmd = args[0].to_shell_string();
+                            STOPPED_JOB.with(|cell| {
+                                *cell.borrow_mut() = Some((child_id, cmd, saved_termios));
+                            });
+                            Err(epsh::error::ShellError::Stopped {
+                                pid: child_id,
+                                pgid: child_id,
+                            })
+                        } else if libc::WIFEXITED(status) {
+                            Ok(epsh::error::ExitStatus::from(libc::WEXITSTATUS(status)))
+                        } else if libc::WIFSIGNALED(status) {
+                            Ok(epsh::error::ExitStatus::from(128 + libc::WTERMSIG(status)))
+                        } else {
+                            Ok(epsh::error::ExitStatus::FAILURE)
+                        }
+                    } else {
+                        // Pipeline child: just wait normally
+                        match child.wait() {
+                            Ok(s) => Ok(epsh::error::ExitStatus::from(s.code().unwrap_or(128))),
+                            Err(e) => Err(epsh::error::ShellError::Io(e)),
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        eprintln!("{name}: not found");
+                        Ok(epsh::error::ExitStatus::NOT_FOUND)
+                    } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        eprintln!("{name}: permission denied");
+                        Ok(epsh::error::ExitStatus::NOT_EXECUTABLE)
+                    } else {
+                        Err(epsh::error::ShellError::Io(e))
                     }
                 }
             }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    eprintln!("{}: not found", args[0]);
-                    Ok(epsh::error::ExitStatus::NOT_FOUND)
-                } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    eprintln!("{}: permission denied", args[0]);
-                    Ok(epsh::error::ExitStatus::NOT_EXECUTABLE)
-                } else {
-                    Err(epsh::error::ShellError::Io(e))
-                }
-            }
-        }
-    })
+        },
+    )
 }
 
 /// Check if input needs a continuation line (open quotes, trailing operator, etc.)
