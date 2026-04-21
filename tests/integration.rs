@@ -1518,7 +1518,7 @@ fn history_up_arrow_uses_session_start_boundary() {
 }
 
 #[test]
-fn history_ctrl_r_prefers_local_entries_but_keeps_global_history() {
+fn history_ctrl_r_uses_session_start_boundary() {
     let dir = tempdir_with_files(&[]);
     let hist_file = dir.join("history");
     std::fs::write(&hist_file, "echo global one\necho global two\n").unwrap();
@@ -1537,23 +1537,21 @@ fn history_ctrl_r_prefers_local_entries_but_keeps_global_history() {
     h.sync();
 
     let all = h.fuzzy_search("");
-    assert_eq!(h.get(all[0].entry_idx), "echo global three");
-    assert_eq!(h.get(all[1].entry_idx), "echo local one");
+    assert_eq!(h.get(all[0].entry_idx), "echo local one");
+    assert_eq!(h.get(all[1].entry_idx), "echo global two");
+    assert!(
+        all.iter()
+            .all(|m| h.get(m.entry_idx) != "echo global three")
+    );
 
     let filtered = h.fuzzy_search("global");
-    assert_eq!(h.get(filtered[0].entry_idx), "echo global three");
-    assert_eq!(h.get(filtered[1].entry_idx), "echo global two");
-    assert_eq!(h.get(filtered[2].entry_idx), "echo global one");
-}
-
-#[test]
-fn history_ctrl_r_local_bias_breaks_ties() {
-    let mut h = History::from_entries(vec!["echo global match".into(), "echo global newer".into()]);
-    h.add("echo local newer");
-
-    let results = h.fuzzy_search("echo");
-    assert_eq!(h.get(results[0].entry_idx), "echo local newer");
-    assert_eq!(h.get(results[1].entry_idx), "echo global newer");
+    assert_eq!(h.get(filtered[0].entry_idx), "echo global two");
+    assert_eq!(h.get(filtered[1].entry_idx), "echo global one");
+    assert!(
+        filtered
+            .iter()
+            .all(|m| h.get(m.entry_idx) != "echo global three")
+    );
 }
 
 // ---------------------------------------------------------------------------

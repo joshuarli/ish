@@ -1205,7 +1205,7 @@ fn history_ctrl_r_search() {
 }
 
 #[test]
-fn history_ctrl_r_includes_later_global_entries() {
+fn history_ctrl_r_ignores_later_global_entries() {
     use std::io::Write;
 
     let sh = PtyShell::spawn_with_opts(&[], &["echo startup"]);
@@ -1222,6 +1222,10 @@ fn history_ctrl_r_includes_later_global_entries() {
     let out = sh.wait_for("search:", 2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(text.contains("search:"), "expected search pager: {text:?}");
+    assert!(
+        !text.contains("later_global"),
+        "later global entry leaked into initial history pager: {text:?}"
+    );
 
     sh.type_str("later");
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1229,8 +1233,8 @@ fn history_ctrl_r_includes_later_global_entries() {
     let out = sh.wait_for_prompt(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
-        text.contains("later_global"),
-        "later global entry should be searchable via Ctrl+R: {text:?}"
+        !text.contains("echo later_global"),
+        "later global entry leaked into Ctrl+R acceptance: {text:?}"
     );
 }
 
