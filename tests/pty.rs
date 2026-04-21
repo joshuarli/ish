@@ -1802,6 +1802,18 @@ fn alias_with_command_substitution() {
 }
 
 #[test]
+fn alias_preserves_quoted_word() {
+    let sh = PtyShell::spawn();
+    sh.run_command(r#"alias greet echo "hello world""#);
+    let out = sh.run_command("greet");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("hello world"),
+        "expected quoted alias word to stay intact: {text:?}"
+    );
+}
+
+#[test]
 fn which_builtin() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("w echo");
@@ -2031,6 +2043,18 @@ fn cd_tilde_subdir() {
     assert!(
         text.contains("subdir"),
         "cd ~/subdir should land in subdir: {text:?}"
+    );
+}
+
+#[test]
+fn implicit_cd_quoted_path() {
+    let sh = PtyShell::spawn_with_opts(&[("space dir/.keep", "")], &[]);
+    sh.run_command("'space dir'");
+    let out = sh.run_command("pwd");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("space dir"),
+        "quoted single path should implicit-cd: {text:?}"
     );
 }
 

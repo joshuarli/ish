@@ -2099,18 +2099,18 @@ fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
 
 /// Handle the "alias" command typed at the prompt.
 fn handle_alias(line: &str, shell: &mut Shell) {
-    let args: Vec<&str> = line.split_whitespace().skip(1).collect();
-    if args.len() >= 2 {
-        let name = args[0].to_string();
-        let expansion: Vec<String> = args[1..].iter().map(|s| s.to_string()).collect();
+    let words = parse_alias_words(line);
+    if words.len() >= 2 {
+        let name = words[0].clone();
+        let expansion = words[1..].to_vec();
         shell.aliases.set(name, expansion);
         shell.last_status = 0;
-    } else if args.len() == 1 {
-        if let Some(exp) = shell.aliases.get(args[0]) {
-            println!("alias {} {}", args[0], exp.join(" "));
+    } else if words.len() == 1 {
+        if let Some(exp) = shell.aliases.get(&words[0]) {
+            println!("alias {} {}", words[0], exp.join(" "));
             shell.last_status = 0;
         } else {
-            eprintln!("ish: alias: not found: {}", args[0]);
+            eprintln!("ish: alias: not found: {}", words[0]);
             shell.last_status = 1;
         }
     } else {
@@ -2119,6 +2119,15 @@ fn handle_alias(line: &str, shell: &mut Shell) {
         }
         shell.last_status = 0;
     }
+}
+
+fn parse_alias_words(line: &str) -> Vec<String> {
+    let rest = line
+        .trim_start()
+        .strip_prefix("alias")
+        .unwrap_or("")
+        .trim_start();
+    ish::alias::lex_words(rest)
 }
 
 /// Handle the "history" command. Returns true if handled (no fallthrough needed).
@@ -2345,50 +2354,49 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
 ///   single-arg that is a directory (and not an alias/builtin/executable) → "cd <arg>"
 fn maybe_rewrite_cd(line: &str, aliases: &AliasMap) -> String {
     let trimmed = line.trim();
-    let mut words = trimmed.split_whitespace();
-    let first = match words.next() {
-        Some(w) => w,
+    let words = match parse_simple_command_words(trimmed) {
+        Some(words) => words,
         None => return line.to_string(),
     };
+    let first = match words.first() {
+        Some(word) => word,
+        None => return line.to_string(),
+    };
+    let first_text = epsh::lexer::parts_to_text(&first.parts);
+    let first_quoted = epsh::lexer::parts_have_quoting(&first.parts);
 
     // Plain cd commands pass through — intercepted in main loop
-    if first == "cd" {
+    if !first_quoted && first_text == "cd" {
         return line.to_string();
     }
 
     // Dot-dot shorthand: ".." is already valid, "..." → "../..", etc.
-    if first.len() >= 2 && first.bytes().all(|b| b == b'.') {
-        let levels = first.len() - 1; // ".." = 1 level, "..." = 2, etc.
+    if words.len() == 1
+        && !first_quoted
+        && first_text.len() >= 2
+        && first_text.bytes().all(|b| b == b'.')
+    {
+        let levels = first_text.len() - 1; // ".." = 1 level, "..." = 2, etc.
         let path = (0..levels).map(|_| "..").collect::<Vec<_>>().join("/");
-        let rest: String = words.collect::<Vec<_>>().join(" ");
-        return if rest.is_empty() {
-            format!("cd {path}")
-        } else {
-            format!("cd {path} {rest}")
-        };
+        return format!("cd {path}");
     }
 
-    // Implicit cd: single arg, not an alias/builtin, is a directory, not an executable
-    if words.next().is_none()
-        && !builtin::is_builtin(first)
-        && aliases.get(first).is_none()
-        && !first.contains('|')
-        && !first.contains('&')
-        && !first.contains(';')
-    {
-        // Resolve ~ prefix
-        let expanded = if let Some(rest) = first.strip_prefix('~') {
-            let home = std::env::var_os("HOME")
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            format!("{home}{rest}")
-        } else {
-            first.to_string()
-        };
-        let path = std::path::Path::new(&expanded);
-        if path.is_dir() && !is_executable(path) {
-            return format!("cd {first}");
-        }
+    // Implicit cd: single word that is a directory (and not a builtin/alias/executable).
+    if words.len() != 1 || builtin::is_builtin(&first_text) || aliases.get(&first_text).is_some() {
+        return line.to_string();
+    }
+
+    let expanded = if let Some(rest) = first_text.strip_prefix('~') {
+        let home = std::env::var_os("HOME")
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        format!("{home}{rest}")
+    } else {
+        first_text
+    };
+    let path = std::path::Path::new(&expanded);
+    if path.is_dir() && !is_executable(path) {
+        return format!("cd {trimmed}");
     }
 
     line.to_string()

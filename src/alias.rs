@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-/// Maps alias names to their expansion (command + args).
+/// Maps alias names to their expansion as raw shell words.
 pub struct AliasMap {
     map: HashMap<String, Vec<String>>,
 }
@@ -42,7 +42,7 @@ impl AliasMap {
         if let Some(expansion) = self.get(first_word) {
             let leading_ws = &line[..line.len() - trimmed.len()];
             let rest = &trimmed[first_word.len()..];
-            let expanded = shell_quote_join(expansion);
+            let expanded = expansion.join(" ");
             std::borrow::Cow::Owned(format!("{leading_ws}{expanded}{rest}"))
         } else {
             std::borrow::Cow::Borrowed(line)
@@ -50,26 +50,40 @@ impl AliasMap {
     }
 }
 
-/// Join words, quoting any that contain whitespace so the result
-/// re-parses into the same tokens.
-fn shell_quote_join(words: &[String]) -> String {
-    let mut result = String::new();
-    for (i, word) in words.iter().enumerate() {
-        if i > 0 {
-            result.push(' ');
-        }
-        if word.contains([' ', '\t', '\n']) {
-            result.push('"');
-            for c in word.chars() {
-                if c == '"' || c == '\\' {
-                    result.push('\\');
-                }
-                result.push(c);
+/// Lex a shell fragment into its raw word tokens, preserving quoting and
+/// substitutions in the returned strings.
+pub fn lex_words(source: &str) -> Vec<String> {
+    let mut lex = epsh::lexer::Lexer::new(source);
+    lex.recognize_reserved = false;
+
+    let mut words = Vec::new();
+    while let Ok((tok, span)) = lex.next_token() {
+        let next_offset = match lex.next_token() {
+            Ok((next, next_span)) => {
+                lex.push_back(next.clone(), next_span);
+                next_span.offset
             }
-            result.push('"');
-        } else {
-            result.push_str(word);
+            Err(_) => source.chars().count(),
+        };
+
+        match tok {
+            epsh::lexer::Token::Word(_, _) => {
+                let start = char_to_byte_offset(source, span.offset);
+                let end = char_to_byte_offset(source, next_offset);
+                words.push(source[start..end].trim_end().to_string());
+            }
+            epsh::lexer::Token::Eof => break,
+            _ => break,
         }
     }
-    result
+
+    words
+}
+
+fn char_to_byte_offset(source: &str, char_offset: usize) -> usize {
+    source
+        .char_indices()
+        .nth(char_offset)
+        .map(|(idx, _)| idx)
+        .unwrap_or(source.len())
 }

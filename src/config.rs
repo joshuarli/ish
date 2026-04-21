@@ -110,19 +110,7 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh:
 }
 
 fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut AliasMap) {
-    // alias name cmd [args...] — lex the whole line with epsh's lexer
-    let mut lex = Lexer::new(rest);
-    lex.recognize_reserved = false;
-    let mut words: Vec<String> = Vec::new();
-    loop {
-        match lex.next_token() {
-            Ok((Token::Word(parts, _), _)) => {
-                words.push(epsh::lexer::parts_to_text(&parts));
-            }
-            Ok((Token::Eof, _)) | Err(_) => break,
-            Ok(_) => break,
-        }
-    }
+    let mut words = crate::alias::lex_words(rest);
 
     if words.is_empty() {
         eprintln!("ish: {}:{}: alias: missing name", path.display(), lineno);
