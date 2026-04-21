@@ -8,6 +8,7 @@ const CACHE_MAGIC_V1: &[u8; 4] = b"ISH\x01";
 const CACHE_MAGIC_V2: &[u8; 4] = b"ISH\x02";
 const CACHE_MAGIC_V3: &[u8; 4] = b"ISH\x03";
 const CACHE_MAGIC_V4: &[u8; 4] = b"ISH\x04";
+const LOG_RECORD_PREFIX: &str = ":ish-history:v1\t";
 
 /// v1/v2 header: magic(4) + reserved(8) + entry_count(4) + arena_size(4)
 const V2_HEADER_SIZE: usize = 20;
@@ -30,6 +31,47 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
+fn new_session_id() -> u64 {
+    now_millis().wrapping_shl(16) ^ unsafe { libc::getpid() as u64 }
+}
+
+struct ParsedHistoryLine<'a> {
+    command: &'a str,
+    timestamp: u64,
+    session_id: u64,
+}
+
+fn parse_history_line<'a>(line: &'a str, fallback_ts: u64) -> Option<ParsedHistoryLine<'a>> {
+    if line.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = line.strip_prefix(LOG_RECORD_PREFIX) {
+        let mut parts = rest.splitn(3, '\t');
+        if let (Some(ts), Some(session_id), Some(command)) =
+            (parts.next(), parts.next(), parts.next())
+            && !command.is_empty()
+            && let (Ok(timestamp), Ok(session_id)) = (ts.parse::<u64>(), session_id.parse::<u64>())
+        {
+            return Some(ParsedHistoryLine {
+                command,
+                timestamp,
+                session_id,
+            });
+        }
+    }
+
+    Some(ParsedHistoryLine {
+        command: line,
+        timestamp: fallback_ts,
+        session_id: 0,
+    })
+}
+
+fn format_history_record(timestamp: u64, session_id: u64, command: &str) -> String {
+    format!("{LOG_RECORD_PREFIX}{timestamp}\t{session_id}\t{command}")
+}
+
 pub struct History {
     /// All entry text packed into a single allocation.
     arena: String,
@@ -37,6 +79,8 @@ pub struct History {
     offsets: Vec<(u32, u16)>,
     /// Epoch milliseconds when each entry was last used. Parallel to `offsets`.
     timestamps: Vec<u64>,
+    /// Session ids parallel to `offsets`. Zero means unknown/legacy.
+    session_ids: Vec<u64>,
     /// Hash index for O(1) duplicate checks in add().
     hashes: HashSet<u64>,
     path: PathBuf,
@@ -50,6 +94,8 @@ pub struct History {
     /// of the session-visible history. Up-arrow sees those entries plus any
     /// entry added by this shell.
     session_cutoff: u64,
+    /// Session id used for new entries written by this shell.
+    session_id: u64,
     /// Set when the cache was corrupt at load time. Prevents overwriting the
     /// (possibly recoverable) cache file until the user resolves it.
     cache_dirty: bool,
@@ -100,6 +146,7 @@ impl History {
         fresh.file_pos = fs::metadata(&fresh.path).map(|m| m.len()).unwrap_or(0);
         fresh.cache_dirty = false;
         fresh.session_cutoff = now_millis();
+        fresh.session_id = self.session_id;
         fresh.save_cache();
         eprintln!(
             "ish: rebuilt history cache — {} entries",
@@ -109,52 +156,65 @@ impl History {
     }
 
     fn load_from_text(path: &Path) -> Self {
-        let (arena, offsets, hashes) = match fs::read(path) {
+        let (arena, offsets, timestamps, session_ids, hashes) = match fs::read(path) {
             Ok(data) => {
                 let line_count = memchr_count(b'\n', &data);
                 let mut seen = HashSet::with_capacity(line_count);
-                let mut deduped: Vec<&str> = Vec::with_capacity(line_count);
+                let mut deduped: Vec<(String, u64, u64)> = Vec::with_capacity(line_count);
+                let fallback_ts = now_millis();
 
                 for chunk in data.rsplit(|&b| b == b'\n') {
                     if let Ok(line) = std::str::from_utf8(chunk)
-                        && !line.is_empty()
+                        && let Some(parsed) = parse_history_line(line, fallback_ts)
                     {
-                        let h = hash_str(line);
+                        let h = hash_str(parsed.command);
                         if seen.insert(h) {
-                            deduped.push(line);
+                            deduped.push((
+                                parsed.command.to_string(),
+                                parsed.timestamp,
+                                parsed.session_id,
+                            ));
                         }
                     }
                 }
                 deduped.reverse();
 
-                let total: usize = deduped.iter().map(|s| s.len()).sum();
+                let total: usize = deduped.iter().map(|(s, _, _)| s.len()).sum();
                 let mut arena = String::with_capacity(total);
                 let mut offsets = Vec::with_capacity(deduped.len());
-                for line in &deduped {
+                let mut timestamps = Vec::with_capacity(deduped.len());
+                let mut session_ids = Vec::with_capacity(deduped.len());
+                for (line, timestamp, session_id) in &deduped {
                     let start = arena.len() as u32;
                     arena.push_str(line);
                     offsets.push((start, line.len() as u16));
+                    timestamps.push(*timestamp);
+                    session_ids.push(*session_id);
                 }
 
-                (arena, offsets, seen)
+                (arena, offsets, timestamps, session_ids, seen)
             }
-            Err(_) => (String::new(), Vec::new(), HashSet::new()),
+            Err(_) => (
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashSet::new(),
+            ),
         };
-
-        // No timestamps in text format — use current time for all entries
-        let ts = now_millis();
         let count = offsets.len();
-        let timestamps = vec![ts; count];
 
         Self {
             arena,
             offsets,
             timestamps,
+            session_ids,
             hashes,
             path: path.to_path_buf(),
             file_pos: 0,
             local: vec![false; count],
             session_cutoff: 0,
+            session_id: new_session_id(),
             cache_dirty: false,
         }
     }
@@ -294,11 +354,13 @@ impl History {
             arena,
             offsets,
             timestamps,
+            session_ids: vec![0; count],
             hashes,
             path: path.to_path_buf(),
             file_pos: 0,
             local: vec![false; count],
             session_cutoff: 0,
+            session_id: new_session_id(),
             cache_dirty: false,
         })
     }
@@ -365,11 +427,13 @@ impl History {
             arena,
             offsets,
             timestamps,
+            session_ids: vec![0; count],
             hashes,
             path: path.to_path_buf(),
             file_pos: 0,
             local: vec![false; count],
             session_cutoff: 0,
+            session_id: new_session_id(),
             cache_dirty: false,
         })
     }
@@ -412,16 +476,17 @@ impl History {
 
         let ts = now_millis();
         for line in tail.lines() {
-            if line.is_empty() {
+            let Some(parsed) = parse_history_line(line, ts) else {
                 continue;
-            }
-            let h = hash_str(line);
+            };
+            let h = hash_str(parsed.command);
             if self.hashes.contains(&h) {
                 // Don't let a newer hidden duplicate disturb the entries this
                 // session can still recall with Up-arrow.
                 if self.offsets.iter().enumerate().any(|(i, &(start, len))| {
                     self.is_session_visible(i)
-                        && &self.arena[start as usize..start as usize + len as usize] == line
+                        && &self.arena[start as usize..start as usize + len as usize]
+                            == parsed.command
                 }) {
                     continue;
                 }
@@ -430,9 +495,11 @@ impl History {
                 let mut i = 0;
                 while i < self.offsets.len() {
                     let (start, len) = self.offsets[i];
-                    if &self.arena[start as usize..start as usize + len as usize] == line {
+                    if &self.arena[start as usize..start as usize + len as usize] == parsed.command
+                    {
                         self.offsets.remove(i);
                         self.timestamps.remove(i);
+                        self.session_ids.remove(i);
                         self.local.remove(i);
                     } else {
                         i += 1;
@@ -440,9 +507,10 @@ impl History {
                 }
             }
             let start = self.arena.len() as u32;
-            self.arena.push_str(line);
-            self.offsets.push((start, line.len() as u16));
-            self.timestamps.push(ts);
+            self.arena.push_str(parsed.command);
+            self.offsets.push((start, parsed.command.len() as u16));
+            self.timestamps.push(parsed.timestamp);
+            self.session_ids.push(parsed.session_id);
             self.local.push(false);
             self.hashes.insert(h);
         }
@@ -569,6 +637,7 @@ impl History {
         let mut arena = String::with_capacity(total);
         let mut offsets = Vec::with_capacity(entries.len());
         let mut timestamps = Vec::with_capacity(entries.len());
+        let mut session_ids = Vec::with_capacity(entries.len());
         let mut hashes = HashSet::with_capacity(entries.len());
         for e in &entries {
             let start = arena.len() as u32;
@@ -576,6 +645,7 @@ impl History {
             arena.push_str(e);
             offsets.push((start, e.len() as u16));
             timestamps.push(ts);
+            session_ids.push(0);
             hashes.insert(h);
         }
         let count = offsets.len();
@@ -583,11 +653,13 @@ impl History {
             arena,
             offsets,
             timestamps,
+            session_ids,
             hashes,
             path: PathBuf::from("/dev/null"),
             file_pos: 0,
             local: vec![false; count],
             session_cutoff: ts,
+            session_id: new_session_id(),
             cache_dirty: false,
         }
     }
@@ -610,6 +682,7 @@ impl History {
                 if &self.arena[start as usize..start as usize + len as usize] == line {
                     self.offsets.remove(i);
                     self.timestamps.remove(i);
+                    self.session_ids.remove(i);
                     self.local.remove(i);
                 } else {
                     i += 1;
@@ -622,6 +695,7 @@ impl History {
         self.arena.push_str(&line[..len]);
         self.offsets.push((start, len as u16));
         self.timestamps.push(now_millis());
+        self.session_ids.push(self.session_id);
         self.local.push(true);
         self.hashes.insert(h);
 
@@ -740,9 +814,10 @@ impl History {
             .open(&self.path)
         {
             use std::io::Write;
-            for &(start, len) in &self.offsets {
+            for (i, &(start, len)) in self.offsets.iter().enumerate() {
                 let entry = &self.arena[start as usize..start as usize + len as usize];
-                let _ = writeln!(f, "{entry}");
+                let record = format_history_record(self.timestamps[i], self.session_ids[i], entry);
+                let _ = writeln!(f, "{record}");
             }
         }
     }
@@ -756,7 +831,8 @@ impl History {
             .append(true)
             .open(&self.path)
         {
-            let _ = writeln!(f, "{line}");
+            let record = format_history_record(now_millis(), self.session_id, line);
+            let _ = writeln!(f, "{record}");
             // Update file_pos so sync() doesn't re-read our own write
             if let Ok(m) = f.metadata() {
                 self.file_pos = m.len();
@@ -791,6 +867,21 @@ impl History {
     fn is_session_visible(&self, idx: usize) -> bool {
         self.local[idx] || self.timestamps[idx] <= self.session_cutoff
     }
+}
+
+pub fn render_history_file(path: &Path) -> std::io::Result<String> {
+    let data = fs::read(path)?;
+    let fallback_ts = now_millis();
+    let mut out = String::new();
+    for chunk in data.split(|&b| b == b'\n') {
+        if let Ok(line) = std::str::from_utf8(chunk)
+            && let Some(parsed) = parse_history_line(line, fallback_ts)
+        {
+            out.push_str(parsed.command);
+            out.push('\n');
+        }
+    }
+    Ok(out)
 }
 
 /// Lowercase a query into a fixed stack buffer, returning the used slice.
@@ -1138,6 +1229,7 @@ fn lock_path_for(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::fs;
     use std::os::unix::ffi::OsStringExt;
 
     #[test]
@@ -1269,5 +1361,42 @@ mod tests {
         for i in 0..3 {
             assert_eq!(parsed.timestamp(i), hist.timestamp(i));
         }
+    }
+
+    #[test]
+    fn structured_log_load_preserves_metadata() {
+        let dir = std::env::temp_dir().join(format!("ish_history_meta_{}", now_millis()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(file, "{}", format_history_record(111, 7, "echo one")).unwrap();
+        writeln!(file, "{}", format_history_record(222, 8, "echo two")).unwrap();
+        writeln!(file, "{}", format_history_record(333, 9, "echo one")).unwrap();
+
+        let hist = History::load_from_text(&path);
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist.get(0), "echo two");
+        assert_eq!(hist.timestamp(0), 222);
+        assert_eq!(hist.session_ids[0], 8);
+        assert_eq!(hist.get(1), "echo one");
+        assert_eq!(hist.timestamp(1), 333);
+        assert_eq!(hist.session_ids[1], 9);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn render_history_file_strips_metadata() {
+        let dir = std::env::temp_dir().join(format!("ish_history_render_{}", now_millis()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(file, "{}", format_history_record(111, 7, "echo one")).unwrap();
+        writeln!(file, "plain legacy line").unwrap();
+
+        let rendered = render_history_file(&path).unwrap();
+        assert_eq!(rendered, "echo one\nplain legacy line\n");
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

@@ -2205,7 +2205,7 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                     } else {
                         std::path::PathBuf::from("/tmp/ish_history")
                     };
-                    match std::fs::read_to_string(&path) {
+                    match history::render_history_file(&path) {
                         Ok(content) => {
                             print!("{content}");
                             return Ok(epsh::error::ExitStatus::SUCCESS);
