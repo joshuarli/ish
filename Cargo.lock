@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "ish"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "criterion",
  "epsh",
