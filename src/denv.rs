@@ -392,15 +392,25 @@ fn active_path(pid: &str) -> Result<PathBuf, String> {
 
 fn stat_regular_file_mtime(path: &Path) -> Option<u64> {
     let bytes = path.as_os_str().as_encoded_bytes();
+    const STACK_BUF_LEN: usize = 1024;
+    if bytes.len() < STACK_BUF_LEN {
+        let mut buf = [0_u8; STACK_BUF_LEN];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        return stat_regular_file_mtime_cstr(buf.as_ptr() as *const libc::c_char);
+    }
+
     let mut buf = Vec::with_capacity(bytes.len() + 1);
     buf.extend_from_slice(bytes);
     buf.push(0);
+    stat_regular_file_mtime_cstr(buf.as_ptr() as *const libc::c_char)
+}
 
-    // SAFETY: buf is NUL-terminated and lives for the duration of the call.
-    // stat is zero-initialized before libc fills it.
+fn stat_regular_file_mtime_cstr(path: *const libc::c_char) -> Option<u64> {
+    // SAFETY: path points to a live NUL-terminated buffer for the duration of
+    // the call. stat is zero-initialized before libc fills it.
     unsafe {
         let mut st: libc::stat = std::mem::zeroed();
-        if libc::stat(buf.as_ptr() as *const libc::c_char, &mut st) != 0 {
+        if libc::stat(path, &mut st) != 0 {
             return None;
         }
         if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
