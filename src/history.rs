@@ -826,6 +826,9 @@ impl History {
             if results.len() > limit {
                 results.pop();
             }
+            if results.len() == limit && results[limit - 1].score == 3 {
+                break;
+            }
         }
     }
 
@@ -952,6 +955,9 @@ impl History {
             results.insert(insert_at, m);
             if results.len() > limit {
                 results.pop();
+            }
+            if results.len() == limit && results[limit - 1].score == 3 {
+                break;
             }
         }
     }
