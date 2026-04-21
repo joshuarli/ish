@@ -9,9 +9,10 @@ use std::cmp::Ordering;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
-use std::os::fd::AsFd;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -204,7 +205,7 @@ fn refresh(force: bool) -> Result<Vec<EnvChange>, String> {
             .envrc
             .as_ref()
             .map(|(path, _)| canonicalize_fallback(path));
-        match eval_env(&dir, envrc.as_deref(), &dotenv_entries, &pid) {
+        match eval_env(&dir, envrc.as_deref(), &dotenv_entries) {
             Ok(diff) => diff,
             Err(err) => {
                 let dir = canonicalize_fallback(&found.dir);
@@ -706,19 +707,24 @@ fn eval_env(
     dir: &Path,
     envrc: Option<&Path>,
     dotenv_entries: &[(String, String)],
-    pid: &str,
 ) -> Result<EnvDiff, String> {
-    let data = data_dir()?;
-    fs::create_dir_all(&data).map_err(|e| format!("create data dir: {e}"))?;
-    let before_path = data.join(format!("before_{pid}"));
-    let after_path = data.join(format!("after_{pid}"));
+    let (before_r, before_w) =
+        crate::sys::pipe_cloexec().map_err(|e| format!("create before pipe: {e}"))?;
+    let (after_r, after_w) =
+        crate::sys::pipe_cloexec().map_err(|e| format!("create after pipe: {e}"))?;
+    // SAFETY: these fds come directly from pipe_cloexec and are uniquely owned here.
+    let before_r = unsafe { OwnedFd::from_raw_fd(before_r) };
+    // SAFETY: these fds come directly from pipe_cloexec and are uniquely owned here.
+    let before_w = unsafe { OwnedFd::from_raw_fd(before_w) };
+    // SAFETY: these fds come directly from pipe_cloexec and are uniquely owned here.
+    let after_r = unsafe { OwnedFd::from_raw_fd(after_r) };
+    // SAFETY: these fds come directly from pipe_cloexec and are uniquely owned here.
+    let after_w = unsafe { OwnedFd::from_raw_fd(after_w) };
 
     let mut script = String::with_capacity(BASH_STDLIB.len() + 256);
     script.push_str(BASH_STDLIB);
     script.push('\n');
-    script.push_str("env -0 > ");
-    push_sh_escaped(&mut script, &before_path.to_string_lossy());
-    script.push('\n');
+    script.push_str("env -0 >&3\n");
     if let Some(envrc) = envrc {
         script.push_str(". ");
         push_sh_escaped(&mut script, &envrc.to_string_lossy());
@@ -731,15 +737,48 @@ fn eval_env(
         push_sh_escaped(&mut script, value);
         script.push('\n');
     }
-    script.push_str("env -0 > ");
-    push_sh_escaped(&mut script, &after_path.to_string_lossy());
-    script.push('\n');
+    script.push_str("env -0 >&4\n");
 
     let stderr_dup = io::stderr()
         .as_fd()
         .try_clone_to_owned()
         .map_err(|e| format!("dup stderr: {e}"))?;
-    let status = Command::new("bash")
+    let before_read = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        let mut file = fs::File::from(before_r);
+        file.read_to_end(&mut data)?;
+        Ok(data)
+    });
+    let after_read = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        let mut file = fs::File::from(after_r);
+        file.read_to_end(&mut data)?;
+        Ok(data)
+    });
+
+    let mut cmd = Command::new("bash");
+    // SAFETY: pre_exec runs in the child after fork and before exec. We only
+    // dup the dedicated pipe fds into 3/4 for the shell snapshot script.
+    unsafe {
+        cmd.pre_exec(move || {
+            let before_w_fd = before_w.as_raw_fd();
+            let after_w_fd = after_w.as_raw_fd();
+            if libc::dup2(before_w_fd, 3) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::dup2(after_w_fd, 4) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if before_w_fd != 3 {
+                libc::close(before_w_fd);
+            }
+            if after_w_fd != 4 {
+                libc::close(after_w_fd);
+            }
+            Ok(())
+        });
+    }
+    let status = cmd
         .arg("-e")
         .arg("-c")
         .arg(&script)
@@ -753,17 +792,20 @@ fn eval_env(
         )
         .status()
         .map_err(|e| format!("failed to run bash: {e}"))?;
+    drop(cmd);
+
+    let before_data = before_read
+        .join()
+        .map_err(|_| "read before env thread panicked".to_string())?
+        .map_err(|e| format!("read before env: {e}"))?;
+    let after_data = after_read
+        .join()
+        .map_err(|_| "read after env thread panicked".to_string())?
+        .map_err(|e| format!("read after env: {e}"))?;
 
     if !status.success() {
-        let _ = fs::remove_file(&before_path);
-        let _ = fs::remove_file(&after_path);
         return Err(".envrc evaluation failed".to_string());
     }
-
-    let before_data = fs::read(&before_path).map_err(|e| format!("read before env: {e}"))?;
-    let after_data = fs::read(&after_path).map_err(|e| format!("read after env: {e}"))?;
-    let _ = fs::remove_file(&before_path);
-    let _ = fs::remove_file(&after_path);
 
     let before = parse_env_null(&before_data);
     let after = parse_env_null(&after_data);
