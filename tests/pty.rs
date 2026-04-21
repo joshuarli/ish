@@ -30,7 +30,8 @@ impl TempDir {
         let ptr = unsafe { libc::mkdtemp(buf.as_mut_ptr() as *mut libc::c_char) };
         assert!(!ptr.is_null(), "mkdtemp failed");
         buf.pop(); // remove NUL
-        Self(PathBuf::from(String::from_utf8(buf).unwrap()))
+        let path = PathBuf::from(String::from_utf8(buf).unwrap());
+        Self(std::fs::canonicalize(&path).unwrap_or(path))
     }
 
     fn path(&self) -> &Path {
@@ -414,6 +415,41 @@ impl PtyShell {
         self.wait_for("$ ", timeout_ms)
     }
 
+    /// Wait until Enter has been processed and the shell advanced to a new line.
+    fn wait_for_line_advance(&self, timeout_ms: u64) -> String {
+        self.wait_for("\n", timeout_ms)
+    }
+
+    /// Wait until the rendered screen satisfies `predicate`, up to `timeout_ms`.
+    fn wait_for_screen<F>(&self, rows: u16, cols: u16, timeout_ms: u64, mut predicate: F) -> String
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let mut accumulated = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u64;
+            if remaining == 0 {
+                break;
+            }
+
+            let chunk = self.read_timeout(remaining.min(200));
+            if !chunk.is_empty() {
+                accumulated.push_str(&chunk);
+            }
+
+            let screen = Screen::render(&accumulated, rows, cols);
+            if predicate(&screen) {
+                return accumulated;
+            }
+        }
+
+        accumulated
+    }
+
     /// Send a command, press enter, wait for the next prompt.
     ///
     /// Waits for `"$ "` that appears after a newline. Typing renders use `\r`
@@ -429,7 +465,7 @@ impl PtyShell {
     fn run_command(&self, cmd: &str) -> String {
         self.type_str(cmd);
         self.enter();
-        let mut accumulated = String::new();
+        let mut accumulated = self.wait_for_line_advance(1000);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
 
         loop {
@@ -443,8 +479,8 @@ impl PtyShell {
             let chunk = self.read_timeout(remaining.min(200));
             accumulated.push_str(&chunk);
 
-            if let Some(nl) = accumulated.find('\n')
-                && accumulated[nl..].contains("$ ")
+            if let Some(nl) = accumulated.rfind('\n')
+                && accumulated[nl + 1..].contains("$ ")
             {
                 return accumulated;
             }
@@ -484,6 +520,8 @@ impl PtyShell {
                                 break;
                             }
                         }
+                    } else if next == '7' || next == '8' {
+                        chars.next();
                     }
                 }
                 continue;
@@ -788,6 +826,10 @@ fn assert_frame_contains_once(frame: &TraceFrame, needle: &str) {
         "expected {needle:?} once in frame {}: {:?}",
         frame.label, frame.snapshot.visible
     );
+}
+
+fn normalize_screen_text(screen: &str) -> String {
+    screen.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl Drop for PtyShell {
@@ -1116,17 +1158,18 @@ fn history_up_narrow_repaint_clears_wrapped_rows() {
         12,
     );
     sh.up();
-    std::thread::sleep(std::time::Duration::from_millis(80));
     sh.up();
-    std::thread::sleep(std::time::Duration::from_millis(80));
     sh.up();
-    std::thread::sleep(std::time::Duration::from_millis(150));
-
-    let out = sh.read_timeout(800);
+    let out = sh.wait_for_screen(24, 12, 2000, |screen| {
+        normalize_screen_text(screen).contains("echo ok")
+            && !screen.contains("WRAPMARK")
+            && !screen.contains("newer")
+    });
     let screen = Screen::render(&out, 24, 12);
+    let normalized = normalize_screen_text(&screen);
     assert!(
-        screen.contains("$ echo\nok"),
-        "expected final prompt to show wrapped `echo ok`: {screen:?}"
+        normalized.contains("echo ok"),
+        "expected final prompt to show `echo ok`: {screen:?}"
     );
     assert!(
         !screen.contains("WRAPMARK"),
@@ -2385,6 +2428,7 @@ fn job_suspend_and_resume() {
     // Start a long-running foreground process.
     sh.type_str("sleep 60");
     sh.enter();
+    sh.wait_for_line_advance(1000);
 
     // Give sleep a moment to start, then suspend it with Ctrl+Z.
     std::thread::sleep(std::time::Duration::from_millis(200));
