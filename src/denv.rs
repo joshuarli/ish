@@ -2,10 +2,12 @@
 //!
 //! ish owns discovery, trust, active-state restore, and prompt flags directly.
 //! `.env` is parsed in Rust. Trusted `.envrc` files are evaluated via `bash`
-//! and diffed against the current environment.
+//! when line 1 mentions `bash`, otherwise via an embedded epsh shell, and then
+//! diffed against the current environment.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -50,6 +52,11 @@ enum PrevVar {
 struct EnvDiff {
     set: Vec<(String, String)>,
     unset: Vec<String>,
+}
+
+enum EnvRcInterpreter {
+    Bash,
+    Epsh,
 }
 
 /// Initialize ish's native denv state vars.
@@ -628,6 +635,10 @@ fn diff_dotenv_only(dotenv_entries: &[(String, String)]) -> EnvDiff {
     }
 }
 
+fn is_ignored_env_key(key: &str) -> bool {
+    matches!(key, "_" | "SHLVL" | "PWD" | "OLDPWD")
+}
+
 fn parse_env_null(data: &[u8]) -> Vec<(&str, &str)> {
     let mut entries = Vec::new();
     for entry in data.split(|&b| b == 0) {
@@ -641,7 +652,7 @@ fn parse_env_null(data: &[u8]) -> Vec<(&str, &str)> {
             continue;
         };
         let key = &s[..eq];
-        if matches!(key, "_" | "SHLVL" | "PWD" | "OLDPWD") {
+        if is_ignored_env_key(key) {
             continue;
         }
         entries.push((key, &s[eq + 1..]));
@@ -703,9 +714,85 @@ fn push_sh_escaped(out: &mut String, value: &str) {
     out.push('\'');
 }
 
+fn first_line_uses_bash(line: &[u8]) -> bool {
+    line.windows(4).any(|window| window == b"bash")
+}
+
+fn envrc_interpreter(envrc: &Path) -> Result<EnvRcInterpreter, String> {
+    let mut file = fs::File::open(envrc).map_err(|e| format!("read {}: {e}", envrc.display()))?;
+    let mut buf = [0_u8; 256];
+    let n = file
+        .read(&mut buf)
+        .map_err(|e| format!("read {}: {e}", envrc.display()))?;
+    let first_line = buf[..n].split(|&b| b == b'\n').next().unwrap_or_default();
+    if first_line_uses_bash(first_line) {
+        Ok(EnvRcInterpreter::Bash)
+    } else {
+        Ok(EnvRcInterpreter::Epsh)
+    }
+}
+
+fn capture_process_env() -> BTreeMap<String, String> {
+    env::vars().collect()
+}
+
+fn filtered_env_from_map(map: &BTreeMap<String, String>) -> Vec<(&str, &str)> {
+    map.iter()
+        .filter(|(key, _)| !is_ignored_env_key(key))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
+}
+
+fn filtered_env_from_owned(entries: &[(String, String)]) -> Vec<(&str, &str)> {
+    let mut filtered: Vec<(&str, &str)> = entries
+        .iter()
+        .filter(|(key, _)| !is_ignored_env_key(key))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    filtered.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    filtered
+}
+
+fn restore_process_env(snapshot: &BTreeMap<String, String>) {
+    for key in env::vars().map(|(key, _)| key).collect::<Vec<_>>() {
+        if !snapshot.contains_key(&key) {
+            crate::shell_unsetenv(&key);
+        }
+    }
+    for (key, value) in snapshot {
+        crate::shell_setenv(key, value);
+    }
+}
+
+struct SharedStderr;
+
+impl Write for SharedStderr {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::stderr().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().flush()
+    }
+}
+
 fn eval_env(
     dir: &Path,
     envrc: Option<&Path>,
+    dotenv_entries: &[(String, String)],
+) -> Result<EnvDiff, String> {
+    let Some(envrc) = envrc else {
+        return Ok(diff_dotenv_only(dotenv_entries));
+    };
+    match envrc_interpreter(envrc)? {
+        EnvRcInterpreter::Bash => eval_env_bash(dir, envrc, dotenv_entries),
+        EnvRcInterpreter::Epsh => eval_env_epsh(dir, envrc, dotenv_entries),
+    }
+}
+
+fn eval_env_bash(
+    dir: &Path,
+    envrc: &Path,
     dotenv_entries: &[(String, String)],
 ) -> Result<EnvDiff, String> {
     let (before_r, before_w) =
@@ -725,11 +812,9 @@ fn eval_env(
     script.push_str(BASH_STDLIB);
     script.push('\n');
     script.push_str("env -0 >&3\n");
-    if let Some(envrc) = envrc {
-        script.push_str(". ");
-        push_sh_escaped(&mut script, &envrc.to_string_lossy());
-        script.push('\n');
-    }
+    script.push_str(". ");
+    push_sh_escaped(&mut script, &envrc.to_string_lossy());
+    script.push('\n');
     for (key, value) in dotenv_entries {
         script.push_str("export ");
         script.push_str(key);
@@ -809,6 +894,46 @@ fn eval_env(
 
     let before = parse_env_null(&before_data);
     let after = parse_env_null(&after_data);
+    Ok(diff_sorted_env(&before, &after))
+}
+
+fn eval_env_epsh(
+    dir: &Path,
+    envrc: &Path,
+    dotenv_entries: &[(String, String)],
+) -> Result<EnvDiff, String> {
+    let before_process = capture_process_env();
+    let sink = std::sync::Arc::new(std::sync::Mutex::new(SharedStderr));
+    let mut shell = epsh::eval::Shell::builder()
+        .cwd(dir.to_path_buf())
+        .stdout_sink(sink.clone())
+        .stderr_sink(sink)
+        .build();
+
+    let mut script = String::with_capacity(BASH_STDLIB.len() + 256);
+    script.push_str(BASH_STDLIB);
+    script.push('\n');
+    script.push_str(". ");
+    push_sh_escaped(&mut script, &envrc.to_string_lossy());
+    script.push('\n');
+    for (key, value) in dotenv_entries {
+        script.push_str("export ");
+        script.push_str(key);
+        script.push('=');
+        push_sh_escaped(&mut script, value);
+        script.push('\n');
+    }
+
+    let status = shell.run_script(&script);
+    let after_process = shell.vars().exported_env();
+    restore_process_env(&before_process);
+
+    if status != 0 {
+        return Err(".envrc evaluation failed".to_string());
+    }
+
+    let before = filtered_env_from_map(&before_process);
+    let after = filtered_env_from_owned(&after_process);
     Ok(diff_sorted_env(&before, &after))
 }
 
@@ -1015,6 +1140,50 @@ mod tests {
     fn apply_bash_output_bench_counts_directives() {
         let count = apply_bash_output_bench("export A='1';\nunset B;\nexport C='3';");
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn first_line_uses_bash_detects_substring() {
+        assert!(first_line_uses_bash(b"#!/usr/bin/env bash"));
+        assert!(first_line_uses_bash(b"bash -eu"));
+        assert!(!first_line_uses_bash(b"#!/bin/sh"));
+    }
+
+    #[test]
+    fn eval_env_uses_epsh_for_non_bash_envrc() {
+        let tmp = TempDir::new("ish_denv_epsh_eval");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let envrc = project.join(".envrc");
+        std::fs::write(&envrc, "#!/bin/sh\nexport DENV_EPSH_TEST=ok\n").unwrap();
+
+        let diff = eval_env(&project, Some(&envrc), &[]).unwrap();
+        assert!(
+            diff.set
+                .iter()
+                .any(|(key, value)| key == "DENV_EPSH_TEST" && value == "ok")
+        );
+    }
+
+    #[test]
+    fn eval_env_epsh_restores_process_env_after_failure() {
+        let tmp = TempDir::new("ish_denv_epsh_restore");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let envrc = project.join(".envrc");
+        std::fs::write(
+            &envrc,
+            "#!/bin/sh\nexport DENV_TMP_SHOULD_ROLLBACK=1\nfalse\n",
+        )
+        .unwrap();
+
+        crate::shell_unsetenv("DENV_TMP_SHOULD_ROLLBACK");
+        let err = match eval_env_epsh(&project, &envrc, &[]) {
+            Ok(_) => panic!("expected epsh envrc evaluation to fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err, ".envrc evaluation failed");
+        assert!(std::env::var("DENV_TMP_SHOULD_ROLLBACK").is_err());
     }
 
     #[test]
