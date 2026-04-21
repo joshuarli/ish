@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -741,15 +741,18 @@ fn envrc_interpreter(envrc: &Path) -> Result<EnvRcInterpreter, String> {
     }
 }
 
-fn capture_process_env() -> BTreeMap<String, String> {
+fn capture_process_env() -> HashMap<String, String> {
     env::vars().collect()
 }
 
-fn filtered_env_from_map(map: &BTreeMap<String, String>) -> Vec<(&str, &str)> {
-    map.iter()
+fn filtered_env_from_map(map: &HashMap<String, String>) -> Vec<(&str, &str)> {
+    let mut filtered: Vec<(&str, &str)> = map
+        .iter()
         .filter(|(key, _)| !is_ignored_env_key(key))
         .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect()
+        .collect();
+    filtered.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    filtered
 }
 
 fn filtered_env_from_owned(entries: &[(String, String)]) -> Vec<(&str, &str)> {
@@ -762,7 +765,7 @@ fn filtered_env_from_owned(entries: &[(String, String)]) -> Vec<(&str, &str)> {
     filtered
 }
 
-fn restore_process_env(snapshot: &BTreeMap<String, String>) {
+fn restore_process_env(snapshot: &HashMap<String, String>) {
     for key in env::vars().map(|(key, _)| key).collect::<Vec<_>>() {
         if !snapshot.contains_key(&key) {
             crate::shell_unsetenv(&key);
