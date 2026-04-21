@@ -1347,7 +1347,10 @@ fn bench_startup(c: &mut Criterion) {
     }
 
     group.bench_function("denv_init", |b| {
-        b.iter(|| black_box(ish::denv::init()));
+        b.iter(|| {
+            ish::denv::init();
+            black_box(())
+        });
     });
 
     group.finish();

@@ -38,7 +38,6 @@ struct Shell {
     job: Option<Job>,
     path_cache: path::PathCache,
     exit_warned: bool,
-    denv_active: Option<bool>, // None = unchecked, defers scan_path to first use
     signal_fd: RawFd,
     home: String,
     session_log: String,
@@ -181,7 +180,6 @@ fn main() {
         job: None,
         path_cache: path::PathCache::new(),
         exit_warned: false,
-        denv_active: None,
         signal_fd,
         home: home.clone(),
         session_log: String::new(),
@@ -194,10 +192,9 @@ fn main() {
         config::load(&mut shell.aliases, &mut shell.epsh, cli.config.as_deref());
     }
 
-    if *shell.denv_active.get_or_insert_with(denv::init) {
-        let changes = denv::on_startup();
-        apply_denv_changes(&changes, &mut shell.epsh);
-    }
+    denv::init();
+    let changes = denv::on_startup();
+    apply_denv_changes(&changes, &mut shell.epsh);
 
     // Main loop
     loop {
@@ -273,16 +270,13 @@ fn main() {
                         shell.last_status = 0;
                         true
                     }
-                    "denv" if *shell.denv_active.get_or_insert_with(denv::init) => {
+                    "denv" => {
                         let args: Vec<String> =
                             line.split_whitespace().skip(1).map(String::from).collect();
-                        if let Some(changes) = denv::command(&args) {
-                            apply_denv_changes(&changes, &mut shell.epsh);
-                            shell.last_status = 0;
-                            true
-                        } else {
-                            false
-                        }
+                        let outcome = denv::command(&args);
+                        apply_denv_changes(&outcome.changes, &mut shell.epsh);
+                        shell.last_status = outcome.status;
+                        true
                     }
                     "fg" => {
                         shell.last_status = ish::job::resume_job(&mut shell.job);
@@ -304,10 +298,8 @@ fn main() {
                             shell.epsh.set_cwd(new_cwd);
                             push_dir_stack(&mut shell.dir_stack);
                             shell.prompt.invalidate_git();
-                            if *shell.denv_active.get_or_insert_with(denv::init) {
-                                let changes = denv::on_cd();
-                                apply_denv_changes(&changes, &mut shell.epsh);
-                            }
+                            let changes = denv::on_cd();
+                            apply_denv_changes(&changes, &mut shell.epsh);
                         }
                         true
                     }
@@ -380,10 +372,8 @@ fn main() {
                     shell.prev_dir = Some(old);
                     push_dir_stack(&mut shell.dir_stack);
                     shell.prompt.invalidate_git();
-                    if *shell.denv_active.get_or_insert_with(denv::init) {
-                        let changes = denv::on_cd();
-                        apply_denv_changes(&changes, &mut shell.epsh);
-                    }
+                    let changes = denv::on_cd();
+                    apply_denv_changes(&changes, &mut shell.epsh);
                 }
 
                 // Detect job suspension (status 148 = 128 + SIGTSTP)
@@ -2004,10 +1994,8 @@ fn do_cd(target: &str, shell: &mut Shell) -> i32 {
     shell.prompt.invalidate_git();
 
     // Trigger denv
-    if *shell.denv_active.get_or_insert_with(denv::init) {
-        let changes = denv::on_cd();
-        apply_denv_changes(&changes, &mut shell.epsh);
-    }
+    let changes = denv::on_cd();
+    apply_denv_changes(&changes, &mut shell.epsh);
 
     0
 }

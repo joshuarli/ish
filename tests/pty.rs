@@ -6,6 +6,7 @@
 
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -56,36 +57,31 @@ fn ish_binary() -> PathBuf {
 impl PtyShell {
     /// Spawn ish in a PTY with an isolated HOME directory.
     fn spawn() -> Self {
-        Self::spawn_with_size_env(&[], &[], &[], 24, 80)
+        Self::spawn_with_setup(&[], &[], &[], 24, 80, None, |_| {})
     }
 
     /// Spawn with files pre-created in HOME and optional history entries.
     fn spawn_with_opts(files: &[(&str, &str)], history: &[&str]) -> Self {
-        Self::spawn_with_size_env(files, history, &[], 24, 80)
+        Self::spawn_with_setup(files, history, &[], 24, 80, None, |_| {})
     }
 
     /// Spawn with a custom terminal size.
     fn spawn_with_size(files: &[(&str, &str)], history: &[&str], rows: u16, cols: u16) -> Self {
-        Self::spawn_with_size_env(files, history, &[], rows, cols)
+        Self::spawn_with_setup(files, history, &[], rows, cols, None, |_| {})
     }
 
-    /// Spawn with files, history, and extra environment variables.
-    /// Extra env vars override defaults (e.g. PATH).
-    fn spawn_with_env(
-        files: &[(&str, &str)],
-        history: &[&str],
-        extra_env: &[(&str, &str)],
-    ) -> Self {
-        Self::spawn_with_size_env(files, history, extra_env, 24, 80)
-    }
-
-    fn spawn_with_size_env(
+    fn spawn_with_setup<F>(
         files: &[(&str, &str)],
         history: &[&str],
         extra_env: &[(&str, &str)],
         rows: u16,
         cols: u16,
-    ) -> Self {
+        cwd_rel: Option<&str>,
+        setup: F,
+    ) -> Self
+    where
+        F: FnOnce(&Path),
+    {
         let home = TempDir::new("ish_pty_test");
         let home_path = home.path().to_str().unwrap().to_string();
 
@@ -102,6 +98,8 @@ impl PtyShell {
                 std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
+
+        setup(home.path());
 
         // Create history file
         if !history.is_empty() {
@@ -139,6 +137,10 @@ impl PtyShell {
         unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws) };
 
         let binary = ish_binary();
+        let cwd = cwd_rel
+            .map(|rel| home.path().join(rel))
+            .unwrap_or_else(|| home.path().to_path_buf());
+        let cwd_str = cwd.to_string_lossy().into_owned();
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
@@ -162,12 +164,12 @@ impl PtyShell {
             cmd.env_clear()
                 .env("HOME", &home_path)
                 .env("USER", "testuser")
-                .env("PWD", &home_path)
+                .env("PWD", &cwd_str)
                 .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
                 .env("TERM", "xterm-256color")
                 .env("XDG_CONFIG_HOME", format!("{home_path}/.config"))
                 .env("XDG_DATA_HOME", format!("{home_path}/.local/share"))
-                .current_dir(&home_path);
+                .current_dir(&cwd);
             for (key, value) in extra_env {
                 cmd.env(key, value);
             }
@@ -196,6 +198,10 @@ impl PtyShell {
         // Wait for the initial prompt
         sh.wait_for_prompt(3000);
         sh
+    }
+
+    fn home_path(&self) -> &Path {
+        self._home.path()
     }
 
     fn master_fd(&self) -> RawFd {
@@ -1999,104 +2005,80 @@ fn true_and_false_builtins() {
 // denv integration tests
 // ---------------------------------------------------------------------------
 
-/// Mock denv script — reads .denv_export from PWD.
-///
-/// `allow`/`reload` only mark the directory dirty; the actual env appears on
-/// the next `export bash`, matching the real shell-hook flow that ish must
-/// emulate internally.
-const MOCK_DENV: &str = r#"#!/bin/sh
-case "$1" in
-export)
-    if [ -f "$PWD/.denv_export" ]; then
-        cat "$PWD/.denv_export"
-        echo "export __DENV_DIR='$PWD';"
-        echo "unset __DENV_DIRTY;"
-        echo "export __DENV_STATE='0 1 $PWD';"
-    elif [ -n "$__DENV_DIR" ]; then
-        echo "unset DENV_TEST_VAR;"
-        echo "unset __DENV_DIR;"
-        echo "unset __DENV_STATE;"
-    fi
-    ;;
-allow|reload)
-    if [ -f "$PWD/.denv_export" ]; then
-        echo "export __DENV_DIR='$PWD';"
-        echo "export __DENV_DIRTY='1';"
-        echo "unset __DENV_STATE;"
-    fi
-    ;;
-deny)
-    if [ -n "$__DENV_DIR" ]; then
-        echo "unset DENV_TEST_VAR;"
-        echo "unset __DENV_DIR;"
-        echo "unset __DENV_STATE;"
-    fi
-    ;;
-esac
-"#;
+fn denv_trust_key(path: &Path) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut key = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        key.push(HEX[(byte >> 4) as usize] as char);
+        key.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    key
+}
 
-/// Spawn ish with mock denv in PATH, using spawn_with_env.
-/// The home_path is dynamically determined by TempDir, so we need a custom
-/// PATH that includes $HOME/bin. We use spawn_with_env's extra_env to override PATH.
-fn spawn_with_denv(files: &[(&str, &str)]) -> PtyShell {
-    let mut all_files: Vec<(&str, &str)> = vec![("bin/denv", MOCK_DENV)];
-    all_files.extend_from_slice(files);
-    // We need HOME/bin in PATH, but don't know HOME yet.
-    // Use spawn_with_env — it creates TempDir, then applies env.
-    // The "PATH" env is set after HOME, so we can compute it.
-    // But spawn_with_env doesn't expose the home_path...
-    //
-    // Workaround: use a well-known prefix. TempDir creates /tmp/ish_pty_test_XXXXXX.
-    // We can't predict the suffix. Instead, symlink denv to a known location.
-    //
-    // Simplest: create /tmp/ish_mock_bin/ with a symlink that spawn_with_env populates.
-    // Actually simplest: just put the mock in /tmp directly with a unique name.
-    //
-    // Even simpler: use spawn_with_env but override PATH to include /tmp/ish_pty_test_*/bin
-    // via a glob... nope, env vars don't glob.
-    //
-    // Real fix: refactor spawn_with_env to return home_path before forking.
-    // For now, create a shared mock dir.
+fn allow_envrc(home: &Path, rel_envrc: &str) {
+    let envrc = home
+        .join(rel_envrc)
+        .canonicalize()
+        .unwrap_or_else(|_| home.join(rel_envrc));
+    let allow_dir = home.join(".local/share/denv/allow");
+    std::fs::create_dir_all(&allow_dir).unwrap();
+    let mtime = std::fs::metadata(&envrc).unwrap().mtime();
+    std::fs::write(allow_dir.join(denv_trust_key(&envrc)), format!("{mtime}")).unwrap();
+}
 
-    let mock_bin = "/tmp/ish_test_mock_bin";
-    let _ = std::fs::create_dir_all(mock_bin);
-    std::fs::write(format!("{mock_bin}/denv"), MOCK_DENV).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(
-        format!("{mock_bin}/denv"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+fn spawn_with_allowed_envrc(files: &[(&str, &str)], rel_envrc: &str) -> PtyShell {
+    PtyShell::spawn_with_setup(files, &[], &[], 24, 80, None, |home| {
+        allow_envrc(home, rel_envrc);
+    })
+}
 
-    let path = format!("{mock_bin}:/usr/bin:/bin:/usr/sbin:/sbin");
-    PtyShell::spawn_with_env(&all_files, &[], &[("PATH", &path)])
+fn spawn_in_dir_with_allowed_envrc(
+    files: &[(&str, &str)],
+    rel_envrc: &str,
+    cwd_rel: &str,
+) -> PtyShell {
+    PtyShell::spawn_with_setup(files, &[], &[], 24, 80, Some(cwd_rel), |home| {
+        allow_envrc(home, rel_envrc);
+    })
 }
 
 #[test]
-fn denv_loads_env_on_cd() {
-    let sh = spawn_with_denv(&[("project/.denv_export", "export DENV_TEST_VAR='loaded';\n")]);
+fn denv_loads_allowed_envrc_on_cd() {
+    let sh = spawn_with_allowed_envrc(
+        &[("project/.envrc", "export DENV_TEST_VAR='loaded'\n")],
+        "project/.envrc",
+    );
     sh.run_command("cd project");
-    let out = sh.run_command("echo $DENV_TEST_VAR");
-    let text = PtyShell::strip_ansi(&out);
+    let text = PtyShell::strip_ansi(&sh.run_command("echo $DENV_TEST_VAR"));
     assert!(
         text.contains("loaded"),
-        "expected denv var after cd: {text:?}"
+        "expected envrc var after cd: {text:?}"
+    );
+}
+
+#[test]
+fn denv_loads_dotenv_on_cd_without_allow() {
+    let sh = PtyShell::spawn_with_opts(&[("project/.env", "DENV_TEST_VAR=loaded\n")], &[]);
+    sh.run_command("cd project");
+    let text = PtyShell::strip_ansi(&sh.run_command("echo $DENV_TEST_VAR"));
+    assert!(
+        text.contains("loaded"),
+        "expected dotenv var after cd: {text:?}"
     );
 }
 
 #[test]
 fn denv_unloads_on_leave() {
-    let sh = spawn_with_denv(&[("project/.denv_export", "export DENV_TEST_VAR='active';\n")]);
+    let sh = spawn_with_allowed_envrc(
+        &[("project/.envrc", "export DENV_TEST_VAR='active'\n")],
+        "project/.envrc",
+    );
     sh.run_command("cd project");
-    // Verify loaded
-    let out = sh.run_command("echo $DENV_TEST_VAR");
-    let text = PtyShell::strip_ansi(&out);
+    let text = PtyShell::strip_ansi(&sh.run_command("echo $DENV_TEST_VAR"));
     assert!(text.contains("active"), "should be loaded: {text:?}");
 
-    // Leave the directory
-    sh.run_command("cd ..");
-    let out = sh.run_command("echo =$DENV_TEST_VAR=");
-    let text = PtyShell::strip_ansi(&out);
+    let text = PtyShell::strip_ansi(&sh.run_command("cd ..\necho =$DENV_TEST_VAR="));
     assert!(
         text.contains("=="),
         "var should be unset after leaving: {text:?}"
@@ -2105,12 +2087,18 @@ fn denv_unloads_on_leave() {
 
 #[test]
 fn denv_allow_applies_env() {
-    let sh = spawn_with_denv(&[("project/.denv_export", "export DENV_TEST_VAR='allowed';\n")]);
-    sh.run_command("cd project");
-    // denv allow should (re-)apply env
+    let sh = PtyShell::spawn_with_opts(
+        &[("project/.envrc", "export DENV_TEST_VAR='allowed'\n")],
+        &[],
+    );
+    let blocked = PtyShell::strip_ansi(&sh.run_command("cd project\necho =$__DENV_DIRTY="));
+    assert!(
+        blocked.contains("=1="),
+        "expected dirty state before allow: {blocked:?}"
+    );
+
     sh.run_command("denv allow");
-    let out = sh.run_command("echo $DENV_TEST_VAR");
-    let text = PtyShell::strip_ansi(&out);
+    let text = PtyShell::strip_ansi(&sh.run_command("echo $DENV_TEST_VAR"));
     assert!(
         text.contains("allowed"),
         "expected var after denv allow: {text:?}"
@@ -2118,73 +2106,198 @@ fn denv_allow_applies_env() {
 }
 
 #[test]
-fn denv_deny_removes_env() {
-    let sh = spawn_with_denv(&[("project/.denv_export", "export DENV_TEST_VAR='loaded';\n")]);
+fn denv_deny_removes_env_and_marks_dirty() {
+    let sh = spawn_with_allowed_envrc(
+        &[("project/.envrc", "export DENV_TEST_VAR='loaded'\n")],
+        "project/.envrc",
+    );
     sh.run_command("cd project");
-    // Verify loaded
-    let out = sh.run_command("echo $DENV_TEST_VAR");
-    let text = PtyShell::strip_ansi(&out);
-    assert!(text.contains("loaded"), "should be loaded: {text:?}");
-
-    // deny should unset
-    sh.run_command("denv deny");
-    let out = sh.run_command("echo =$DENV_TEST_VAR=");
-    let text = PtyShell::strip_ansi(&out);
+    let text =
+        PtyShell::strip_ansi(&sh.run_command("denv deny\necho =$DENV_TEST_VAR=:$__DENV_DIRTY="));
     assert!(
-        text.contains("=="),
-        "var should be unset after deny: {text:?}"
+        text.contains("==:1"),
+        "expected var unset and dirty after deny: {text:?}"
     );
 }
 
 #[test]
-fn denv_init_loads_at_startup() {
-    // .denv_export in HOME should load as soon as the shell starts there.
-    let sh = spawn_with_denv(&[(".denv_export", "export DENV_TEST_VAR='from_init';\n")]);
-    let out = sh.run_command("echo $DENV_TEST_VAR");
-    let text = PtyShell::strip_ansi(&out);
+fn denv_startup_loads_dotenv_in_initial_cwd() {
+    let sh = PtyShell::spawn_with_setup(
+        &[("project/.env", "DENV_TEST_VAR=from_startup\n")],
+        &[],
+        &[],
+        24,
+        80,
+        Some("project"),
+        |_| {},
+    );
+    let text = PtyShell::strip_ansi(&sh.run_command("echo $DENV_TEST_VAR"));
     assert!(
-        text.contains("from_init"),
-        "expected var loaded after first cd: {text:?}"
+        text.contains("from_startup"),
+        "expected dotenv to load on startup: {text:?}"
     );
 }
 
 #[test]
-fn denv_value_with_spaces() {
-    let sh = spawn_with_denv(&[(
-        "project/.denv_export",
-        "export DENV_TEST_VAR='hello world';\n",
-    )]);
-    sh.run_command("cd project");
-    let out = sh.run_command("echo $DENV_TEST_VAR");
-    let text = PtyShell::strip_ansi(&out);
+fn denv_startup_loads_allowed_envrc_in_initial_cwd() {
+    let sh = spawn_in_dir_with_allowed_envrc(
+        &[("project/.envrc", "export DENV_TEST_VAR='from_startup'\n")],
+        "project/.envrc",
+        "project",
+    );
+    let text = PtyShell::strip_ansi(&sh.run_command("echo $DENV_TEST_VAR"));
     assert!(
-        text.contains("hello world"),
-        "expected value with spaces: {text:?}"
+        text.contains("from_startup"),
+        "expected envrc to load on startup: {text:?}"
     );
 }
 
 #[test]
-fn denv_multiple_vars() {
-    let sh = spawn_with_denv(&[(
-        "project/.denv_export",
-        "export DENV_A='one';\nexport DENV_B='two';\n",
-    )]);
+fn denv_dotenv_overrides_envrc() {
+    let sh = spawn_with_allowed_envrc(
+        &[
+            (
+                "project/.envrc",
+                "export SHARED='from_envrc'\nexport ENVRC_ONLY='1'\n",
+            ),
+            ("project/.env", "SHARED=from_dotenv\nDOTENV_ONLY=1\n"),
+        ],
+        "project/.envrc",
+    );
     sh.run_command("cd project");
-    let out = sh.run_command("echo $DENV_A $DENV_B");
-    let text = PtyShell::strip_ansi(&out);
-    assert!(text.contains("one"), "expected DENV_A: {text:?}");
-    assert!(text.contains("two"), "expected DENV_B: {text:?}");
+    let text = PtyShell::strip_ansi(&sh.run_command("echo $SHARED $ENVRC_ONLY $DOTENV_ONLY"));
+    assert!(
+        text.contains("from_dotenv"),
+        "expected dotenv override: {text:?}"
+    );
+    assert!(
+        text.contains("1 1"),
+        "expected both unique vars present: {text:?}"
+    );
 }
 
 #[test]
-fn denv_no_error_without_denv() {
-    // Without mock denv in PATH, shell should start fine (denv_active=false)
-    let sh = PtyShell::spawn();
-    let out = sh.run_command("echo works");
-    let text = PtyShell::strip_ansi(&out);
+fn denv_reload_after_reallow_picks_up_envrc_edit() {
+    let sh = spawn_with_allowed_envrc(
+        &[("project/.envrc", "export DENV_TEST_VAR='old'\n")],
+        "project/.envrc",
+    );
+    sh.run_command("cd project");
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(
+        sh.home_path().join("project/.envrc"),
+        "export DENV_TEST_VAR='updated'\n",
+    )
+    .unwrap();
+
+    sh.run_command("denv allow");
+    sh.run_command("denv reload");
+    let text = PtyShell::strip_ansi(&sh.run_command("echo $DENV_TEST_VAR"));
     assert!(
-        text.contains("works"),
-        "shell should work without denv: {text:?}"
+        text.contains("updated"),
+        "expected updated var after reload: {text:?}"
+    );
+}
+
+#[test]
+fn denv_edit_envrc_invalidates_trust() {
+    let sh = spawn_with_allowed_envrc(
+        &[("project/.envrc", "export DENV_TEST_VAR='old'\n")],
+        "project/.envrc",
+    );
+    sh.run_command("cd project");
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(
+        sh.home_path().join("project/.envrc"),
+        "export DENV_TEST_VAR='changed'\n",
+    )
+    .unwrap();
+
+    let reload = PtyShell::strip_ansi(&sh.run_command("denv reload"));
+    assert!(
+        reload.contains("blocked"),
+        "expected blocked warning after edit: {reload:?}"
+    );
+    let text = PtyShell::strip_ansi(&sh.run_command("echo =$DENV_TEST_VAR=:$__DENV_DIRTY="));
+    assert!(
+        text.contains("==:1"),
+        "expected dirty state after invalidation: {text:?}"
+    );
+}
+
+#[test]
+fn denv_restores_preexisting_var_on_leave() {
+    let sh = PtyShell::spawn_with_setup(
+        &[("project/.envrc", "export EXISTING='inside'\n")],
+        &[],
+        &[("EXISTING", "outside")],
+        24,
+        80,
+        None,
+        |home| allow_envrc(home, "project/.envrc"),
+    );
+    sh.run_command("cd project");
+    let inside = PtyShell::strip_ansi(&sh.run_command("echo $EXISTING"));
+    assert!(
+        inside.contains("inside"),
+        "expected overridden value in project: {inside:?}"
+    );
+
+    let outside = PtyShell::strip_ansi(&sh.run_command("cd ..\necho $EXISTING"));
+    assert!(
+        outside.contains("outside"),
+        "expected original value restored: {outside:?}"
+    );
+}
+
+#[test]
+fn denv_path_add_relative_dir() {
+    let sh = spawn_with_allowed_envrc(
+        &[
+            ("project/.envrc", "PATH_add bin\n"),
+            ("project/bin/tool", "#!/bin/sh\nexit 0\n"),
+        ],
+        "project/.envrc",
+    );
+    sh.run_command("cd project");
+    let text = PtyShell::strip_ansi(&sh.run_command("echo $PATH"));
+    assert!(
+        text.contains(
+            &sh.home_path()
+                .join("project/bin")
+                .to_string_lossy()
+                .into_owned()
+        ),
+        "expected PATH_add to prepend project/bin: {text:?}"
+    );
+}
+
+#[test]
+fn denv_dotenv_helper_loads_env_file() {
+    let sh = spawn_with_allowed_envrc(
+        &[
+            ("project/.envrc", "dotenv\nexport AFTER='1'\n"),
+            ("project/.env", "FROM_ENV=loaded\n"),
+        ],
+        "project/.envrc",
+    );
+    sh.run_command("cd project");
+    let text = PtyShell::strip_ansi(&sh.run_command("echo $FROM_ENV $AFTER"));
+    assert!(
+        text.contains("loaded 1"),
+        "expected dotenv helper values: {text:?}"
+    );
+}
+
+#[test]
+fn denv_allow_requires_envrc() {
+    let sh = PtyShell::spawn_with_opts(&[("project/.env", "DENV_TEST_VAR=loaded\n")], &[]);
+    let text = PtyShell::strip_ansi(&sh.run_command("cd project\ndenv allow"));
+    assert!(
+        text.contains("no .envrc"),
+        "expected allow failure without envrc: {text:?}"
     );
 }
 
