@@ -1517,6 +1517,43 @@ fn history_up_arrow_uses_session_start_boundary() {
     assert_eq!(h.prefix_search("echo global", 0), Some("echo global three"));
 }
 
+#[test]
+fn history_ctrl_r_uses_session_start_boundary() {
+    let dir = tempdir_with_files(&[]);
+    let hist_file = dir.join("history");
+    std::fs::write(&hist_file, "echo global one\necho global two\n").unwrap();
+
+    let mut h = History::load_from(hist_file.clone());
+    h.add("echo local one");
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&hist_file)
+        .unwrap()
+        .write_all(b"echo global three\n")
+        .unwrap();
+    h.sync();
+
+    let all = h.fuzzy_search("");
+    assert_eq!(h.get(all[0].entry_idx), "echo local one");
+    assert_eq!(h.get(all[1].entry_idx), "echo global two");
+    assert!(
+        all.iter()
+            .all(|m| h.get(m.entry_idx) != "echo global three")
+    );
+
+    let filtered = h.fuzzy_search("global");
+    assert_eq!(h.get(filtered[0].entry_idx), "echo global two");
+    assert_eq!(h.get(filtered[1].entry_idx), "echo global one");
+    assert!(
+        filtered
+            .iter()
+            .all(|m| h.get(m.entry_idx) != "echo global three")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // ls: executable files, symlinks, permissions edge cases
 // ---------------------------------------------------------------------------
