@@ -7,15 +7,15 @@ use std::path::{Path, PathBuf};
 const CACHE_MAGIC_V1: &[u8; 4] = b"ISH\x01";
 const CACHE_MAGIC_V2: &[u8; 4] = b"ISH\x02";
 const CACHE_MAGIC_V3: &[u8; 4] = b"ISH\x03";
+const CACHE_MAGIC_V4: &[u8; 4] = b"ISH\x04";
 
 /// v1/v2 header: magic(4) + reserved(8) + entry_count(4) + arena_size(4)
 const V2_HEADER_SIZE: usize = 20;
 /// v3 header: magic(4) + entry_count(4) + arena_size(4)
 const V3_HEADER_SIZE: usize = 12;
 
-/// 1998-01-01T00:00:00 UTC as Unix epoch seconds.
-/// v3 timestamps are stored relative to this, extending range to ~2134.
-const TS_EPOCH: u32 = 883_612_800;
+/// 1998-01-01T00:00:00 UTC as Unix epoch milliseconds.
+const TS_EPOCH_MILLIS: u64 = 883_612_800_000;
 
 fn hash_str(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
@@ -23,9 +23,11 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
-/// Current epoch seconds via libc::time (commpage on macOS, vDSO on Linux — no syscall).
-fn now_secs() -> u32 {
-    unsafe { libc::time(std::ptr::null_mut()) as u32 }
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub struct History {
@@ -33,8 +35,8 @@ pub struct History {
     arena: String,
     /// (start, len) byte offsets into `arena` for each entry.
     offsets: Vec<(u32, u16)>,
-    /// Epoch seconds when each entry was last used. Parallel to `offsets`.
-    timestamps: Vec<u32>,
+    /// Epoch milliseconds when each entry was last used. Parallel to `offsets`.
+    timestamps: Vec<u64>,
     /// Hash index for O(1) duplicate checks in add().
     hashes: HashSet<u64>,
     path: PathBuf,
@@ -47,7 +49,7 @@ pub struct History {
     /// Entries with timestamps at or before this boundary are considered part
     /// of the session-visible history. Up-arrow sees those entries plus any
     /// entry added by this shell.
-    session_cutoff: u32,
+    session_cutoff: u64,
     /// Set when the cache was corrupt at load time. Prevents overwriting the
     /// (possibly recoverable) cache file until the user resolves it.
     cache_dirty: bool,
@@ -65,7 +67,7 @@ impl History {
             Ok(Some(mut hist)) => {
                 // Cache loaded — sync any new entries from the text file
                 hist.sync();
-                hist.session_cutoff = now_secs();
+                hist.session_cutoff = now_millis();
                 hist
             }
             Ok(None) => {
@@ -75,7 +77,7 @@ impl History {
                 if !hist.offsets.is_empty() {
                     hist.save_cache();
                 }
-                hist.session_cutoff = now_secs();
+                hist.session_cutoff = now_millis();
                 hist
             }
             Err(()) => {
@@ -85,7 +87,7 @@ impl History {
                 let mut hist = Self::load_from_text(&path);
                 hist.file_pos = fs::metadata(&hist.path).map(|m| m.len()).unwrap_or(0);
                 hist.cache_dirty = true;
-                hist.session_cutoff = now_secs();
+                hist.session_cutoff = now_millis();
                 hist
             }
         }
@@ -97,7 +99,7 @@ impl History {
         let mut fresh = Self::load_from_text(&self.path);
         fresh.file_pos = fs::metadata(&fresh.path).map(|m| m.len()).unwrap_or(0);
         fresh.cache_dirty = false;
-        fresh.session_cutoff = now_secs();
+        fresh.session_cutoff = now_millis();
         fresh.save_cache();
         eprintln!(
             "ish: rebuilt history cache — {} entries",
@@ -140,7 +142,7 @@ impl History {
         };
 
         // No timestamps in text format — use current time for all entries
-        let ts = now_secs();
+        let ts = now_millis();
         let count = offsets.len();
         let timestamps = vec![ts; count];
 
@@ -187,11 +189,43 @@ impl History {
         }
 
         match &data[0..4] {
+            x if x == CACHE_MAGIC_V4 => Self::parse_v4(data, path),
             x if x == CACHE_MAGIC_V3 => Self::parse_v3(data, path),
             x if x == CACHE_MAGIC_V2 => Self::parse_v1v2(data, path, 2),
             x if x == CACHE_MAGIC_V1 => Self::parse_v1v2(data, path, 1),
             _ => None,
         }
+    }
+
+    /// Parse v4 format: [magic(4)][entry_count(4)][arena_size(4)][timestamps: N×8][arena: \0-delimited]
+    fn parse_v4(data: &[u8], path: &Path) -> Option<Self> {
+        if data.len() < V3_HEADER_SIZE {
+            return None;
+        }
+
+        let entry_count = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
+        let arena_size = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
+
+        let expected = V3_HEADER_SIZE + entry_count * 8 + arena_size;
+        if data.len() != expected {
+            return None;
+        }
+
+        let ts_start = V3_HEADER_SIZE;
+        let mut timestamps = Vec::with_capacity(entry_count);
+        for i in 0..entry_count {
+            let off = ts_start + i * 8;
+            let stored = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
+            timestamps.push(stored.wrapping_add(TS_EPOCH_MILLIS));
+        }
+
+        Self::parse_delimited_arena(
+            path,
+            data,
+            ts_start + entry_count * 8,
+            arena_size,
+            timestamps,
+        )
     }
 
     /// Parse v3 format: [magic(4)][entry_count(4)][arena_size(4)][timestamps: N×4][arena: \0-delimited]
@@ -214,11 +248,26 @@ impl History {
         for i in 0..entry_count {
             let off = ts_start + i * 4;
             let stored = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
-            timestamps.push(stored.wrapping_add(TS_EPOCH));
+            timestamps.push(stored as u64 * 1000 + TS_EPOCH_MILLIS);
         }
 
-        // Arena: null-delimited entries
-        let arena_start = ts_start + entry_count * 4;
+        Self::parse_delimited_arena(
+            path,
+            data,
+            ts_start + entry_count * 4,
+            arena_size,
+            timestamps,
+        )
+    }
+
+    fn parse_delimited_arena(
+        path: &Path,
+        data: &[u8],
+        arena_start: usize,
+        arena_size: usize,
+        timestamps: Vec<u64>,
+    ) -> Option<Self> {
+        let entry_count = timestamps.len();
         let arena_bytes = &data[arena_start..arena_start + arena_size];
         let arena_str = std::str::from_utf8(arena_bytes).ok()?;
 
@@ -226,7 +275,6 @@ impl History {
         let mut offsets = Vec::with_capacity(entry_count);
         let mut hashes = HashSet::with_capacity(entry_count);
         let mut count = 0;
-
         for entry in arena_str.split('\0') {
             if entry.is_empty() {
                 continue;
@@ -282,7 +330,7 @@ impl History {
         let timestamps = if version >= 2 {
             let mut ts = Vec::with_capacity(entry_count);
             for _ in 0..entry_count {
-                ts.push(u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?));
+                ts.push(u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as u64 * 1000);
                 pos += 4;
             }
             ts
@@ -362,7 +410,7 @@ impl History {
             return;
         }
 
-        let ts = now_secs();
+        let ts = now_millis();
         for line in tail.lines() {
             if line.is_empty() {
                 continue;
@@ -402,8 +450,8 @@ impl History {
         self.file_pos = file_size;
     }
 
-    /// Write v3 binary cache, then truncate text file.
-    /// v3 format: [magic(4)][entry_count(4)][arena_size(4)][timestamps: N×4][arena: \0-delimited]
+    /// Write v4 binary cache, then truncate text file.
+    /// v4 format: [magic(4)][entry_count(4)][arena_size(4)][timestamps: N×8][arena: \0-delimited]
     /// Atomic: writes cache to .tmp then renames.
     pub fn save_cache(&self) {
         if self.cache_dirty {
@@ -424,17 +472,17 @@ impl History {
         }
         let arena_size = arena_buf.len();
 
-        let total = V3_HEADER_SIZE + entry_count * 4 + arena_size;
+        let total = V3_HEADER_SIZE + entry_count * 8 + arena_size;
         let mut buf = Vec::with_capacity(total);
 
         // Header
-        buf.extend_from_slice(CACHE_MAGIC_V3);
+        buf.extend_from_slice(CACHE_MAGIC_V4);
         buf.extend_from_slice(&(entry_count as u32).to_le_bytes());
         buf.extend_from_slice(&(arena_size as u32).to_le_bytes());
 
         // Timestamps (offset from 1998 epoch)
         for &ts in &self.timestamps {
-            buf.extend_from_slice(&ts.wrapping_sub(TS_EPOCH).to_le_bytes());
+            buf.extend_from_slice(&ts.wrapping_sub(TS_EPOCH_MILLIS).to_le_bytes());
         }
 
         // Null-delimited arena
@@ -445,6 +493,9 @@ impl History {
             && existing.len() >= 4
         {
             let old_count = match &existing[0..4] {
+                x if x == CACHE_MAGIC_V4 && existing.len() >= V3_HEADER_SIZE => {
+                    u32::from_le_bytes(existing[4..8].try_into().unwrap_or_default()) as usize
+                }
                 x if x == CACHE_MAGIC_V3 && existing.len() >= V3_HEADER_SIZE => {
                     u32::from_le_bytes(existing[4..8].try_into().unwrap_or_default()) as usize
                 }
@@ -513,7 +564,7 @@ impl History {
 
     /// Create from pre-existing entries (for testing/benchmarks).
     pub fn from_entries(entries: Vec<String>) -> Self {
-        let ts = now_secs();
+        let ts = now_millis();
         let total: usize = entries.iter().map(|e| e.len()).sum();
         let mut arena = String::with_capacity(total);
         let mut offsets = Vec::with_capacity(entries.len());
@@ -570,7 +621,7 @@ impl History {
         let start = self.arena.len() as u32;
         self.arena.push_str(&line[..len]);
         self.offsets.push((start, len as u16));
-        self.timestamps.push(now_secs());
+        self.timestamps.push(now_millis());
         self.local.push(true);
         self.hashes.insert(h);
 
@@ -586,8 +637,8 @@ impl History {
         self.offsets.is_empty()
     }
 
-    /// Get the timestamp (epoch seconds) for entry at index.
-    pub fn timestamp(&self, idx: usize) -> u32 {
+    /// Get the timestamp (epoch milliseconds) for entry at index.
+    pub fn timestamp(&self, idx: usize) -> u64 {
         self.timestamps[idx]
     }
 
@@ -1175,19 +1226,19 @@ mod tests {
     #[test]
     fn timestamps_are_set() {
         let mut h = History::from_entries(vec!["old".into()]);
-        let before = now_secs();
+        let before = now_millis();
         h.add("new_cmd");
-        let after = now_secs();
+        let after = now_millis();
         let ts = h.timestamp(h.len() - 1);
         assert!(ts >= before && ts <= after);
     }
 
     #[test]
-    fn v3_round_trip() {
+    fn v4_round_trip() {
         let entries: Vec<String> = vec!["ls -la".into(), "git status".into(), "cargo test".into()];
         let hist = History::from_entries(entries);
 
-        // Serialize to v3 format
+        // Serialize to v4 format
         let entry_count = hist.offsets.len();
         let mut arena_buf = Vec::new();
         for &(start, len) in &hist.offsets {
@@ -1199,17 +1250,17 @@ mod tests {
         let arena_size = arena_buf.len();
 
         let mut buf = Vec::new();
-        buf.extend_from_slice(CACHE_MAGIC_V3);
+        buf.extend_from_slice(CACHE_MAGIC_V4);
         buf.extend_from_slice(&(entry_count as u32).to_le_bytes());
         buf.extend_from_slice(&(arena_size as u32).to_le_bytes());
         for &ts in &hist.timestamps {
-            buf.extend_from_slice(&ts.wrapping_sub(TS_EPOCH).to_le_bytes());
+            buf.extend_from_slice(&ts.wrapping_sub(TS_EPOCH_MILLIS).to_le_bytes());
         }
         buf.extend_from_slice(&arena_buf);
 
         // Parse it back
         let path = PathBuf::from("/dev/null");
-        let parsed = History::parse_v3(&buf, &path).expect("v3 round-trip failed");
+        let parsed = History::parse_v4(&buf, &path).expect("v4 round-trip failed");
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed.get(0), "ls -la");
         assert_eq!(parsed.get(1), "git status");

@@ -1498,7 +1498,7 @@ fn history_up_arrow_uses_session_start_boundary() {
         Some("echo local one")
     );
 
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    std::thread::sleep(std::time::Duration::from_millis(2));
 
     std::fs::OpenOptions::new()
         .append(true)
