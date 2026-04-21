@@ -194,7 +194,10 @@ fn main() {
         config::load(&mut shell.aliases, &mut shell.epsh, cli.config.as_deref());
     }
 
-    // denv init is deferred — scan_path("denv") runs on first cd, not startup
+    if *shell.denv_active.get_or_insert_with(denv::init) {
+        let changes = denv::on_startup();
+        apply_denv_changes(&changes, &mut shell.epsh);
+    }
 
     // Main loop
     loop {

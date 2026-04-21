@@ -1999,13 +1999,18 @@ fn true_and_false_builtins() {
 // denv integration tests
 // ---------------------------------------------------------------------------
 
-/// Mock denv script — reads .denv_export from PWD, handles allow/deny/reload.
+/// Mock denv script — reads .denv_export from PWD.
+///
+/// `allow`/`reload` only mark the directory dirty; the actual env appears on
+/// the next `export bash`, matching the real shell-hook flow that ish must
+/// emulate internally.
 const MOCK_DENV: &str = r#"#!/bin/sh
 case "$1" in
 export)
     if [ -f "$PWD/.denv_export" ]; then
         cat "$PWD/.denv_export"
         echo "export __DENV_DIR='$PWD';"
+        echo "unset __DENV_DIRTY;"
         echo "export __DENV_STATE='0 1 $PWD';"
     elif [ -n "$__DENV_DIR" ]; then
         echo "unset DENV_TEST_VAR;"
@@ -2015,9 +2020,9 @@ export)
     ;;
 allow|reload)
     if [ -f "$PWD/.denv_export" ]; then
-        cat "$PWD/.denv_export"
         echo "export __DENV_DIR='$PWD';"
-        echo "export __DENV_STATE='0 1 $PWD';"
+        echo "export __DENV_DIRTY='1';"
+        echo "unset __DENV_STATE;"
     fi
     ;;
 deny)
@@ -2133,10 +2138,8 @@ fn denv_deny_removes_env() {
 
 #[test]
 fn denv_init_loads_at_startup() {
-    // .denv_export in HOME — should be loaded on first cd (init defers to avoid startup cost)
+    // .denv_export in HOME should load as soon as the shell starts there.
     let sh = spawn_with_denv(&[(".denv_export", "export DENV_TEST_VAR='from_init';\n")]);
-    // Trigger on_cd by cd'ing to current dir
-    sh.run_command("cd .");
     let out = sh.run_command("echo $DENV_TEST_VAR");
     let text = PtyShell::strip_ansi(&out);
     assert!(

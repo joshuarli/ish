@@ -1,4 +1,4 @@
-//! denv integration — automatic .envrc/.env loading on cd.
+//! denv integration — automatic .envrc/.env loading on shell start and cd.
 //!
 //! On shell start and every cd, checks if the environment needs updating
 //! via a fast-path (file mtimes + sentinel), then calls `denv export bash`
@@ -30,8 +30,12 @@ pub fn init() -> bool {
         });
     crate::shell_setenv("__DENV_SENTINEL", &format!("{data_dir}/active_{pid}"));
 
-    // Initial export deferred to first cd — avoids startup subprocess.
     true
+}
+
+/// Called once after init to load the current directory's environment.
+pub fn on_startup() -> Vec<EnvChange> {
+    run_export()
 }
 
 /// Called after cd. Checks fast-path, runs export if needed.
@@ -46,7 +50,14 @@ pub fn on_cd() -> Vec<EnvChange> {
 /// Handle `denv allow|deny|reload`. Returns Some(changes) if handled.
 pub fn command(args: &[String]) -> Option<Vec<EnvChange>> {
     match args.first().map(|s| s.as_str()) {
-        Some("allow" | "deny" | "reload") => Some(run_denv_and_apply(args)),
+        Some("allow") | Some("reload") => {
+            let mut changes = run_denv_and_apply(args);
+            // denv's shell hook reconciles allow/reload via a later
+            // `denv export bash`. ish has no prompt hook, so do that here.
+            changes.extend(run_export());
+            Some(changes)
+        }
+        Some("deny") => Some(run_denv_and_apply(args)),
         _ => None,
     }
 }
