@@ -1331,6 +1331,93 @@ enum CompAction {
     Refilter,
 }
 
+/// Returns the byte offset of the start of the current shell command segment
+/// (the text after the last unquoted |, ;, or && in `s`).
+fn current_cmd_start(s: &str) -> usize {
+    let mut in_single = false;
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                in_single = !in_single;
+                i += 1;
+            }
+            b'|' | b';' if !in_single => {
+                i += 1;
+                start = i;
+            }
+            b'&' if !in_single && i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                i += 2;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    start
+}
+
+/// Split a shell command segment into tokens, stripping single-quote delimiters.
+fn shell_tokens(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    for c in s.chars() {
+        match c {
+            '\'' => in_single = !in_single,
+            ' ' | '\t' if !in_single => {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// Collect the arguments already present in the current command before `word_start`,
+/// skipping the command name itself. Used to filter duplicates from completions.
+fn existing_cmd_args(before_cursor: &str, word_start: usize) -> Vec<String> {
+    let prefix = &before_cursor[..word_start];
+    let cmd_start = current_cmd_start(prefix);
+    let tokens = shell_tokens(&prefix[cmd_start..]);
+    if tokens.len() > 1 {
+        tokens[1..].to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Remove completion entries whose full form (dir_prefix + name) is already
+/// present in `existing`. Leaves the names arena intact; orphaned bytes are harmless.
+fn filter_existing_args(comp: &mut complete::Completions, existing: &[String], dir_prefix: &str) {
+    if existing.is_empty() {
+        return;
+    }
+    let to_remove: Vec<bool> = comp
+        .entries
+        .iter()
+        .map(|e| {
+            let full = format!("{}{}", dir_prefix, comp.entry_name(e));
+            // Directories are inserted with a trailing '/', so check both forms.
+            existing
+                .iter()
+                .any(|a| *a == full || (e.is_dir() && a.strip_suffix('/') == Some(full.as_str())))
+        })
+        .collect();
+    let mut idx = 0;
+    comp.entries.retain(|_| {
+        let remove = to_remove[idx];
+        idx += 1;
+        !remove
+    });
+}
+
 /// Whether the cursor is at a command position (first word, after | && ;,
 /// or immediately after sudo/doas/su).
 fn is_command_position(before_cursor: &str, word_start: usize) -> bool {
@@ -1420,6 +1507,7 @@ fn start_completion(
     let text = line.text();
     let before_cursor = &text[..line.cursor()];
     let (word_start, in_single) = find_comp_word_start(before_cursor);
+    let existing = existing_cmd_args(before_cursor, word_start);
     let raw_word = &before_cursor[word_start..];
 
     // Strip quotes for filesystem lookup; track whether the word was quoted.
@@ -1505,6 +1593,7 @@ fn start_completion(
             complete::complete_path_into(&partial, false, &mut comp);
             comp.sort_entries();
             comp.dedup_sorted();
+            filter_existing_args(&mut comp, &existing, "");
             if !comp.is_empty() {
                 let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
                 return CompletionState {
@@ -1538,6 +1627,7 @@ fn start_completion(
     };
 
     complete::complete_path_into(&expanded, dirs_only, &mut comp);
+    filter_existing_args(&mut comp, &existing, &dir_prefix);
     if !comp.is_empty() {
         let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
         return CompletionState {
@@ -1585,6 +1675,7 @@ fn start_completion(
             }
         }
 
+        filter_existing_args(&mut comp, &existing, &user_root);
         let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
         return CompletionState {
             comp,
