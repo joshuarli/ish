@@ -150,6 +150,11 @@ fn main() {
         ish::shell_setenv_os("PWD", cwd.as_os_str());
     }
 
+    // Initialize signals before taking terminal control. When launched through
+    // macOS login(1), the shell starts in a background process group behind the
+    // login process; tcsetpgrp from that state raises SIGTTOU unless ignored.
+    let signal_fd = signal::init();
+
     // SAFETY: Set shell as its own process group leader and take foreground
     // control of the terminal. Called once at startup, single-threaded.
     unsafe {
@@ -158,9 +163,6 @@ fn main() {
         // pgid == pid after setpgid above, no need for getpgrp() syscall
         let _ = libc::tcsetpgrp(0, pid);
     }
-
-    // Initialize signals
-    let signal_fd = signal::init();
 
     let (rows, cols) = term::term_size();
     let home = std::env::var_os("HOME")
