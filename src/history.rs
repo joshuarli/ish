@@ -32,7 +32,7 @@ fn now_millis() -> u64 {
 }
 
 fn new_session_id() -> u64 {
-    now_millis().wrapping_shl(16) ^ unsafe { libc::getpid() as u64 }
+    now_millis().wrapping_shl(16) ^ rustix::process::getpid().as_raw_pid() as u64
 }
 
 struct ParsedHistoryLine<'a> {
@@ -603,10 +603,12 @@ impl History {
             }
         };
 
-        use std::os::fd::AsRawFd;
         // Try non-blocking lock — skip if another shell is compacting
-        let rc = unsafe { libc::flock(lock_fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
+        let lock_result = rustix::fs::flock(
+            &lock_fd,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        );
+        if lock_result.is_err() {
             self.file_pos = 0;
             self.sync();
             self.save_cache();

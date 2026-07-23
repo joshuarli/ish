@@ -1,4 +1,4 @@
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 /// Native directory listing, equivalent to `ls -plAhG`.
 /// Writes output to stdout directly. Returns 0 on success, 1 on error.
@@ -112,7 +112,8 @@ fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
 
 fn build_entry(name: &str, full_path: &std::path::Path, lmeta: &std::fs::Metadata) -> Entry {
     let mode = lmeta.mode();
-    let is_link = lmeta.file_type().is_symlink();
+    let file_type = lmeta.file_type();
+    let is_link = file_type.is_symlink();
     let is_dir = if is_link {
         std::fs::metadata(full_path)
             .map(|m| m.is_dir())
@@ -141,7 +142,7 @@ fn build_entry(name: &str, full_path: &std::path::Path, lmeta: &std::fs::Metadat
         "\x1b[36m".to_string() // cyan
     } else if is_dir {
         "\x1b[34m".to_string() // blue
-    } else if mode & libc::S_ISUID as u32 != 0 {
+    } else if mode & 0o4000 != 0 {
         "\x1b[31m".to_string() // red for setuid
     } else if is_exec {
         "\x1b[32m".to_string() // green
@@ -150,7 +151,24 @@ fn build_entry(name: &str, full_path: &std::path::Path, lmeta: &std::fs::Metadat
     };
 
     Entry {
-        mode_str: format_mode(mode),
+        mode_str: format_mode(
+            mode,
+            if is_link {
+                'l'
+            } else if is_dir {
+                'd'
+            } else if file_type.is_char_device() {
+                'c'
+            } else if file_type.is_block_device() {
+                'b'
+            } else if file_type.is_fifo() {
+                'p'
+            } else if file_type.is_socket() {
+                's'
+            } else {
+                '-'
+            },
+        ),
         nlink_str: lmeta.nlink().to_string(),
         owner: username(lmeta.uid()),
         group: groupname(lmeta.gid()),
@@ -173,45 +191,16 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
-fn format_mode(mode: u32) -> String {
+fn format_mode(mode: u32, file_type: char) -> String {
     let mut s = String::with_capacity(10);
 
-    s.push(match mode & libc::S_IFMT as u32 {
-        m if m == libc::S_IFDIR as u32 => 'd',
-        m if m == libc::S_IFLNK as u32 => 'l',
-        m if m == libc::S_IFCHR as u32 => 'c',
-        m if m == libc::S_IFBLK as u32 => 'b',
-        m if m == libc::S_IFIFO as u32 => 'p',
-        m if m == libc::S_IFSOCK as u32 => 's',
-        _ => '-',
-    });
+    s.push(file_type);
 
     // (read, write, exec, setbit, set_char, SET_CHAR)
     const PERMS: [(u32, u32, u32, u32, char, char); 3] = [
-        (
-            libc::S_IRUSR as u32,
-            libc::S_IWUSR as u32,
-            libc::S_IXUSR as u32,
-            libc::S_ISUID as u32,
-            's',
-            'S',
-        ),
-        (
-            libc::S_IRGRP as u32,
-            libc::S_IWGRP as u32,
-            libc::S_IXGRP as u32,
-            libc::S_ISGID as u32,
-            's',
-            'S',
-        ),
-        (
-            libc::S_IROTH as u32,
-            libc::S_IWOTH as u32,
-            libc::S_IXOTH as u32,
-            libc::S_ISVTX as u32,
-            't',
-            'T',
-        ),
+        (0o400, 0o200, 0o100, 0o4000, 's', 'S'),
+        (0o040, 0o020, 0o010, 0o2000, 's', 'S'),
+        (0o004, 0o002, 0o001, 0o1000, 't', 'T'),
     ];
     for &(r, w, x, set, sc, tc) in &PERMS {
         s.push(if mode & r != 0 { 'r' } else { '-' });
@@ -241,6 +230,8 @@ fn human_size(size: u64) -> String {
 }
 
 fn format_time(mtime: i64) -> String {
+    // rustix has no localtime_r wrapper; retain libc for thread-safe local
+    // timezone conversion in this non-hot-path display helper.
     // SAFETY: time(NULL) returns seconds since epoch, cannot fail meaningfully.
     let now = unsafe { libc::time(std::ptr::null_mut()) };
     // SAFETY: zeroed tm is valid for localtime_r. localtime_r is thread-safe
@@ -267,6 +258,7 @@ fn format_time(mtime: i64) -> String {
 }
 
 fn username(uid: u32) -> String {
+    // rustix does not expose passwd database lookups.
     // SAFETY: getpwuid returns a pointer to a static struct (or NULL).
     // We immediately copy pw_name into an owned String. Single-threaded
     // shell so no concurrent getpwuid calls can invalidate the pointer.
@@ -282,6 +274,7 @@ fn username(uid: u32) -> String {
 }
 
 fn groupname(gid: u32) -> String {
+    // rustix does not expose group database lookups.
     // SAFETY: getgrgid returns a pointer to a static struct (or NULL).
     // We immediately copy gr_name into an owned String. Single-threaded.
     unsafe {

@@ -1,6 +1,6 @@
 use crate::signal;
 use crate::term::STDIN_FD;
-use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, RawFd};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -158,41 +158,37 @@ impl InputReader {
     }
 
     fn poll(&self, timeout_ms: i32) -> PollResult {
+        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        let signal = unsafe { BorrowedFd::borrow_raw(self.signal_fd) };
         let mut fds = [
-            libc::pollfd {
-                fd: STDIN_FD,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: self.signal_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
+            rustix::event::PollFd::from_borrowed_fd(stdin, rustix::event::PollFlags::IN),
+            rustix::event::PollFd::from_borrowed_fd(signal, rustix::event::PollFlags::IN),
         ];
         loop {
             // SAFETY: poll on two valid fds (stdin + signal pipe). Returns
             // count of ready fds, 0 on timeout, -1 on error.
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
-            if n < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return PollResult::Error;
-            }
+            let timeout_ms = timeout_ms.max(0) as i64;
+            let timeout = rustix::event::Timespec {
+                tv_sec: timeout_ms / 1000,
+                tv_nsec: (timeout_ms % 1000) * 1_000_000,
+            };
+            let n = match rustix::event::poll(&mut fds, Some(&timeout)) {
+                Ok(n) => n,
+                Err(e) if e == rustix::io::Errno::INTR => continue,
+                Err(_) => return PollResult::Error,
+            };
             if n == 0 {
                 return PollResult::Timeout;
             }
-            if fds[1].revents & libc::POLLIN != 0 {
+            if fds[1].revents().contains(rustix::event::PollFlags::IN) {
                 return PollResult::Signal;
             }
-            if fds[0].revents & libc::POLLIN != 0 {
+            if fds[0].revents().contains(rustix::event::PollFlags::IN) {
                 return PollResult::Stdin;
             }
             // POLLHUP on stdin without POLLIN: PTY master was closed (or similar).
             // Treat as EOF so the shell exits rather than spinning.
-            if fds[0].revents & libc::POLLHUP != 0 {
+            if fds[0].revents().contains(rustix::event::PollFlags::HUP) {
                 return PollResult::StdinHup;
             }
             return PollResult::Error;
@@ -205,21 +201,28 @@ impl InputReader {
     }
 
     fn poll_stdin(&self, timeout_ms: i32) -> bool {
-        let mut fds = [libc::pollfd {
-            fd: STDIN_FD,
-            events: libc::POLLIN,
-            revents: 0,
-        }];
+        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        let mut fds = [rustix::event::PollFd::from_borrowed_fd(
+            stdin,
+            rustix::event::PollFlags::IN,
+        )];
         // SAFETY: poll on a single valid fd (stdin). Stack-allocated pollfd array.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
-        n > 0 && fds[0].revents & libc::POLLIN != 0
+        let timeout_ms = timeout_ms.max(0) as i64;
+        let timeout = rustix::event::Timespec {
+            tv_sec: timeout_ms / 1000,
+            tv_nsec: (timeout_ms % 1000) * 1_000_000,
+        };
+        rustix::event::poll(&mut fds, Some(&timeout)).is_ok()
+            && fds[0].revents().contains(rustix::event::PollFlags::IN)
     }
 
     fn read_byte(&self) -> Option<u8> {
-        let mut byte = 0u8;
-        // SAFETY: Reading 1 byte from stdin into a stack variable. STDIN_FD is valid.
-        let n = unsafe { libc::read(STDIN_FD, &mut byte as *mut u8 as *mut libc::c_void, 1) };
-        if n == 1 { Some(byte) } else { None }
+        let mut buffer = [0u8; 1];
+        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        match rustix::io::read(stdin, &mut buffer) {
+            Ok(1) => Some(buffer[0]),
+            _ => None,
+        }
     }
 
     fn read_byte_timeout(&self, timeout_ms: i32) -> Option<u8> {

@@ -1,45 +1,29 @@
 use std::io::{self, Write};
-use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, RawFd};
 
 pub const STDIN_FD: RawFd = 0;
 pub const STDOUT_FD: RawFd = 1;
 
+pub type Termios = rustix::termios::Termios;
+
 pub struct RawMode {
-    orig: libc::termios,
+    orig: Termios,
 }
 
 impl RawMode {
     pub fn enable() -> io::Result<Self> {
-        // SAFETY: tcgetattr reads terminal attributes into a zeroed struct.
-        // STDIN_FD is a valid fd (the shell's controlling terminal).
-        let orig = unsafe {
-            let mut t = std::mem::zeroed();
-            if libc::tcgetattr(STDIN_FD, &mut t) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            t
-        };
+        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        let orig = rustix::termios::tcgetattr(stdin)?;
 
-        let mut raw = orig;
-        // Disable: echo, canonical mode, extended input processing, signal generation
-        raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
-        // Disable: XON/XOFF flow control, CR-to-NL
-        raw.c_iflag &= !(libc::IXON | libc::ICRNL | libc::BRKINT | libc::INPCK | libc::ISTRIP);
-        // Keep OPOST enabled so \n → \r\n
-        // 8-bit chars
-        raw.c_cflag |= libc::CS8;
-        // Return immediately from read, no minimum chars
-        raw.c_cc[libc::VMIN] = 0;
-        raw.c_cc[libc::VTIME] = 0;
+        let mut raw = orig.clone();
+        raw.make_raw();
+        raw.special_codes[rustix::termios::SpecialCodeIndex::VMIN] = 0;
+        raw.special_codes[rustix::termios::SpecialCodeIndex::VTIME] = 0;
 
         // SAFETY: tcsetattr with TCSADRAIN drains output, then applies settings.
         // Preserves pending input so typeahead typed during child execution
         // is available to read_line.
-        unsafe {
-            if libc::tcsetattr(STDIN_FD, libc::TCSADRAIN, &raw) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
+        rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Drain, &raw)?;
 
         // Enable bracketed paste mode so the terminal wraps pastes in
         // \x1b[200~ ... \x1b[201~, letting us distinguish paste from typing.
@@ -57,35 +41,24 @@ impl Drop for RawMode {
         let _ = io::stdout().flush();
         // SAFETY: Restores saved termios. TCSANOW avoids blocking if output
         // hasn't drained (e.g. PTY). orig was captured in enable().
-        unsafe {
-            libc::tcsetattr(STDIN_FD, libc::TCSANOW, &self.orig);
-        }
+        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        let _ =
+            rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Now, &self.orig);
     }
 }
 
 pub fn term_size() -> (u16, u16) {
-    // SAFETY: ioctl(TIOCGWINSZ) reads window size into a zeroed winsize struct.
-    // Returns 0 on success. Falls back to 24x80 on failure.
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(STDOUT_FD, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-            (ws.ws_row, ws.ws_col)
-        } else {
-            (24, 80)
-        }
+    let stdout = unsafe { BorrowedFd::borrow_raw(STDOUT_FD) };
+    match rustix::termios::tcgetwinsize(stdout) {
+        Ok(ws) if ws.ws_col > 0 => (ws.ws_row, ws.ws_col),
+        _ => (24, 80),
     }
 }
 
 /// Save original termios without entering raw mode (for child process restoration).
-pub fn save_termios() -> io::Result<libc::termios> {
-    // SAFETY: tcgetattr reads terminal attributes. STDIN_FD is valid.
-    unsafe {
-        let mut t = std::mem::zeroed();
-        if libc::tcgetattr(STDIN_FD, &mut t) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(t)
-    }
+pub fn save_termios() -> io::Result<Termios> {
+    let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+    Ok(rustix::termios::tcgetattr(stdin)?)
 }
 
 pub struct TermWriter {

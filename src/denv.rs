@@ -405,33 +405,9 @@ fn active_path(pid: &str) -> Result<PathBuf, String> {
 }
 
 fn stat_regular_file_mtime(path: &Path) -> Option<u64> {
-    let bytes = path.as_os_str().as_encoded_bytes();
-    const STACK_BUF_LEN: usize = 1024;
-    if bytes.len() < STACK_BUF_LEN {
-        let mut buf = [0_u8; STACK_BUF_LEN];
-        buf[..bytes.len()].copy_from_slice(bytes);
-        return stat_regular_file_mtime_cstr(buf.as_ptr() as *const libc::c_char);
-    }
-
-    let mut buf = Vec::with_capacity(bytes.len() + 1);
-    buf.extend_from_slice(bytes);
-    buf.push(0);
-    stat_regular_file_mtime_cstr(buf.as_ptr() as *const libc::c_char)
-}
-
-fn stat_regular_file_mtime_cstr(path: *const libc::c_char) -> Option<u64> {
-    // SAFETY: path points to a live NUL-terminated buffer for the duration of
-    // the call. stat is zero-initialized before libc fills it.
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::stat(path, &mut st) != 0 {
-            return None;
-        }
-        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
-            return None;
-        }
-        Some(st.st_mtime as u64)
-    }
+    let st = rustix::fs::stat(path).ok()?;
+    (rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile)
+        .then_some(st.st_mtime as u64)
 }
 
 fn is_allowed(envrc: &Path) -> bool {
@@ -893,17 +869,17 @@ fn eval_env_bash(
         cmd.pre_exec(move || {
             let before_w_fd = before_w.as_raw_fd();
             let after_w_fd = after_w.as_raw_fd();
-            if libc::dup2(before_w_fd, 3) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::dup2(after_w_fd, 4) < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            let mut before_target = OwnedFd::from_raw_fd(3);
+            rustix::io::dup2(&before_w, &mut before_target).map_err(io::Error::from)?;
+            std::mem::forget(before_target);
+            let mut after_target = OwnedFd::from_raw_fd(4);
+            rustix::io::dup2(&after_w, &mut after_target).map_err(io::Error::from)?;
+            std::mem::forget(after_target);
             if before_w_fd != 3 {
-                libc::close(before_w_fd);
+                rustix::io::close(before_w_fd);
             }
             if after_w_fd != 4 {
-                libc::close(after_w_fd);
+                rustix::io::close(after_w_fd);
             }
             Ok(())
         });

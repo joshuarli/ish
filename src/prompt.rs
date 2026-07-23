@@ -283,20 +283,13 @@ fn read_head_into(head_path: &Path, out: &mut String) -> bool {
 }
 
 fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: gethostname writes a NUL-terminated hostname into the buffer.
-    // 256 bytes is well above HOST_NAME_MAX (typically 64) on all targets.
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if rc == 0 {
-        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        String::from_utf8_lossy(&buf[..len])
-            .split('.')
-            .next()
-            .unwrap_or("localhost")
-            .to_string()
-    } else {
-        "localhost".to_string()
-    }
+    rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .unwrap_or("localhost")
+        .to_string()
 }
 
 #[cfg(test)]

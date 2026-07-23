@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 epsh = "0.0.6"
+rustix = { version = "1.1.4", features = ["event", "fs", "pipe", "process", "runtime", "system", "termios", "time"] }
 libc = "0.2"
 
 [dev-dependencies]

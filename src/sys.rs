@@ -3,71 +3,29 @@
 //! Linux: uses pipe2 (atomic CLOEXEC/NONBLOCK), close_range (bulk fd close).
 //! macOS: falls back to pipe+fcntl, getdtablesize loop.
 
-use std::os::fd::RawFd;
+use std::os::fd::{IntoRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 
 /// Create a pipe with O_CLOEXEC on both ends.
 /// Linux: 1 syscall (pipe2). macOS: 3 syscalls (pipe + 2x fcntl).
 pub fn pipe_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
-    let mut fds = [0i32; 2];
-
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: pipe2 writes two valid fds into the array on success.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: pipe writes two valid fds into the array on success.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        for &fd in &fds {
-            // SAFETY: fd is valid (just created by pipe above).
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-        }
-    }
-
-    Ok((fds[0], fds[1]))
+    let (read, write) = rustix::pipe::pipe()?;
+    rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC)?;
+    Ok((read.into_raw_fd(), write.into_raw_fd()))
 }
 
 /// Create a pipe with O_CLOEXEC | O_NONBLOCK on both ends.
 /// Used for the signal self-pipe.
 /// Linux: 1 syscall. macOS: 5 syscalls (pipe + 4x fcntl).
 pub fn pipe_nonblock_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
-    let mut fds = [0i32; 2];
-
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: pipe2 with combined flags, writes two valid fds on success.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: pipe writes two valid fds on success.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        for &fd in &fds {
-            // SAFETY: fd is valid (just created by pipe above).
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-        }
-    }
-
-    Ok((fds[0], fds[1]))
+    let (read, write) = rustix::pipe::pipe()?;
+    rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::fs::fcntl_setfl(&read, rustix::fs::OFlags::NONBLOCK)?;
+    rustix::fs::fcntl_setfl(&write, rustix::fs::OFlags::NONBLOCK)?;
+    Ok((read.into_raw_fd(), write.into_raw_fd()))
 }
 
 /// Close all file descriptors >= `min_fd`.
@@ -78,6 +36,8 @@ pub fn pipe_nonblock_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
 /// macOS: iterates to getdtablesize().
 pub fn close_fds_from(min_fd: RawFd) {
     #[cfg(target_os = "linux")]
+    // rustix 1.1.4 does not expose close_range; retain the direct syscall
+    // for the one-call child-fd cleanup path.
     // SAFETY: close_range closes a range of fds. On older kernels (< 5.9)
     // returns ENOSYS which we ignore — fd leak is non-critical.
     unsafe {
@@ -86,13 +46,13 @@ pub fn close_fds_from(min_fd: RawFd) {
 
     #[cfg(target_os = "macos")]
     {
+        // rustix has no getdtablesize/closefrom equivalent; only the table
+        // size query remains libc-based, while closing uses rustix.
         // SAFETY: getdtablesize returns the fd table size. Closing invalid
         // fds returns EBADF which is harmlessly ignored.
         let max = unsafe { libc::getdtablesize() };
         for fd in min_fd..max {
-            unsafe {
-                libc::close(fd);
-            }
+            unsafe { rustix::io::close(fd) };
         }
     }
 }
@@ -111,7 +71,9 @@ pub unsafe fn exec_command(cmd: &std::ffi::CStr, argv: *const *const libc::c_cha
     {
         // Absolute or relative path — exec directly
         if cmd.to_bytes().contains(&b'/') {
-            unsafe { libc::execve(cmd.as_ptr(), argv, get_environ()) };
+            unsafe {
+                let _ = rustix::runtime::execve(cmd, argv.cast(), get_environ().cast());
+            }
             return;
         }
 
@@ -123,26 +85,23 @@ pub unsafe fn exec_command(cmd: &std::ffi::CStr, argv: *const *const libc::c_cha
                     continue;
                 }
                 if let Ok(c_dir) = std::ffi::CString::new(dir) {
-                    let dirfd = unsafe {
-                        libc::openat(
-                            libc::AT_FDCWD,
-                            c_dir.as_ptr(),
-                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                        )
-                    };
-                    if dirfd >= 0 {
+                    let dirfd = rustix::fs::open(
+                        c_dir.as_c_str(),
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::DIRECTORY
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    );
+                    if let Ok(dirfd) = dirfd {
                         unsafe {
-                            libc::syscall(
-                                libc::SYS_execveat,
-                                dirfd,
-                                cmd.as_ptr(),
-                                argv,
-                                get_environ(),
-                                0,
-                            )
+                            let _ = rustix::runtime::execveat(
+                                &dirfd,
+                                cmd,
+                                argv.cast(),
+                                get_environ().cast(),
+                                rustix::fs::AtFlags::empty(),
+                            );
                         };
-                        // execveat returned — exec failed, try next dir
-                        unsafe { libc::close(dirfd) };
                     }
                 }
             }
@@ -151,6 +110,8 @@ pub unsafe fn exec_command(cmd: &std::ffi::CStr, argv: *const *const libc::c_cha
 
     #[cfg(target_os = "macos")]
     unsafe {
+        // rustix provides execve/execveat but not execvp, so macOS PATH
+        // execution keeps the platform libc wrapper.
         libc::execvp(cmd.as_ptr(), argv);
     }
 }
@@ -161,6 +122,8 @@ pub unsafe fn exec_command(cmd: &std::ffi::CStr, argv: *const *const libc::c_cha
 /// The returned pointer is only valid for immediate use in exec syscalls
 /// within a forked child. The shell is single-threaded so environ is stable.
 unsafe fn get_environ() -> *const *const libc::c_char {
+    // rustix has no portable borrowed environ-pointer API; exec needs the
+    // process environment without constructing a new environment array.
     unsafe extern "C" {
         static environ: *const *mut libc::c_char;
     }
@@ -173,11 +136,13 @@ unsafe fn get_environ() -> *const *const libc::c_char {
 ///
 /// Child: stdin=/dev/null, stdout=pipe_w, stderr=inherited, signals=default.
 /// Returns (pid, pipe_read_fd).
-pub fn spawn_command_subst(cmd: &str) -> Result<(libc::pid_t, RawFd), std::io::Error> {
+pub fn spawn_command_subst(cmd: &str) -> Result<(i32, RawFd), std::io::Error> {
     use std::ffi::CString;
 
     let (pipe_r, pipe_w) = pipe_cloexec()?;
 
+    // rustix does not expose POSIX spawn file-actions/attributes, which are
+    // used here to avoid fork overhead for command substitution.
     // SAFETY: posix_spawn_file_actions are opaque structs managed by init/destroy.
     // We init, configure, use in spawn, then destroy — standard lifecycle.
     let mut file_actions: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
@@ -217,7 +182,7 @@ pub fn spawn_command_subst(cmd: &str) -> Result<(libc::pid_t, RawFd), std::io::E
         std::ptr::null_mut(),
     ];
 
-    let mut pid: libc::pid_t = 0;
+    let mut pid: i32 = 0;
     // SAFETY: All CStrings are alive for the duration of the call.
     // argv is a valid null-terminated array. file_actions and attrs are initialized.
     let rc = unsafe {
@@ -235,11 +200,11 @@ pub fn spawn_command_subst(cmd: &str) -> Result<(libc::pid_t, RawFd), std::io::E
     unsafe {
         libc::posix_spawn_file_actions_destroy(&mut file_actions);
         libc::posix_spawnattr_destroy(&mut attrs);
-        libc::close(pipe_w);
+        rustix::io::close(pipe_w);
     }
 
     if rc != 0 {
-        unsafe { libc::close(pipe_r) };
+        unsafe { rustix::io::close(pipe_r) };
         return Err(std::io::Error::from_raw_os_error(rc));
     }
 

@@ -1,8 +1,8 @@
 pub struct Job {
-    pub pgid: libc::pid_t,
+    pub pgid: i32,
     pub cmd: String,
     /// Saved terminal attributes — restored on fg resume.
-    pub termios: libc::termios,
+    pub termios: crate::term::Termios,
 }
 
 /// Resume a suspended job in the foreground.
@@ -18,41 +18,38 @@ pub fn resume_job(job: &mut Option<Job>) -> i32 {
 
     eprintln!("ish: resuming: {}", j.cmd);
 
-    // SAFETY: Give the job the foreground and restore its terminal settings.
+    let pgid = match rustix::process::Pid::from_raw(j.pgid) {
+        Some(pgid) => pgid,
+        None => return 1,
+    };
+    // Give the job the foreground and restore its terminal settings.
     // This is critical for programs like vim/less that set raw mode —
     // without this, they'd resume with the shell's terminal settings.
-    unsafe {
-        libc::tcsetpgrp(0, j.pgid);
-        libc::tcsetattr(0, libc::TCSADRAIN, &j.termios);
-        libc::killpg(j.pgid, libc::SIGCONT);
-    }
+    let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
+    let _ = rustix::termios::tcsetpgrp(stdin, pgid);
+    let _ = rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Drain, &j.termios);
+    let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::CONT);
 
     // Wait for the job, detecting if it stops again
-    let mut status = 0i32;
-    let result = unsafe { libc::waitpid(-j.pgid, &mut status, libc::WUNTRACED) };
+    let result = rustix::process::waitpgid(pgid, rustix::process::WaitOptions::UNTRACED);
 
     // Reclaim the terminal
-    unsafe {
-        libc::tcsetpgrp(0, libc::getpgrp());
-    }
+    let _ = rustix::termios::tcsetpgrp(stdin, rustix::process::getpgrp());
 
-    if result > 0 && libc::WIFSTOPPED(status) {
-        // Stopped again — re-save the job
-        let mut new_termios: libc::termios = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::tcgetattr(0, &mut new_termios);
+    match result {
+        Ok(Some((_, status))) if status.stopped() => {
+            let new_termios = rustix::termios::tcgetattr(stdin).ok();
+            *job = Some(Job {
+                pgid: j.pgid,
+                cmd: j.cmd,
+                termios: new_termios.unwrap_or(j.termios),
+            });
+            148
         }
-        *job = Some(Job {
-            pgid: j.pgid,
-            cmd: j.cmd,
-            termios: new_termios,
-        });
-        148
-    } else if result > 0 && libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if result > 0 && libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
-    } else {
-        1
+        Ok(Some((_, status))) if status.exited() => status.exit_status().unwrap_or(1),
+        Ok(Some((_, status))) if status.signaled() => {
+            128 + status.terminating_signal().unwrap_or(0)
+        }
+        _ => 1,
     }
 }

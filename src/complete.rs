@@ -1,3 +1,5 @@
+use std::os::fd::BorrowedFd;
+
 /// Completion entry — mtime + u32 offset + u8 len + u8 display_width + u8 flags.
 /// name_len is u8: NAME_MAX is 255 on Linux/macOS.
 pub struct CompEntry {
@@ -373,6 +375,8 @@ pub fn complete_path_into(partial: &str, dirs_only: bool, comp: &mut Completions
 /// preferring prefix matches when any exist. Substring fallback is
 /// case-insensitive (like fish) so "tom" matches "Cargo.toml".
 fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completions) {
+    // Keep libc directory/stat calls here: rustix::fs::Dir allocates, while
+    // warmed completion must remain zero-allocation.
     let dir_path = if dir.is_empty() { "." } else { dir };
 
     // Build NUL-terminated dir path on stack
@@ -533,6 +537,7 @@ pub fn complete_partial_path(
 }
 
 /// Check if path is a directory using libc::stat — zero allocation.
+// libc is retained because this helper runs during warm completion.
 fn is_dir(path: &str) -> bool {
     let bytes = path.as_bytes();
     let mut buf = [0u8; 4096];
@@ -549,6 +554,7 @@ fn is_dir(path: &str) -> bool {
 /// Recursively resolve a directory path where each component is a prefix.
 /// e.g., "/home/user/de" → ["/home/user/dev", "/home/user/Desktop", ...]
 fn resolve_partial_dir(dir: &str) -> Vec<String> {
+    // This picker-side walk also keeps libc to preserve stack-buffer behavior.
     let dir = dir.trim_end_matches('/');
     if dir.is_empty() {
         return Vec::new();
@@ -816,50 +822,48 @@ pub fn complete_remote_path(host: &str, path_prefix: &str, comp: &mut Completion
 
     // Set pipe to non-blocking so we can enforce the deadline
     // SAFETY: pipe_r is a valid fd from spawn_command_subst.
-    unsafe {
-        let flags = libc::fcntl(pipe_r, libc::F_GETFL);
-        libc::fcntl(pipe_r, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
+    let pipe_fd = unsafe { BorrowedFd::borrow_raw(pipe_r) };
+    let flags = match rustix::fs::fcntl_getfl(pipe_fd) {
+        Ok(flags) => flags,
+        Err(_) => rustix::fs::OFlags::empty(),
+    };
+    let _ = rustix::fs::fcntl_setfl(pipe_fd, flags | rustix::fs::OFlags::NONBLOCK);
 
     loop {
-        // SAFETY: reading from a valid pipe fd into a stack buffer.
-        let n = unsafe { libc::read(pipe_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n > 0 {
-            if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
-                output.push_str(s);
+        let pipe_fd = unsafe { BorrowedFd::borrow_raw(pipe_r) };
+        match rustix::io::read(pipe_fd, &mut buf) {
+            Ok(n) if n > 0 => {
+                if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+                    output.push_str(s);
+                }
             }
-        } else if n == 0 {
-            break; // EOF
-        } else {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EAGAIN)
-                || err.raw_os_error() == Some(libc::EWOULDBLOCK)
-            {
+            Ok(_) => break,
+            Err(err) if err == rustix::io::Errno::AGAIN => {
                 if monotonic_ns() >= deadline_ns {
-                    // SAFETY: kill the timed-out child.
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+                        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                    }
                     break;
                 }
-                // Brief poll to avoid busy-spinning
-                let mut pfd = libc::pollfd {
-                    fd: pipe_r,
-                    events: libc::POLLIN,
-                    revents: 0,
+                let mut pfd = [rustix::event::PollFd::from_borrowed_fd(
+                    pipe_fd,
+                    rustix::event::PollFlags::IN,
+                )];
+                let timeout = rustix::event::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 100_000_000,
                 };
-                // SAFETY: poll on a single valid fd with 100ms timeout.
-                unsafe { libc::poll(&mut pfd, 1, 100) };
+                let _ = rustix::event::poll(&mut pfd, Some(&timeout));
                 continue;
             }
-            if err.kind() != std::io::ErrorKind::Interrupted {
-                break;
-            }
+            Err(err) if err == rustix::io::Errno::INTR => continue,
+            Err(_) => break,
         }
     }
 
-    // SAFETY: close pipe and reap child.
-    unsafe {
-        libc::close(pipe_r);
-        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    unsafe { rustix::io::close(pipe_r) };
+    if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+        let _ = rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty());
     }
 
     // Determine the directory prefix to strip (everything up to and including the last /)
@@ -898,16 +902,7 @@ fn shell_escape(s: &str) -> String {
 
 /// Monotonic clock in nanoseconds.
 fn monotonic_ns() -> u64 {
-    // SAFETY: clock_gettime writes into a stack-allocated timespec.
-    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts)
-    };
-    #[cfg(target_os = "macos")]
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts)
-    };
+    let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 

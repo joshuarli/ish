@@ -18,7 +18,7 @@ use std::path::Path;
 // and consumed by the main loop. Avoids needing to thread state through epsh's
 // callback boundary.
 thread_local! {
-    static STOPPED_JOB: RefCell<Option<(libc::pid_t, String, libc::termios)>> =
+    static STOPPED_JOB: RefCell<Option<(i32, String, term::Termios)>> =
         const { RefCell::new(None) };
 }
 
@@ -157,19 +157,17 @@ fn main() {
 
     // SAFETY: Set shell as its own process group leader and take foreground
     // control of the terminal. Called once at startup, single-threaded.
-    unsafe {
-        let pid = libc::getpid();
-        let _ = libc::setpgid(pid, pid);
-        // pgid == pid after setpgid above, no need for getpgrp() syscall
-        let _ = libc::tcsetpgrp(0, pid);
-    }
+    let pid = rustix::process::getpid();
+    let _ = rustix::process::setpgid(None, None);
+    let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
+    let _ = rustix::termios::tcsetpgrp(stdin, pid);
 
     let (rows, cols) = term::term_size();
     let home = std::env::var_os("HOME")
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let shell_pid = unsafe { libc::getpid() };
+    let shell_pid = rustix::process::getpid().as_raw_pid();
 
     let cwd = std::env::current_dir().unwrap_or_default();
     let epsh = epsh::eval::Shell::builder()
@@ -413,6 +411,7 @@ fn main() {
 
 /// Read an env var via libc::getenv — zero allocation (returns &str into env block).
 /// SAFETY: Only safe in a single-threaded context (which ish is).
+// libc is used because rustix has no borrowed, allocation-free getenv API.
 fn getenv_str(name: &std::ffi::CStr) -> &'static str {
     unsafe {
         let ptr = libc::getenv(name.as_ptr());
@@ -514,7 +513,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
         };
         match event {
             InputEvent::Signal(sig) => {
-                if sig == libc::SIGWINCH {
+                if sig == rustix::process::Signal::WINCH.as_raw() {
                     let (rows, cols) = term::term_size();
                     shell.rows = rows;
                     shell.cols = cols;
@@ -2269,10 +2268,10 @@ fn render_dir_picker_mode(
 fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
     if shell.job.is_some() {
         if shell.exit_warned {
-            if let Some(job) = shell.job.take() {
-                unsafe {
-                    libc::killpg(job.pgid, libc::SIGTERM);
-                }
+            if let Some(job) = shell.job.take()
+                && let Some(pgid) = rustix::process::Pid::from_raw(job.pgid)
+            {
+                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::TERM);
             }
             return true; // break
         } else {
@@ -2395,7 +2394,7 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
             }
 
             // External command: fork/exec with job control
-            let is_main = unsafe { libc::getpid() } == shell_pid;
+            let is_main = rustix::process::getpid().as_raw_pid() == shell_pid;
 
             let mut cmd = std::process::Command::new(args[0].to_os_string());
             cmd.args(args[1..].iter().map(|arg| arg.to_os_string()));
@@ -2416,7 +2415,7 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                 // belt-and-suspenders duplicate for the parent-side view.
                 unsafe {
                     cmd.pre_exec(|| {
-                        libc::setpgid(0, 0);
+                        let _ = rustix::process::setpgid(None, None);
                         ish::signal::restore_defaults();
                         Ok(())
                     });
@@ -2426,31 +2425,31 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
             match cmd.spawn() {
                 Ok(mut child) => {
                     let child_id = child.id() as i32;
+                    let child_pid = unsafe { rustix::process::Pid::from_raw_unchecked(child_id) };
 
                     if is_main {
                         // Parent: duplicate setpgid (child did it too — no race)
                         // and hand the terminal to the new process group.
-                        unsafe {
-                            libc::setpgid(child_id, child_id);
-                            libc::tcsetpgrp(0, child_id);
-                        }
+                        let _ = rustix::process::setpgid(Some(child_pid), Some(child_pid));
+                        let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
+                        let _ = rustix::termios::tcsetpgrp(stdin, child_pid);
 
                         // Wait with WUNTRACED for job control
-                        let mut status = 0i32;
-                        unsafe {
-                            libc::waitpid(child_id, &mut status, libc::WUNTRACED);
-                        }
+                        let status = rustix::process::waitpid(
+                            Some(child_pid),
+                            rustix::process::WaitOptions::UNTRACED,
+                        )
+                        .ok()
+                        .and_then(|result| result.map(|(_, status)| status));
 
                         // Reclaim terminal
-                        unsafe {
-                            libc::tcsetpgrp(0, libc::getpgrp());
-                        }
+                        let _ = rustix::termios::tcsetpgrp(stdin, rustix::process::getpgrp());
 
-                        if libc::WIFSTOPPED(status) {
+                        if status.is_some_and(|status| status.stopped()) {
                             // Capture the terminal state the stopped process left behind,
                             // then save it in the thread-local so the main loop can build a Job.
-                            let mut saved_termios: libc::termios = unsafe { std::mem::zeroed() };
-                            unsafe { libc::tcgetattr(0, &mut saved_termios) };
+                            let saved_termios =
+                                term::save_termios().expect("terminal attributes unavailable");
                             let cmd = args[0].to_shell_string();
                             STOPPED_JOB.with(|cell| {
                                 *cell.borrow_mut() = Some((child_id, cmd, saved_termios));
@@ -2459,10 +2458,14 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                                 pid: child_id,
                                 pgid: child_id,
                             })
-                        } else if libc::WIFEXITED(status) {
-                            Ok(epsh::error::ExitStatus::from(libc::WEXITSTATUS(status)))
-                        } else if libc::WIFSIGNALED(status) {
-                            Ok(epsh::error::ExitStatus::from(128 + libc::WTERMSIG(status)))
+                        } else if let Some(status) = status.filter(|status| status.exited()) {
+                            Ok(epsh::error::ExitStatus::from(
+                                status.exit_status().unwrap_or(1),
+                            ))
+                        } else if let Some(status) = status.filter(|status| status.signaled()) {
+                            Ok(epsh::error::ExitStatus::from(
+                                128 + status.terminating_signal().unwrap_or(0),
+                            ))
                         } else {
                             Ok(epsh::error::ExitStatus::FAILURE)
                         }
@@ -2528,8 +2531,9 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
         if shell.exit_warned {
             if let Some(job) = shell.job.take() {
                 // SAFETY: Send SIGTERM to the job's pgid before force-quit.
-                unsafe {
-                    libc::killpg(job.pgid, libc::SIGTERM);
+                if let Some(pgid) = rustix::process::Pid::from_raw(job.pgid) {
+                    let _ =
+                        rustix::process::kill_process_group(pgid, rustix::process::Signal::TERM);
                 }
             }
             ReadResult::Exit

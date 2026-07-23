@@ -40,6 +40,8 @@ impl PathCache {
 
     /// Rebuild the cache if $PATH has changed.
     fn ensure_fresh(&mut self) {
+        // libc::getenv borrows the environment block without allocating;
+        // this keeps the command-coloring hot path allocation-free.
         // SAFETY: Single-threaded shell. getenv returns a pointer into the
         // environment block, valid until the variable is next modified.
         let path_bytes = unsafe {
@@ -65,6 +67,8 @@ impl PathCache {
     /// Scan each directory in $PATH using libc opendir/readdir, insert hashes
     /// of executable filenames.
     fn rebuild(&mut self, path_bytes: &[u8]) {
+        // rustix's safe directory iterator allocates, so these libc calls are
+        // retained to preserve the zero-allocation PATH-cache path.
         self.commands.clear();
 
         let mut pathbuf = [0u8; 4096];
@@ -133,6 +137,7 @@ impl PathCache {
 
 /// Collect executable names from $PATH matching `prefix` into `comp`.
 pub fn complete_commands(prefix: &str, comp: &mut crate::complete::Completions) {
+    // This PATH scan remains libc-based for its allocation-free warm path.
     // SAFETY: Single-threaded shell. getenv returns a pointer into the
     // environment block, valid until the variable is next modified.
     let path_bytes = unsafe {

@@ -1,6 +1,7 @@
 //! Native file finder — libc readdir, gitignore parsing, background walk
 //! with channel-based streaming for live filtering. Zero external deps beyond libc.
 
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,6 +9,17 @@ use std::sync::mpsc;
 
 const MAX_DEPTH: usize = 8;
 const VISIT_CAP: usize = 10_000;
+
+fn open_dir(path: &Path) -> Option<rustix::fs::Dir> {
+    let path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    let fd = rustix::fs::open(
+        path.as_c_str(),
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .ok()?;
+    rustix::fs::Dir::new(fd).ok()
+}
 
 /// Search for files whose name contains `pattern` (case-insensitive substring).
 ///
@@ -128,32 +140,24 @@ fn walk_async(
 
     let gi_pushed = try_push_gitignore(&full_path, rel_buf, ignores);
 
-    let mut cpath = full_path.as_os_str().as_encoded_bytes().to_vec();
-    cpath.push(0);
-
-    let dp = unsafe { libc::opendir(cpath.as_ptr() as *const libc::c_char) };
-    if dp.is_null() {
+    let Some(dir_entries) = open_dir(&full_path) else {
         if gi_pushed {
             ignores.pop();
         }
         return;
-    }
+    };
 
     // Save the prefix length so we can restore it after each entry
     let prefix_len = rel_buf.len();
-    let mut subdir_starts: Vec<usize> = Vec::new();
+    let mut subdir_names: Vec<String> = Vec::new();
 
-    loop {
+    for ent in dir_entries {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let ent = unsafe { libc::readdir(dp) };
-        if ent.is_null() {
-            break;
-        }
-
-        let name_cstr = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let Ok(ent) = ent else { continue };
+        let name_cstr = ent.file_name();
         let name_bytes = name_cstr.to_bytes();
 
         if name_bytes == b"." || name_bytes == b".." {
@@ -167,8 +171,7 @@ fn walk_async(
             continue;
         }
 
-        let d_type = unsafe { (*ent).d_type };
-        let is_dir = d_type == libc::DT_DIR;
+        let is_dir = ent.file_type() == rustix::fs::FileType::Directory;
 
         // Build relative path in the shared buffer
         rel_buf.truncate(prefix_len);
@@ -186,11 +189,9 @@ fn walk_async(
         }
 
         if is_dir {
-            subdir_starts.push(rel_buf.len());
+            subdir_names.push(name.to_string());
         }
     }
-
-    unsafe { libc::closedir(dp) };
 
     // Recurse into subdirectories — we saved the rel_buf content length for each.
     // Reconstruct by re-reading: subdir_starts tells us how long rel_buf was
@@ -202,52 +203,16 @@ fn walk_async(
     // The subdir_starts approach doesn't work cleanly. Let's just collect subdir paths.
     // This is still better than before: we save one alloc per non-dir entry.
 
-    // Actually, let's just re-do this simply: collect subdir relative paths.
-    // The key savings are: no format!() per entry, reuse rel_buf for building.
-
-    // We need to re-walk to get subdir names. That's wasteful. Let me use a different
-    // approach: save subdir names (just the name, not full rel path) and reconstruct.
-
-    drop(subdir_starts); // unused
-
-    // Reopen dir to collect subdir names for recursion
-    let dp2 = unsafe { libc::opendir(cpath.as_ptr() as *const libc::c_char) };
-    if !dp2.is_null() {
-        loop {
-            let ent = unsafe { libc::readdir(dp2) };
-            if ent.is_null() {
-                break;
-            }
-            let name_cstr = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
-            let name_bytes = name_cstr.to_bytes();
-            if name_bytes == b"." || name_bytes == b".." {
-                continue;
-            }
-            let d_type = unsafe { (*ent).d_type };
-            if d_type != libc::DT_DIR {
-                continue;
-            }
-            let name = match std::str::from_utf8(name_bytes) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            if name == ".git" || name_bytes.first() == Some(&b'.') {
-                continue;
-            }
-
-            rel_buf.truncate(prefix_len);
-            if !rel_buf.is_empty() {
-                rel_buf.push('/');
-            }
-            rel_buf.push_str(name);
-
-            if is_ignored(rel_buf, true, ignores) {
-                continue;
-            }
-
-            walk_async(root, depth + 1, ignores, tx, stop, rel_buf);
+    for name in subdir_names {
+        rel_buf.truncate(prefix_len);
+        if !rel_buf.is_empty() {
+            rel_buf.push('/');
         }
-        unsafe { libc::closedir(dp2) };
+        rel_buf.push_str(&name);
+        if is_ignored(rel_buf, true, ignores) {
+            continue;
+        }
+        walk_async(root, depth + 1, ignores, tx, stop, rel_buf);
     }
 
     rel_buf.truncate(prefix_len);
@@ -274,30 +239,22 @@ fn walk_hidden_async(
         root.join(rel_buf.as_str())
     };
 
-    let mut cpath = full_path.as_os_str().as_encoded_bytes().to_vec();
-    cpath.push(0);
-
-    let dp = unsafe { libc::opendir(cpath.as_ptr() as *const libc::c_char) };
-    if dp.is_null() {
+    let Some(dir_entries) = open_dir(&full_path) else {
         return;
-    }
+    };
 
     let prefix_len = rel_buf.len();
 
     // First pass: send entries + collect subdir names
     let mut subdir_names: Vec<String> = Vec::new();
 
-    loop {
+    for ent in dir_entries {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let ent = unsafe { libc::readdir(dp) };
-        if ent.is_null() {
-            break;
-        }
-
-        let name_cstr = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let Ok(ent) = ent else { continue };
+        let name_cstr = ent.file_name();
         let name_bytes = name_cstr.to_bytes();
 
         if name_bytes == b"." || name_bytes == b".." {
@@ -311,8 +268,7 @@ fn walk_hidden_async(
             continue;
         }
 
-        let d_type = unsafe { (*ent).d_type };
-        let is_dir = d_type == libc::DT_DIR;
+        let is_dir = ent.file_type() == rustix::fs::FileType::Directory;
 
         rel_buf.truncate(prefix_len);
         if !rel_buf.is_empty() {
@@ -328,8 +284,6 @@ fn walk_hidden_async(
             subdir_names.push(name.to_string());
         }
     }
-
-    unsafe { libc::closedir(dp) };
 
     for name in subdir_names {
         rel_buf.truncate(prefix_len);
@@ -369,34 +323,22 @@ fn walk(
     // Check for .gitignore in this directory and add to the stack
     let gi_pushed = try_push_gitignore(&full_path, rel_prefix, ignores);
 
-    // NUL-terminate the path for libc
-    let mut path_buf = full_path.as_os_str().as_encoded_bytes().to_vec();
-    path_buf.push(0);
-
-    // SAFETY: path_buf is NUL-terminated, opendir returns NULL on failure.
-    let dp = unsafe { libc::opendir(path_buf.as_ptr() as *const libc::c_char) };
-    if dp.is_null() {
+    let Some(dir_entries) = open_dir(&full_path) else {
         if gi_pushed {
             ignores.pop();
         }
         return;
-    }
+    };
 
     let mut subdirs: Vec<String> = Vec::new();
 
-    loop {
+    for ent in dir_entries {
         if *visited >= VISIT_CAP || entries.len() >= match_cap {
             break;
         }
 
-        // SAFETY: dp is a valid DIR* from opendir.
-        let ent = unsafe { libc::readdir(dp) };
-        if ent.is_null() {
-            break;
-        }
-
-        // SAFETY: d_name is a NUL-terminated C string.
-        let name_cstr = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let Ok(ent) = ent else { continue };
+        let name_cstr = ent.file_name();
         let name_bytes = name_cstr.to_bytes();
 
         if name_bytes == b"." || name_bytes == b".." {
@@ -418,9 +360,7 @@ fn walk(
             continue;
         }
 
-        // SAFETY: ent is a valid dirent pointer.
-        let d_type = unsafe { (*ent).d_type };
-        let is_dir = d_type == libc::DT_DIR;
+        let is_dir = ent.file_type() == rustix::fs::FileType::Directory;
 
         let rel = if rel_prefix.is_empty() {
             name.to_string()
@@ -441,11 +381,6 @@ fn walk(
         if is_dir {
             subdirs.push(rel);
         }
-    }
-
-    // SAFETY: dp is a valid DIR* from opendir.
-    unsafe {
-        libc::closedir(dp);
     }
 
     for subdir in subdirs {
@@ -495,27 +430,19 @@ fn walk_hidden(
     }
 
     let full_path = root.join(rel_prefix);
-    let mut path_buf = full_path.as_os_str().as_encoded_bytes().to_vec();
-    path_buf.push(0);
-
-    let dp = unsafe { libc::opendir(path_buf.as_ptr() as *const libc::c_char) };
-    if dp.is_null() {
+    let Some(dir_entries) = open_dir(&full_path) else {
         return;
-    }
+    };
 
     let mut subdirs: Vec<String> = Vec::new();
 
-    loop {
+    for ent in dir_entries {
         if *visited >= VISIT_CAP || entries.len() >= match_cap {
             break;
         }
 
-        let ent = unsafe { libc::readdir(dp) };
-        if ent.is_null() {
-            break;
-        }
-
-        let name_cstr = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let Ok(ent) = ent else { continue };
+        let name_cstr = ent.file_name();
         let name_bytes = name_cstr.to_bytes();
 
         if name_bytes == b"." || name_bytes == b".." {
@@ -531,8 +458,7 @@ fn walk_hidden(
             continue;
         }
 
-        let d_type = unsafe { (*ent).d_type };
-        let is_dir = d_type == libc::DT_DIR;
+        let is_dir = ent.file_type() == rustix::fs::FileType::Directory;
 
         let rel = format!("{rel_prefix}/{name}");
 
@@ -546,8 +472,6 @@ fn walk_hidden(
             subdirs.push(rel);
         }
     }
-
-    unsafe { libc::closedir(dp) };
 
     for subdir in subdirs {
         walk_hidden(
