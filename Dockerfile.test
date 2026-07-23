@@ -1,0 +1,60 @@
+FROM alpine:3.24.1
+
+ARG TARGETARCH
+ARG LLVM_VERSION=22.1.8
+
+RUN apk add --no-cache \
+    musl-dev \
+    libgcc \
+    git \
+    tzdata
+
+# Use the same prebuilt LLVM family as the Linux CI image. The archive is
+# musl-linked so clang, lld, and the LLVM tools run inside Alpine.
+ADD https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-linux-musl.tar.xz /tmp/llvm-x86_64.tar.xz
+ADD https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-aarch64-linux-musl.tar.xz /tmp/llvm-aarch64.tar.xz
+RUN case "$TARGETARCH" in \
+        amd64) archive=/tmp/llvm-x86_64.tar.xz ;; \
+        arm64) archive=/tmp/llvm-aarch64.tar.xz ;; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && mkdir -p /opt/llvm-musl \
+    && tar xf "$archive" -C /opt/llvm-musl --strip-components=1 \
+    && rm /tmp/llvm-x86_64.tar.xz /tmp/llvm-aarch64.tar.xz
+
+ADD https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init /rustup-init-x86_64
+ADD https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-musl/rustup-init /rustup-init-aarch64
+RUN case "$TARGETARCH" in \
+        amd64) init=/rustup-init-x86_64 ;; \
+        arm64) init=/rustup-init-aarch64 ;; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && cp "$init" /rustup-init \
+    && chmod +x /rustup-init \
+    && /rustup-init -y --default-toolchain none \
+    && rm /rustup-init /rustup-init-x86_64 /rustup-init-aarch64
+
+ENV PATH="/opt/llvm-musl/bin:/root/.cargo/bin:$PATH" \
+    CC="/opt/llvm-musl/bin/clang" \
+    AR="/opt/llvm-musl/bin/llvm-ar" \
+    RANLIB="/opt/llvm-musl/bin/llvm-ranlib" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="rust-lld" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="rust-lld"
+
+RUN rustup toolchain install nightly-2026-04-20 \
+    --target x86_64-unknown-linux-musl \
+    --target aarch64-unknown-linux-musl \
+    --component rust-src \
+    --component llvm-tools-preview
+
+# Alpine keeps these libraries outside the Rust musl target directory, while
+# rust-lld searches that directory when linking host proc-macro crates.
+RUN host_libdir="$(rustc --print target-libdir)" \
+    && ln -sf /usr/lib/libgcc_s.so.1 "$host_libdir/libgcc_s.so" \
+    && ln -sf /usr/lib/libgcc_s.so.1 "$host_libdir/libgcc_s.so.1" \
+    && ln -sf /usr/lib/libc.so "$host_libdir/libc.so"
+
+WORKDIR /ish
+COPY . .
+
+CMD ["cargo", "test", "--all-targets"]
