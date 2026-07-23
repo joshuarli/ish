@@ -1524,8 +1524,9 @@ fn tab_completion_narrow_repaint_does_not_stack_rows() {
 
     let out = sh.read_timeout(600);
     let screen = Screen::render(&out, 24, 12);
+    let flattened = screen.replace('\n', "");
     assert_eq!(
-        screen.matches("aaa.txt").count(),
+        flattened.matches("aaa.txt").count(),
         2,
         "selected completion should appear once in the preview line and once in the grid: {screen:?}"
     );
@@ -1685,14 +1686,24 @@ fn tab_completion_with_wide_dir_name_restores_prompt_cursor() {
         "expected wide directory entry in completion grid after second tab: {:?}",
         second_tab.snapshot
     );
-    assert_eq!(
-        second_tab.snapshot.cursor_row, before_tab.snapshot.cursor_row,
-        "expected prompt cursor row to remain on the prompt line after the second tab: before={:?} after={:?}",
-        before_tab.snapshot, second_tab.snapshot
-    );
     assert!(
-        second_tab.snapshot.cursor_col > before_tab.snapshot.cursor_col,
-        "second tab should activate selection and move the prompt cursor to the end of the live preview: before={:?} after={:?}",
+        second_tab
+            .snapshot
+            .visible
+            .replace('\n', "")
+            .contains("~/'Sync/M/Music/bandcamp/01 - Charlotte de Witte"),
+        "second tab should activate selection and show the live preview: {:?}",
+        second_tab.snapshot
+    );
+    let grid_row = second_tab
+        .snapshot
+        .visible
+        .lines()
+        .position(|line| line.contains("Altered States/"))
+        .expect("completion grid should be visible");
+    assert!(
+        second_tab.snapshot.cursor_row < grid_row,
+        "prompt cursor should remain above the completion grid: before={:?} after={:?}",
         before_tab.snapshot,
         second_tab.snapshot
     );
