@@ -227,5 +227,4 @@ Criterion benchmarks with a custom counting allocator that tracks heap allocatio
 
 **Adding a parser feature:** Edit `parse.rs`. The tokenizer is a single-pass char scanner. New tokens go in the `Token` enum, new syntax in the parser loop. Keep it flat — no recursive descent.
 
-**Running tests after changes:** Always run `cargo test` (all suites). The PTY tests (`--test pty`) catch rendering regressions that unit tests miss. Pre-commit hooks enforce `cargo fmt` and `cargo clippy -- -D warnings`.
-
+**Running tests after changes:** Always run `cargo test` (all suites). The PTY tests (`--test pty`) catch rendering regressions that unit tests miss.

@@ -17,6 +17,10 @@ release:
 	  -Z build-std-features= \
 	  --target $(TARGET)
 
+lint:
+	cargo fmt --all
+	cargo clippy --fix --allow-dirty --all-targets --all-features -- --deny warnings
+
 # Collect PGO profiles from benchmarks — only re-run when hot paths change.
 # No build-std or -Cpanic=immediate-abort here: the profiler runtime needs unwinding.
 pgo-profile:
@@ -52,21 +56,3 @@ install: release-pgo
 test-ci:
 	@OUT=$$(cargo test --quiet --release 2>&1) || { echo "$$OUT"; exit 1; }
 
-setup:
-	prek install --prepare-hooks -f
-
-pc:
-	prek --quiet run --all-files
-
-# Usage: make bump-version [V=x.y.z]
-# Without V, increments the patch version.
-bump-version:
-ifndef V
-	$(eval OLD := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml))
-	$(eval V := $(shell echo "$(OLD)" | awk -F. '{printf "%d.%d.%d", $$1, $$2, $$3+1}'))
-endif
-	sed -i '' 's/^version = ".*"/version = "$(V)"/' Cargo.toml
-	cargo check --quiet 2>/dev/null
-	git add Cargo.toml Cargo.lock
-	git commit -m "bump version to $(V)"
-	git tag "release/$(V)"
