@@ -47,10 +47,12 @@ jobs:
         # release-pgo disabled for now
         run: make release
 
+      - run: cp "target/${{ matrix.target }}/release/ish" "ish-${{ matrix.target }}"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ish-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/ish
+          path: ish-${{ matrix.target }}
 
   release:
     name: Create pre-release
@@ -68,11 +70,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: release-${{ github.sha }}
         run: |
-          for dir in ish-*; do
-            target="${dir#ish-}"
-            mv "$dir/ish" "ish-${RELEASE_TAG}-${target}"
-          done
-          gh release create "$RELEASE_TAG" ish-"${RELEASE_TAG}"-* \
+          gh release create "$RELEASE_TAG" dist/ish-* \
             --repo "$GITHUB_REPOSITORY" \
             --prerelease \
             --target "$GITHUB_SHA" \
