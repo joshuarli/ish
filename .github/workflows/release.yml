@@ -1,12 +1,18 @@
-name: Release
+name: release
 
 on:
-  push:
-    tags:
-      - 'release/*'
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   build:
@@ -20,16 +26,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          - runner: macos-26
             target: aarch64-apple-darwin
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-
-    env:
-      CARGO_INCREMENTAL: 0
-      CARGO_PROFILE_DEV_DEBUG: 0
 
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +44,8 @@ jobs:
         run: make test-ci
 
       - name: Build release
-        run: make release-pgo
+        # release-pgo disabled for now
+        run: make release
 
       - uses: actions/upload-artifact@v4
         with:
@@ -50,22 +53,27 @@ jobs:
           path: target/${{ matrix.target }}/release/ish
 
   release:
-    name: Create release
+    name: Create pre-release
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
-      - name: Create GitHub release
+      - name: Create pre-release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ github.ref_name }}
-          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: release-${{ github.sha }}
         run: |
-          V="${VERSION#release/}"
           for dir in ish-*; do
             target="${dir#ish-}"
-            mv "$dir/ish" "ish-${V}-${target}"
+            mv "$dir/ish" "ish-${RELEASE_TAG}-${target}"
           done
-          gh release create "$VERSION" ish-"${V}"-* --title "$V"
+          gh release create "$RELEASE_TAG" ish-"${RELEASE_TAG}"-* \
+            --repo "$GITHUB_REPOSITORY" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG"
