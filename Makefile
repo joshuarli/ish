@@ -55,12 +55,12 @@ lint:
 	cargo fmt --all
 	cargo clippy --fix --allow-dirty --all-targets --all-features -- --deny warnings
 
-# Collect PGO profiles from representative interactive and startup benchmarks.
+# Collect PGO profiles from the built-in benchmark harness.
 # No build-std or -Cpanic=immediate-abort here: the profiler runtime needs unwinding.
 pgo-profile:
 	rm -rf $(PGO_DIR) && mkdir -p $(PGO_DIR)
 	RUSTFLAGS="-Cprofile-generate=$(PGO_DIR)" \
-	cargo bench --bench bench -- --profile-time 1 "startup|line_buffer|history|completion|prompt_render|interactive_render|history_add|path_lookup|completion_fs|autosuggestion|command_coloring|finder"
+	cargo bench --bench bench
 	$(LLVM_BIN)/llvm-profdata merge -o $(PGO_MERGED) $(PGO_DIR)
 
 # PGO-optimized release: uses gathered profiles + all aggressive flags.
@@ -72,12 +72,13 @@ release-pgo: $(PGO_MERGED)
 	  -Z build-std-features= \
 	  --target $(TARGET)
 
-# Benchmark regular release vs PGO. Requires: critcmp (cargo install critcmp)
+# Benchmark regular release vs PGO. The built-in harness prints both reports.
 bench-pgo: $(PGO_MERGED)
-	cargo bench --bench bench -- --save-baseline regular 2>/dev/null
+	@echo '--- regular ---'
+	cargo bench --bench bench
+	@echo '--- pgo ---'
 	RUSTFLAGS="-Cprofile-use=$(PGO_MERGED)" \
-	cargo bench --bench bench -- --save-baseline pgo 2>/dev/null
-	critcmp regular pgo
+	cargo bench --bench bench
 
 $(PGO_MERGED):
 	$(MAKE) pgo-profile
