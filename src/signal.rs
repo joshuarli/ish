@@ -20,7 +20,10 @@ pub fn init() -> RawFd {
         PIPE_WRITE = write_fd;
     }
 
-    install_handler(rustix::process::Signal::CHILD);
+    // External jobs are waited synchronously, so SIGCHLD does not need to wake
+    // the input poller. The old rustix self-pipe handler caused the shell to
+    // segfault after child exit on Alpine/musl.
+    // install_handler(rustix::process::Signal::CHILD);
     install_handler(rustix::process::Signal::WINCH);
 
     // Shell ignores these — it must not be suspended/stopped
@@ -85,13 +88,16 @@ pub fn read_signal() -> Option<i32> {
 fn install_handler(sig: rustix::process::Signal) {
     #[cfg(target_os = "linux")]
     unsafe {
-        let action = rustix::runtime::KernelSigaction {
-            sa_handler_kernel: Some(handler),
-            sa_flags: rustix::runtime::KernelSigactionFlags::RESTART,
-            sa_restorer: None,
-            sa_mask: rustix::runtime::KernelSigSet::empty(),
-        };
-        let _ = rustix::runtime::kernel_sigaction(sig, Some(action));
+        // The Rustix kernel_sigaction trampoline segfaults when a signal is
+        // delivered to a statically linked musl binary.
+        // let action = rustix::runtime::KernelSigaction {
+        //     sa_handler_kernel: Some(handler),
+        //     sa_flags: rustix::runtime::KernelSigactionFlags::RESTART,
+        //     sa_restorer: None,
+        //     sa_mask: rustix::runtime::KernelSigSet::empty(),
+        // };
+        // let _ = rustix::runtime::kernel_sigaction(sig, Some(action));
+        let _ = libc::signal(sig.as_raw(), handler as *const () as usize);
     }
 
     #[cfg(target_os = "macos")]
@@ -121,10 +127,11 @@ fn ignore(sig: rustix::process::Signal) {
 unsafe extern "C" fn handler(sig: i32) {
     let byte = sig as u8;
     // SAFETY: write() is async-signal-safe. PIPE_WRITE is valid (set in init).
-    // O_NONBLOCK ensures we never block in the handler. If pipe is full,
+    // O_NONBLOCK ensures we never block in the handler. If the pipe is full,
     // the signal was already pending — dropping the byte is safe.
-    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(PIPE_WRITE) };
-    let _ = rustix::io::write(fd, &[byte]);
+    unsafe {
+        let _ = libc::write(PIPE_WRITE, &byte as *const u8 as *const libc::c_void, 1);
+    }
 }
 
 #[cfg(target_os = "macos")]

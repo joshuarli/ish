@@ -151,7 +151,10 @@ impl PtyShell {
             unsafe {
                 libc::close(master_fd);
                 libc::setsid();
-                libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+                #[cfg(target_os = "linux")]
+                libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_int, 0);
+                #[cfg(not(target_os = "linux"))]
+                libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
                 libc::dup2(slave_fd, 0);
                 libc::dup2(slave_fd, 1);
                 libc::dup2(slave_fd, 2);

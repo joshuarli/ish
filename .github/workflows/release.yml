@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -28,31 +29,73 @@ jobs:
         include:
           - runner: macos-26
             target: aarch64-apple-darwin
+            docker_platform: ''
           - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
+            docker_platform: linux/amd64
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
+            docker_platform: linux/arm64
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        if: matrix.docker_platform != ''
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Linux release image
+        if: matrix.docker_platform != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.docker_platform }}
+          load: true
+          tags: ish-builder:${{ matrix.target }}
+          cache-from: type=gha,scope=ish-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=ish-${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
+        if: matrix.docker_platform == ''
         with:
           key: ${{ matrix.runner }}-${{ matrix.target }}
 
       - name: Run tests
+        if: matrix.docker_platform == ''
         run: make test-ci
+
+      - name: Run Linux tests in Docker
+        if: matrix.docker_platform != ''
+        run: |
+          docker run --rm --init \
+            --platform "${{ matrix.docker_platform }}" \
+            -v "$GITHUB_WORKSPACE:/ish" \
+            -w /ish \
+            ish-builder:${{ matrix.target }} \
+            sh -ec '
+              make test-ci
+              make release TARGET=${{ matrix.target }}
+              make verify-release TARGET=${{ matrix.target }}
+              cp target/${{ matrix.target }}/release/ish ish-${{ matrix.target }}-static
+              make release-dynamic TARGET=${{ matrix.target }}
+              make verify-release-dynamic TARGET=${{ matrix.target }}
+              cp target/${{ matrix.target }}/release/ish ish-${{ matrix.target }}
+            '
 
       - name: Build release
         # release-pgo disabled for now
-        run: make release
+        if: matrix.docker_platform == ''
+        run: make release TARGET=${{ matrix.target }}
 
-      - run: cp "target/${{ matrix.target }}/release/ish" "ish-${{ matrix.target }}"
+      - name: Save macOS release
+        if: matrix.docker_platform == ''
+        run: cp "target/${{ matrix.target }}/release/ish" "ish-${{ matrix.target }}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ish-${{ matrix.target }}
-          path: ish-${{ matrix.target }}
+          path: ish-*
 
   release:
     name: Create pre-release
@@ -62,6 +105,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: ish-*
           path: dist
           merge-multiple: true
 

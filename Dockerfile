@@ -4,10 +4,18 @@ ARG TARGETARCH
 ARG LLVM_VERSION=22.1.8
 
 RUN apk add --no-cache \
+    binutils \
+    file \
+    make \
     musl-dev \
     libgcc \
     git \
     tzdata
+
+# rustix requests libutil for Unix PTY support; musl provides those symbols in
+# libc, so an empty archive satisfies the legacy library name without adding a
+# glibc runtime dependency.
+RUN ar rcs /usr/lib/libutil.a
 
 # Use the same prebuilt LLVM family as the Linux CI image. The archive is
 # musl-linked so clang, lld, and the LLVM tools run inside Alpine.
@@ -21,6 +29,14 @@ RUN case "$TARGETARCH" in \
     && mkdir -p /opt/llvm-musl \
     && tar xf "$archive" -C /opt/llvm-musl --strip-components=1 \
     && rm /tmp/llvm-x86_64.tar.xz /tmp/llvm-aarch64.tar.xz
+
+RUN for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do \
+        stub_dir="/usr/lib/e-crt/$target"; \
+        mkdir -p "$stub_dir"; \
+        for obj in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o; do \
+            /opt/llvm-musl/bin/clang --target="$target" -x c -c /dev/null -o "$stub_dir/$obj"; \
+        done; \
+    done
 
 ADD https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init /rustup-init-x86_64
 ADD https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-musl/rustup-init /rustup-init-aarch64
@@ -41,6 +57,9 @@ ENV PATH="/opt/llvm-musl/bin:/root/.cargo/bin:$PATH" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="rust-lld" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="rust-lld"
 
+RUN llvm-strip --strip-debug /usr/lib/libc.a
+RUN llvm-strip --strip-debug /usr/lib/crt*.o /usr/lib/[S]*.o 2>/dev/null || true
+
 RUN rustup toolchain install nightly-2026-04-20 \
     --target x86_64-unknown-linux-musl \
     --target aarch64-unknown-linux-musl \
@@ -53,8 +72,3 @@ RUN host_libdir="$(rustc --print target-libdir)" \
     && ln -sf /usr/lib/libgcc_s.so.1 "$host_libdir/libgcc_s.so" \
     && ln -sf /usr/lib/libgcc_s.so.1 "$host_libdir/libgcc_s.so.1" \
     && ln -sf /usr/lib/libc.so "$host_libdir/libc.so"
-
-WORKDIR /ish
-COPY . .
-
-CMD ["cargo", "test", "--all-targets"]
