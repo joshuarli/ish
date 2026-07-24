@@ -168,7 +168,7 @@ cargo build --release    # Optimized build (LTO, stripped)
 cargo test               # All tests (unit + integration + pty)
 cargo test --test pty    # PTY visual tests only
 cargo test --test integration  # Library integration tests only
-cargo bench              # Criterion benchmarks with allocation tracking
+cargo bench              # Criterion benchmarks for interactive and startup hot paths
 cargo +nightly fuzz run fuzz_parse  # Fuzz the parser (requires cargo-fuzz)
 ```
 
@@ -201,7 +201,7 @@ The PTY harness (`PtyShell`) uses `openpty()` + `fork()` to create an isolated t
 - `fuzz_input` — Full parse → expand pipeline never panics on any input
 
 ### Benchmarks (`benches/bench.rs`)
-Criterion benchmarks with a custom counting allocator that tracks heap allocations and bytes. Covers: parsing, expansion, line buffer ops, history search, completion grid + sort, prompt rendering, end-to-end parse+expand, PATH lookup, alias lookup, `ls` builtin, filesystem completion, and denv output parsing. Includes an allocation audit section that prints cold and warm (pooled buffer) allocation counts — warm paths should show 0 allocs.
+Criterion benchmarks for user-visible and interactive hot paths: startup, line editing, history search and insertion, completion, prompt and terminal rendering, `ls`, PATH lookup, autosuggestion, command coloring, filesystem completion, and finder searches. The PGO profile uses representative groups from this list.
 
 ## Design Principles
 
@@ -213,7 +213,7 @@ Criterion benchmarks with a custom counting allocator that tracks heap allocatio
 
 **Flat data structures.** The parser produces a flat `CommandLine` with no recursive AST. No nesting means simple, predictable execution. The completion grid is a flat Vec with column-major indexing. History is a flat Vec with linear search.
 
-**Zero-allocation warm paths.** All interactive hot paths — prompt render, tab completion, fuzzy history search — are zero-allocation on the steady state via pre-allocated pooled buffers (`prompt_buf`, `comp_buf`, `match_buf` on Shell). Completions use an arena (`Completions.names` String + offset-based `CompEntry`). Filesystem operations use `libc::opendir`/`readdir`/`stat` directly with stack buffers instead of `std::fs`. Env var reads use `libc::getenv` (zero-alloc `&str` into env block). The benchmark suite tracks allocations per operation with a custom counting allocator.
+**Zero-allocation warm paths.** All interactive hot paths — prompt render, tab completion, fuzzy history search — are zero-allocation on the steady state via pre-allocated pooled buffers (`prompt_buf`, `comp_buf`, `match_buf` on Shell). Completions use an arena (`Completions.names` String + offset-based `CompEntry`). Filesystem operations use `libc::opendir`/`readdir`/`stat` directly with stack buffers instead of `std::fs`. Env var reads use `libc::getenv` (zero-alloc `&str` into env block).
 
 **Unsafe is contained.** All unsafe code is in 8 modules: `term.rs` (termios), `signal.rs` (signal handlers), `exec.rs` (fork/exec + libc::getenv/stat), `input.rs` (raw fd reads), `sys.rs` (platform syscalls), `denv.rs` (fork/exec for denv subprocess), `complete.rs` (libc opendir/readdir/stat/lstat), and `main.rs` (libc::getenv). The rest of the codebase is safe Rust.
 

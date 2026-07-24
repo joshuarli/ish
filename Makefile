@@ -55,12 +55,12 @@ lint:
 	cargo fmt --all
 	cargo clippy --fix --allow-dirty --all-targets --all-features -- --deny warnings
 
-# Collect PGO profiles from benchmarks — only re-run when hot paths change.
+# Collect PGO profiles from representative interactive and startup benchmarks.
 # No build-std or -Cpanic=immediate-abort here: the profiler runtime needs unwinding.
 pgo-profile:
 	rm -rf $(PGO_DIR) && mkdir -p $(PGO_DIR)
 	RUSTFLAGS="-Cprofile-generate=$(PGO_DIR)" \
-	cargo bench --bench bench -- --profile-time 1 "parse|expand|prompt|path_lookup|completion|history|line_buffer"
+	cargo bench --bench bench -- --profile-time 1 "startup|line_buffer|history|completion|prompt_render|interactive_render|history_add|path_lookup|completion_fs|autosuggestion|command_coloring|finder"
 	$(LLVM_BIN)/llvm-profdata merge -o $(PGO_MERGED) $(PGO_DIR)
 
 # PGO-optimized release: uses gathered profiles + all aggressive flags.

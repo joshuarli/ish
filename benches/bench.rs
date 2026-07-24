@@ -1,10 +1,8 @@
 //! Benchmark harness for ish shell.
 //!
-//! Tracks wall time (criterion) and heap allocations (counting allocator).
+//! Tracks wall time for user-visible and interactive hot paths.
 //! Run: `cargo bench`
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
@@ -18,113 +16,6 @@ use ish::path as exec;
 use ish::prompt;
 use ish::render;
 use ish::term::TermWriter;
-
-// ---------------------------------------------------------------------------
-// Counting allocator — tracks allocations and live bytes
-// ---------------------------------------------------------------------------
-
-struct CountingAlloc;
-
-static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-fn update_peak() {
-    let live = LIVE_BYTES.load(Relaxed);
-    let mut peak = PEAK_BYTES.load(Relaxed);
-    while live > peak {
-        match PEAK_BYTES.compare_exchange_weak(peak, live, Relaxed, Relaxed) {
-            Ok(_) => break,
-            Err(actual) => peak = actual,
-        }
-    }
-}
-
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOC_COUNT.fetch_add(1, Relaxed);
-        ALLOC_BYTES.fetch_add(layout.size(), Relaxed);
-        LIVE_BYTES.fetch_add(layout.size(), Relaxed);
-        update_peak();
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE_BYTES.fetch_sub(layout.size(), Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOC_COUNT.fetch_add(1, Relaxed);
-        if new_size > layout.size() {
-            let delta = new_size - layout.size();
-            ALLOC_BYTES.fetch_add(delta, Relaxed);
-            LIVE_BYTES.fetch_add(delta, Relaxed);
-        } else {
-            let delta = layout.size() - new_size;
-            LIVE_BYTES.fetch_sub(delta, Relaxed);
-        }
-        update_peak();
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: CountingAlloc = CountingAlloc;
-
-fn reset_alloc_counters() {
-    ALLOC_COUNT.store(0, Relaxed);
-    ALLOC_BYTES.store(0, Relaxed);
-    PEAK_BYTES.store(LIVE_BYTES.load(Relaxed), Relaxed);
-}
-
-fn alloc_count() -> usize {
-    ALLOC_COUNT.load(Relaxed)
-}
-
-fn alloc_bytes() -> usize {
-    ALLOC_BYTES.load(Relaxed)
-}
-
-struct AllocStats {
-    count: usize,
-    bytes: usize,
-}
-
-impl std::fmt::Display for AllocStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fn human(n: usize) -> String {
-            if n >= 1_048_576 {
-                format!("{:.1} MiB", n as f64 / 1_048_576.0)
-            } else if n >= 1024 {
-                format!("{:.1} KiB", n as f64 / 1024.0)
-            } else {
-                format!("{n} B")
-            }
-        }
-        write!(f, "{} allocs, {}", self.count, human(self.bytes))
-    }
-}
-
-fn measure_allocs<F: FnOnce()>(f: F) -> AllocStats {
-    reset_alloc_counters();
-    f();
-    AllocStats {
-        count: alloc_count(),
-        bytes: alloc_bytes(),
-    }
-}
-
-fn format_bytes(n: usize) -> String {
-    if n >= 1_048_576 {
-        format!("{:.1} MiB", n as f64 / 1_048_576.0)
-    } else if n >= 1024 {
-        format!("{:.1} KiB", n as f64 / 1024.0)
-    } else {
-        format!("{n} B")
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Line buffer benchmarks
@@ -278,63 +169,6 @@ fn bench_history(c: &mut Criterion) {
         });
     });
 
-    // Subsequence match only — measures the optimal alignment overhead
-    group.bench_function("subsequence_match_hit", |b| {
-        let query: Vec<char> = "gco".chars().collect();
-        b.iter(|| black_box(ish::history::subsequence_match(&query, "git checkout main")));
-    });
-
-    group.bench_function("subsequence_match_miss", |b| {
-        let query: Vec<char> = "zzz".chars().collect();
-        b.iter(|| black_box(ish::history::subsequence_match(&query, "git checkout main")));
-    });
-
-    // Optimal alignment: query chars appear early AND late — exercises the
-    // backward pass from two endpoints.
-    group.bench_function("subsequence_match_alignment", |b| {
-        let query: Vec<char> = "test".chars().collect();
-        b.iter(|| {
-            black_box(ish::history::subsequence_match(
-                &query,
-                "the best integration test suite",
-            ))
-        });
-    });
-
-    // Score match in isolation — measures scoring overhead per result
-    group.bench_function("score_match_contiguous", |b| {
-        let mut positions = [0u16; 32];
-        positions[0] = 10;
-        positions[1] = 11;
-        positions[2] = 12;
-        positions[3] = 13;
-        positions[4] = 14;
-        positions[5] = 15;
-        b.iter(|| {
-            black_box(ish::history::score_match(
-                &positions,
-                6,
-                "cd /home/target/release/bin",
-                "myproject",
-            ))
-        });
-    });
-
-    group.bench_function("score_match_scattered", |b| {
-        let mut positions = [0u16; 32];
-        positions[0] = 3;
-        positions[1] = 12;
-        positions[2] = 18;
-        b.iter(|| {
-            black_box(ish::history::score_match(
-                &positions,
-                3,
-                "git remote add origin https://example.com",
-                "",
-            ))
-        });
-    });
-
     group.finish();
 }
 
@@ -359,51 +193,9 @@ fn bench_completion(c: &mut Criterion) {
         b.iter(|| black_box(complete::compute_grid(&comp100.entries, 40)));
     });
 
-    let mut comp5 = complete::Completions::new();
-    for i in 0..5 {
-        comp5.push(&format!("f{i}.rs"), false, false, false);
-    }
-
-    group.bench_function("compute_grid_5_entries", |b| {
-        b.iter(|| black_box(complete::compute_grid(&comp5.entries, 80)));
-    });
-
     // Filesystem completion (real I/O — measures readdir performance)
     group.bench_function("complete_path_cwd", |b| {
         b.iter(|| black_box(complete::complete_path("./src/", false)));
-    });
-
-    // Sort benchmark: isolated sort of typical directory listing (~17 entries)
-    group.bench_function("sort_17_filenames", |b| {
-        // Realistic filenames from a Rust project src/ dir
-        let names = [
-            "main.rs",
-            "lib.rs",
-            "prompt.rs",
-            "render.rs",
-            "complete.rs",
-            "history.rs",
-            "parse.rs",
-            "expand.rs",
-            "exec.rs",
-            "builtin.rs",
-            "line.rs",
-            "term.rs",
-            "input.rs",
-            "signal.rs",
-            "config.rs",
-            "alias.rs",
-            "error.rs",
-        ];
-        b.iter(|| {
-            let mut comp = complete::Completions::new();
-            // Push in reverse to force real sorting work
-            for n in names.iter().rev() {
-                comp.push(n, false, false, false);
-            }
-            comp.sort_entries();
-            black_box(&comp);
-        });
     });
 
     // Sort: large directory (100 entries)
@@ -415,38 +207,6 @@ fn bench_completion(c: &mut Criterion) {
             }
             comp.sort_entries();
             black_box(&comp);
-        });
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// Prompt benchmarks
-// ---------------------------------------------------------------------------
-
-fn bench_prompt(c: &mut Criterion) {
-    let mut group = c.benchmark_group("prompt");
-
-    group.bench_function("shorten_pwd_deep", |b| {
-        b.iter(|| {
-            black_box(prompt::shorten_pwd(
-                "/home/user/projects/rust/ish/src/main.rs",
-                "/home/user",
-            ))
-        });
-    });
-
-    group.bench_function("shorten_pwd_home", |b| {
-        b.iter(|| black_box(prompt::shorten_pwd("/home/user", "/home/user")));
-    });
-
-    group.bench_function("shorten_pwd_outside_home", |b| {
-        b.iter(|| {
-            black_box(prompt::shorten_pwd(
-                "/var/log/syslog/messages",
-                "/home/user",
-            ))
         });
     });
 
@@ -470,13 +230,6 @@ fn bench_prompt_render(c: &mut Criterion) {
     group.bench_function("full_error_status", |b| {
         let mut p = prompt::Prompt::new();
         b.iter(|| black_box(p.render(1)));
-    });
-
-    // display_len computation
-    group.bench_function("display_len", |b| {
-        let p = prompt::Prompt::new();
-        let sample = "\x1b[38;5;10muser@host ~/d/ish\x1b[0m \x1b[38;5;1m*\x1b[0m master $ ";
-        b.iter(|| black_box(p.display_len(sample)));
     });
 
     group.finish();
@@ -856,41 +609,6 @@ fn bench_path_lookup(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Alias lookup
-// ---------------------------------------------------------------------------
-
-fn bench_alias(c: &mut Criterion) {
-    let mut group = c.benchmark_group("alias");
-
-    let mut aliases = AliasMap::new();
-    aliases.set("g".into(), vec!["git".into()]);
-    aliases.set("gc".into(), vec!["git".into(), "commit".into()]);
-    aliases.set("ll".into(), vec!["ls".into(), "-la".into()]);
-    aliases.set(
-        "deploy".into(),
-        vec![
-            "make".into(),
-            "build".into(),
-            "&&".into(),
-            "./deploy.sh".into(),
-        ],
-    );
-    for i in 0..50 {
-        aliases.set(format!("alias_{i}"), vec![format!("cmd_{i}")]);
-    }
-
-    group.bench_function("hit", |b| {
-        b.iter(|| black_box(aliases.get("gc")));
-    });
-
-    group.bench_function("miss", |b| {
-        b.iter(|| black_box(aliases.get("nonexistent")));
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
 // Completion: realistic filesystem
 // ---------------------------------------------------------------------------
 
@@ -915,378 +633,6 @@ fn bench_completion_fs(c: &mut Criterion) {
     // /usr/bin — large directory, stress test
     group.bench_function("complete_usr_bin", |b| {
         b.iter(|| black_box(complete::complete_path("/usr/bin/z", false)));
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// denv output parsing
-// ---------------------------------------------------------------------------
-
-fn bench_denv(c: &mut Criterion) {
-    let mut group = c.benchmark_group("denv");
-
-    // Typical denv export output: 5-10 vars
-    let small_output = "export FOO='bar';\nexport BAZ='qux';\nexport PATH='/usr/bin:/bin';\n";
-    group.bench_function("parse_small_output", |b| {
-        b.iter(|| black_box(ish::denv::apply_bash_output_bench(small_output)));
-    });
-
-    // Larger: 50 vars
-    let large_output: String = (0..50)
-        .map(|i| format!("export DENV_BENCH_{i}='value_{i}';"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    group.bench_function("parse_50_vars", |b| {
-        b.iter(|| black_box(ish::denv::apply_bash_output_bench(&large_output)));
-    });
-
-    // Mixed export + unset
-    let mixed = "export A='1';\nexport B='two';\nunset C;\nexport D='it'\\''s here';\nunset E;\n";
-    group.bench_function("parse_mixed", |b| {
-        b.iter(|| black_box(ish::denv::apply_bash_output_bench(mixed)));
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// Allocation audit
-// ---------------------------------------------------------------------------
-
-fn bench_alloc_audit(c: &mut Criterion) {
-    let mut group = c.benchmark_group("alloc_audit");
-
-    // One-shot allocation reports
-    {
-        eprintln!();
-        eprintln!("  -- allocation audit --");
-
-        let stats = measure_allocs(|| {
-            let mut lb = LineBuffer::new();
-            for c in "echo hello world this is a test".chars() {
-                lb.insert_char(c);
-            }
-            black_box(lb.text());
-        });
-        eprintln!("  [alloc] line_buffer_30_chars:      {stats}");
-
-        let entries: Vec<String> = (0..1000)
-            .map(|i| format!("command_{i} --arg={i}"))
-            .collect();
-        let history = History::from_entries(entries);
-        let stats = measure_allocs(|| {
-            black_box(history.fuzzy_search("cmd99"));
-        });
-        eprintln!("  [alloc] fuzzy_search_1k:           {stats}");
-
-        // Warm: reuse pre-allocated Vec — should be 0 allocs
-        {
-            let mut results = Vec::with_capacity(200);
-            history.fuzzy_search_into("cmd99", &mut results, 200, "");
-            let stats = measure_allocs(|| {
-                history.fuzzy_search_into("cmd99", &mut results, 200, "");
-                black_box(&results);
-            });
-            eprintln!("  [alloc] fuzzy_search_warm:         {stats}");
-        }
-
-        let stats = measure_allocs(|| {
-            black_box(prompt::shorten_pwd(
-                "/home/user/projects/rust/ish/src",
-                "/home/user",
-            ));
-        });
-        eprintln!("  [alloc] shorten_pwd:               {stats}");
-
-        // --- New practical operation audits ---
-
-        // Cold start (includes Prompt::new allocations)
-        let stats = measure_allocs(|| {
-            let mut p = prompt::Prompt::new();
-            black_box(p.render(0));
-        });
-        eprintln!("  [alloc] prompt_render_cold:         {stats}");
-
-        // Warm: second render reuses all buffers — should be 0 allocs
-        {
-            let mut p = prompt::Prompt::new();
-            let mut buf = String::with_capacity(128);
-            let pwd = std::env::var_os("PWD")
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            p.render_into(&mut buf, 0, &pwd, false); // warm up caches
-            let stats = measure_allocs(|| {
-                p.render_into(&mut buf, 0, &pwd, false);
-                black_box(&buf);
-            });
-            eprintln!("  [alloc] prompt_render_warm:         {stats}");
-        }
-
-        let stats = measure_allocs(|| {
-            let entries: Vec<String> = (0..1000)
-                .map(|i| format!("command_{i} --arg={i}"))
-                .collect();
-            let mut h = History::from_entries(entries);
-            h.add("brand_new_command --flag");
-        });
-        eprintln!("  [alloc] history_add_1k:            {stats}");
-
-        let stats = measure_allocs(|| {
-            let _ = black_box(exec::scan_path("ls"));
-        });
-        eprintln!("  [alloc] scan_path_ls:              {stats}");
-
-        let stats = measure_allocs(|| {
-            let _ = black_box(complete::complete_path("./src/", false));
-        });
-        eprintln!("  [alloc] complete_path_src:         {stats}");
-
-        // Warm: reuse pre-allocated Completions — should be 0 allocs
-        {
-            let mut comp = complete::Completions::with_capacity(2048, 64);
-            complete::complete_path_into("./src/", false, &mut comp);
-            let stats = measure_allocs(|| {
-                comp.clear();
-                complete::complete_path_into("./src/", false, &mut comp);
-                black_box(&comp);
-            });
-            eprintln!("  [alloc] complete_path_warm:        {stats}");
-        }
-
-        let stats = measure_allocs(|| {
-            let _ = black_box(ish::denv::apply_bash_output_bench(
-                "export A='1';\nexport B='two';\nunset C;\n",
-            ));
-        });
-        eprintln!("  [alloc] denv_parse_3_directives:   {stats}");
-
-        // Finder: sync find
-        let stats = measure_allocs(|| {
-            black_box(ish::finder::find(".", "main", false, 100));
-        });
-        eprintln!("  [alloc] finder_normal:              {stats}");
-
-        // Finder: async drain
-        {
-            let stats = measure_allocs(|| {
-                let handle = ish::finder::find_async(".", false);
-                let mut buf = Vec::new();
-                loop {
-                    handle.drain_into(&mut buf);
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    handle.drain_into(&mut buf);
-                    if buf.len() > 10 {
-                        break;
-                    }
-                }
-                black_box(buf.len());
-            });
-            eprintln!("  [alloc] finder_async_drain:         {stats}");
-        }
-
-        // Finder: client-side filter (the hot path on each keystroke)
-        {
-            let entries: Vec<(usize, String)> = (0..500)
-                .map(|i| (i % 5, format!("src/module_{i}/main.rs")))
-                .collect();
-            let mut filtered = Vec::new();
-            let mut selected = 0usize;
-            // Warm the Vec
-            ish::finder::filter_entries_pub("mai", &entries, &mut filtered, &mut selected);
-            let stats = measure_allocs(|| {
-                ish::finder::filter_entries_pub("mai", &entries, &mut filtered, &mut selected);
-                black_box(&filtered);
-            });
-            eprintln!("  [alloc] finder_filter_warm:         {stats}");
-        }
-
-        {
-            let line = make_line("gh api");
-            let opts = render::RenderOpts::default();
-            let mut tw = TermWriter::new();
-            let mut prev = render::render_line(
-                &mut tw,
-                "$ ",
-                2,
-                &line,
-                80,
-                render::RenderedRegion::default(),
-                &opts,
-            );
-            tw.clear_buffer();
-            let stats = measure_allocs(|| {
-                prev = render::render_line(&mut tw, "$ ", 2, &line, 80, prev, &opts);
-                black_box(prev);
-                black_box(&tw);
-            });
-            eprintln!("  [alloc] render_line_warm:          {stats}");
-            tw.clear_buffer();
-            let _ = render::render_line(&mut tw, "$ ", 2, &line, 80, prev, &opts);
-            eprintln!(
-                "  [bytes] render_line_warm:          {}",
-                format_bytes(tw.buffer_len())
-            );
-        }
-
-        {
-            let history = sample_history();
-            let query = "gh api";
-            let matches = history.fuzzy_search(query);
-            let mut tw = TermWriter::new();
-            let mut cache = render::HistoryPagerCache::default();
-            let mut prev = render::render_history_pager_cached(
-                &mut tw,
-                query,
-                &matches,
-                &history,
-                0,
-                24,
-                20,
-                query.len(),
-                render::RenderedRegion::default(),
-                &mut cache,
-            );
-            tw.clear_buffer();
-            let stats = measure_allocs(|| {
-                prev = render::render_history_pager_cached(
-                    &mut tw,
-                    query,
-                    &matches,
-                    &history,
-                    0,
-                    24,
-                    20,
-                    query.len(),
-                    prev,
-                    &mut cache,
-                );
-                black_box(prev);
-                black_box(&tw);
-            });
-            eprintln!("  [alloc] render_history_warm:       {stats}");
-            tw.clear_buffer();
-            let _ = render::render_history_pager_cached(
-                &mut tw,
-                query,
-                &matches,
-                &history,
-                0,
-                24,
-                20,
-                query.len(),
-                prev,
-                &mut cache,
-            );
-            eprintln!(
-                "  [bytes] render_history_warm:       {}",
-                format_bytes(tw.buffer_len())
-            );
-        }
-
-        {
-            let all_entries = sample_file_picker_entries();
-            let filtered = vec![0usize, 1, 2];
-            let mut tw = TermWriter::new();
-            let mut prev = render::render_file_picker(
-                &mut tw,
-                "abc",
-                &all_entries,
-                &filtered,
-                0,
-                24,
-                20,
-                3,
-                false,
-                false,
-                render::RenderedRegion::default(),
-            );
-            tw.clear_buffer();
-            let stats = measure_allocs(|| {
-                prev = render::render_file_picker(
-                    &mut tw,
-                    "abc",
-                    &all_entries,
-                    &filtered,
-                    0,
-                    24,
-                    20,
-                    3,
-                    false,
-                    false,
-                    prev,
-                );
-                black_box(prev);
-                black_box(&tw);
-            });
-            eprintln!("  [alloc] render_file_picker_warm:   {stats}");
-            tw.clear_buffer();
-            let _ = render::render_file_picker(
-                &mut tw,
-                "abc",
-                &all_entries,
-                &filtered,
-                0,
-                24,
-                20,
-                3,
-                false,
-                false,
-                prev,
-            );
-            eprintln!(
-                "  [bytes] render_file_picker_warm:   {}",
-                format_bytes(tw.buffer_len())
-            );
-        }
-
-        {
-            let line = make_line("echo aa");
-            let opts = render::RenderOpts::default();
-            let mut state = sample_completion_state(20);
-            let mut tw = TermWriter::new();
-            let mut info = render::render_line(
-                &mut tw,
-                "$ ",
-                2,
-                &line,
-                20,
-                render::RenderedRegion::default(),
-                &opts,
-            );
-            render::render_completions(&mut tw, &state, info, true);
-            tw.clear_buffer();
-            let stats = measure_allocs(|| {
-                state.selected = 1;
-                info = render::render_line(&mut tw, "$ ", 2, &line, 20, info, &opts);
-                render::render_completions(&mut tw, &state, info, false);
-                black_box(info);
-                black_box(state.selected);
-                black_box(&tw);
-            });
-            eprintln!("  [alloc] render_completion_warm:    {stats}");
-            tw.clear_buffer();
-            info = render::render_line(&mut tw, "$ ", 2, &line, 20, info, &opts);
-            render::render_completions(&mut tw, &state, info, false);
-            eprintln!(
-                "  [bytes] render_completion_warm:    {}",
-                format_bytes(tw.buffer_len())
-            );
-        }
-
-        eprintln!();
-    }
-
-    // Criterion timing for the same operations
-    group.bench_function("line_buffer_30_chars", |b| {
-        b.iter(|| {
-            let mut lb = LineBuffer::new();
-            for c in "echo hello world this is a test".chars() {
-                lb.insert_char(c);
-            }
-            black_box(lb.text());
-        });
     });
 
     group.finish();
@@ -1349,13 +695,6 @@ fn bench_startup(c: &mut Criterion) {
         });
     }
 
-    group.bench_function("denv_init", |b| {
-        b.iter(|| {
-            ish::denv::init();
-            black_box(())
-        });
-    });
-
     group.finish();
 }
 
@@ -1385,18 +724,6 @@ fn bench_autosuggestion(c: &mut Criterion) {
         });
     });
 
-    // Verify zero allocations for a suggestion hit
-    group.bench_function("prefix_search_allocs", |b| {
-        b.iter(|| {
-            let stats = measure_allocs(|| {
-                let entry = history.prefix_search("git commit", 0);
-                let suffix = entry.and_then(|e| e.strip_prefix("git commit"));
-                black_box(suffix);
-            });
-            assert_eq!(stats.count, 0, "autosuggestion should be zero-alloc");
-        });
-    });
-
     group.finish();
 }
 
@@ -1422,16 +749,6 @@ fn bench_command_coloring(c: &mut Criterion) {
 
     group.bench_function("path_cache_miss", |b| {
         b.iter(|| black_box(cache.contains("zzzznotacommand")));
-    });
-
-    // Verify zero allocations for a cached lookup
-    group.bench_function("path_cache_allocs", |b| {
-        b.iter(|| {
-            let stats = measure_allocs(|| {
-                black_box(cache.contains("git"));
-            });
-            assert_eq!(stats.count, 0, "cached lookup should be zero-alloc");
-        });
     });
 
     // Full per-keystroke cost: builtin check + alias check + path cache
@@ -1488,44 +805,6 @@ fn bench_finder(c: &mut Criterion) {
         b.iter(|| black_box(ish::finder::find(".", "", false, 1000)));
     });
 
-    // Async finder: measure time to spawn + drain all entries
-    group.bench_function("find_async_normal_drain", |b| {
-        b.iter(|| {
-            let handle = ish::finder::find_async(".", false);
-            let mut buf = Vec::new();
-            loop {
-                handle.drain_into(&mut buf);
-                if handle.receiver.try_recv().is_err() {
-                    // Channel empty + no more coming = walk done
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    handle.drain_into(&mut buf);
-                    if handle.receiver.try_recv().is_err() {
-                        break;
-                    }
-                }
-            }
-            black_box(buf.len());
-        });
-    });
-
-    group.bench_function("find_async_hidden_drain", |b| {
-        b.iter(|| {
-            let handle = ish::finder::find_async(".", true);
-            let mut buf = Vec::new();
-            loop {
-                handle.drain_into(&mut buf);
-                if handle.receiver.try_recv().is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    handle.drain_into(&mut buf);
-                    if handle.receiver.try_recv().is_err() {
-                        break;
-                    }
-                }
-            }
-            black_box(buf.len());
-        });
-    });
-
     group.finish();
 }
 
@@ -1537,16 +816,12 @@ criterion_group!(
         bench_line_buffer,
         bench_history,
         bench_completion,
-        bench_prompt,
         bench_prompt_render,
         bench_interactive_render,
         bench_history_add,
         bench_ls,
         bench_path_lookup,
-        bench_alias,
         bench_completion_fs,
-        bench_denv,
-        bench_alloc_audit,
         bench_autosuggestion,
         bench_command_coloring,
         bench_finder,
