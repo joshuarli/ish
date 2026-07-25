@@ -74,20 +74,15 @@ pgo-profile:
 	cargo bench --bench bench -- --sample-size 1
 	$(LLVM_BIN)/llvm-profdata merge -o $(PGO_MERGED) $(PGO_DIR)
 
-$(PGO_MERGED):
-	$(MAKE) pgo-profile
-
 # PGO-optimized release: uses gathered profiles + all aggressive flags.
-release-pgo: $(PGO_MERGED)
-	cargo clean -p $(NAME) --release --target $(TARGET)
+release-pgo: pgo-profile
 	RUSTFLAGS="-Cprofile-use=$(PGO_MERGED) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
 	cargo build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
 
-release-pgo-linux: $(PGO_MERGED)
-	cargo clean -p $(NAME) --release --target $(TARGET)
+release-pgo-linux: pgo-profile
 	CARGO_TARGET_$(TARGET_ENV)_LINKER=clang \
 	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Cprofile-use=$(PGO_MERGED) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)" \
 	cargo build --release \
@@ -95,8 +90,7 @@ release-pgo-linux: $(PGO_MERGED)
 	  -Z build-std-features= \
 	  --target $(TARGET)
 
-release-pgo-linux-static: $(PGO_MERGED)
-	cargo clean -p $(NAME) --release --target $(TARGET)
+release-pgo-linux-static: pgo-profile
 	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Cprofile-use=$(PGO_MERGED) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
 	cargo build --release \
 	  -Z build-std=std \
@@ -104,7 +98,7 @@ release-pgo-linux-static: $(PGO_MERGED)
 	  --target $(TARGET)
 
 # Benchmark regular release vs PGO and compare persisted baselines.
-bench-pgo: $(PGO_MERGED)
+bench-pgo: pgo-profile
 	@BASELINE=$$(scripts/bench-baseline.py --print-path); \
 	PGO_BASELINE=$$(scripts/bench-baseline.py --variant pgo --print-path); \
 	scripts/bench-baseline.py --baseline "$$BASELINE" --quiet; \
