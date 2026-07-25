@@ -46,6 +46,12 @@ impl Drop for TempDir {
 }
 
 fn ish_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("ISH_TEST_BINARY") {
+        let path = PathBuf::from(path);
+        assert!(path.exists(), "ish binary not found at {}", path.display());
+        return path;
+    }
+
     // Find the debug binary relative to the test binary
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // remove test binary name

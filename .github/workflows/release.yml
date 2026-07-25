@@ -61,10 +61,6 @@ jobs:
         with:
           key: ${{ matrix.runner }}-${{ matrix.target }}
 
-      - name: Run tests
-        if: matrix.docker_platform == ''
-        run: make test-ci
-
       - name: Run Linux tests in Docker
         if: matrix.docker_platform != ''
         run: |
@@ -74,9 +70,9 @@ jobs:
             -w /ish \
             ish-builder:${{ matrix.target }} \
             sh -ec '
-              make test-ci
               make release TARGET=${{ matrix.target }}
               make verify-release TARGET=${{ matrix.target }}
+              make test-ci TARGET=${{ matrix.target }}
               cp target/${{ matrix.target }}/release/ish ish-${{ matrix.target }}-static
               make release-dynamic TARGET=${{ matrix.target }}
               make verify-release-dynamic TARGET=${{ matrix.target }}
@@ -84,9 +80,12 @@ jobs:
             '
 
       - name: Build release
-        # release-pgo disabled for now
         if: matrix.docker_platform == ''
-        run: make release TARGET=${{ matrix.target }}
+        run: make release-pgo TARGET=${{ matrix.target }}
+
+      - name: Run tests
+        if: matrix.docker_platform == ''
+        run: make test-ci TARGET=${{ matrix.target }}
 
       - name: Save macOS release
         if: matrix.docker_platform == ''

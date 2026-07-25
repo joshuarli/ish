@@ -1,4 +1,6 @@
 NAME       := ish
+TEST_BINARY_ENV := ISH_TEST_BINARY
+TEST_TARGETS := --lib --tests
 HOST       := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 TARGET     ?= $(subst -unknown-linux-gnu,-unknown-linux-musl,$(HOST))
 MUSL_LOADER := $(if $(findstring x86_64,$(TARGET)),/lib/ld-musl-x86_64.so.1,/lib/ld-musl-aarch64.so.1)
@@ -9,10 +11,18 @@ LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 
-.PHONY: setup build release release-dynamic verify-release verify-release-dynamic bench bench-syscalls release-pgo pgo-profile bench-pgo install test-ci pc bump-version
+.PHONY: build test test-ci release release-dynamic verify-release verify-release-dynamic bench bench-syscalls release-pgo pgo-profile bench-pgo install setup
 
 build:
 	cargo build
+
+test:
+	cargo test --quiet
+
+test-ci:
+	@test -x "target/$(TARGET)/release/$(NAME)"
+	$(TEST_BINARY_ENV)="$(CURDIR)/target/$(TARGET)/release/$(NAME)" \
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" cargo test --quiet --release $(TEST_TARGETS)
 
 release:
 	cargo clean -p $(NAME) --release --target $(TARGET)
@@ -39,7 +49,9 @@ verify-release:
 		file "target/$(TARGET)/release/$(NAME)" | grep -q 'stripped' || { echo 'release is not stripped'; exit 1; }; \
 		! readelf -l "target/$(TARGET)/release/$(NAME)" | grep -q INTERP || { echo 'release has a dynamic ELF interpreter'; exit 1; }; \
 		! readelf -d "target/$(TARGET)/release/$(NAME)" | grep -q NEEDED || { echo 'release has dynamic dependencies'; exit 1; }; \
-	else echo "Skipping ELF checks for $(TARGET)"; fi
+	else \
+		echo "Skipping ELF checks for $(TARGET)"; \
+	fi
 
 verify-release-dynamic:
 	@test -f "target/$(TARGET)/release/$(NAME)"
@@ -49,7 +61,9 @@ verify-release-dynamic:
 		file "target/$(TARGET)/release/$(NAME)" | grep -q 'stripped' || { echo 'release is not stripped'; exit 1; }; \
 		readelf -l "target/$(TARGET)/release/$(NAME)" | grep -q '/lib/ld-musl-' || { echo 'release does not use the musl loader'; exit 1; }; \
 		readelf -d "target/$(TARGET)/release/$(NAME)" | grep -q NEEDED || { echo 'release has no dynamic dependencies'; exit 1; }; \
-	else echo "Skipping ELF checks for $(TARGET)"; fi
+	else \
+		echo "Skipping ELF checks for $(TARGET)"; \
+	fi
 
 lint:
 	cargo fmt --all
@@ -69,6 +83,9 @@ pgo-profile:
 	cargo bench --bench bench
 	$(LLVM_BIN)/llvm-profdata merge -o $(PGO_MERGED) $(PGO_DIR)
 
+$(PGO_MERGED):
+	$(MAKE) pgo-profile
+
 # PGO-optimized release: uses gathered profiles + all aggressive flags.
 release-pgo: $(PGO_MERGED)
 	cargo clean -p $(NAME) --release --target $(TARGET)
@@ -78,21 +95,15 @@ release-pgo: $(PGO_MERGED)
 	  -Z build-std-features= \
 	  --target $(TARGET)
 
-# Benchmark regular release vs PGO. Divan prints both reports.
+# Benchmark regular release vs PGO and compare persisted baselines.
 bench-pgo: $(PGO_MERGED)
-	@echo '--- regular ---'
-	cargo bench --bench bench
-	@echo '--- pgo ---'
+	@BASELINE=$$(scripts/bench-baseline.py --print-path); \
+	PGO_BASELINE=$$(scripts/bench-baseline.py --variant pgo --print-path); \
+	scripts/bench-baseline.py --baseline "$$BASELINE" --quiet; \
 	RUSTFLAGS="-Cprofile-use=$(PGO_MERGED)" \
-	cargo bench --bench bench
-
-$(PGO_MERGED):
-	$(MAKE) pgo-profile
+	scripts/bench-baseline.py --baseline "$$PGO_BASELINE" --quiet --variant pgo; \
+	scripts/diff-baselines.py "$$BASELINE" "$$PGO_BASELINE"
 
 install: release-pgo
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
 	codesign -fs - ~/usr/bin/$(NAME)
-
-# So we don't do duplicate work (building both debug and release) in CI.
-test-ci:
-	@OUT=$$(cargo test --quiet --release -- --test-threads=1 2>&1) || { echo "$$OUT"; exit 1; }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import platform
 import re
@@ -245,10 +246,39 @@ def print_table(rows: list[tuple[str, str, str, str]]) -> None:
     print(border("╰", "┴", "╯"))
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="baseline path to read and write instead of the host default",
+    )
+    parser.add_argument(
+        "--variant",
+        help="suffix for the host default baseline path, such as pgo",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="update the baseline without printing the comparison table",
+    )
+    parser.add_argument(
+        "--print-path",
+        action="store_true",
+        help="print the selected baseline path and exit",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
+    args = parse_args()
     host, cpus = host_info()
-    baseline_path = root / "benches" / f"{host}-baseline.txt"
+    suffix = f"-{args.variant}" if args.variant else ""
+    baseline_path = args.baseline or root / "benches" / f"{host}{suffix}-baseline.txt"
+    if args.print_path:
+        print(baseline_path)
+        return 0
     completed = subprocess.run(
         ["cargo", "bench", "--bench", "bench"],
         cwd=root,
@@ -284,7 +314,8 @@ def main() -> int:
             )
         )
 
-    print_table(rows)
+    if not args.quiet:
+        print_table(rows)
     write_baseline(baseline_path, host, current)
     return 0
 

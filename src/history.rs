@@ -776,11 +776,11 @@ impl History {
         _pwd_basename: &str,
     ) {
         if query.is_ascii() && query.len() <= 32 {
-            let mut query_lower = ['\0'; 32];
+            let mut query_lower = [0u8; 32];
             for (slot, byte) in query_lower.iter_mut().zip(query.bytes()) {
-                *slot = byte.to_ascii_lowercase() as char;
+                *slot = byte.to_ascii_lowercase();
             }
-            self.fill_search_results_limited_chars(&query_lower[..query.len()], results, limit);
+            self.fill_search_results_limited_bytes(&query_lower[..query.len()], results, limit);
         } else {
             self.fill_search_results_limited(query, results, limit);
         }
@@ -931,6 +931,58 @@ impl History {
     ) {
         let query_lower = lowercase_query(query);
         self.fill_search_results_limited_chars(&query_lower, results, limit);
+    }
+
+    fn fill_search_results_limited_bytes(
+        &self,
+        query_lower: &[u8],
+        results: &mut Vec<FuzzyMatch>,
+        limit: usize,
+    ) {
+        results.clear();
+        if limit == 0 {
+            return;
+        }
+
+        if query_lower.is_empty() {
+            results.extend(
+                (0..self.offsets.len())
+                    .rev()
+                    .filter(|&idx| self.is_session_visible(idx))
+                    .take(limit)
+                    .map(|idx| FuzzyMatch {
+                        entry_idx: idx,
+                        match_positions: [0; 32],
+                        match_count: 0,
+                        score: 0,
+                    }),
+            );
+            return;
+        }
+
+        for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
+            if !self.is_session_visible(idx) {
+                continue;
+            }
+            let entry = &self.arena[start as usize..start as usize + len as usize];
+            let Some(m) = classify_match_ascii(query_lower, entry, idx) else {
+                continue;
+            };
+
+            let insert_at = results
+                .binary_search_by(|existing| compare_fuzzy_match(existing, &m))
+                .unwrap_or_else(|pos| pos);
+            if insert_at >= limit {
+                continue;
+            }
+            results.insert(insert_at, m);
+            if results.len() > limit {
+                results.pop();
+            }
+            if results.len() == limit && results[limit - 1].score == 3 {
+                break;
+            }
+        }
     }
 
     fn fill_search_results_limited_chars(
@@ -1096,6 +1148,28 @@ fn classify_match(query: &[char], text: &str, entry_idx: usize) -> Option<FuzzyM
     })
 }
 
+fn classify_match_ascii(query: &[u8], text: &str, entry_idx: usize) -> Option<FuzzyMatch> {
+    if starts_with_icase_ascii(query, text.as_bytes()) {
+        return Some(contiguous_match(entry_idx, 3, 0, query.len()));
+    }
+
+    if let Some(start) = find_substring_icase_ascii_bytes(query, text.as_bytes(), true) {
+        return Some(contiguous_match(entry_idx, 2, start, query.len()));
+    }
+
+    if let Some(start) = find_substring_icase_ascii_bytes(query, text.as_bytes(), false) {
+        return Some(contiguous_match(entry_idx, 1, start, query.len()));
+    }
+
+    let (positions, count) = subsequence_match_ascii_bytes(query, text.as_bytes())?;
+    Some(FuzzyMatch {
+        entry_idx,
+        match_positions: positions,
+        match_count: count,
+        score: 0,
+    })
+}
+
 fn contiguous_match(entry_idx: usize, score: i16, start: usize, len: usize) -> FuzzyMatch {
     let mut positions = [0u16; 32];
     let count = len.min(positions.len()).min(u8::MAX as usize);
@@ -1121,6 +1195,14 @@ fn starts_with_icase(query: &[char], text: &str) -> bool {
         }
     }
     true
+}
+
+fn starts_with_icase_ascii(query: &[u8], text: &[u8]) -> bool {
+    text.len() >= query.len()
+        && text[..query.len()]
+            .iter()
+            .zip(query)
+            .all(|(&text_byte, &query_byte)| text_byte.to_ascii_lowercase() == query_byte)
 }
 
 fn find_substring_icase(query: &[char], text: &str, boundary_only: bool) -> Option<usize> {
@@ -1164,6 +1246,30 @@ fn find_substring_icase_ascii(query: &[char], text: &[u8], boundary_only: bool) 
         }
         for (offset, &q) in query.iter().enumerate() {
             if text[start + offset].to_ascii_lowercase() != q as u8 {
+                continue 'start;
+            }
+        }
+        return Some(start);
+    }
+
+    None
+}
+
+fn find_substring_icase_ascii_bytes(
+    query: &[u8],
+    text: &[u8],
+    boundary_only: bool,
+) -> Option<usize> {
+    if query.len() > text.len() {
+        return None;
+    }
+
+    'start: for start in 0..=text.len() - query.len() {
+        if boundary_only && start > 0 && !is_word_boundary_byte(text[start - 1]) {
+            continue;
+        }
+        for (offset, &query_byte) in query.iter().enumerate() {
+            if text[start + offset].to_ascii_lowercase() != query_byte {
                 continue 'start;
             }
         }
@@ -1257,6 +1363,66 @@ fn subsequence_match_ascii(query: &[char], text: &str) -> Option<([u16; 32], u8)
     Some((positions, qlen as u8))
 }
 
+fn subsequence_match_ascii_bytes(query: &[u8], text: &[u8]) -> Option<([u16; 32], u8)> {
+    let qlen = query.len();
+    let last_qchar = query[qlen - 1];
+
+    let mut qi = 0;
+    let mut first_end = 0usize;
+    for (ti, &byte) in text.iter().enumerate() {
+        if byte.to_ascii_lowercase() == query[qi] {
+            qi += 1;
+            if qi == qlen {
+                first_end = ti;
+                break;
+            }
+        }
+    }
+    if qi < qlen {
+        return None;
+    }
+
+    let mut last_end = first_end;
+    for (ti, &byte) in text.iter().enumerate().skip(first_end + 1) {
+        if byte.to_ascii_lowercase() == last_qchar {
+            last_end = ti;
+        }
+    }
+
+    let (window_start, window_end) = if last_end == first_end {
+        (backward_ascii_bytes(text, query, first_end), first_end)
+    } else {
+        let start1 = backward_ascii_bytes(text, query, first_end);
+        let start2 = backward_ascii_bytes(text, query, last_end);
+        let span1 = first_end - start1;
+        let span2 = last_end - start2;
+        if span2 < span1 {
+            (start2, last_end)
+        } else {
+            (start1, first_end)
+        }
+    };
+
+    let mut positions = [0u16; 32];
+    let mut qi2 = 0;
+    for (ti, &byte) in text
+        .iter()
+        .enumerate()
+        .take(window_end + 1)
+        .skip(window_start)
+    {
+        if byte.to_ascii_lowercase() == query[qi2] {
+            positions[qi2] = ti as u16;
+            qi2 += 1;
+            if qi2 == qlen {
+                break;
+            }
+        }
+    }
+
+    Some((positions, qlen as u8))
+}
+
 /// Backward scan from `end` (inclusive) to find the tightest window start.
 fn backward_ascii(bytes: &[u8], query: &[char], end: usize) -> usize {
     let mut qi = query.len();
@@ -1269,6 +1435,19 @@ fn backward_ascii(bytes: &[u8], query: &[char], end: usize) -> usize {
         }
     }
     0 // unreachable if forward pass confirmed the match
+}
+
+fn backward_ascii_bytes(bytes: &[u8], query: &[u8], end: usize) -> usize {
+    let mut qi = query.len();
+    for ti in (0..=end).rev() {
+        if bytes[ti].to_ascii_lowercase() == query[qi - 1] {
+            qi -= 1;
+            if qi == 0 {
+                return ti;
+            }
+        }
+    }
+    0
 }
 
 /// Unicode path — operates on chars.

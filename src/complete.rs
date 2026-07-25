@@ -509,10 +509,13 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
         // Most filesystems provide d_type. Use it to avoid metadata work for
         // entries that cannot satisfy a directory-only completion.
         let d_type = unsafe { (*ent).d_type as u8 };
-        if dirs_only && d_type != libc::DT_DIR && d_type != libc::DT_LNK
-            && d_type != libc::DT_UNKNOWN {
-                continue;
-            }
+        if dirs_only
+            && d_type != libc::DT_DIR
+            && d_type != libc::DT_LNK
+            && d_type != libc::DT_UNKNOWN
+        {
+            continue;
+        }
 
         // Build full path for stat: "dir/name\0"
         let total = dir_prefix_len + name_bytes.len();
