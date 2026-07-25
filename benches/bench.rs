@@ -7,6 +7,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use divan::{AllocProfiler, Bencher, black_box};
@@ -23,6 +25,41 @@ use ish::path as exec;
 use ish::prompt;
 use ish::render;
 use ish::term::TermWriter;
+
+const TRACE_BEGIN: &[u8] = b"BENCH_BEGIN\0";
+const TRACE_END: &[u8] = b"BENCH_END\0";
+
+#[cfg(target_os = "linux")]
+fn syscall_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SYSCALL_TRACE").is_some())
+}
+
+fn trace_marker(marker: &[u8]) {
+    #[cfg(target_os = "linux")]
+    if syscall_trace_enabled() {
+        unsafe {
+            libc::syscall(libc::SYS_prctl, 15, marker.as_ptr(), 0, 0, 0);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = marker;
+}
+
+#[cfg(target_os = "linux")]
+fn bench_with_syscall_trace<O>(bencher: Bencher, mut operation: impl FnMut() -> O) {
+    bencher.bench_local(|| {
+        trace_marker(TRACE_BEGIN);
+        let result = operation();
+        trace_marker(TRACE_END);
+        black_box(result);
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bench_with_syscall_trace<O>(bencher: Bencher, operation: impl FnMut() -> O) {
+    bencher.bench_local(operation);
+}
 
 struct BenchDir(PathBuf);
 
@@ -131,12 +168,16 @@ fn synthetic_history_45k() -> Vec<String> {
 }
 
 #[divan::bench]
-fn line_buffer_insert_100_chars() {
-    let mut lb = LineBuffer::new();
-    for c in "echo hello world this is a long command line with many characters and words".chars() {
-        lb.insert_char(c);
-    }
-    black_box(lb.text());
+fn line_buffer_insert_100_chars(bencher: Bencher) {
+    bench_with_syscall_trace(bencher, || {
+        let mut lb = LineBuffer::new();
+        for c in
+            "echo hello world this is a long command line with many characters and words".chars()
+        {
+            lb.insert_char(c);
+        }
+        black_box(lb.text());
+    });
 }
 
 #[divan::bench]
@@ -144,7 +185,7 @@ fn history_fuzzy_search_into_45k(bencher: Bencher) {
     let history = History::from_entries(synthetic_history_45k());
     let mut results = Vec::with_capacity(200);
     history.fuzzy_search_into("gco", &mut results, 200, "");
-    bencher.bench_local(|| {
+    bench_with_syscall_trace(bencher, || {
         history.fuzzy_search_into("gco", &mut results, 200, "");
         black_box(&results);
     });
@@ -162,7 +203,7 @@ fn completion_candidates(bencher: Bencher) {
         .collect();
     let mut comp = complete::Completions::with_capacity(2048, 100);
     complete::complete_candidates(&entries, "file_0", false, &mut comp);
-    bencher.bench_local(|| {
+    bench_with_syscall_trace(bencher, || {
         complete::complete_candidates(&entries, "file_0", false, &mut comp);
         black_box(&comp);
     });
@@ -175,7 +216,7 @@ fn prompt_full_fixture(bencher: Bencher) {
     let mut out = String::with_capacity(128);
     let path = fixture.path().to_str().unwrap().to_owned();
     p.render_into(&mut out, 0, &path, false);
-    bencher.bench_local(|| {
+    bench_with_syscall_trace(bencher, || {
         p.render_into(&mut out, 0, &path, false);
         black_box(&out);
     });
@@ -223,8 +264,10 @@ fn history_add_duplicate_45k(bencher: Bencher) {
     bencher
         .with_inputs(|| History::from_entries(entries.clone()))
         .bench_local_values(|mut history| {
+            trace_marker(TRACE_BEGIN);
             history.add(&duplicate);
             black_box(history);
+            trace_marker(TRACE_END);
         });
 }
 
@@ -234,7 +277,7 @@ fn ls_fixture_dir(bencher: Bencher) {
     let path = fixture.path().to_str().unwrap().to_owned();
     let _stdout = SuppressStdout::new();
     black_box(ls::list_dir(&path));
-    bencher.bench_local(|| black_box(ls::list_dir(&path)));
+    bench_with_syscall_trace(bencher, || black_box(ls::list_dir(&path)));
 }
 
 #[divan::bench]
@@ -263,13 +306,15 @@ fn startup_fixture(bencher: Bencher) {
         black_box(out);
     };
     run();
-    bencher.bench_local(run);
+    bench_with_syscall_trace(bencher, run);
 }
 
 #[divan::bench]
-fn autosuggestion_prefix_search_miss() {
+fn autosuggestion_prefix_search_miss(bencher: Bencher) {
     let history = History::from_entries(synthetic_history_45k());
-    black_box(history.prefix_search("zzzznotfound", 0));
+    bench_with_syscall_trace(bencher, || {
+        black_box(history.prefix_search("zzzznotfound", 0));
+    });
 }
 
 #[divan::bench]
@@ -277,7 +322,7 @@ fn command_coloring_full_check(bencher: Bencher) {
     let mut cache = exec::PathCache::new();
     cache.contains("ls");
     let aliases = AliasMap::new();
-    bencher.bench_local(|| {
+    bench_with_syscall_trace(bencher, || {
         let valid = ish::builtin::is_builtin("git")
             || aliases.get("git").is_some()
             || cache.contains("git");
@@ -293,7 +338,7 @@ fn finder_filter_candidates(bencher: Bencher) {
     let mut filtered = Vec::with_capacity(entries.len());
     let mut selected = 0usize;
     ish::finder::filter_entries_pub("module", &entries, &mut filtered, &mut selected);
-    bencher.bench_local(|| {
+    bench_with_syscall_trace(bencher, || {
         ish::finder::filter_entries_pub("module", &entries, &mut filtered, &mut selected);
         black_box(&filtered);
     });

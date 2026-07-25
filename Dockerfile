@@ -7,6 +7,7 @@ RUN apk add --no-cache \
     binutils \
     file \
     make \
+    strace \
     musl-dev \
     libgcc \
     git \
