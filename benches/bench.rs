@@ -4,7 +4,7 @@
 //! Run: `cargo bench --bench bench`.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
@@ -18,7 +18,9 @@ static ALLOC: AllocProfiler = AllocProfiler::system();
 use ish::alias::AliasMap;
 use ish::complete::{self, CompletionState};
 use ish::history::History;
+use ish::line::LineBuffer;
 use ish::ls;
+use ish::path::PathCache;
 use ish::prompt;
 use ish::render::{self, RenderedRegion};
 use ish::term::TermWriter;
@@ -200,17 +202,20 @@ fn synthetic_history_45k() -> Vec<String> {
         .collect()
 }
 
-#[divan::bench]
-fn completion_path_realistic(bencher: Bencher) {
+fn completion_path_benchmark(bencher: Bencher, file_count: usize, render_grid: bool) {
     let fixture = make_fs_fixture("completion");
-    for index in 0..200 {
+    for index in 0..file_count {
         fs::write(
             fixture.path().join(format!("file_{index:03}.rs")),
             b"fixture\n",
         )
         .unwrap();
     }
-    let partial = format!("{}/file_", fixture.path().display());
+    let partial = if file_count == 1 {
+        format!("{}/file_0", fixture.path().display())
+    } else {
+        format!("{}/file_", fixture.path().display())
+    };
     let mut state = CompletionState {
         comp: complete::Completions::with_capacity(8192, 256),
         selected: 0,
@@ -227,40 +232,54 @@ fn completion_path_realistic(bencher: Bencher) {
         state.comp.clear();
         complete::complete_path_into(&partial, false, &mut state.comp);
         (state.cols, state.rows) = complete::compute_grid(&state.comp.entries, state.term_cols);
-        tw.clear_buffer();
-        render::render_completions(&mut tw, &state, RenderedRegion::default(), true);
+        if render_grid {
+            tw.clear_buffer();
+            render::render_completions(&mut tw, &state, RenderedRegion::default(), true);
+        }
         black_box((&state, &tw));
     });
 }
 
 #[divan::bench]
-fn history_fuzzy_search_into_45k(bencher: Bencher) {
-    let history = History::from_entries(synthetic_history_45k());
-    let mut results = Vec::with_capacity(200);
-    history.fuzzy_search_into("gco", &mut results, 200, "");
-    bench_with_syscall_trace(bencher, || {
-        history.fuzzy_search_into("gco", &mut results, 200, "");
-        black_box(&results);
-    });
+fn completion_path_realistic(bencher: Bencher) {
+    completion_path_benchmark(bencher, 200, true);
 }
 
 #[divan::bench]
-fn history_add_duplicate_45k(bencher: Bencher) {
-    let entries = synthetic_history_45k();
-    let duplicate = entries[entries.len() / 2].clone();
-    bencher
-        .with_inputs(|| History::from_entries(entries.clone()))
-        .bench_local_values(|mut history| {
-            trace_marker(TRACE_BEGIN);
-            history.add(&duplicate);
-            black_box(history);
-            trace_marker(TRACE_END);
-        });
+fn completion_path_single_match(bencher: Bencher) {
+    completion_path_benchmark(bencher, 1, false);
+}
+
+#[divan::bench]
+fn history_fuzzy_search_into_45k(bencher: Bencher) {
+    let history = History::from_entries(synthetic_history_45k());
+    let mut candidates = Vec::with_capacity(history.len());
+    history.visible_entry_indices_into(&mut candidates);
+    let mut scratch = Vec::with_capacity(history.len());
+    let mut results = Vec::with_capacity(200);
+    bench_with_syscall_trace(bencher, || {
+        history.fuzzy_search_subset_into("gco", &candidates, &mut scratch, &mut results, 200);
+        black_box((&scratch, &results));
+    });
 }
 
 #[divan::bench]
 fn ls_fixture_dir(bencher: Bencher) {
     let fixture = make_fs_fixture("ls");
+    for index in 0..32 {
+        fs::write(
+            fixture.path().join(format!("entry_{index:02}.txt")),
+            b"fixture\n",
+        )
+        .unwrap();
+    }
+    for index in 0..4 {
+        fs::create_dir(fixture.path().join(format!("dir_{index}"))).unwrap();
+    }
+    let executable = fixture.path().join("run.sh");
+    fs::write(&executable, b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink("entry_00.txt", fixture.path().join("latest.txt")).unwrap();
     let path = fixture.path().to_str().unwrap().to_owned();
     let _stdout = SuppressStdout::new();
     black_box(ls::list_dir(&path));
@@ -286,11 +305,11 @@ fn startup_fixture(bencher: Bencher, cold: bool) {
         let _history = black_box(History::load_from(history_path.clone()));
 
         let mut aliases = AliasMap::new();
-        ish::config::load(
-            &mut aliases,
-            &mut epsh::eval::Shell::new(),
-            Some(config_path.as_os_str()),
-        );
+        let mut epsh = epsh::eval::Shell::builder()
+            .cwd(fixture.path().to_path_buf())
+            .interactive(true)
+            .build();
+        ish::config::load(&mut aliases, &mut epsh, Some(config_path.as_os_str()));
 
         let mut p = prompt::Prompt::new();
         let mut out = String::with_capacity(128);
@@ -324,15 +343,16 @@ fn startup_warm(bencher: Bencher) {
     startup_fixture(bencher, false);
 }
 
-#[divan::bench]
-fn cd_prompt_with_denv(bencher: Bencher) {
-    let fixture = BenchDir::new("cd-denv");
+fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
+    let fixture = BenchDir::new(if with_denv { "cd-denv" } else { "cd" });
     let first = fixture.path().join("first");
     let second = fixture.path().join("second");
     fs::create_dir_all(&first).unwrap();
     fs::create_dir_all(&second).unwrap();
-    fs::write(first.join(".env"), b"ISH_BENCH_DIR=first\n").unwrap();
-    fs::write(second.join(".env"), b"ISH_BENCH_DIR=second\n").unwrap();
+    if with_denv {
+        fs::write(first.join(".env"), b"ISH_BENCH_DIR=first\n").unwrap();
+        fs::write(second.join(".env"), b"ISH_BENCH_DIR=second\n").unwrap();
+    }
 
     let original_dir = std::env::current_dir().unwrap();
     let original_pwd = std::env::var_os("PWD");
@@ -367,10 +387,158 @@ fn cd_prompt_with_denv(bencher: Bencher) {
 }
 
 #[divan::bench]
+fn cd_prompt_without_denv(bencher: Bencher) {
+    cd_prompt_benchmark(bencher, false);
+}
+
+#[divan::bench]
+fn cd_prompt_with_denv(bencher: Bencher) {
+    cd_prompt_benchmark(bencher, true);
+}
+
+#[divan::bench]
 fn autosuggestion_prefix_search_miss(bencher: Bencher) {
     let history = History::from_entries(synthetic_history_45k());
     bench_with_syscall_trace(bencher, || {
-        black_box(history.prefix_search("zzzznotfound", 0));
+        black_box(history.session_prefix_search("zzzznotfound", 0));
+    });
+}
+
+fn keypress_render_benchmark(bencher: Bencher, initial: &str, inserted: char) {
+    let history = History::from_entries(vec![
+        "git status --short --branch".to_owned(),
+        "git stash list".to_owned(),
+    ]);
+    let mut line = LineBuffer::new();
+    line.set(initial);
+    let mut path_cache = PathCache::new();
+    let mut tw = TermWriter::new();
+    let mut region = RenderedRegion::default();
+
+    bench_with_syscall_trace(bencher, || {
+        line.insert_char(inserted);
+        let text = line.text();
+        let suggestion = if text.len() >= 3 && line.cursor() == text.len() {
+            history
+                .session_prefix_search(text, 0)
+                .and_then(|entry| entry.strip_prefix(text))
+                .unwrap_or("")
+        } else {
+            ""
+        };
+        let opts = render::RenderOpts {
+            cmd_color: Some(path_cache.contains("git")),
+            suggestion,
+        };
+        tw.clear_buffer();
+        region = render::render_line(&mut tw, "$ ", 2, &line, 80, region, &opts);
+        line.delete_back();
+        black_box((&line, &region, &tw));
+    });
+}
+
+#[divan::bench]
+fn normal_keypress_render_short(bencher: Bencher) {
+    keypress_render_benchmark(bencher, "git s", 't');
+}
+
+#[divan::bench]
+fn normal_keypress_render_long(bencher: Bencher) {
+    keypress_render_benchmark(
+        bencher,
+        "git status --short --branch --untracked-files=all src/",
+        'x',
+    );
+}
+
+struct CommandEnterFixture {
+    aliases: AliasMap,
+    history: History,
+    epsh: epsh::eval::Shell,
+    prompt: prompt::Prompt,
+    prompt_buf: String,
+    pwd: String,
+}
+
+impl CommandEnterFixture {
+    fn new(pwd: &Path) -> Self {
+        let mut aliases = AliasMap::new();
+        aliases.set("t".to_owned(), vec!["true".to_owned()]);
+        let epsh = epsh::eval::Shell::builder()
+            .cwd(pwd.to_path_buf())
+            .interactive(true)
+            .build();
+        Self {
+            aliases,
+            history: History::from_entries(Vec::new()),
+            epsh,
+            prompt: prompt::Prompt::new(),
+            prompt_buf: String::with_capacity(128),
+            pwd: pwd.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+#[divan::bench]
+fn command_enter_to_prompt(bencher: Bencher) {
+    let pwd = std::env::current_dir().unwrap();
+    bencher
+        .with_inputs(|| CommandEnterFixture::new(&pwd))
+        .bench_local_values(|mut fixture| {
+            trace_marker(TRACE_BEGIN);
+            let expanded = fixture.aliases.expand_line("t");
+            let status = fixture.epsh.run_script(&expanded);
+            fixture.history.add("t");
+            fixture
+                .prompt
+                .render_into(&mut fixture.prompt_buf, status, &fixture.pwd, false);
+            trace_marker(TRACE_END);
+            black_box(fixture);
+        });
+}
+
+#[divan::bench]
+fn history_search_trace(bencher: Bencher) {
+    let history = History::from_entries(synthetic_history_45k());
+    let mut all_candidates = Vec::with_capacity(history.len());
+    history.visible_entry_indices_into(&mut all_candidates);
+    let mut candidates = Vec::with_capacity(history.len());
+    let mut scratch = Vec::with_capacity(history.len());
+    let mut matches = Vec::with_capacity(200);
+    let mut tw = TermWriter::new();
+    let mut region = RenderedRegion::default();
+    let mut cache = render::HistoryPagerCache::default();
+
+    bench_with_syscall_trace(bencher, || {
+        candidates.clear();
+        candidates.extend_from_slice(&all_candidates);
+        scratch.clear();
+        matches.clear();
+        cache.clear();
+        tw.clear_buffer();
+        history.fuzzy_search_subset_into("", &candidates, &mut scratch, &mut matches, 200);
+        region = render::render_history_pager_cached(
+            &mut tw, "", &matches, &history, 0, 24, 80, 0, region, &mut cache,
+        );
+
+        for query in ["g", "gc", "gco"] {
+            history.fuzzy_search_subset_into(query, &candidates, &mut scratch, &mut matches, 200);
+            std::mem::swap(&mut candidates, &mut scratch);
+            tw.clear_buffer();
+            region = render::render_history_pager_cached(
+                &mut tw,
+                query,
+                &matches,
+                &history,
+                0,
+                24,
+                80,
+                query.len(),
+                region,
+                &mut cache,
+            );
+        }
+        black_box((&candidates, &scratch, &matches, &region, &tw));
     });
 }
 

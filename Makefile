@@ -66,12 +66,12 @@ bench:
 bench-syscalls:
 	@scripts/bench-syscalls.py
 
-# Collect PGO profiles from Divan benchmarks.
+# Collect equally weighted profiles from the user-facing Divan benchmarks.
 # No build-std or -Cpanic=immediate-abort here: the profiler runtime needs unwinding.
 pgo-profile:
 	rm -rf $(PGO_DIR) && mkdir -p $(PGO_DIR)
 	RUSTFLAGS="-Cprofile-generate=$(PGO_DIR)" \
-	cargo bench --bench bench
+	cargo bench --bench bench -- --sample-size 1
 	$(LLVM_BIN)/llvm-profdata merge -o $(PGO_MERGED) $(PGO_DIR)
 
 $(PGO_MERGED):

@@ -15,8 +15,9 @@ from pathlib import Path
 
 
 TIME_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(ns|µs|ms|s)")
-COUNT_RE = re.compile(r"^\s*│\s*([0-9]+(?:\.[0-9]+)?)\s+│")
-BYTES_RE = re.compile(r"^\s*│\s*([0-9]+(?:\.[0-9]+)?)\s+(B|KB|MB|GB)\s+│")
+COUNT_RE = re.compile(r"^\s*(?:│\s*)?([0-9]+(?:\.[0-9]+)?)\s+│")
+BYTES_RE = re.compile(r"^\s*(?:│\s*)?([0-9]+(?:\.[0-9]+)?)\s+(B|KB|MB|GB)\s+│")
+ALLOC_RE = re.compile(r"^\s*(?:│\s*)?alloc:\s+│")
 BENCH_RE = re.compile(r"^[├╰]─\s+(\S+)")
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
@@ -75,7 +76,7 @@ def parse_report(output: str) -> dict[str, tuple[float, float, float]]:
                 median = time_ns(float(pairs[2][0]), pairs[2][1])
             continue
 
-        if line.startswith("│") and "alloc:" in line and "max alloc:" not in line:
+        if ALLOC_RE.match(line):
             allocation_state = 1
             continue
         if allocation_state == 1:
