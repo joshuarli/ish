@@ -9,7 +9,7 @@ LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 
-.PHONY: setup build release release-dynamic verify-release verify-release-dynamic release-pgo pgo-profile bench-pgo install test-ci pc bump-version
+.PHONY: setup build release release-dynamic verify-release verify-release-dynamic bench release-pgo pgo-profile bench-pgo install test-ci pc bump-version
 
 build:
 	cargo build
@@ -55,7 +55,10 @@ lint:
 	cargo fmt --all
 	cargo clippy --fix --allow-dirty --all-targets --all-features -- --deny warnings
 
-# Collect PGO profiles from the built-in benchmark harness.
+bench:
+	scripts/bench-baseline.py
+
+# Collect PGO profiles from Divan benchmarks.
 # No build-std or -Cpanic=immediate-abort here: the profiler runtime needs unwinding.
 pgo-profile:
 	rm -rf $(PGO_DIR) && mkdir -p $(PGO_DIR)
@@ -72,7 +75,7 @@ release-pgo: $(PGO_MERGED)
 	  -Z build-std-features= \
 	  --target $(TARGET)
 
-# Benchmark regular release vs PGO. The built-in harness prints both reports.
+# Benchmark regular release vs PGO. Divan prints both reports.
 bench-pgo: $(PGO_MERGED)
 	@echo '--- regular ---'
 	cargo bench --bench bench

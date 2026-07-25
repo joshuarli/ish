@@ -168,7 +168,8 @@ cargo build --release    # Optimized build (LTO, stripped)
 cargo test               # All tests (unit + integration + pty)
 cargo test --test pty    # PTY visual tests only
 cargo test --test integration  # Library integration tests only
-cargo bench              # Criterion benchmarks for interactive and startup hot paths
+make bench               # Divan benchmarks plus host-keyed baseline deltas
+cargo bench              # Divan benchmarks for interactive and startup hot paths
 cargo +nightly fuzz run fuzz_parse  # Fuzz the parser (requires cargo-fuzz)
 ```
 
@@ -201,7 +202,7 @@ The PTY harness (`PtyShell`) uses `openpty()` + `fork()` to create an isolated t
 - `fuzz_input` — Full parse → expand pipeline never panics on any input
 
 ### Benchmarks (`benches/bench.rs`)
-Criterion benchmarks for user-visible and interactive hot paths: startup, line editing, history search and insertion, completion, prompt and terminal rendering, `ls`, PATH lookup, autosuggestion, command coloring, filesystem completion, and finder searches. The PGO profile uses representative groups from this list.
+Divan benchmarks for user-visible and interactive hot paths: startup, line editing, history search and insertion, completion, prompt and terminal rendering, `ls`, PATH lookup, autosuggestion, command coloring, filesystem completion, and finder searches. Divan's allocation profiler reports allocation counts and bytes alongside timings. `make bench` persists median nanoseconds and allocation bytes in a host-keyed file under `benches/` and reports deltas against the previous run. The PGO profile uses representative benchmarks from this list.
 
 ## Design Principles
 

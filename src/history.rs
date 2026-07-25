@@ -771,7 +771,15 @@ impl History {
         limit: usize,
         _pwd_basename: &str,
     ) {
-        self.fill_search_results_limited(query, results, limit);
+        if query.is_ascii() && query.len() <= 32 {
+            let mut query_lower = ['\0'; 32];
+            for (slot, byte) in query_lower.iter_mut().zip(query.bytes()) {
+                *slot = byte.to_ascii_lowercase() as char;
+            }
+            self.fill_search_results_limited_chars(&query_lower[..query.len()], results, limit);
+        } else {
+            self.fill_search_results_limited(query, results, limit);
+        }
     }
 
     /// Fill `out` with session-visible entry indices in recency order.
@@ -917,12 +925,22 @@ impl History {
         results: &mut Vec<FuzzyMatch>,
         limit: usize,
     ) {
+        let query_lower = lowercase_query(query);
+        self.fill_search_results_limited_chars(&query_lower, results, limit);
+    }
+
+    fn fill_search_results_limited_chars(
+        &self,
+        query_lower: &[char],
+        results: &mut Vec<FuzzyMatch>,
+        limit: usize,
+    ) {
         results.clear();
         if limit == 0 {
             return;
         }
 
-        if query.is_empty() {
+        if query_lower.is_empty() {
             results.extend(
                 (0..self.offsets.len())
                     .rev()
@@ -938,7 +956,6 @@ impl History {
             return;
         }
 
-        let query_lower = lowercase_query(query);
         for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
             if !self.is_session_visible(idx) {
                 continue;
