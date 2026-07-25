@@ -123,7 +123,7 @@ def write_baseline(path: Path, host: str, values: dict[str, tuple[float, float, 
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w") as file:
-            file.write("# ish benchmark baseline\n")
+            file.write("# benchmark baseline\n")
             file.write(f"# host: {host}\n")
             file.write("# columns: benchmark median_ns alloc_count alloc_bytes\n")
             for name in sorted(values):
@@ -293,7 +293,7 @@ def main() -> int:
 
     current = parse_report(completed.stdout)
     if not current:
-        print("ish: could not parse Divan benchmark output", file=sys.stderr)
+        print("benchmark: could not parse Divan benchmark output", file=sys.stderr)
         print(completed.stdout, end="", file=sys.stderr)
         return 1
 

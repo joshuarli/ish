@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 
-IMAGE = "ish-bench-syscalls:local"
+IMAGE = "benchmark-syscalls:local"
 WORKDIR = "/workspace"
 SAMPLE_COUNT = 10
 SAMPLE_SIZE = 100

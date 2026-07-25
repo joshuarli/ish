@@ -128,7 +128,7 @@ def print_table(rows: list[tuple[str, str, str, str]]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Compare two ish benchmark baselines")
+    parser = argparse.ArgumentParser(description="Compare two benchmark baselines")
     parser.add_argument("baseline", type=Path)
     parser.add_argument("candidate", type=Path)
     args = parser.parse_args()
