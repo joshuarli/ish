@@ -11,7 +11,7 @@ LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 
-.PHONY: build test test-ci release release-dynamic verify-release verify-release-dynamic bench bench-syscalls release-pgo pgo-profile bench-pgo install setup
+.PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-profile bench-pgo install setup
 
 build:
 	cargo build
@@ -27,15 +27,6 @@ test-ci:
 release:
 	cargo clean -p $(NAME) --release --target $(TARGET)
 	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
-	cargo build --release \
-	  -Z build-std=std \
-	  -Z build-std-features= \
-	  --target $(TARGET)
-
-release-dynamic:
-	cargo clean -p $(NAME) --release --target $(TARGET)
-	CARGO_TARGET_$(TARGET_ENV)_LINKER=clang \
-	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)" \
 	cargo build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
@@ -90,6 +81,23 @@ $(PGO_MERGED):
 release-pgo: $(PGO_MERGED)
 	cargo clean -p $(NAME) --release --target $(TARGET)
 	RUSTFLAGS="-Cprofile-use=$(PGO_MERGED) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
+	cargo build --release \
+	  -Z build-std=std \
+	  -Z build-std-features= \
+	  --target $(TARGET)
+
+release-pgo-linux: $(PGO_MERGED)
+	cargo clean -p $(NAME) --release --target $(TARGET)
+	CARGO_TARGET_$(TARGET_ENV)_LINKER=clang \
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Cprofile-use=$(PGO_MERGED) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)" \
+	cargo build --release \
+	  -Z build-std=std \
+	  -Z build-std-features= \
+	  --target $(TARGET)
+
+release-pgo-linux-static: $(PGO_MERGED)
+	cargo clean -p $(NAME) --release --target $(TARGET)
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Cprofile-use=$(PGO_MERGED) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
 	cargo build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
