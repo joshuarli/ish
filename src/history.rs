@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap, FxHashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
@@ -82,7 +82,7 @@ pub struct History {
     /// Session ids parallel to `offsets`. Zero means unknown/legacy.
     session_ids: Vec<u64>,
     /// Maps command hash to its current in-memory position.
-    index_by_hash: HashMap<u64, usize>,
+    index_by_hash: FxHashMap<u64, usize>,
     path: PathBuf,
     /// Byte offset into the text file we've read up to. Enables incremental
     /// sync — only new bytes appended by other shells are read.
@@ -159,7 +159,7 @@ impl History {
         let (arena, offsets, timestamps, session_ids, index_by_hash) = match fs::read(path) {
             Ok(data) => {
                 let line_count = memchr_count(b'\n', &data);
-                let mut seen = HashSet::with_capacity(line_count);
+                let mut seen = FxHashSet::with_capacity_and_hasher(line_count, Default::default());
                 let mut deduped: Vec<(String, u64, u64)> = Vec::with_capacity(line_count);
                 let fallback_ts = now_millis();
 
@@ -192,7 +192,8 @@ impl History {
                     session_ids.push(*session_id);
                 }
 
-                let mut index_by_hash = HashMap::with_capacity(deduped.len());
+                let mut index_by_hash =
+                    FxHashMap::with_capacity_and_hasher(deduped.len(), Default::default());
                 for (idx, (line, _, _)) in deduped.iter().enumerate() {
                     index_by_hash.insert(hash_str(line), idx);
                 }
@@ -204,7 +205,7 @@ impl History {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
-                HashMap::new(),
+                FxHashMap::default(),
             ),
         };
         let count = offsets.len();
@@ -338,7 +339,8 @@ impl History {
 
         let mut arena = String::with_capacity(arena_size);
         let mut offsets = Vec::with_capacity(entry_count);
-        let mut index_by_hash = HashMap::with_capacity(entry_count);
+        let mut index_by_hash =
+            FxHashMap::with_capacity_and_hasher(entry_count, Default::default());
         let mut count = 0;
         for entry in arena_str.split('\0') {
             if entry.is_empty() {
@@ -390,7 +392,8 @@ impl History {
         let mut pos = V2_HEADER_SIZE;
 
         // Skip hashes (no longer stored in-memory)
-        let mut index_by_hash = HashMap::with_capacity(entry_count);
+        let mut index_by_hash =
+            FxHashMap::with_capacity_and_hasher(entry_count, Default::default());
         pos += entry_count * 8;
 
         // Read timestamps (v2+) or default to 0 (v1)
@@ -632,7 +635,8 @@ impl History {
         let mut offsets = Vec::with_capacity(entries.len());
         let mut timestamps = Vec::with_capacity(entries.len());
         let mut session_ids = Vec::with_capacity(entries.len());
-        let mut index_by_hash = HashMap::with_capacity(entries.len());
+        let mut index_by_hash =
+            FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
         for e in &entries {
             let start = arena.len() as u32;
             let h = hash_str(e);
@@ -961,7 +965,7 @@ impl History {
                 continue;
             }
             let entry = &self.arena[start as usize..start as usize + len as usize];
-            let Some(m) = classify_match(&query_lower, entry, idx) else {
+            let Some(m) = classify_match(query_lower, entry, idx) else {
                 continue;
             };
 

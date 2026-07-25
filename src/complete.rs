@@ -496,6 +496,24 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
         if name_bytes.iter().any(|&b| b < b' ' || b == 0x7f) {
             continue;
         }
+
+        let prefix_bytes = prefix.as_bytes();
+        if name_bytes.first() == Some(&b'.') && !prefix_bytes.starts_with(b".") {
+            continue;
+        }
+        let is_prefix = name_bytes.starts_with(prefix_bytes);
+        if !is_prefix && (prefix_bytes.is_empty() || !contains_icase(name_bytes, prefix_bytes)) {
+            continue;
+        }
+
+        // Most filesystems provide d_type. Use it to avoid metadata work for
+        // entries that cannot satisfy a directory-only completion.
+        let d_type = unsafe { (*ent).d_type as u8 };
+        if dirs_only && d_type != libc::DT_DIR && d_type != libc::DT_LNK
+            && d_type != libc::DT_UNKNOWN {
+                continue;
+            }
+
         // Build full path for stat: "dir/name\0"
         let total = dir_prefix_len + name_bytes.len();
         if total >= path_buf.len() {
@@ -511,11 +529,15 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
             continue;
         }
         let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
-        // lstat to detect symlinks
-        let mut lst: libc::stat = unsafe { std::mem::zeroed() };
-        let is_link = unsafe { libc::lstat(path_buf.as_ptr() as *const libc::c_char, &mut lst) }
-            == 0
-            && lst.st_mode & libc::S_IFMT == libc::S_IFLNK;
+        let is_link = if d_type == libc::DT_LNK {
+            true
+        } else if d_type == libc::DT_UNKNOWN {
+            let mut lst: libc::stat = unsafe { std::mem::zeroed() };
+            (unsafe { libc::lstat(path_buf.as_ptr() as *const libc::c_char, &mut lst) }) == 0
+                && lst.st_mode & libc::S_IFMT == libc::S_IFLNK
+        } else {
+            false
+        };
 
         let is_exec = !is_dir && st.st_mode & 0o111 != 0;
 

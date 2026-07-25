@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use fxhash::FxHashSet;
 use std::path::PathBuf;
 
 fn fnv1a(s: &[u8]) -> u64 {
@@ -13,7 +13,7 @@ fn fnv1a(s: &[u8]) -> u64 {
 /// O(1) command existence cache built from $PATH directories.
 /// Stores FNV-1a hashes of executable names in a `HashSet<u64>`.
 pub struct PathCache {
-    commands: HashSet<u64>,
+    commands: FxHashSet<u64>,
     path_hash: u64,
 }
 
@@ -26,7 +26,7 @@ impl Default for PathCache {
 impl PathCache {
     pub fn new() -> Self {
         Self {
-            commands: HashSet::new(),
+            commands: FxHashSet::default(),
             path_hash: 0,
         }
     }

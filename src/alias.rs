@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use fxhash::FxHashMap;
 
 /// Maps alias names to their expansion as raw shell words.
 pub struct AliasMap {
-    map: HashMap<String, Vec<String>>,
+    map: FxHashMap<String, Vec<String>>,
 }
 
 impl Default for AliasMap {
@@ -14,7 +14,7 @@ impl Default for AliasMap {
 impl AliasMap {
     pub fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: FxHashMap::default(),
         }
     }
 

@@ -3,7 +3,6 @@
 //! Tracks wall time and allocations for user-visible and interactive hot paths.
 //! Run: `cargo bench --bench bench`.
 
-use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -17,9 +16,12 @@ use divan::{AllocProfiler, Bencher, black_box};
 static ALLOC: AllocProfiler = AllocProfiler::system();
 
 use ish::alias::AliasMap;
+use ish::complete::{self, CompletionState};
 use ish::history::History;
 use ish::ls;
 use ish::prompt;
+use ish::render::{self, RenderedRegion};
+use ish::term::TermWriter;
 
 const TRACE_BEGIN: &[u8] = b"BENCH_BEGIN\0";
 const TRACE_END: &[u8] = b"BENCH_END\0";
@@ -109,6 +111,34 @@ impl Drop for SuppressStdout {
     }
 }
 
+struct SuppressStderr {
+    saved: libc::c_int,
+}
+
+impl SuppressStderr {
+    fn new() -> Self {
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(saved >= 0);
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+        assert!(null >= 0);
+        unsafe {
+            libc::dup2(null, libc::STDERR_FILENO);
+            libc::close(null);
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for SuppressStderr {
+    fn drop(&mut self) {
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+            libc::dup2(self.saved, libc::STDERR_FILENO);
+            libc::close(self.saved);
+        }
+    }
+}
+
 fn make_fs_fixture(label: &str) -> BenchDir {
     let fixture = BenchDir::new(label);
     let src = fixture.path().join("src");
@@ -139,6 +169,14 @@ fn make_fs_fixture(label: &str) -> BenchDir {
     fixture
 }
 
+fn make_git_fixture(label: &str) -> BenchDir {
+    let fixture = make_fs_fixture(label);
+    let git = fixture.path().join(".git");
+    fs::create_dir_all(&git).unwrap();
+    fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fixture
+}
+
 fn synthetic_history_45k() -> Vec<String> {
     let templates = [
         "git commit -m 'fix issue #{}' --no-verify",
@@ -160,6 +198,39 @@ fn synthetic_history_45k() -> Vec<String> {
     (0..45_000)
         .map(|i| templates[i % templates.len()].replace("{}", &i.to_string()))
         .collect()
+}
+
+#[divan::bench]
+fn completion_path_realistic(bencher: Bencher) {
+    let fixture = make_fs_fixture("completion");
+    for index in 0..200 {
+        fs::write(
+            fixture.path().join(format!("file_{index:03}.rs")),
+            b"fixture\n",
+        )
+        .unwrap();
+    }
+    let partial = format!("{}/file_", fixture.path().display());
+    let mut state = CompletionState {
+        comp: complete::Completions::with_capacity(8192, 256),
+        selected: 0,
+        cols: 0,
+        rows: 0,
+        scroll: 0,
+        term_cols: 80,
+        dir_prefix: fixture.path().to_string_lossy().into_owned(),
+        in_quote: false,
+    };
+    let mut tw = TermWriter::new();
+
+    bench_with_syscall_trace(bencher, || {
+        state.comp.clear();
+        complete::complete_path_into(&partial, false, &mut state.comp);
+        (state.cols, state.rows) = complete::compute_grid(&state.comp.entries, state.term_cols);
+        tw.clear_buffer();
+        render::render_completions(&mut tw, &state, RenderedRegion::default(), true);
+        black_box((&state, &tw));
+    });
 }
 
 #[divan::bench]
@@ -196,15 +267,20 @@ fn ls_fixture_dir(bencher: Bencher) {
     bench_with_syscall_trace(bencher, || black_box(ls::list_dir(&path)));
 }
 
-#[divan::bench]
-fn startup_fixture(bencher: Bencher) {
-    let fixture = BenchDir::new("startup");
+fn startup_fixture(bencher: Bencher, cold: bool) {
+    let fixture = make_git_fixture(if cold { "startup-cold" } else { "startup-warm" });
     let history_path = fixture.path().join("history");
-    let entries = (0..2_000)
+    let config_path = fixture.path().join("config.ish");
+    let history_contents = (0..2_000)
         .map(|i| format!("git status --short {i}"))
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(&history_path, entries).unwrap();
+    fs::write(&history_path, &history_contents).unwrap();
+    fs::write(
+        &config_path,
+        "set EDITOR \"vim\"\nalias gs \"git status\"\nalias ll \"l -la\"\n",
+    )
+    .unwrap();
 
     let run = || {
         let _history = black_box(History::load_from(history_path.clone()));
@@ -213,7 +289,7 @@ fn startup_fixture(bencher: Bencher) {
         ish::config::load(
             &mut aliases,
             &mut epsh::eval::Shell::new(),
-            Some(OsStr::new("/dev/null")),
+            Some(config_path.as_os_str()),
         );
 
         let mut p = prompt::Prompt::new();
@@ -221,8 +297,73 @@ fn startup_fixture(bencher: Bencher) {
         p.render_into(&mut out, 0, fixture.path().to_str().unwrap(), false);
         black_box(out);
     };
-    run();
-    bench_with_syscall_trace(bencher, run);
+    if !cold {
+        run();
+        bench_with_syscall_trace(bencher, run);
+    } else {
+        bencher
+            .with_inputs(|| {
+                fs::write(&history_path, &history_contents).unwrap();
+                let _ = fs::remove_file(fixture.path().join("history.bin"));
+            })
+            .bench_local_values(|_| {
+                trace_marker(TRACE_BEGIN);
+                run();
+                trace_marker(TRACE_END);
+            });
+    }
+}
+
+#[divan::bench]
+fn startup_cold(bencher: Bencher) {
+    startup_fixture(bencher, true);
+}
+
+#[divan::bench]
+fn startup_warm(bencher: Bencher) {
+    startup_fixture(bencher, false);
+}
+
+#[divan::bench]
+fn cd_prompt_with_denv(bencher: Bencher) {
+    let fixture = BenchDir::new("cd-denv");
+    let first = fixture.path().join("first");
+    let second = fixture.path().join("second");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+    fs::write(first.join(".env"), b"ISH_BENCH_DIR=first\n").unwrap();
+    fs::write(second.join(".env"), b"ISH_BENCH_DIR=second\n").unwrap();
+
+    let original_dir = std::env::current_dir().unwrap();
+    let original_pwd = std::env::var_os("PWD");
+    let _stderr = SuppressStderr::new();
+    ish::denv::init();
+    std::env::set_current_dir(&first).unwrap();
+    ish::shell_setenv_os("PWD", first.as_os_str());
+    let _ = ish::denv::on_cd();
+    std::env::set_current_dir(&second).unwrap();
+    ish::shell_setenv_os("PWD", second.as_os_str());
+    let _ = ish::denv::on_cd();
+
+    let mut prompt = prompt::Prompt::new();
+    let mut out = String::with_capacity(128);
+    let mut use_first = false;
+    bench_with_syscall_trace(bencher, || {
+        let dir = if use_first { &first } else { &second };
+        use_first = !use_first;
+        std::env::set_current_dir(dir).unwrap();
+        ish::shell_setenv_os("PWD", dir.as_os_str());
+        let changes = ish::denv::on_cd();
+        prompt.invalidate_git();
+        prompt.render_into(&mut out, 0, dir.to_str().unwrap(), !changes.is_empty());
+        black_box((&changes, &out));
+    });
+
+    std::env::set_current_dir(original_dir).unwrap();
+    match original_pwd {
+        Some(pwd) => ish::shell_setenv_os("PWD", pwd),
+        None => ish::shell_unsetenv("PWD"),
+    }
 }
 
 #[divan::bench]
