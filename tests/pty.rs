@@ -2712,3 +2712,216 @@ fn job_suspend_and_resume() {
         "shell unresponsive after job resume: {out:?}"
     );
 }
+
+/// Paste a 2 KiB payload via bracketed paste and verify the shell
+/// instantly rejects it with "[paste exceeded 1KB limit]".
+#[test]
+fn bracketed_paste_over_limit_rejected() {
+    let content: String = "x".repeat(2048);
+    assert!(content.len() > 1024);
+
+    let sh = PtyShell::spawn();
+
+    // Build the bracketed paste payload: \x1b[200~ CONTENT \x1b[201~
+    let mut payload = Vec::with_capacity(6 + content.len() + 6);
+    payload.extend_from_slice(b"\x1b[200~");
+    payload.extend_from_slice(content.as_bytes());
+    payload.extend_from_slice(b"\x1b[201~");
+
+    // Write directly to the PTY master — avoid File::from_raw_fd which
+    // conflicts with the OwnedFd ownership on nightly Rust 2024.
+    // The master fd is non-blocking, so handle EAGAIN with retry.
+    let fd = sh.master_fd();
+    let mut written = 0usize;
+    while written < payload.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                payload[written..].as_ptr() as *const libc::c_void,
+                (payload.len() - written).min(4096),
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            panic!("write to PTY failed: {err}");
+        }
+        written += n as usize;
+    }
+    // Give the shell time to process the entire paste.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let out = sh.wait_for_prompt(5000);
+    let clean = PtyShell::strip_ansi(&out);
+
+    assert!(
+        clean.contains("[paste exceeded 1KB limit]"),
+        "expected paste-rejection message, got: {clean:?}"
+    );
+    // No 'x's from the paste content should appear on screen.
+    assert!(
+        !clean.contains("xxxxx"),
+        "paste content appeared on screen — limit bypassed: {clean:?}"
+    );
+    // Shell must still be responsive after rejection.
+    let out2 = sh.run_command("echo ok");
+    let clean2 = PtyShell::strip_ansi(&out2);
+    assert!(
+        clean2.contains("ok"),
+        "shell unresponsive after paste: {clean2:?}"
+    );
+}
+
+/// Paste the real AGENTS.md (14.8 KB) via bracketed paste and verify it's
+/// instantly rejected without displaying the content.
+#[test]
+fn bracketed_paste_agents_md_rejected() {
+    let content = include_str!("../AGENTS.md");
+    assert!(
+        content.len() > 2048,
+        "AGENTS.md must be > 2 KiB for this test"
+    );
+
+    let sh = PtyShell::spawn();
+
+    let mut payload = Vec::with_capacity(6 + content.len() + 6);
+    payload.extend_from_slice(b"\x1b[200~");
+    payload.extend_from_slice(content.as_bytes());
+    payload.extend_from_slice(b"\x1b[201~");
+
+    let fd = sh.master_fd();
+    let mut written = 0usize;
+    while written < payload.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                payload[written..].as_ptr() as *const libc::c_void,
+                (payload.len() - written).min(4096),
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            panic!("write to PTY failed: {err}");
+        }
+        written += n as usize;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let out = sh.wait_for_prompt(5000);
+    let clean = PtyShell::strip_ansi(&out);
+
+    assert!(
+        clean.contains("[paste exceeded 1KB limit]"),
+        "expected paste-rejection message, got: {clean:?}"
+    );
+    // The first line of AGENTS.md must NOT appear on screen.
+    let first_line = content.lines().next().unwrap_or("");
+    assert!(
+        !clean.contains(first_line),
+        "paste content appeared on screen — limit bypassed: {clean:?}"
+    );
+
+    let out2 = sh.run_command("echo ok");
+    let clean2 = PtyShell::strip_ansi(&out2);
+    assert!(
+        clean2.contains("ok"),
+        "shell unresponsive after paste: {clean2:?}"
+    );
+}
+
+/// Paste a small payload under the 1 KiB limit and verify the shell accepts
+/// it — the text should appear in the line buffer ready for editing.
+#[test]
+fn bracketed_paste_under_limit_accepted() {
+    let sh = PtyShell::spawn();
+    let content = "echo hello world";
+    assert!(content.len() <= 1024);
+
+    let mut payload = Vec::with_capacity(6 + content.len() + 6);
+    payload.extend_from_slice(b"\x1b[200~");
+    payload.extend_from_slice(content.as_bytes());
+    payload.extend_from_slice(b"\x1b[201~");
+
+    let fd = sh.master_fd();
+    let mut written = 0usize;
+    while written < payload.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                payload[written..].as_ptr() as *const libc::c_void,
+                (payload.len() - written).min(4096),
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            panic!("write to PTY failed: {err}");
+        }
+        written += n as usize;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // The paste should be sitting in the line buffer — press Enter to run it.
+    let out = sh.run_command(""); // just Enter
+    let clean = PtyShell::strip_ansi(&out);
+    assert!(
+        clean.contains("hello world"),
+        "paste was not accepted into line buffer: {clean:?}"
+    );
+}
+
+/// Paste exactly 1024 bytes — right at the limit — which should still be
+/// accepted (limit is > 1024, not >=).
+#[test]
+fn bracketed_paste_exactly_at_limit_accepted() {
+    let sh = PtyShell::spawn();
+    let content: String = "x".repeat(1024);
+    assert_eq!(content.len(), 1024);
+
+    let mut payload = Vec::with_capacity(6 + content.len() + 6);
+    payload.extend_from_slice(b"\x1b[200~");
+    payload.extend_from_slice(content.as_bytes());
+    payload.extend_from_slice(b"\x1b[201~");
+
+    let fd = sh.master_fd();
+    let mut written = 0usize;
+    while written < payload.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                payload[written..].as_ptr() as *const libc::c_void,
+                (payload.len() - written).min(4096),
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            panic!("write to PTY failed: {err}");
+        }
+        written += n as usize;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // The 1024 'x's should be in the line buffer (not rejected).  Verify
+    // by appending " ok" via normal typing and running with echo.
+    sh.type_str(" ok");
+    let out = sh.run_command("");
+    let clean = PtyShell::strip_ansi(&out);
+    assert!(
+        !clean.contains("[paste exceeded 1KB limit]"),
+        "1024-byte paste was wrongly rejected: {clean:?}"
+    );
+}

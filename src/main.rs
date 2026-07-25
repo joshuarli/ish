@@ -532,166 +532,191 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                 let _ = tw.flush_to_stdout();
                 continue;
             }
+            InputEvent::Paste(text) => {
+                // Insert the entire paste content in one shot — no per-char
+                // rendering.
+                line.insert_str(&text);
+                region = render_active_mode(
+                    &mut tw,
+                    &mode,
+                    shell,
+                    &line,
+                    &prompt_str,
+                    prompt_display_len,
+                    region,
+                    &mut history_cache,
+                );
+                let _ = tw.flush_to_stdout();
+                continue;
+            }
+            InputEvent::PasteRejected => {
+                line.set("[paste exceeded 1KB limit]");
+                region = render_active_mode(
+                    &mut tw,
+                    &mode,
+                    shell,
+                    &line,
+                    &prompt_str,
+                    prompt_display_len,
+                    region,
+                    &mut history_cache,
+                );
+                let _ = tw.flush_to_stdout();
+                continue;
+            }
             InputEvent::Key(key) => {
                 match &mut mode {
                     Mode::Normal => {
-                        // Bracketed paste: insert newlines into the buffer
-                        // rather than executing or splitting into continuations.
-                        if key.key == Key::Enter && reader.in_paste() {
-                            line.insert_char('\n');
-                        } else {
-                            match handle_normal_key(
-                                key,
-                                &mut line,
-                                &mut history_idx,
-                                &mut saved_line,
-                                shell,
-                            ) {
-                                KeyAction::Continue => {}
-                                KeyAction::Execute(text) => {
-                                    // Clear autosuggestion ghost text before freezing the line
-                                    if line.cursor() == line.text().len() {
-                                        tw.write_str("\x1b[J");
-                                    }
-                                    tw.write_str("\r\n");
-                                    let _ = tw.flush_to_stdout();
-                                    shell.prompt_buf = prompt_str;
-                                    let joined = join_continuation_lines(&text);
-                                    return if joined.is_empty() {
-                                        ReadResult::Empty
-                                    } else {
-                                        ReadResult::Line(joined)
-                                    };
+                        match handle_normal_key(
+                            key,
+                            &mut line,
+                            &mut history_idx,
+                            &mut saved_line,
+                            shell,
+                        ) {
+                            KeyAction::Continue => {}
+                            KeyAction::Execute(text) => {
+                                // Clear autosuggestion ghost text before freezing the line
+                                if line.cursor() == line.text().len() {
+                                    tw.write_str("\x1b[J");
                                 }
-                                KeyAction::Continuation => {
-                                    line.insert_char('\n');
-                                    history_idx = None;
-                                }
-                                KeyAction::Cancel => {
-                                    tw.write_str("^C\r\n");
-                                    let _ = tw.flush_to_stdout();
-                                    shell.prompt_buf = prompt_str;
-                                    return ReadResult::Empty;
-                                }
-                                KeyAction::Exit => {
-                                    tw.write_str("\r\n");
-                                    let _ = tw.flush_to_stdout();
-                                    shell.prompt_buf = prompt_str;
-                                    return handle_exit(shell);
-                                }
-                                KeyAction::ClearScreen => {
-                                    tw.clear_screen();
-                                    region = render::RenderedRegion::default();
-                                }
-                                KeyAction::StartHistorySearch => {
-                                    shell.history.sync();
-                                    saved_line = line.text().to_string();
-                                    let mut candidates = Vec::new();
-                                    shell.history.visible_entry_indices_into(&mut candidates);
-                                    let mut scratch = Vec::new();
-                                    let mut matches = std::mem::take(&mut shell.match_buf);
-                                    shell.history.fuzzy_search_subset_into(
-                                        "",
-                                        &candidates,
-                                        &mut scratch,
-                                        &mut matches,
-                                        200,
-                                    );
-                                    std::mem::swap(&mut candidates, &mut scratch);
+                                tw.write_str("\r\n");
+                                let _ = tw.flush_to_stdout();
+                                shell.prompt_buf = prompt_str;
+                                let joined = join_continuation_lines(&text);
+                                return if joined.is_empty() {
+                                    ReadResult::Empty
+                                } else {
+                                    ReadResult::Line(joined)
+                                };
+                            }
+                            KeyAction::Continuation => {
+                                line.insert_char('\n');
+                                history_idx = None;
+                            }
+                            KeyAction::Cancel => {
+                                tw.write_str("^C\r\n");
+                                let _ = tw.flush_to_stdout();
+                                shell.prompt_buf = prompt_str;
+                                return ReadResult::Empty;
+                            }
+                            KeyAction::Exit => {
+                                tw.write_str("\r\n");
+                                let _ = tw.flush_to_stdout();
+                                shell.prompt_buf = prompt_str;
+                                return handle_exit(shell);
+                            }
+                            KeyAction::ClearScreen => {
+                                tw.clear_screen();
+                                region = render::RenderedRegion::default();
+                            }
+                            KeyAction::StartHistorySearch => {
+                                shell.history.sync();
+                                saved_line = line.text().to_string();
+                                let mut candidates = Vec::new();
+                                shell.history.visible_entry_indices_into(&mut candidates);
+                                let mut scratch = Vec::new();
+                                let mut matches = std::mem::take(&mut shell.match_buf);
+                                shell.history.fuzzy_search_subset_into(
+                                    "",
+                                    &candidates,
+                                    &mut scratch,
+                                    &mut matches,
+                                    200,
+                                );
+                                std::mem::swap(&mut candidates, &mut scratch);
+                                region.clear(&mut tw);
+                                mode = Mode::HistorySearch {
+                                    query: LineBuffer::new(),
+                                    matches,
+                                    candidates,
+                                    scratch,
+                                    candidate_stack: Vec::new(),
+                                    selected: 0,
+                                    saved_line: saved_line.clone(),
+                                };
+                                history_cache.clear();
+                                region = render_history_mode(
+                                    &mut tw,
+                                    &mode,
+                                    shell,
+                                    render::RenderedRegion::default(),
+                                    &mut history_cache,
+                                );
+                                let _ = tw.flush_to_stdout();
+                                continue;
+                            }
+                            KeyAction::StartFilePicker => {
+                                saved_line = line.text().to_string();
+                                let handle = finder::find_async(".", false);
+                                region.clear(&mut tw);
+                                mode = Mode::FilePicker {
+                                    query: LineBuffer::new(),
+                                    all_entries: Vec::new(),
+                                    filtered: Vec::new(),
+                                    selected: 0,
+                                    saved_line: saved_line.clone(),
+                                    saved_cursor: line.cursor(),
+                                    hidden: false,
+                                    handle,
+                                };
+                                region = render_file_picker_mode(
+                                    &mut tw,
+                                    &mode,
+                                    shell,
+                                    render::RenderedRegion::default(),
+                                );
+                                let _ = tw.flush_to_stdout();
+                                continue;
+                            }
+                            KeyAction::StartDirPicker => {
+                                // Show dir stack in reverse (most recent first),
+                                // excluding the current directory
+                                let pwd = std::env::current_dir()
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let entries: Vec<String> = shell
+                                    .dir_stack
+                                    .iter()
+                                    .rev()
+                                    .filter(|d| *d != &pwd)
+                                    .cloned()
+                                    .collect();
+                                if entries.is_empty() {
+                                    // No history yet — stay in normal mode
+                                } else {
                                     region.clear(&mut tw);
-                                    mode = Mode::HistorySearch {
-                                        query: LineBuffer::new(),
-                                        matches,
-                                        candidates,
-                                        scratch,
-                                        candidate_stack: Vec::new(),
+                                    mode = Mode::DirPicker {
+                                        entries,
                                         selected: 0,
-                                        saved_line: saved_line.clone(),
                                     };
-                                    history_cache.clear();
-                                    region = render_history_mode(
-                                        &mut tw,
-                                        &mode,
-                                        shell,
-                                        render::RenderedRegion::default(),
-                                        &mut history_cache,
-                                    );
+                                    region = render_dir_picker_mode(&mut tw, &mode, shell, region);
                                     let _ = tw.flush_to_stdout();
                                     continue;
                                 }
-                                KeyAction::StartFilePicker => {
-                                    saved_line = line.text().to_string();
-                                    let handle = finder::find_async(".", false);
-                                    region.clear(&mut tw);
-                                    mode = Mode::FilePicker {
-                                        query: LineBuffer::new(),
-                                        all_entries: Vec::new(),
-                                        filtered: Vec::new(),
-                                        selected: 0,
-                                        saved_line: saved_line.clone(),
-                                        saved_cursor: line.cursor(),
-                                        hidden: false,
-                                        handle,
+                            }
+                            KeyAction::StartCompletion => {
+                                let comp = std::mem::take(&mut shell.comp_buf);
+                                let base_line = line.clone();
+                                let mut cs = start_completion(
+                                    &base_line,
+                                    shell.cols,
+                                    &shell.home,
+                                    &shell.aliases,
+                                    comp,
+                                );
+                                if cs.comp.len() == 1 {
+                                    preview_completion(&mut line, &cs, &base_line);
+                                    shell.comp_buf = cs.comp;
+                                } else if !cs.comp.is_empty() {
+                                    cs.selected = usize::MAX;
+                                    preview_completion(&mut line, &cs, &base_line);
+                                    mode = Mode::Completion {
+                                        state: cs,
+                                        base_line,
                                     };
-                                    region = render_file_picker_mode(
-                                        &mut tw,
-                                        &mode,
-                                        shell,
-                                        render::RenderedRegion::default(),
-                                    );
-                                    let _ = tw.flush_to_stdout();
-                                    continue;
-                                }
-                                KeyAction::StartDirPicker => {
-                                    // Show dir stack in reverse (most recent first),
-                                    // excluding the current directory
-                                    let pwd = std::env::current_dir()
-                                        .map(|p| p.to_string_lossy().into_owned())
-                                        .unwrap_or_default();
-                                    let entries: Vec<String> = shell
-                                        .dir_stack
-                                        .iter()
-                                        .rev()
-                                        .filter(|d| *d != &pwd)
-                                        .cloned()
-                                        .collect();
-                                    if entries.is_empty() {
-                                        // No history yet — stay in normal mode
-                                    } else {
-                                        region.clear(&mut tw);
-                                        mode = Mode::DirPicker {
-                                            entries,
-                                            selected: 0,
-                                        };
-                                        region =
-                                            render_dir_picker_mode(&mut tw, &mode, shell, region);
-                                        let _ = tw.flush_to_stdout();
-                                        continue;
-                                    }
-                                }
-                                KeyAction::StartCompletion => {
-                                    let comp = std::mem::take(&mut shell.comp_buf);
-                                    let base_line = line.clone();
-                                    let mut cs = start_completion(
-                                        &base_line,
-                                        shell.cols,
-                                        &shell.home,
-                                        &shell.aliases,
-                                        comp,
-                                    );
-                                    if cs.comp.len() == 1 {
-                                        preview_completion(&mut line, &cs, &base_line);
-                                        shell.comp_buf = cs.comp;
-                                    } else if !cs.comp.is_empty() {
-                                        cs.selected = usize::MAX;
-                                        preview_completion(&mut line, &cs, &base_line);
-                                        mode = Mode::Completion {
-                                            state: cs,
-                                            base_line,
-                                        };
-                                    } else {
-                                        shell.comp_buf = cs.comp;
-                                    }
+                                } else {
+                                    shell.comp_buf = cs.comp;
                                 }
                             }
                         }
