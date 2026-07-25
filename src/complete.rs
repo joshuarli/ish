@@ -370,6 +370,71 @@ pub fn complete_path_into(partial: &str, dirs_only: bool, comp: &mut Completions
     complete_in_dir(dir, prefix, dirs_only, comp);
 }
 
+/// Complete a caller-provided candidate set without filesystem access.
+/// Used by benchmarks and tests to exercise filtering and sorting deterministically.
+pub fn complete_candidates(
+    entries: &[(&str, bool, bool, bool)],
+    prefix: &str,
+    dirs_only: bool,
+    comp: &mut Completions,
+) {
+    comp.clear();
+    let before = comp.entries.len();
+    let mut prefix_count = 0usize;
+
+    for &(name, is_dir, is_link, is_exec) in entries {
+        if add_candidate(comp, name, is_dir, is_link, is_exec, 0, prefix, dirs_only) {
+            prefix_count += 1;
+        }
+    }
+
+    finish_candidates(comp, before, prefix, prefix_count);
+}
+
+fn add_candidate(
+    comp: &mut Completions,
+    name: &str,
+    is_dir: bool,
+    is_link: bool,
+    is_exec: bool,
+    mtime: i64,
+    prefix: &str,
+    dirs_only: bool,
+) -> bool {
+    let name_bytes = name.as_bytes();
+    let prefix_bytes = prefix.as_bytes();
+    if name_bytes.first() == Some(&b'.') && !prefix_bytes.starts_with(b".") {
+        return false;
+    }
+    let is_prefix = name_bytes.starts_with(prefix_bytes);
+    if !is_prefix && (prefix_bytes.is_empty() || !contains_icase(name_bytes, prefix_bytes)) {
+        return false;
+    }
+    if dirs_only && !is_dir {
+        return false;
+    }
+    comp.push_with_mtime(name, is_dir, is_link, is_exec, mtime);
+    is_prefix
+}
+
+fn finish_candidates(comp: &mut Completions, before: usize, prefix: &str, prefix_count: usize) {
+    let prefix_bytes = prefix.as_bytes();
+    let added = comp.entries.len() - before;
+    if prefix_count > 0 && prefix_count < added {
+        let mut i = before;
+        while i < comp.entries.len() {
+            let e = &comp.entries[i];
+            let name = &comp.names.as_bytes()[e.name_start as usize..][..e.name_len as usize];
+            if name.starts_with(prefix_bytes) {
+                i += 1;
+            } else {
+                comp.entries.remove(i);
+            }
+        }
+    }
+    comp.sort_by_mtime();
+}
+
 /// Complete entries in `dir` matching `prefix`.
 /// Single readdir pass: collects prefix and substring matches together,
 /// preferring prefix matches when any exist. Substring fallback is
@@ -394,7 +459,6 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
         return;
     }
 
-    let prefix_bytes = prefix.as_bytes();
     let before = comp.entries.len();
     let mut prefix_count = 0usize;
 
@@ -432,16 +496,6 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
         if name_bytes.iter().any(|&b| b < b' ' || b == 0x7f) {
             continue;
         }
-        // Skip hidden files unless prefix starts with .
-        if name_bytes.first() == Some(&b'.') && !prefix_bytes.starts_with(b".") {
-            continue;
-        }
-        // Classify: prefix match vs substring match
-        let is_prefix = name_bytes.starts_with(prefix_bytes);
-        if !is_prefix && (prefix_bytes.is_empty() || !contains_icase(name_bytes, prefix_bytes)) {
-            continue;
-        }
-
         // Build full path for stat: "dir/name\0"
         let total = dir_prefix_len + name_bytes.len();
         if total >= path_buf.len() {
@@ -457,10 +511,6 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
             continue;
         }
         let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
-        if dirs_only && !is_dir {
-            continue;
-        }
-
         // lstat to detect symlinks
         let mut lst: libc::stat = unsafe { std::mem::zeroed() };
         let is_link = unsafe { libc::lstat(path_buf.as_ptr() as *const libc::c_char, &mut lst) }
@@ -474,8 +524,16 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
             Err(_) => continue,
         };
 
-        comp.push_with_mtime(name, is_dir, is_link, is_exec, st.st_mtime);
-        if is_prefix {
+        if add_candidate(
+            comp,
+            name,
+            is_dir,
+            is_link,
+            is_exec,
+            st.st_mtime,
+            prefix,
+            dirs_only,
+        ) {
             prefix_count += 1;
         }
     }
@@ -483,22 +541,7 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
     // SAFETY: dp is a valid DIR* from opendir.
     unsafe { libc::closedir(dp) };
 
-    // If we have prefix matches, discard substring-only matches
-    let added = comp.entries.len() - before;
-    if prefix_count > 0 && prefix_count < added {
-        let mut i = before;
-        while i < comp.entries.len() {
-            let e = &comp.entries[i];
-            let name = &comp.names.as_bytes()[e.name_start as usize..][..e.name_len as usize];
-            if name.starts_with(prefix_bytes) {
-                i += 1;
-            } else {
-                comp.entries.remove(i);
-            }
-        }
-    }
-
-    comp.sort_by_mtime();
+    finish_candidates(comp, before, prefix, prefix_count);
 }
 
 /// Fish-style partial path completion: each intermediate directory component
@@ -959,6 +1002,20 @@ mod tests {
         assert!(cols >= 1);
         assert!(rows >= 1);
         assert!(cols * rows >= 7);
+    }
+
+    #[test]
+    fn candidate_completion_prefers_prefix_matches() {
+        let entries = [
+            ("alpha.txt", false, false, false),
+            ("src/alpha.txt", false, false, false),
+            ("alpine.txt", false, false, false),
+        ];
+        let mut comp = Completions::new();
+        complete_candidates(&entries, "alp", false, &mut comp);
+        assert_eq!(comp.len(), 2);
+        assert_eq!(comp.name(0), "alpha.txt");
+        assert_eq!(comp.name(1), "alpine.txt");
     }
 
     #[test]

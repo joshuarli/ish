@@ -234,7 +234,10 @@ pub fn scan_path(cmd: &str) -> Option<PathBuf> {
         }
         std::ffi::CStr::from_ptr(ptr).to_bytes()
     };
+    scan_path_bytes(cmd, path_bytes)
+}
 
+fn scan_path_bytes(cmd: &str, path_bytes: &[u8]) -> Option<PathBuf> {
     // Stack buffer for "dir/cmd\0" — avoids all PathBuf/String allocations
     let mut buf = [0u8; 4096];
     let cmd_bytes = cmd.as_bytes();
