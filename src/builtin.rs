@@ -37,7 +37,7 @@ pub fn all_builtin_names() -> impl Iterator<Item = &'static str> {
 pub fn builtin_w(
     args: &[String],
     aliases: &crate::alias::AliasMap,
-    functions: &std::collections::HashMap<String, epsh::ast::Command>,
+    function_exists: impl Fn(&str) -> bool,
 ) -> i32 {
     if args.is_empty() {
         eprintln!("ish: w: expected command name");
@@ -56,7 +56,7 @@ pub fn builtin_w(
         return 0;
     }
 
-    if functions.contains_key(name.as_str()) {
+    if function_exists(name) {
         println!("function");
         return 0;
     }

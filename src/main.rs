@@ -331,7 +331,9 @@ fn main() {
                                 line.split_whitespace().skip(1).map(String::from).collect()
                             });
                         shell.last_status =
-                            builtin::builtin_w(&args, &shell.aliases, shell.epsh.functions());
+                            builtin::builtin_w(&args, &shell.aliases, |name| {
+                                shell.epsh.functions().contains_key(name)
+                            });
                         true
                     }
                     "l" => {
