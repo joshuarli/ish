@@ -1,95 +1,123 @@
-# Search and Ranking — Design Notes
+# Search and ranking
 
-This document covers the ranking and scoring strategies for history search
-and tab completion.
+Design notes for the three interactive search surfaces: Ctrl+R history search,
+Tab completion, and Ctrl+F file finding. This document records behavior that
+is easy to accidentally change while optimizing or refactoring the hot path.
 
-## History Search
+## History search
 
-### Matching
+The implementation lives in `src/history.rs`:
 
-`history.rs` now uses a **tiered literal-first search** for Ctrl+R:
+- `History::fuzzy_search_into()` is the normal Ctrl+R entry point. It reuses a
+  caller-owned `Vec<FuzzyMatch>` and keeps at most the requested limit.
+- `History::fuzzy_search_subset_into()` narrows an existing candidate set;
+  `src/main.rs::handle_history_search_key()` uses it while the query grows or
+  shrinks.
+- `FuzzyMatch` stores the entry index, up to 32 match positions, match count,
+  and the tier score used for ordering.
+- `classify_match()` selects the first applicable match tier. The ASCII path is
+  `classify_match_ascii()`; the alignment helpers are
+  `subsequence_match_ascii_bytes()` and `subsequence_match_unicode()`.
+- `compare_fuzzy_match()` sorts stronger tiers first, then newer history
+  entries. `score_match()` and the `pwd_basename` parameter remain for API and
+  test compatibility, but current-directory weighting is not active.
 
-1. **Prefix match**: entry starts with the query
-2. **Boundary substring**: entry contains the query after `/`, `-`, `_`, `.`, or whitespace
-3. **Substring match**: entry contains the query anywhere
-4. **Subsequence fallback**: only if there is no literal substring match in that entry
+Matching is intentionally literal-first:
 
-The first three tiers are easy to reason about and align better with shell
-history use: if you type a literal command fragment, the most recent literal
-match should surface first. Subsequence matching remains as a fallback for
-short abbreviations like `gc`.
+1. Case-insensitive prefix match, score `3`.
+2. Case-insensitive substring beginning at a word boundary, score `2`.
+3. Case-insensitive substring anywhere, score `1`.
+4. Case-insensitive subsequence fallback, score `0`.
 
-When the search falls back to subsequence matching, it still uses the
-forward/backward alignment pass to highlight the tightest window.
+Within a tier, newer entries win. Subsequence matches record positions so the
+history pager can highlight them. Empty queries return visible history in
+recency order. Ctrl+R normally asks for 200 results; the limit is supplied by
+the caller rather than hard-coded into the matching primitive.
 
-### Scoring
+The UI and rendering call sites are:
 
-Each `FuzzyMatch` carries a simple tier score:
+- `Mode::HistorySearch` in `src/main.rs` owns the query, candidates, matches,
+  and selection.
+- `handle_history_search_key()` handles editing, incremental filtering, and
+  selection.
+- `render_history_mode()` calls
+  `render::render_history_pager_cached()` in `src/render.rs`.
 
-- `3` prefix
-- `2` boundary substring
-- `1` substring
-- `0` subsequence fallback
+When changing ranking, update the focused history tests in `src/history.rs` and
+the integration/PTY coverage in `tests/integration.rs` and `tests/pty.rs`.
+Keep ranking predictable and recency-friendly; do not add a general fuzzy
+matching dependency without an explicit design decision.
 
-Within a tier, newer entries win. There is no current-directory bonus and no
-weighted reranking pass.
+## Tab completion
 
-### Sort Order
+The data model and filesystem search are in `src/complete.rs`:
 
-Results are ranked by tier first, then by recency. The full result set is
-ranked before truncation, so an older but stronger literal match is not
-dropped just because 200 newer weak matches appeared first.
+- `Completions` is an arena: all names are stored in `names`, while
+  `CompEntry` stores offsets, lengths, flags, and modification time.
+- `complete_path_into()` completes a filesystem path into a caller-owned arena.
+- `complete_candidates()` provides deterministic, filesystem-free filtering
+  for tests and benchmarks.
+- `CompletionState` owns grid selection, scrolling, directory prefix, and
+  quoting state.
+- `compute_grid()` calculates the column-major layout without heap allocation.
+- `sort_by_mtime()` orders candidates by newest `st_mtime`, with
+  case-insensitive name order as the tiebreaker. Non-path candidates use mtime
+  zero.
 
-### Comparison to fzf
+Matching is two-stage. Prefix matches are preferred; case-insensitive
+substring matches are retained only when there are no prefix matches. Hidden
+entries are excluded unless the typed prefix begins with `.`. `dirs_only`
+filters out non-directories. Duplicate names are removed by
+`Completions::dedup_sorted()` after sorting.
 
-This is intentionally less ambitious than fzf-style scoring. The design goal
-is predictability, not maximum fuzzy cleverness.
+Completion orchestration is in `src/main.rs`:
 
-## Tab Completion
+- `start_completion()` decides whether to complete commands, builtins,
+  hostnames, remote paths, or filesystem paths.
+- `handle_completion_key()` handles navigation, refiltering, acceptance, and
+  cancellation.
+- `preview_completion()` updates the line while navigating without committing
+  the selection.
+- `render::render_completions()` draws the grid.
 
-### Matching
+Keep the warm path allocation-conscious. `complete_path_into()` exists so the
+shell can reuse `Shell::comp_buf`; use it instead of constructing a fresh
+`Completions` value in per-keystroke code. If completion ordering changes,
+update `complete_candidates()` tests in `src/complete.rs` and the completion
+tests in `tests/integration.rs`/`tests/pty.rs`.
 
-`complete.rs` uses a two-tier strategy:
+## File finder
 
-1. **Prefix match** (high priority): entry name starts with the typed prefix
-2. **Substring match** (fallback): entry name contains the prefix (like fish)
+Ctrl+F is a separate filesystem search, not path completion. Its implementation
+is in `src/finder.rs`:
 
-If any prefix matches exist, substring-only matches are discarded.
+- `find()` is the synchronous/testable search primitive.
+- `find_async()` returns a `FinderHandle`; `drain_into()` collects results and
+  `stop()` cancels the worker.
+- `load_gitignores()`, `parse_gitignore()`, and `is_ignored()` implement the
+  default gitignore-aware filtering.
+- `walk_hidden()` is used for the hidden-results mode.
+- `filter_entries_pub()` exposes deterministic filtering behavior to tests.
 
-### Sorting: mtime
+Results are represented as `(depth, path)` pairs internally and are presented
+shallowest-first. Normal mode hides dotfiles and applies gitignore rules;
+hidden mode disables those filters. Keep traversal bounded and cancellable,
+and test both modes when changing ignore or traversal behavior.
 
-Path completions are sorted by modification time (most recent first) with
-case-insensitive alphabetical as tiebreaker. The `st_mtime` is captured
-from the `stat()` call already made per candidate for type detection, so
-there is near-zero additional cost.
+## Design constraints
 
-This naturally surfaces recently-built artifacts (`./target/debug/ish` after
-`cargo build`) and recently-edited files above stale ones.
+- Prefer the standard library or existing dependencies. Do not add a fuzzy
+  matching or completion crate for these features.
+- Keep matching deterministic, case-insensitive where documented, and stable
+  under recency/mtime ties.
+- Preserve bounded interactive work: history callers cap displayed results,
+  completion scans one directory at a time, and finder searches can be
+  cancelled.
+- Keep allocation-sensitive code explicit. Reuse the buffers and arenas passed
+  into the `*_into()` APIs.
+- Preserve comments that explain ranking choices, allocation behavior, or
+  platform-specific filesystem decisions.
 
-Non-path completions (builtins, commands, hostnames) have `mtime: 0` and
-fall back to alphabetical ordering.
-
-### Future: Frecency
-
-Track which completions are actually accepted (command name + argument) and
-weight by frequency x recency. This requires persistent storage (a small
-file, similar to history) and is a larger change. The mtime approach gives
-80% of the benefit for 10% of the complexity.
-
-### Future: History-Informed Completion
-
-When completing a path prefix, check recent history for commands containing
-paths that match the prefix. If the user recently ran
-`./target/debug/ish --help`, then typing `./ta` should surface that path
-even before reading the filesystem. This bridges completion and history into
-a unified relevance model.
-
-## Design Constraints
-
-All search and ranking code respects ish's core invariants:
-
-- **Single dependency (libc).** No external fuzzy matching libraries.
-- **Bounded work.** History search ranks the full match set, then caps the
-  displayed results at 200. Completion caps at readdir output.
-- **Predictable.** Users can reason about why a result ranks where it does:
-  literal matches first, then recency.
+Future ideas such as frecency or history-informed completion require persistent
+state and a clearer product decision; they are not part of the current ranking
+contract.
