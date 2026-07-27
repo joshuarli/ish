@@ -49,7 +49,7 @@ Single kill ring shared across Ctrl+K/U/W. Full UTF-8 support.
 
 Fuzzy search opens a pager with matching characters highlighted in yellow. Up/Down to navigate, Enter to accept, Escape to cancel.
 
-**Scored ranking**: results are ranked by match quality, not just recency. Contiguous matches (searching "target" finds literal `target/release/` first), word-boundary alignment (`deb` prefers `debug/` over scattered d-e-b), and PWD context (entries mentioning the current project rank higher). Optimal alignment via forward+backward scan finds the tightest match window — "test" in "the best test" finds the contiguous "test" at the end, not scattered letters.
+**Scored ranking**: results are ranked by match quality, not just recency. Entries recorded in the current directory or one of its ancestors get a priority boost. Contiguous matches (searching "target" finds literal `target/release/` first), word-boundary alignment (`deb` prefers `debug/` over scattered d-e-b), and optimal alignment via forward+backward scan find the tightest match window — "test" in "the best test" finds the contiguous "test" at the end, not scattered letters.
 
 Stored at `~/.local/share/ish/history`. Deduplicated on add.
 

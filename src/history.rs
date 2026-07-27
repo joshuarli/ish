@@ -8,12 +8,15 @@ const CACHE_MAGIC_V1: &[u8; 4] = b"ISH\x01";
 const CACHE_MAGIC_V2: &[u8; 4] = b"ISH\x02";
 const CACHE_MAGIC_V3: &[u8; 4] = b"ISH\x03";
 const CACHE_MAGIC_V4: &[u8; 4] = b"ISH\x04";
+const CACHE_MAGIC_V5: &[u8; 4] = b"ISH\x05";
 const LOG_RECORD_PREFIX: &str = ":ish-history:v1\t";
+const LOG_RECORD_PREFIX_V2: &str = ":ish-history:v2\t";
 
 /// v1/v2 header: magic(4) + reserved(8) + entry_count(4) + arena_size(4)
 const V2_HEADER_SIZE: usize = 20;
 /// v3 header: magic(4) + entry_count(4) + arena_size(4)
 const V3_HEADER_SIZE: usize = 12;
+const V5_HEADER_SIZE: usize = 16;
 
 /// 1998-01-01T00:00:00 UTC as Unix epoch milliseconds.
 const TS_EPOCH_MILLIS: u64 = 883_612_800_000;
@@ -39,11 +42,28 @@ struct ParsedHistoryLine<'a> {
     command: &'a str,
     timestamp: u64,
     session_id: u64,
+    cwd: Option<PathBuf>,
 }
 
 fn parse_history_line<'a>(line: &'a str, fallback_ts: u64) -> Option<ParsedHistoryLine<'a>> {
     if line.is_empty() {
         return None;
+    }
+
+    if let Some(rest) = line.strip_prefix(LOG_RECORD_PREFIX_V2) {
+        let mut parts = rest.splitn(4, '\t');
+        if let (Some(ts), Some(session_id), Some(cwd), Some(command)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+            && !command.is_empty()
+            && let (Ok(timestamp), Ok(session_id)) = (ts.parse::<u64>(), session_id.parse::<u64>())
+        {
+            return Some(ParsedHistoryLine {
+                command,
+                timestamp,
+                session_id,
+                cwd: unescape_history_field(cwd).map(PathBuf::from),
+            });
+        }
     }
 
     if let Some(rest) = line.strip_prefix(LOG_RECORD_PREFIX) {
@@ -57,6 +77,7 @@ fn parse_history_line<'a>(line: &'a str, fallback_ts: u64) -> Option<ParsedHisto
                 command,
                 timestamp,
                 session_id,
+                cwd: None,
             });
         }
     }
@@ -65,11 +86,57 @@ fn parse_history_line<'a>(line: &'a str, fallback_ts: u64) -> Option<ParsedHisto
         command: line,
         timestamp: fallback_ts,
         session_id: 0,
+        cwd: None,
     })
 }
 
 fn format_history_record(timestamp: u64, session_id: u64, command: &str) -> String {
     format!("{LOG_RECORD_PREFIX}{timestamp}\t{session_id}\t{command}")
+}
+
+fn format_history_record_with_cwd(
+    timestamp: u64,
+    session_id: u64,
+    cwd: &Path,
+    command: &str,
+) -> String {
+    format!(
+        "{LOG_RECORD_PREFIX_V2}{timestamp}\t{session_id}\t{}\t{command}",
+        escape_history_field(&cwd.to_string_lossy())
+    )
+}
+
+fn escape_history_field(field: &str) -> String {
+    let mut escaped = String::with_capacity(field.len());
+    for c in field.chars() {
+        match c {
+            '\\' => escaped.push_str("\\\\"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+fn unescape_history_field(field: &str) -> Option<String> {
+    let mut unescaped = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            unescaped.push(c);
+            continue;
+        }
+        match chars.next()? {
+            '\\' => unescaped.push('\\'),
+            't' => unescaped.push('\t'),
+            'n' => unescaped.push('\n'),
+            'r' => unescaped.push('\r'),
+            _ => return None,
+        }
+    }
+    Some(unescaped)
 }
 
 pub struct History {
@@ -81,6 +148,8 @@ pub struct History {
     timestamps: Vec<u64>,
     /// Session ids parallel to `offsets`. Zero means unknown/legacy.
     session_ids: Vec<u64>,
+    /// Working directory for each entry. None means unknown/legacy.
+    cwds: Vec<Option<PathBuf>>,
     /// Maps command hash to its current in-memory position.
     index_by_hash: FxHashMap<u64, usize>,
     path: PathBuf,
@@ -156,11 +225,12 @@ impl History {
     }
 
     fn load_from_text(path: &Path) -> Self {
-        let (arena, offsets, timestamps, session_ids, index_by_hash) = match fs::read(path) {
+        let (arena, offsets, timestamps, session_ids, cwds, index_by_hash) = match fs::read(path) {
             Ok(data) => {
                 let line_count = memchr_count(b'\n', &data);
                 let mut seen = FxHashSet::with_capacity_and_hasher(line_count, Default::default());
-                let mut deduped: Vec<(String, u64, u64)> = Vec::with_capacity(line_count);
+                let mut deduped: Vec<(String, u64, u64, Option<PathBuf>)> =
+                    Vec::with_capacity(line_count);
                 let fallback_ts = now_millis();
 
                 for chunk in data.rsplit(|&b| b == b'\n') {
@@ -173,35 +243,39 @@ impl History {
                                 parsed.command.to_string(),
                                 parsed.timestamp,
                                 parsed.session_id,
+                                parsed.cwd,
                             ));
                         }
                     }
                 }
                 deduped.reverse();
 
-                let total: usize = deduped.iter().map(|(s, _, _)| s.len()).sum();
+                let total: usize = deduped.iter().map(|(s, _, _, _)| s.len()).sum();
                 let mut arena = String::with_capacity(total);
                 let mut offsets = Vec::with_capacity(deduped.len());
                 let mut timestamps = Vec::with_capacity(deduped.len());
                 let mut session_ids = Vec::with_capacity(deduped.len());
-                for (line, timestamp, session_id) in &deduped {
+                let mut cwds = Vec::with_capacity(deduped.len());
+                for (line, timestamp, session_id, cwd) in &deduped {
                     let start = arena.len() as u32;
                     arena.push_str(line);
                     offsets.push((start, line.len() as u16));
                     timestamps.push(*timestamp);
                     session_ids.push(*session_id);
+                    cwds.push(cwd.clone());
                 }
 
                 let mut index_by_hash =
                     FxHashMap::with_capacity_and_hasher(deduped.len(), Default::default());
-                for (idx, (line, _, _)) in deduped.iter().enumerate() {
+                for (idx, (line, _, _, _)) in deduped.iter().enumerate() {
                     index_by_hash.insert(hash_str(line), idx);
                 }
 
-                (arena, offsets, timestamps, session_ids, index_by_hash)
+                (arena, offsets, timestamps, session_ids, cwds, index_by_hash)
             }
             Err(_) => (
                 String::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -215,6 +289,7 @@ impl History {
             offsets,
             timestamps,
             session_ids,
+            cwds,
             index_by_hash,
             path: path.to_path_buf(),
             file_pos: 0,
@@ -255,12 +330,55 @@ impl History {
         }
 
         match &data[0..4] {
+            x if x == CACHE_MAGIC_V5 => Self::parse_v5(data, path),
             x if x == CACHE_MAGIC_V4 => Self::parse_v4(data, path),
             x if x == CACHE_MAGIC_V3 => Self::parse_v3(data, path),
             x if x == CACHE_MAGIC_V2 => Self::parse_v1v2(data, path, 2),
             x if x == CACHE_MAGIC_V1 => Self::parse_v1v2(data, path, 1),
             _ => None,
         }
+    }
+
+    /// Parse v5 format: [magic(4)][entry_count(4)][arena_size(4)][cwd_arena_size(4)]
+    /// [timestamps: N×8][arena: \0-delimited][cwd arena: \0-delimited]
+    fn parse_v5(data: &[u8], path: &Path) -> Option<Self> {
+        if data.len() < V5_HEADER_SIZE {
+            return None;
+        }
+
+        let entry_count = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
+        let arena_size = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
+        let cwd_arena_size = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
+        let expected = V5_HEADER_SIZE
+            .checked_add(entry_count.checked_mul(8)?)?
+            .checked_add(arena_size)?
+            .checked_add(cwd_arena_size)?;
+        if data.len() != expected {
+            return None;
+        }
+
+        let ts_start = V5_HEADER_SIZE;
+        let mut timestamps = Vec::with_capacity(entry_count);
+        for i in 0..entry_count {
+            let off = ts_start + i * 8;
+            let stored = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
+            timestamps.push(stored.wrapping_add(TS_EPOCH_MILLIS));
+        }
+
+        let arena_start = ts_start + entry_count * 8;
+        let cwd_start = arena_start + arena_size;
+        let cwd_arena = std::str::from_utf8(&data[cwd_start..cwd_start + cwd_arena_size]).ok()?;
+        let mut cwd_parts = cwd_arena.split('\0');
+        let mut cwds = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            let cwd = cwd_parts.next()?;
+            cwds.push((!cwd.is_empty()).then(|| PathBuf::from(cwd)));
+        }
+        if cwd_parts.next() != Some("") || cwd_parts.next().is_some() {
+            return None;
+        }
+
+        Self::parse_delimited_arena(path, data, arena_start, arena_size, timestamps, cwds)
     }
 
     /// Parse v4 format: [magic(4)][entry_count(4)][arena_size(4)][timestamps: N×8][arena: \0-delimited]
@@ -291,6 +409,7 @@ impl History {
             ts_start + entry_count * 8,
             arena_size,
             timestamps,
+            vec![None; entry_count],
         )
     }
 
@@ -323,6 +442,7 @@ impl History {
             ts_start + entry_count * 4,
             arena_size,
             timestamps,
+            vec![None; entry_count],
         )
     }
 
@@ -332,8 +452,12 @@ impl History {
         arena_start: usize,
         arena_size: usize,
         timestamps: Vec<u64>,
+        cwds: Vec<Option<PathBuf>>,
     ) -> Option<Self> {
         let entry_count = timestamps.len();
+        if cwds.len() != entry_count {
+            return None;
+        }
         let arena_bytes = &data[arena_start..arena_start + arena_size];
         let arena_str = std::str::from_utf8(arena_bytes).ok()?;
 
@@ -362,6 +486,7 @@ impl History {
             offsets,
             timestamps,
             session_ids: vec![0; count],
+            cwds,
             index_by_hash,
             path: path.to_path_buf(),
             file_pos: 0,
@@ -441,6 +566,7 @@ impl History {
             offsets,
             timestamps,
             session_ids: vec![0; count],
+            cwds: vec![None; count],
             index_by_hash,
             path: path.to_path_buf(),
             file_pos: 0,
@@ -506,6 +632,7 @@ impl History {
             self.offsets.push((start, parsed.command.len() as u16));
             self.timestamps.push(parsed.timestamp);
             self.session_ids.push(parsed.session_id);
+            self.cwds.push(parsed.cwd);
             self.local.push(false);
             self.index_by_hash.insert(h, self.offsets.len() - 1);
         }
@@ -513,8 +640,9 @@ impl History {
         self.file_pos = file_size;
     }
 
-    /// Write v4 binary cache, then truncate text file.
-    /// v4 format: [magic(4)][entry_count(4)][arena_size(4)][timestamps: N×8][arena: \0-delimited]
+    /// Write v5 binary cache, then truncate text file.
+    /// v5 format: [magic(4)][entry_count(4)][arena_size(4)][cwd_arena_size(4)]
+    /// [timestamps: N×8][arena: \0-delimited][cwd arena: \0-delimited]
     /// Atomic: writes cache to .tmp then renames.
     pub fn save_cache(&self) {
         if self.cache_dirty {
@@ -535,13 +663,23 @@ impl History {
         }
         let arena_size = arena_buf.len();
 
-        let total = V3_HEADER_SIZE + entry_count * 8 + arena_size;
+        let mut cwd_arena_buf = Vec::new();
+        for cwd in &self.cwds {
+            if let Some(cwd) = cwd {
+                cwd_arena_buf.extend_from_slice(cwd.to_string_lossy().as_bytes());
+            }
+            cwd_arena_buf.push(0);
+        }
+        let cwd_arena_size = cwd_arena_buf.len();
+
+        let total = V5_HEADER_SIZE + entry_count * 8 + arena_size + cwd_arena_size;
         let mut buf = Vec::with_capacity(total);
 
         // Header
-        buf.extend_from_slice(CACHE_MAGIC_V4);
+        buf.extend_from_slice(CACHE_MAGIC_V5);
         buf.extend_from_slice(&(entry_count as u32).to_le_bytes());
         buf.extend_from_slice(&(arena_size as u32).to_le_bytes());
+        buf.extend_from_slice(&(cwd_arena_size as u32).to_le_bytes());
 
         // Timestamps (offset from 1998 epoch)
         for &ts in &self.timestamps {
@@ -550,12 +688,16 @@ impl History {
 
         // Null-delimited arena
         buf.extend_from_slice(&arena_buf);
+        buf.extend_from_slice(&cwd_arena_buf);
 
         // Guard: refuse to overwrite a larger cache with a much smaller one.
         if let Ok(existing) = fs::read(&cache)
             && existing.len() >= 4
         {
             let old_count = match &existing[0..4] {
+                x if x == CACHE_MAGIC_V5 && existing.len() >= V5_HEADER_SIZE => {
+                    u32::from_le_bytes(existing[4..8].try_into().unwrap_or_default()) as usize
+                }
                 x if x == CACHE_MAGIC_V4 && existing.len() >= V3_HEADER_SIZE => {
                     u32::from_le_bytes(existing[4..8].try_into().unwrap_or_default()) as usize
                 }
@@ -635,6 +777,7 @@ impl History {
         let mut offsets = Vec::with_capacity(entries.len());
         let mut timestamps = Vec::with_capacity(entries.len());
         let mut session_ids = Vec::with_capacity(entries.len());
+        let mut cwds = Vec::with_capacity(entries.len());
         let mut index_by_hash =
             FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
         for e in &entries {
@@ -644,6 +787,7 @@ impl History {
             offsets.push((start, e.len() as u16));
             timestamps.push(ts);
             session_ids.push(0);
+            cwds.push(None);
             index_by_hash.insert(h, offsets.len() - 1);
         }
         let count = offsets.len();
@@ -652,6 +796,7 @@ impl History {
             offsets,
             timestamps,
             session_ids,
+            cwds,
             index_by_hash,
             path: PathBuf::from("/dev/null"),
             file_pos: 0,
@@ -664,6 +809,12 @@ impl History {
 
     /// Add entry. Deduplicates (removes prior occurrence).
     pub fn add(&mut self, line: &str) {
+        let cwd = std::env::current_dir().ok();
+        self.add_in_dir(line, cwd.as_deref());
+    }
+
+    /// Add an entry with the directory in which it was entered.
+    pub fn add_in_dir(&mut self, line: &str, cwd: Option<&Path>) {
         // Collapse newlines to spaces to prevent history file corruption.
         let line = line.trim().replace('\n', " ");
         let line = line.trim();
@@ -682,11 +833,12 @@ impl History {
         self.offsets.push((start, len as u16));
         self.timestamps.push(now_millis());
         self.session_ids.push(self.session_id);
+        self.cwds.push(cwd.map(Path::to_path_buf));
         self.local.push(true);
         self.index_by_hash.insert(h, self.offsets.len() - 1);
 
         // Append to file
-        self.append_to_file(line);
+        self.append_to_file(line, cwd);
     }
 
     pub fn len(&self) -> usize {
@@ -757,32 +909,64 @@ impl History {
     }
 
     /// Like `fuzzy_search` but keeps the old signature used by callers/tests.
-    /// `pwd_basename` is ignored; current-directory bias made Ctrl+R less
-    /// predictable than recency-first history search.
-    pub fn fuzzy_search_scored(&self, query: &str, _pwd_basename: &str) -> Vec<FuzzyMatch> {
+    pub fn fuzzy_search_scored(&self, query: &str, cwd: &str) -> Vec<FuzzyMatch> {
         let mut results = Vec::new();
-        self.fill_search_results(query, &mut results);
+        let cwd = (!cwd.is_empty()).then(|| Path::new(cwd));
+        self.fill_search_results(query, &mut results, cwd);
+        results
+    }
+
+    /// Search with a priority boost for entries recorded in an ancestor directory.
+    pub fn fuzzy_search_in_dir(&self, query: &str, cwd: &Path) -> Vec<FuzzyMatch> {
+        let mut results = Vec::new();
+        self.fill_search_results(query, &mut results, Some(cwd));
         results
     }
 
     /// Like `fuzzy_search` but appends into a caller-owned Vec (zero-alloc reuse).
     /// Caps at `limit` results since the pager only shows a screenful.
-    /// `pwd_basename` is ignored; see `fuzzy_search_scored`.
     pub fn fuzzy_search_into(
         &self,
         query: &str,
         results: &mut Vec<FuzzyMatch>,
         limit: usize,
-        _pwd_basename: &str,
+        cwd: &str,
+    ) {
+        let cwd = (!cwd.is_empty()).then(|| Path::new(cwd));
+        self.fuzzy_search_into_with_cwd(query, results, limit, cwd);
+    }
+
+    /// Search with cwd weighting into a caller-owned result buffer.
+    pub fn fuzzy_search_into_in_dir(
+        &self,
+        query: &str,
+        results: &mut Vec<FuzzyMatch>,
+        limit: usize,
+        cwd: &Path,
+    ) {
+        self.fuzzy_search_into_with_cwd(query, results, limit, Some(cwd));
+    }
+
+    fn fuzzy_search_into_with_cwd(
+        &self,
+        query: &str,
+        results: &mut Vec<FuzzyMatch>,
+        limit: usize,
+        cwd: Option<&Path>,
     ) {
         if query.is_ascii() && query.len() <= 32 {
             let mut query_lower = [0u8; 32];
             for (slot, byte) in query_lower.iter_mut().zip(query.bytes()) {
                 *slot = byte.to_ascii_lowercase();
             }
-            self.fill_search_results_limited_bytes(&query_lower[..query.len()], results, limit);
+            self.fill_search_results_limited_bytes(
+                &query_lower[..query.len()],
+                results,
+                limit,
+                cwd,
+            );
         } else {
-            self.fill_search_results_limited(query, results, limit);
+            self.fill_search_results_limited(query, results, limit, cwd);
         }
     }
 
@@ -806,6 +990,46 @@ impl History {
         results: &mut Vec<FuzzyMatch>,
         limit: usize,
     ) {
+        self.fuzzy_search_subset_into_with_cwd(
+            query,
+            candidates,
+            matched_indices,
+            results,
+            limit,
+            None,
+        );
+    }
+
+    /// Search a candidate set with a priority boost for entries recorded in an
+    /// ancestor of `cwd`.
+    pub fn fuzzy_search_subset_into_in_dir(
+        &self,
+        query: &str,
+        candidates: &[usize],
+        matched_indices: &mut Vec<usize>,
+        results: &mut Vec<FuzzyMatch>,
+        limit: usize,
+        cwd: &Path,
+    ) {
+        self.fuzzy_search_subset_into_with_cwd(
+            query,
+            candidates,
+            matched_indices,
+            results,
+            limit,
+            Some(cwd),
+        );
+    }
+
+    fn fuzzy_search_subset_into_with_cwd(
+        &self,
+        query: &str,
+        candidates: &[usize],
+        matched_indices: &mut Vec<usize>,
+        results: &mut Vec<FuzzyMatch>,
+        limit: usize,
+        cwd: Option<&Path>,
+    ) {
         matched_indices.clear();
         results.clear();
         if limit == 0 {
@@ -814,21 +1038,26 @@ impl History {
 
         if query.is_empty() {
             matched_indices.extend_from_slice(candidates);
-            results.extend(candidates.iter().take(limit).map(|&idx| FuzzyMatch {
+            results.extend(candidates.iter().map(|&idx| FuzzyMatch {
                 entry_idx: idx,
                 match_positions: [0; 32],
                 match_count: 0,
-                score: 0,
+                score: self.cwd_weight(idx, cwd),
             }));
+            if cwd.is_some() {
+                results.sort_unstable_by(compare_fuzzy_match);
+            }
+            results.truncate(limit);
             return;
         }
 
         let query_lower = lowercase_query(query);
         for &idx in candidates {
             let entry = self.entry_text(idx);
-            let Some(m) = classify_match(&query_lower, entry, idx) else {
+            let Some(mut m) = classify_match(&query_lower, entry, idx) else {
                 continue;
             };
+            m.score += self.cwd_weight(idx, cwd);
             matched_indices.push(idx);
             let insert_at = results
                 .binary_search_by(|existing| compare_fuzzy_match(existing, &m))
@@ -840,7 +1069,7 @@ impl History {
             if results.len() > limit {
                 results.pop();
             }
-            if results.len() == limit && results[limit - 1].score == 3 {
+            if results.len() == limit && self.can_stop_search(results, cwd) {
                 break;
             }
         }
@@ -867,13 +1096,23 @@ impl History {
             use std::io::Write;
             for (i, &(start, len)) in self.offsets.iter().enumerate() {
                 let entry = &self.arena[start as usize..start as usize + len as usize];
-                let record = format_history_record(self.timestamps[i], self.session_ids[i], entry);
+                let record = self.cwds[i].as_deref().map_or_else(
+                    || format_history_record(self.timestamps[i], self.session_ids[i], entry),
+                    |cwd| {
+                        format_history_record_with_cwd(
+                            self.timestamps[i],
+                            self.session_ids[i],
+                            cwd,
+                            entry,
+                        )
+                    },
+                );
                 let _ = writeln!(f, "{record}");
             }
         }
     }
 
-    fn append_to_file(&mut self, line: &str) {
+    fn append_to_file(&mut self, line: &str, cwd: Option<&Path>) {
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -882,7 +1121,10 @@ impl History {
             .append(true)
             .open(&self.path)
         {
-            let record = format_history_record(now_millis(), self.session_id, line);
+            let record = cwd.map_or_else(
+                || format_history_record(now_millis(), self.session_id, line),
+                |cwd| format_history_record_with_cwd(now_millis(), self.session_id, cwd, line),
+            );
             let _ = writeln!(f, "{record}");
             // Update file_pos so sync() doesn't re-read our own write
             if let Ok(m) = f.metadata() {
@@ -891,7 +1133,7 @@ impl History {
         }
     }
 
-    fn fill_search_results(&self, query: &str, results: &mut Vec<FuzzyMatch>) {
+    fn fill_search_results(&self, query: &str, results: &mut Vec<FuzzyMatch>, cwd: Option<&Path>) {
         results.clear();
 
         if query.is_empty() {
@@ -903,9 +1145,12 @@ impl History {
                         entry_idx: idx,
                         match_positions: [0; 32],
                         match_count: 0,
-                        score: 0,
+                        score: self.cwd_weight(idx, cwd),
                     }),
             );
+            if cwd.is_some() {
+                results.sort_unstable_by(compare_fuzzy_match);
+            }
             return;
         }
 
@@ -915,7 +1160,8 @@ impl History {
                 continue;
             }
             let entry = &self.arena[start as usize..start as usize + len as usize];
-            if let Some(m) = classify_match(&query_lower, entry, idx) {
+            if let Some(mut m) = classify_match(&query_lower, entry, idx) {
+                m.score += self.cwd_weight(idx, cwd);
                 results.push(m);
             }
         }
@@ -928,9 +1174,10 @@ impl History {
         query: &str,
         results: &mut Vec<FuzzyMatch>,
         limit: usize,
+        cwd: Option<&Path>,
     ) {
         let query_lower = lowercase_query(query);
-        self.fill_search_results_limited_chars(&query_lower, results, limit);
+        self.fill_search_results_limited_chars(&query_lower, results, limit, cwd);
     }
 
     fn fill_search_results_limited_bytes(
@@ -938,6 +1185,7 @@ impl History {
         query_lower: &[u8],
         results: &mut Vec<FuzzyMatch>,
         limit: usize,
+        cwd: Option<&Path>,
     ) {
         results.clear();
         if limit == 0 {
@@ -954,9 +1202,13 @@ impl History {
                         entry_idx: idx,
                         match_positions: [0; 32],
                         match_count: 0,
-                        score: 0,
+                        score: self.cwd_weight(idx, cwd),
                     }),
             );
+            if cwd.is_some() {
+                results.sort_unstable_by(compare_fuzzy_match);
+                results.truncate(limit);
+            }
             return;
         }
 
@@ -965,9 +1217,10 @@ impl History {
                 continue;
             }
             let entry = &self.arena[start as usize..start as usize + len as usize];
-            let Some(m) = classify_match_ascii(query_lower, entry, idx) else {
+            let Some(mut m) = classify_match_ascii(query_lower, entry, idx) else {
                 continue;
             };
+            m.score += self.cwd_weight(idx, cwd);
 
             let insert_at = results
                 .binary_search_by(|existing| compare_fuzzy_match(existing, &m))
@@ -979,7 +1232,7 @@ impl History {
             if results.len() > limit {
                 results.pop();
             }
-            if results.len() == limit && results[limit - 1].score == 3 {
+            if results.len() == limit && self.can_stop_search(results, cwd) {
                 break;
             }
         }
@@ -990,6 +1243,7 @@ impl History {
         query_lower: &[char],
         results: &mut Vec<FuzzyMatch>,
         limit: usize,
+        cwd: Option<&Path>,
     ) {
         results.clear();
         if limit == 0 {
@@ -1006,9 +1260,13 @@ impl History {
                         entry_idx: idx,
                         match_positions: [0; 32],
                         match_count: 0,
-                        score: 0,
+                        score: self.cwd_weight(idx, cwd),
                     }),
             );
+            if cwd.is_some() {
+                results.sort_unstable_by(compare_fuzzy_match);
+                results.truncate(limit);
+            }
             return;
         }
 
@@ -1017,9 +1275,10 @@ impl History {
                 continue;
             }
             let entry = &self.arena[start as usize..start as usize + len as usize];
-            let Some(m) = classify_match(query_lower, entry, idx) else {
+            let Some(mut m) = classify_match(query_lower, entry, idx) else {
                 continue;
             };
+            m.score += self.cwd_weight(idx, cwd);
 
             let insert_at = results
                 .binary_search_by(|existing| compare_fuzzy_match(existing, &m))
@@ -1031,10 +1290,26 @@ impl History {
             if results.len() > limit {
                 results.pop();
             }
-            if results.len() == limit && results[limit - 1].score == 3 {
+            if results.len() == limit && self.can_stop_search(results, cwd) {
                 break;
             }
         }
+    }
+
+    fn cwd_weight(&self, idx: usize, cwd: Option<&Path>) -> i16 {
+        const CWD_WEIGHT: i16 = 4;
+        if cwd.is_some_and(|cwd| {
+            self.cwds[idx]
+                .as_deref()
+                .is_some_and(|entry_cwd| cwd.starts_with(entry_cwd))
+        }) { CWD_WEIGHT } else { 0 }
+    }
+
+    fn can_stop_search(&self, results: &[FuzzyMatch], cwd: Option<&Path>) -> bool {
+        let best_possible_score = if cwd.is_some() { 7 } else { 3 };
+        results
+            .last()
+            .is_some_and(|m| m.score >= best_possible_score)
     }
 
     fn is_session_visible(&self, idx: usize) -> bool {
@@ -1063,6 +1338,7 @@ impl History {
         self.offsets.remove(idx);
         self.timestamps.remove(idx);
         self.session_ids.remove(idx);
+        self.cwds.remove(idx);
         self.local.remove(idx);
         self.rebuild_index();
     }
@@ -1078,6 +1354,7 @@ impl History {
             self.offsets.remove(idx);
             self.timestamps.remove(idx);
             self.session_ids.remove(idx);
+            self.cwds.remove(idx);
             self.local.remove(idx);
         }
         self.rebuild_index();
@@ -1676,6 +1953,58 @@ mod tests {
         h.fuzzy_search_into("cargo", &mut results, 200, "ish");
         assert_eq!(h.get(results[0].entry_idx), "cargo build");
         assert!(results.iter().any(|m| h.get(m.entry_idx) == "cargo build"));
+    }
+
+    #[test]
+    fn cwd_weight_prefers_ancestor_entries() {
+        let mut hist = History::from_entries(vec!["echo cargo".into(), "cargo build".into()]);
+        hist.cwds[0] = Some(PathBuf::from("/work/project"));
+        hist.cwds[1] = Some(PathBuf::from("/other"));
+
+        let results = hist.fuzzy_search_in_dir("cargo", Path::new("/work/project/src"));
+        assert_eq!(hist.get(results[0].entry_idx), "echo cargo");
+        assert_eq!(results[0].score, 6);
+
+        let results = hist.fuzzy_search_in_dir("cargo", Path::new("/work/projects"));
+        assert_eq!(hist.get(results[0].entry_idx), "cargo build");
+    }
+
+    #[test]
+    fn cwd_metadata_round_trips_in_text_and_cache() {
+        let dir = std::env::temp_dir().join(format!("ish_history_cwd_{}", now_millis()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        let cwd = dir.join("project\twith\\escapes");
+
+        let mut hist = History::load_from_text(&path);
+        hist.path = path.clone();
+        hist.add_in_dir("echo cwd", Some(&cwd));
+        hist.flush_for_read();
+
+        let loaded = History::load_from_text(&path);
+        assert_eq!(loaded.cwds[0].as_deref(), Some(cwd.as_path()));
+
+        hist.save_cache();
+        let cache = cache_path_for(&path);
+        let data = fs::read(&cache).unwrap();
+        let parsed = History::parse_cache(&data, &path).expect("v5 cache parse failed");
+        assert_eq!(parsed.cwds[0].as_deref(), Some(cwd.as_path()));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_history_has_unknown_cwd() {
+        let dir = std::env::temp_dir().join(format!("ish_history_legacy_{}", now_millis()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        fs::write(&path, format_history_record(111, 7, "echo legacy")).unwrap();
+
+        let hist = History::load_from_text(&path);
+        assert_eq!(hist.get(0), "echo legacy");
+        assert_eq!(hist.cwds[0], None);
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

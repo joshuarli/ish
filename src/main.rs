@@ -226,6 +226,7 @@ fn main() {
                 // Resolve relative cd paths to absolute so `z` can use them.
                 let history_line =
                     resolve_cd_for_history(&expand_aliases_for_history(&line, &shell.aliases));
+                let history_cwd = shell.epsh.cwd().to_path_buf();
 
                 // Log for session transcript
                 shell.session_log.push_str(&line);
@@ -356,7 +357,7 @@ fn main() {
 
                 if handled {
                     if history_line.trim() != "l" {
-                        shell.history.add(&history_line);
+                        shell.history.add_in_dir(&history_line, Some(&history_cwd));
                     }
                     continue;
                 }
@@ -397,7 +398,7 @@ fn main() {
                 }
 
                 if history_line.trim() != "l" {
-                    shell.history.add(&history_line);
+                    shell.history.add_in_dir(&history_line, Some(&history_cwd));
                 }
             }
             ReadResult::Exit => {
@@ -617,12 +618,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 shell.history.visible_entry_indices_into(&mut candidates);
                                 let mut scratch = Vec::new();
                                 let mut matches = std::mem::take(&mut shell.match_buf);
-                                shell.history.fuzzy_search_subset_into(
+                                shell.history.fuzzy_search_subset_into_in_dir(
                                     "",
                                     &candidates,
                                     &mut scratch,
                                     &mut matches,
                                     200,
+                                    shell.epsh.cwd(),
                                 );
                                 std::mem::swap(&mut candidates, &mut scratch);
                                 region.clear(&mut tw);
@@ -1923,12 +1925,13 @@ fn handle_history_search_key(
             && prev_text.starts_with(new_text);
         if append_at_end {
             candidate_stack.push((prev_text.len(), std::mem::take(candidates)));
-            shell.history.fuzzy_search_subset_into(
+            shell.history.fuzzy_search_subset_into_in_dir(
                 new_text,
                 &candidate_stack.last().unwrap().1,
                 scratch,
                 matches,
                 200,
+                shell.epsh.cwd(),
             );
             std::mem::swap(candidates, scratch);
         } else if delete_at_end {
@@ -1945,23 +1948,38 @@ fn handle_history_search_key(
             {
                 let (_, old_candidates) = candidate_stack.pop().unwrap();
                 *candidates = old_candidates;
-                shell
-                    .history
-                    .fuzzy_search_subset_into(new_text, candidates, scratch, matches, 200);
+                shell.history.fuzzy_search_subset_into_in_dir(
+                    new_text,
+                    candidates,
+                    scratch,
+                    matches,
+                    200,
+                    shell.epsh.cwd(),
+                );
             } else {
                 candidate_stack.clear();
                 shell.history.visible_entry_indices_into(scratch);
-                shell
-                    .history
-                    .fuzzy_search_subset_into(new_text, scratch, candidates, matches, 200);
+                shell.history.fuzzy_search_subset_into_in_dir(
+                    new_text,
+                    scratch,
+                    candidates,
+                    matches,
+                    200,
+                    shell.epsh.cwd(),
+                );
                 std::mem::swap(candidates, scratch);
             }
         } else {
             candidate_stack.clear();
             shell.history.visible_entry_indices_into(scratch);
-            shell
-                .history
-                .fuzzy_search_subset_into(new_text, scratch, candidates, matches, 200);
+            shell.history.fuzzy_search_subset_into_in_dir(
+                new_text,
+                scratch,
+                candidates,
+                matches,
+                200,
+                shell.epsh.cwd(),
+            );
             std::mem::swap(candidates, scratch);
         }
         *selected = 0;
