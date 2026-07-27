@@ -85,7 +85,7 @@ Colors: blue for directories, cyan for symlinks, green for executables.
 
 ### Syntax
 
-Pipes and chaining:
+Pipelines, command lists, and redirections:
 ```
 ls -la | grep foo > out.txt && echo done
 cat err.log |& head          # pipe stderr too
@@ -117,7 +117,7 @@ test?              # glob: single character
 src/**/*.py        # glob: recursive descent
 ```
 
-Expansion order: tilde, variables, command substitution, glob. Quoted characters skip expansion. No match on glob is an error.
+Expansion order: tilde, parameter expansion, command substitution, pathname expansion (globbing). Quoted characters skip expansion. No match on glob is an error.
 
 ### Builtins
 
@@ -164,7 +164,7 @@ Aliases expand inline when you press space. `w`/`which`/`type` check aliases fir
 
 Ctrl+Z suspends the foreground job. `fg` resumes it. One job slot — simple and intentional. Shell warns before exiting with a suspended job (exit again to force).
 
-If a pipeline was suspended mid-chain (`a && b`, suspended during `a`), `fg` resumes and continues the chain.
+If an AND-OR list was suspended while running its first command (`a && b`, suspended during `a`), `fg` resumes and continues the list.
 
 ### denv Integration
 
@@ -191,7 +191,7 @@ Two directives: `set` and `alias`. Variables expand in values. Comments with `#`
 
 Every omission is deliberate. No scripting engine means no code injection, no `source`-based exploits, no eval chains. No `if`/`for`/`while`/functions means no control flow to hijack. No `${VAR}` brace expansion means no expansion-based attacks. One suspended job (no `&` backgrounding) means no resource exhaustion through job spawning. No plugins means no supply chain.
 
-The result: the entire shell is a single flat pipeline executor with a small, auditable attack surface. If you can't `source` it, you can't trick a user into `source`-ing it.
+The result: the shell has a small, auditable interactive command evaluator. If you can't `source` it, you can't trick a user into `source`-ing it.
 
 - No scripting. `ish script.sh` prints an error.
 - No POSIX compliance.
@@ -202,8 +202,8 @@ The result: the entire shell is a single flat pipeline executor with a small, au
 
 ## Architecture
 
-Single binary crate, one dependency (`libc`).
+Single Rust package with a library target and interactive binary. Platform code primarily uses `rustix`; `libc` remains a narrow compatibility escape hatch.
 
-The shell never subprocesses for its own operations — directory listing, git detection, glob expansion, environment loading checks are all native. Only user commands get `fork`/`exec`'d.
+Shell-owned operations stay native where possible: directory listing, git detection, pathname expansion, completion, and file finding do not spawn subprocesses. Running external commands, command substitutions, and the denv integration may spawn processes.
 
 Signal handling uses the self-pipe pattern. Each pipeline gets its own process group. Terminal foreground control via `tcsetpgrp`. Raw mode via `termios`.

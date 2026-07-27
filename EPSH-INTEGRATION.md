@@ -2,9 +2,10 @@
 
 ## Architecture
 
-ish is a pure interactive layer on top of epsh. epsh handles parsing, expansion,
-execution, pipelines, POSIX builtins, functions, and control flow. ish handles
-line editing, completion, history, prompt, aliases, job control, and denv.
+ish is a pure interactive layer on top of epsh. epsh provides parsing,
+expansion, command evaluation, pipelines, and a broader general-purpose shell
+runtime. ish intentionally exposes only its interactive subset and handles line
+editing, completion, history, prompt, aliases, job control, and denv.
 
 The main loop flow:
 1. `read_line()` — interactive input with completion, history search, etc.
@@ -42,7 +43,8 @@ external commands fall through to epsh.
 
 ### 3. ~~cd intercepted via text rewriting~~ (RESOLVED)
 
-Simple cd commands are now intercepted in the main loop via `do_cd()`. Handles
+Simple `cd` commands are now intercepted in the main loop via
+`change_directory()`. Handles
 `cd -` (OLDPWD lookup), `cd` (HOME), and `cd path` directly. Sets OLDPWD/PWD in
 both process env and epsh vars, triggers denv, updates dir stack and prompt.
 Compound commands (`cd /tmp && ls`) still fall through to epsh with cwd detection.

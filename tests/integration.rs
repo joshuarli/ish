@@ -988,7 +988,7 @@ fn prompt_render_multiple() {
 }
 
 // ---------------------------------------------------------------------------
-// Builtin: is_builtin, is_ish_builtin
+// Builtin: is_builtin, is_ish_extension_builtin
 // ---------------------------------------------------------------------------
 
 #[test]

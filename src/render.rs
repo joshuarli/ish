@@ -815,11 +815,11 @@ pub fn render_history_pager_cached(
     }
 }
 
-/// Render the file picker pager (Ctrl+F).
+/// Render the file finder pager (Ctrl+F).
 /// In query phase (`query_phase` true), shows "find: " prompt.
 /// In results phase, shows the selectable file list.
 #[allow(clippy::too_many_arguments)]
-pub fn render_file_picker(
+pub fn render_file_finder(
     tw: &mut TermWriter,
     query: &str,
     all_entries: &[(usize, String)],
@@ -1093,7 +1093,7 @@ mod tests {
         hidden: bool,
     ) -> (RenderedRegion, Vec<u8>) {
         let mut tw = TermWriter::new();
-        let info = render_file_picker(
+        let info = render_file_finder(
             &mut tw,
             query,
             &[],

@@ -12,8 +12,8 @@ The important design constraints are:
   not spawn a subprocess. Running a user command or the existing denv
   integration may spawn one.
 - Keep the execution model and data structures simple and flat. Avoid adding
-  an AST, a general configuration language, or abstraction layers that do not
-  pay for themselves.
+  an ish-owned AST, a general configuration language, or abstraction layers
+  that do not pay for themselves.
 - Preserve the interactive hot path. Reuse buffers where practical and avoid
   allocations in code that runs on every keystroke; measure before making a
   performance claim.
@@ -41,8 +41,9 @@ without an explicit decision.
 The main flow is:
 
 ```text
-input → line editing → main dispatch → render
-                         └────────→ builtin or external command execution
+input → line editing → alias handling → command dispatch → render
+                                      ├→ ish builtin
+                                      └→ epsh parse/expand/evaluate → job or external command
 ```
 
 Subsystem ownership:
@@ -65,10 +66,11 @@ platform workarounds, safety, allocation behavior, or non-obvious constants.
 
 ## User-visible behavior
 
-Supported shell behavior includes pipelines and `&&`/`||`/`;` chains,
-redirections, quoting and escaping, comments, continuation lines, tilde and
-environment expansion, command substitution, globs, aliases, history search,
-file completion, the native file finder, and one suspended foreground job.
+Supported shell behavior includes pipelines, AND-OR lists (`&&`/`||`),
+sequential lists (`;`), redirections, quoting and escaping, comments,
+continuation lines, tilde expansion, parameter expansion, command substitution,
+pathname expansion (globbing), aliases, history search, file completion, the
+native file finder, and one suspended foreground job.
 
 Builtins and keybindings are documented in [README.md](README.md). Treat the
 README and existing tests as the behavior contract; update both when a
@@ -79,9 +81,38 @@ Notable builtin rules:
 
 - State-changing builtins (`cd`, `exit`, `fg`, `set`, `unset`, and `alias`) must
   run in the shell process.
-- Output-only builtins may participate in pipelines.
-- New builtins belong in the builtin registry and in the appropriate special or
-  output execution path, with integration/PTY coverage as applicable.
+- Pipeline-safe output builtins may participate in pipelines.
+- New builtins belong in the builtin registry and in the appropriate
+  state-changing or pipeline-safe execution path, with integration/PTY coverage
+  as applicable.
+
+## Shell terminology
+
+Use these terms consistently in code, comments, tests, and documentation:
+
+- An input line is raw text from the line editor.
+- A token is a lexical unit, including operators such as `|`, `&&`, and `>`.
+- A shell word is an unexpanded syntactic word; `epsh::ast::Word` contains its
+  word parts.
+- A word part is literal text, quoting, parameter expansion, command
+  substitution, or tilde expansion.
+- A field is an argument produced after expansion, suitable for `argv`.
+- A simple command contains assignments, a command name, arguments, and
+  redirections.
+- A pipeline joins commands with `|` or `|&`.
+- An AND-OR list joins commands with `&&` or `||`.
+- A sequential list joins commands with `;` or a newline. Use list as the
+  umbrella term; do not call every composition a pipeline or a chain.
+- A redirection routes a file descriptor, such as `>file`, `2>file`, or `&>file`.
+- Parameter expansion handles `$HOME` and `$PATH`; pathname expansion, also
+  called globbing, handles patterns such as `*.rs`.
+- A builtin is implemented by the shell. An external command is launched as a
+  child process. A job is the process group and terminal state for a foreground
+  command or pipeline.
+
+The `epsh` AST supports more shell constructs than `ish` intentionally exposes.
+Do not describe parser capabilities as supported `ish` behavior without checking
+the interactive dispatch and README contract.
 
 ## Testing
 
@@ -108,18 +139,19 @@ verification of commits to the user.
 
 ## Common changes
 
-- Builtin: start at `src/builtin.rs` (`ISH_BUILTINS`, `is_builtin()`,
-  `all_builtin_names()`, `builtin_w()`, `builtin_l()`). Commands that must
-  change shell state are intercepted by the `first_word` match in `src/main.rs`;
+- Builtin: start at `src/builtin.rs` (`ISH_EXTENSION_BUILTINS`,
+  `is_ish_extension_builtin()`, `is_builtin()`, `all_builtin_names()`,
+  `locate_command()`, `list_directory()`). Commands that must change shell
+  state are intercepted by the `first_command_word` match in `src/main.rs`;
   relevant handlers include `handle_alias()`, `handle_exit_command()`,
-  `do_cd()`, `handle_history()`, `denv::command()`, and
+  `change_directory()`, `handle_history()`, `denv::command()`, and
   `job::resume_job()`. Add behavior tests in `tests/integration.rs` or
   `tests/pty.rs`.
 - Keybinding or mode behavior: update `handle_normal_key()`,
   `handle_completion_key()`, `handle_history_search_key()`, or
-  `handle_file_picker_key()` in `src/main.rs`. The mode state is the `Mode`
-  enum; terminal actions are represented by `KeyAction`, `CompAction`,
-  `HistAction`, and `FilePickerAction`.
+  `handle_file_finder_key()` in `src/main.rs`. The mode state is the `Mode`
+  enum; terminal actions are represented by `KeyAction`, `CompletionAction`,
+  `HistoryAction`, and `FileFinderAction`.
 - Completion: use `complete::complete_path_into()`,
   `complete::complete_candidates()`, `complete::CompletionState`, and
   `complete::compute_grid()` in `src/complete.rs`; orchestration and accept/
@@ -132,7 +164,7 @@ verification of commits to the user.
 - Prompt or rendering: prompt data and git inspection are in `Prompt` and
   `shorten_pwd()` in `src/prompt.rs`; terminal composition is in
   `render_line()`, `render_completions()`, `render_history_pager_cached()`,
-  and `render_file_picker()` in `src/render.rs`. Run PTY tests for changes
+  and `render_file_finder()` in `src/render.rs`. Run PTY tests for changes
   visible on screen.
 - Config or aliases: `config::load()`, `parse_set()`, and `parse_alias()` are
   in `src/config.rs`; `AliasMap` and `lex_words()` are in `src/alias.rs`.
@@ -145,5 +177,5 @@ verification of commits to the user.
   appropriate.
 - Parser/expansion behavior: inspect the call sites of
   `expand_builtin_args()` and the `epsh::lexer`/`epsh::expand` integration in
-  `src/main.rs` and `src/alias.rs`. Extend that integration rather than
-  introducing a parallel parser.
+  `src/main.rs` and `src/alias.rs`. Distinguish shell words from expanded
+  fields, and extend that integration rather than introducing a parallel parser.

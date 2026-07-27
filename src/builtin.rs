@@ -1,8 +1,10 @@
 use crate::ls;
 use crate::path;
 
-/// Builtins handled by ish's interactive layer (not by epsh).
-const ISH_BUILTINS: &[&str] = &[
+/// Additional builtins provided by ish beyond epsh.
+///
+/// Builtins that override epsh commands are dispatched separately in main.rs.
+const ISH_EXTENSION_BUILTINS: &[&str] = &[
     "fg",
     "z",
     "l",
@@ -16,25 +18,25 @@ const ISH_BUILTINS: &[&str] = &[
     "denv",
 ];
 
-pub fn is_ish_builtin(name: &str) -> bool {
-    ISH_BUILTINS.contains(&name)
+pub fn is_ish_extension_builtin(name: &str) -> bool {
+    ISH_EXTENSION_BUILTINS.contains(&name)
 }
 
 /// Check if a command name is a builtin in either ish or epsh.
 pub fn is_builtin(name: &str) -> bool {
-    is_ish_builtin(name) || epsh::builtins::is_builtin(name)
+    is_ish_extension_builtin(name) || epsh::builtins::is_builtin(name)
 }
 
 /// All builtin names (ish + epsh), for completion.
 pub fn all_builtin_names() -> impl Iterator<Item = &'static str> {
-    ISH_BUILTINS
+    ISH_EXTENSION_BUILTINS
         .iter()
         .copied()
         .chain(epsh::builtins::BUILTIN_NAMES.iter().copied())
 }
 
-/// Run a `w`/`which`/`type` lookup. Checks aliases, builtins, functions, PATH.
-pub fn builtin_w(
+/// Locate a command through aliases, builtins, functions, or PATH.
+pub fn locate_command(
     args: &[String],
     aliases: &crate::alias::AliasMap,
     function_exists: impl Fn(&str) -> bool,
@@ -70,8 +72,8 @@ pub fn builtin_w(
     1
 }
 
-/// Run the `l` builtin (native ls).
-pub fn builtin_l(args: &[String]) -> i32 {
+/// List directories using ish's native directory listing.
+pub fn list_directory(args: &[String]) -> i32 {
     if args.is_empty() {
         ls::list_dir(".")
     } else {

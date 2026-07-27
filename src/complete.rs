@@ -2,7 +2,7 @@ use std::os::fd::BorrowedFd;
 
 /// Completion entry — mtime + u32 offset + u8 len + u8 display_width + u8 flags.
 /// name_len is u8: NAME_MAX is 255 on Linux/macOS.
-pub struct CompEntry {
+pub struct CompletionEntry {
     mtime: i64, // st_mtime from stat(), 0 for non-path entries (hosts, builtins)
     name_start: u32,
     name_len: u8,
@@ -10,7 +10,7 @@ pub struct CompEntry {
     flags: u8, // bit 0: is_dir, bit 1: is_link, bit 2: is_exec, bit 3: is_host
 }
 
-impl CompEntry {
+impl CompletionEntry {
     pub fn display_width(&self) -> usize {
         self.name_display_width as usize
             + if self.is_dir() || self.is_host() {
@@ -42,11 +42,11 @@ fn pack_flags(is_dir: bool, is_link: bool, is_exec: bool) -> u8 {
 }
 
 /// Arena-backed completion results. All entry names are stored contiguously
-/// in `names`; each `CompEntry` stores an offset+length into it.
+/// in `names`; each `CompletionEntry` stores an offset+length into it.
 /// Typical completion: 2 heap allocations total (the arena String + entries Vec).
 pub struct Completions {
     pub names: String,
-    pub entries: Vec<CompEntry>,
+    pub entries: Vec<CompletionEntry>,
 }
 
 impl Default for Completions {
@@ -90,7 +90,7 @@ impl Completions {
     }
 
     /// Get the name of an entry reference.
-    pub fn entry_name(&self, e: &CompEntry) -> &str {
+    pub fn entry_name(&self, e: &CompletionEntry) -> &str {
         &self.names[e.name_start as usize..][..e.name_len as usize]
     }
 
@@ -108,7 +108,7 @@ impl Completions {
     ) {
         let start = self.names.len() as u32;
         self.names.push_str(name);
-        self.entries.push(CompEntry {
+        self.entries.push(CompletionEntry {
             mtime,
             name_start: start,
             name_len: name.len().min(255) as u8,
@@ -139,7 +139,7 @@ impl Completions {
         let name = &self.names[start as usize..];
         let name_len = name.len().min(255) as u8;
         let name_display_width = crate::line::str_width(name).min(255) as u8;
-        self.entries.push(CompEntry {
+        self.entries.push(CompletionEntry {
             mtime,
             name_start: start,
             name_len,
@@ -203,7 +203,7 @@ impl Completions {
 /// Case-insensitive byte-level comparator for arena-backed entries.
 /// Inlined into sort hot path — no iterator overhead.
 #[inline(always)]
-fn cmp_icase_arena(names: &[u8], a: &CompEntry, b: &CompEntry) -> std::cmp::Ordering {
+fn cmp_icase_arena(names: &[u8], a: &CompletionEntry, b: &CompletionEntry) -> std::cmp::Ordering {
     let a_bytes = &names[a.name_start as usize..][..a.name_len as usize];
     let b_bytes = &names[b.name_start as usize..][..b.name_len as usize];
     let len = a_bytes.len().min(b_bytes.len());
@@ -248,7 +248,7 @@ impl CompletionState {
         }
     }
 
-    pub fn selected_entry(&self) -> Option<&CompEntry> {
+    pub fn selected_entry(&self) -> Option<&CompletionEntry> {
         self.comp.entries.get(self.selected)
     }
 
@@ -771,7 +771,7 @@ fn split_path(partial: &str) -> (&str, &str) {
 }
 
 /// Compute grid layout: (cols, rows) for column-major display.
-pub fn compute_grid(entries: &[CompEntry], term_cols: u16) -> (usize, usize) {
+pub fn compute_grid(entries: &[CompletionEntry], term_cols: u16) -> (usize, usize) {
     let n = entries.len();
     if n == 0 {
         return (0, 0);
@@ -856,7 +856,7 @@ pub fn complete_hostnames(prefix: &str, home: &str, comp: &mut Completions) {
         if host.starts_with(prefix) {
             let start = comp.names.len() as u32;
             comp.names.push_str(&host);
-            comp.entries.push(CompEntry {
+            comp.entries.push(CompletionEntry {
                 mtime: 0,
                 name_start: start,
                 name_len: host.len().min(255) as u8,
@@ -984,7 +984,7 @@ mod tests {
         // Push a host entry manually
         let start = comp.names.len() as u32;
         comp.names.push_str("myhost");
-        comp.entries.push(CompEntry {
+        comp.entries.push(CompletionEntry {
             mtime: 0,
             name_start: start,
             name_len: 6,

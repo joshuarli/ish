@@ -34,9 +34,9 @@ struct Shell {
     /// Reusable buffer for rendered prompt string — avoids allocation per render.
     prompt_buf: String,
     /// Reusable completion arena — avoids allocation per tab press.
-    comp_buf: complete::Completions,
+    completion_buffer: complete::Completions,
     /// Reusable fuzzy match buffer — avoids allocation per Ctrl+R keystroke.
-    match_buf: Vec<history::FuzzyMatch>,
+    history_match_buffer: Vec<history::FuzzyMatch>,
     job: Option<Job>,
     path_cache: path::PathCache,
     exit_warned: bool,
@@ -68,7 +68,7 @@ enum Mode {
         selected: usize,
         saved_line: String,
     },
-    FilePicker {
+    FileFinder {
         query: LineBuffer,
         /// All entries from the background walk (depth, rel_path).
         all_entries: Vec<(usize, String)>,
@@ -185,8 +185,8 @@ fn main() {
         history: history::History::load(),
         prompt: prompt::Prompt::new(),
         prompt_buf: String::with_capacity(128),
-        comp_buf: complete::Completions::with_capacity(2048, 64),
-        match_buf: Vec::with_capacity(200),
+        completion_buffer: complete::Completions::with_capacity(2048, 64),
+        history_match_buffer: Vec::with_capacity(200),
         job: None,
         path_cache: path::PathCache::new(),
         exit_warned: false,
@@ -233,9 +233,9 @@ fn main() {
                 shell.session_log.push('\n');
 
                 // Handle ish-level commands that must be intercepted before epsh
-                let first_word = line.split_whitespace().next().unwrap_or("");
-                let simple_words = parse_simple_command_words(&line);
-                let handled = match first_word {
+                let first_command_word = line.split_whitespace().next().unwrap_or("");
+                let simple_words = lex_simple_command_words(&line);
+                let handled = match first_command_word {
                     "alias" => {
                         handle_alias(&line, &mut shell);
                         true
@@ -260,7 +260,7 @@ fn main() {
                                     {
                                         eprintln!("{}", Path::new(&prev).display());
                                         shell.last_status =
-                                            do_cd_path(Path::new(&prev), &mut shell);
+                                            change_directory_path(Path::new(&prev), &mut shell);
                                     } else {
                                         eprintln!("ish: cd: no previous directory");
                                         shell.last_status = 1;
@@ -270,7 +270,7 @@ fn main() {
                                 Some(args) => {
                                     let target =
                                         args.first().cloned().unwrap_or_else(|| shell.home.clone());
-                                    shell.last_status = do_cd(&target, &mut shell);
+                                    shell.last_status = change_directory(&target, &mut shell);
                                     true
                                 }
                                 None => true,
@@ -325,13 +325,13 @@ fn main() {
                         let args = simple_words
                             .as_deref()
                             .and_then(|words| {
-                                expand_builtin_args(&words[1..], &mut shell, first_word)
+                                expand_builtin_args(&words[1..], &mut shell, first_command_word)
                             })
                             .unwrap_or_else(|| {
                                 line.split_whitespace().skip(1).map(String::from).collect()
                             });
                         shell.last_status =
-                            builtin::builtin_w(&args, &shell.aliases, |name| {
+                            builtin::locate_command(&args, &shell.aliases, |name| {
                                 shell.epsh.functions().contains_key(name)
                             });
                         true
@@ -340,7 +340,7 @@ fn main() {
                         if let Some(words) = simple_words.as_deref() {
                             match expand_builtin_args(&words[1..], &mut shell, "l") {
                                 Some(args) => {
-                                    shell.last_status = builtin::builtin_l(&args);
+                                    shell.last_status = builtin::list_directory(&args);
                                     true
                                 }
                                 None => true,
@@ -484,14 +484,14 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     let _ = tw.flush_to_stdout();
 
     loop {
-        // In file picker mode, use a short timeout so we periodically drain
+        // In file finder mode, use a short timeout so we periodically drain
         // the background walk channel and re-render as results stream in.
-        let event = if matches!(mode, Mode::FilePicker { .. }) {
+        let event = if matches!(mode, Mode::FileFinder { .. }) {
             match reader.read_event_timeout(50) {
                 Some(ev) => ev,
                 None => {
                     // Timeout: drain channel, re-filter, re-render
-                    if let Mode::FilePicker {
+                    if let Mode::FileFinder {
                         query,
                         all_entries,
                         filtered,
@@ -504,7 +504,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         handle.drain_into(all_entries);
                         if all_entries.len() != before {
                             filter_entries(query.text(), all_entries, filtered, selected);
-                            region = render_file_picker_mode(&mut tw, &mode, shell, region);
+                            region = render_file_finder_mode(&mut tw, &mode, shell, region);
                             let _ = tw.flush_to_stdout();
                         }
                     }
@@ -619,7 +619,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 let mut candidates = Vec::new();
                                 shell.history.visible_entry_indices_into(&mut candidates);
                                 let mut scratch = Vec::new();
-                                let mut matches = std::mem::take(&mut shell.match_buf);
+                                let mut matches = std::mem::take(&mut shell.history_match_buffer);
                                 shell.history.fuzzy_search_subset_into_in_dir(
                                     "",
                                     &candidates,
@@ -650,11 +650,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 let _ = tw.flush_to_stdout();
                                 continue;
                             }
-                            KeyAction::StartFilePicker => {
+                            KeyAction::StartFileFinder => {
                                 saved_line = line.text().to_string();
                                 let handle = finder::find_async(".", false);
                                 region.clear(&mut tw);
-                                mode = Mode::FilePicker {
+                                mode = Mode::FileFinder {
                                     query: LineBuffer::new(),
                                     all_entries: Vec::new(),
                                     filtered: Vec::new(),
@@ -664,7 +664,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     hidden: false,
                                     handle,
                                 };
-                                region = render_file_picker_mode(
+                                region = render_file_finder_mode(
                                     &mut tw,
                                     &mode,
                                     shell,
@@ -700,7 +700,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 }
                             }
                             KeyAction::StartCompletion => {
-                                let comp = std::mem::take(&mut shell.comp_buf);
+                                let comp = std::mem::take(&mut shell.completion_buffer);
                                 let base_line = line.clone();
                                 let mut cs = start_completion(
                                     &base_line,
@@ -711,7 +711,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 );
                                 if cs.comp.len() == 1 {
                                     preview_completion(&mut line, &cs, &base_line);
-                                    shell.comp_buf = cs.comp;
+                                    shell.completion_buffer = cs.comp;
                                 } else if !cs.comp.is_empty() {
                                     cs.selected = usize::MAX;
                                     preview_completion(&mut line, &cs, &base_line);
@@ -720,7 +720,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                         base_line,
                                     };
                                 } else {
-                                    shell.comp_buf = cs.comp;
+                                    shell.completion_buffer = cs.comp;
                                 }
                             }
                         }
@@ -741,7 +741,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                     Mode::Completion { state, base_line } => {
                         let (p, pdl) = active_prompt(&prompt_str, prompt_display_len);
                         match handle_completion_key(key, state, base_line) {
-                            CompAction::Navigate => {
+                            CompletionAction::Navigate => {
                                 preview_completion(&mut line, state, base_line);
                                 // Cursor is on prompt line — repaint grid in-place
                                 let info = render::render_line(
@@ -758,7 +758,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 let _ = tw.flush_to_stdout();
                                 continue;
                             }
-                            CompAction::Refilter => {
+                            CompletionAction::Refilter => {
                                 // Reclaim buffer from current state, re-run completion
                                 let selected = state.selected;
                                 let comp = std::mem::take(&mut state.comp);
@@ -795,18 +795,18 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     continue;
                                 } else {
                                     line = base_line.clone();
-                                    shell.comp_buf = cs.comp;
+                                    shell.completion_buffer = cs.comp;
                                     mode = Mode::Normal;
                                 }
                             }
-                            CompAction::Accept => {
+                            CompletionAction::Accept => {
                                 preview_completion(&mut line, state, base_line);
-                                shell.comp_buf = std::mem::take(&mut state.comp);
+                                shell.completion_buffer = std::mem::take(&mut state.comp);
                                 mode = Mode::Normal;
                             }
-                            CompAction::Cancel => {
+                            CompletionAction::Cancel => {
                                 line = base_line.clone();
-                                shell.comp_buf = std::mem::take(&mut state.comp);
+                                shell.completion_buffer = std::mem::take(&mut state.comp);
                                 mode = Mode::Normal;
                             }
                         }
@@ -844,7 +844,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         selected,
                         shell,
                     ) {
-                        HistAction::Continue => {
+                        HistoryAction::Continue => {
                             region = render_history_mode(
                                 &mut tw,
                                 &mode,
@@ -854,9 +854,9 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             );
                             let _ = tw.flush_to_stdout();
                         }
-                        HistAction::Accept(text) => {
+                        HistoryAction::Accept(text) => {
                             line.set(&text);
-                            shell.match_buf = std::mem::take(matches);
+                            shell.history_match_buffer = std::mem::take(matches);
                             history_cache.clear();
                             mode = Mode::Normal;
                             region.clear(&mut tw);
@@ -872,9 +872,9 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             region = info;
                             let _ = tw.flush_to_stdout();
                         }
-                        HistAction::Cancel => {
+                        HistoryAction::Cancel => {
                             line.set(saved_line);
-                            shell.match_buf = std::mem::take(matches);
+                            shell.history_match_buffer = std::mem::take(matches);
                             history_cache.clear();
                             mode = Mode::Normal;
                             region.clear(&mut tw);
@@ -892,7 +892,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         }
                     },
 
-                    Mode::FilePicker {
+                    Mode::FileFinder {
                         query,
                         all_entries,
                         filtered,
@@ -904,7 +904,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                     } => {
                         // Drain new entries from the background walk
                         handle.drain_into(all_entries);
-                        let action = handle_file_picker_key(
+                        let action = handle_file_finder_key(
                             key,
                             query,
                             all_entries,
@@ -914,11 +914,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             handle,
                         );
                         match action {
-                            FilePickerAction::Continue => {
-                                region = render_file_picker_mode(&mut tw, &mode, shell, region);
+                            FileFinderAction::Continue => {
+                                region = render_file_finder_mode(&mut tw, &mode, shell, region);
                                 let _ = tw.flush_to_stdout();
                             }
-                            FilePickerAction::Accept(path) => {
+                            FileFinderAction::Accept(path) => {
                                 // Insert path at the saved cursor position
                                 let mut text = saved_line.clone();
                                 text.insert_str(*saved_cursor, &path);
@@ -938,7 +938,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 region = info;
                                 let _ = tw.flush_to_stdout();
                             }
-                            FilePickerAction::Cancel => {
+                            FileFinderAction::Cancel => {
                                 line.set(saved_line);
                                 mode = Mode::Normal;
                                 region.clear(&mut tw);
@@ -977,7 +977,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             if let Some(dir) = entries.get(*selected) {
                                 let dir = dir.clone();
                                 eprintln!("{dir}");
-                                do_cd(&dir, shell);
+                                change_directory(&dir, shell);
                             }
                             mode = Mode::Normal;
                             region.clear(&mut tw);
@@ -1089,7 +1089,7 @@ fn render_active_mode(
             info
         }
         Mode::HistorySearch { .. } => render_history_mode(tw, mode, shell, region, history_cache),
-        Mode::FilePicker { .. } => render_file_picker_mode(tw, mode, shell, region),
+        Mode::FileFinder { .. } => render_file_finder_mode(tw, mode, shell, region),
         Mode::DirPicker { .. } => render_dir_picker_mode(tw, mode, shell, region),
     }
 }
@@ -1111,7 +1111,7 @@ enum KeyAction {
     Exit,
     ClearScreen,
     StartHistorySearch,
-    StartFilePicker,
+    StartFileFinder,
     StartDirPicker,
     StartCompletion,
 }
@@ -1210,7 +1210,7 @@ fn handle_normal_key(
         (Key::Char('y'), true, _) => line.yank(),
         (Key::Char('l'), true, _) => return KeyAction::ClearScreen,
         (Key::Char('r'), true, _) => return KeyAction::StartHistorySearch,
-        (Key::Char('f'), true, _) => return KeyAction::StartFilePicker,
+        (Key::Char('f'), true, _) => return KeyAction::StartFileFinder,
 
         (Key::Char('b'), false, true) => line.move_word_left(),
         (Key::Char('f'), false, true) => line.move_word_right(),
@@ -1354,7 +1354,7 @@ fn try_alias_expand(line: &mut LineBuffer, aliases: &AliasMap) {
 
 // -- Completion --
 
-enum CompAction {
+enum CompletionAction {
     Navigate,
     Accept,
     Cancel,
@@ -1588,12 +1588,12 @@ fn start_completion(
     }
 
     // Detect if first word is cd → complete only directories
-    let first_word = text.split_whitespace().next().unwrap_or("");
-    let dirs_only = first_word == "cd" && word_start > 0;
+    let first_command_word = text.split_whitespace().next().unwrap_or("");
+    let dirs_only = first_command_word == "cd" && word_start > 0;
 
     // SSH-aware completion: hostname and remote path
     const SSH_CMDS: &[&str] = &["ssh", "scp", "rsync", "sftp", "mosh"];
-    if word_start > 0 && SSH_CMDS.contains(&first_word) {
+    if word_start > 0 && SSH_CMDS.contains(&first_command_word) {
         if let Some(colon_pos) = partial.find(':') {
             // Remote path: host:/path/prefix → complete via SSH
             let host = &partial[..colon_pos];
@@ -1736,40 +1736,40 @@ fn handle_completion_key(
     key: KeyEvent,
     state: &mut CompletionState,
     line: &mut LineBuffer,
-) -> CompAction {
+) -> CompletionAction {
     match key.key {
         Key::Up => {
             state.move_up();
-            CompAction::Navigate
+            CompletionAction::Navigate
         }
         Key::Down | Key::Tab => {
             state.move_down();
-            CompAction::Navigate
+            CompletionAction::Navigate
         }
         Key::Left => {
             state.move_left();
-            CompAction::Navigate
+            CompletionAction::Navigate
         }
         Key::Right => {
             state.move_right();
-            CompAction::Navigate
+            CompletionAction::Navigate
         }
-        Key::Enter => CompAction::Accept,
-        Key::Escape => CompAction::Cancel,
-        Key::Char('c') if key.mods.ctrl => CompAction::Cancel,
+        Key::Enter => CompletionAction::Accept,
+        Key::Escape => CompletionAction::Cancel,
+        Key::Char('c') if key.mods.ctrl => CompletionAction::Cancel,
         Key::Char(c) if !key.mods.ctrl && !key.mods.alt => {
             line.insert_char(c);
-            CompAction::Refilter
+            CompletionAction::Refilter
         }
         Key::Backspace => {
             if line.cursor() > 0 {
                 line.delete_back();
-                CompAction::Refilter
+                CompletionAction::Refilter
             } else {
-                CompAction::Cancel
+                CompletionAction::Cancel
             }
         }
-        _ => CompAction::Cancel,
+        _ => CompletionAction::Cancel,
     }
 }
 
@@ -1825,7 +1825,7 @@ fn preview_completion(line: &mut LineBuffer, state: &CompletionState, base_line:
 
 // -- History Search --
 
-enum HistAction {
+enum HistoryAction {
     Continue,
     Accept(String),
     Cancel,
@@ -1840,18 +1840,18 @@ fn handle_history_search_key(
     candidate_stack: &mut Vec<(usize, Vec<usize>)>,
     selected: &mut usize,
     shell: &Shell,
-) -> HistAction {
+) -> HistoryAction {
     let mut re_search = false;
     let prev_text = query.text().to_string();
     let prev_cursor = query.cursor();
     match (key.key, key.mods.ctrl, key.mods.alt) {
-        (Key::Escape, _, _) => return HistAction::Cancel,
-        (Key::Char('c'), true, _) => return HistAction::Cancel,
+        (Key::Escape, _, _) => return HistoryAction::Cancel,
+        (Key::Char('c'), true, _) => return HistoryAction::Cancel,
         (Key::Enter, _, _) => {
             return if let Some(m) = matches.get(*selected) {
-                HistAction::Accept(shell.history.get(m.entry_idx).to_string())
+                HistoryAction::Accept(shell.history.get(m.entry_idx).to_string())
             } else {
-                HistAction::Cancel
+                HistoryAction::Cancel
             };
         }
         (Key::Up, _, _) | (Key::Char('p'), true, _) if *selected > 0 => {
@@ -1986,7 +1986,7 @@ fn handle_history_search_key(
         }
         *selected = 0;
     }
-    HistAction::Continue
+    HistoryAction::Continue
 }
 
 fn render_history_mode(
@@ -2021,16 +2021,16 @@ fn render_history_mode(
 }
 
 // ---------------------------------------------------------------------------
-// File picker (Ctrl+F)
+// File finder (Ctrl+F)
 // ---------------------------------------------------------------------------
 
-enum FilePickerAction {
+enum FileFinderAction {
     Continue,
     Accept(String),
     Cancel,
 }
 
-fn handle_file_picker_key(
+fn handle_file_finder_key(
     key: KeyEvent,
     query: &mut LineBuffer,
     all_entries: &mut Vec<(usize, String)>,
@@ -2038,18 +2038,18 @@ fn handle_file_picker_key(
     selected: &mut usize,
     hidden: &mut bool,
     handle: &mut finder::FinderHandle,
-) -> FilePickerAction {
+) -> FileFinderAction {
     let mut refilter = false;
 
     match (key.key, key.mods.ctrl, key.mods.alt) {
-        (Key::Escape, _, _) | (Key::Char('c'), true, _) => return FilePickerAction::Cancel,
+        (Key::Escape, _, _) | (Key::Char('c'), true, _) => return FileFinderAction::Cancel,
 
         // Accept selected result
         (Key::Enter, _, _) => {
             return if let Some(&entry_idx) = filtered.get(*selected) {
-                FilePickerAction::Accept(all_entries[entry_idx].1.clone())
+                FileFinderAction::Accept(all_entries[entry_idx].1.clone())
             } else {
-                FilePickerAction::Cancel
+                FileFinderAction::Cancel
             };
         }
 
@@ -2124,7 +2124,7 @@ fn handle_file_picker_key(
         filter_entries(query.text(), all_entries, filtered, selected);
     }
 
-    FilePickerAction::Continue
+    FileFinderAction::Continue
 }
 
 fn filter_entries(
@@ -2136,13 +2136,13 @@ fn filter_entries(
     finder::filter_entries_pub(query, all_entries, filtered, selected);
 }
 
-fn render_file_picker_mode(
+fn render_file_finder_mode(
     tw: &mut TermWriter,
     mode: &Mode,
     shell: &Shell,
     prev: render::RenderedRegion,
 ) -> render::RenderedRegion {
-    if let Mode::FilePicker {
+    if let Mode::FileFinder {
         query,
         all_entries,
         filtered,
@@ -2153,7 +2153,7 @@ fn render_file_picker_mode(
     {
         let query_text = query.text();
         let in_query = query_text.len() < 3;
-        render::render_file_picker(
+        render::render_file_finder(
             tw,
             query_text,
             all_entries,
@@ -2208,7 +2208,7 @@ fn sync_cwd_change(shell: &mut Shell, old_cwd: &Path, new_cwd: std::path::PathBu
 
 /// Parse a command line into shell words only.
 /// Returns `None` if the line contains operators, redirections, or lexer errors.
-fn parse_simple_command_words(line: &str) -> Option<Vec<epsh::ast::Word>> {
+fn lex_simple_command_words(line: &str) -> Option<Vec<epsh::ast::Word>> {
     let mut lex = epsh::lexer::Lexer::new(line);
     lex.recognize_reserved = false;
 
@@ -2249,7 +2249,7 @@ fn expand_builtin_args(
 
 /// Change directory and run all post-cd hooks (OLDPWD, epsh sync, dir stack, denv, prompt).
 /// Returns 0 on success, 1 on failure.
-fn do_cd(target: &str, shell: &mut Shell) -> i32 {
+fn change_directory(target: &str, shell: &mut Shell) -> i32 {
     // Resolve ~ prefix
     let resolved = if target == "~" || target.is_empty() {
         shell.home.clone()
@@ -2259,10 +2259,10 @@ fn do_cd(target: &str, shell: &mut Shell) -> i32 {
         target.to_string()
     };
 
-    do_cd_path(Path::new(&resolved), shell)
+    change_directory_path(Path::new(&resolved), shell)
 }
 
-fn do_cd_path(target: &Path, shell: &mut Shell) -> i32 {
+fn change_directory_path(target: &Path, shell: &mut Shell) -> i32 {
     if let Err(e) = std::env::set_current_dir(target) {
         eprintln!("ish: cd: {}: {e}", target.display());
         return 1;
@@ -2410,7 +2410,7 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                 "l" => {
                     let l_args: Vec<String> =
                         args[1..].iter().map(|arg| arg.to_shell_string()).collect();
-                    let status = builtin::builtin_l(&l_args);
+                    let status = builtin::list_directory(&l_args);
                     return Ok(epsh::error::ExitStatus::from(status));
                 }
                 "c" => {
@@ -2597,7 +2597,7 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
 ///   single-arg that is a directory (and not an alias/builtin/executable) → "cd <arg>"
 fn maybe_rewrite_cd(line: &str, aliases: &AliasMap) -> String {
     let trimmed = line.trim();
-    let words = match parse_simple_command_words(trimmed) {
+    let words = match lex_simple_command_words(trimmed) {
         Some(words) => words,
         None => return line.to_string(),
     };

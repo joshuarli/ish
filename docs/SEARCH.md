@@ -53,7 +53,7 @@ matching dependency without an explicit design decision.
 The data model and filesystem search are in `src/complete.rs`:
 
 - `Completions` is an arena: all names are stored in `names`, while
-  `CompEntry` stores offsets, lengths, flags, and modification time.
+  `CompletionEntry` stores offsets, lengths, flags, and modification time.
 - `complete_path_into()` completes a filesystem path into a caller-owned arena.
 - `complete_candidates()` provides deterministic, filesystem-free filtering
   for tests and benchmarks.
@@ -81,7 +81,7 @@ Completion orchestration is in `src/main.rs`:
 - `render::render_completions()` draws the grid.
 
 Keep the warm path allocation-conscious. `complete_path_into()` exists so the
-shell can reuse `Shell::comp_buf`; use it instead of constructing a fresh
+shell can reuse `Shell::completion_buffer`; use it instead of constructing a fresh
 `Completions` value in per-keystroke code. If completion ordering changes,
 update `complete_candidates()` tests in `src/complete.rs` and the completion
 tests in `tests/integration.rs`/`tests/pty.rs`.

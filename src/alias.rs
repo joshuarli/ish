@@ -30,18 +30,18 @@ impl AliasMap {
         self.map.iter().map(|(k, v)| (k.as_str(), v.as_slice()))
     }
 
-    /// Expand aliases in the first word of a command line.
+    /// Expand aliases in the command name at the start of a command line.
     /// Returns the expanded line, or the original if no alias matched.
     /// Non-recursive: only the first word is checked.
     pub fn expand_line<'a>(&self, line: &'a str) -> std::borrow::Cow<'a, str> {
         let trimmed = line.trim_start();
-        let first_word = match trimmed.split_whitespace().next() {
+        let command_name = match trimmed.split_whitespace().next() {
             Some(w) => w,
             None => return std::borrow::Cow::Borrowed(line),
         };
-        if let Some(expansion) = self.get(first_word) {
+        if let Some(expansion) = self.get(command_name) {
             let leading_ws = &line[..line.len() - trimmed.len()];
-            let rest = &trimmed[first_word.len()..];
+            let rest = &trimmed[command_name.len()..];
             let expanded = expansion.join(" ");
             std::borrow::Cow::Owned(format!("{leading_ws}{expanded}{rest}"))
         } else {

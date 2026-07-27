@@ -1066,7 +1066,7 @@ fn line_editing_ctrl_k_and_ctrl_y() {
 }
 
 #[test]
-fn pipe_chain() {
+fn pipeline() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("echo 'abc def ghi' | /usr/bin/tr ' ' '\\n' | /usr/bin/wc -l");
     let text = PtyShell::strip_ansi(&out);
@@ -1074,7 +1074,7 @@ fn pipe_chain() {
 }
 
 #[test]
-fn and_chain() {
+fn and_or_list() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("true && echo yes");
     let text = PtyShell::strip_ansi(&out);
@@ -1082,7 +1082,7 @@ fn and_chain() {
 }
 
 #[test]
-fn or_chain() {
+fn or_list() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("false || echo fallback");
     let text = PtyShell::strip_ansi(&out);
@@ -1106,7 +1106,7 @@ fn redirect_output() {
 }
 
 #[test]
-fn l_builtin_lists_files() {
+fn l_lists_files() {
     let sh = PtyShell::spawn_with_opts(
         &[
             ("file_a.txt", "aaa"),
@@ -2195,7 +2195,7 @@ fn cd_minus_goes_back() {
 
 #[test]
 fn cd_tilde_subdir() {
-    // Regression: `cd ~/subdir` was broken because do_cd used format!("{}{rest}", home)
+    // Regression: `cd ~/subdir` was broken because change_directory used format!("{}{rest}", home)
     // (missing slash), producing e.g. `/tmp/homedir` instead of `/tmp/home/dir`.
     let sh = PtyShell::spawn_with_opts(&[("subdir/.keep", "")], &[]);
     sh.run_command("cd ~/subdir");
@@ -2221,7 +2221,7 @@ fn implicit_cd_quoted_path() {
 
 #[test]
 fn l_tilde_subdir() {
-    // Regression: `l ~/subdir` passed the literal "~/subdir" to builtin_l without tilde
+    // Regression: `l ~/subdir` passed the literal "~/subdir" to list_directory without tilde
     // expansion, producing "No such file or directory".
     let sh = PtyShell::spawn_with_opts(&[("subdir/file.txt", "hello")], &[]);
     let out = sh.run_command("l ~/subdir");
@@ -2256,7 +2256,7 @@ fn glob_expansion() {
 }
 
 #[test]
-fn builtin_l_glob_expansion() {
+fn l_glob_expansion() {
     let sh = PtyShell::spawn_with_opts(
         &[
             ("rust-toolchain.toml", ""),

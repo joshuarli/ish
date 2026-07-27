@@ -134,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_cd_chained() {
+    fn extract_cd_from_command_list() {
         assert_eq!(extract_cd_target("cd /tmp && ls"), Some("/tmp"));
         assert_eq!(extract_cd_target("cd src; make"), Some("src"));
     }

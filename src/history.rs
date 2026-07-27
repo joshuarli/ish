@@ -1302,7 +1302,11 @@ impl History {
             self.cwds[idx]
                 .as_deref()
                 .is_some_and(|entry_cwd| cwd.starts_with(entry_cwd))
-        }) { CWD_WEIGHT } else { 0 }
+        }) {
+            CWD_WEIGHT
+        } else {
+            0
+        }
     }
 
     fn can_stop_search(&self, results: &[FuzzyMatch], cwd: Option<&Path>) -> bool {
