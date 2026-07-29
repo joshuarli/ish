@@ -168,6 +168,10 @@ pub struct History {
     /// Set when the cache was corrupt at load time. Prevents overwriting the
     /// (possibly recoverable) cache file until the user resolves it.
     cache_dirty: bool,
+    /// Generation written by `history reset`; stale shells clear their
+    /// in-memory entries before they can persist them again.
+    reset_generation: u64,
+    reset_marker_modified: Option<std::time::SystemTime>,
 }
 
 impl History {
@@ -284,6 +288,7 @@ impl History {
         };
         let count = offsets.len();
 
+        let (reset_generation, reset_marker_modified) = read_reset_marker(path);
         Self {
             arena,
             offsets,
@@ -297,6 +302,8 @@ impl History {
             session_cutoff: 0,
             session_id: new_session_id(),
             cache_dirty: false,
+            reset_generation,
+            reset_marker_modified,
         }
     }
 
@@ -481,6 +488,7 @@ impl History {
             return None;
         }
 
+        let (reset_generation, reset_marker_modified) = read_reset_marker(path);
         Some(Self {
             arena,
             offsets,
@@ -494,6 +502,8 @@ impl History {
             session_cutoff: 0,
             session_id: new_session_id(),
             cache_dirty: false,
+            reset_generation,
+            reset_marker_modified,
         })
     }
 
@@ -561,6 +571,7 @@ impl History {
         }
 
         let count = offsets.len();
+        let (reset_generation, reset_marker_modified) = read_reset_marker(path);
         Some(Self {
             arena,
             offsets,
@@ -574,6 +585,8 @@ impl History {
             session_cutoff: 0,
             session_id: new_session_id(),
             cache_dirty: false,
+            reset_generation,
+            reset_marker_modified,
         })
     }
 
@@ -581,6 +594,7 @@ impl History {
     /// One stat() call to check for growth; reads only the new tail bytes.
     /// Called at each prompt and before Ctrl+R history search.
     pub fn sync(&mut self) {
+        self.sync_reset_marker();
         let file_size = match fs::metadata(&self.path) {
             Ok(m) => m.len(),
             Err(_) => return,
@@ -638,6 +652,35 @@ impl History {
         }
 
         self.file_pos = file_size;
+    }
+
+    fn sync_reset_marker(&mut self) {
+        let marker = reset_marker_for(&self.path);
+        let modified = fs::metadata(&marker).and_then(|m| m.modified()).ok();
+        if modified == self.reset_marker_modified {
+            return;
+        }
+
+        let generation = fs::read_to_string(&marker)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        self.reset_marker_modified = modified;
+        if generation == self.reset_generation {
+            return;
+        }
+
+        self.arena.clear();
+        self.offsets.clear();
+        self.timestamps.clear();
+        self.session_ids.clear();
+        self.cwds.clear();
+        self.index_by_hash.clear();
+        self.local.clear();
+        self.file_pos = 0;
+        self.session_cutoff = now_millis();
+        self.reset_generation = generation;
+        self.cache_dirty = false;
     }
 
     /// Write v5 binary cache, then truncate text file.
@@ -769,6 +812,36 @@ impl History {
         // lock released when lock_fd drops
     }
 
+    /// Delete all history and invalidate the in-memory state of other shells.
+    pub fn reset(&mut self) -> std::io::Result<()> {
+        let marker = reset_marker_for(&self.path);
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let generation = new_session_id();
+        let tmp = marker.with_extension("reset.tmp");
+        fs::write(&tmp, generation.to_string())?;
+        fs::rename(&tmp, &marker)?;
+
+        remove_if_present(&self.path)?;
+        remove_if_present(&cache_path_for(&self.path))?;
+
+        self.arena.clear();
+        self.offsets.clear();
+        self.timestamps.clear();
+        self.session_ids.clear();
+        self.cwds.clear();
+        self.index_by_hash.clear();
+        self.local.clear();
+        self.file_pos = 0;
+        self.session_cutoff = now_millis();
+        self.reset_generation = generation;
+        self.reset_marker_modified = fs::metadata(&marker).and_then(|m| m.modified()).ok();
+        self.cache_dirty = false;
+        Ok(())
+    }
+
     /// Create from pre-existing entries (for testing/benchmarks).
     pub fn from_entries(entries: Vec<String>) -> Self {
         let ts = now_millis();
@@ -804,6 +877,8 @@ impl History {
             session_cutoff: ts,
             session_id: new_session_id(),
             cache_dirty: false,
+            reset_generation: 0,
+            reset_marker_modified: None,
         }
     }
 
@@ -815,6 +890,7 @@ impl History {
 
     /// Add an entry with the directory in which it was entered.
     pub fn add_in_dir(&mut self, line: &str, cwd: Option<&Path>) {
+        self.sync_reset_marker();
         // Collapse newlines to spaces to prevent history file corruption.
         let line = line.trim().replace('\n', " ");
         let line = line.trim();
@@ -1886,6 +1962,32 @@ fn lock_path_for(path: &Path) -> PathBuf {
     name.push(".lock");
     p.set_file_name(name);
     p
+}
+
+fn reset_marker_for(path: &Path) -> PathBuf {
+    let mut p = path.to_path_buf();
+    let mut name = p.file_name().unwrap_or_default().to_os_string();
+    name.push(".reset");
+    p.set_file_name(name);
+    p
+}
+
+fn read_reset_marker(path: &Path) -> (u64, Option<std::time::SystemTime>) {
+    let marker = reset_marker_for(path);
+    let generation = fs::read_to_string(&marker)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+    let modified = fs::metadata(marker).and_then(|m| m.modified()).ok();
+    (generation, modified)
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]

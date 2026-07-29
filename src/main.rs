@@ -358,7 +358,9 @@ fn main() {
                 };
 
                 if handled {
-                    if history_line.trim() != "l" {
+                    let reset_history = first_command_word == "history"
+                        && line.split_whitespace().nth(1) == Some("reset");
+                    if history_line.trim() != "l" && !reset_history {
                         shell.history.add_in_dir(&history_line, Some(&history_cwd));
                     }
                     continue;
@@ -2379,6 +2381,13 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
             shell.last_status = 0;
             true
         }
+        Some("-h") | Some("--help") => {
+            println!("Usage: history [compact|rebuild|reset]");
+            println!();
+            println!("Show history, compact its storage, rebuild its cache, or reset it.");
+            shell.last_status = 0;
+            true
+        }
         Some("compact") => {
             shell.history.compact();
             shell.last_status = 0;
@@ -2387,6 +2396,16 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
         Some("rebuild") => {
             shell.history.rebuild();
             shell.last_status = 0;
+            true
+        }
+        Some("reset") => {
+            match shell.history.reset() {
+                Ok(()) => shell.last_status = 0,
+                Err(error) => {
+                    eprintln!("ish: history reset: {error}");
+                    shell.last_status = 1;
+                }
+            }
             true
         }
         Some(other) => {

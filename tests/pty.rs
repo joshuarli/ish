@@ -2318,6 +2318,16 @@ fn history_persisted_across_commands() {
 }
 
 #[test]
+fn history_help() {
+    let sh = PtyShell::spawn();
+    let text = PtyShell::strip_ansi(&sh.run_command("history -h"));
+    assert!(
+        text.contains("Usage: history [compact|rebuild|reset]"),
+        "expected history help text: {text:?}"
+    );
+}
+
+#[test]
 fn history_autosuggest_ignores_later_global_entries() {
     use std::io::Write;
 

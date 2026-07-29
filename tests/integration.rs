@@ -1492,6 +1492,32 @@ fn history_file_io() {
 }
 
 #[test]
+fn history_reset_invalidates_existing_shell_cache() {
+    let dir = tempdir_with_files(&[]);
+    let hist_file = dir.join("history");
+
+    let mut resetter = History::load_from(hist_file.clone());
+    resetter.add("old command");
+    let mut stale_shell = History::load_from(hist_file.clone());
+    assert_eq!(stale_shell.get(0), "old command");
+
+    resetter.reset().unwrap();
+    stale_shell.sync();
+    assert!(stale_shell.is_empty());
+
+    stale_shell.add("new command");
+    stale_shell.compact();
+    let mut fresh_shell = History::load_from(hist_file.clone());
+    assert_eq!(fresh_shell.len(), 1);
+    assert_eq!(fresh_shell.get(0), "new command");
+
+    fresh_shell.add("another new command");
+    fresh_shell.compact();
+    let persisted_shell = History::load_from(hist_file);
+    assert_eq!(persisted_shell.len(), 2);
+}
+
+#[test]
 fn history_up_arrow_uses_session_start_boundary() {
     let dir = tempdir_with_files(&[]);
     let hist_file = dir.join("history");

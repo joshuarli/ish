@@ -53,6 +53,11 @@ Fuzzy search opens a pager with matching characters highlighted in yellow. Up/Do
 
 Stored at `~/.local/share/ish/history`. Deduplicated on add.
 
+`history reset` deletes all saved history and invalidates cached history in
+other running ish shells.
+
+Run `history -h` for the available history storage commands.
+
 ### File Finder
 
 | Key | Action |
