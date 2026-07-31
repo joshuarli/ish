@@ -746,8 +746,14 @@ pub fn render_history_pager_cached(
 
     if can_diff {
         tw.hide_cursor();
-        for (i, m) in matches.iter().take(layout.max_results).enumerate() {
-            let row_key = history_row_key(m, i == selected);
+        for (i, m) in matches
+            .iter()
+            .skip(layout.scroll)
+            .take(layout.max_results)
+            .enumerate()
+        {
+            let abs_idx = layout.scroll + i;
+            let row_key = history_row_key(m, abs_idx == selected);
             if cache.rows[i] == row_key {
                 continue;
             }
@@ -794,11 +800,17 @@ pub fn render_history_pager_cached(
     }
 
     cache.rows.clear();
-    for (i, m) in matches.iter().take(layout.max_results).enumerate() {
+    for (i, m) in matches
+        .iter()
+        .skip(layout.scroll)
+        .take(layout.max_results)
+        .enumerate()
+    {
+        let abs_idx = layout.scroll + i;
         tw.carriage_return();
         tw.clear_to_end_of_line();
 
-        let row_key = history_row_key(m, i == selected);
+        let row_key = history_row_key(m, abs_idx == selected);
         if row_key.selected {
             tw.write_str("\x1b[7m"); // reverse video
         }

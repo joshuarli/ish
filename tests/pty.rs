@@ -1434,6 +1434,35 @@ fn history_ctrl_r_near_bottom_keeps_pager_stable() {
 }
 
 #[test]
+fn history_ctrl_r_scrolls_when_selection_passes_last_visible_entry() {
+    let history = &[
+        "hist01", "hist02", "hist03", "hist04", "hist05", "hist06", "hist07", "hist08", "hist09",
+        "hist10", "hist11", "hist12",
+    ];
+    let sh = PtyShell::spawn_with_size(&[], history, 8, 20);
+
+    sh.ctrl_r();
+    let mut out = sh.wait_for("search:", 2000);
+    for _ in 0..11 {
+        sh.down();
+    }
+    out.push_str(&sh.read_timeout(500));
+
+    let screen = Screen::render(&out, 8, 20);
+    assert!(
+        screen.contains("hist01"),
+        "expected the last history entry: {screen:?}"
+    );
+    assert!(
+        !screen.contains("hist12"),
+        "pager did not scroll down: {screen:?}"
+    );
+
+    sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
 fn history_ctrl_r_near_bottom_query_edits_do_not_stack_headers() {
     let history = &[
         "gh auth login",
