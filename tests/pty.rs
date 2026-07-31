@@ -933,6 +933,25 @@ fn echo_command() {
 }
 
 #[test]
+fn broken_interpreter_reports_bad_interpreter() {
+    let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("badscript");
+        let interp = bin.join("missing-interp");
+        std::fs::write(&script, format!("#!{}\n", interp.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    });
+    let out = sh.run_command("./bin/badscript");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("bad interpreter") && text.contains("missing-interp"),
+        "expected bash-style bad interpreter message, got: {text:?}"
+    );
+}
+
+#[test]
 fn pwd_builtin() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("pwd");

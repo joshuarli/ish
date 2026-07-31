@@ -14,6 +14,16 @@ The main loop flow:
 4. `epsh.run_script(&expanded)` — epsh does everything else
 5. Observe state changes (cwd, exit status) and run hooks
 
+## Exec Error Reporting
+
+Because ish replaces `eval_external` with its own handler (issue #2 below), it
+must reproduce epsh's exec error messages itself. Spawn failures in the handler
+call `epsh::eval::bad_interpreter_message` (`src/main.rs`, `make_external_handler`)
+so a script whose `#!` interpreter is broken reports
+`cmd: interp: bad interpreter: <errno>` like the default exec path. The same
+function is used by `eval::handle_exec_error` in epsh (`src/eval.rs`), which is
+why the message format stays in sync.
+
 ## Known Issues
 
 ### 1. ~~Environment variable sync~~ (RESOLVED)

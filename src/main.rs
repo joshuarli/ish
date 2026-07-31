@@ -2796,6 +2796,20 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                     }
                 }
                 Err(e) => {
+                    if let Some(code) = e.raw_os_error() {
+                        // Match epsh's default exec error reporting: an executable
+                        // script whose interpreter is broken surfaces as a bare
+                        // ENOTDIR/ENOENT/EACCES.
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        let path_env = std::env::var("PATH")
+                            .unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+                        if let Some(msg) =
+                            epsh::eval::bad_interpreter_message(&name, code, &cwd, &path_env)
+                        {
+                            eprintln!("{msg}");
+                            return Ok(epsh::error::ExitStatus::NOT_EXECUTABLE);
+                        }
+                    }
                     if e.kind() == std::io::ErrorKind::NotFound {
                         eprintln!("{name}: not found");
                         Ok(epsh::error::ExitStatus::NOT_FOUND)
