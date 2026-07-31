@@ -18,6 +18,7 @@ struct PtyShell {
     master: OwnedFd,
     child: libc::pid_t,
     _home: TempDir,
+    startup_output: String,
 }
 
 /// Minimal RAII temp dir.
@@ -197,19 +198,24 @@ impl PtyShell {
 
         let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
 
-        let sh = PtyShell {
+        let mut sh = PtyShell {
             master,
             child: pid,
             _home: home,
+            startup_output: String::new(),
         };
 
         // Wait for the initial prompt
-        sh.wait_for_prompt(3000);
+        sh.startup_output = sh.wait_for_prompt(3000);
         sh
     }
 
     fn home_path(&self) -> &Path {
         self._home.path()
+    }
+
+    fn startup_output(&self) -> &str {
+        &self.startup_output
     }
 
     fn master_fd(&self) -> RawFd {
@@ -773,7 +779,18 @@ struct TraceStep<'a> {
 }
 
 fn run_trace(sh: &PtyShell, rows: u16, cols: u16, steps: &[TraceStep<'_>]) -> Vec<TraceFrame> {
+    run_trace_with_initial_output(sh, rows, cols, steps, "")
+}
+
+fn run_trace_with_initial_output(
+    sh: &PtyShell,
+    rows: u16,
+    cols: u16,
+    steps: &[TraceStep<'_>],
+    initial_output: &str,
+) -> Vec<TraceFrame> {
     let mut screen = Screen::new(rows, cols);
+    screen.apply_output(initial_output);
     let mut frames = Vec::with_capacity(steps.len());
 
     for step in steps {
@@ -1292,6 +1309,93 @@ fn history_ctrl_r_narrow_repaint_does_not_stack_rows() {
     assert_screen_contains_once(&screen, "abc2");
     assert_screen_contains_once(&screen, "abc3");
 
+    sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
+fn history_search_selection_preserves_cursor_after_typing() {
+    let history = &[
+        "abcdefghi0",
+        "abcdefghi1",
+        "abcdefghi2",
+        "abcdefghi3",
+        "abcdefghi4",
+        "abcdefghi5",
+        "abcdefghi6",
+        "abcdefghi7",
+        "abcdefghi8",
+        "abcdefghi9",
+    ];
+    let sh = PtyShell::spawn_with_size(&[], history, 24, 10);
+    let fill_cmd = (1..=14)
+        .map(|i| format!("echo fill{i:02}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut initial_output = sh.startup_output().to_string();
+    initial_output.push_str(&sh.run_command(&fill_cmd));
+    let frames = run_trace_with_initial_output(
+        &sh,
+        24,
+        10,
+        &[
+            TraceStep {
+                label: "open search",
+                input: TraceInput::Bytes(b"\x12"),
+                settle_ms: 0,
+                read_ms: 500,
+            },
+            TraceStep {
+                label: "type abc",
+                input: TraceInput::Text("abc"),
+                settle_ms: 100,
+                read_ms: 500,
+            },
+            TraceStep {
+                label: "select next",
+                input: TraceInput::Bytes(b"\x1b[B"),
+                settle_ms: 100,
+                read_ms: 500,
+            },
+            TraceStep {
+                label: "type x",
+                input: TraceInput::Text("x"),
+                settle_ms: 100,
+                read_ms: 500,
+            },
+        ],
+        &initial_output,
+    );
+    let query_frame = &frames[1];
+    let selection_frame = &frames[2];
+    assert_eq!(
+        selection_frame.snapshot.cursor_row, query_frame.snapshot.cursor_row,
+        "selection redraw moved the visual cursor to a different row: query={:?} selection={:?}",
+        query_frame.snapshot, selection_frame.snapshot
+    );
+    assert_eq!(
+        selection_frame.snapshot.cursor_col, query_frame.snapshot.cursor_col,
+        "selection redraw moved the visual cursor to a different column: query={:?} selection={:?}",
+        query_frame.snapshot, selection_frame.snapshot
+    );
+
+    let typed_frame = &frames[3];
+    assert_eq!(
+        typed_frame.snapshot.cursor_row, query_frame.snapshot.cursor_row,
+        "typing after selection left the visual cursor on the wrong row: {:?}",
+        typed_frame.snapshot
+    );
+    assert_eq!(
+        typed_frame.snapshot.cursor_col,
+        query_frame.snapshot.cursor_col + 1,
+        "typing after selection left the visual cursor at the wrong column: {:?}",
+        typed_frame.snapshot
+    );
+    assert!(
+        typed_frame.snapshot.visible.contains("search: ab\ncx"),
+        "the query buffer should contain the typed character: {:?}",
+        typed_frame.snapshot
+    );
     sh.escape();
     sh.wait_for_prompt(2000);
 }

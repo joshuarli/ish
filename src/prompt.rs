@@ -99,18 +99,15 @@ impl Prompt {
     pub fn display_len(&self, prompt_str: &str) -> usize {
         let mut len = 0;
         let mut in_escape = false;
-        // Byte-based: prompt is ASCII + ANSI escapes. Non-ASCII chars
-        // (if any) are each one display column, same as the byte count.
-        for &b in prompt_str.as_bytes() {
+        for c in prompt_str.chars() {
             if in_escape {
-                if b == b'm' {
+                if c == 'm' {
                     in_escape = false;
                 }
-            } else if b == 0x1b {
+            } else if c == '\x1b' {
                 in_escape = true;
-            } else if b & 0xC0 != 0x80 {
-                // Count lead bytes (ASCII or UTF-8 start), skip continuation bytes
-                len += 1;
+            } else {
+                len += crate::line::char_width(c);
             }
         }
         len

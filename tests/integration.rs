@@ -922,7 +922,7 @@ fn prompt_display_len_multiple_escapes() {
 #[test]
 fn prompt_display_len_utf8() {
     let p = prompt::Prompt::new();
-    assert_eq!(p.display_len("日本語"), 3);
+    assert_eq!(p.display_len("日本語"), 6);
 }
 
 #[test]

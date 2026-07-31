@@ -75,6 +75,17 @@ fn restore_cursor_from_end(tw: &mut TermWriter, rows_up: u16, cursor_col: u16) {
     }
 }
 
+fn restore_cursor_from_anchor(tw: &mut TermWriter, region: RenderedRegion) {
+    tw.restore_cursor();
+    if region.cursor_row > 0 {
+        tw.move_cursor_down(region.cursor_row);
+    }
+    tw.carriage_return();
+    if region.cursor_col > 0 {
+        tw.move_cursor_right(region.cursor_col);
+    }
+}
+
 fn cursor_move_seq_len(n: u16) -> usize {
     if n == 0 {
         return 0;
@@ -92,14 +103,7 @@ fn restore_cursor_smart(tw: &mut TermWriter, region: RenderedRegion, rows_up_fro
     let anchor_cost = 2 + cursor_move_seq_len(region.cursor_row);
     let end_cost = cursor_move_seq_len(rows_up_from_end);
     if anchor_cost < end_cost {
-        tw.restore_cursor();
-        if region.cursor_row > 0 {
-            tw.move_cursor_down(region.cursor_row);
-        }
-        tw.carriage_return();
-        if region.cursor_col > 0 {
-            tw.move_cursor_right(region.cursor_col);
-        }
+        restore_cursor_from_anchor(tw, region);
     } else {
         restore_cursor_from_end(tw, rows_up_from_end, region.cursor_col);
     }
@@ -147,6 +151,8 @@ struct HistoryHeaderKey {
     query_hash: u64,
     query_len: usize,
     query_cursor: usize,
+    term_rows: u16,
+    term_cols: u16,
     header_rows: u16,
     needs_forced_wrap: bool,
 }
@@ -183,6 +189,8 @@ fn history_header_key(query: &str, query_cursor: usize, layout: &PagerLayout) ->
         query_hash: hash_text(query),
         query_len: query.len(),
         query_cursor,
+        term_rows: layout.term_rows,
+        term_cols: layout.term_cols,
         header_rows: layout.header_rows,
         needs_forced_wrap: layout.needs_forced_wrap,
     }
@@ -211,6 +219,8 @@ struct PagerLayout {
     max_results: usize,
     max_width: usize,
     scroll: usize,
+    term_rows: u16,
+    term_cols: u16,
 }
 
 struct PagerInput {
@@ -331,7 +341,7 @@ fn layout_multiline_prompt(
 }
 
 fn layout_pager(input: PagerInput) -> PagerLayout {
-    let cols = input.term_cols as usize;
+    let cols = (input.term_cols as usize).max(1);
     let header_before_cursor = input.prefix_width + input.query_cursor;
     let header_full = input.prefix_width + input.query_width + input.suffix_width;
     let header_rows = header_full.saturating_sub(1) / cols + 1;
@@ -359,8 +369,10 @@ fn layout_pager(input: PagerInput) -> PagerLayout {
         header_rows: header_rows as u16,
         needs_forced_wrap: header_full > 0 && header_full.is_multiple_of(cols),
         max_results,
-        max_width: input.term_cols as usize - 2,
+        max_width: (input.term_cols as usize).saturating_sub(2),
         scroll,
+        term_rows: input.term_rows,
+        term_cols: input.term_cols,
     }
 }
 
@@ -415,7 +427,7 @@ pub fn render_line(
     opts: &RenderOpts,
 ) -> RenderedRegion {
     let text = line.text();
-    let cols = term_cols as usize;
+    let cols = (term_cols as usize).max(1);
 
     // Multiline path: buffer contains explicit newlines
     if text.contains('\n') {
@@ -757,7 +769,9 @@ pub fn render_history_pager_cached(
             tw.clear_to_end_of_line();
             cache.rows[i] = row_key;
         }
-        restore_cursor_from_end(tw, layout.rows_up_from_end, layout.region.cursor_col);
+        // Row diffs leave the terminal cursor on the last changed row, not at
+        // the pager's bottom edge, so restore from the saved anchor.
+        restore_cursor_from_anchor(tw, layout.region);
         tw.show_cursor();
         return RenderedRegion {
             anchored: true,
