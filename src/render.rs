@@ -2,6 +2,7 @@ use crate::complete::CompletionState;
 use crate::history::{FuzzyMatch, History};
 use crate::line::LineBuffer;
 use crate::term::TermWriter;
+use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Geometry for a rendered region, relative to the region's top row.
@@ -205,12 +206,14 @@ fn history_row_key(m: &FuzzyMatch, selected: bool) -> HistoryRowKey {
     }
 }
 
+#[derive(Debug)]
 struct PromptLayout {
     region: RenderedRegion,
     rows_up_from_end: u16,
     needs_forced_wrap: bool,
 }
 
+#[derive(Debug)]
 struct PagerLayout {
     region: RenderedRegion,
     rows_up_from_end: u16,
@@ -234,6 +237,7 @@ struct PagerInput {
     term_cols: u16,
 }
 
+#[derive(Debug)]
 struct CompletionGridLayout {
     visible_rows: usize,
     scroll_start: usize,
@@ -411,6 +415,62 @@ fn layout_completion_grid(state: &CompletionState) -> CompletionGridLayout {
         scroll_start,
         col_widths,
     }
+}
+
+/// Dump the computed prompt geometry without writing terminal control sequences.
+/// This is kept next to the layout functions so diagnostics describe the same
+/// values that the renderer uses.
+pub fn debug_dump_prompt_layout(
+    out: &mut String,
+    prompt_display_len: usize,
+    line: &LineBuffer,
+    suggestion_display_len: usize,
+    term_cols: u16,
+) {
+    let cols = (term_cols as usize).max(1);
+    let layout = if line.has_newlines() {
+        layout_multiline_prompt(prompt_display_len, line, cols)
+    } else {
+        layout_single_line_prompt(prompt_display_len, line, suggestion_display_len, cols)
+    };
+    let _ = writeln!(out, "prompt_layout: {layout:?}");
+}
+
+/// Dump the computed pager geometry used by history, file finder, and directory picker.
+pub fn debug_dump_pager_layout(
+    out: &mut String,
+    prefix_width: usize,
+    query_width: usize,
+    suffix_width: usize,
+    query_cursor: usize,
+    total_entries: usize,
+    selected: usize,
+    term_rows: u16,
+    term_cols: u16,
+) {
+    let layout = layout_pager(PagerInput {
+        prefix_width,
+        query_width,
+        suffix_width,
+        query_cursor,
+        total_entries,
+        selected,
+        term_rows,
+        term_cols,
+    });
+    let _ = writeln!(out, "pager_layout: {layout:?}");
+}
+
+/// Dump the computed completion grid geometry.
+pub fn debug_dump_completion_layout(out: &mut String, state: &CompletionState) {
+    let layout = layout_completion_grid(state);
+    let _ = writeln!(out, "completion_grid_layout: {layout:?}");
+}
+
+/// Dump cached history-search layout keys used to decide whether a row redraw is safe.
+pub fn debug_dump_history_cache(out: &mut String, cache: &HistoryPagerCache) {
+    let _ = writeln!(out, "history_cache.header: {:?}", cache.header);
+    let _ = writeln!(out, "history_cache.rows: {:?}", cache.rows);
 }
 
 /// Render the prompt + line buffer. Positions cursor correctly.

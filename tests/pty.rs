@@ -945,6 +945,35 @@ fn pwd_builtin() {
 }
 
 #[test]
+fn ish_dump_writes_layout_state() {
+    let sh = PtyShell::spawn();
+    let out = sh.run_command("ish-dump");
+    let text = PtyShell::strip_ansi(&out);
+    let path_text = text
+        .split("ish-dump: wrote ")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .expect("ish-dump should report its output path")
+        .trim();
+    let path = Path::new(path_text);
+
+    assert_eq!(
+        path.parent(),
+        Some(sh.home_path().join(".cache/ish").as_path())
+    );
+    let filename = path.file_name().unwrap().to_str().unwrap();
+    assert!(filename.strip_prefix("dump-").is_some_and(|suffix| {
+        suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }));
+
+    let dump = std::fs::read_to_string(path).expect("ish-dump file should be readable");
+    assert!(dump.contains("ish layout dump"));
+    assert!(dump.contains("terminal.rows: 24"));
+    assert!(dump.contains("mode: normal"));
+    assert!(dump.contains("line.text: \"ish-dump\""));
+}
+
+#[test]
 fn cd_and_pwd() {
     let sh = PtyShell::spawn_with_opts(&[], &[]);
     // Create a subdir

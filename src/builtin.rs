@@ -16,6 +16,7 @@ const ISH_EXTENSION_BUILTINS: &[&str] = &[
     "history",
     "alias",
     "denv",
+    "ish-dump",
 ];
 
 pub fn is_ish_extension_builtin(name: &str) -> bool {

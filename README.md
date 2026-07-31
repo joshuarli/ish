@@ -141,6 +141,7 @@ Expansion order: tilde, parameter expansion, command substitution, pathname expa
 | `pwd` | Print working directory |
 | `true` / `false` | Return 0 / 1 |
 | `copy-scrollback` | Copy session to clipboard via OSC 52 |
+| `ish-dump` | Write the current layout state to `~/.cache/ish/dump-<random hex>` |
 
 ### `l` — Native Directory Listing
 

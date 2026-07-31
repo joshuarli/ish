@@ -2,6 +2,7 @@ use std::os::fd::BorrowedFd;
 
 /// Completion entry — mtime + u32 offset + u8 len + u8 display_width + u8 flags.
 /// name_len is u8: NAME_MAX is 255 on Linux/macOS.
+#[derive(Debug)]
 pub struct CompletionEntry {
     mtime: i64, // st_mtime from stat(), 0 for non-path entries (hosts, builtins)
     name_start: u32,

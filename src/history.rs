@@ -1473,6 +1473,7 @@ fn lowercase_query(query: &str) -> Vec<char> {
     query.chars().flat_map(|c| c.to_lowercase()).collect()
 }
 
+#[derive(Debug)]
 pub struct FuzzyMatch {
     pub entry_idx: usize,
     /// Matched character indices (as u16 — entries are always <64K chars).

@@ -10,6 +10,7 @@ use ish::{
 };
 use std::cell::RefCell;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -43,6 +44,7 @@ struct Shell {
     signal_fd: RawFd,
     home: String,
     session_log: String,
+    layout_dump: String,
     epsh: epsh::eval::Shell,
     shell_pid: i32,
 }
@@ -193,6 +195,7 @@ fn main() {
         signal_fd,
         home: home.clone(),
         session_log: String::new(),
+        layout_dump: String::new(),
         epsh,
         shell_pid,
     };
@@ -287,6 +290,10 @@ fn main() {
                         let _ = std::io::stdout().write_all(osc.as_bytes());
                         let _ = std::io::stdout().flush();
                         shell.last_status = 0;
+                        true
+                    }
+                    "ish-dump" => {
+                        shell.last_status = write_layout_dump(&shell);
                         true
                     }
                     "denv" => {
@@ -412,6 +419,244 @@ fn main() {
             ReadResult::Empty => {}
         }
     }
+}
+
+fn capture_layout_dump(
+    shell: &mut Shell,
+    mode: &Mode,
+    line: &LineBuffer,
+    prompt_str: &str,
+    prompt_display_len: usize,
+    region: render::RenderedRegion,
+    history_cache: &render::HistoryPagerCache,
+) {
+    let suggestion_display_len =
+        if line.text().len() >= 3 && !line.has_newlines() && line.cursor() == line.text().len() {
+            shell
+                .history
+                .session_prefix_search(line.text(), 0)
+                .and_then(|entry| entry.strip_prefix(line.text()))
+                .map(ish::line::str_width)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+    shell.layout_dump.clear();
+    let out = &mut shell.layout_dump;
+    let _ = writeln!(out, "ish layout dump");
+    let _ = writeln!(out, "version: {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(out, "terminal.rows: {}", shell.rows);
+    let _ = writeln!(out, "terminal.cols: {}", shell.cols);
+    let _ = writeln!(out, "prompt.text: {prompt_str:?}");
+    let _ = writeln!(out, "prompt.display_len: {prompt_display_len}");
+    let _ = writeln!(out, "line.text: {:?}", line.text());
+    let _ = writeln!(out, "line.bytes: {}", line.text().len());
+    let _ = writeln!(out, "line.cursor_byte: {}", line.cursor());
+    let _ = writeln!(
+        out,
+        "line.cursor_display_col: {}",
+        line.display_cursor_pos()
+    );
+    let _ = writeln!(out, "line.display_len: {}", line.display_len());
+    let _ = writeln!(out, "line.has_newlines: {}", line.has_newlines());
+    let _ = writeln!(out, "rendered_region: {region:?}");
+    let _ = writeln!(out, "mode: {}", mode_name(mode));
+    render::debug_dump_prompt_layout(
+        out,
+        prompt_display_len,
+        line,
+        suggestion_display_len,
+        shell.cols,
+    );
+
+    match mode {
+        Mode::Normal => {}
+        Mode::Completion { state, base_line } => {
+            let _ = writeln!(out, "completion.base_line.text: {:?}", base_line.text());
+            let _ = writeln!(
+                out,
+                "completion.base_line.cursor_byte: {}",
+                base_line.cursor()
+            );
+            let _ = writeln!(out, "completion.selected: {}", state.selected);
+            let _ = writeln!(out, "completion.cols: {}", state.cols);
+            let _ = writeln!(out, "completion.rows: {}", state.rows);
+            let _ = writeln!(out, "completion.scroll: {}", state.scroll);
+            let _ = writeln!(out, "completion.term_cols: {}", state.term_cols);
+            let _ = writeln!(out, "completion.dir_prefix: {:?}", state.dir_prefix);
+            let _ = writeln!(out, "completion.in_quote: {}", state.in_quote);
+            let _ = writeln!(out, "completion.names: {:?}", state.comp.names);
+            let _ = writeln!(out, "completion.entries: {:?}", state.comp.entries);
+            render::debug_dump_completion_layout(out, state);
+        }
+        Mode::HistorySearch {
+            query,
+            matches,
+            candidates,
+            scratch,
+            candidate_stack,
+            selected,
+            saved_line,
+        } => {
+            let _ = writeln!(out, "history.query.text: {:?}", query.text());
+            let _ = writeln!(out, "history.query.cursor_byte: {}", query.cursor());
+            let _ = writeln!(
+                out,
+                "history.query.cursor_display_col: {}",
+                query.display_cursor_pos()
+            );
+            let _ = writeln!(out, "history.matches: {:?}", matches);
+            let _ = writeln!(out, "history.candidates: {candidates:?}");
+            let _ = writeln!(out, "history.scratch: {scratch:?}");
+            let _ = writeln!(out, "history.candidate_stack: {candidate_stack:?}");
+            let _ = writeln!(out, "history.selected: {selected}");
+            let _ = writeln!(out, "history.saved_line: {saved_line:?}");
+            render::debug_dump_pager_layout(
+                out,
+                ish::line::str_width("search: "),
+                ish::line::str_width(query.text()),
+                0,
+                query.display_cursor_pos(),
+                matches.len(),
+                *selected,
+                shell.rows,
+                shell.cols,
+            );
+        }
+        Mode::FileFinder {
+            query,
+            all_entries,
+            filtered,
+            selected,
+            saved_line,
+            saved_cursor,
+            hidden,
+            ..
+        } => {
+            let query_phase = query.text().len() < 3;
+            let prefix = if *hidden {
+                "find (hidden): "
+            } else if query_phase && query.text().is_empty() {
+                "find (ctrl+f toggle hidden): "
+            } else {
+                "find: "
+            };
+            let suffix = if !query_phase && filtered.is_empty() && !query.text().is_empty() {
+                "  (no matches)"
+            } else {
+                ""
+            };
+            let _ = writeln!(out, "finder.query.text: {:?}", query.text());
+            let _ = writeln!(out, "finder.query.cursor_byte: {}", query.cursor());
+            let _ = writeln!(out, "finder.all_entries: {all_entries:?}");
+            let _ = writeln!(out, "finder.filtered: {filtered:?}");
+            let _ = writeln!(out, "finder.selected: {selected}");
+            let _ = writeln!(out, "finder.saved_line: {saved_line:?}");
+            let _ = writeln!(out, "finder.saved_cursor: {saved_cursor}");
+            let _ = writeln!(out, "finder.hidden: {hidden}");
+            let _ = writeln!(out, "finder.handle: active");
+            render::debug_dump_pager_layout(
+                out,
+                ish::line::str_width(prefix),
+                ish::line::str_width(query.text()),
+                ish::line::str_width(suffix),
+                query.display_cursor_pos(),
+                filtered.len(),
+                *selected,
+                shell.rows,
+                shell.cols,
+            );
+        }
+        Mode::DirPicker { entries, selected } => {
+            let _ = writeln!(out, "dir_picker.entries: {entries:?}");
+            let _ = writeln!(out, "dir_picker.selected: {selected}");
+            render::debug_dump_pager_layout(
+                out,
+                ish::line::str_width("dirs:"),
+                0,
+                0,
+                0,
+                entries.len(),
+                *selected,
+                shell.rows,
+                shell.cols,
+            );
+        }
+    }
+
+    render::debug_dump_history_cache(out, history_cache);
+}
+
+fn mode_name(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::Normal => "normal",
+        Mode::Completion { .. } => "completion",
+        Mode::HistorySearch { .. } => "history_search",
+        Mode::FileFinder { .. } => "file_finder",
+        Mode::DirPicker { .. } => "dir_picker",
+    }
+}
+
+fn write_layout_dump(shell: &Shell) -> i32 {
+    if shell.home.is_empty() {
+        eprintln!("ish-dump: HOME is not set");
+        return 1;
+    }
+
+    let dir = Path::new(&shell.home).join(".cache/ish");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("ish-dump: could not create {}: {error}", dir.display());
+        return 1;
+    }
+
+    for _ in 0..8 {
+        let path = dir.join(format!("dump-{}", random_dump_hex()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        let Ok(mut file) = file else {
+            continue;
+        };
+        if let Err(error) = std::io::Write::write_all(&mut file, shell.layout_dump.as_bytes()) {
+            eprintln!("ish-dump: could not write {}: {error}", path.display());
+            return 1;
+        }
+        println!("ish-dump: wrote {}", path.display());
+        return 0;
+    }
+
+    eprintln!(
+        "ish-dump: could not choose a unique dump filename in {}",
+        dir.display()
+    );
+    1
+}
+
+fn random_dump_hex() -> String {
+    let mut bytes = [0u8; 16];
+    let random_read = std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes));
+    if random_read.is_err() {
+        let mut value = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            ^ (rustix::process::getpid().as_raw_pid() as u128);
+        for byte in &mut bytes {
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            *byte = value as u8;
+        }
+    }
+
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Read an env var via libc::getenv — zero allocation (returns &str into env block).
@@ -581,6 +826,15 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         ) {
                             KeyAction::Continue => {}
                             KeyAction::Execute(text) => {
+                                capture_layout_dump(
+                                    shell,
+                                    &mode,
+                                    &line,
+                                    &prompt_str,
+                                    prompt_display_len,
+                                    region,
+                                    &history_cache,
+                                );
                                 // Clear autosuggestion ghost text before freezing the line
                                 if line.cursor() == line.text().len() {
                                     tw.write_str("\x1b[J");
