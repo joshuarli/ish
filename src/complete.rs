@@ -922,8 +922,11 @@ pub fn complete_remote_path(host: &str, path_prefix: &str, comp: &mut Completion
                     tv_sec: 0,
                     tv_nsec: 100_000_000,
                 };
-                let _ = rustix::event::poll(&mut pfd, Some(&timeout));
-                continue;
+                match rustix::event::poll(&mut pfd, Some(&timeout)) {
+                    Ok(_) => continue,
+                    Err(err) if err == rustix::io::Errno::INTR => continue,
+                    Err(_) => break,
+                }
             }
             Err(err) if err == rustix::io::Errno::INTR => continue,
             Err(_) => break,

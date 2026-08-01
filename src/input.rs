@@ -108,8 +108,7 @@ enum PollResult {
     Stdin,
     Signal,
     Timeout,
-    Error,
-    /// stdin fd has POLLHUP without POLLIN — master side closed, treat as EOF.
+    /// stdin fd has POLLHUP without POLLIN, or polling failed fatally — treat as EOF.
     StdinHup,
 }
 
@@ -215,7 +214,7 @@ impl InputReader {
                         return InputEvent::Signal(sig);
                     }
                 }
-                PollResult::Timeout | PollResult::Error => {}
+                PollResult::Timeout => {}
                 PollResult::StdinHup => {
                     // PTY master closed (or stdin EOF) — synthesise Ctrl+D so the
                     // shell exits cleanly rather than spinning in poll forever.
@@ -281,7 +280,7 @@ impl InputReader {
                     return Some(InputEvent::Signal(sig));
                 }
             }
-            PollResult::Timeout | PollResult::Error => {}
+            PollResult::Timeout => {}
             PollResult::StdinHup => {
                 return Some(InputEvent::Key(KeyEvent::ctrl('d')));
             }
@@ -307,7 +306,7 @@ impl InputReader {
             let n = match rustix::event::poll(&mut fds, timeout.as_ref()) {
                 Ok(n) => n,
                 Err(e) if e == rustix::io::Errno::INTR => continue,
-                Err(_) => return PollResult::Error,
+                Err(_) => return PollResult::StdinHup,
             };
             if n == 0 {
                 return PollResult::Timeout;
@@ -323,7 +322,7 @@ impl InputReader {
             if fds[0].revents().contains(rustix::event::PollFlags::HUP) {
                 return PollResult::StdinHup;
             }
-            return PollResult::Error;
+            return PollResult::StdinHup;
         }
     }
 
