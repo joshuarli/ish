@@ -290,7 +290,11 @@ impl InputReader {
     }
 
     fn poll(&self, timeout_ms: i32) -> PollResult {
-        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        self.poll_fds(STDIN_FD, timeout_ms)
+    }
+
+    fn poll_fds(&self, stdin_fd: RawFd, timeout_ms: i32) -> PollResult {
+        let stdin = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
         let signal = unsafe { BorrowedFd::borrow_raw(self.signal_fd) };
         let mut fds = [
             rustix::event::PollFd::from_borrowed_fd(stdin, rustix::event::PollFlags::IN),
@@ -299,12 +303,8 @@ impl InputReader {
         loop {
             // SAFETY: poll on two valid fds (stdin + signal pipe). Returns
             // count of ready fds, 0 on timeout, -1 on error.
-            let timeout_ms = timeout_ms.max(0) as i64;
-            let timeout = rustix::event::Timespec {
-                tv_sec: timeout_ms / 1000,
-                tv_nsec: (timeout_ms % 1000) * 1_000_000,
-            };
-            let n = match rustix::event::poll(&mut fds, Some(&timeout)) {
+            let timeout = poll_timeout(timeout_ms);
+            let n = match rustix::event::poll(&mut fds, timeout.as_ref()) {
                 Ok(n) => n,
                 Err(e) if e == rustix::io::Errno::INTR => continue,
                 Err(_) => return PollResult::Error,
@@ -623,6 +623,17 @@ impl InputReader {
     }
 }
 
+fn poll_timeout(timeout_ms: i32) -> Option<rustix::event::Timespec> {
+    if timeout_ms < 0 {
+        return None;
+    }
+    let timeout_ms = timeout_ms as i64;
+    Some(rustix::event::Timespec {
+        tv_sec: timeout_ms / 1000,
+        tv_nsec: (timeout_ms % 1000) * 1_000_000,
+    })
+}
+
 pub fn modifier_from_param(param: u32) -> Modifiers {
     let bits = param.saturating_sub(1);
     Modifiers {
@@ -635,6 +646,8 @@ pub fn modifier_from_param(param: u32) -> Modifiers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn modifier_parsing() {
@@ -709,5 +722,24 @@ mod tests {
         reader.csi_to_key(b'~', &[201]);
         assert!(!reader.in_paste());
         assert!(reader.paste_limit_hit);
+    }
+
+    #[test]
+    fn blocking_poll_waits_for_signal() {
+        let (stdin_read, _stdin_write) = rustix::pipe::pipe().unwrap();
+        let (signal_read, signal_write) = rustix::pipe::pipe().unwrap();
+        let reader = InputReader::new(signal_read.as_raw_fd());
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            rustix::io::write(&signal_write, b"x").unwrap();
+        });
+
+        let started = Instant::now();
+        assert!(matches!(
+            reader.poll_fds(stdin_read.as_raw_fd(), -1),
+            PollResult::Signal
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(25));
+        writer.join().unwrap();
     }
 }
