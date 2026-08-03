@@ -159,7 +159,7 @@ impl PtyShell {
                 libc::close(master_fd);
                 libc::setsid();
                 #[cfg(target_os = "linux")]
-                libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_int, 0);
+                libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
                 #[cfg(not(target_os = "linux"))]
                 libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
                 libc::dup2(slave_fd, 0);

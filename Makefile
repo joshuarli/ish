@@ -6,12 +6,24 @@ TARGET     ?= $(subst -unknown-linux-gnu,-unknown-linux-musl,$(HOST))
 MUSL_LOADER := $(if $(findstring x86_64,$(TARGET)),/lib/ld-musl-x86_64.so.1,/lib/ld-musl-aarch64.so.1)
 MUSL_NATIVE_RUSTFLAGS := $(if $(findstring -linux-musl,$(TARGET)),-L native=/usr/lib)
 TARGET_ENV := $(shell echo $(TARGET) | tr '[:lower:]-' '[:upper:]_')
-MUSL_CRT_DIR := /usr/lib/e-crt/$(TARGET)
-LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
+# Fedora's musl cross packages use /usr/<arch>-linux-musl/lib64, while the
+# e-crt layout is used by other toolchains. Keep this overridable for hosts
+# with a different musl sysroot layout.
+MUSL_CRT_DIR ?= $(shell for dir in \
+	/usr/lib/e-crt/$(TARGET) \
+	/usr/$(subst -unknown,,$(TARGET))/lib64 \
+	/usr/$(subst -unknown,,$(TARGET))/lib; do \
+	if test -f "$$dir/crt1.o"; then printf '%s' "$$dir"; break; fi; \
+done)
+# LLVM helper binaries run on the build host; they are not installed in the
+# target triple's rustlib directory when cross-compiling to musl.
+LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(HOST)/bin
+MUSL_LINKER := $(LLVM_BIN)/rust-lld
+MUSL_TARGET_LIBDIR := $(shell rustc --print target-libdir --target $(TARGET))
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 
-.PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-profile bench-pgo install setup
+.PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-profile bench-pgo install setup ensure-musl-target
 
 build:
 	cargo build
@@ -24,8 +36,9 @@ test-ci:
 	$(TEST_BINARY_ENV)="$(CURDIR)/target/$(TARGET)/release/$(NAME)" \
 	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" cargo test --quiet --release $(TEST_TARGETS)
 
-release:
+release: ensure-musl-target
 	cargo clean -p $(NAME) --release --target $(TARGET)
+	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
 	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
 	cargo build --release \
 	  -Z build-std=std \
@@ -75,7 +88,8 @@ pgo-profile:
 	$(LLVM_BIN)/llvm-profdata merge -o $(PGO_MERGED) $(PGO_DIR)
 
 # PGO-optimized release: uses gathered profiles + all aggressive flags.
-release-pgo: pgo-profile
+release-pgo: ensure-musl-target pgo-profile
+	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
 	RUSTFLAGS="-Cprofile-use=$(PGO_MERGED) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
 	cargo build --release \
 	  -Z build-std=std \
@@ -90,7 +104,8 @@ release-pgo-linux: pgo-profile
 	  -Z build-std-features= \
 	  --target $(TARGET)
 
-release-pgo-linux-static: pgo-profile
+release-pgo-linux-static: ensure-musl-target pgo-profile
+	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
 	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Cprofile-use=$(PGO_MERGED) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
 	cargo build --release \
 	  -Z build-std=std \
@@ -108,4 +123,19 @@ bench-pgo: pgo-profile
 
 install: release-pgo
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
-	codesign -fs - ~/usr/bin/$(NAME)
+	@if test "$$(uname -s)" = Darwin; then \
+		codesign -fs - ~/usr/bin/$(NAME); \
+	fi
+
+ensure-musl-target:
+	@if ! echo "$(TARGET)" | grep -q -- '-linux-musl$$'; then exit 0; fi; \
+	if test -f "$(MUSL_TARGET_LIBDIR)/self-contained/libunwind.a"; then \
+		exit 0; \
+	fi; \
+	if command -v rustup >/dev/null 2>&1; then \
+		echo "Installing Rust target $(TARGET)"; \
+		rustup target add "$(TARGET)"; \
+	else \
+		echo "Rust target $(TARGET) is missing and rustup is unavailable" >&2; \
+		exit 1; \
+	fi
