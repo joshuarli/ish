@@ -165,27 +165,37 @@ fn main() {
     let _ = rustix::termios::tcsetpgrp(stdin, pid);
 
     let (rows, cols) = term::term_size();
-    let home = std::env::var_os("HOME")
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
     let shell_pid = rustix::process::getpid().as_raw_pid();
 
     let cwd = std::env::current_dir().unwrap_or_default();
-    let epsh = epsh::eval::Shell::builder()
+    let mut epsh = epsh::eval::Shell::builder()
         .cwd(cwd)
         .interactive(true)
         .build();
 
+    let initial_home = store_env_os(&epsh, "HOME");
+    let mut aliases = AliasMap::new();
+    if !cli.no_config {
+        config::load_with_home(
+            &mut aliases,
+            &mut epsh,
+            cli.config.as_deref(),
+            initial_home.as_deref(),
+        );
+    }
+    let user = store_env_string(&epsh, "USER");
+    let home = store_env_string(&epsh, "HOME");
+    let home_os = store_env_os(&epsh, "HOME");
+
     let mut shell = Shell {
-        aliases: AliasMap::new(),
+        aliases,
         last_status: 0,
         prev_dir: None,
         dir_stack: Vec::with_capacity(32),
         rows,
         cols,
-        history: history::History::load(),
-        prompt: prompt::Prompt::new(),
+        history: history::History::load_from_home(home_os.as_deref()),
+        prompt: prompt::Prompt::with_identity(&user, &home),
         prompt_buf: String::with_capacity(128),
         completion_buffer: complete::Completions::with_capacity(2048, 64),
         history_match_buffer: Vec::with_capacity(200),
@@ -200,14 +210,10 @@ fn main() {
         shell_pid,
     };
 
-    // Load config
-    if !cli.no_config {
-        config::load(&mut shell.aliases, &mut shell.epsh, cli.config.as_deref());
-    }
-
-    denv::init();
-    let changes = denv::on_startup();
+    denv::init(&mut shell.epsh);
+    let changes = denv::on_startup(&shell.epsh);
     apply_denv_changes(&changes, &mut shell.epsh);
+    sync_shell_store_derived(&mut shell);
 
     // Main loop
     loop {
@@ -222,7 +228,7 @@ fn main() {
                 // Rewrite shorthand cd forms before parsing:
                 //   ".." → "cd ..", "..." → "cd ../..", etc.
                 //   single-arg directory that isn't an executable → "cd <dir>"
-                let line = maybe_rewrite_cd(&line, &shell.aliases);
+                let line = maybe_rewrite_cd(&line, &shell.aliases, &shell.home);
 
                 // Expand aliases before recording in history so "g status"
                 // becomes "git status" — matches what actually runs.
@@ -258,8 +264,8 @@ fn main() {
                                     true
                                 }
                                 Some(args) if args.first().map(String::as_str) == Some("-") => {
-                                    if let Some(prev) =
-                                        std::env::var_os("OLDPWD").filter(|s| !s.is_empty())
+                                    if let Some(prev) = store_env_os(&shell.epsh, "OLDPWD")
+                                        .filter(|s| !s.is_empty())
                                     {
                                         eprintln!("{}", Path::new(&prev).display());
                                         shell.last_status =
@@ -303,8 +309,9 @@ fn main() {
                             .unwrap_or_else(|| {
                                 line.split_whitespace().skip(1).map(String::from).collect()
                             });
-                        let outcome = denv::command(&args);
+                        let outcome = denv::command(&args, &shell.epsh);
                         apply_denv_changes(&outcome.changes, &mut shell.epsh);
+                        sync_shell_store_derived(&mut shell);
                         shell.last_status = outcome.status;
                         true
                     }
@@ -337,10 +344,12 @@ fn main() {
                             .unwrap_or_else(|| {
                                 line.split_whitespace().skip(1).map(String::from).collect()
                             });
-                        shell.last_status =
-                            builtin::locate_command(&args, &shell.aliases, |name| {
-                                shell.epsh.functions().contains_key(name)
-                            });
+                        shell.last_status = builtin::locate_command(
+                            &args,
+                            &shell.aliases,
+                            |name| shell.epsh.functions().contains_key(name),
+                            store_path_env(&shell.epsh),
+                        );
                         true
                     }
                     "l" => {
@@ -391,6 +400,7 @@ fn main() {
                 shell.epsh.set_external_handler(handler);
 
                 shell.last_status = shell.epsh.run_script(&expanded);
+                sync_shell_store_derived(&mut shell);
 
                 // Detect cwd change from epsh (compound commands with cd, pushd, etc.)
                 if shell.epsh.cwd() != prev_cwd {
@@ -659,19 +669,29 @@ fn random_dump_hex() -> String {
     hex
 }
 
-/// Read an env var via libc::getenv — zero allocation (returns &str into env block).
-/// SAFETY: Only safe in a single-threaded context (which ish is).
-// libc is used because rustix has no borrowed, allocation-free getenv API.
-fn getenv_str(name: &std::ffi::CStr) -> &'static str {
-    unsafe {
-        let ptr = libc::getenv(name.as_ptr());
-        if ptr.is_null() {
-            return "";
-        }
-        let cstr = std::ffi::CStr::from_ptr(ptr);
-        // Env vars set by the shell are always valid UTF-8; fallback to empty on exotic values.
-        std::str::from_utf8(cstr.to_bytes()).unwrap_or("")
-    }
+fn store_env_os(epsh: &epsh::eval::Shell, name: &str) -> Option<OsString> {
+    epsh.vars()
+        .get_bytes(name)
+        .map(|value| value.to_os_string())
+}
+
+fn store_env_string(epsh: &epsh::eval::Shell, name: &str) -> String {
+    epsh.vars().get_shell(name).unwrap_or_default()
+}
+
+/// `$PATH` as raw bytes from epsh's variable store — the single source of
+/// truth for the environment. Empty when unset. ish's in-process PATH lookups
+/// (command coloring, `which`/`type`, completion) use this instead of the OS
+/// environment, which is only a denv mirror and can be stale after
+/// `set`/`export`/`unset`.
+fn store_path_env(epsh: &epsh::eval::Shell) -> &[u8] {
+    epsh.vars().get_bytes("PATH").map_or(&[], |v| v.as_bytes())
+}
+
+fn sync_shell_store_derived(shell: &mut Shell) {
+    shell.home = store_env_string(&shell.epsh, "HOME");
+    let user = store_env_string(&shell.epsh, "USER");
+    shell.prompt.set_identity(&user, &shell.home);
 }
 
 fn read_line(shell: &mut Shell) -> ReadResult {
@@ -691,9 +711,9 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     let mut saved_line = String::new();
     // Emit OSC 7 so terminal emulators track the working directory
     {
-        let pwd = getenv_str(c"PWD");
+        let pwd = shell.epsh.vars().get("PWD").unwrap_or("");
         if !pwd.is_empty() {
-            let hostname = getenv_str(c"HOSTNAME");
+            let hostname = shell.epsh.vars().get("HOSTNAME").unwrap_or("");
             // percent-encode spaces in the path
             let mut osc = format!("\x1b]7;file://{hostname}");
             for b in pwd.bytes() {
@@ -708,10 +728,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
         }
     }
 
-    // Render prompt — zero-alloc: reuse shell.prompt_buf, read env via getenv.
+    // Render prompt — zero-alloc: reuse shell.prompt_buf, read state from epsh.
     // Take ownership so prompt_str can be borrowed independently of shell.
-    let pwd = getenv_str(c"PWD");
-    let denv_dirty = getenv_str(c"__DENV_DIRTY") == "1";
+    let pwd = shell.epsh.vars().get("PWD").unwrap_or("");
+    let denv_dirty = shell.epsh.vars().get("__DENV_DIRTY") == Some("1");
     shell
         .prompt
         .render_into(&mut shell.prompt_buf, shell.last_status, pwd, denv_dirty);
@@ -963,6 +983,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     shell.cols,
                                     &shell.home,
                                     &shell.aliases,
+                                    &shell.epsh,
                                     comp,
                                 );
                                 if cs.comp.len() == 1 {
@@ -1023,6 +1044,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     shell.cols,
                                     &shell.home,
                                     &shell.aliases,
+                                    &shell.epsh,
                                     comp,
                                 );
                                 if !cs.comp.is_empty() {
@@ -1291,7 +1313,11 @@ fn render_prompt_region(
         {
             Some(true)
         } else {
-            Some(shell.path_cache.contains(first))
+            Some(
+                shell
+                    .path_cache
+                    .contains(first, store_path_env(&shell.epsh)),
+            )
         }
     } else {
         None
@@ -1786,6 +1812,7 @@ fn start_completion(
     term_cols: u16,
     home: &str,
     aliases: &AliasMap,
+    epsh: &epsh::eval::Shell,
     mut comp: complete::Completions,
 ) -> CompletionState {
     comp.clear();
@@ -1824,7 +1851,7 @@ fn start_completion(
                 comp.push(name, false, false, false);
             }
         }
-        path::complete_commands(&partial, &mut comp);
+        path::complete_commands(&partial, &mut comp, store_path_env(epsh));
         // Directories are valid commands (implicit cd)
         complete::complete_path_into(&partial, true, &mut comp);
         comp.sort_entries();
@@ -1854,7 +1881,10 @@ fn start_completion(
             // Remote path: host:/path/prefix → complete via SSH
             let host = &partial[..colon_pos];
             let remote_path = &partial[colon_pos + 1..];
-            complete::complete_remote_path(host, remote_path, &mut comp);
+            // The ssh child gets its environment from the store, matching the
+            // contract that children never inherit ish's process environment.
+            let child_env = epsh.vars().env_for_command_os(&[]);
+            complete::complete_remote_path(host, remote_path, &mut comp, &child_env);
             if !comp.is_empty() {
                 let dir_prefix = if let Some(slash) = remote_path.rfind('/') {
                     format!("{}:{}", host, &remote_path[..=slash])
@@ -2449,6 +2479,9 @@ fn sync_path_var(epsh: &mut epsh::eval::Shell, name: &str, path: &Path) {
         name,
         epsh::shell_bytes::ShellBytes::from_os_str(path.as_os_str()),
     );
+    // PWD/OLDPWD must be exported so they survive denv's process-env mirror
+    // sync and reach children (matches bash, which exports both).
+    epsh.vars_mut().export(name);
 }
 
 fn sync_cwd_change(shell: &mut Shell, old_cwd: &Path, new_cwd: std::path::PathBuf) {
@@ -2458,8 +2491,9 @@ fn sync_cwd_change(shell: &mut Shell, old_cwd: &Path, new_cwd: std::path::PathBu
     shell.epsh.set_cwd(new_cwd);
     push_dir_stack(&mut shell.dir_stack);
     shell.prompt.invalidate_git();
-    let changes = denv::on_cd();
+    let changes = denv::on_cd(&shell.epsh);
     apply_denv_changes(&changes, &mut shell.epsh);
+    sync_shell_store_derived(shell);
 }
 
 /// Parse a command line into shell words only.
@@ -2670,12 +2704,23 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
     }
 }
 
+/// Look up a variable in the store-derived child environment the handler
+/// receives. Returns `None` when unset or not exported.
+fn env_pair_value(
+    env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)],
+    name: &str,
+) -> Option<String> {
+    env_pairs
+        .iter()
+        .find_map(|(k, v)| (k.as_bytes() == name.as_bytes()).then(|| v.to_shell_string()))
+}
+
 /// Build the external handler for epsh. Handles ish-specific builtins
 /// and fork/exec with job control for external commands.
 fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
     Box::new(
         move |args: &[epsh::shell_bytes::ShellBytes],
-              env_pairs: &[(String, epsh::shell_bytes::ShellBytes)]| {
+              env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)]| {
             let name = args[0].to_shell_string();
 
             // ish interactive builtins
@@ -2691,9 +2736,11 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                     return Ok(epsh::error::ExitStatus::SUCCESS);
                 }
                 "history" => {
-                    // In a pipeline context — read from text file
-                    let path = if let Some(home) = std::env::var_os("HOME") {
-                        std::path::PathBuf::from(home).join(".local/share/ish/history")
+                    // In a pipeline context — read from text file. HOME comes
+                    // from the store (via env_pairs), not ish's process env.
+                    let home = env_pair_value(env_pairs, "HOME");
+                    let path = if let Some(home) = home.as_deref() {
+                        std::path::Path::new(home).join(".local/share/ish/history")
                     } else {
                         std::path::PathBuf::from("/tmp/ish_history")
                     };
@@ -2717,9 +2764,14 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
             let mut cmd = std::process::Command::new(args[0].to_os_string());
             cmd.args(args[1..].iter().map(|arg| arg.to_os_string()));
 
-            // Apply prefix env assignments
+            // Store-authoritative child environment: the child inherits
+            // nothing from ish's process environment. Its env comes entirely
+            // from epsh's variable store (exported vars, inherited
+            // non-shell-name entries) plus any prefix assignments, so
+            // `set`/`export`/`unset` are reflected exactly in children.
+            cmd.env_clear();
             for (k, v) in env_pairs {
-                cmd.env(k, v.to_os_string());
+                cmd.env(k.to_os_string(), v.to_os_string());
             }
 
             if is_main {
@@ -2801,8 +2853,8 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                         // script whose interpreter is broken surfaces as a bare
                         // ENOTDIR/ENOENT/EACCES.
                         let cwd = std::env::current_dir().unwrap_or_default();
-                        let path_env = std::env::var("PATH")
-                            .unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+                        let path_env = env_pair_value(env_pairs, "PATH")
+                            .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
                         if let Some(msg) =
                             epsh::eval::bad_interpreter_message(&name, code, &cwd, &path_env)
                         {
@@ -2882,7 +2934,7 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
 /// Rewrite shorthand cd forms:
 ///   ".." → "cd ..", "..." → "cd ../..", "...." → "cd ../../..", etc.
 ///   single-arg that is a directory (and not an alias/builtin/executable) → "cd <arg>"
-fn maybe_rewrite_cd(line: &str, aliases: &AliasMap) -> String {
+fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &str) -> String {
     let trimmed = line.trim();
     let words = match lex_simple_command_words(trimmed) {
         Some(words) => words,
@@ -2917,9 +2969,6 @@ fn maybe_rewrite_cd(line: &str, aliases: &AliasMap) -> String {
     }
 
     let expanded = if let Some(rest) = first_text.strip_prefix('~') {
-        let home = std::env::var_os("HOME")
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
         format!("{home}{rest}")
     } else {
         first_text

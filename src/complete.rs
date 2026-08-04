@@ -871,7 +871,15 @@ pub fn complete_hostnames(prefix: &str, home: &str, comp: &mut Completions) {
 /// Complete remote paths via SSH. Runs `ssh -o BatchMode=yes -o ConnectTimeout=2`
 /// to list files on the remote host. Nearly instant when ControlMaster is active.
 /// Returns after at most ~2 seconds.
-pub fn complete_remote_path(host: &str, path_prefix: &str, comp: &mut Completions) {
+///
+/// `env` is the child environment as `K=V` pairs from epsh's variable store —
+/// the child never inherits ish's process environment.
+pub fn complete_remote_path(
+    host: &str,
+    path_prefix: &str,
+    comp: &mut Completions,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) {
     // Build the remote ls command — shell-quote the glob pattern
     let cmd = format!(
         "ssh -o BatchMode=yes -o ConnectTimeout=2 {} 'ls -dp {}* 2>/dev/null'",
@@ -879,7 +887,7 @@ pub fn complete_remote_path(host: &str, path_prefix: &str, comp: &mut Completion
         shell_escape(path_prefix),
     );
 
-    let (pid, pipe_r) = match crate::sys::spawn_command_subst(&cmd) {
+    let (pid, pipe_r) = match crate::sys::spawn_command_subst(&cmd, env) {
         Ok(v) => v,
         Err(_) => return,
     };

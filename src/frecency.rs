@@ -12,7 +12,6 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
             eprintln!("ish: z: {home}: {e}");
             return 1;
         }
-        update_pwd();
         return 0;
     }
 
@@ -24,7 +23,6 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
             eprintln!("ish: z: {query}: {e}");
             return 1;
         }
-        update_pwd();
         return 0;
     }
 
@@ -95,7 +93,6 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
         eprintln!("ish: z: {target}: {e}");
         return 1;
     }
-    update_pwd();
     0
 }
 
@@ -114,12 +111,6 @@ fn extract_cd_target(entry: &str) -> Option<&str> {
         .next()?;
 
     if arg.is_empty() { None } else { Some(arg) }
-}
-
-fn update_pwd() {
-    if let Ok(pwd) = std::env::current_dir() {
-        crate::shell_setenv_os("PWD", pwd.as_os_str());
-    }
 }
 
 #[cfg(test)]

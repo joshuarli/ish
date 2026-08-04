@@ -28,9 +28,21 @@ why the message format stays in sync.
 
 ### 1. ~~Environment variable sync~~ (RESOLVED)
 
-denv now returns `Vec<EnvChange>` from `on_cd()` and `command()`. Each change is
-applied to both process env (inside denv) and epsh vars (via `apply_denv_changes`
-in the main loop). The O(n) `sync_env_to_epsh` reconciliation is gone.
+epsh's variable store is the single source of truth for the environment.
+`set`/`export`/`unset` run as epsh builtins and only mutate the store. The
+external handler (`make_external_handler`) builds the child environment
+entirely from the store (`cmd.env_clear()` + the complete `env_for_command_os`
+pair list the handler receives), so children see exactly the store, not ish's
+process environment. denv's bash evaluator receives the same explicit pair
+list; its temporary process-environment mirror exists only for denv's own
+snapshot and restore bookkeeping. ish's own in-process PATH lookups (command coloring via
+`PathCache`, `which`/`type` via `path::scan_path`, completion via
+`path::complete_commands`) also take `$PATH` from the store, as do the
+handler's `history` HOME lookup and the SSH-completion child. denv still
+evaluates and restores its snapshot against that temporary process mirror.
+`EnvChange`s returned by denv are applied to epsh vars via
+`apply_denv_changes` in the main loop. The O(n) `sync_env_to_epsh`
+reconciliation is gone.
 
 ### 2. External handler does fork/exec
 

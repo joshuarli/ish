@@ -357,13 +357,17 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
     let original_dir = std::env::current_dir().unwrap();
     let original_pwd = std::env::var_os("PWD");
     let _stderr = SuppressStderr::new();
-    ish::denv::init();
+    let mut epsh = epsh::eval::Shell::builder()
+        .cwd(first.clone())
+        .interactive(true)
+        .build();
+    ish::denv::init(&mut epsh);
     std::env::set_current_dir(&first).unwrap();
-    ish::shell_setenv_os("PWD", first.as_os_str());
-    let _ = ish::denv::on_cd();
+    sync_bench_pwd(&mut epsh, &first);
+    let _ = ish::denv::on_cd(&epsh);
     std::env::set_current_dir(&second).unwrap();
-    ish::shell_setenv_os("PWD", second.as_os_str());
-    let _ = ish::denv::on_cd();
+    sync_bench_pwd(&mut epsh, &second);
+    let _ = ish::denv::on_cd(&epsh);
 
     let mut prompt = prompt::Prompt::new();
     let mut out = String::with_capacity(128);
@@ -372,8 +376,8 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
         let dir = if use_first { &first } else { &second };
         use_first = !use_first;
         std::env::set_current_dir(dir).unwrap();
-        ish::shell_setenv_os("PWD", dir.as_os_str());
-        let changes = ish::denv::on_cd();
+        sync_bench_pwd(&mut epsh, dir);
+        let changes = ish::denv::on_cd(&epsh);
         prompt.invalidate_git();
         prompt.render_into(&mut out, 0, dir.to_str().unwrap(), !changes.is_empty());
         black_box((&changes, &out));
@@ -384,6 +388,18 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
         Some(pwd) => ish::shell_setenv_os("PWD", pwd),
         None => ish::shell_unsetenv("PWD"),
     }
+}
+
+// Mirror what change_directory does before denv::on_cd: PWD must agree in both
+// the process environment and epsh's variable store, because denv::refresh
+// starts by restoring the process environment from the store.
+fn sync_bench_pwd(epsh: &mut epsh::eval::Shell, dir: &Path) {
+    ish::shell_setenv_os("PWD", dir.as_os_str());
+    let _ = epsh.vars_mut().set_bytes(
+        "PWD",
+        epsh::shell_bytes::ShellBytes::from_os_str(dir.as_os_str()),
+    );
+    epsh.vars_mut().export("PWD");
 }
 
 #[divan::bench]
@@ -427,7 +443,8 @@ fn keypress_render_benchmark(bencher: Bencher, initial: &str, inserted: char) {
             ""
         };
         let opts = render::RenderOpts {
-            cmd_color: Some(path_cache.contains("git")),
+            // PATH bytes from the store; a representative constant is fine here.
+            cmd_color: Some(path_cache.contains("git", b"/usr/local/bin:/usr/bin:/bin")),
             suggestion,
         };
         tw.clear_buffer();

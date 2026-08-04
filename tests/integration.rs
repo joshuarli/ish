@@ -853,10 +853,8 @@ fn config_load_all_paths() {
     let mut epsh = epsh::eval::Shell::new();
     config::load(&mut aliases, &mut epsh, Some(config_path.as_os_str()));
     assert_eq!(
-        std::env::var_os("ISH_TEST_CFG_LOAD_VAR")
-            .unwrap()
-            .to_string_lossy(),
-        "hello world"
+        epsh.vars().get("ISH_TEST_CFG_LOAD_VAR"),
+        Some("hello world")
     );
     assert_eq!(aliases.get("ll").unwrap(), &["ls", "-la"]);
 
@@ -887,12 +885,7 @@ fn config_load_all_paths() {
     let mut aliases = AliasMap::new();
     let mut epsh = epsh::eval::Shell::new();
     config::load(&mut aliases, &mut epsh, Some(config_path4.as_os_str()));
-    assert_eq!(
-        std::env::var_os("ISH_TEST_CFG_NOVAL")
-            .unwrap()
-            .to_string_lossy(),
-        ""
-    );
+    assert_eq!(epsh.vars().get("ISH_TEST_CFG_NOVAL"), Some(""));
 }
 
 // ---------------------------------------------------------------------------
@@ -940,12 +933,9 @@ fn prompt_render_status_colors() {
 
 #[test]
 fn prompt_render_dirty_indicator() {
-    // Test that the dirty indicator code path is exercised.
-    // We can't reliably test env var reads in parallel tests, so just
-    // verify the render doesn't crash with __DENV_DIRTY set or unset.
     let mut p = prompt::Prompt::new();
-    let r1 = p.render(0);
-    assert!(r1.ends_with(" $ "));
+    let r1 = p.render_with_state(0, "/tmp", true);
+    assert!(r1.contains("\x1b[38;5;1m *"));
 }
 
 #[test]
@@ -965,10 +955,8 @@ fn prompt_default_impl() {
 fn prompt_git_branch_in_git_repo() {
     // We're running from within a git repo (ish itself)
     let mut p = prompt::Prompt::new();
-    // Set PWD to our repo root
     let cwd = std::env::current_dir().unwrap();
-    unsafe { std::env::set_var("PWD", cwd.to_str().unwrap()) };
-    let rendered = p.render(0);
+    let rendered = p.render_with_state(0, cwd.to_str().unwrap(), false);
     // Should detect git branch — the rendered prompt should contain a branch name
     // We can't predict the exact branch name, but it should be there
     // At minimum, the prompt should not crash
@@ -1651,8 +1639,7 @@ fn prompt_git_branch_detects_repo() {
 
     // Render sets PWD, but other tests may race. Just verify the code path runs.
     let mut p = prompt::Prompt::new();
-    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
-    let rendered = p.render(0);
+    let rendered = p.render_with_state(0, dir.to_str().unwrap(), false);
     // If PWD wasn't clobbered, we see the branch. Either way, no crash.
     assert!(rendered.ends_with(" $ "));
 }
@@ -1665,8 +1652,7 @@ fn prompt_git_branch_detached_head() {
     std::fs::write(git_dir.join("HEAD"), "abc12345deadbeef\n").unwrap();
 
     let mut p = prompt::Prompt::new();
-    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
-    let rendered = p.render(0);
+    let rendered = p.render_with_state(0, dir.to_str().unwrap(), false);
     assert!(rendered.ends_with(" $ "));
 }
 
@@ -1674,8 +1660,7 @@ fn prompt_git_branch_detached_head() {
 fn prompt_git_branch_no_repo() {
     let dir = tempdir_with_files(&[]);
     let mut p = prompt::Prompt::new();
-    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
-    let rendered = p.render(0);
+    let rendered = p.render_with_state(0, dir.to_str().unwrap(), false);
     assert!(rendered.ends_with(" $ "));
 }
 
@@ -1688,12 +1673,10 @@ fn prompt_git_cache_no_repo_reuse() {
     let mut p = prompt::Prompt::new();
 
     // First render in dir with no repo — caches NoRepo
-    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
-    let _ = p.render(0);
+    let _ = p.render_with_state(0, dir.to_str().unwrap(), false);
 
     // Render in subdir — exercises the NoRepo cache path
-    unsafe { std::env::set_var("PWD", subdir.to_str().unwrap()) };
-    let r = p.render(0);
+    let r = p.render_with_state(0, subdir.to_str().unwrap(), false);
     assert!(r.ends_with(" $ "));
 }
 
@@ -1705,13 +1688,11 @@ fn prompt_git_invalidate_clears_cache() {
     std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
 
     let mut p = prompt::Prompt::new();
-    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
-    let _ = p.render(0);
+    let _ = p.render_with_state(0, dir.to_str().unwrap(), false);
 
     // Invalidate and re-render — exercises the Unknown→Repo path again
     p.invalidate_git();
-    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
-    let r = p.render(0);
+    let r = p.render_with_state(0, dir.to_str().unwrap(), false);
     assert!(r.ends_with(" $ "));
 }
 
@@ -1723,8 +1704,7 @@ fn prompt_git_bare_ref() {
     std::fs::write(git_dir.join("HEAD"), "ref: refs/remotes/origin/main\n").unwrap();
 
     let mut p = prompt::Prompt::new();
-    unsafe { std::env::set_var("PWD", dir.to_str().unwrap()) };
-    let rendered = p.render(0);
+    let rendered = p.render_with_state(0, dir.to_str().unwrap(), false);
     assert!(rendered.ends_with(" $ "));
 }
 
@@ -1745,8 +1725,7 @@ fn prompt_git_worktree_gitdir_file() {
     .unwrap();
 
     let mut p = prompt::Prompt::new();
-    unsafe { std::env::set_var("PWD", worktree.to_str().unwrap()) };
-    let rendered = p.render(0);
+    let rendered = p.render_with_state(0, worktree.to_str().unwrap(), false);
     assert!(rendered.ends_with(" $ "));
 }
 

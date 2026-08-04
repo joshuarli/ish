@@ -37,10 +37,12 @@ pub fn all_builtin_names() -> impl Iterator<Item = &'static str> {
 }
 
 /// Locate a command through aliases, builtins, functions, or PATH.
+/// `path_env` is `$PATH` from epsh's variable store — the source of truth.
 pub fn locate_command(
     args: &[String],
     aliases: &crate::alias::AliasMap,
     function_exists: impl Fn(&str) -> bool,
+    path_env: &[u8],
 ) -> i32 {
     if args.is_empty() {
         eprintln!("ish: w: expected command name");
@@ -64,7 +66,7 @@ pub fn locate_command(
         return 0;
     }
 
-    if let Some(p) = path::scan_path(name) {
+    if let Some(p) = path::scan_path(name, path_env) {
         println!("{}", p.display());
         return 0;
     }

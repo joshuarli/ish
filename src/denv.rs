@@ -58,27 +58,30 @@ enum EnvRcInterpreter {
     Epsh,
 }
 
-/// Initialize ish's native denv state vars.
-pub fn init() {
+/// Initialize ish's native denv state vars in epsh's variable store.
+pub fn init(epsh: &mut epsh::eval::Shell) {
     let pid = std::process::id().to_string();
-    crate::shell_setenv("__DENV_PID", &pid);
-    crate::shell_setenv("__DENV_SHELL", "bash");
+    let vars = epsh.vars_mut();
+    let _ = vars.set("__DENV_PID", &pid);
+    vars.export("__DENV_PID");
+    let _ = vars.set("__DENV_SHELL", "bash");
+    vars.export("__DENV_SHELL");
 }
 
 /// Called once at shell startup.
-pub fn on_startup() -> Vec<EnvChange> {
-    refresh(false).unwrap_or_else(report_error)
+pub fn on_startup(epsh: &epsh::eval::Shell) -> Vec<EnvChange> {
+    refresh(false, epsh).unwrap_or_else(report_error)
 }
 
 /// Called after any directory change.
-pub fn on_cd() -> Vec<EnvChange> {
-    refresh(false).unwrap_or_else(report_error)
+pub fn on_cd(epsh: &epsh::eval::Shell) -> Vec<EnvChange> {
+    refresh(false, epsh).unwrap_or_else(report_error)
 }
 
 /// Handle `denv allow|deny|reload`.
-pub fn command(args: &[String]) -> CommandOutcome {
+pub fn command(args: &[String], epsh: &epsh::eval::Shell) -> CommandOutcome {
     match args.first().map(|s| s.as_str()) {
-        Some("allow") => match allow_current_dir() {
+        Some("allow") => match allow_current_dir(epsh) {
             Ok(changes) => CommandOutcome { status: 0, changes },
             Err(err) => {
                 eprintln!("denv: {err}");
@@ -88,7 +91,7 @@ pub fn command(args: &[String]) -> CommandOutcome {
                 }
             }
         },
-        Some("deny") => match deny_current_dir() {
+        Some("deny") => match deny_current_dir(epsh) {
             Ok(changes) => CommandOutcome { status: 0, changes },
             Err(err) => {
                 eprintln!("denv: {err}");
@@ -98,7 +101,7 @@ pub fn command(args: &[String]) -> CommandOutcome {
                 }
             }
         },
-        Some("reload") => match refresh(true) {
+        Some("reload") => match refresh(true, epsh) {
             Ok(changes) => CommandOutcome { status: 0, changes },
             Err(err) => {
                 eprintln!("denv: {err}");
@@ -123,14 +126,21 @@ fn report_error(err: String) -> Vec<EnvChange> {
     Vec::new()
 }
 
-fn current_dir_from_env() -> PathBuf {
-    env::var_os("PWD")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| env::current_dir().unwrap_or_default())
+fn current_dir_from_store(epsh: &epsh::eval::Shell) -> PathBuf {
+    epsh.vars()
+        .get_bytes("PWD")
+        .filter(|pwd| !pwd.as_bytes().is_empty())
+        .map(|pwd| PathBuf::from(pwd.to_os_string()))
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_default()
 }
 
-fn refresh(force: bool) -> Result<Vec<EnvChange>, String> {
-    let cwd = current_dir_from_env();
+fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
+    let store_env_pairs = epsh.vars().env_for_command_os(&[]);
+    // denv's bookkeeping and embedded epsh evaluator use process-global
+    // environment APIs, so keep that environment as a temporary mirror.
+    restore_process_env(&store_env_pairs);
+    let cwd = current_dir_from_store(epsh);
     let pid = std::process::id().to_string();
 
     // Fast path: skip the parent-directory walk entirely. Go straight to the
@@ -161,6 +171,11 @@ fn refresh(force: bool) -> Result<Vec<EnvChange>, String> {
         apply_restore(&state.prev, &mut changes);
         clear_active(&pid);
     }
+
+    // Active denv state has now been restored in the process mirror. Capture
+    // that post-restore baseline for the explicit child environment so reload
+    // does not reintroduce values that should have been removed first.
+    let env_pairs = capture_process_env();
 
     let Some(found) = found else {
         clear_runtime_state(&mut changes);
@@ -211,7 +226,7 @@ fn refresh(force: bool) -> Result<Vec<EnvChange>, String> {
             .envrc
             .as_ref()
             .map(|(path, _)| canonicalize_fallback(path));
-        match eval_env(&dir, envrc.as_deref(), &dotenv_entries) {
+        match eval_env(&dir, envrc.as_deref(), &dotenv_entries, &env_pairs) {
             Ok(diff) => diff,
             Err(err) => {
                 let dir = canonicalize_fallback(&found.dir);
@@ -260,26 +275,26 @@ fn refresh(force: bool) -> Result<Vec<EnvChange>, String> {
     Ok(changes)
 }
 
-fn allow_current_dir() -> Result<Vec<EnvChange>, String> {
-    let cwd = current_dir_from_env();
+fn allow_current_dir(epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
+    let cwd = current_dir_from_store(epsh);
     let found = find_env_files(&cwd).ok_or("no .envrc or .env found")?;
     let Some((envrc, _)) = found.envrc else {
         return Err("no .envrc found".to_string());
     };
     let envrc = envrc.canonicalize().unwrap_or(envrc);
     allow_envrc(&envrc)?;
-    refresh(true)
+    refresh(true, epsh)
 }
 
-fn deny_current_dir() -> Result<Vec<EnvChange>, String> {
-    let cwd = current_dir_from_env();
+fn deny_current_dir(epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
+    let cwd = current_dir_from_store(epsh);
     let found = find_env_files(&cwd).ok_or("no .envrc or .env found")?;
     let Some((envrc, _)) = found.envrc else {
         return Err("no .envrc found".to_string());
     };
     let envrc = envrc.canonicalize().unwrap_or(envrc);
     deny_envrc(&envrc)?;
-    refresh(true)
+    refresh(true, epsh)
 }
 
 fn find_env_files(start: &Path) -> Option<EnvFiles> {
@@ -801,13 +816,14 @@ fn eval_env(
     dir: &Path,
     envrc: Option<&Path>,
     dotenv_entries: &[(String, String)],
+    env_pairs: &[(OsString, OsString)],
 ) -> Result<EnvDiff, String> {
     let Some(envrc) = envrc else {
         return Ok(diff_dotenv_only(dotenv_entries));
     };
     match envrc_interpreter(envrc)? {
-        EnvRcInterpreter::Bash => eval_env_bash(dir, envrc, dotenv_entries),
-        EnvRcInterpreter::Epsh => eval_env_epsh(dir, envrc, dotenv_entries),
+        EnvRcInterpreter::Bash => eval_env_bash(dir, envrc, dotenv_entries, env_pairs),
+        EnvRcInterpreter::Epsh => eval_env_epsh(dir, envrc, dotenv_entries, env_pairs),
     }
 }
 
@@ -815,6 +831,7 @@ fn eval_env_bash(
     dir: &Path,
     envrc: &Path,
     dotenv_entries: &[(String, String)],
+    env_pairs: &[(OsString, OsString)],
 ) -> Result<EnvDiff, String> {
     let (before_r, before_w) =
         crate::sys::pipe_cloexec().map_err(|e| format!("create before pipe: {e}"))?;
@@ -863,6 +880,10 @@ fn eval_env_bash(
     });
 
     let mut cmd = Command::new("bash");
+    cmd.env_clear();
+    for (key, value) in env_pairs {
+        cmd.env(key, value);
+    }
     // SAFETY: pre_exec runs in the child after fork and before exec. We only
     // dup the dedicated pipe fds into 3/4 for the shell snapshot script.
     unsafe {
@@ -922,8 +943,11 @@ fn eval_env_epsh(
     dir: &Path,
     envrc: &Path,
     dotenv_entries: &[(String, String)],
+    env_pairs: &[(OsString, OsString)],
 ) -> Result<EnvDiff, String> {
-    let before_process = capture_process_env();
+    let process_before = capture_process_env();
+    restore_process_env(env_pairs);
+    let before_process = env_pairs.to_vec();
     let sink = std::sync::Arc::new(std::sync::Mutex::new(SharedStderr));
     let mut shell = epsh::eval::Shell::builder()
         .cwd(dir.to_path_buf())
@@ -947,7 +971,7 @@ fn eval_env_epsh(
 
     let status = shell.run_script(&script);
     let after_process = shell.vars().exported_env();
-    restore_process_env(&before_process);
+    restore_process_env(&process_before);
 
     if status != 0 {
         return Err(".envrc evaluation failed".to_string());
@@ -1186,12 +1210,34 @@ mod tests {
         let envrc = project.join(".envrc");
         std::fs::write(&envrc, "#!/bin/sh\nexport DENV_EPSH_TEST=ok\n").unwrap();
 
-        let diff = eval_env(&project, Some(&envrc), &[]).unwrap();
+        let epsh = epsh::eval::Shell::new();
+        let env_pairs = epsh.vars().env_for_command_os(&[]);
+        let diff = eval_env(&project, Some(&envrc), &[], &env_pairs).unwrap();
         assert!(
             diff.set
                 .iter()
                 .any(|(key, value)| key == "DENV_EPSH_TEST" && value == "ok")
         );
+    }
+
+    #[test]
+    fn eval_env_bash_uses_explicit_store_environment() {
+        let tmp = TempDir::new("ish_denv_bash_env");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let envrc = project.join(".envrc");
+        std::fs::write(
+            &envrc,
+            "#!/usr/bin/env bash\nif [ -n \"${DENV_AMBIENT_ONLY+x}\" ]; then export DENV_LEAK=1; fi\n",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("DENV_AMBIENT_ONLY", "ambient") };
+        let epsh = epsh::eval::Shell::builder().env_clear().build();
+        let env_pairs = epsh.vars().env_for_command_os(&[]);
+        let diff = eval_env(&project, Some(&envrc), &[], &env_pairs).unwrap();
+        assert!(!diff.set.iter().any(|(key, _)| key == "DENV_LEAK"));
+        unsafe { std::env::remove_var("DENV_AMBIENT_ONLY") };
     }
 
     #[test]
@@ -1207,7 +1253,9 @@ mod tests {
         .unwrap();
 
         crate::shell_unsetenv("DENV_TMP_SHOULD_ROLLBACK");
-        let err = match eval_env_epsh(&project, &envrc, &[]) {
+        let epsh = epsh::eval::Shell::new();
+        let env_pairs = epsh.vars().env_for_command_os(&[]);
+        let err = match eval_env_epsh(&project, &envrc, &[], &env_pairs) {
             Ok(_) => panic!("expected epsh envrc evaluation to fail"),
             Err(err) => err,
         };

@@ -131,6 +131,7 @@ Expansion order: tilde, parameter expansion, command substitution, pathname expa
 | `cd [dir]` | Change directory. `cd -` for previous |
 | `exit [code]` | Exit (warns if job suspended) |
 | `fg` | Resume suspended job |
+| `export [NAME[=value]]` | Export a variable to child processes. No args lists all |
 | `set [VAR [val]]` | Set env var. No args lists all |
 | `unset VAR...` | Remove env vars |
 | `alias [name [cmd]]` | Define/list aliases |

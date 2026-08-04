@@ -9,9 +9,24 @@ use std::path::PathBuf;
 /// Also sources `init.sh` from the config directory via epsh.
 /// Warns on bad lines, continues processing.
 pub fn load(aliases: &mut AliasMap, epsh: &mut epsh::eval::Shell, path_override: Option<&OsStr>) {
+    load_with_home(
+        aliases,
+        epsh,
+        path_override,
+        std::env::var_os("HOME").as_deref(),
+    );
+}
+
+/// Load config using an explicit HOME value from the shell's variable store.
+pub fn load_with_home(
+    aliases: &mut AliasMap,
+    epsh: &mut epsh::eval::Shell,
+    path_override: Option<&OsStr>,
+    home: Option<&OsStr>,
+) {
     let path = match path_override {
         Some(p) => PathBuf::from(p),
-        None => config_path(),
+        None => config_path_for_home(home),
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -103,8 +118,8 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh:
         }
     };
 
-    crate::shell_setenv(name, &expanded);
-    // Sync to epsh's variable store (set + export so it's visible to subprocesses)
+    // Config values belong to epsh's store; child processes receive them through
+    // the normal external-handler environment path.
     let _ = epsh.vars_mut().set(name, &expanded);
     epsh.vars_mut().export(name);
 }
@@ -128,10 +143,6 @@ fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut 
     }
 
     aliases.set(name, words);
-}
-
-fn config_path() -> PathBuf {
-    config_path_for_home(std::env::var_os("HOME").as_deref())
 }
 
 fn config_path_for_home(home: Option<&OsStr>) -> PathBuf {

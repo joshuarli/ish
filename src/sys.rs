@@ -4,8 +4,6 @@
 //! macOS: falls back to pipe+fcntl, getdtablesize loop.
 
 use std::os::fd::{IntoRawFd, RawFd};
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
 
 /// Create a pipe with O_CLOEXEC on both ends.
 /// Linux: 1 syscall (pipe2). macOS: 3 syscalls (pipe + 2x fcntl).
@@ -57,89 +55,38 @@ pub fn close_fds_from(min_fd: RawFd) {
     }
 }
 
-/// Execute a command, searching PATH if needed. Does not return on success.
-///
-/// Linux: uses execveat() — iterates PATH directories by fd, no path string
-/// construction needed. Falls through to error if all dirs fail.
-/// macOS: uses execvp() which handles PATH search internally.
-///
-/// # Safety
-/// Must be called in a forked child process. `argv` must be a valid
-/// null-terminated array of C string pointers.
-pub unsafe fn exec_command(cmd: &std::ffi::CStr, argv: *const *const libc::c_char) {
-    #[cfg(target_os = "linux")]
-    {
-        // Absolute or relative path — exec directly
-        if cmd.to_bytes().contains(&b'/') {
-            unsafe {
-                let _ = rustix::runtime::execve(cmd, argv.cast(), get_environ().cast());
-            }
-            return;
-        }
-
-        // Search PATH using execveat: open each dir as fd, try exec relative to it.
-        // No path string allocation — the kernel resolves cmd within the directory.
-        if let Some(path_var) = std::env::var_os("PATH") {
-            for dir in path_var.as_os_str().as_bytes().split(|&b| b == b':') {
-                if dir.is_empty() {
-                    continue;
-                }
-                if let Ok(c_dir) = std::ffi::CString::new(dir) {
-                    let dirfd = rustix::fs::open(
-                        c_dir.as_c_str(),
-                        rustix::fs::OFlags::RDONLY
-                            | rustix::fs::OFlags::DIRECTORY
-                            | rustix::fs::OFlags::CLOEXEC,
-                        rustix::fs::Mode::empty(),
-                    );
-                    if let Ok(dirfd) = dirfd {
-                        unsafe {
-                            let _ = rustix::runtime::execveat(
-                                &dirfd,
-                                cmd,
-                                argv.cast(),
-                                get_environ().cast(),
-                                rustix::fs::AtFlags::empty(),
-                            );
-                        };
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    unsafe {
-        // rustix provides execve/execveat but not execvp, so macOS PATH
-        // execution keeps the platform libc wrapper.
-        libc::execvp(cmd.as_ptr(), argv);
-    }
-}
-
-/// Access the process environment pointer for exec calls.
-///
-/// # Safety
-/// The returned pointer is only valid for immediate use in exec syscalls
-/// within a forked child. The shell is single-threaded so environ is stable.
-unsafe fn get_environ() -> *const *const libc::c_char {
-    // rustix has no portable borrowed environ-pointer API; exec needs the
-    // process environment without constructing a new environment array.
-    unsafe extern "C" {
-        static environ: *const *mut libc::c_char;
-    }
-    unsafe { environ as *const *const libc::c_char }
-}
-
 /// Spawn a child for command substitution using posix_spawn.
 /// Avoids fork's page-table copy — on Linux, posix_spawn uses
 /// clone(CLONE_VFORK|CLONE_VM) internally.
 ///
 /// Child: stdin=/dev/null, stdout=pipe_w, stderr=inherited, signals=default.
 /// Returns (pid, pipe_read_fd).
-pub fn spawn_command_subst(cmd: &str) -> Result<(i32, RawFd), std::io::Error> {
+///
+/// The child environment is passed in as `K=V` pairs from epsh's variable
+/// store (the source of truth); it never inherits ish's process environment.
+pub fn spawn_command_subst(
+    cmd: &str,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<(i32, RawFd), std::io::Error> {
     use std::ffi::CString;
 
     let (pipe_r, pipe_w) = pipe_cloexec()?;
+
+    // Build a null-terminated `K=V` environment block. Entries whose value
+    // contains a NUL byte are skipped (such values cannot cross exec anyway).
+    let mut env_storage: Vec<CString> = Vec::with_capacity(env.len());
+    let mut envp: Vec<*mut libc::c_char> = Vec::with_capacity(env.len() + 1);
+    for (k, v) in env {
+        use std::os::unix::ffi::OsStrExt;
+        let mut entry = k.as_bytes().to_vec();
+        entry.push(b'=');
+        entry.extend_from_slice(v.as_bytes());
+        if let Ok(c) = CString::new(entry) {
+            envp.push(c.as_ptr() as *mut libc::c_char);
+            env_storage.push(c);
+        }
+    }
+    envp.push(std::ptr::null_mut());
 
     // rustix does not expose POSIX spawn file-actions/attributes, which are
     // used here to avoid fork overhead for command substitution.
@@ -185,6 +132,7 @@ pub fn spawn_command_subst(cmd: &str) -> Result<(i32, RawFd), std::io::Error> {
     let mut pid: i32 = 0;
     // SAFETY: All CStrings are alive for the duration of the call.
     // argv is a valid null-terminated array. file_actions and attrs are initialized.
+    // envp points into env_storage, which outlives the call.
     let rc = unsafe {
         libc::posix_spawnp(
             &mut pid,
@@ -192,7 +140,7 @@ pub fn spawn_command_subst(cmd: &str) -> Result<(i32, RawFd), std::io::Error> {
             &file_actions,
             &attrs,
             argv.as_ptr(),
-            get_environ() as *const *mut libc::c_char,
+            envp.as_ptr(),
         )
     };
 

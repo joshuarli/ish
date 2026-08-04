@@ -1200,6 +1200,234 @@ fn set_and_echo_var() {
 }
 
 #[test]
+fn exported_var_reaches_external_commands() {
+    let sh = PtyShell::spawn();
+    sh.run_command("export MY_VAR=hello_world");
+    let out = sh.run_command("env");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("MY_VAR=hello_world"),
+        "expected exported var in external command env: {text:?}"
+    );
+}
+
+#[test]
+fn set_var_reaches_external_commands() {
+    let sh = PtyShell::spawn();
+    sh.run_command("set TEST_VAR hello_world");
+    let out = sh.run_command("env");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("TEST_VAR=hello_world"),
+        "expected set var in external command env: {text:?}"
+    );
+}
+
+#[test]
+fn set_var_joins_multiple_value_words() {
+    let sh = PtyShell::spawn();
+    sh.run_command("set GREETING hello world");
+    let out = sh.run_command("echo $GREETING");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("hello world"),
+        "expected joined value: {text:?}"
+    );
+}
+
+#[test]
+fn set_no_args_lists_env_vars() {
+    let sh = PtyShell::spawn();
+    let out = sh.run_command("set");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(text.contains("PATH="), "expected env vars listed: {text:?}");
+}
+
+#[test]
+fn set_option_forms_fall_through_to_epsh() {
+    let sh = PtyShell::spawn();
+    let out = sh.run_command("set -e");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        !text.contains("not a valid variable name"),
+        "set -e should fall through to epsh: {text:?}"
+    );
+}
+
+#[test]
+fn unset_removes_var_from_children() {
+    let sh = PtyShell::spawn();
+    sh.run_command("export TMP_UNSET_VAR=present");
+    assert!(PtyShell::strip_ansi(&sh.run_command("env")).contains("TMP_UNSET_VAR=present"));
+    sh.run_command("unset TMP_UNSET_VAR");
+    let out = PtyShell::strip_ansi(&sh.run_command("env"));
+    assert!(
+        !out.contains("TMP_UNSET_VAR=present"),
+        "unset var should not reach children: {out:?}"
+    );
+}
+
+#[test]
+fn unset_removes_os_env_var_set_by_set() {
+    let sh = PtyShell::spawn();
+    sh.run_command("set TMP_OS_VAR some_value");
+    assert!(PtyShell::strip_ansi(&sh.run_command("env")).contains("TMP_OS_VAR=some_value"));
+    sh.run_command("unset TMP_OS_VAR");
+    let out = PtyShell::strip_ansi(&sh.run_command("env"));
+    assert!(
+        !out.contains("TMP_OS_VAR=some_value"),
+        "unset should remove OS env var from children: {out:?}"
+    );
+}
+
+#[test]
+fn unset_in_same_line_not_inherited_by_children() {
+    let sh = PtyShell::spawn();
+    sh.run_command("export TMP_SAME_LINE=present");
+    let out = PtyShell::strip_ansi(&sh.run_command("unset TMP_SAME_LINE; env"));
+    assert!(
+        !out.contains("TMP_SAME_LINE=present"),
+        "unset in the same line must not leak to children: {out:?}"
+    );
+}
+
+#[test]
+fn unset_removes_ambient_environment_from_children() {
+    let sh = PtyShell::spawn_with_setup(
+        &[],
+        &[],
+        &[
+            ("TMP_AMBIENT_VAR", "ambient"),
+            ("1ISH_AMBIENT", "invalid-name"),
+        ],
+        24,
+        80,
+        None,
+        |_| {},
+    );
+    let before = PtyShell::strip_ansi(&sh.run_command("env"));
+    assert!(before.contains("TMP_AMBIENT_VAR=ambient"));
+    assert!(before.contains("1ISH_AMBIENT=invalid-name"));
+
+    let out = PtyShell::strip_ansi(&sh.run_command("unset TMP_AMBIENT_VAR; env | grep AMBIENT"));
+    assert!(
+        !out.contains("TMP_AMBIENT_VAR=ambient"),
+        "stale env leaked: {out:?}"
+    );
+    assert!(
+        out.contains("1ISH_AMBIENT=invalid-name"),
+        "inherited non-shell-name env entry was lost: {out:?}"
+    );
+}
+
+#[test]
+fn unset_removes_ambient_environment_in_pipeline_children() {
+    let sh = PtyShell::spawn_with_setup(
+        &[],
+        &[],
+        &[("TMP_PIPE_AMBIENT", "ambient")],
+        24,
+        80,
+        None,
+        |_| {},
+    );
+    let out = PtyShell::strip_ansi(&sh.run_command("unset TMP_PIPE_AMBIENT; env | grep TMP_PIPE"));
+    assert!(
+        !out.contains("TMP_PIPE_AMBIENT=ambient"),
+        "stale pipeline env leaked: {out:?}"
+    );
+}
+
+#[test]
+fn compound_list_export_reaches_child() {
+    let sh = PtyShell::spawn();
+    let out = PtyShell::strip_ansi(&sh.run_command("cd /tmp && export TMP_COMPOUND=value; env"));
+    assert!(
+        out.contains("TMP_COMPOUND=value"),
+        "compound export was lost: {out:?}"
+    );
+}
+
+#[test]
+fn store_home_drives_interactive_cd() {
+    let sh = PtyShell::spawn();
+    sh.run_command("set HOME /tmp");
+    let out = PtyShell::strip_ansi(&sh.run_command("cd; pwd"));
+    assert!(out.contains("/tmp"), "cd did not use store HOME: {out:?}");
+}
+
+#[test]
+fn unset_oldpwd_blocks_interactive_cd_minus() {
+    let sh = PtyShell::spawn();
+    sh.run_command("cd /tmp");
+    sh.run_command("unset OLDPWD");
+    let out = PtyShell::strip_ansi(&sh.run_command("cd -"));
+    assert!(
+        out.contains("no previous directory"),
+        "cd - used stale process OLDPWD: {out:?}"
+    );
+}
+
+#[test]
+fn prefix_assignment_reaches_child_but_does_not_persist() {
+    let sh = PtyShell::spawn();
+    let out = PtyShell::strip_ansi(&sh.run_command("TMP_PREFIX=value env"));
+    assert!(
+        out.contains("TMP_PREFIX=value"),
+        "prefix assignment should reach the child: {out:?}"
+    );
+    let out = PtyShell::strip_ansi(&sh.run_command("env"));
+    assert!(
+        !out.contains("TMP_PREFIX=value"),
+        "prefix assignment must not persist: {out:?}"
+    );
+}
+
+#[test]
+fn set_path_affects_command_lookup() {
+    let sh = PtyShell::spawn_with_opts(&[("bin/mytool", "#!/bin/sh\necho mytool-ran\n")], &[]);
+    let bin = sh.home_path().join("bin");
+    sh.run_command(&format!("export PATH={}", bin.display()));
+    let out = PtyShell::strip_ansi(&sh.run_command("mytool"));
+    assert!(
+        out.contains("mytool-ran"),
+        "expected script found via exported PATH: {out:?}"
+    );
+}
+
+#[test]
+fn which_reflects_exported_path() {
+    let sh = PtyShell::spawn_with_opts(&[("bin/mytool", "#!/bin/sh\necho mytool-ran\n")], &[]);
+    let bin = sh.home_path().join("bin");
+    sh.run_command(&format!("export PATH={}", bin.display()));
+    let out = PtyShell::strip_ansi(&sh.run_command("which mytool"));
+    assert!(
+        out.contains("mytool"),
+        "which should resolve through the exported PATH: {out:?}"
+    );
+}
+
+#[test]
+fn which_uses_store_path_not_os_env() {
+    // `export PATH` only changes epsh's store. ish's own command lookup must
+    // consult the store, not ish's (stale) process environment.
+    let sh = PtyShell::spawn();
+    let empty = sh.home_path().join("empty-bin");
+    sh.run_command(&format!("mkdir -p {}", empty.display()));
+    sh.run_command(&format!("export PATH={}", empty.display()));
+    let out = PtyShell::strip_ansi(&sh.run_command("which ls"));
+    assert!(
+        out.contains("not found"),
+        "which must use the exported (store) PATH, not the OS env: {out:?}"
+    );
+    let out = PtyShell::strip_ansi(&sh.run_command("which /bin/ls"));
+    assert!(
+        out.contains("/bin/ls"),
+        "absolute path lookup must still work: {out:?}"
+    );
+}
+
+#[test]
 fn tilde_expansion() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("echo ~");

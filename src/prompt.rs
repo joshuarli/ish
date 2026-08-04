@@ -1,8 +1,8 @@
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Cached prompt state — reused across renders.
 pub struct Prompt {
+    user: String,
     user_host: String,
     home: String,
     git: GitCache,
@@ -28,20 +28,34 @@ impl Default for Prompt {
 
 impl Prompt {
     pub fn new() -> Self {
-        let user = std::env::var_os("USER")
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let host = hostname();
-        let home = std::env::var_os("HOME")
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        Self::with_identity("", "")
+    }
+
+    /// Create prompt state from values owned by the shell's variable store.
+    pub fn with_identity(user: &str, home: &str) -> Self {
         Self {
-            user_host: format!("{user}@{host} "),
-            home,
+            user: user.to_string(),
+            user_host: format!("{user}@{} ", hostname()),
+            home: home.to_string(),
             git: GitCache::Unknown,
             pwd_last: String::new(),
             pwd_short: String::new(),
             branch_buf: String::new(),
+        }
+    }
+
+    /// Update identity values after the shell's variable store changes.
+    pub fn set_identity(&mut self, user: &str, home: &str) {
+        if self.user != user {
+            self.user.clear();
+            self.user.push_str(user);
+            self.user_host = format!("{user}@{} ", hostname());
+        }
+        if self.home != home {
+            self.home.clear();
+            self.home.push_str(home);
+            self.pwd_last.clear();
+            self.pwd_short.clear();
         }
     }
 
@@ -86,12 +100,16 @@ impl Prompt {
 
     /// Legacy render — allocates. Used by benchmarks and tests.
     pub fn render(&mut self, last_status: i32) -> String {
-        let pwd = std::env::var_os("PWD")
-            .map(|s| s.to_string_lossy().into_owned())
+        let pwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let denv_dirty = std::env::var_os("__DENV_DIRTY").as_deref() == Some(OsStr::new("1"));
+        self.render_with_state(last_status, &pwd, false)
+    }
+
+    /// Legacy render helper with explicit shell-owned prompt state.
+    pub fn render_with_state(&mut self, last_status: i32, pwd: &str, denv_dirty: bool) -> String {
         let mut out = String::with_capacity(128);
-        self.render_into(&mut out, last_status, &pwd, denv_dirty);
+        self.render_into(&mut out, last_status, pwd, denv_dirty);
         out
     }
 

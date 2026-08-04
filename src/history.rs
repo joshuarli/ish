@@ -176,7 +176,11 @@ pub struct History {
 
 impl History {
     pub fn load() -> Self {
-        Self::load_from(history_path())
+        Self::load_from_home(None)
+    }
+
+    pub fn load_from_home(home: Option<&std::ffi::OsStr>) -> Self {
+        Self::load_from(history_path_for_home(home))
     }
 
     pub fn load_from(path: PathBuf) -> Self {
@@ -1935,10 +1939,6 @@ pub fn score_match(positions: &[u16; 32], count: u8, text: &str, _pwd_basename: 
 /// Count occurrences of a byte in a slice.
 fn memchr_count(needle: u8, haystack: &[u8]) -> usize {
     haystack.iter().filter(|&&b| b == needle).count()
-}
-
-fn history_path() -> PathBuf {
-    history_path_for_home(std::env::var_os("HOME").as_deref())
 }
 
 fn history_path_for_home(home: Option<&std::ffi::OsStr>) -> PathBuf {

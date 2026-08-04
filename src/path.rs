@@ -12,6 +12,10 @@ fn fnv1a(s: &[u8]) -> u64 {
 
 /// O(1) command existence cache built from $PATH directories.
 /// Stores FNV-1a hashes of executable names in a `HashSet<u64>`.
+///
+/// The caller supplies the `$PATH` bytes from epsh's variable store — the
+/// single source of truth for the environment. The OS process environment is
+/// only a denv mirror and may be stale, so it is never consulted here.
 pub struct PathCache {
     commands: FxHashSet<u64>,
     path_hash: u64,
@@ -31,31 +35,15 @@ impl PathCache {
         }
     }
 
-    /// Check if `cmd` is an executable on $PATH.
-    /// Rebuilds the cache if $PATH has changed since the last check.
-    pub fn contains(&mut self, cmd: &str) -> bool {
-        self.ensure_fresh();
+    /// Check if `cmd` is an executable on `$PATH` (given as raw bytes).
+    /// Rebuilds the cache if `$PATH` has changed since the last check.
+    pub fn contains(&mut self, cmd: &str, path_bytes: &[u8]) -> bool {
+        self.ensure_fresh(path_bytes);
         self.commands.contains(&fnv1a(cmd.as_bytes()))
     }
 
-    /// Rebuild the cache if $PATH has changed.
-    fn ensure_fresh(&mut self) {
-        // libc::getenv borrows the environment block without allocating;
-        // this keeps the command-coloring hot path allocation-free.
-        // SAFETY: Single-threaded shell. getenv returns a pointer into the
-        // environment block, valid until the variable is next modified.
-        let path_bytes = unsafe {
-            let ptr = libc::getenv(c"PATH".as_ptr());
-            if ptr.is_null() {
-                if self.path_hash != 0 {
-                    self.commands.clear();
-                    self.path_hash = 0;
-                }
-                return;
-            }
-            std::ffi::CStr::from_ptr(ptr).to_bytes()
-        };
-
+    /// Rebuild the cache if `$PATH` has changed.
+    fn ensure_fresh(&mut self, path_bytes: &[u8]) {
         let current_hash = fnv1a(path_bytes);
         if current_hash == self.path_hash && !self.commands.is_empty() {
             return;
@@ -135,19 +123,10 @@ impl PathCache {
     }
 }
 
-/// Collect executable names from $PATH matching `prefix` into `comp`.
-pub fn complete_commands(prefix: &str, comp: &mut crate::complete::Completions) {
-    // This PATH scan remains libc-based for its allocation-free warm path.
-    // SAFETY: Single-threaded shell. getenv returns a pointer into the
-    // environment block, valid until the variable is next modified.
-    let path_bytes = unsafe {
-        let ptr = libc::getenv(c"PATH".as_ptr());
-        if ptr.is_null() {
-            return;
-        }
-        std::ffi::CStr::from_ptr(ptr).to_bytes()
-    };
-
+/// Collect executable names from `$PATH` (given as raw bytes) matching
+/// `prefix` into `comp`. The PATH comes from epsh's variable store — the
+/// source of truth for the environment.
+pub fn complete_commands(prefix: &str, comp: &mut crate::complete::Completions, path_bytes: &[u8]) {
     let prefix_bytes = prefix.as_bytes();
     let mut pathbuf = [0u8; 4096];
 
@@ -223,17 +202,9 @@ pub fn complete_commands(prefix: &str, comp: &mut crate::complete::Completions) 
     }
 }
 
-/// Find the full path to `cmd` by scanning $PATH directories.
-pub fn scan_path(cmd: &str) -> Option<PathBuf> {
-    // SAFETY: Single-threaded shell. getenv returns a pointer into the
-    // environment block, valid until the variable is next modified.
-    let path_bytes = unsafe {
-        let ptr = libc::getenv(c"PATH".as_ptr());
-        if ptr.is_null() {
-            return None;
-        }
-        std::ffi::CStr::from_ptr(ptr).to_bytes()
-    };
+/// Find the full path to `cmd` by scanning the given `$PATH` bytes (from
+/// epsh's variable store — the source of truth for the environment).
+pub fn scan_path(cmd: &str, path_bytes: &[u8]) -> Option<PathBuf> {
     scan_path_bytes(cmd, path_bytes)
 }
 
