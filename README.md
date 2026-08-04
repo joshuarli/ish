@@ -32,6 +32,7 @@ josh@mac ~/d/ish* main $
 | Ctrl+D | Delete forward / exit on empty line |
 | Ctrl+C | Cancel line |
 | Ctrl+L | Clear screen |
+| Ctrl+P (any mode) | Write a layout dump to `~/.cache/ish/dump-<random hex>` without changing the screen |
 | Left / Right | Move by character |
 | Ctrl+Left / Alt+B | Move word left |
 | Ctrl+Right / Alt+F | Move word right |
@@ -142,7 +143,7 @@ Expansion order: tilde, parameter expansion, command substitution, pathname expa
 | `pwd` | Print working directory |
 | `true` / `false` | Return 0 / 1 |
 | `copy-scrollback` | Copy session to clipboard via OSC 52 |
-| `ish-dump` | Write the current layout state to `~/.cache/ish/dump-<random hex>` |
+| `ish-dump` | Write the current layout state to `~/.cache/ish/dump-<random hex>` (same as Ctrl+P) |
 
 ### `l` — Native Directory Listing
 

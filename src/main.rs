@@ -440,17 +440,16 @@ fn capture_layout_dump(
     region: render::RenderedRegion,
     history_cache: &render::HistoryPagerCache,
 ) {
-    let suggestion_display_len =
-        if line.text().len() >= 3 && !line.has_newlines() && line.cursor() == line.text().len() {
-            shell
-                .history
-                .session_prefix_search(line.text(), 0)
-                .and_then(|entry| entry.strip_prefix(line.text()))
-                .map(ish::line::str_width)
-                .unwrap_or(0)
-        } else {
-            0
-        };
+    let suggestion = if line.text().len() >= 3 && !line.has_newlines() && line.cursor() == line.text().len()
+    {
+        shell
+            .history
+            .session_prefix_search(line.text(), 0)
+            .and_then(|entry| entry.strip_prefix(line.text()))
+    } else {
+        None
+    };
+    let suggestion_display_len = suggestion.map(ish::line::str_width).unwrap_or(0);
 
     shell.layout_dump.clear();
     let out = &mut shell.layout_dump;
@@ -469,6 +468,8 @@ fn capture_layout_dump(
         line.display_cursor_pos()
     );
     let _ = writeln!(out, "line.display_len: {}", line.display_len());
+    let _ = writeln!(out, "suggestion.text: {suggestion:?}");
+    let _ = writeln!(out, "suggestion.display_len: {suggestion_display_len}");
     let _ = writeln!(out, "line.has_newlines: {}", line.has_newlines());
     let _ = writeln!(out, "rendered_region: {region:?}");
     let _ = writeln!(out, "mode: {}", mode_name(mode));
@@ -608,40 +609,53 @@ fn mode_name(mode: &Mode) -> &'static str {
     }
 }
 
-fn write_layout_dump(shell: &Shell) -> i32 {
+/// Write the captured layout dump to a fresh file in `~/.cache/ish/dump-<hex>`.
+/// Returns the written path on success, or an error message. Deliberately does
+/// not write to the terminal, so Ctrl+P can capture a corrupted screen without
+/// changing its contents.
+fn write_layout_dump_to_file(shell: &Shell) -> Result<String, String> {
     if shell.home.is_empty() {
-        eprintln!("ish-dump: HOME is not set");
-        return 1;
+        return Err("ish-dump: HOME is not set".to_string());
     }
 
     let dir = Path::new(&shell.home).join(".cache/ish");
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        eprintln!("ish-dump: could not create {}: {error}", dir.display());
-        return 1;
-    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("ish-dump: could not create {}: {error}", dir.display()))?;
 
     for _ in 0..8 {
         let path = dir.join(format!("dump-{}", random_dump_hex()));
-        let file = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path);
-        let Ok(mut file) = file else {
-            continue;
-        };
-        if let Err(error) = std::io::Write::write_all(&mut file, shell.layout_dump.as_bytes()) {
-            eprintln!("ish-dump: could not write {}: {error}", path.display());
-            return 1;
+            .open(&path)
+        {
+            Ok(mut file) => {
+                std::io::Write::write_all(&mut file, shell.layout_dump.as_bytes()).map_err(
+                    |error| format!("ish-dump: could not write {}: {error}", path.display()),
+                )?;
+                return Ok(path.display().to_string());
+            }
+            Err(_) => continue,
         }
-        println!("ish-dump: wrote {}", path.display());
-        return 0;
     }
 
-    eprintln!(
+    Err(format!(
         "ish-dump: could not choose a unique dump filename in {}",
         dir.display()
-    );
-    1
+    ))
+}
+
+fn write_layout_dump(shell: &Shell) -> i32 {
+    match write_layout_dump_to_file(shell) {
+        Ok(path) => {
+            println!("ish-dump: wrote {path}");
+            0
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            1
+        }
+    }
 }
 
 fn random_dump_hex() -> String {
@@ -835,6 +849,25 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                 continue;
             }
             InputEvent::Key(key) => {
+                // Ctrl+P writes a layout dump in any mode and does not repaint,
+                // so it captures the screen exactly as it is (including the
+                // status line) without disturbing it. Intercept before mode
+                // dispatch so every mode is covered uniformly.
+                if key.key == Key::Char('p') && key.mods.ctrl {
+                    capture_layout_dump(
+                        shell,
+                        &mode,
+                        &line,
+                        &prompt_str,
+                        prompt_display_len,
+                        region,
+                        &history_cache,
+                    );
+                    if let Err(message) = write_layout_dump_to_file(shell) {
+                        eprintln!("{message}");
+                    }
+                    continue;
+                }
                 match &mut mode {
                     Mode::Normal => {
                         match handle_normal_key(

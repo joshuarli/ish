@@ -428,11 +428,22 @@ pub fn debug_dump_prompt_layout(
     term_cols: u16,
 ) {
     let cols = (term_cols as usize).max(1);
-    let layout = if line.has_newlines() {
-        layout_multiline_prompt(prompt_display_len, line, cols)
-    } else {
-        layout_single_line_prompt(prompt_display_len, line, suggestion_display_len, cols)
-    };
+    if line.has_newlines() {
+        let layout = layout_multiline_prompt(prompt_display_len, line, cols);
+        let _ = writeln!(out, "prompt_layout: {layout:?}");
+        return;
+    }
+    // Reveal the intermediate arithmetic so a single-line layout bug can be
+    // traced without re-running the terminal. These are exactly the values
+    // `layout_single_line_prompt` and `render_line` derive from the same inputs.
+    let before_cursor = prompt_display_len + line.display_cursor_pos();
+    let full = prompt_display_len + line.display_len() + suggestion_display_len;
+    let layout = layout_single_line_prompt(prompt_display_len, line, suggestion_display_len, cols);
+    let _ = writeln!(
+        out,
+        "prompt.layout_math: before_cursor={before_cursor} full={full} cols={cols} forced_wrap={}",
+        full > 0 && full.is_multiple_of(cols),
+    );
     let _ = writeln!(out, "prompt_layout: {layout:?}");
 }
 
