@@ -22,6 +22,7 @@ MUSL_LINKER := $(LLVM_BIN)/rust-lld
 MUSL_TARGET_LIBDIR := $(shell rustc --print target-libdir --target $(TARGET))
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
+RELEASE_RUSTFLAGS := $(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort
 
 .PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-profile bench-pgo install setup ensure-musl-target
 
@@ -47,6 +48,14 @@ release: ensure-musl-target
 
 verify-release:
 	@test -f "target/$(TARGET)/release/$(NAME)"
+	@if command -v otool >/dev/null 2>&1 && otool -l "target/$(TARGET)/release/$(NAME)" 2>/dev/null | grep -q '__llvm_prf'; then \
+		echo 'release still contains PGO profile sections; rebuild with make release-pgo' >&2; \
+		exit 1; \
+	fi
+	@if strings "target/$(TARGET)/release/$(NAME)" 2>/dev/null | grep -q 'LLVM Profile'; then \
+		echo 'release still contains the LLVM profile runtime; profile use must be limited to the application crate' >&2; \
+		exit 1; \
+	fi
 	@if echo "$(TARGET)" | grep -q -- '-linux-musl$$'; then \
 		command -v readelf >/dev/null || { echo 'readelf is required for release verification'; exit 1; }; \
 		file "target/$(TARGET)/release/$(NAME)" | grep -Eq 'static-pie linked|statically linked' || { echo 'release is not statically linked'; exit 1; }; \
@@ -87,30 +96,52 @@ pgo-profile:
 	cargo bench --bench bench -- --sample-size 1
 	$(LLVM_BIN)/llvm-profdata merge -o $(PGO_MERGED) $(PGO_DIR)
 
-# PGO-optimized release: uses gathered profiles + all aggressive flags.
+# PGO-optimized release: build dependencies and build-std without profile
+# runtime support, then apply the profile only to the application crate.
 release-pgo: ensure-musl-target pgo-profile
 	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
-	RUSTFLAGS="-Cprofile-use=$(PGO_MERGED) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
+	RUSTFLAGS="$(RELEASE_RUSTFLAGS)" \
 	cargo build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
+	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
+	RUSTFLAGS="$(RELEASE_RUSTFLAGS)" \
+	cargo rustc --release \
+	  -Z build-std=std \
+	  -Z build-std-features= \
+	  --target $(TARGET) --bin $(NAME) -- \
+	  -Cprofile-use=$(PGO_MERGED)
 
 release-pgo-linux: pgo-profile
 	CARGO_TARGET_$(TARGET_ENV)_LINKER=clang \
-	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Cprofile-use=$(PGO_MERGED) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)" \
+	RUSTFLAGS="$(RELEASE_RUSTFLAGS) -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)" \
 	cargo build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
+	CARGO_TARGET_$(TARGET_ENV)_LINKER=clang \
+	RUSTFLAGS="$(RELEASE_RUSTFLAGS) -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)" \
+	cargo rustc --release \
+	  -Z build-std=std \
+	  -Z build-std-features= \
+	  --target $(TARGET) --bin $(NAME) -- \
+	  -Cprofile-use=$(PGO_MERGED)
 
 release-pgo-linux-static: ensure-musl-target pgo-profile
 	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
-	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Cprofile-use=$(PGO_MERGED) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
+	RUSTFLAGS="$(RELEASE_RUSTFLAGS)" \
 	cargo build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
+	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
+	RUSTFLAGS="$(RELEASE_RUSTFLAGS)" \
+	cargo rustc --release \
+	  -Z build-std=std \
+	  -Z build-std-features= \
+	  --target $(TARGET) --bin $(NAME) -- \
+	  -Cprofile-use=$(PGO_MERGED)
 
 # Benchmark regular release vs PGO and compare persisted baselines.
 bench-pgo: pgo-profile
