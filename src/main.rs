@@ -802,6 +802,15 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                     shell.rows = rows;
                     shell.cols = cols;
                     update_mode_layout_for_resize(&mut mode, shell);
+
+                    // Terminal emulators reflow the live cursor and their
+                    // DEC saved cursor differently on resize. The saved
+                    // RenderedRegion anchor is therefore no longer a safe
+                    // basis for an incremental repaint. Start from a known
+                    // screen position and rebuild the active region.
+                    tw.clear_screen();
+                    region = render::RenderedRegion::default();
+                    history_cache.clear();
                 }
                 region = render_active_mode(
                     &mut tw,
@@ -1170,7 +1179,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             shell.history_match_buffer = std::mem::take(matches);
                             history_cache.clear();
                             mode = Mode::Normal;
-                            region.clear(&mut tw);
+                            region.clear_from_cursor(&mut tw);
                             let info = render::render_line(
                                 &mut tw,
                                 &prompt_str,
@@ -1188,7 +1197,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             shell.history_match_buffer = std::mem::take(matches);
                             history_cache.clear();
                             mode = Mode::Normal;
-                            region.clear(&mut tw);
+                            region.clear_from_cursor(&mut tw);
                             let info = render::render_line(
                                 &mut tw,
                                 &prompt_str,

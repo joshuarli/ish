@@ -753,6 +753,67 @@ impl Screen {
             cursor_col: self.col,
         }
     }
+
+    /// Reflow the simple screen model when a test changes terminal width.
+    /// This covers the single-line prompt cases exercised below; the real
+    /// terminal reflows each soft-wrapped row before delivering SIGWINCH.
+    fn resize(&mut self, rows: u16, cols: u16) {
+        let old_rows = self.rows;
+        let old_cols = self.cols;
+        let old_cells = std::mem::take(&mut self.cells);
+        let old_cursor = (self.row, self.col);
+        let old_saved = self.saved;
+
+        self.rows = rows as usize;
+        self.cols = cols as usize;
+        self.cells = vec![vec![' '; self.cols]; self.rows];
+
+        let reflow_position = |row: usize, col: usize| {
+            if self.cols == 0 {
+                return (0, 0);
+            }
+            let offset = row.saturating_mul(old_cols).saturating_add(col);
+            (
+                (offset / self.cols).min(self.rows.saturating_sub(1)),
+                (offset % self.cols).min(self.cols.saturating_sub(1)),
+            )
+        };
+
+        for (old_row, cells) in old_cells.into_iter().enumerate().take(old_rows) {
+            let mut new_row = if self.cols == 0 {
+                0
+            } else {
+                old_row.saturating_mul(old_cols) / self.cols
+            };
+            let mut new_col = if self.cols == 0 {
+                0
+            } else {
+                old_row.saturating_mul(old_cols) % self.cols
+            };
+            for ch in cells {
+                if new_row >= self.rows || self.cols == 0 {
+                    break;
+                }
+                self.cells[new_row][new_col] = ch;
+                new_col += 1;
+                if new_col >= self.cols {
+                    new_col = 0;
+                    new_row += 1;
+                }
+            }
+        }
+
+        (self.row, self.col) = reflow_position(old_cursor.0, old_cursor.1);
+        // tmux/xterm keep the DEC saved cursor in its screen coordinate while
+        // reflowing the live cursor, which is the mismatch this regression
+        // models.
+        self.saved = old_saved.map(|(row, col)| {
+            (
+                row.min(self.rows.saturating_sub(1)),
+                col.min(self.cols.saturating_sub(1)),
+            )
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1741,6 +1802,85 @@ fn history_search_selection_preserves_cursor_after_typing() {
 }
 
 #[test]
+fn history_accept_reanchors_prompt_before_typing() {
+    let history = &[
+        "echo history-one-abcdefghijklmnop",
+        "echo history-two-abcdefghijklmnop",
+    ];
+    let sh = PtyShell::spawn_with_size(&[], history, 8, 20);
+    let fill_cmd = (1..=6)
+        .map(|i| format!("echo fill{i:02}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut initial_output = sh.startup_output().to_string();
+    initial_output.push_str(&sh.run_command(&fill_cmd));
+
+    let frames = run_trace_with_initial_output(
+        &sh,
+        8,
+        20,
+        &[
+            TraceStep {
+                label: "open search",
+                input: TraceInput::Bytes(b"\x12"),
+                settle_ms: 0,
+                read_ms: 500,
+            },
+            TraceStep {
+                label: "query",
+                input: TraceInput::Text("history"),
+                settle_ms: 100,
+                read_ms: 500,
+            },
+            TraceStep {
+                label: "select second result",
+                input: TraceInput::Bytes(b"\x1b[B"),
+                settle_ms: 100,
+                read_ms: 500,
+            },
+            TraceStep {
+                label: "accept",
+                input: TraceInput::Bytes(b"\r"),
+                settle_ms: 100,
+                read_ms: 500,
+            },
+            TraceStep {
+                label: "type after accept",
+                input: TraceInput::Text("x"),
+                settle_ms: 100,
+                read_ms: 500,
+            },
+        ],
+        &initial_output,
+    );
+
+    let frame = frames.last().unwrap();
+    let accept_frame = &frames[3];
+    assert!(
+        !accept_frame.raw.starts_with("\x1b8\x1b[J"),
+        "history exit should clear from the live pager cursor, not a stale saved anchor: {:?}",
+        accept_frame.raw
+    );
+    assert!(
+        !frame.snapshot.visible.contains("search:"),
+        "history header remained after accepting a result: {:?}",
+        frame.snapshot
+    );
+    assert!(
+        frame
+            .snapshot
+            .visible
+            .replace('\n', "")
+            .contains("echo history-one-abcdefghijklmnopx"),
+        "typing after history acceptance should start from the selected command: {:?}",
+        frame.snapshot
+    );
+
+    sh.ctrl_c();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
 fn history_ctrl_r_near_bottom_keeps_pager_stable() {
     let history = &[
         "hist01", "hist02", "hist03", "hist04", "hist05", "hist06", "hist07", "hist08", "hist09",
@@ -2246,6 +2386,50 @@ fn completion_resize_rerenders_grid() {
     assert_screen_contains_once(&screen, "aac.txt");
 
     sh.escape();
+    sh.wait_for_prompt(2000);
+}
+
+#[test]
+fn normal_resize_reanchors_wrapped_prompt() {
+    let sh = PtyShell::spawn_with_size(&[], &[], 12, 80);
+    let mut screen = Screen::new(12, 80);
+    let mut initial_output = sh.startup_output().to_string();
+    initial_output.push_str(&sh.run_command("printf '\\n\\n'"));
+    screen.apply_output(&initial_output);
+
+    sh.type_str("echo resize-test-abcdefghijklmnopqrstuvwxyz");
+    screen.apply_output(&sh.read_timeout(800));
+
+    sh.resize(12, 52);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    screen.resize(12, 52);
+    let resize_output = sh.read_timeout(800);
+    assert!(
+        resize_output.contains("\x1b[H\x1b[2J"),
+        "resize should invalidate the old terminal region before repainting: {resize_output:?}"
+    );
+    screen.apply_output(&resize_output);
+
+    sh.type_str("x");
+    screen.apply_output(&sh.read_timeout(800));
+
+    let prompt_count = screen.visible_text().matches("testuser@sentry").count();
+    assert_eq!(
+        prompt_count,
+        1,
+        "resize should repaint one prompt, not duplicate the reflowed prompt: {:?}",
+        screen.snapshot()
+    );
+    assert!(
+        screen
+            .visible_text()
+            .replace('\n', "")
+            .contains("echo resize-test-abcdefghijklmnopqrstuvwxyzx"),
+        "resized prompt lost or duplicated input: {:?}",
+        screen.snapshot()
+    );
+
+    sh.ctrl_c();
     sh.wait_for_prompt(2000);
 }
 

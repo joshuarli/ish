@@ -21,6 +21,19 @@ impl RenderedRegion {
         tw.restore_cursor();
         tw.clear_to_end_of_screen();
     }
+
+    /// Clear from the cursor position currently left by the renderer.
+    ///
+    /// This is safer than restoring the DEC saved cursor when leaving a
+    /// pager: terminal scrolling can reflow the live cursor and the saved
+    /// anchor differently, while the pager's relative cursor row remains
+    /// known.
+    pub fn clear_from_cursor(self, tw: &mut TermWriter) {
+        if !self.anchored {
+            return;
+        }
+        clear_region_from_cursor(tw, self);
+    }
 }
 
 fn reserve_rows_below(tw: &mut TermWriter, rows_below: u16) {
@@ -34,7 +47,7 @@ fn reserve_rows_below(tw: &mut TermWriter, rows_below: u16) {
     tw.carriage_return();
 }
 
-fn clear_from_cursor(tw: &mut TermWriter, region: RenderedRegion) {
+fn clear_region_from_cursor(tw: &mut TermWriter, region: RenderedRegion) {
     if region.cursor_row > 0 {
         tw.move_cursor_up(region.cursor_row);
     }
@@ -48,7 +61,7 @@ fn begin_region_render(tw: &mut TermWriter, prev: RenderedRegion, region: Render
         let prev_rows_below = prev.painted_rows.saturating_sub(1);
         let new_rows_below = region.painted_rows.saturating_sub(1);
         if new_rows_below <= prev_rows_below {
-            clear_from_cursor(tw, prev);
+            clear_region_from_cursor(tw, prev);
         } else {
             prev.clear(tw);
             if prev_rows_below > 0 {
