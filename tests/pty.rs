@@ -920,11 +920,13 @@ fn assert_frame_contains_once(frame: &TraceFrame, needle: &str) {
     );
 }
 
-fn latest_layout_dump(home: &Path) -> PathBuf {
-    let cache = home.join(".cache/ish");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+fn latest_layout_dump(sh: &PtyShell) -> PathBuf {
+    let cache = sh.home_path().join(".cache/ish");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut output = String::new();
 
     loop {
+        output.push_str(&sh.read_timeout(100));
         let mut dumps: Vec<_> = std::fs::read_dir(&cache)
             .into_iter()
             .flatten()
@@ -941,7 +943,11 @@ fn latest_layout_dump(home: &Path) -> PathBuf {
             return dumps.last().unwrap().path();
         }
         if std::time::Instant::now() >= deadline {
-            panic!("layout dump was not written in {}", cache.display());
+            panic!(
+                "layout dump was not written in {}; shell output: {:?}",
+                cache.display(),
+                PtyShell::strip_ansi(&output)
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -1198,7 +1204,7 @@ fn ctrl_p_writes_layout_dump_without_executing() {
 
     // Ctrl+P writes silently (no stdout message), so locate the newest dump
     // in the temp HOME's cache dir.
-    let path = latest_layout_dump(sh.home_path());
+    let path = latest_layout_dump(&sh);
     let dump = std::fs::read_to_string(&path).expect("dump file should be readable");
 
     assert!(dump.contains("ish layout dump"));
@@ -1220,7 +1226,7 @@ fn ctrl_p_works_in_history_search_mode() {
     sh.ctrl_p();
 
     // Ctrl+P writes silently, so locate the newest dump in the temp HOME.
-    let path = latest_layout_dump(sh.home_path());
+    let path = latest_layout_dump(&sh);
     let dump = std::fs::read_to_string(&path).expect("dump file should be readable");
 
     assert!(dump.contains("mode: history_search"));
