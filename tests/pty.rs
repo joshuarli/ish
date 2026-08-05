@@ -987,6 +987,107 @@ fn prompt_appears_on_startup() {
     assert!(out.contains("$ "), "expected prompt, got: {out:?}");
 }
 
+fn pgo_profile_history() -> Vec<String> {
+    const COMMANDS: &[&str] = &[
+        "cargo test --workspace",
+        "cargo test --test pty",
+        "cargo clippy --all-targets",
+        "git status --short",
+        "git diff --stat",
+        "git log --oneline --decorate -20",
+        "rg -n TODO src tests",
+        "docker compose up -d database",
+        "ssh staging deploy --verbose",
+        "kubectl get pods --all-namespaces",
+    ];
+
+    (0..12_000)
+        .map(|index| {
+            format!(
+                "{} # pgo-session-{index:05}",
+                COMMANDS[index % COMMANDS.len()]
+            )
+        })
+        .collect()
+}
+
+/// Representative user activity for release PGO collection. This deliberately
+/// stays in the PTY test so the profiled process is the real shell event loop;
+/// the test harness itself is built and run without profile instrumentation.
+#[test]
+#[ignore]
+fn pgo_profile_startup_history_tui() {
+    assert!(
+        std::env::var_os("ISH_TEST_BINARY").is_some(),
+        "this scenario must run with ISH_TEST_BINARY set to an instrumented ish"
+    );
+
+    let config = "set EDITOR vi\nset PAGER less\nalias gs git status\nalias ct cargo test\n";
+    let startup_files = [(".config/ish/config.ish", config)];
+
+    // Repeated launches give startup code meaningful profile counts without
+    // letting one interactive session dominate the profile by construction.
+    for _ in 0..4 {
+        let sh = PtyShell::spawn_with_setup(&startup_files, &[], &[], 24, 80, None, |_| {});
+        assert!(sh.startup_output().contains("$ "));
+    }
+
+    let history = pgo_profile_history();
+    let history_refs = history.iter().map(String::as_str).collect::<Vec<_>>();
+    let files = [
+        (".config/ish/config.ish", config),
+        ("project/.git/HEAD", "ref: refs/heads/main\n"),
+        (
+            "project/.git/refs/heads/main",
+            "0123456789012345678901234567890123456789\n",
+        ),
+    ];
+    let sh =
+        PtyShell::spawn_with_setup(&files, &history_refs, &[], 32, 120, Some("project"), |_| {});
+
+    // Exercise the initial pager, incremental fuzzy search, candidate-stack
+    // restoration on backspace, and selection movement without executing a
+    // command. The short reads drain the PTY without adding sleeps to the
+    // profiled workload.
+    sh.ctrl_r();
+    assert!(
+        sh.wait_for("search:", 5000).contains("search:"),
+        "history search did not open"
+    );
+    sh.type_str("cargo tes");
+    sh.read_timeout(500);
+    sh.backspace();
+    sh.type_str("t");
+    sh.read_timeout(500);
+    sh.down();
+    sh.up();
+    sh.read_timeout(500);
+    sh.escape();
+    sh.wait_for_prompt(5000);
+
+    // A second pass uses a different match distribution and forces the pager
+    // to repaint as the query narrows and then expands again.
+    sh.ctrl_r();
+    assert!(
+        sh.wait_for("search:", 5000).contains("search:"),
+        "second history search did not open"
+    );
+    sh.type_str("git sta");
+    sh.read_timeout(500);
+    sh.type_str("tus");
+    sh.read_timeout(500);
+    sh.backspace();
+    sh.backspace();
+    sh.type_str("at");
+    sh.read_timeout(500);
+    sh.down();
+    sh.down();
+    sh.up();
+    sh.read_timeout(500);
+    sh.escape();
+    sh.wait_for_prompt(5000);
+}
+
 #[test]
 fn echo_command() {
     let sh = PtyShell::spawn();
