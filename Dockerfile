@@ -32,6 +32,19 @@ RUN case "$TARGETARCH" in \
     && tar xf "$archive" -C /opt/llvm-musl --strip-components=1 \
     && rm /tmp/llvm-x86_64.tar.xz /tmp/llvm-aarch64.tar.xz
 
+# Rust's static musl profiler link asks lld for -lgcc. Keep the linker
+# interface while resolving it to the LLVM compiler-rt builtins shipped in
+# the prebuilt toolchain; this image must not depend on GCC.
+RUN case "$TARGETARCH" in \
+        amd64) llvm_arch=x86_64 ;; \
+        arm64) llvm_arch=aarch64 ;; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && clang_major="${LLVM_VERSION%%.*}" \
+    && builtins="/opt/llvm-musl/lib/clang/$clang_major/lib/linux/libclang_rt.builtins-$llvm_arch.a" \
+    && test -f "$builtins" \
+    && ln -sf "$builtins" /usr/lib/libcompiler-rt-builtins.a
+
 RUN for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do \
         stub_dir="/usr/lib/e-crt/$target"; \
         mkdir -p "$stub_dir"; \

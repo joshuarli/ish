@@ -27,6 +27,7 @@ PGO_BINARY := $(PGO_BUILD_DIR)/$(TARGET)/release/$(NAME)
 RELEASE_RUSTFLAGS := $(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort
 RELEASE_LINUX_RUSTFLAGS := $(RELEASE_RUSTFLAGS) -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)
 PGO_RUSTFLAGS := $(RELEASE_RUSTFLAGS) -Cprofile-generate=$(PGO_DIR)
+PGO_STATIC_RUSTFLAGS := $(if $(findstring -linux-musl,$(TARGET)),$(PGO_RUSTFLAGS) -Clink-arg=/usr/lib/libcompiler-rt-builtins.a,$(PGO_RUSTFLAGS))
 PGO_LINUX_RUSTFLAGS := $(RELEASE_LINUX_RUSTFLAGS) -Cprofile-generate=$(PGO_DIR)
 
 .PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux install setup ensure-musl-target
@@ -100,7 +101,7 @@ pgo-instrument: ensure-musl-target
 	rm -rf "$(PGO_BUILD_DIR)" "$(PGO_DIR)" && mkdir -p "$(PGO_DIR)"
 	CARGO_TARGET_DIR="$(PGO_BUILD_DIR)" \
 	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
-	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(PGO_RUSTFLAGS)" \
+	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(PGO_STATIC_RUSTFLAGS)" \
 	cargo build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
