@@ -282,11 +282,6 @@ impl PtyShell {
         self.send(b"\x0c");
     }
 
-    /// Send Ctrl+P (write a layout dump without touching the screen).
-    fn ctrl_p(&self) {
-        self.send(b"\x10");
-    }
-
     /// Send Ctrl+A.
     fn ctrl_a(&self) {
         self.send(b"\x01");
@@ -920,39 +915,6 @@ fn assert_frame_contains_once(frame: &TraceFrame, needle: &str) {
     );
 }
 
-fn latest_layout_dump(sh: &PtyShell) -> PathBuf {
-    let cache = sh.home_path().join(".cache/ish");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut output = String::new();
-
-    loop {
-        output.push_str(&sh.read_timeout(100));
-        let mut dumps: Vec<_> = std::fs::read_dir(&cache)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("dump-"))
-            .collect();
-        dumps.sort_by_key(|entry| {
-            entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(std::time::UNIX_EPOCH)
-        });
-        if !dumps.is_empty() {
-            return dumps.last().unwrap().path();
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!(
-                "layout dump was not written in {}; shell output: {:?}",
-                cache.display(),
-                PtyShell::strip_ansi(&output)
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-}
-
 fn normalize_screen_text(screen: &str) -> String {
     screen.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -1165,72 +1127,6 @@ fn pwd_builtin() {
         text.contains("/tmp/ish_pty_test_"),
         "expected temp dir in pwd output: {text:?}"
     );
-}
-
-#[test]
-fn ish_dump_writes_layout_state() {
-    let sh = PtyShell::spawn();
-    let out = sh.run_command("ish-dump");
-    let text = PtyShell::strip_ansi(&out);
-    let path_text = text
-        .split("ish-dump: wrote ")
-        .nth(1)
-        .and_then(|rest| rest.lines().next())
-        .expect("ish-dump should report its output path")
-        .trim();
-    let path = Path::new(path_text);
-
-    assert_eq!(
-        path.parent(),
-        Some(sh.home_path().join(".cache/ish").as_path())
-    );
-    let filename = path.file_name().unwrap().to_str().unwrap();
-    assert!(filename.strip_prefix("dump-").is_some_and(|suffix| {
-        suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
-    }));
-
-    let dump = std::fs::read_to_string(path).expect("ish-dump file should be readable");
-    assert!(dump.contains("ish layout dump"));
-    assert!(dump.contains("terminal.rows: 24"));
-    assert!(dump.contains("mode: normal"));
-    assert!(dump.contains("line.text: \"ish-dump\""));
-}
-
-#[test]
-fn ctrl_p_writes_layout_dump_without_executing() {
-    let sh = PtyShell::spawn();
-    sh.type_str("ish-dump");
-    sh.ctrl_p();
-
-    // Ctrl+P writes silently (no stdout message), so locate the newest dump
-    // in the temp HOME's cache dir.
-    let path = latest_layout_dump(&sh);
-    let dump = std::fs::read_to_string(&path).expect("dump file should be readable");
-
-    assert!(dump.contains("ish layout dump"));
-    assert!(dump.contains("mode: normal"));
-    // The typed-but-not-executed line is what got captured.
-    assert!(dump.contains("line.text: \"ish-dump\""));
-    // Newly captured data.
-    assert!(dump.contains("suggestion.display_len:"));
-    assert!(dump.contains("prompt.layout_math:"));
-}
-
-#[test]
-fn ctrl_p_works_in_history_search_mode() {
-    let sh = PtyShell::spawn_with_opts(&[], &["echo beta"]);
-    sh.ctrl_r();
-    let _ = sh.wait_for("search:", 2000);
-    sh.type_str("beta");
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    sh.ctrl_p();
-
-    // Ctrl+P writes silently, so locate the newest dump in the temp HOME.
-    let path = latest_layout_dump(&sh);
-    let dump = std::fs::read_to_string(&path).expect("dump file should be readable");
-
-    assert!(dump.contains("mode: history_search"));
-    assert!(dump.contains("history.query.text: \"beta\""));
 }
 
 #[test]

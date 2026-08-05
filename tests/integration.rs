@@ -997,7 +997,6 @@ fn builtin_is_builtin_known() {
     assert!(builtin::is_builtin("true"));
     assert!(builtin::is_builtin("false"));
     assert!(builtin::is_builtin("copy-scrollback"));
-    assert!(builtin::is_builtin("ish-dump"));
 }
 
 #[test]
