@@ -12,7 +12,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -845,6 +845,15 @@ fn eval_env_bash(
     let after_r = unsafe { OwnedFd::from_raw_fd(after_r) };
     // SAFETY: these fds come directly from pipe_cloexec and are uniquely owned here.
     let after_w = unsafe { OwnedFd::from_raw_fd(after_w) };
+    // Keep stable source fds for the child remap. The pipe fds can occupy 3 or
+    // 4 themselves, so remapping directly from them can overwrite the other
+    // source before it has been installed.
+    let before_src = rustix::io::dup(&before_w).map_err(|e| format!("dup before pipe: {e}"))?;
+    let after_src = rustix::io::dup(&after_w).map_err(|e| format!("dup after pipe: {e}"))?;
+    rustix::io::fcntl_setfd(&before_src, rustix::io::FdFlags::CLOEXEC)
+        .map_err(|e| format!("set before pipe close-on-exec: {e}"))?;
+    rustix::io::fcntl_setfd(&after_src, rustix::io::FdFlags::CLOEXEC)
+        .map_err(|e| format!("set after pipe close-on-exec: {e}"))?;
 
     let mut script = String::with_capacity(BASH_STDLIB.len() + 256);
     script.push_str(BASH_STDLIB);
@@ -888,20 +897,12 @@ fn eval_env_bash(
     // dup the dedicated pipe fds into 3/4 for the shell snapshot script.
     unsafe {
         cmd.pre_exec(move || {
-            let before_w_fd = before_w.as_raw_fd();
-            let after_w_fd = after_w.as_raw_fd();
             let mut before_target = OwnedFd::from_raw_fd(3);
-            rustix::io::dup2(&before_w, &mut before_target).map_err(io::Error::from)?;
+            rustix::io::dup2(&before_src, &mut before_target).map_err(io::Error::from)?;
             std::mem::forget(before_target);
             let mut after_target = OwnedFd::from_raw_fd(4);
-            rustix::io::dup2(&after_w, &mut after_target).map_err(io::Error::from)?;
+            rustix::io::dup2(&after_src, &mut after_target).map_err(io::Error::from)?;
             std::mem::forget(after_target);
-            if before_w_fd != 3 {
-                rustix::io::close(before_w_fd);
-            }
-            if after_w_fd != 4 {
-                rustix::io::close(after_w_fd);
-            }
             Ok(())
         });
     }
@@ -920,6 +921,8 @@ fn eval_env_bash(
         .status()
         .map_err(|e| format!("failed to run bash: {e}"))?;
     drop(cmd);
+    drop(before_w);
+    drop(after_w);
 
     let before_data = before_read
         .join()

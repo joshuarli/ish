@@ -5,6 +5,7 @@ ARG LLVM_VERSION=22.1.8
 
 RUN apk add --no-cache \
     binutils \
+    bash \
     file \
     make \
     strace \

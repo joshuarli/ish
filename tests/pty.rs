@@ -2517,7 +2517,7 @@ fn normal_resize_reanchors_wrapped_prompt() {
     sh.type_str("x");
     screen.apply_output(&sh.read_timeout(800));
 
-    let prompt_count = screen.visible_text().matches("testuser@sentry").count();
+    let prompt_count = screen.visible_text().matches("testuser@").count();
     assert_eq!(
         prompt_count,
         1,

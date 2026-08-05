@@ -13,7 +13,7 @@ MUSL_CRT_DIR ?= $(shell for dir in \
 	/usr/lib/e-crt/$(TARGET) \
 	/usr/$(subst -unknown,,$(TARGET))/lib64 \
 	/usr/$(subst -unknown,,$(TARGET))/lib; do \
-	if test -f "$$dir/crt1.o"; then printf '%s' "$$dir"; break; fi; \
+	if test -f "$$dir/crtbegin.o"; then printf '%s' "$$dir"; break; fi; \
 done)
 # LLVM helper binaries run on the build host; they are not installed in the
 # target triple's rustlib directory when cross-compiling to musl.
