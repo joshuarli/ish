@@ -85,7 +85,9 @@ dependencies = [
 
 [[package]]
 name = "epsh"
-version = "0.0.6"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49ff603ecd15bc59d7d2134902ef329690f1858d57af213aafbe7cd69d52bd4f"
 dependencies = [
  "fxhash",
  "libc",

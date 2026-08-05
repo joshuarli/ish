@@ -1209,7 +1209,10 @@ fn ctrl_p_works_in_history_search_mode() {
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("dump-"))
         .collect();
-    assert!(!dumps.is_empty(), "ctrl-p in history search should write a dump");
+    assert!(
+        !dumps.is_empty(),
+        "ctrl-p in history search should write a dump"
+    );
     dumps.sort_by_key(|entry| entry.metadata().unwrap().modified().unwrap());
     let path = dumps.last().unwrap().path();
     let dump = std::fs::read_to_string(&path).expect("dump file should be readable");

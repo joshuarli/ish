@@ -440,15 +440,15 @@ fn capture_layout_dump(
     region: render::RenderedRegion,
     history_cache: &render::HistoryPagerCache,
 ) {
-    let suggestion = if line.text().len() >= 3 && !line.has_newlines() && line.cursor() == line.text().len()
-    {
-        shell
-            .history
-            .session_prefix_search(line.text(), 0)
-            .and_then(|entry| entry.strip_prefix(line.text()))
-    } else {
-        None
-    };
+    let suggestion =
+        if line.text().len() >= 3 && !line.has_newlines() && line.cursor() == line.text().len() {
+            shell
+                .history
+                .session_prefix_search(line.text(), 0)
+                .and_then(|entry| entry.strip_prefix(line.text()))
+        } else {
+            None
+        };
     let suggestion_display_len = suggestion.map(ish::line::str_width).unwrap_or(0);
 
     shell.layout_dump.clear();
