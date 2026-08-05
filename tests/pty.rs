@@ -920,8 +920,39 @@ fn assert_frame_contains_once(frame: &TraceFrame, needle: &str) {
     );
 }
 
+fn latest_layout_dump(home: &Path) -> PathBuf {
+    let cache = home.join(".cache/ish");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+
+    loop {
+        let mut dumps: Vec<_> = std::fs::read_dir(&cache)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("dump-"))
+            .collect();
+        dumps.sort_by_key(|entry| {
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH)
+        });
+        if !dumps.is_empty() {
+            return dumps.last().unwrap().path();
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("layout dump was not written in {}", cache.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 fn normalize_screen_text(screen: &str) -> String {
     screen.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn compact_screen_text(screen: &str) -> String {
+    screen.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 impl Drop for PtyShell {
@@ -1164,23 +1195,10 @@ fn ctrl_p_writes_layout_dump_without_executing() {
     let sh = PtyShell::spawn();
     sh.type_str("ish-dump");
     sh.ctrl_p();
-    std::thread::sleep(std::time::Duration::from_millis(300));
 
     // Ctrl+P writes silently (no stdout message), so locate the newest dump
     // in the temp HOME's cache dir.
-    let cache = sh.home_path().join(".cache/ish");
-    let mut dumps: Vec<_> = std::fs::read_dir(&cache)
-        .expect("cache dir should exist")
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("dump-"))
-        .collect();
-    assert!(
-        !dumps.is_empty(),
-        "ctrl-p should write at least one dump in {}",
-        cache.display()
-    );
-    dumps.sort_by_key(|entry| entry.metadata().unwrap().modified().unwrap());
-    let path = dumps.last().unwrap().path();
+    let path = latest_layout_dump(sh.home_path());
     let dump = std::fs::read_to_string(&path).expect("dump file should be readable");
 
     assert!(dump.contains("ish layout dump"));
@@ -1200,21 +1218,9 @@ fn ctrl_p_works_in_history_search_mode() {
     sh.type_str("beta");
     std::thread::sleep(std::time::Duration::from_millis(200));
     sh.ctrl_p();
-    std::thread::sleep(std::time::Duration::from_millis(300));
 
     // Ctrl+P writes silently, so locate the newest dump in the temp HOME.
-    let cache = sh.home_path().join(".cache/ish");
-    let mut dumps: Vec<_> = std::fs::read_dir(&cache)
-        .expect("cache dir should exist")
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("dump-"))
-        .collect();
-    assert!(
-        !dumps.is_empty(),
-        "ctrl-p in history search should write a dump"
-    );
-    dumps.sort_by_key(|entry| entry.metadata().unwrap().modified().unwrap());
-    let path = dumps.last().unwrap().path();
+    let path = latest_layout_dump(sh.home_path());
     let dump = std::fs::read_to_string(&path).expect("dump file should be readable");
 
     assert!(dump.contains("mode: history_search"));
@@ -1971,11 +1977,8 @@ fn history_accept_reanchors_prompt_before_typing() {
         frame.snapshot
     );
     assert!(
-        frame
-            .snapshot
-            .visible
-            .replace('\n', "")
-            .contains("echo history-one-abcdefghijklmnopx"),
+        compact_screen_text(&frame.snapshot.visible)
+            .contains(&compact_screen_text("echo history-one-abcdefghijklmnopx")),
         "typing after history acceptance should start from the selected command: {:?}",
         frame.snapshot
     );
