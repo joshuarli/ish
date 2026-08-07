@@ -30,7 +30,9 @@ PGO_RUSTFLAGS := $(RELEASE_RUSTFLAGS) -Cprofile-generate=$(PGO_DIR)
 PGO_STATIC_RUSTFLAGS := $(if $(findstring -linux-musl,$(TARGET)),$(PGO_RUSTFLAGS) -Clink-arg=/usr/lib/libcompiler-rt-builtins.a,$(PGO_RUSTFLAGS))
 PGO_LINUX_RUSTFLAGS := $(RELEASE_LINUX_RUSTFLAGS) -Cprofile-generate=$(PGO_DIR)
 
-.PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux install setup ensure-musl-target
+RUSTYBENCH ?= cargo run --quiet --manifest-path ../rustybench/Cargo.toml --
+
+.PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-fast bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux install setup ensure-musl-target
 
 build:
 	cargo build
@@ -89,10 +91,13 @@ lint:
 	cargo clippy --fix --allow-dirty --all-targets --all-features -- --deny warnings
 
 bench:
-	@scripts/bench-baseline.py
+	@$(RUSTYBENCH) baseline --root "$(CURDIR)" --baseline "$(CURDIR)/benches/baseline.json" -- cargo bench --bench bench
+
+bench-fast:
+	@$(RUSTYBENCH) baseline --root "$(CURDIR)" --baseline "$(CURDIR)/benches/fast-baseline.json" --fast -- cargo bench --bench bench
 
 bench-syscalls:
-	@scripts/bench-syscalls.py
+	@$(RUSTYBENCH) syscalls --root "$(CURDIR)"
 
 # Build the release-shaped application binary with target-scoped profile
 # instrumentation. The PTY driver and its test dependencies are built later,

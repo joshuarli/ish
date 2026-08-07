@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use divan::{AllocProfiler, Bencher, black_box};
+use rustybench::{AllocProfiler, Bencher, black_box};
 
 #[global_allocator]
 static ALLOC: AllocProfiler = AllocProfiler::system();
@@ -240,17 +240,17 @@ fn completion_path_benchmark(bencher: Bencher, file_count: usize, render_grid: b
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn completion_path_realistic(bencher: Bencher) {
     completion_path_benchmark(bencher, 200, true);
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn completion_path_single_match(bencher: Bencher) {
     completion_path_benchmark(bencher, 1, false);
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn history_fuzzy_search_into_45k(bencher: Bencher) {
     let history = History::from_entries(synthetic_history_45k());
     let mut candidates = Vec::with_capacity(history.len());
@@ -263,7 +263,7 @@ fn history_fuzzy_search_into_45k(bencher: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn ls_fixture_dir(bencher: Bencher) {
     let fixture = make_fs_fixture("ls");
     for index in 0..32 {
@@ -333,12 +333,12 @@ fn startup_fixture(bencher: Bencher, cold: bool) {
     }
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn startup_cold(bencher: Bencher) {
     startup_fixture(bencher, true);
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn startup_warm(bencher: Bencher) {
     startup_fixture(bencher, false);
 }
@@ -402,17 +402,17 @@ fn sync_bench_pwd(epsh: &mut epsh::eval::Shell, dir: &Path) {
     epsh.vars_mut().export("PWD");
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn cd_prompt_without_denv(bencher: Bencher) {
     cd_prompt_benchmark(bencher, false);
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn cd_prompt_with_denv(bencher: Bencher) {
     cd_prompt_benchmark(bencher, true);
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn autosuggestion_prefix_search_miss(bencher: Bencher) {
     let history = History::from_entries(synthetic_history_45k());
     bench_with_syscall_trace(bencher, || {
@@ -454,12 +454,12 @@ fn keypress_render_benchmark(bencher: Bencher, initial: &str, inserted: char) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn normal_keypress_render_short(bencher: Bencher) {
     keypress_render_benchmark(bencher, "git s", 't');
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn normal_keypress_render_long(bencher: Bencher) {
     keypress_render_benchmark(
         bencher,
@@ -496,7 +496,7 @@ impl CommandEnterFixture {
     }
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn command_enter_to_prompt(bencher: Bencher) {
     let pwd = std::env::current_dir().unwrap();
     bencher
@@ -514,7 +514,7 @@ fn command_enter_to_prompt(bencher: Bencher) {
         });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn history_search_trace(bencher: Bencher) {
     let history = History::from_entries(synthetic_history_45k());
     let mut all_candidates = Vec::with_capacity(history.len());
@@ -560,5 +560,5 @@ fn history_search_trace(bencher: Bencher) {
 }
 
 fn main() {
-    divan::main();
+    rustybench::main();
 }
