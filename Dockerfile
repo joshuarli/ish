@@ -73,6 +73,7 @@ ENV PATH="/opt/llvm-musl/bin:/root/.cargo/bin:$PATH" \
     CC="/opt/llvm-musl/bin/clang" \
     AR="/opt/llvm-musl/bin/llvm-ar" \
     RANLIB="/opt/llvm-musl/bin/llvm-ranlib" \
+    LIBRARY_PATH="/opt/llvm-musl/lib" \
     LIBCLANG_PATH="/opt/llvm-musl/lib" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang"
