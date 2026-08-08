@@ -1,8 +1,8 @@
 FROM alpine:3.24.1
 
 ARG TARGETARCH
-ARG LLVM_VERSION=22.1.8
-ARG LLVM_RELEASE_SHA=e6297bf
+ARG LLVM_VERSION=23.1.0-rc2
+ARG LLVM_RELEASE_SHA=6eb5fb9
 
 RUN apk add --no-cache \
     binutils \
@@ -29,8 +29,11 @@ RUN case "$TARGETARCH" in \
         arm64) archive=/tmp/llvm-aarch64.tar.xz ;; \
         *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac \
+    && echo '36647cca0bf57d206a6ce757d07a9d8489ef6ccf283a2cc7f740d1cba99a088b  /tmp/llvm-x86_64.tar.xz' | sha256sum -c - \
+    && echo '0c9bd6f0fefa26dbdb7d6ed568f3799b558428b1ce1264656aa328fc6fd9e32d  /tmp/llvm-aarch64.tar.xz' | sha256sum -c - \
     && mkdir -p /opt/llvm-musl \
     && tar xf "$archive" -C /opt/llvm-musl --strip-components=1 \
+    && test -f /opt/llvm-musl/lib/libclang.so \
     && rm /tmp/llvm-x86_64.tar.xz /tmp/llvm-aarch64.tar.xz
 
 # Rust's static musl profiler link asks lld for -lgcc. Keep the linker
@@ -70,6 +73,7 @@ ENV PATH="/opt/llvm-musl/bin:/root/.cargo/bin:$PATH" \
     CC="/opt/llvm-musl/bin/clang" \
     AR="/opt/llvm-musl/bin/llvm-ar" \
     RANLIB="/opt/llvm-musl/bin/llvm-ranlib" \
+    LIBCLANG_PATH="/opt/llvm-musl/lib" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang"
 
