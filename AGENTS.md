@@ -8,7 +8,7 @@ The important design constraints are:
   `eval`, control flow, functions, background jobs, plugins, themes, or prompt
   configuration without an explicit design decision.
 - Shell-owned operations stay in-process. Directory listing, completion,
-  finder searches, globbing, prompt/git inspection, and similar operations must
+  globbing, prompt/git inspection, and similar operations must
   not spawn a subprocess. Running a user command or the existing denv
   integration may spawn one.
 - Keep the execution model and data structures simple and flat. Avoid adding
@@ -54,8 +54,8 @@ Subsystem ownership:
   repainting.
 - `builtin.rs`, `job.rs`, `sys.rs`, `signal.rs`: builtins, foreground job
   control, process/file-descriptor plumbing, and signal handling.
-- `complete.rs`, `finder.rs`, `path.rs`, `ls.rs`: native completion, file
-  finding, PATH lookup, and directory listing.
+- `complete.rs`, `path.rs`, `ls.rs`: native completion, PATH lookup, and
+  directory listing.
 - `history.rs`, `frecency.rs`: persistent history, fuzzy search, and ranking.
 - `alias.rs`, `config.rs`, `denv.rs`: aliases, `config.ish`, and denv
   integration.
@@ -69,8 +69,8 @@ platform workarounds, safety, allocation behavior, or non-obvious constants.
 Supported shell behavior includes pipelines, AND-OR lists (`&&`/`||`),
 sequential lists (`;`), redirections, quoting and escaping, comments,
 continuation lines, tilde expansion, parameter expansion, command substitution,
-pathname expansion (globbing), aliases, history search, file completion, the
-native file finder, and one suspended foreground job.
+pathname expansion (globbing), aliases, history search, file completion, and
+one suspended foreground job.
 
 Builtins and keybindings are documented in [README.md](README.md). Treat the
 README and existing tests as the behavior contract; update both when a
@@ -148,10 +148,9 @@ verification of commits to the user.
   `job::resume_job()`. Add behavior tests in `tests/integration.rs` or
   `tests/pty.rs`.
 - Keybinding or mode behavior: update `handle_normal_key()`,
-  `handle_completion_key()`, `handle_history_search_key()`, or
-  `handle_file_finder_key()` in `src/main.rs`. The mode state is the `Mode`
-  enum; terminal actions are represented by `KeyAction`, `CompletionAction`,
-  `HistoryAction`, and `FileFinderAction`.
+  `handle_completion_key()`, or `handle_history_search_key()` in `src/main.rs`.
+  The mode state is the `Mode` enum; terminal actions are represented by
+  `KeyAction`, `CompletionAction`, and `HistoryAction`.
 - Completion: use `complete::complete_path_into()`,
   `complete::complete_candidates()`, `complete::CompletionState`, and
   `complete::compute_grid()` in `src/complete.rs`; orchestration and accept/
@@ -163,9 +162,8 @@ verification of commits to the user.
   `render_history_mode()` in `src/main.rs`.
 - Prompt or rendering: prompt data and git inspection are in `Prompt` and
   `shorten_pwd()` in `src/prompt.rs`; terminal composition is in
-  `render_line()`, `render_completions()`, `render_history_pager_cached()`,
-  and `render_file_finder()` in `src/render.rs`. Run PTY tests for changes
-  visible on screen.
+  `render_line()`, `render_completions()`, and `render_history_pager_cached()`
+  in `src/render.rs`. Run PTY tests for changes visible on screen.
 - Config or aliases: `config::load()`, `parse_set()`, and `parse_alias()` are
   in `src/config.rs`; `AliasMap` and `lex_words()` are in `src/alias.rs`.
   Keep expansion through the existing `epsh` integration.
@@ -173,8 +171,7 @@ verification of commits to the user.
   boundary, document unavoidable libc use, and test error paths. Start with
   `src/sys.rs` (`pipe_cloexec()`, `close_fds_from()`,
   `spawn_command_subst()`), `src/path.rs` (`PathCache`, `scan_path()`),
-  `src/ls.rs` (`list_dir()`), or `src/finder.rs` (`find_async()`) as
-  appropriate.
+  `src/ls.rs` (`list_dir()`) as appropriate.
 - Parser/expansion behavior: inspect the call sites of
   `expand_builtin_args()` and the `epsh::lexer`/`epsh::expand` integration in
   `src/main.rs` and `src/alias.rs`. Distinguish shell words from expanded

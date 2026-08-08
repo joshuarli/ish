@@ -5,9 +5,7 @@ use ish::input::{InputEvent, InputReader, Key, KeyEvent};
 use ish::job::Job;
 use ish::line::LineBuffer;
 use ish::term::TermWriter;
-use ish::{
-    builtin, complete, config, denv, finder, frecency, history, path, prompt, render, signal, term,
-};
+use ish::{builtin, complete, config, denv, frecency, history, path, prompt, render, signal, term};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -69,18 +67,6 @@ enum Mode {
         candidate_stack: Vec<(usize, Vec<usize>)>,
         selected: usize,
         saved_line: String,
-    },
-    FileFinder {
-        query: LineBuffer,
-        /// All entries from the background walk (depth, rel_path).
-        all_entries: Vec<(usize, String)>,
-        /// Filtered + sorted results: indices into `all_entries`.
-        filtered: Vec<usize>,
-        selected: usize,
-        saved_line: String,
-        saved_cursor: usize,
-        hidden: bool,
-        handle: finder::FinderHandle,
     },
     DirPicker {
         entries: Vec<String>,
@@ -535,50 +521,6 @@ fn capture_layout_dump(
                 shell.cols,
             );
         }
-        Mode::FileFinder {
-            query,
-            all_entries,
-            filtered,
-            selected,
-            saved_line,
-            saved_cursor,
-            hidden,
-            ..
-        } => {
-            let query_phase = query.text().len() < 3;
-            let prefix = if *hidden {
-                "find (hidden): "
-            } else if query_phase && query.text().is_empty() {
-                "find (ctrl+f toggle hidden): "
-            } else {
-                "find: "
-            };
-            let suffix = if !query_phase && filtered.is_empty() && !query.text().is_empty() {
-                "  (no matches)"
-            } else {
-                ""
-            };
-            let _ = writeln!(out, "finder.query.text: {:?}", query.text());
-            let _ = writeln!(out, "finder.query.cursor_byte: {}", query.cursor());
-            let _ = writeln!(out, "finder.all_entries: {all_entries:?}");
-            let _ = writeln!(out, "finder.filtered: {filtered:?}");
-            let _ = writeln!(out, "finder.selected: {selected}");
-            let _ = writeln!(out, "finder.saved_line: {saved_line:?}");
-            let _ = writeln!(out, "finder.saved_cursor: {saved_cursor}");
-            let _ = writeln!(out, "finder.hidden: {hidden}");
-            let _ = writeln!(out, "finder.handle: active");
-            render::debug_dump_pager_layout(
-                out,
-                ish::line::str_width(prefix),
-                ish::line::str_width(query.text()),
-                ish::line::str_width(suffix),
-                query.display_cursor_pos(),
-                filtered.len(),
-                *selected,
-                shell.rows,
-                shell.cols,
-            );
-        }
         Mode::DirPicker { entries, selected } => {
             let _ = writeln!(out, "dir_picker.entries: {entries:?}");
             let _ = writeln!(out, "dir_picker.selected: {selected}");
@@ -604,7 +546,6 @@ fn mode_name(mode: &Mode) -> &'static str {
         Mode::Normal => "normal",
         Mode::Completion { .. } => "completion",
         Mode::HistorySearch { .. } => "history_search",
-        Mode::FileFinder { .. } => "file_finder",
         Mode::DirPicker { .. } => "dir_picker",
     }
 }
@@ -765,36 +706,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     let _ = tw.flush_to_stdout();
 
     loop {
-        // In file finder mode, use a short timeout so we periodically drain
-        // the background walk channel and re-render as results stream in.
-        let event = if matches!(mode, Mode::FileFinder { .. }) {
-            match reader.read_event_timeout(50) {
-                Some(ev) => ev,
-                None => {
-                    // Timeout: drain channel, re-filter, re-render
-                    if let Mode::FileFinder {
-                        query,
-                        all_entries,
-                        filtered,
-                        selected,
-                        handle,
-                        ..
-                    } = &mut mode
-                    {
-                        let before = all_entries.len();
-                        handle.drain_into(all_entries);
-                        if all_entries.len() != before {
-                            filter_entries(query.text(), all_entries, filtered, selected);
-                            region = render_file_finder_mode(&mut tw, &mode, shell, region);
-                            let _ = tw.flush_to_stdout();
-                        }
-                    }
-                    continue;
-                }
-            }
-        } else {
-            reader.read_event()
-        };
+        let event = reader.read_event();
         match event {
             InputEvent::Signal(sig) => {
                 if sig == rustix::process::Signal::WINCH.as_raw() {
@@ -964,29 +876,6 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     shell,
                                     render::RenderedRegion::default(),
                                     &mut history_cache,
-                                );
-                                let _ = tw.flush_to_stdout();
-                                continue;
-                            }
-                            KeyAction::StartFileFinder => {
-                                saved_line = line.text().to_string();
-                                let handle = finder::find_async(".", false);
-                                region.clear(&mut tw);
-                                mode = Mode::FileFinder {
-                                    query: LineBuffer::new(),
-                                    all_entries: Vec::new(),
-                                    filtered: Vec::new(),
-                                    selected: 0,
-                                    saved_line: saved_line.clone(),
-                                    saved_cursor: line.cursor(),
-                                    hidden: false,
-                                    handle,
-                                };
-                                region = render_file_finder_mode(
-                                    &mut tw,
-                                    &mode,
-                                    shell,
-                                    render::RenderedRegion::default(),
                                 );
                                 let _ = tw.flush_to_stdout();
                                 continue;
@@ -1212,71 +1101,6 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         }
                     },
 
-                    Mode::FileFinder {
-                        query,
-                        all_entries,
-                        filtered,
-                        selected,
-                        saved_line,
-                        saved_cursor,
-                        hidden,
-                        handle,
-                    } => {
-                        // Drain new entries from the background walk
-                        handle.drain_into(all_entries);
-                        let action = handle_file_finder_key(
-                            key,
-                            query,
-                            all_entries,
-                            filtered,
-                            selected,
-                            hidden,
-                            handle,
-                        );
-                        match action {
-                            FileFinderAction::Continue => {
-                                region = render_file_finder_mode(&mut tw, &mode, shell, region);
-                                let _ = tw.flush_to_stdout();
-                            }
-                            FileFinderAction::Accept(path) => {
-                                // Insert path at the saved cursor position
-                                let mut text = saved_line.clone();
-                                text.insert_str(*saved_cursor, &path);
-                                let new_cursor = *saved_cursor + path.len();
-                                line.set_with_cursor(&text, new_cursor);
-                                mode = Mode::Normal;
-                                region.clear(&mut tw);
-                                let info = render::render_line(
-                                    &mut tw,
-                                    &prompt_str,
-                                    prompt_display_len,
-                                    &line,
-                                    shell.cols,
-                                    render::RenderedRegion::default(),
-                                    &render::RenderOpts::default(),
-                                );
-                                region = info;
-                                let _ = tw.flush_to_stdout();
-                            }
-                            FileFinderAction::Cancel => {
-                                line.set(saved_line);
-                                mode = Mode::Normal;
-                                region.clear(&mut tw);
-                                let info = render::render_line(
-                                    &mut tw,
-                                    &prompt_str,
-                                    prompt_display_len,
-                                    &line,
-                                    shell.cols,
-                                    render::RenderedRegion::default(),
-                                    &render::RenderOpts::default(),
-                                );
-                                region = info;
-                                let _ = tw.flush_to_stdout();
-                            }
-                        }
-                    }
-
                     Mode::DirPicker { entries, selected } => match (key.key, key.mods.ctrl) {
                         (Key::Escape, _) | (Key::Char('c'), true) => {
                             mode = Mode::Normal;
@@ -1413,7 +1237,6 @@ fn render_active_mode(
             info
         }
         Mode::HistorySearch { .. } => render_history_mode(tw, mode, shell, region, history_cache),
-        Mode::FileFinder { .. } => render_file_finder_mode(tw, mode, shell, region),
         Mode::DirPicker { .. } => render_dir_picker_mode(tw, mode, shell, region),
     }
 }
@@ -1435,7 +1258,6 @@ enum KeyAction {
     Exit,
     ClearScreen,
     StartHistorySearch,
-    StartFileFinder,
     StartDirPicker,
     StartCompletion,
 }
@@ -1534,7 +1356,6 @@ fn handle_normal_key(
         (Key::Char('y'), true, _) => line.yank(),
         (Key::Char('l'), true, _) => return KeyAction::ClearScreen,
         (Key::Char('r'), true, _) => return KeyAction::StartHistorySearch,
-        (Key::Char('f'), true, _) => return KeyAction::StartFileFinder,
 
         (Key::Char('b'), false, true) => line.move_word_left(),
         (Key::Char('f'), false, true) => line.move_word_right(),
@@ -2342,157 +2163,6 @@ fn render_history_mode(
             query.display_cursor_pos(),
             prev,
             cache,
-        )
-    } else {
-        render::RenderedRegion::default()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// File finder (Ctrl+F)
-// ---------------------------------------------------------------------------
-
-enum FileFinderAction {
-    Continue,
-    Accept(String),
-    Cancel,
-}
-
-fn handle_file_finder_key(
-    key: KeyEvent,
-    query: &mut LineBuffer,
-    all_entries: &mut Vec<(usize, String)>,
-    filtered: &mut Vec<usize>,
-    selected: &mut usize,
-    hidden: &mut bool,
-    handle: &mut finder::FinderHandle,
-) -> FileFinderAction {
-    let mut refilter = false;
-
-    match (key.key, key.mods.ctrl, key.mods.alt) {
-        (Key::Escape, _, _) | (Key::Char('c'), true, _) => return FileFinderAction::Cancel,
-
-        // Accept selected result
-        (Key::Enter, _, _) => {
-            return if let Some(&entry_idx) = filtered.get(*selected) {
-                FileFinderAction::Accept(all_entries[entry_idx].1.clone())
-            } else {
-                FileFinderAction::Cancel
-            };
-        }
-
-        // Navigate results
-        (Key::Up, _, _) | (Key::Char('p'), true, _) if *selected > 0 => {
-            *selected -= 1;
-        }
-        (Key::Down, _, _) | (Key::Char('n'), true, _)
-            if !filtered.is_empty() && *selected + 1 < filtered.len() =>
-        {
-            *selected += 1;
-        }
-
-        // Hidden mode toggle (Ctrl+F again)
-        (Key::Char('f'), true, _) => {
-            *hidden = !*hidden;
-            // Restart the walk with new hidden setting
-            handle.stop();
-            all_entries.clear();
-            filtered.clear();
-            *selected = 0;
-            *handle = finder::find_async(".", *hidden);
-        }
-
-        // Query editing
-        (Key::Backspace, _, _) => {
-            query.delete_back();
-            refilter = true;
-        }
-        (Key::Delete, true, _) | (Key::Char('d'), false, true) => {
-            query.kill_word_back();
-            refilter = true;
-        }
-        (Key::Delete, _, _) | (Key::Char('d'), true, _) => {
-            query.delete_forward();
-            refilter = true;
-        }
-        (Key::Left, _, false) if key.mods.ctrl => query.move_word_left(),
-        (Key::Right, _, false) if key.mods.ctrl => query.move_word_right(),
-        (Key::Left, _, _) => {
-            query.move_left();
-        }
-        (Key::Right, _, _) => {
-            query.move_right();
-        }
-        (Key::Home, _, _) | (Key::Char('a'), true, _) => query.move_home(),
-        (Key::End, _, _) | (Key::Char('e'), true, _) => query.move_end(),
-        (Key::Char('u'), true, _) => {
-            query.kill_to_start();
-            refilter = true;
-        }
-        (Key::Char('k'), true, _) => {
-            query.kill_to_end();
-            refilter = true;
-        }
-        (Key::Char('w'), true, _) => {
-            query.kill_word_back();
-            refilter = true;
-        }
-        (Key::Char('y'), true, _) => {
-            query.yank();
-            refilter = true;
-        }
-        (Key::Char(c), false, false) => {
-            query.insert_char(c);
-            refilter = true;
-        }
-        _ => {}
-    }
-
-    if refilter {
-        filter_entries(query.text(), all_entries, filtered, selected);
-    }
-
-    FileFinderAction::Continue
-}
-
-fn filter_entries(
-    query: &str,
-    all_entries: &[(usize, String)],
-    filtered: &mut Vec<usize>,
-    selected: &mut usize,
-) {
-    finder::filter_entries_pub(query, all_entries, filtered, selected);
-}
-
-fn render_file_finder_mode(
-    tw: &mut TermWriter,
-    mode: &Mode,
-    shell: &Shell,
-    prev: render::RenderedRegion,
-) -> render::RenderedRegion {
-    if let Mode::FileFinder {
-        query,
-        all_entries,
-        filtered,
-        selected,
-        hidden,
-        ..
-    } = mode
-    {
-        let query_text = query.text();
-        let in_query = query_text.len() < 3;
-        render::render_file_finder(
-            tw,
-            query_text,
-            all_entries,
-            filtered,
-            *selected,
-            shell.rows,
-            shell.cols,
-            query.display_cursor_pos(),
-            in_query,
-            *hidden,
-            prev,
         )
     } else {
         render::RenderedRegion::default()

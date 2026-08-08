@@ -272,11 +272,6 @@ impl PtyShell {
         self.send(b"\x12");
     }
 
-    /// Send Ctrl+F.
-    fn ctrl_f(&self) {
-        self.send(b"\x06");
-    }
-
     /// Send Ctrl+L.
     fn ctrl_l(&self) {
         self.send(b"\x0c");
@@ -2344,35 +2339,6 @@ fn tab_completion_with_wide_dir_name_restores_prompt_cursor() {
 }
 
 #[test]
-fn file_picker_narrow_repaint_does_not_stack_rows() {
-    let sh = PtyShell::spawn_with_size(&[("abc1", ""), ("abc2", ""), ("abc3", "")], &[], 24, 8);
-    sh.ctrl_f();
-    sh.wait_for("find", 2000);
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    sh.type_str("ab");
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    sh.type_str("c");
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    sh.backspace();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    sh.type_str("c");
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    sh.down();
-    sh.up();
-    std::thread::sleep(std::time::Duration::from_millis(300));
-
-    let out = sh.read_timeout(800);
-    let screen = Screen::render(&out, 24, 8);
-    assert_screen_contains_once(&screen, "find:");
-    assert_screen_contains_once(&screen, "abc1");
-    assert_screen_contains_once(&screen, "abc2");
-    assert_screen_contains_once(&screen, "abc3");
-
-    sh.escape();
-    sh.wait_for_prompt(2000);
-}
-
-#[test]
 fn completion_resize_rerenders_grid() {
     let sh = PtyShell::spawn_with_size(
         &[("aaa.txt", ""), ("aab.txt", ""), ("aac.txt", "")],
@@ -2457,30 +2423,6 @@ fn history_resize_rerenders_pager() {
     let out = sh.read_timeout(800);
     let screen = Screen::render(&out, 24, 10);
     assert_screen_contains_once(&screen, "search:");
-    assert_screen_contains_once(&screen, "abc1");
-    assert_screen_contains_once(&screen, "abc2");
-    assert_screen_contains_once(&screen, "abc3");
-
-    sh.escape();
-    sh.wait_for_prompt(2000);
-}
-
-#[test]
-fn file_picker_resize_rerenders_pager() {
-    let sh = PtyShell::spawn_with_size(&[("abc1", ""), ("abc2", ""), ("abc3", "")], &[], 24, 20);
-    sh.ctrl_f();
-    sh.wait_for("find", 2000);
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    sh.type_str("abc");
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    sh.read_timeout(300);
-
-    sh.resize(24, 8);
-    std::thread::sleep(std::time::Duration::from_millis(300));
-
-    let out = sh.read_timeout(800);
-    let screen = Screen::render(&out, 24, 8);
-    assert_screen_contains_once(&screen, "find:");
     assert_screen_contains_once(&screen, "abc1");
     assert_screen_contains_once(&screen, "abc2");
     assert_screen_contains_once(&screen, "abc3");

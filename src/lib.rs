@@ -20,7 +20,6 @@ pub mod builtin;
 pub mod complete;
 pub mod config;
 pub mod denv;
-pub mod finder;
 pub mod frecency;
 pub mod history;
 pub mod input;

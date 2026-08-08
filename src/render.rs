@@ -460,7 +460,7 @@ pub fn debug_dump_prompt_layout(
     let _ = writeln!(out, "prompt_layout: {layout:?}");
 }
 
-/// Dump the computed pager geometry used by history, file finder, and directory picker.
+/// Dump the computed pager geometry used by history and directory picker.
 pub fn debug_dump_pager_layout(
     out: &mut String,
     prefix_width: usize,
@@ -925,121 +925,6 @@ pub fn render_history_pager_cached(
     }
 }
 
-/// Render the file finder pager (Ctrl+F).
-/// In query phase (`query_phase` true), shows "find: " prompt.
-/// In results phase, shows the selectable file list.
-#[allow(clippy::too_many_arguments)]
-pub fn render_file_finder(
-    tw: &mut TermWriter,
-    query: &str,
-    all_entries: &[(usize, String)],
-    filtered: &[usize],
-    selected: usize,
-    term_rows: u16,
-    term_cols: u16,
-    query_cursor: usize,
-    query_phase: bool,
-    hidden: bool,
-    prev: RenderedRegion,
-) -> RenderedRegion {
-    let prefix = if hidden {
-        "find (hidden): "
-    } else if query_phase && query.is_empty() {
-        "find (ctrl+f toggle hidden): "
-    } else {
-        "find: "
-    };
-    let suffix = if !query_phase && filtered.is_empty() && !query.is_empty() {
-        "  (no matches)"
-    } else {
-        ""
-    };
-    let layout = layout_pager(PagerInput {
-        prefix_width: crate::line::str_width(prefix),
-        query_width: crate::line::str_width(query),
-        suffix_width: crate::line::str_width(suffix),
-        query_cursor,
-        total_entries: filtered.len(),
-        selected,
-        term_rows,
-        term_cols,
-    });
-    begin_region_render(tw, prev, layout.region);
-
-    // Header: "find: " or "find (hidden): "
-    tw.write_str("\x1b[1m"); // bold
-    if hidden {
-        tw.write_str("find \x1b[33m(hidden)\x1b[0;1m: ");
-    } else if query_phase && query.is_empty() {
-        tw.write_str("find \x1b[2m(ctrl+f toggle hidden)\x1b[0;1m: ");
-    } else {
-        tw.write_str("find: ");
-    }
-    tw.write_str("\x1b[0m");
-    tw.write_str(query);
-
-    if !query_phase && filtered.is_empty() && !query.is_empty() {
-        tw.write_str("  \x1b[2m(no matches)\x1b[0m");
-    }
-
-    if layout.needs_forced_wrap {
-        tw.write_str(" \r");
-        tw.clear_to_end_of_line();
-    } else {
-        tw.write_str("\n");
-    }
-
-    let displayed = filtered.len().min(layout.max_results);
-    let visible = filtered
-        .iter()
-        .skip(layout.scroll)
-        .take(layout.max_results)
-        .enumerate();
-    for (i, &entry_idx) in visible {
-        let abs_idx = layout.scroll + i;
-        let path = &all_entries[entry_idx].1;
-        tw.carriage_return();
-        tw.clear_to_end_of_line();
-
-        let is_selected = abs_idx == selected;
-        if is_selected {
-            tw.write_str("\x1b[7m"); // reverse video
-        }
-
-        // Truncate to terminal width
-        let mut col = 0;
-        for ch in path.chars() {
-            let w = crate::line::char_width(ch);
-            if col + w > layout.max_width {
-                break;
-            }
-            col += w;
-            let mut buf = [0u8; 4];
-            tw.write_str(ch.encode_utf8(&mut buf));
-        }
-
-        if is_selected {
-            tw.write_str("\x1b[0m");
-        }
-        tw.clear_to_end_of_line();
-        if i + 1 < displayed {
-            tw.write_str("\n");
-        }
-    }
-
-    // Clear remaining lines
-    tw.clear_to_end_of_screen();
-
-    // Position cursor in the query field
-    restore_cursor_smart(tw, layout.region, layout.rows_up_from_end);
-    tw.show_cursor();
-
-    RenderedRegion {
-        anchored: true,
-        ..layout.region
-    }
-}
-
 /// Render the directory picker pager.
 pub fn render_dir_picker(
     tw: &mut TermWriter,
@@ -1190,30 +1075,6 @@ mod tests {
             24,
             cols,
             query_cursor,
-            RenderedRegion::default(),
-        );
-        (info, tw.as_bytes().to_vec())
-    }
-
-    fn render_file_query(
-        query: &str,
-        cols: u16,
-        query_cursor: usize,
-        query_phase: bool,
-        hidden: bool,
-    ) -> (RenderedRegion, Vec<u8>) {
-        let mut tw = TermWriter::new();
-        let info = render_file_finder(
-            &mut tw,
-            query,
-            &[],
-            &[],
-            0,
-            24,
-            cols,
-            query_cursor,
-            query_phase,
-            hidden,
             RenderedRegion::default(),
         );
         (info, tw.as_bytes().to_vec())
@@ -1495,20 +1356,6 @@ mod tests {
         let buf = tw.as_bytes();
         let opens = buf.windows(7).filter(|w| *w == b"\x1b[1;33m").count();
         assert_eq!(opens, 2);
-    }
-
-    #[test]
-    fn file_picker_tracks_wrapped_query_cursor_row() {
-        let (info, _) = render_file_query("abcdef", 10, 6, false, false);
-        assert_eq!(info.cursor_row, 1);
-        assert_eq!(info.cursor_col, 2);
-    }
-
-    #[test]
-    fn file_picker_uses_visible_prefix_widths() {
-        let (info, _) = render_file_query("", 80, 0, true, true);
-        assert_eq!(info.cursor_row, 0);
-        assert_eq!(info.cursor_col, 15);
     }
 
     #[test]

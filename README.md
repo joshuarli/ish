@@ -59,23 +59,6 @@ other running ish shells.
 
 Run `history -h` for the available history storage commands.
 
-### File Finder
-
-| Key | Action |
-|---|---|
-| Ctrl+F | Open file finder |
-| Down (in query) | Toggle hidden mode |
-| Enter | Search / accept selection |
-| Up / Down (in results) | Navigate |
-| Backspace (in results) | Back to query |
-| Escape | Cancel |
-
-Type a pattern, press Enter, pick from results. The selected path is inserted at the cursor position — type `vim `, press Ctrl+F, pick a file, get `vim src/main.rs`.
-
-Native implementation: recursive readdir with gitignore support, no external dependencies. Results sorted by depth (shallowest first) so nearby files appear before deeply nested ones. Normal mode respects `.gitignore`; hidden mode shows everything except `.git/`.
-
-Sub-millisecond for gitignore-respecting searches (~0.85ms). No indexes, no background processes.
-
 ### Tab Completion
 
 | Context | Behavior |
@@ -212,6 +195,6 @@ The result: the shell has a small, auditable interactive command evaluator. If y
 
 Single Rust package with a library target and interactive binary. Platform code primarily uses `rustix`; `libc` remains a narrow compatibility escape hatch.
 
-Shell-owned operations stay native where possible: directory listing, git detection, pathname expansion, completion, and file finding do not spawn subprocesses. Running external commands, command substitutions, and the denv integration may spawn processes.
+Shell-owned operations stay native where possible: directory listing, git detection, pathname expansion, and completion do not spawn subprocesses. Running external commands, command substitutions, and the denv integration may spawn processes.
 
 Signal handling uses the self-pipe pattern. Each pipeline gets its own process group. Terminal foreground control via `tcsetpgrp`. Raw mode via `termios`.
