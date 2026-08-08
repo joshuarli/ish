@@ -18,7 +18,7 @@ done)
 # LLVM helper binaries run on the build host; they are not installed in the
 # target triple's rustlib directory when cross-compiling to musl.
 LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(HOST)/bin
-MUSL_LINKER := $(LLVM_BIN)/rust-lld
+MUSL_LINKER ?= clang
 MUSL_TARGET_LIBDIR := $(shell rustc --print target-libdir --target $(TARGET))
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
