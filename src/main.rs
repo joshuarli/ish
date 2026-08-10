@@ -36,6 +36,10 @@ struct Shell {
     completion_buffer: complete::Completions,
     /// Reusable fuzzy match buffer — avoids allocation per Ctrl+R keystroke.
     history_match_buffer: Vec<history::FuzzyMatch>,
+    /// The previous evaluated command may have left the terminal mid-line.
+    /// The next prompt must begin at a fresh row so its layout starts from a
+    /// known column, even when command output omitted its final newline.
+    prompt_needs_line_start: bool,
     job: Option<Job>,
     path_cache: path::PathCache,
     exit_warned: bool,
@@ -185,6 +189,7 @@ fn main() {
         prompt_buf: String::with_capacity(128),
         completion_buffer: complete::Completions::with_capacity(2048, 64),
         history_match_buffer: Vec::with_capacity(200),
+        prompt_needs_line_start: false,
         job: None,
         path_cache: path::PathCache::new(),
         exit_warned: false,
@@ -407,6 +412,7 @@ fn main() {
                 if history_line.trim() != "l" {
                     shell.history.add_in_dir(&history_line, Some(&history_cwd));
                 }
+                shell.prompt_needs_line_start = true;
             }
             ReadResult::Exit => {
                 shell.history.compact();
@@ -681,6 +687,14 @@ fn read_line(shell: &mut Shell) -> ReadResult {
             osc.push('\x07');
             let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
         }
+    }
+
+    if shell.prompt_needs_line_start {
+        // Commands write directly to the terminal, so ish cannot observe
+        // whether their output ended with a newline. Start the prompt on a
+        // fresh row to keep prompt geometry independent of child output.
+        tw.write_str("\r\n");
+        shell.prompt_needs_line_start = false;
     }
 
     // Render prompt — zero-alloc: reuse shell.prompt_buf, read state from epsh.

@@ -1094,6 +1094,26 @@ fn echo_command() {
 }
 
 #[test]
+fn prompt_does_not_share_a_line_with_unterminated_external_output() {
+    let sh = PtyShell::spawn();
+    let out = sh.run_command("/usr/bin/printf no-newline");
+    let screen = Screen::render(&out, 24, 80);
+
+    assert!(
+        screen.lines().any(|line| line == "no-newline"),
+        "unterminated command output was not preserved: {screen:?}"
+    );
+    assert!(
+        !screen.lines().any(|line| {
+            line.find("no-newline")
+                .zip(line.rfind('$'))
+                .is_some_and(|(output, prompt)| output < prompt)
+        }),
+        "prompt was rendered on the unterminated output line: {screen:?}"
+    );
+}
+
+#[test]
 fn broken_interpreter_reports_bad_interpreter() {
     let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
         let bin = home.join("bin");
