@@ -12,7 +12,7 @@ libc = "0.2"
 
 [dev-dependencies]
 rustybench = "0.1"
-vt100 = "0.16"
+ptytest = { path = "../ptytest" }
 
 [[bench]]
 name = "bench"

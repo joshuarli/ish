@@ -3,25 +3,25 @@
 //! Spawns ish in a real pseudo-terminal and drives it with keystrokes,
 //! asserting on the visible terminal output. This tests the full shell loop
 //! including raw mode, prompt rendering, line editing, completion, and history.
-//! Screen assertions are rendered through `vt100`, so terminal-state tests
-//! exercise control sequences and wrapping instead of relying on ANSI stripping.
+//! Screen assertions use `ptytest`'s independent terminal state, so terminal
+//! behavior is checked without a second parser in this consumer.
 
-use std::cell::RefCell;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::cell::{Cell, RefCell};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use ptytest::{CommandSpec, ExitStatus, ProtocolProfile, PtyTest, Scenario, Size, TerminalBaseline, TestEnv};
 
 // ---------------------------------------------------------------------------
 // PTY harness
 // ---------------------------------------------------------------------------
 
 struct PtyShell {
-    master: OwnedFd,
-    child: libc::pid_t,
+    terminal: RefCell<PtyTest>,
+    terminal_baseline: TerminalBaseline,
     _home: TempDir,
     startup_output: String,
     pending_output: RefCell<Vec<u8>>,
+    output_offset: Cell<usize>,
 }
 
 /// Minimal RAII temp dir.
@@ -124,99 +124,40 @@ impl PtyShell {
         let config_dir = home.path().join(".config/ish");
         std::fs::create_dir_all(&config_dir).unwrap();
 
-        // Open PTY
-        let mut master_fd: RawFd = -1;
-        let mut slave_fd: RawFd = -1;
-        let ret = unsafe {
-            libc::openpty(
-                &mut master_fd,
-                &mut slave_fd,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(ret, 0, "openpty failed");
-
-        // Every test process may have several live PTYs because Cargo runs
-        // tests in parallel. Keep unrelated masters/slaves out of a child
-        // exec so one shell cannot keep another test's PTY open.
-        for fd in [master_fd, slave_fd] {
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert!(flags >= 0, "fcntl(F_GETFD) failed");
-            let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-            assert_eq!(result, 0, "fcntl(FD_CLOEXEC) failed");
-        }
-
-        // Set terminal size
-        let ws = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws) };
-
         let binary = ish_binary();
         let cwd = cwd_rel
             .map(|rel| home.path().join(rel))
             .unwrap_or_else(|| home.path().to_path_buf());
-        let cwd_str = cwd.to_string_lossy().into_owned();
-
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed");
-
-        if pid == 0 {
-            // Child — become session leader, set controlling terminal
-            unsafe {
-                libc::close(master_fd);
-                libc::setsid();
-                #[cfg(target_os = "linux")]
-                libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
-                #[cfg(not(target_os = "linux"))]
-                libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
-                libc::dup2(slave_fd, 0);
-                libc::dup2(slave_fd, 1);
-                libc::dup2(slave_fd, 2);
-                if slave_fd > 2 {
-                    libc::close(slave_fd);
-                }
-            }
-
-            // Exec ish with clean env
-            let mut cmd = Command::new(&binary);
-            cmd.env_clear()
-                .env("HOME", &home_path)
-                .env("USER", "testuser")
-                .env("PWD", &cwd_str)
-                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-                .env("TERM", "xterm-256color")
-                .current_dir(&cwd);
-            for (key, value) in extra_env {
-                cmd.env(key, value);
-            }
-            let err = cmd.exec();
-            eprintln!("exec failed: {err}");
-            std::process::exit(127);
+        let mut command = CommandSpec::new(binary)
+            .current_dir(&cwd)
+            .env("HOME", &home_path)
+            .env("USER", "testuser")
+            .env("PWD", &cwd)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        for (key, value) in extra_env {
+            command = command.env(key, value);
         }
-
-        // Parent
-        unsafe { libc::close(slave_fd) };
-
-        // Set master to non-blocking for reads
-        unsafe {
-            let flags = libc::fcntl(master_fd, libc::F_GETFL);
-            libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-
-        let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
-
+        let environment = TestEnv::hermetic_utf8("C.UTF-8")
+            .expect("C.UTF-8 must be available on supported PTY platforms")
+            .env("HOME", &home_path)
+            .env("USER", "testuser")
+            .env("PWD", &cwd)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        let scenario = Scenario::new("ish interactive shell")
+            .expect("valid scenario label")
+            .command(command)
+            .size(Size::new(cols, rows).expect("non-zero shell size"))
+            .environment(environment)
+            .protocol_profile(ProtocolProfile::xterm_minimal_v1());
+        let terminal = PtyTest::spawn(scenario).expect("spawn ish through ptytest");
+        let terminal_baseline = terminal.terminal_baseline();
         let mut sh = PtyShell {
-            master,
-            child: pid,
+            terminal: RefCell::new(terminal),
+            terminal_baseline,
             _home: home,
             startup_output: String::new(),
             pending_output: RefCell::new(Vec::new()),
+            output_offset: Cell::new(0),
         };
 
         // Wait for the initial prompt
@@ -237,58 +178,11 @@ impl PtyShell {
         &self.startup_output
     }
 
-    fn master_fd(&self) -> RawFd {
-        use std::os::fd::AsRawFd;
-        self.master.as_raw_fd()
-    }
-
     /// Send raw bytes to the shell.
     fn send(&self, input: &[u8]) {
-        let mut written = 0;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while written < input.len() {
-            let count = unsafe {
-                libc::write(
-                    self.master_fd(),
-                    input[written..].as_ptr().cast::<libc::c_void>(),
-                    input.len() - written,
-                )
-            };
-            if count > 0 {
-                written += count as usize;
-                continue;
-            }
-            if count == 0 {
-                panic!("PTY write made no progress");
-            }
-
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            if error.raw_os_error() != Some(libc::EAGAIN)
-                && error.raw_os_error() != Some(libc::EWOULDBLOCK)
-            {
-                panic!("PTY write failed: {error}");
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("PTY write timed out after {} bytes", input.len() - written);
-            }
-
-            let mut pollfd = libc::pollfd {
-                fd: self.master_fd(),
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            let timeout = deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis()
-                .min(100) as i32;
-            let ready = unsafe { libc::poll(&mut pollfd, 1, timeout) };
-            if ready < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                panic!("PTY write poll failed: {}", std::io::Error::last_os_error());
-            }
-        }
+        let mut terminal = self.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::from_secs(5));
+        terminal.send_bytes(deadline, input).expect("PTY write failed");
     }
 
     /// Send a string.
@@ -403,90 +297,47 @@ impl PtyShell {
     }
 
     fn resize(&self, rows: u16, cols: u16) {
-        let ws = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        unsafe {
-            libc::ioctl(self.master_fd(), libc::TIOCSWINSZ, &ws);
-            libc::kill(self.child, libc::SIGWINCH);
-        }
+        self.terminal
+            .borrow_mut()
+            .resize(Size::new(cols, rows).expect("non-zero shell size"))
+            .expect("resize shell PTY");
     }
 
     /// Read all available output, waiting up to `timeout_ms` for data.
     fn read_timeout(&self, timeout_ms: u64) -> String {
         let mut buf = std::mem::take(&mut *self.pending_output.borrow_mut());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-
-        loop {
-            let mut fds = [libc::pollfd {
-                fd: self.master_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            }];
-
-            let remaining = deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis() as i32;
-            if remaining <= 0 {
-                break;
-            }
-
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, remaining.min(100)) };
-            if n < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                break;
-            }
-            if n == 0 {
-                // No data and we've waited — if we have some data already, we're done.
-                if !buf.is_empty() {
-                    break;
-                }
-                continue;
-            }
-
-            let mut closed = false;
-            if fds[0].revents & libc::POLLIN != 0 {
-                loop {
-                    let mut chunk = [0u8; 4096];
-                    let read = unsafe {
-                        libc::read(
-                            self.master_fd(),
-                            chunk.as_mut_ptr().cast::<libc::c_void>(),
-                            chunk.len(),
-                        )
-                    };
-                    if read > 0 {
-                        buf.extend_from_slice(&chunk[..read as usize]);
-                        continue;
-                    }
-                    if read == 0 {
-                        closed = true;
-                        break;
-                    }
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::EAGAIN)
-                        && error.raw_os_error() != Some(libc::EWOULDBLOCK)
-                    {
-                        closed = true;
-                    }
-                    break;
-                }
-            }
-
-            if closed
-                || fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
-            {
-                break;
-            }
+        let mut terminal = self.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::from_millis(timeout_ms));
+        terminal.drain(deadline).expect("drain shell output");
+        let output_length = terminal.raw_output().len();
+        if output_length == self.output_offset.get() {
+            let _ = terminal.wait_for_output(deadline).expect("wait for shell output");
         }
+        let _ = terminal
+            .wait_for_quiescence(deadline, std::time::Duration::from_millis(50))
+            .expect("wait for shell output quiescence");
+        terminal.drain(deadline).expect("drain shell output");
+        let output = terminal.raw_output();
+        let offset = self.output_offset.get();
+        buf.extend_from_slice(output.get(offset..).unwrap_or_default());
+        self.output_offset.set(output.len());
 
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Wait for terminal output to become quiescent without using a generic
+    /// sleep. The supplied bound is an observable terminal-I/O deadline.
+    fn wait_for_quiescence(&self, timeout_ms: u64) {
+        let mut terminal = self.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::from_millis(timeout_ms));
+        terminal.drain(deadline).expect("drain shell output");
+        let _ = terminal
+            .wait_for_quiescence(deadline, std::time::Duration::from_millis(timeout_ms))
+            .expect("wait for shell output quiescence");
+    }
+
+    fn screen(&self) -> ptytest::ScreenSnapshot {
+        self.terminal.borrow().screen()
     }
 
     /// Wait until output contains `marker`, up to `timeout_ms`.
@@ -529,38 +380,6 @@ impl PtyShell {
     /// Wait until Enter has been processed and the shell advanced to a new line.
     fn wait_for_line_advance(&self, timeout_ms: u64) -> String {
         self.wait_for("\n", timeout_ms)
-    }
-
-    /// Wait until the rendered screen satisfies `predicate`, up to `timeout_ms`.
-    fn wait_for_screen<F>(&self, rows: u16, cols: u16, timeout_ms: u64, mut predicate: F) -> String
-    where
-        F: FnMut(&str) -> bool,
-    {
-        let mut accumulated = String::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-
-        loop {
-            let remaining = deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis() as u64;
-            if remaining == 0 {
-                break;
-            }
-
-            let chunk = self.read_timeout(remaining.min(200));
-            if !chunk.is_empty() {
-                accumulated.push_str(&chunk);
-            }
-
-            let screen = Screen::render(&accumulated, rows, cols);
-            if predicate(&screen) {
-                return accumulated;
-            }
-        }
-
-        panic!(
-            "timed out after {timeout_ms}ms waiting for screen predicate; output: {accumulated:?}"
-        );
     }
 
     /// Send a command, press enter, wait for the next prompt.
@@ -607,6 +426,17 @@ impl PtyShell {
         panic!("timed out waiting for the prompt after running {cmd:?}; output: {accumulated:?}");
     }
 
+    fn wait_for_exit(&self, timeout_ms: u64) {
+        let mut terminal = self.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::from_millis(timeout_ms));
+        let status = terminal.wait_for_exit(deadline).expect("wait for ish exit");
+        if status == ExitStatus::Code(0) {
+            terminal
+                .assert_terminal_restored(&self.terminal_baseline)
+                .expect("normal ish exit restores applicable terminal modes");
+        }
+    }
+
     /// Strip ANSI escape sequences from output for easier text matching.
     fn strip_ansi(s: &str) -> String {
         let mut result = String::new();
@@ -650,72 +480,23 @@ impl PtyShell {
     }
 }
 
-struct Screen {
-    parser: vt100::Parser,
+fn snapshot_text(screen: &ptytest::ScreenSnapshot) -> String {
+    let mut lines = (0..screen.row_count())
+        .map(|row| screen.row(row).unwrap_or_default().trim_end().to_owned())
+        .collect::<Vec<_>>();
+    while lines.last().is_some_and(String::is_empty) { lines.pop(); }
+    lines.join("\n")
 }
 
-impl Screen {
-    fn new(rows: u16, cols: u16) -> Self {
-        Self { parser: vt100::Parser::new(rows, cols, 0) }
-    }
-
-    fn render(output: &str, rows: u16, cols: u16) -> String {
-        let mut screen = Self::new(rows, cols);
-        screen.apply_output(output);
-        screen.visible_text()
-    }
-
-    fn apply_output(&mut self, output: &str) {
-        self.parser.process(output.as_bytes());
-    }
-
-    fn visible_text(&self) -> String {
-        let (_, cols) = self.parser.screen().size();
-        let mut lines = self
-            .parser
-            .screen()
-            .rows(0, cols)
-            .map(|line| line.trim_end().to_owned())
-            .collect::<Vec<_>>();
-        while lines.last().is_some_and(String::is_empty) {
-            lines.pop();
-        }
-        lines.join("\n")
-    }
-
-    fn snapshot(&self) -> ScreenSnapshot {
-        let (cursor_row, cursor_col) = self.parser.screen().cursor_position();
-        ScreenSnapshot {
-            visible: self.visible_text(),
-            cursor_row: usize::from(cursor_row),
-            cursor_col: usize::from(cursor_col),
-        }
-    }
-
-    fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser.screen_mut().set_size(rows, cols);
-    }
-}
-
-#[cfg(test)]
-mod screen_tests {
-    use super::Screen;
-
-    #[test]
-    fn parses_terminal_sequences_and_utf8() {
-        let mut screen = Screen::new(2, 12);
-        screen.apply_output("\x1b[31mred\x1b[0m 日本\x1b[K");
-        assert_eq!(screen.visible_text(), "red 日本");
-        assert_eq!(screen.snapshot().cursor_col, 8);
-    }
-
-    #[test]
-    fn handles_split_escape_sequences() {
-        let mut screen = Screen::new(2, 12);
-        screen.apply_output("hello\x1b[");
-        screen.apply_output("2J\x1b[Hworld");
-        assert_eq!(screen.visible_text(), "world");
-    }
+fn active_prompt_text(screen: &ptytest::ScreenSnapshot) -> String {
+    let cursor_row = usize::from(screen.cursor().row);
+    let first = cursor_row.saturating_sub(2);
+    let last = (cursor_row + 2).min(screen.row_count().saturating_sub(1));
+    (first..=last)
+        .filter_map(|row| screen.row(row))
+        .map(|row| row.trim_end().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Clone, Debug)]
@@ -755,10 +536,8 @@ fn run_trace_with_initial_output(
     rows: u16,
     cols: u16,
     steps: &[TraceStep<'_>],
-    initial_output: &str,
+    _initial_output: &str,
 ) -> Vec<TraceFrame> {
-    let mut screen = Screen::new(rows, cols);
-    screen.apply_output(initial_output);
     let mut frames = Vec::with_capacity(steps.len());
 
     for step in steps {
@@ -766,23 +545,28 @@ fn run_trace_with_initial_output(
             TraceInput::Bytes(bytes) => {
                 sh.send(bytes);
                 if step.settle_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(step.settle_ms));
+                    sh.wait_for_quiescence(step.settle_ms);
                 }
                 sh.read_timeout(step.read_ms)
             }
             TraceInput::Text(text) => {
                 sh.type_str(text);
                 if step.settle_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(step.settle_ms));
+                    sh.wait_for_quiescence(step.settle_ms);
                 }
                 sh.read_timeout(step.read_ms)
             }
         };
-        screen.apply_output(&raw);
+        let screen = sh.screen();
+        assert_eq!(screen.size(), Size::new(cols, rows).unwrap());
         frames.push(TraceFrame {
             label: step.label,
             raw,
-            snapshot: screen.snapshot(),
+            snapshot: ScreenSnapshot {
+                visible: snapshot_text(&screen),
+                cursor_row: usize::from(screen.cursor().row),
+                cursor_col: usize::from(screen.cursor().column),
+            },
         });
     }
 
@@ -813,78 +597,9 @@ fn compact_screen_text(screen: &str) -> String {
 
 impl Drop for PtyShell {
     fn drop(&mut self) {
-        // Avoid writing to a closed PTY when a test has already reaped the
-        // shell. Otherwise use EOF as the normal shutdown path, then escalate
-        // to the whole process group so foreground descendants cannot leak.
-        let mut status = 0i32;
-        let child_state = unsafe { libc::waitpid(self.child, &mut status, libc::WNOHANG) };
-        if child_state == self.child {
-            return;
-        }
-        if child_state < 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
-        {
-            return;
-        }
-
-        let eof = [0x04u8];
-        unsafe {
-            let _ = libc::write(
-                self.master_fd(),
-                eof.as_ptr().cast::<libc::c_void>(),
-                eof.len(),
-            );
-            libc::kill(-self.child, libc::SIGTERM);
-            libc::kill(self.child, libc::SIGTERM);
-        }
-
-        // Use WNOHANG polling while the PTY remains open and escalate after a
-        // bounded grace period so cleanup cannot hang the test process.
-        let start = std::time::Instant::now();
-        let mut killed = false;
-        loop {
-            let ret = unsafe { libc::waitpid(self.child, &mut status, libc::WNOHANG) };
-            if ret == self.child || (ret < 0 && errno_is_echild()) {
-                break;
-            }
-            if !killed && start.elapsed() > std::time::Duration::from_millis(500) {
-                unsafe {
-                    libc::kill(-self.child, libc::SIGKILL);
-                    libc::kill(self.child, libc::SIGKILL);
-                }
-                killed = true;
-            }
-            if start.elapsed() > std::time::Duration::from_millis(2000) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        // Do not use a final blocking wait here: macOS can report a PTY child
-        // as exiting while its session teardown is still in progress. The
-        // bounded WNOHANG loop above keeps test cleanup from hanging.
-    }
-}
-
-fn errno_is_echild() -> bool {
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
-}
-
-// Helper: use Command::exec() which replaces the process
-use std::os::unix::process::CommandExt;
-
-/// Wait up to `timeout_ms` for a child process to exit.
-fn assert_child_exits(pid: libc::pid_t, timeout_ms: u64) {
-    let start = std::time::Instant::now();
-    loop {
-        let mut status = 0i32;
-        let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if ret > 0 {
-            return;
-        }
-        if start.elapsed() > std::time::Duration::from_millis(timeout_ms) {
-            panic!("child pid {pid} did not exit within {timeout_ms}ms");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut terminal = self.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::from_secs(2));
+        let _ = terminal.finish(deadline);
     }
 }
 
@@ -1017,8 +732,8 @@ fn echo_command() {
 #[test]
 fn prompt_does_not_share_a_line_with_unterminated_external_output() {
     let sh = PtyShell::spawn();
-    let out = sh.run_command("/usr/bin/printf no-newline");
-    let screen = Screen::render(&out, 24, 80);
+    sh.run_command("/usr/bin/printf no-newline");
+    let screen = snapshot_text(&sh.screen());
 
     assert!(
         screen.lines().any(|line| line == "no-newline"),
@@ -1078,12 +793,11 @@ fn cd_and_pwd() {
 #[test]
 fn exit_with_ctrl_d() {
     let sh = PtyShell::spawn();
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.wait_for_quiescence(100);
     sh.ctrl_d();
     // Use a generous timeout: on loaded CI runners (macOS-15 in particular)
     // process scheduling can delay the shell processing the ^D by several seconds.
-    assert_child_exits(sh.child, 10_000);
-    std::mem::forget(sh);
+    sh.wait_for_exit(10_000);
 }
 
 #[test]
@@ -1091,8 +805,7 @@ fn exit_command() {
     let sh = PtyShell::spawn();
     sh.type_str("exit");
     sh.enter();
-    assert_child_exits(sh.child, 3000);
-    std::mem::forget(sh);
+    sh.wait_for_exit(3000);
 }
 
 #[test]
@@ -1129,24 +842,21 @@ fn line_editing_up_down_navigate_wrapped_input() {
     // A narrow terminal makes both the prompt and input span multiple rows.
     // Up/Down should move within the visual input grid, not enter history.
     let sh = PtyShell::spawn_with_size(&[], &[], 24, 30);
-    let mut screen = Screen::new(24, 30);
-    screen.apply_output(sh.startup_output());
-
     sh.type_str("echo 012345678901234567890123456789");
-    screen.apply_output(&sh.read_timeout(500));
-    let before = screen.snapshot();
-    assert!(before.cursor_row > 0, "input did not wrap: {before:?}");
+    sh.read_timeout(500);
+    let before = sh.screen();
+    assert!(before.cursor().row > 0, "input did not wrap: {before:?}");
 
     sh.up();
-    screen.apply_output(&sh.read_timeout(500));
-    let after_up = screen.snapshot();
-    assert_eq!(after_up.cursor_row + 1, before.cursor_row);
+    sh.read_timeout(500);
+    let after_up = sh.screen();
+    assert_eq!(after_up.cursor().row + 1, before.cursor().row);
 
     sh.down();
-    screen.apply_output(&sh.read_timeout(500));
-    let after_down = screen.snapshot();
-    assert_eq!(after_down.cursor_row, before.cursor_row);
-    assert_eq!(after_down.cursor_col, before.cursor_col);
+    sh.read_timeout(500);
+    let after_down = sh.screen();
+    assert_eq!(after_down.cursor().row, before.cursor().row);
+    assert_eq!(after_down.cursor().column, before.cursor().column);
 }
 
 #[test]
@@ -1564,24 +1274,32 @@ fn history_up_narrow_repaint_clears_wrapped_rows() {
     for _ in 0..32 {
         sh.up();
     }
-    let out = sh.wait_for_screen(24, 12, 2000, |screen| {
-        normalize_screen_text(screen).contains("echo ok")
-            && !screen.contains("WRAPMARK")
-            && !screen.contains("newer")
-    });
-    let screen = Screen::render(&out, 24, 12);
-    let normalized = normalize_screen_text(&screen);
+    let screen = {
+        let mut terminal = sh.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::from_secs(2));
+        terminal
+            .wait_for_screen(deadline, "recalled oldest history entry", |screen| {
+                let active = active_prompt_text(screen);
+                normalize_screen_text(&active).contains("echo ok")
+                    && !active.contains("WRAPMARK")
+                    && !active.contains("newer")
+            })
+            .expect("timed out recalling oldest history entry")
+    };
+    assert_eq!(screen.size(), Size::new(12, 24).unwrap());
+    let active = active_prompt_text(&screen);
+    let normalized = normalize_screen_text(&active);
     assert!(
         normalized.contains("echo ok"),
-        "expected final prompt to show `echo ok`: {screen:?}"
+        "expected final prompt to show `echo ok`: {active:?}"
     );
     assert!(
-        !screen.contains("WRAPMARK"),
-        "wrapped history entry leaked into final screen: {screen:?}"
+        !active.contains("WRAPMARK"),
+        "wrapped history entry leaked into final prompt region: {active:?}"
     );
     assert!(
-        !screen.contains("newer"),
-        "newer history entry leaked into final screen: {screen:?}"
+        !active.contains("newer"),
+        "newer history entry leaked into final prompt region: {active:?}"
     );
 }
 
@@ -1596,7 +1314,7 @@ fn history_ctrl_r_search() {
 
     // Type search query
     sh.type_str("beta");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
 
     // Accept with Enter
     sh.enter();
@@ -1630,7 +1348,7 @@ fn history_ctrl_r_ignores_later_global_entries() {
     );
 
     sh.type_str("later");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     sh.enter();
     let out = sh.wait_for_prompt(2000);
     let text = PtyShell::strip_ansi(&out);
@@ -1646,7 +1364,7 @@ fn history_ctrl_r_escape_cancels() {
     sh.ctrl_r();
     sh.wait_for("search:", 2000);
     sh.type_str("secret");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     sh.escape();
     sh.wait_for_prompt(2000);
     // After escape, the original line should be restored (empty)
@@ -1667,19 +1385,19 @@ fn history_ctrl_r_narrow_repaint_does_not_stack_rows() {
     sh.ctrl_r();
     sh.wait_for("search:", 2000);
     sh.type_str("ab");
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.wait_for_quiescence(100);
     sh.type_str("c");
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.wait_for_quiescence(100);
     sh.backspace();
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.wait_for_quiescence(100);
     sh.type_str("c");
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.wait_for_quiescence(100);
     sh.down();
     sh.up();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
 
-    let out = sh.read_timeout(600);
-    let screen = Screen::render(&out, 24, 10);
+    sh.read_timeout(600);
+    let screen = snapshot_text(&sh.screen());
     assert_screen_contains_once(&screen, "search:");
     assert_screen_contains_once(&screen, "abc1");
     assert_screen_contains_once(&screen, "abc2");
@@ -1870,7 +1588,7 @@ fn history_ctrl_r_near_bottom_keeps_pager_stable() {
     let mut out = sh.wait_for("search:", 2000);
     out.push_str(&sh.read_timeout(400));
 
-    let screen = Screen::render(&out, 24, 20);
+    let screen = snapshot_text(&sh.screen());
     assert_screen_contains_once(&screen, "search:");
     assert!(
         screen.contains("hist12"),
@@ -1900,7 +1618,7 @@ fn history_ctrl_r_scrolls_when_selection_passes_last_visible_entry() {
     }
     out.push_str(&sh.read_timeout(500));
 
-    let screen = Screen::render(&out, 8, 20);
+    let screen = snapshot_text(&sh.screen());
     assert!(
         screen.contains("hist01"),
         "expected the last history entry: {screen:?}"
@@ -2013,8 +1731,14 @@ fn history_ctrl_r_near_bottom_query_edits_do_not_stack_headers() {
             frame.raw,
             frame.snapshot.visible
         );
+        let header_row = frame
+            .snapshot
+            .visible
+            .lines()
+            .position(|line| line.contains("search:"))
+            .expect("search header should be visible");
         assert_eq!(
-            frame.snapshot.cursor_row, 0,
+            frame.snapshot.cursor_row, header_row,
             "search cursor moved off header row in frame {}: {:?}",
             frame.label, frame.snapshot
         );
@@ -2044,7 +1768,7 @@ fn tab_completion_files() {
     );
     sh.type_str("echo al");
     sh.tab();
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    sh.wait_for_quiescence(300);
     sh.enter();
     let out = sh.wait_for_prompt(2000);
     let text = PtyShell::strip_ansi(&out);
@@ -2077,8 +1801,9 @@ fn tab_completion_first_tab_has_no_selection_second_tab_selects_first() {
     let sh = PtyShell::spawn_with_opts(&[("aaa.txt", ""), ("aab.txt", ""), ("aac.txt", "")], &[]);
     sh.type_str("echo aa");
     sh.tab();
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    let first = Screen::render(&sh.read_timeout(400), 24, 80);
+    sh.wait_for_quiescence(150);
+    sh.read_timeout(400);
+    let first = snapshot_text(&sh.screen());
     assert_eq!(
         first.matches("aaa.txt").count(),
         1,
@@ -2086,8 +1811,9 @@ fn tab_completion_first_tab_has_no_selection_second_tab_selects_first() {
     );
 
     sh.tab();
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    let second = Screen::render(&sh.read_timeout(400), 24, 80);
+    sh.wait_for_quiescence(150);
+    sh.read_timeout(400);
+    let second = snapshot_text(&sh.screen());
     assert_eq!(
         second.matches("aaa.txt").count(),
         2,
@@ -2108,16 +1834,16 @@ fn tab_completion_narrow_repaint_does_not_stack_rows() {
     );
     sh.type_str("echo a");
     sh.tab();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    sh.wait_for_quiescence(150);
     sh.type_str("a");
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.wait_for_quiescence(100);
     sh.down();
     sh.down();
     sh.up();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
 
-    let out = sh.read_timeout(600);
-    let screen = Screen::render(&out, 24, 12);
+    sh.read_timeout(600);
+    let screen = snapshot_text(&sh.screen());
     let flattened = screen.replace('\n', "");
     assert_eq!(
         flattened.matches("aaa.txt").count(),
@@ -2136,7 +1862,7 @@ fn tab_completion_directory() {
     let sh = PtyShell::spawn_with_opts(&[("mydir/.keep", "")], &[]);
     sh.type_str("cd my");
     sh.tab();
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    sh.wait_for_quiescence(300);
     sh.enter();
     sh.wait_for_prompt(2000);
     // After cd, pwd should show mydir
@@ -2150,12 +1876,12 @@ fn tab_completion_escape_restores_typed_prefix() {
     let sh = PtyShell::spawn_with_opts(&[("alpha.txt", ""), ("alpine.txt", "")], &[]);
     sh.type_str("echo al");
     sh.tab();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     sh.escape();
     sh.type_str("x");
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
-    let screen = Screen::render(&out, 24, 80);
+    sh.wait_for_prompt(2000);
+    let screen = snapshot_text(&sh.screen());
     let text = normalize_screen_text(&screen);
     assert!(
         text.contains("al"),
@@ -2172,14 +1898,14 @@ fn tab_completion_narrowing_does_not_autoaccept() {
     let sh = PtyShell::spawn_with_opts(&[("signal.rs", ""), ("sys.rs", "")], &[]);
     sh.type_str("echo s");
     sh.tab();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    sh.wait_for_quiescence(150);
     sh.type_str("y");
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    sh.wait_for_quiescence(150);
     sh.escape();
     sh.type_str("x");
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
-    let screen = Screen::render(&out, 24, 80);
+    sh.wait_for_prompt(2000);
+    let screen = snapshot_text(&sh.screen());
     let text = normalize_screen_text(&screen);
     assert!(
         text.contains("sy"),
@@ -2316,14 +2042,14 @@ fn completion_resize_rerenders_grid() {
     );
     sh.type_str("echo a");
     sh.tab();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     sh.read_timeout(300);
 
     sh.resize(24, 12);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
 
-    let out = sh.read_timeout(800);
-    let screen = Screen::render(&out, 24, 12);
+    sh.read_timeout(800);
+    let screen = snapshot_text(&sh.screen());
     assert_screen_contains_once(&screen, "aaa.txt");
     assert_screen_contains_once(&screen, "aab.txt");
     assert_screen_contains_once(&screen, "aac.txt");
@@ -2335,41 +2061,38 @@ fn completion_resize_rerenders_grid() {
 #[test]
 fn normal_resize_reanchors_wrapped_prompt() {
     let sh = PtyShell::spawn_with_size(&[], &[], 12, 80);
-    let mut screen = Screen::new(12, 80);
-    let mut initial_output = sh.startup_output().to_string();
-    initial_output.push_str(&sh.run_command("printf '\\n\\n'"));
-    screen.apply_output(&initial_output);
+    sh.run_command("printf '\\n\\n'");
 
     sh.type_str("echo resize-test-abcdefghijklmnopqrstuvwxyz");
-    screen.apply_output(&sh.read_timeout(800));
+    sh.read_timeout(800);
 
     sh.resize(12, 52);
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    screen.resize(12, 52);
+    sh.wait_for_quiescence(200);
     let resize_output = sh.read_timeout(800);
     assert!(
         resize_output.contains("\x1b[H\x1b[2J"),
         "resize should invalidate the old terminal region before repainting: {resize_output:?}"
     );
-    screen.apply_output(&resize_output);
 
     sh.type_str("x");
-    screen.apply_output(&sh.read_timeout(800));
+    sh.read_timeout(800);
+    let screen = sh.screen();
+    assert_eq!(screen.size(), Size::new(52, 12).unwrap());
+    let visible = snapshot_text(&screen);
 
-    let prompt_count = screen.visible_text().matches("testuser@").count();
+    let prompt_count = visible.matches("testuser@").count();
     assert_eq!(
         prompt_count,
         1,
         "resize should repaint one prompt, not duplicate the reflowed prompt: {:?}",
-        screen.snapshot()
+        screen
     );
     assert!(
-        screen
-            .visible_text()
+        visible
             .replace('\n', "")
             .contains("echo resize-test-abcdefghijklmnopqrstuvwxyzx"),
         "resized prompt lost or duplicated input: {:?}",
-        screen.snapshot()
+        screen
     );
 
     sh.ctrl_c();
@@ -2382,14 +2105,14 @@ fn history_resize_rerenders_pager() {
     sh.ctrl_r();
     sh.wait_for("search:", 2000);
     sh.type_str("abc");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     sh.read_timeout(300);
 
     sh.resize(24, 10);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
 
-    let out = sh.read_timeout(800);
-    let screen = Screen::render(&out, 24, 10);
+    sh.read_timeout(800);
+    let screen = snapshot_text(&sh.screen());
     assert_screen_contains_once(&screen, "search:");
     assert_screen_contains_once(&screen, "abc1");
     assert_screen_contains_once(&screen, "abc2");
@@ -2417,15 +2140,15 @@ fn alias_self_referencing_no_reexpand() {
     sh.run_command("alias rg rg --hidden -S -g !.git");
     // Type "rg" then space — should expand once
     sh.type_str("rg");
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    sh.wait_for_quiescence(50);
     sh.type_str(" ");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     let after_first = sh.read_timeout(300);
     let first_text = PtyShell::strip_ansi(&after_first);
     eprintln!("AFTER FIRST SPACE: {first_text:?}");
     // Type another space — should NOT re-expand
     sh.type_str(" ");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     let after_second = sh.read_timeout(300);
     let second_text = PtyShell::strip_ansi(&after_second);
     eprintln!("AFTER SECOND SPACE: {second_text:?}");
@@ -2453,21 +2176,21 @@ fn alias_self_referencing_from_config() {
     let sh = PtyShell::spawn_with_opts(&[(".config/ish/config.ish", config)], &[]);
     // Type "rg" then space — should expand once
     sh.type_str("rg");
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    sh.wait_for_quiescence(50);
     sh.type_str(" ");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     let after_first = sh.read_timeout(300);
     let first_text = PtyShell::strip_ansi(&after_first);
     eprintln!("CONFIG AFTER FIRST SPACE: {first_text:?}");
     // Type another space
     sh.type_str(" ");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     let after_second = sh.read_timeout(300);
     let second_text = PtyShell::strip_ansi(&after_second);
     eprintln!("CONFIG AFTER SECOND SPACE: {second_text:?}");
     // Third space
     sh.type_str(" ");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     let after_third = sh.read_timeout(300);
     let third_text = PtyShell::strip_ansi(&after_third);
     eprintln!("CONFIG AFTER THIRD SPACE: {third_text:?}");
@@ -2524,7 +2247,7 @@ fn alias_with_command_substitution() {
     // Type "grt" then space to trigger try_alias_expand, then Enter.
     // The $(echo hello_subst) must survive re-parsing as a single token.
     sh.type_str("grt");
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    sh.wait_for_quiescence(50);
     sh.type_str(" \n");
     let out = sh.read_timeout(2000);
     let text = PtyShell::strip_ansi(&out);
@@ -2646,7 +2369,7 @@ fn ctrl_l_clears_screen() {
     sh.type_str("echo after_clear");
     sh.ctrl_l();
     out.push_str(&sh.read_timeout(500));
-    let screen = Screen::render(&out, 24, 80);
+    let screen = snapshot_text(&sh.screen());
     let normalized = normalize_screen_text(&screen);
     assert!(
         out.contains("\x1b[H") || out.contains("\x1b[2J"),
@@ -2688,7 +2411,7 @@ fn multiline_completion_on_continuation_line() {
     sh.read_timeout(300);
     sh.type_str("./bin/up");
     sh.tab();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     let out = sh.read_timeout(600);
     let text = PtyShell::strip_ansi(&out);
     assert!(
@@ -2712,16 +2435,18 @@ fn dir_picker_narrow_repaint_does_not_stack_rows() {
     sh.run_command("cd ../three");
     sh.ctrl_backspace();
     sh.wait_for("dirs:", 2000);
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    sh.wait_for_quiescence(150);
     sh.down();
     sh.up();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
 
-    let out = sh.read_timeout(800);
-    let screen = Screen::render(&out, 24, 40);
-    assert_screen_contains_once(&screen, "dirs:");
-    assert_screen_contains_once(&screen, "one");
-    assert_screen_contains_once(&screen, "two");
+    sh.read_timeout(800);
+    let screen = snapshot_text(&sh.screen());
+    let (_, picker) = screen
+        .split_once("dirs:\n")
+        .expect("directory picker should be visible");
+    assert_screen_contains_once(picker, "~/one");
+    assert_screen_contains_once(picker, "~/two");
 
     sh.escape();
     sh.wait_for_prompt(2000);
@@ -3130,6 +2855,8 @@ fn denv_reload_after_reallow_picks_up_envrc_edit() {
     );
     sh.run_command("cd project");
 
+    // `denv` deliberately uses filesystem modification timestamps as its
+    // trust invalidation contract; cross the one-second timestamp boundary.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     std::fs::write(
         sh.home_path().join("project/.envrc"),
@@ -3154,6 +2881,8 @@ fn denv_edit_envrc_invalidates_trust() {
     );
     sh.run_command("cd project");
 
+    // `denv` deliberately uses filesystem modification timestamps as its
+    // trust invalidation contract; cross the one-second timestamp boundary.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     std::fs::write(
         sh.home_path().join("project/.envrc"),
@@ -3259,7 +2988,7 @@ fn job_suspend_and_resume() {
     sh.wait_for_line_advance(1000);
 
     // Give sleep a moment to start, then suspend it with Ctrl+Z.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    sh.wait_for_quiescence(200);
     sh.ctrl_z();
 
     // Shell should report the stop and return a prompt.
@@ -3281,7 +3010,7 @@ fn job_suspend_and_resume() {
     );
 
     // sleep is now in the foreground again — kill it so the shell returns.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.wait_for_quiescence(100);
     sh.ctrl_c();
 
     // Shell must return a prompt, confirming it regained control.
@@ -3314,31 +3043,7 @@ fn bracketed_paste_over_limit_rejected() {
     payload.extend_from_slice(content.as_bytes());
     payload.extend_from_slice(b"\x1b[201~");
 
-    // Write directly to the PTY master — avoid File::from_raw_fd which
-    // conflicts with the OwnedFd ownership on nightly Rust 2024.
-    // The master fd is non-blocking, so handle EAGAIN with retry.
-    let fd = sh.master_fd();
-    let mut written = 0usize;
-    while written < payload.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                payload[written..].as_ptr() as *const libc::c_void,
-                (payload.len() - written).min(4096),
-            )
-        };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
-            panic!("write to PTY failed: {err}");
-        }
-        written += n as usize;
-    }
-    // Give the shell time to process the entire paste.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    sh.send(&payload);
 
     let out = sh.wait_for_prompt(5000);
     let clean = PtyShell::strip_ansi(&out);
@@ -3378,27 +3083,7 @@ fn bracketed_paste_agents_md_rejected() {
     payload.extend_from_slice(content.as_bytes());
     payload.extend_from_slice(b"\x1b[201~");
 
-    let fd = sh.master_fd();
-    let mut written = 0usize;
-    while written < payload.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                payload[written..].as_ptr() as *const libc::c_void,
-                (payload.len() - written).min(4096),
-            )
-        };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
-            panic!("write to PTY failed: {err}");
-        }
-        written += n as usize;
-    }
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    sh.send(&payload);
 
     let out = sh.wait_for_prompt(5000);
     let clean = PtyShell::strip_ansi(&out);
@@ -3435,27 +3120,7 @@ fn bracketed_paste_under_limit_accepted() {
     payload.extend_from_slice(content.as_bytes());
     payload.extend_from_slice(b"\x1b[201~");
 
-    let fd = sh.master_fd();
-    let mut written = 0usize;
-    while written < payload.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                payload[written..].as_ptr() as *const libc::c_void,
-                (payload.len() - written).min(4096),
-            )
-        };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
-            panic!("write to PTY failed: {err}");
-        }
-        written += n as usize;
-    }
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    sh.send(&payload);
 
     // The paste should be sitting in the line buffer — press Enter to run it.
     let out = sh.run_command(""); // just Enter
@@ -3479,27 +3144,7 @@ fn bracketed_paste_exactly_at_limit_accepted() {
     payload.extend_from_slice(content.as_bytes());
     payload.extend_from_slice(b"\x1b[201~");
 
-    let fd = sh.master_fd();
-    let mut written = 0usize;
-    while written < payload.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                payload[written..].as_ptr() as *const libc::c_void,
-                (payload.len() - written).min(4096),
-            )
-        };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
-            panic!("write to PTY failed: {err}");
-        }
-        written += n as usize;
-    }
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    sh.send(&payload);
 
     // The 1024 'x's should be in the line buffer (not rejected).  Verify
     // by appending " ok" via normal typing and running with echo.
