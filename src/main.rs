@@ -670,6 +670,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     let mut mode = Mode::Normal;
     let mut history_idx: Option<usize> = None;
     let mut saved_line = String::new();
+    let mut grid_column: Option<usize> = None;
     // Emit OSC 7 so terminal emulators track the working directory
     {
         let pwd = shell.epsh.vars().get("PWD").unwrap_or("");
@@ -727,6 +728,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                     let (rows, cols) = term::term_size();
                     shell.rows = rows;
                     shell.cols = cols;
+                    grid_column = None;
                     update_mode_layout_for_resize(&mut mode, shell);
 
                     // Terminal emulators reflow the live cursor and their
@@ -754,6 +756,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
             InputEvent::Paste(text) => {
                 // Insert the entire paste content in one shot — no per-char
                 // rendering.
+                grid_column = None;
                 line.insert_str(&text);
                 region = render_active_mode(
                     &mut tw,
@@ -769,6 +772,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                 continue;
             }
             InputEvent::PasteRejected => {
+                grid_column = None;
                 line.set("[paste exceeded 1KB limit]");
                 region = render_active_mode(
                     &mut tw,
@@ -810,6 +814,8 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                             &mut line,
                             &mut history_idx,
                             &mut saved_line,
+                            &mut grid_column,
+                            prompt_display_len,
                             shell,
                         ) {
                             KeyAction::Continue => {}
@@ -1351,8 +1357,14 @@ fn handle_normal_key(
     line: &mut LineBuffer,
     history_idx: &mut Option<usize>,
     saved_line: &mut String,
+    grid_column: &mut Option<usize>,
+    prompt_display_len: usize,
     shell: &Shell,
 ) -> KeyAction {
+    if !matches!(key.key, Key::Up | Key::Down) || key.mods.ctrl {
+        *grid_column = None;
+    }
+
     match (key.key, key.mods.ctrl, key.mods.alt) {
         (Key::Char('c'), true, _) => return KeyAction::Cancel,
         (Key::Char('d'), true, _) => {
@@ -1377,6 +1389,15 @@ fn handle_normal_key(
         (Key::Up, _, _) if !key.mods.ctrl => {
             if line.has_newlines() && !line.on_first_line() {
                 line.move_line_up();
+                *grid_column = None;
+            } else if !line.has_newlines() {
+                let col = *grid_column.get_or_insert_with(|| {
+                    line.grid_cursor_position(prompt_display_len, shell.cols).1
+                });
+                if !line.move_grid_up(prompt_display_len, shell.cols, col) {
+                    *grid_column = None;
+                    navigate_history(line, history_idx, saved_line, shell, true);
+                }
             } else {
                 navigate_history(line, history_idx, saved_line, shell, true);
             }
@@ -1384,6 +1405,15 @@ fn handle_normal_key(
         (Key::Down, _, _) if !key.mods.ctrl => {
             if line.has_newlines() && !line.on_last_line() {
                 line.move_line_down();
+                *grid_column = None;
+            } else if !line.has_newlines() {
+                let col = *grid_column.get_or_insert_with(|| {
+                    line.grid_cursor_position(prompt_display_len, shell.cols).1
+                });
+                if !line.move_grid_down(prompt_display_len, shell.cols, col) {
+                    *grid_column = None;
+                    navigate_history(line, history_idx, saved_line, shell, false);
+                }
             } else {
                 navigate_history(line, history_idx, saved_line, shell, false);
             }

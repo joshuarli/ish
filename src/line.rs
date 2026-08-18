@@ -119,6 +119,101 @@ impl LineBuffer {
         true
     }
 
+    /// Return the terminal row and column for the cursor in a wrapped prompt.
+    ///
+    /// `prompt_display_len` is the prompt's display width on the first row;
+    /// `term_cols` is the terminal width. This only models a single-line
+    /// buffer (explicit newlines use the multiline navigation below).
+    pub fn grid_cursor_position(
+        &self,
+        prompt_display_len: usize,
+        term_cols: u16,
+    ) -> (usize, usize) {
+        let cols = usize::from(term_cols).max(1);
+        let total = prompt_display_len + self.display_cursor_pos();
+        (total / cols, total % cols)
+    }
+
+    /// Move the cursor up one wrapped terminal row, preserving `target_col`.
+    ///
+    /// The target column is the terminal column rather than a byte or line
+    /// offset. It is kept by the caller so a short wrapped row does not make a
+    /// later Down press permanently lose the user's intended column.
+    pub fn move_grid_up(
+        &mut self,
+        prompt_display_len: usize,
+        term_cols: u16,
+        target_col: usize,
+    ) -> bool {
+        self.move_grid(-1, prompt_display_len, term_cols, target_col)
+    }
+
+    /// Move the cursor down one wrapped terminal row, preserving `target_col`.
+    pub fn move_grid_down(
+        &mut self,
+        prompt_display_len: usize,
+        term_cols: u16,
+        target_col: usize,
+    ) -> bool {
+        self.move_grid(1, prompt_display_len, term_cols, target_col)
+    }
+
+    fn move_grid(
+        &mut self,
+        direction: isize,
+        prompt_display_len: usize,
+        term_cols: u16,
+        target_col: usize,
+    ) -> bool {
+        debug_assert!(!self.has_newlines());
+        if self.buf.is_empty() {
+            return false;
+        }
+        let cols = usize::from(term_cols).max(1);
+        let (row, _) = self.grid_cursor_position(prompt_display_len, term_cols);
+        let last_row = (prompt_display_len + self.display_len()) / cols;
+        let target_row = if direction < 0 {
+            let first_input_row = prompt_display_len / cols;
+            if row > first_input_row {
+                Some(row - 1)
+            } else {
+                None
+            }
+        } else if row < last_row {
+            Some(row + 1)
+        } else {
+            None
+        };
+        let Some(target_row) = target_row else {
+            return false;
+        };
+
+        // Convert the terminal coordinate back to a display offset in the
+        // line. Rows occupied only by the prompt clamp to the start of input.
+        let target_total = target_row * cols + target_col.min(cols - 1);
+        let target_display = target_total.saturating_sub(prompt_display_len);
+        self.cursor = self.byte_offset_for_display_pos(target_display);
+        true
+    }
+
+    fn byte_offset_for_display_pos(&self, target: usize) -> usize {
+        if target == 0 {
+            return 0;
+        }
+        let mut display = 0;
+        for (byte, ch) in self.buf.char_indices() {
+            let next = display + char_width(ch);
+            if target < next {
+                return byte;
+            }
+            display = next;
+            if target == display {
+                return byte + ch.len_utf8();
+            }
+        }
+        self.buf.len()
+    }
+
     pub fn move_home(&mut self) {
         self.cursor = 0;
     }

@@ -39,13 +39,13 @@ josh@mac ~/d/ish* main $
 
 Single kill ring shared across Ctrl+K/U/W. Full UTF-8 support.
 
-**Multiline editing**: paste a multi-line command (with `\` continuations or unclosed quotes) and move freely with Up/Down between lines. No more unwinding — the entire command lives in one buffer with free cursor movement.
+**Multiline editing**: paste a multi-line command (with `\` continuations or unclosed quotes) and move freely with Up/Down between lines. Long single-line input also behaves like a wrapped grid: Up/Down move by visual row and preserve the target column. At the first or last input row, Up/Down resume history navigation.
 
 ### History
 
 | Key | Action |
 |---|---|
-| Up / Down | Prefix search through history |
+| Up / Down | Move by visual row in wrapped input; prefix search through history at the boundary |
 | Ctrl+R | Fuzzy search (subsequence, case-insensitive) |
 
 Fuzzy search opens a pager with matching characters highlighted in yellow. Up/Down to navigate, Enter to accept, Escape to cancel.

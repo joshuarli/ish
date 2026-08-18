@@ -140,6 +140,36 @@ fn line_buffer_insert_str() {
     assert_eq!(lb.cursor(), 11);
 }
 
+#[test]
+fn line_buffer_grid_navigation_preserves_terminal_column() {
+    let mut lb = LineBuffer::new();
+    lb.set("abcdefghijklmnopqrst");
+
+    // The prompt occupies two columns in a twelve-column terminal. The end
+    // of the input is therefore on row 1, column 10.
+    assert_eq!(lb.grid_cursor_position(2, 12), (1, 10));
+    assert!(lb.move_grid_up(2, 12, 10));
+    assert_eq!(lb.cursor(), 8);
+    assert_eq!(lb.grid_cursor_position(2, 12), (0, 10));
+
+    // Moving down with the original terminal column returns to the end,
+    // rather than using the clipped column on the shorter row.
+    assert!(lb.move_grid_down(2, 12, 10));
+    assert_eq!(lb.cursor(), 20);
+    assert_eq!(lb.grid_cursor_position(2, 12), (1, 10));
+    assert!(!lb.move_grid_down(2, 12, 10));
+}
+
+#[test]
+fn line_buffer_grid_navigation_ignores_prompt_only_rows() {
+    let mut lb = LineBuffer::new();
+    assert!(!lb.move_grid_up(18, 12, 6));
+
+    lb.set("abc");
+    assert_eq!(lb.grid_cursor_position(18, 12), (1, 9));
+    assert!(!lb.move_grid_up(18, 12, 9));
+}
+
 // ---------------------------------------------------------------------------
 // History: search and deduplication
 // ---------------------------------------------------------------------------

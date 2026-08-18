@@ -3,8 +3,10 @@
 //! Spawns ish in a real pseudo-terminal and drives it with keystrokes,
 //! asserting on the visible terminal output. This tests the full shell loop
 //! including raw mode, prompt rendering, line editing, completion, and history.
+//! Screen assertions are rendered through `vt100`, so terminal-state tests
+//! exercise control sequences and wrapping instead of relying on ANSI stripping.
 
-use std::io::{Read, Write};
+use std::cell::RefCell;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -19,6 +21,7 @@ struct PtyShell {
     child: libc::pid_t,
     _home: TempDir,
     startup_output: String,
+    pending_output: RefCell<Vec<u8>>,
 }
 
 /// Minimal RAII temp dir.
@@ -135,6 +138,16 @@ impl PtyShell {
         };
         assert_eq!(ret, 0, "openpty failed");
 
+        // Every test process may have several live PTYs because Cargo runs
+        // tests in parallel. Keep unrelated masters/slaves out of a child
+        // exec so one shell cannot keep another test's PTY open.
+        for fd in [master_fd, slave_fd] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "fcntl(F_GETFD) failed");
+            let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            assert_eq!(result, 0, "fcntl(FD_CLOEXEC) failed");
+        }
+
         // Set terminal size
         let ws = libc::winsize {
             ws_row: rows,
@@ -203,10 +216,16 @@ impl PtyShell {
             child: pid,
             _home: home,
             startup_output: String::new(),
+            pending_output: RefCell::new(Vec::new()),
         };
 
         // Wait for the initial prompt
         sh.startup_output = sh.wait_for_prompt(3000);
+        assert!(
+            sh.startup_output.contains("$ "),
+            "ish did not render its initial prompt within 3s: {:?}",
+            sh.startup_output
+        );
         sh
     }
 
@@ -225,11 +244,51 @@ impl PtyShell {
 
     /// Send raw bytes to the shell.
     fn send(&self, input: &[u8]) {
-        use std::os::fd::AsRawFd;
-        let mut f = unsafe { std::fs::File::from_raw_fd(self.master.as_raw_fd()) };
-        f.write_all(input).unwrap();
-        // Don't drop — that would close the fd
-        std::mem::forget(f);
+        let mut written = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while written < input.len() {
+            let count = unsafe {
+                libc::write(
+                    self.master_fd(),
+                    input[written..].as_ptr().cast::<libc::c_void>(),
+                    input.len() - written,
+                )
+            };
+            if count > 0 {
+                written += count as usize;
+                continue;
+            }
+            if count == 0 {
+                panic!("PTY write made no progress");
+            }
+
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            if error.raw_os_error() != Some(libc::EAGAIN)
+                && error.raw_os_error() != Some(libc::EWOULDBLOCK)
+            {
+                panic!("PTY write failed: {error}");
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("PTY write timed out after {} bytes", input.len() - written);
+            }
+
+            let mut pollfd = libc::pollfd {
+                fd: self.master_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let timeout = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(100) as i32;
+            let ready = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+            if ready < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                panic!("PTY write poll failed: {}", std::io::Error::last_os_error());
+            }
+        }
     }
 
     /// Send a string.
@@ -358,7 +417,7 @@ impl PtyShell {
 
     /// Read all available output, waiting up to `timeout_ms` for data.
     fn read_timeout(&self, timeout_ms: u64) -> String {
-        let mut buf = Vec::new();
+        let mut buf = std::mem::take(&mut *self.pending_output.borrow_mut());
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
         loop {
@@ -376,20 +435,54 @@ impl PtyShell {
             }
 
             let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, remaining.min(100)) };
-            if n > 0 && fds[0].revents & libc::POLLIN != 0 {
-                let mut chunk = [0u8; 4096];
-                use std::os::fd::AsRawFd;
-                let mut f = unsafe { std::fs::File::from_raw_fd(self.master.as_raw_fd()) };
-                match f.read(&mut chunk) {
-                    Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
-                    _ => {}
+            if n < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
                 }
-                std::mem::forget(f);
-            } else {
-                // No data and we've waited — if we have some data already, we're done
+                break;
+            }
+            if n == 0 {
+                // No data and we've waited — if we have some data already, we're done.
                 if !buf.is_empty() {
                     break;
                 }
+                continue;
+            }
+
+            let mut closed = false;
+            if fds[0].revents & libc::POLLIN != 0 {
+                loop {
+                    let mut chunk = [0u8; 4096];
+                    let read = unsafe {
+                        libc::read(
+                            self.master_fd(),
+                            chunk.as_mut_ptr().cast::<libc::c_void>(),
+                            chunk.len(),
+                        )
+                    };
+                    if read > 0 {
+                        buf.extend_from_slice(&chunk[..read as usize]);
+                        continue;
+                    }
+                    if read == 0 {
+                        closed = true;
+                        break;
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EAGAIN)
+                        && error.raw_os_error() != Some(libc::EWOULDBLOCK)
+                    {
+                        closed = true;
+                    }
+                    break;
+                }
+            }
+
+            if closed
+                || fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+            {
+                break;
             }
         }
 
@@ -412,12 +505,20 @@ impl PtyShell {
             let chunk = self.read_timeout(remaining.min(200));
             accumulated.push_str(&chunk);
 
-            if accumulated.contains(marker) {
+            if let Some(marker_start) = accumulated.find(marker) {
+                let marker_end = marker_start + marker.len();
+                let suffix = accumulated.split_off(marker_end);
+                self.pending_output
+                    .borrow_mut()
+                    .extend_from_slice(suffix.as_bytes());
+                accumulated.push_str(&suffix);
                 return accumulated;
             }
         }
 
-        accumulated
+        panic!(
+            "timed out after {timeout_ms}ms waiting for {marker:?}; output: {accumulated:?}"
+        );
     }
 
     /// Wait for the shell prompt (` $ `).
@@ -457,7 +558,9 @@ impl PtyShell {
             }
         }
 
-        accumulated
+        panic!(
+            "timed out after {timeout_ms}ms waiting for screen predicate; output: {accumulated:?}"
+        );
     }
 
     /// Send a command, press enter, wait for the next prompt.
@@ -490,13 +593,18 @@ impl PtyShell {
             accumulated.push_str(&chunk);
 
             if let Some(nl) = accumulated.rfind('\n')
-                && accumulated[nl + 1..].contains("$ ")
+                && let Some(prompt_offset) = accumulated[nl + 1..].find("$ ")
             {
+                let prompt_end = nl + 1 + prompt_offset + 2;
+                let suffix = accumulated.split_off(prompt_end);
+                self.pending_output
+                    .borrow_mut()
+                    .extend_from_slice(suffix.as_bytes());
                 return accumulated;
             }
         }
 
-        accumulated
+        panic!("timed out waiting for the prompt after running {cmd:?}; output: {accumulated:?}");
     }
 
     /// Strip ANSI escape sequences from output for easier text matching.
@@ -542,28 +650,13 @@ impl PtyShell {
     }
 }
 
-#[derive(Clone)]
 struct Screen {
-    rows: usize,
-    cols: usize,
-    cells: Vec<Vec<char>>,
-    row: usize,
-    col: usize,
-    saved: Option<(usize, usize)>,
+    parser: vt100::Parser,
 }
 
 impl Screen {
     fn new(rows: u16, cols: u16) -> Self {
-        let rows = rows as usize;
-        let cols = cols as usize;
-        Self {
-            rows,
-            cols,
-            cells: vec![vec![' '; cols]; rows],
-            row: 0,
-            col: 0,
-            saved: None,
-        }
+        Self { parser: vt100::Parser::new(rows, cols, 0) }
     }
 
     fn render(output: &str, rows: u16, cols: u16) -> String {
@@ -573,236 +666,55 @@ impl Screen {
     }
 
     fn apply_output(&mut self, output: &str) {
-        let bytes = output.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\r' => {
-                    self.col = 0;
-                    i += 1;
-                }
-                b'\n' => {
-                    self.line_feed();
-                    i += 1;
-                }
-                0x1b => {
-                    i += 1;
-                    if i >= bytes.len() {
-                        break;
-                    }
-                    match bytes[i] {
-                        b'[' => {
-                            i += 1;
-                            let start = i;
-                            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                                i += 1;
-                            }
-                            if i >= bytes.len() {
-                                break;
-                            }
-                            self.apply_csi(&bytes[start..i], bytes[i]);
-                            i += 1;
-                        }
-                        b']' => {
-                            i += 1;
-                            while i < bytes.len() {
-                                if bytes[i] == 0x07 {
-                                    i += 1;
-                                    break;
-                                }
-                                if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\'
-                                {
-                                    i += 2;
-                                    break;
-                                }
-                                i += 1;
-                            }
-                        }
-                        b'7' => {
-                            self.saved = Some((self.row, self.col));
-                            i += 1;
-                        }
-                        b'8' => {
-                            if let Some((row, col)) = self.saved {
-                                self.row = row.min(self.rows.saturating_sub(1));
-                                self.col = col.min(self.cols.saturating_sub(1));
-                            }
-                            i += 1;
-                        }
-                        _ => i += 1,
-                    }
-                }
-                b if b < b' ' => {
-                    i += 1;
-                }
-                _ => {
-                    let ch = output[i..].chars().next().unwrap();
-                    self.put_char(ch);
-                    i += ch.len_utf8();
-                }
-            }
-        }
+        self.parser.process(output.as_bytes());
     }
 
     fn visible_text(&self) -> String {
-        let mut lines: Vec<String> = self
-            .cells
-            .clone()
-            .into_iter()
-            .map(|row| row.into_iter().collect::<String>().trim_end().to_string())
-            .collect();
+        let (_, cols) = self.parser.screen().size();
+        let mut lines = self
+            .parser
+            .screen()
+            .rows(0, cols)
+            .map(|line| line.trim_end().to_owned())
+            .collect::<Vec<_>>();
         while lines.last().is_some_and(String::is_empty) {
             lines.pop();
         }
         lines.join("\n")
     }
 
-    fn apply_csi(&mut self, params: &[u8], final_byte: u8) {
-        match final_byte {
-            b'A' => {
-                let n = parse_csi_n(params).max(1);
-                self.row = self.row.saturating_sub(n as usize);
-            }
-            b'B' => {
-                let n = parse_csi_n(params).max(1) as usize;
-                self.row = (self.row + n).min(self.rows.saturating_sub(1));
-            }
-            b'C' => {
-                let n = parse_csi_n(params).max(1) as usize;
-                self.col = (self.col + n).min(self.cols.saturating_sub(1));
-            }
-            b'D' => {
-                let n = parse_csi_n(params).max(1);
-                self.col = self.col.saturating_sub(n as usize);
-            }
-            b'H' => {
-                let (row, col) = parse_csi_pos(params);
-                self.row = row.min(self.rows.saturating_sub(1));
-                self.col = col.min(self.cols.saturating_sub(1));
-            }
-            b'J' => {
-                let mode = parse_csi_n(params);
-                if mode == 2 {
-                    for row in &mut self.cells {
-                        row.fill(' ');
-                    }
-                } else {
-                    self.clear_to_end_of_screen();
-                }
-            }
-            b'K' => self.clear_to_end_of_line(),
-            _ => {}
-        }
-    }
-
-    fn put_char(&mut self, ch: char) {
-        if self.rows == 0 || self.cols == 0 {
-            return;
-        }
-        if self.col >= self.cols {
-            self.col = 0;
-            self.line_feed();
-        }
-        self.cells[self.row][self.col] = ch;
-        self.col += 1;
-        if self.col >= self.cols {
-            self.col = 0;
-            self.line_feed();
-        }
-    }
-
-    fn line_feed(&mut self) {
-        if self.row + 1 >= self.rows {
-            self.cells.rotate_left(1);
-            self.cells[self.rows - 1].fill(' ');
-        } else {
-            self.row += 1;
-        }
-    }
-
-    fn clear_to_end_of_line(&mut self) {
-        if self.rows == 0 || self.cols == 0 {
-            return;
-        }
-        for col in self.col..self.cols {
-            self.cells[self.row][col] = ' ';
-        }
-    }
-
-    fn clear_to_end_of_screen(&mut self) {
-        self.clear_to_end_of_line();
-        for row in self.row + 1..self.rows {
-            self.cells[row].fill(' ');
-        }
-    }
-
     fn snapshot(&self) -> ScreenSnapshot {
+        let (cursor_row, cursor_col) = self.parser.screen().cursor_position();
         ScreenSnapshot {
             visible: self.visible_text(),
-            cursor_row: self.row,
-            cursor_col: self.col,
+            cursor_row: usize::from(cursor_row),
+            cursor_col: usize::from(cursor_col),
         }
     }
 
-    /// Reflow the simple screen model when a test changes terminal width.
-    /// This covers the single-line prompt cases exercised below; the real
-    /// terminal reflows each soft-wrapped row before delivering SIGWINCH.
     fn resize(&mut self, rows: u16, cols: u16) {
-        let old_rows = self.rows;
-        let old_cols = self.cols;
-        let old_cells = std::mem::take(&mut self.cells);
-        let old_cursor = (self.row, self.col);
-        let old_saved = self.saved;
+        self.parser.screen_mut().set_size(rows, cols);
+    }
+}
 
-        self.rows = rows as usize;
-        self.cols = cols as usize;
-        self.cells = vec![vec![' '; self.cols]; self.rows];
+#[cfg(test)]
+mod screen_tests {
+    use super::Screen;
 
-        let reflow_position = |row: usize, col: usize| {
-            if self.cols == 0 {
-                return (0, 0);
-            }
-            let offset = row.saturating_mul(old_cols).saturating_add(col);
-            (
-                (offset / self.cols).min(self.rows.saturating_sub(1)),
-                (offset % self.cols).min(self.cols.saturating_sub(1)),
-            )
-        };
+    #[test]
+    fn parses_terminal_sequences_and_utf8() {
+        let mut screen = Screen::new(2, 12);
+        screen.apply_output("\x1b[31mred\x1b[0m 日本\x1b[K");
+        assert_eq!(screen.visible_text(), "red 日本");
+        assert_eq!(screen.snapshot().cursor_col, 8);
+    }
 
-        for (old_row, cells) in old_cells.into_iter().enumerate().take(old_rows) {
-            let mut new_row = if self.cols == 0 {
-                0
-            } else {
-                old_row.saturating_mul(old_cols) / self.cols
-            };
-            let mut new_col = if self.cols == 0 {
-                0
-            } else {
-                old_row.saturating_mul(old_cols) % self.cols
-            };
-            for ch in cells {
-                if new_row >= self.rows || self.cols == 0 {
-                    break;
-                }
-                self.cells[new_row][new_col] = ch;
-                new_col += 1;
-                if new_col >= self.cols {
-                    new_col = 0;
-                    new_row += 1;
-                }
-            }
-        }
-
-        (self.row, self.col) = reflow_position(old_cursor.0, old_cursor.1);
-        // tmux/xterm keep the DEC saved cursor in its screen coordinate while
-        // reflowing the live cursor, which is the mismatch this regression
-        // models.
-        self.saved = old_saved.map(|(row, col)| {
-            (
-                row.min(self.rows.saturating_sub(1)),
-                col.min(self.cols.saturating_sub(1)),
-            )
-        });
+    #[test]
+    fn handles_split_escape_sequences() {
+        let mut screen = Screen::new(2, 12);
+        screen.apply_output("hello\x1b[");
+        screen.apply_output("2J\x1b[Hworld");
+        assert_eq!(screen.visible_text(), "world");
     }
 }
 
@@ -877,25 +789,6 @@ fn run_trace_with_initial_output(
     frames
 }
 
-fn parse_csi_n(params: &[u8]) -> u16 {
-    std::str::from_utf8(params)
-        .ok()
-        .and_then(|s| s.split(';').next())
-        .and_then(|s| s.trim_start_matches('?').parse().ok())
-        .unwrap_or(0)
-}
-
-fn parse_csi_pos(params: &[u8]) -> (usize, usize) {
-    let mut parts = std::str::from_utf8(params)
-        .ok()
-        .unwrap_or("")
-        .split(';')
-        .map(|s| s.trim_start_matches('?').parse::<usize>().unwrap_or(1));
-    let row = parts.next().unwrap_or(1).saturating_sub(1);
-    let col = parts.next().unwrap_or(1).saturating_sub(1);
-    (row, col)
-}
-
 fn assert_screen_contains_once(screen: &str, needle: &str) {
     let count = screen.matches(needle).count();
     assert_eq!(count, 1, "expected {needle:?} once in screen: {screen:?}");
@@ -920,32 +813,60 @@ fn compact_screen_text(screen: &str) -> String {
 
 impl Drop for PtyShell {
     fn drop(&mut self) {
-        // Send Ctrl+D to exit cleanly
-        self.send(b"\x04");
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        // Escalate: SIGTERM, then SIGKILL
+        // Avoid writing to a closed PTY when a test has already reaped the
+        // shell. Otherwise use EOF as the normal shutdown path, then escalate
+        // to the whole process group so foreground descendants cannot leak.
+        let mut status = 0i32;
+        let child_state = unsafe { libc::waitpid(self.child, &mut status, libc::WNOHANG) };
+        if child_state == self.child {
+            return;
+        }
+        if child_state < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+        {
+            return;
+        }
+
+        let eof = [0x04u8];
         unsafe {
+            let _ = libc::write(
+                self.master_fd(),
+                eof.as_ptr().cast::<libc::c_void>(),
+                eof.len(),
+            );
+            libc::kill(-self.child, libc::SIGTERM);
             libc::kill(self.child, libc::SIGTERM);
         }
-        // Use WNOHANG polling — blocking waitpid can hang on macOS with open PTY master
+
+        // Use WNOHANG polling while the PTY remains open and escalate after a
+        // bounded grace period so cleanup cannot hang the test process.
         let start = std::time::Instant::now();
+        let mut killed = false;
         loop {
-            let mut status = 0i32;
             let ret = unsafe { libc::waitpid(self.child, &mut status, libc::WNOHANG) };
-            if ret != 0 {
+            if ret == self.child || (ret < 0 && errno_is_echild()) {
                 break;
             }
-            if start.elapsed() > std::time::Duration::from_millis(500) {
+            if !killed && start.elapsed() > std::time::Duration::from_millis(500) {
                 unsafe {
+                    libc::kill(-self.child, libc::SIGKILL);
                     libc::kill(self.child, libc::SIGKILL);
                 }
+                killed = true;
             }
             if start.elapsed() > std::time::Duration::from_millis(2000) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // Do not use a final blocking wait here: macOS can report a PTY child
+        // as exiting while its session teardown is still in progress. The
+        // bounded WNOHANG loop above keeps test cleanup from hanging.
     }
+}
+
+fn errno_is_echild() -> bool {
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
 }
 
 // Helper: use Command::exec() which replaces the process
@@ -1201,6 +1122,31 @@ fn line_editing_backspace() {
         text.contains("hello"),
         "expected 'hello' in output: {text:?}"
     );
+}
+
+#[test]
+fn line_editing_up_down_navigate_wrapped_input() {
+    // A narrow terminal makes both the prompt and input span multiple rows.
+    // Up/Down should move within the visual input grid, not enter history.
+    let sh = PtyShell::spawn_with_size(&[], &[], 24, 30);
+    let mut screen = Screen::new(24, 30);
+    screen.apply_output(sh.startup_output());
+
+    sh.type_str("echo 012345678901234567890123456789");
+    screen.apply_output(&sh.read_timeout(500));
+    let before = screen.snapshot();
+    assert!(before.cursor_row > 0, "input did not wrap: {before:?}");
+
+    sh.up();
+    screen.apply_output(&sh.read_timeout(500));
+    let after_up = screen.snapshot();
+    assert_eq!(after_up.cursor_row + 1, before.cursor_row);
+
+    sh.down();
+    screen.apply_output(&sh.read_timeout(500));
+    let after_down = screen.snapshot();
+    assert_eq!(after_down.cursor_row, before.cursor_row);
+    assert_eq!(after_down.cursor_col, before.cursor_col);
 }
 
 #[test]
@@ -1613,9 +1559,11 @@ fn history_up_narrow_repaint_clears_wrapped_rows() {
     sh.run_command("echo ok");
     sh.run_command("echo WRAPMARK12345678901234567890");
     sh.run_command("echo newer");
-    sh.up();
-    sh.up();
-    sh.up();
+    // Up first traverses the wrapped visual rows of each recalled command;
+    // keep moving until the oldest entry is reached.
+    for _ in 0..32 {
+        sh.up();
+    }
     let out = sh.wait_for_screen(24, 12, 2000, |screen| {
         normalize_screen_text(screen).contains("echo ok")
             && !screen.contains("WRAPMARK")
