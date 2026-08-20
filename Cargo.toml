@@ -4,8 +4,7 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-epsh = "0.0.8"
-# epsh = { path = "../epsh" }
+epsh = { path = "../epsh" }
 fxhash = "0.2"
 rustix = { version = "1.1.4", features = ["event", "fs", "pipe", "process", "runtime", "system", "termios", "time"] }
 libc = "0.2"
@@ -19,6 +18,7 @@ name = "bench"
 harness = false
 
 [profile.dev]
+incremental = false
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
 
