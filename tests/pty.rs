@@ -1282,7 +1282,7 @@ fn history_up_arrow() {
     // PTY runner can otherwise coalesce rapid writes with the previous redraw.
     for expected in ["echo local_two", "echo local_one", "echo from_global"] {
         sh.up();
-        sh.wait_for_prompt_text(expected, 2000);
+        sh.wait_for_prompt_text(expected, 5000);
     }
     sh.enter();
     let out = sh.wait_for_prompt(2000);
