@@ -360,11 +360,21 @@ impl PtyShell {
     fn wait_for_prompt_text(&self, expected: &str, timeout_ms: u64) {
         let mut terminal = self.terminal.borrow_mut();
         let deadline = terminal.deadline(std::time::Duration::from_millis(timeout_ms));
-        terminal
+        if terminal
             .wait_for_screen(deadline, "history line", |screen| {
                 active_prompt_text(screen).contains(expected)
             })
-            .unwrap_or_else(|_| panic!("timed out waiting for history line {expected:?}"));
+            .is_err()
+        {
+            let screen = terminal.screen();
+            let raw = String::from_utf8_lossy(terminal.raw_output());
+            panic!(
+                "timed out waiting for history line {expected:?}; active={:?}; screen={:?}; raw_tail={:?}",
+                active_prompt_text(&screen),
+                snapshot_text(&screen),
+                raw.chars().rev().take(512).collect::<String>().chars().rev().collect::<String>()
+            );
+        }
     }
 
     /// Wait until output contains `marker`, up to `timeout_ms`.
