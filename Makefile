@@ -4,7 +4,6 @@ TEST_TARGETS := --lib --tests
 HOST       := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 TARGET     ?= $(subst -unknown-linux-gnu,-unknown-linux-musl,$(HOST))
 MUSL_LOADER := $(if $(findstring x86_64,$(TARGET)),/lib/ld-musl-x86_64.so.1,/lib/ld-musl-aarch64.so.1)
-MUSL_NATIVE_RUSTFLAGS := $(if $(findstring -linux-musl,$(TARGET)),-L native=/usr/lib)
 TARGET_ENV := $(shell echo $(TARGET) | tr '[:lower:]-' '[:upper:]_')
 # Fedora's musl cross packages use /usr/<arch>-linux-musl/lib64, while the
 # e-crt layout is used by other toolchains. Keep this overridable for hosts
@@ -15,6 +14,9 @@ MUSL_CRT_DIR ?= $(shell for dir in \
 	/usr/$(subst -unknown,,$(TARGET))/lib; do \
 	if test -f "$$dir/crtbegin.o"; then printf '%s' "$$dir"; break; fi; \
 done)
+# Host proc-macro crates are linked with the same musl toolchain. Keep the
+# target CRT objects visible to those links as well as to the final binary.
+MUSL_NATIVE_RUSTFLAGS = $(if $(findstring -linux-musl,$(TARGET)),-L native=/usr/lib -Clink-arg=-B$(MUSL_CRT_DIR))
 # LLVM helper binaries run on the build host; they are not installed in the
 # target triple's rustlib directory when cross-compiling to musl.
 LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(HOST)/bin
