@@ -70,9 +70,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "laputa-ptytest"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8125ac34092fe1c8464b74641e39073d66ebc95e8174647d0ca9510e27bb40ba"
+checksum = "a8445b7e2429c6b3c5f02f0b9d4dadf99722f7b506159e4c00e61c2c23bde4dc"
 dependencies = [
  "libc",
  "vt100",
