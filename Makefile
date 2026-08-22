@@ -9,11 +9,12 @@ PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 PGO_BUILD_DIR := $(CURDIR)/target/pgo-build
 PGO_BINARY := $(PGO_BUILD_DIR)/$(TARGET)/release/$(NAME)
+PROFILE_RUSTC_ARGS := $(if $(findstring -linux-musl,$(TARGET)),,-- -Cprofile-generate=$(PGO_DIR))
 
 # Docker's musl-cargo wrapper owns linker, CRT, loader, and profile-runtime
 # flags. The Makefile selects only the build mode and keeps Cargo invocations
 # readable on macOS as well as in the Linux release image.
-cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter static-profile dynamic-profile,$(1)),RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort -Cprofile-generate=$(PGO_DIR)",$(if $(filter release-static release-dynamic,$(1)),RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort"))) MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" MUSL_PROFILE_DIR="$(PGO_DIR)" $(CARGO_CMD)
+cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static release-dynamic static-profile dynamic-profile,$(1)),RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort")) MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" MUSL_PROFILE_DIR="$(PGO_DIR)" $(CARGO_CMD)
 
 RUSTYBENCH ?= cargo run --quiet --manifest-path ../rustybench/Cargo.toml --
 
@@ -87,10 +88,10 @@ bench-syscalls:
 pgo-instrument:
 	rm -rf "$(PGO_BUILD_DIR)" "$(PGO_DIR)" && mkdir -p "$(PGO_DIR)"
 	CARGO_TARGET_DIR="$(PGO_BUILD_DIR)" \
-	$(call cargo,static-profile) build --release \
+	$(call cargo,static-profile) rustc --release --target $(TARGET) --bin $(NAME) \
 	  -Z build-std=std \
 	  -Z build-std-features= \
-	  --target $(TARGET)
+	  $(PROFILE_RUSTC_ARGS)
 	@test -x "$(PGO_BINARY)"
 
 # The dynamic Linux artifact uses Docker's dynamic-profile mode so its startup
