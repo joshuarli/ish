@@ -146,8 +146,12 @@ impl PtyShell {
         for (key, value) in extra_env {
             command = command.env(key, value);
         }
-        let mut environment = TestEnv::hermetic_utf8("C.UTF-8")
-            .expect("C.UTF-8 must be available on supported PTY platforms")
+        let mut environment = if cfg!(target_os = "linux") {
+            TestEnv::hermetic_ascii()
+        } else {
+            TestEnv::hermetic_utf8("C.UTF-8")
+        }
+        .expect("a supported hermetic locale must be available on PTY platforms")
             .env("HOME", &home_path)
             .env("USER", "testuser")
             .env("PWD", &cwd)
