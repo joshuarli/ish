@@ -57,7 +57,7 @@ jobs:
         if: matrix.docker_platform == ''
       - name: Build macOS release
         if: matrix.docker_platform == ''
-        run: make release-pgo TARGET="${{ matrix.target }}"
+        run: make release TARGET="${{ matrix.target }}"
       - name: Run macOS tests
         if: matrix.docker_platform == ''
         run: make test-ci TARGET="${{ matrix.target }}"
