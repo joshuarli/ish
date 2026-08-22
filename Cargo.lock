@@ -56,8 +56,8 @@ version = "0.0.0"
 dependencies = [
  "epsh",
  "fxhash",
+ "laputa-ptytest",
  "libc",
- "ptytest",
  "rustix",
  "rustybench",
 ]
@@ -67,6 +67,16 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "laputa-ptytest"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8125ac34092fe1c8464b74641e39073d66ebc95e8174647d0ca9510e27bb40ba"
+dependencies = [
+ "libc",
+ "vt100",
+]
 
 [[package]]
 name = "lexopt"
@@ -121,14 +131,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "ptytest"
-version = "0.1.0"
-dependencies = [
- "libc",
- "vt100",
 ]
 
 [[package]]
