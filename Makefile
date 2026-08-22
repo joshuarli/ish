@@ -135,7 +135,7 @@ pgo-instrument-linux: ensure-musl-target
 # startup, history search, and pager rendering rather than benchmark machinery.
 pgo-profile: pgo-instrument
 	ISH_PGO_PROFILE_DIR="$(PGO_DIR)" \
-	RUSTFLAGS="" CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="" \
+	RUSTFLAGS="" CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" \
 	ISH_TEST_BINARY="$(PGO_BINARY)" \
 	cargo test --release --test pty pgo_profile_startup_history_tui -- --ignored
 	@test -n "$$(find "$(PGO_DIR)" -type f -name '*.profraw' -print -quit)"
@@ -143,7 +143,7 @@ pgo-profile: pgo-instrument
 
 pgo-profile-linux: pgo-instrument-linux
 	ISH_PGO_PROFILE_DIR="$(PGO_DIR)" \
-	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="" \
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" \
 	ISH_TEST_BINARY="$(PGO_BINARY)" \
 	cargo test --release --test pty pgo_profile_startup_history_tui -- --ignored
 	@test -n "$$(find "$(PGO_DIR)" -type f -name '*.profraw' -print -quit)"
