@@ -356,6 +356,17 @@ impl PtyShell {
         self.terminal.borrow().screen()
     }
 
+    /// Wait until the current editable prompt shows the expected history line.
+    fn wait_for_prompt_text(&self, expected: &str, timeout_ms: u64) {
+        let mut terminal = self.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::from_millis(timeout_ms));
+        terminal
+            .wait_for_screen(deadline, "history line", |screen| {
+                active_prompt_text(screen).contains(expected)
+            })
+            .unwrap_or_else(|_| panic!("timed out waiting for history line {expected:?}"));
+    }
+
     /// Wait until output contains `marker`, up to `timeout_ms`.
     fn wait_for(&self, marker: &str, timeout_ms: u64) -> String {
         let mut accumulated = String::new();
@@ -1267,12 +1278,11 @@ fn history_up_arrow() {
     let sh = PtyShell::spawn_with_opts(&[], &["echo from_global"]);
     sh.run_command("echo local_one");
     sh.run_command("echo local_two");
-    // Let each escape sequence reach the shell event loop before sending the
-    // next one. The macOS PTY runner can otherwise coalesce rapid writes with
-    // the redraw from the previous navigation step, dropping a history move.
-    for _ in 0..3 {
+    // Wait for each redraw before sending the next escape sequence. The macOS
+    // PTY runner can otherwise coalesce rapid writes with the previous redraw.
+    for expected in ["echo local_two", "echo local_one", "echo from_global"] {
         sh.up();
-        sh.wait_for_quiescence(500);
+        sh.wait_for_prompt_text(expected, 2000);
     }
     sh.enter();
     let out = sh.wait_for_prompt(2000);
