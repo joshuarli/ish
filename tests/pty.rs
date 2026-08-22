@@ -517,8 +517,8 @@ fn snapshot_text(screen: &ptytest::ScreenSnapshot) -> String {
 
 fn active_prompt_text(screen: &ptytest::ScreenSnapshot) -> String {
     let cursor_row = usize::from(screen.cursor().row);
-    let first = cursor_row.saturating_sub(2);
-    let last = (cursor_row + 2).min(screen.row_count().saturating_sub(1));
+    let first = cursor_row.saturating_sub(4);
+    let last = (cursor_row + 4).min(screen.row_count().saturating_sub(1));
     (first..=last)
         .filter_map(|row| screen.row(row))
         .map(|row| row.trim_end().to_owned())
