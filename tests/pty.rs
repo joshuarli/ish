@@ -1267,9 +1267,13 @@ fn history_up_arrow() {
     let sh = PtyShell::spawn_with_opts(&[], &["echo from_global"]);
     sh.run_command("echo local_one");
     sh.run_command("echo local_two");
-    sh.up();
-    sh.up();
-    sh.up();
+    // Let each escape sequence reach the shell event loop before sending the
+    // next one. The macOS PTY runner can otherwise coalesce rapid writes with
+    // the redraw from the previous navigation step, dropping a history move.
+    for _ in 0..3 {
+        sh.up();
+        sh.wait_for_quiescence(500);
+    }
     sh.enter();
     let out = sh.wait_for_prompt(2000);
     let text = PtyShell::strip_ansi(&out);

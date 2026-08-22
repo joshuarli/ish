@@ -30,7 +30,9 @@ RELEASE_RUSTFLAGS := $(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-
 RELEASE_LINUX_RUSTFLAGS := $(RELEASE_RUSTFLAGS) -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)
 PGO_RUSTFLAGS := $(RELEASE_RUSTFLAGS) -Cprofile-generate=$(PGO_DIR)
 PGO_STATIC_RUSTFLAGS := $(if $(findstring -linux-musl,$(TARGET)),$(PGO_RUSTFLAGS) -Clink-arg=/usr/lib/libcompiler-rt-builtins.a,$(PGO_RUSTFLAGS))
-PGO_LINUX_RUSTFLAGS := $(RELEASE_LINUX_RUSTFLAGS) -Cprofile-generate=$(PGO_DIR)
+# The dynamic musl profile runtime needs the same compiler-rt builtins archive
+# as the static profile path.
+PGO_LINUX_RUSTFLAGS := $(RELEASE_LINUX_RUSTFLAGS) -Cprofile-generate=$(PGO_DIR) -Clink-arg=/usr/lib/libcompiler-rt-builtins.a
 
 RUSTYBENCH ?= cargo run --quiet --manifest-path ../rustybench/Cargo.toml --
 
