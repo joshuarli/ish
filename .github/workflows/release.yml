@@ -3,7 +3,6 @@ name: release
 on:
   workflow_dispatch:
 
-# Keep write access scoped to the jobs that need it.
 permissions: {}
 
 concurrency:
@@ -16,7 +15,7 @@ env:
 
 jobs:
   build:
-    name: Build (${{ matrix.runner }})
+    name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -41,11 +40,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
+      - uses: docker/setup-buildx-action@v3
         if: matrix.docker_platform != ''
-        uses: docker/setup-buildx-action@v3
-
       - name: Build Linux release image
         if: matrix.docker_platform != ''
         uses: docker/build-push-action@v6
@@ -57,13 +53,18 @@ jobs:
           tags: ish-builder:${{ matrix.target }}
           cache-from: type=gha,scope=ish-${{ matrix.target }}
           cache-to: type=gha,mode=max,scope=ish-${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: laputa-systems/setup-rust@a7d09bfe692e431e6a98cd107ac2df77d47b5bba
         if: matrix.docker_platform == ''
-        with:
-          key: ${{ matrix.runner }}-${{ matrix.target }}
-
-      - name: Run Linux tests in Docker
+      - name: Build macOS release
+        if: matrix.docker_platform == ''
+        run: make release-pgo TARGET="${{ matrix.target }}"
+      - name: Run macOS tests
+        if: matrix.docker_platform == ''
+        run: make test-ci TARGET="${{ matrix.target }}"
+      - name: Save macOS release
+        if: matrix.docker_platform == ''
+        run: cp "target/${{ matrix.target }}/release/ish" "ish-${{ matrix.target }}"
+      - name: Build and verify Linux releases
         if: matrix.docker_platform != ''
         run: |
           docker run --rm --init \
@@ -80,19 +81,6 @@ jobs:
               make verify-release TARGET=${{ matrix.target }}
               cp target/${{ matrix.target }}/release/ish ish-${{ matrix.target }}-static
             '
-
-      - name: Build release
-        if: matrix.docker_platform == ''
-        run: make release-pgo TARGET=${{ matrix.target }}
-
-      - name: Run tests
-        if: matrix.docker_platform == ''
-        run: make test-ci TARGET=${{ matrix.target }}
-
-      - name: Save macOS release
-        if: matrix.docker_platform == ''
-        run: cp "target/${{ matrix.target }}/release/ish" "ish-${{ matrix.target }}"
-
       - uses: actions/upload-artifact@v4
         with:
           name: ish-${{ matrix.target }}
@@ -112,14 +100,10 @@ jobs:
           pattern: ish-*
           path: dist
           merge-multiple: true
-
+      - name: Zip artifacts
+        run: for f in dist/*; do zip -9 --junk-paths "$f.zip" "$f"; done
       - name: Create pre-release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: release-${{ github.sha }}
-        run: |
-          gh release create "$RELEASE_TAG" dist/ish-* \
-            --repo "$GITHUB_REPOSITORY" \
-            --prerelease \
-            --target "$GITHUB_SHA" \
-            --title "$RELEASE_TAG"
+        run: gh release create "$RELEASE_TAG" dist/*.zip --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" --title "$RELEASE_TAG"
