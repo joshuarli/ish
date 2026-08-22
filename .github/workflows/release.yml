@@ -60,6 +60,8 @@ jobs:
         run: make release TARGET="${{ matrix.target }}"
       - name: Run macOS tests
         if: matrix.docker_platform == ''
+        env:
+          RUST_TEST_THREADS: 1
         run: make test-ci TARGET="${{ matrix.target }}"
       - name: Save macOS release
         if: matrix.docker_platform == ''
