@@ -56,6 +56,15 @@ fn ish_binary() -> PathBuf {
         return path;
     }
 
+    // Cargo provides the exact binary path for integration tests. This also
+    // works with Cargo versions that keep test artifacts in a per-package
+    // build directory instead of `target/{profile}/deps`.
+    if let Some(path) = option_env!("CARGO_BIN_EXE_ish") {
+        let path = PathBuf::from(path);
+        assert!(path.exists(), "ish binary not found at {}", path.display());
+        return path;
+    }
+
     // Find the debug binary relative to the test binary
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // remove test binary name
@@ -128,25 +137,16 @@ impl PtyShell {
         let cwd = cwd_rel
             .map(|rel| home.path().join(rel))
             .unwrap_or_else(|| home.path().to_path_buf());
-        let pgo_profile = std::env::var_os("ISH_PGO_PROFILE_DIR").map(|dir| {
-            PathBuf::from(dir)
-                .join("ish-%p.profraw")
-                .to_string_lossy()
-                .into_owned()
-        });
         let mut command = CommandSpec::new(binary)
             .current_dir(&cwd)
             .env("HOME", &home_path)
             .env("USER", "testuser")
             .env("PWD", &cwd)
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
-        if let Some(path) = &pgo_profile {
-            command = command.env("LLVM_PROFILE_FILE", path);
-        }
         for (key, value) in extra_env {
             command = command.env(key, value);
         }
-        let mut environment = if cfg!(target_os = "linux") {
+        let environment = if cfg!(target_os = "linux") {
             TestEnv::hermetic_ascii()
         } else {
             TestEnv::hermetic_utf8("C.UTF-8")
@@ -156,9 +156,6 @@ impl PtyShell {
             .env("USER", "testuser")
             .env("PWD", &cwd)
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
-        if let Some(path) = &pgo_profile {
-            environment = environment.env("LLVM_PROFILE_FILE", path);
-        }
         let scenario = Scenario::new("ish interactive shell")
             .expect("valid scenario label")
             .command(command)
@@ -633,107 +630,6 @@ fn prompt_appears_on_startup() {
     sh.enter();
     let out = sh.wait_for_prompt(2000);
     assert!(out.contains("$ "), "expected prompt, got: {out:?}");
-}
-
-fn pgo_profile_history() -> Vec<String> {
-    const COMMANDS: &[&str] = &[
-        "cargo test --workspace",
-        "cargo test --test pty",
-        "cargo clippy --all-targets",
-        "git status --short",
-        "git diff --stat",
-        "git log --oneline --decorate -20",
-        "rg -n TODO src tests",
-        "docker compose up -d database",
-        "ssh staging deploy --verbose",
-        "kubectl get pods --all-namespaces",
-    ];
-
-    (0..12_000)
-        .map(|index| {
-            format!(
-                "{} # pgo-session-{index:05}",
-                COMMANDS[index % COMMANDS.len()]
-            )
-        })
-        .collect()
-}
-
-/// Representative user activity for release PGO collection. This deliberately
-/// stays in the PTY test so the profiled process is the real shell event loop;
-/// the test harness itself is built and run without profile instrumentation.
-#[test]
-#[ignore]
-fn pgo_profile_startup_history_tui() {
-    assert!(
-        std::env::var_os("ISH_TEST_BINARY").is_some(),
-        "this scenario must run with ISH_TEST_BINARY set to an instrumented ish"
-    );
-
-    let config = "set EDITOR vi\nset PAGER less\nalias gs git status\nalias ct cargo test\n";
-    let startup_files = [(".config/ish/config.ish", config)];
-
-    // Repeated launches give startup code meaningful profile counts without
-    // letting one interactive session dominate the profile by construction.
-    for _ in 0..4 {
-        let sh = PtyShell::spawn_with_setup(&startup_files, &[], &[], 24, 80, None, |_| {});
-        assert!(sh.startup_output().contains("$ "));
-    }
-
-    let history = pgo_profile_history();
-    let history_refs = history.iter().map(String::as_str).collect::<Vec<_>>();
-    let files = [
-        (".config/ish/config.ish", config),
-        ("project/.git/HEAD", "ref: refs/heads/main\n"),
-        (
-            "project/.git/refs/heads/main",
-            "0123456789012345678901234567890123456789\n",
-        ),
-    ];
-    let sh =
-        PtyShell::spawn_with_setup(&files, &history_refs, &[], 32, 120, Some("project"), |_| {});
-
-    // Exercise the initial pager, incremental fuzzy search, candidate-stack
-    // restoration on backspace, and selection movement without executing a
-    // command. The short reads drain the PTY without adding sleeps to the
-    // profiled workload.
-    sh.ctrl_r();
-    assert!(
-        sh.wait_for("search:", 5000).contains("search:"),
-        "history search did not open"
-    );
-    sh.type_str("cargo tes");
-    sh.read_timeout(500);
-    sh.backspace();
-    sh.type_str("t");
-    sh.read_timeout(500);
-    sh.down();
-    sh.up();
-    sh.read_timeout(500);
-    sh.escape();
-    sh.wait_for_prompt(5000);
-
-    // A second pass uses a different match distribution and forces the pager
-    // to repaint as the query narrows and then expands again.
-    sh.ctrl_r();
-    assert!(
-        sh.wait_for("search:", 5000).contains("search:"),
-        "second history search did not open"
-    );
-    sh.type_str("git sta");
-    sh.read_timeout(500);
-    sh.type_str("tus");
-    sh.read_timeout(500);
-    sh.backspace();
-    sh.backspace();
-    sh.type_str("at");
-    sh.read_timeout(500);
-    sh.down();
-    sh.down();
-    sh.up();
-    sh.read_timeout(500);
-    sh.escape();
-    sh.wait_for_prompt(5000);
 }
 
 #[test]

@@ -73,11 +73,11 @@ jobs:
             -w /ish \
             ish-builder:${{ matrix.target }} \
             sh -ec '
-              make release-pgo-linux TARGET=${{ matrix.target }}
+              make release-dynamic TARGET=${{ matrix.target }}
               make verify-release-dynamic TARGET=${{ matrix.target }}
               make test-ci TARGET=${{ matrix.target }}
               cp target/${{ matrix.target }}/release/ish ish-${{ matrix.target }}
-              make release-pgo-linux-static TARGET=${{ matrix.target }}
+              make release TARGET=${{ matrix.target }}
               make verify-release TARGET=${{ matrix.target }}
               cp target/${{ matrix.target }}/release/ish ish-${{ matrix.target }}-static
             '
