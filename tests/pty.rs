@@ -356,17 +356,6 @@ impl PtyShell {
         self.terminal.borrow().screen()
     }
 
-    /// Wait until the current editable prompt shows the expected history line.
-    fn wait_for_prompt_text(&self, expected: &str, timeout_ms: u64) {
-        let mut terminal = self.terminal.borrow_mut();
-        let deadline = terminal.deadline(std::time::Duration::from_millis(timeout_ms));
-        terminal
-            .wait_for_screen(deadline, "history line", |screen| {
-                active_prompt_text(screen).contains(expected)
-            })
-            .unwrap_or_else(|_| panic!("timed out waiting for history line {expected:?}"));
-    }
-
     /// Wait until output contains `marker`, up to `timeout_ms`.
     fn wait_for(&self, marker: &str, timeout_ms: u64) -> String {
         let mut accumulated = String::new();
@@ -1284,7 +1273,11 @@ fn history_up_arrow() {
     // PTY runner can otherwise coalesce rapid writes with the previous redraw.
     for expected in ["echo local_two", "echo local_one", "echo from_global"] {
         sh.up();
-        sh.wait_for_prompt_text(expected, 5000);
+        let redraw = normalize_screen_text(&PtyShell::strip_ansi(&sh.read_timeout(5000)));
+        assert!(
+            redraw.contains(expected),
+            "expected history redraw {expected:?}: {redraw:?}"
+        );
     }
     sh.enter();
     let out = sh.wait_for_prompt(2000);
