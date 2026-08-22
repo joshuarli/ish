@@ -3,6 +3,7 @@ TEST_BINARY_ENV := ISH_TEST_BINARY
 TEST_TARGETS := --lib --tests
 HOST       := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 TARGET     ?= $(subst -unknown-linux-gnu,-unknown-linux-musl,$(HOST))
+TARGET_ENV := $(shell printf '%s' "$(TARGET)" | tr '[:lower:]-' '[:upper:]_')
 CARGO_CMD  := $(if $(findstring -linux-musl,$(TARGET)),$(shell command -v musl-cargo 2>/dev/null || printf cargo),cargo)
 LLVM_PROFDATA := $(shell command -v llvm-profdata 2>/dev/null || printf '%s/lib/rustlib/%s/bin/llvm-profdata' "$(shell rustc --print sysroot)" "$(HOST)")
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
@@ -14,7 +15,7 @@ PROFILE_RUSTC_ARGS := $(if $(findstring -linux-musl,$(TARGET)),,-- -Cprofile-gen
 # Docker's musl-cargo wrapper owns linker, CRT, loader, and profile-runtime
 # flags. The Makefile selects only the build mode and keeps Cargo invocations
 # readable on macOS as well as in the Linux release image.
-cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static release-dynamic static-profile dynamic-profile,$(1)),RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort")) MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" MUSL_PROFILE_DIR="$(PGO_DIR)" $(CARGO_CMD)
+cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter static-profile dynamic-profile,$(1)),CARGO_TARGET_$(TARGET_ENV)_LINKER=clang ,)$(if $(filter release-static release-dynamic static-profile dynamic-profile,$(1)),RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort")) MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" MUSL_PROFILE_DIR="$(PGO_DIR)" $(CARGO_CMD)
 
 RUSTYBENCH ?= cargo run --quiet --manifest-path ../rustybench/Cargo.toml --
 
