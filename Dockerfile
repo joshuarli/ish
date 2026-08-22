@@ -98,3 +98,62 @@ RUN host_libdir="$(rustc --print target-libdir)" \
     && ln -sf /usr/lib/libgcc_s.so.1 "$host_libdir/libgcc_s.so" \
     && ln -sf /usr/lib/libgcc_s.so.1 "$host_libdir/libgcc_s.so.1" \
     && ln -sf /usr/lib/libc.so "$host_libdir/libc.so"
+
+# Keep musl linker, CRT, loader, and LLVM profile-runtime flags in the image.
+# Makefiles select only static, dynamic, profile, or test mode through this
+# wrapper, so the same release commands work on both container architectures.
+RUN cat > /usr/local/bin/musl-cargo <<'EOF' \
+    && chmod +x /usr/local/bin/musl-cargo
+#!/bin/sh
+set -eu
+
+target=${MUSL_TARGET:?MUSL_TARGET is required}
+case "$target" in
+    x86_64-unknown-linux-musl)
+        crt=/usr/lib/e-crt/x86_64-unknown-linux-musl
+        loader=/lib/ld-musl-x86_64.so.1
+        ;;
+    aarch64-unknown-linux-musl)
+        crt=/usr/lib/e-crt/aarch64-unknown-linux-musl
+        loader=/lib/ld-musl-aarch64.so.1
+        ;;
+    *)
+        exec cargo "$@"
+        ;;
+esac
+
+mode=${MUSL_BUILD_MODE:-static}
+native="-L native=/usr/lib -Clink-arg=-B$crt"
+case "$mode" in
+    static|test|driver)
+        flags=$native
+        ;;
+    dynamic)
+        flags="$native -Ctarget-feature=-crt-static -Clink-arg=-B$crt -Clink-arg=-dynamic-linker=$loader"
+        ;;
+    static-profile)
+        flags="$native -Clink-arg=/usr/lib/libcompiler-rt-builtins.a"
+        ;;
+    dynamic-profile)
+        flags="$native -Ctarget-feature=-crt-static -Clink-arg=-B$crt -Clink-arg=-dynamic-linker=$loader -Clink-arg=/usr/lib/libcompiler-rt-builtins.a"
+        ;;
+    *)
+        echo "musl-cargo: unknown build mode: $mode" >&2
+        exit 2
+        ;;
+    esac
+
+case "$mode" in
+    static-profile|dynamic-profile)
+        profile_dir=${MUSL_PROFILE_DIR:?MUSL_PROFILE_DIR is required for profile mode}
+        flags="$flags -Cprofile-generate=$profile_dir"
+        ;;
+esac
+
+target_env=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')
+linker_var="CARGO_TARGET_${target_env}_LINKER"
+rustflags_var="CARGO_TARGET_${target_env}_RUSTFLAGS"
+export "$linker_var=clang"
+export "$rustflags_var=$flags"
+exec cargo "$@"
+EOF

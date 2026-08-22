@@ -3,57 +3,36 @@ TEST_BINARY_ENV := ISH_TEST_BINARY
 TEST_TARGETS := --lib --tests
 HOST       := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 TARGET     ?= $(subst -unknown-linux-gnu,-unknown-linux-musl,$(HOST))
-MUSL_LOADER := $(if $(findstring x86_64,$(TARGET)),/lib/ld-musl-x86_64.so.1,/lib/ld-musl-aarch64.so.1)
-TARGET_ENV := $(shell echo $(TARGET) | tr '[:lower:]-' '[:upper:]_')
-# Fedora's musl cross packages use /usr/<arch>-linux-musl/lib64, while the
-# e-crt layout is used by other toolchains. Keep this overridable for hosts
-# with a different musl sysroot layout.
-MUSL_CRT_DIR ?= $(shell for dir in \
-	/usr/lib/e-crt/$(TARGET) \
-	/usr/$(subst -unknown,,$(TARGET))/lib64 \
-	/usr/$(subst -unknown,,$(TARGET))/lib; do \
-	if test -f "$$dir/crtbegin.o"; then printf '%s' "$$dir"; break; fi; \
-done)
-# Host proc-macro crates are linked with the same musl toolchain. Keep the
-# target CRT objects visible to those links as well as to the final binary.
-MUSL_NATIVE_RUSTFLAGS = $(if $(findstring -linux-musl,$(TARGET)),-L native=/usr/lib -Clink-arg=-B$(MUSL_CRT_DIR))
-# LLVM helper binaries run on the build host; they are not installed in the
-# target triple's rustlib directory when cross-compiling to musl.
-LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(HOST)/bin
-MUSL_LINKER ?= clang
-MUSL_TARGET_LIBDIR := $(shell rustc --print target-libdir --target $(TARGET))
+CARGO_CMD  := $(if $(findstring -linux-musl,$(TARGET)),$(shell command -v musl-cargo 2>/dev/null || printf cargo),cargo)
+LLVM_PROFDATA := $(shell command -v llvm-profdata 2>/dev/null || printf '%s/lib/rustlib/%s/bin/llvm-profdata' "$(shell rustc --print sysroot)" "$(HOST)")
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 PGO_BUILD_DIR := $(CURDIR)/target/pgo-build
 PGO_BINARY := $(PGO_BUILD_DIR)/$(TARGET)/release/$(NAME)
-RELEASE_RUSTFLAGS := $(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort
-RELEASE_LINUX_RUSTFLAGS := $(RELEASE_RUSTFLAGS) -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)
-PGO_RUSTFLAGS := $(RELEASE_RUSTFLAGS) -Cprofile-generate=$(PGO_DIR)
-PGO_STATIC_RUSTFLAGS := $(if $(findstring -linux-musl,$(TARGET)),$(PGO_RUSTFLAGS) -Clink-arg=/usr/lib/libcompiler-rt-builtins.a,$(PGO_RUSTFLAGS))
-# The dynamic musl profile runtime needs the same compiler-rt builtins archive
-# as the static profile path.
-PGO_LINUX_RUSTFLAGS := $(RELEASE_LINUX_RUSTFLAGS) -Cprofile-generate=$(PGO_DIR) -Clink-arg=/usr/lib/libcompiler-rt-builtins.a
+
+# Docker's musl-cargo wrapper owns linker, CRT, loader, and profile-runtime
+# flags. The Makefile selects only the build mode and keeps Cargo invocations
+# readable on macOS as well as in the Linux release image.
+cargo = MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" MUSL_PROFILE_DIR="$(PGO_DIR)" $(CARGO_CMD)
 
 RUSTYBENCH ?= cargo run --quiet --manifest-path ../rustybench/Cargo.toml --
 
-.PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-fast bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux install setup ensure-musl-target
+.PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-fast bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux install setup
 
 build:
-	cargo build
+	$(call cargo,static) build
 
 test:
-	cargo test --quiet
+	$(call cargo,test) test --quiet
 
 test-ci:
 	@test -x "target/$(TARGET)/release/$(NAME)"
 	$(TEST_BINARY_ENV)="$(CURDIR)/target/$(TARGET)/release/$(NAME)" \
-	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" cargo test --quiet --release $(TEST_TARGETS)
+	$(call cargo,test) test --quiet --release $(TEST_TARGETS)
 
-release: ensure-musl-target
-	cargo clean -p $(NAME) --release --target $(TARGET)
-	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
-	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
-	cargo build --release \
+release:
+	$(call cargo,static) clean -p $(NAME) --release --target $(TARGET)
+	$(call cargo,static) build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
@@ -103,28 +82,23 @@ bench-fast:
 bench-syscalls:
 	@$(RUSTYBENCH) syscalls --root "$(CURDIR)"
 
-# Build the release-shaped application binary with target-scoped profile
-# instrumentation. The PTY driver and its test dependencies are built later,
-# without these flags, so compiler and harness activity cannot enter the profile.
-pgo-instrument: ensure-musl-target
+# Build the release-shaped application binary with Docker's profile mode. The
+# PTY driver and its test dependencies are built later without instrumentation.
+pgo-instrument:
 	rm -rf "$(PGO_BUILD_DIR)" "$(PGO_DIR)" && mkdir -p "$(PGO_DIR)"
 	CARGO_TARGET_DIR="$(PGO_BUILD_DIR)" \
-	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
-	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(PGO_STATIC_RUSTFLAGS)" \
-	cargo build --release \
+	$(call cargo,static-profile) build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
 	@test -x "$(PGO_BINARY)"
 
-# The dynamic Linux artifact uses the same loader and CRT shape as the final
-# release binary, so its startup profile includes the deployed linking path.
-pgo-instrument-linux: ensure-musl-target
+# The dynamic Linux artifact uses Docker's dynamic-profile mode so its startup
+# profile includes the deployed linking path.
+pgo-instrument-linux:
 	rm -rf "$(PGO_BUILD_DIR)" "$(PGO_DIR)" && mkdir -p "$(PGO_DIR)"
 	CARGO_TARGET_DIR="$(PGO_BUILD_DIR)" \
-	CARGO_TARGET_$(TARGET_ENV)_LINKER=clang \
-	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(PGO_LINUX_RUSTFLAGS)" \
-	cargo build --release \
+	$(call cargo,dynamic-profile) build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
@@ -135,33 +109,29 @@ pgo-instrument-linux: ensure-musl-target
 # startup, history search, and pager rendering rather than benchmark machinery.
 pgo-profile: pgo-instrument
 	ISH_PGO_PROFILE_DIR="$(PGO_DIR)" \
-	RUSTFLAGS="" CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" \
+	RUSTFLAGS="" \
 	ISH_TEST_BINARY="$(PGO_BINARY)" \
-	cargo test --release --test pty pgo_profile_startup_history_tui -- --ignored
+	$(call cargo,driver) test --release --test pty pgo_profile_startup_history_tui -- --ignored
 	@test -n "$$(find "$(PGO_DIR)" -type f -name '*.profraw' -print -quit)"
-	$(LLVM_BIN)/llvm-profdata merge -o "$(PGO_MERGED)" "$(PGO_DIR)"/*.profraw
+	$(LLVM_PROFDATA) merge -o "$(PGO_MERGED)" "$(PGO_DIR)"/*.profraw
 
 pgo-profile-linux: pgo-instrument-linux
 	ISH_PGO_PROFILE_DIR="$(PGO_DIR)" \
-	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" \
+	RUSTFLAGS="" \
 	ISH_TEST_BINARY="$(PGO_BINARY)" \
-	cargo test --release --test pty pgo_profile_startup_history_tui -- --ignored
+	$(call cargo,driver) test --release --test pty pgo_profile_startup_history_tui -- --ignored
 	@test -n "$$(find "$(PGO_DIR)" -type f -name '*.profraw' -print -quit)"
-	$(LLVM_BIN)/llvm-profdata merge -o "$(PGO_MERGED)" "$(PGO_DIR)"/*.profraw
+	$(LLVM_PROFDATA) merge -o "$(PGO_MERGED)" "$(PGO_DIR)"/*.profraw
 
 # PGO-optimized release: build dependencies and build-std without profile
 # runtime support, then apply the merged profile to the final application
 # compilation. The profile is never passed to the benchmark or PTY harness.
-release-pgo: ensure-musl-target pgo-profile
-	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
-	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(RELEASE_RUSTFLAGS)" \
-	cargo build --release \
+release-pgo: pgo-profile
+	$(call cargo,static) build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
-	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
-	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(RELEASE_RUSTFLAGS)" \
-	cargo rustc --release \
+	$(call cargo,static) rustc --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET) --bin $(NAME) -- \
@@ -169,31 +139,23 @@ release-pgo: ensure-musl-target pgo-profile
 	  -Cllvm-args=-pgo-warn-missing-function
 
 release-pgo-linux: pgo-profile-linux
-	CARGO_TARGET_$(TARGET_ENV)_LINKER=clang \
-	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(RELEASE_LINUX_RUSTFLAGS)" \
-	cargo build --release \
+	$(call cargo,dynamic) build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
-	CARGO_TARGET_$(TARGET_ENV)_LINKER=clang \
-	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(RELEASE_LINUX_RUSTFLAGS)" \
-	cargo rustc --release \
+	$(call cargo,dynamic) rustc --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET) --bin $(NAME) -- \
 	  -Cprofile-use=$(PGO_MERGED) \
 	  -Cllvm-args=-pgo-warn-missing-function
 
-release-pgo-linux-static: ensure-musl-target pgo-profile
-	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
-	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(RELEASE_RUSTFLAGS)" \
-	cargo build --release \
+release-pgo-linux-static: pgo-profile
+	$(call cargo,static) build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
-	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
-	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(RELEASE_RUSTFLAGS)" \
-	cargo rustc --release \
+	$(call cargo,static) rustc --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET) --bin $(NAME) -- \
@@ -204,17 +166,4 @@ install: release-pgo
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
 	@if test "$$(uname -s)" = Darwin; then \
 		codesign -fs - ~/usr/bin/$(NAME); \
-	fi
-
-ensure-musl-target:
-	@if ! echo "$(TARGET)" | grep -q -- '-linux-musl$$'; then exit 0; fi; \
-	if test -f "$(MUSL_TARGET_LIBDIR)/self-contained/libunwind.a"; then \
-		exit 0; \
-	fi; \
-	if command -v rustup >/dev/null 2>&1; then \
-		echo "Installing Rust target $(TARGET)"; \
-		rustup target add "$(TARGET)"; \
-	else \
-		echo "Rust target $(TARGET) is missing and rustup is unavailable" >&2; \
-		exit 1; \
 	fi
