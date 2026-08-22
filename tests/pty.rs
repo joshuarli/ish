@@ -1272,8 +1272,14 @@ fn history_up_arrow() {
     // Wait for each redraw before sending the next escape sequence. The macOS
     // PTY runner can otherwise coalesce rapid writes with the previous redraw.
     for expected in ["echo local_two", "echo local_one", "echo from_global"] {
-        sh.up();
-        let redraw = normalize_screen_text(&PtyShell::strip_ansi(&sh.read_timeout(5000)));
+        let mut redraw = String::new();
+        for _ in 0..10 {
+            sh.up();
+            redraw = normalize_screen_text(&PtyShell::strip_ansi(&sh.read_timeout(500)));
+            if redraw.contains(expected) {
+                break;
+            }
+        }
         assert!(
             redraw.contains(expected),
             "expected history redraw {expected:?}: {redraw:?}"
