@@ -517,13 +517,15 @@ fn snapshot_text(screen: &ptytest::ScreenSnapshot) -> String {
 
 fn active_prompt_text(screen: &ptytest::ScreenSnapshot) -> String {
     let cursor_row = usize::from(screen.cursor().row);
-    let first = cursor_row.saturating_sub(4);
+    let rows = (0..screen.row_count())
+        .map(|row| screen.row(row).unwrap_or_default().trim_end().to_owned())
+        .collect::<Vec<_>>();
+    let first = (0..=cursor_row)
+        .rev()
+        .find(|&row| rows[row].contains("$ "))
+        .unwrap_or_else(|| cursor_row.saturating_sub(4));
     let last = (cursor_row + 4).min(screen.row_count().saturating_sub(1));
-    (first..=last)
-        .filter_map(|row| screen.row(row))
-        .map(|row| row.trim_end().to_owned())
-        .collect::<Vec<_>>()
-        .join(" ")
+    rows[first..=last].join(" ")
 }
 
 #[derive(Clone, Debug)]
