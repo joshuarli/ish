@@ -124,18 +124,22 @@ esac
 
 mode=${MUSL_BUILD_MODE:-static}
 native="-L native=/usr/lib -Clink-arg=-B$crt"
+release="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort"
 case "$mode" in
     static|test|driver)
         flags=$native
         ;;
-    dynamic)
-        flags="$native -Ctarget-feature=-crt-static -Clink-arg=-B$crt -Clink-arg=-dynamic-linker=$loader"
+    release-static)
+        flags="$native $release"
+        ;;
+    release-dynamic)
+        flags="$native $release -Ctarget-feature=-crt-static -Clink-arg=-B$crt -Clink-arg=-dynamic-linker=$loader"
         ;;
     static-profile)
-        flags="$native -Clink-arg=/usr/lib/libcompiler-rt-builtins.a"
+        flags="$native $release -Clink-arg=/usr/lib/libcompiler-rt-builtins.a"
         ;;
     dynamic-profile)
-        flags="$native -Ctarget-feature=-crt-static -Clink-arg=-B$crt -Clink-arg=-dynamic-linker=$loader -Clink-arg=/usr/lib/libcompiler-rt-builtins.a"
+        flags="$native $release -Ctarget-feature=-crt-static -Clink-arg=-B$crt -Clink-arg=-dynamic-linker=$loader -Clink-arg=/usr/lib/libcompiler-rt-builtins.a"
         ;;
     *)
         echo "musl-cargo: unknown build mode: $mode" >&2

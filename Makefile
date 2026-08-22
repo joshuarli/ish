@@ -13,14 +13,14 @@ PGO_BINARY := $(PGO_BUILD_DIR)/$(TARGET)/release/$(NAME)
 # Docker's musl-cargo wrapper owns linker, CRT, loader, and profile-runtime
 # flags. The Makefile selects only the build mode and keeps Cargo invocations
 # readable on macOS as well as in the Linux release image.
-cargo = MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" MUSL_PROFILE_DIR="$(PGO_DIR)" $(CARGO_CMD)
+cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static release-dynamic static-profile dynamic-profile,$(1)),RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort")) MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" MUSL_PROFILE_DIR="$(PGO_DIR)" $(CARGO_CMD)
 
 RUSTYBENCH ?= cargo run --quiet --manifest-path ../rustybench/Cargo.toml --
 
 .PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-fast bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux install setup
 
 build:
-	$(call cargo,static) build
+	$(call cargo,dev) build
 
 test:
 	$(call cargo,test) test --quiet
@@ -31,8 +31,8 @@ test-ci:
 	$(call cargo,test) test --quiet --release $(TEST_TARGETS)
 
 release:
-	$(call cargo,static) clean -p $(NAME) --release --target $(TARGET)
-	$(call cargo,static) build --release \
+	$(call cargo,release-static) clean -p $(NAME) --release --target $(TARGET)
+	$(call cargo,release-static) build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
@@ -127,11 +127,11 @@ pgo-profile-linux: pgo-instrument-linux
 # runtime support, then apply the merged profile to the final application
 # compilation. The profile is never passed to the benchmark or PTY harness.
 release-pgo: pgo-profile
-	$(call cargo,static) build --release \
+	$(call cargo,release-static) build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
-	$(call cargo,static) rustc --release \
+	$(call cargo,release-static) rustc --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET) --bin $(NAME) -- \
@@ -139,11 +139,11 @@ release-pgo: pgo-profile
 	  -Cllvm-args=-pgo-warn-missing-function
 
 release-pgo-linux: pgo-profile-linux
-	$(call cargo,dynamic) build --release \
+	$(call cargo,release-dynamic) build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
-	$(call cargo,dynamic) rustc --release \
+	$(call cargo,release-dynamic) rustc --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET) --bin $(NAME) -- \
@@ -151,11 +151,11 @@ release-pgo-linux: pgo-profile-linux
 	  -Cllvm-args=-pgo-warn-missing-function
 
 release-pgo-linux-static: pgo-profile
-	$(call cargo,static) build --release \
+	$(call cargo,release-static) build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
-	$(call cargo,static) rustc --release \
+	$(call cargo,release-static) rustc --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET) --bin $(NAME) -- \
