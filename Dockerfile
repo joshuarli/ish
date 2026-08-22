@@ -84,6 +84,15 @@ RUN rustup toolchain install nightly-2026-07-24 \
     --component rust-src \
     --component llvm-tools-preview
 
+# Host proc-macro links search rustc's target library directory for CRT
+# startup objects. Keep those objects available there without changing the
+# target's build-std Rust flags.
+RUN host_target="$(rustc -vV | awk '/^host:/ {print $2}')" \
+    && host_libdir="$(rustc --print target-libdir)" \
+    && for obj in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o; do \
+        ln -sf "/usr/lib/e-crt/$host_target/$obj" "$host_libdir/$obj"; \
+    done
+
 # Alpine keeps these libraries outside the Rust musl target directory.
 RUN host_libdir="$(rustc --print target-libdir)" \
     && ln -sf /usr/lib/libgcc_s.so.1 "$host_libdir/libgcc_s.so" \

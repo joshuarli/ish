@@ -73,7 +73,6 @@ jobs:
             -w /ish \
             ish-builder:${{ matrix.target }} \
             sh -ec '
-              export RUSTFLAGS="-Clink-arg=-B/usr/lib/e-crt/${{ matrix.target }}"
               make release-pgo-linux TARGET=${{ matrix.target }}
               make verify-release-dynamic TARGET=${{ matrix.target }}
               make test-ci TARGET=${{ matrix.target }}
