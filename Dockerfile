@@ -162,6 +162,7 @@ if [ "$mode" = driver ] || [ "$mode" = test ]; then
     # Cargo builds proc-macro and test-support crates for the container host,
     # where target-scoped flags do not apply. Keep those links on the same
     # musl CRT path as the instrumented binary.
+    unset CARGO_ENCODED_RUSTFLAGS
     export RUSTFLAGS="$flags"
 else
     export "$rustflags_var=$flags"
