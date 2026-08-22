@@ -128,21 +128,33 @@ impl PtyShell {
         let cwd = cwd_rel
             .map(|rel| home.path().join(rel))
             .unwrap_or_else(|| home.path().to_path_buf());
+        let pgo_profile = std::env::var_os("ISH_PGO_PROFILE_DIR").map(|dir| {
+            PathBuf::from(dir)
+                .join("ish-%p.profraw")
+                .to_string_lossy()
+                .into_owned()
+        });
         let mut command = CommandSpec::new(binary)
             .current_dir(&cwd)
             .env("HOME", &home_path)
             .env("USER", "testuser")
             .env("PWD", &cwd)
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        if let Some(path) = &pgo_profile {
+            command = command.env("LLVM_PROFILE_FILE", path);
+        }
         for (key, value) in extra_env {
             command = command.env(key, value);
         }
-        let environment = TestEnv::hermetic_utf8("C.UTF-8")
+        let mut environment = TestEnv::hermetic_utf8("C.UTF-8")
             .expect("C.UTF-8 must be available on supported PTY platforms")
             .env("HOME", &home_path)
             .env("USER", "testuser")
             .env("PWD", &cwd)
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        if let Some(path) = &pgo_profile {
+            environment = environment.env("LLVM_PROFILE_FILE", path);
+        }
         let scenario = Scenario::new("ish interactive shell")
             .expect("valid scenario label")
             .command(command)

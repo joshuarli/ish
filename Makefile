@@ -132,6 +132,7 @@ pgo-instrument-linux: ensure-musl-target
 # intentionally separate from `bench`: it profiles the real event loop,
 # startup, history search, and pager rendering rather than benchmark machinery.
 pgo-profile: pgo-instrument
+	ISH_PGO_PROFILE_DIR="$(PGO_DIR)" \
 	RUSTFLAGS="" CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="" \
 	ISH_TEST_BINARY="$(PGO_BINARY)" \
 	cargo test --release --test pty pgo_profile_startup_history_tui -- --ignored
@@ -139,7 +140,8 @@ pgo-profile: pgo-instrument
 	$(LLVM_BIN)/llvm-profdata merge -o "$(PGO_MERGED)" "$(PGO_DIR)"/*.profraw
 
 pgo-profile-linux: pgo-instrument-linux
-	RUSTFLAGS="" CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="" \
+	ISH_PGO_PROFILE_DIR="$(PGO_DIR)" \
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="" \
 	ISH_TEST_BINARY="$(PGO_BINARY)" \
 	cargo test --release --test pty pgo_profile_startup_history_tui -- --ignored
 	@test -n "$$(find "$(PGO_DIR)" -type f -name '*.profraw' -print -quit)"
