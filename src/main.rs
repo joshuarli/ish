@@ -773,7 +773,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
             }
             InputEvent::PasteRejected => {
                 grid_column = None;
-                line.set("[paste exceeded 1KB limit]");
+                line.set("[paste exceeded 8KB limit]");
                 region = render_active_mode(
                     &mut tw,
                     &mode,

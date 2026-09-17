@@ -2956,7 +2956,7 @@ fn job_suspend_and_resume() {
 }
 
 /// Paste a 2 KiB payload via bracketed paste and verify the shell
-/// instantly rejects it with "[paste exceeded 1KB limit]".
+/// instantly rejects it with "[paste exceeded 8KB limit]".
 #[test]
 fn bracketed_paste_over_limit_rejected() {
     let content: String = "x".repeat(2048);
@@ -2976,7 +2976,7 @@ fn bracketed_paste_over_limit_rejected() {
     let clean = PtyShell::strip_ansi(&out);
 
     assert!(
-        clean.contains("[paste exceeded 1KB limit]"),
+        clean.contains("[paste exceeded 8KB limit]"),
         "expected paste-rejection message, got: {clean:?}"
     );
     // No 'x's from the paste content should appear on screen.
@@ -3016,7 +3016,7 @@ fn bracketed_paste_agents_md_rejected() {
     let clean = PtyShell::strip_ansi(&out);
 
     assert!(
-        clean.contains("[paste exceeded 1KB limit]"),
+        clean.contains("[paste exceeded 8KB limit]"),
         "expected paste-rejection message, got: {clean:?}"
     );
     // The first line of AGENTS.md must NOT appear on screen.
@@ -3079,7 +3079,7 @@ fn bracketed_paste_exactly_at_limit_accepted() {
     let out = sh.run_command("");
     let clean = PtyShell::strip_ansi(&out);
     assert!(
-        !clean.contains("[paste exceeded 1KB limit]"),
+        !clean.contains("[paste exceeded 8KB limit]"),
         "1024-byte paste was wrongly rejected: {clean:?}"
     );
 }

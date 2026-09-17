@@ -2,7 +2,7 @@ use crate::signal;
 use crate::term::STDIN_FD;
 use std::os::fd::{BorrowedFd, RawFd};
 
-const PASTE_LIMIT: usize = 1024; // 1 KiB — reject pastes larger than this
+const PASTE_LIMIT: usize = 8192;
 const READ_BUF_SIZE: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
