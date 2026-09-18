@@ -65,7 +65,7 @@ ENV PATH="/opt/llvm-musl/bin:/root/.cargo/bin:$PATH" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang"
 
-RUN rustup toolchain install nightly-2026-07-24 \
+RUN rustup toolchain install nightly-2026-09-15 \
     --target x86_64-unknown-linux-musl \
     --target aarch64-unknown-linux-musl \
     --component rust-src
