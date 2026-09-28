@@ -10,8 +10,8 @@ use std::os::fd::AsFd;
 use std::process::{Child, Stdio};
 
 use common::*;
-use ish_undo::journal::Strength;
-use ish_undo::store::Stores;
+use ish_undo::testing::journal::Strength;
+use ish_undo::testing::store::Stores;
 
 struct Holder {
     child: Child,
@@ -60,9 +60,9 @@ fn saved_bytes(fx: &Fixture, id: u64) -> Vec<u8> {
         .clone();
     let mut stores = Stores::new(fx.home_store(), id).unwrap();
     let fd = stores.open_object(saved.obj().unwrap()).unwrap();
-    let len = ish_undo::sys::fstat(fd.as_fd()).unwrap().size as usize;
+    let len = ish_undo::testing::sys::fstat(fd.as_fd()).unwrap().size as usize;
     let mut buf = vec![0u8; len];
-    let n = ish_undo::sys::read_full_at(fd.as_fd(), &mut buf, 0).unwrap();
+    let n = ish_undo::testing::sys::read_full_at(fd.as_fd(), &mut buf, 0).unwrap();
     buf.truncate(n);
     buf
 }
@@ -100,18 +100,16 @@ fn frozen_pre_image_ignores_later_writes_through_every_path() {
     );
 
     // The live file no longer matches what the transaction left, so undo
-    // conflicts; --force preserves the newer state first.
+    // reports a conflict and leaves the newer data alone.
     let (status, _, err) = fx.undo(&[]);
     assert_eq!(status, 1, "{err}");
     assert!(err.contains("conflict"), "{err}");
     assert_eq!(&fx.read("f")[..3], b"FDM");
-    let (status, _, err) = fx.undo(&["--force"]);
-    assert_eq!(status, 0, "{err}");
-    assert_eq!(fx.read("f"), b"ORIGINAL");
-    // The displaced newer version can be brought back.
-    let (status, _, err) = fx.undo(&["redo"]);
-    assert_eq!(status, 0, "{err}");
-    assert_eq!(&fx.read("f")[..3], b"FDM");
+    assert_eq!(
+        saved_bytes(&fx, id),
+        b"ORIGINAL",
+        "the conflict did not touch the saved version"
+    );
 }
 
 #[test]

@@ -1,13 +1,20 @@
 //! Recovery benchmarks: ordinary versus protected removal, undo and redo,
-//! scoped checkpoints, and per-input transaction overhead.
+//! how protected removal scales with the number of entries, and per-input
+//! transaction overhead.
 //!
 //! Every sample gets a fresh fixture built outside the timed closure, and
-//! validation reads happen after it. Before the timed runs, `main` prints a
-//! one-shot report of entry counts, preservation backends, and bytes copied
-//! in userspace for each scenario, so the timings can be read against what
-//! actually happened. Sizes are bounded; the sparse file is labeled
-//! separately because its timing says nothing about data movement.
-//! Run: `cargo bench --bench undo`.
+//! validation reads happen after it. Protected removal is timed the way the
+//! shell runs it: the removal, sealing the transaction, and the maintenance
+//! pass that runs before the prompt comes back. Before the timed runs, `main`
+//! prints a one-shot report of entry counts, preservation backends, bytes
+//! copied in userspace, and where the time went for each scenario, so the
+//! timings can be read against what actually happened. Sizes are bounded; the
+//! sparse file is labeled separately because its timing says nothing about
+//! data movement. The scaling runs print no pass or fail: the point is how the
+//! seal column grows with entries. The 100,000-entry run takes a while to
+//! build, so it is opt-in.
+//! Run: `cargo bench --bench undo`, or
+//! `ISH_UNDO_BENCH_LARGE=1 cargo bench --bench undo` for the largest tree.
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -15,16 +22,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ish_undo::journal::Strength;
-use ish_undo::replay::{self, Model};
-use ish_undo::store::Home;
-use ish_undo::{Config, Io, Session, ops, scope};
+use ish_undo::testing::journal::Strength;
+use ish_undo::testing::replay::{self, Model};
+use ish_undo::testing::store::Home;
+use ish_undo::{Config, Io, Session, maybe_collect, rm};
 use rustybench::{AllocProfiler, Bencher, black_box};
 
 #[global_allocator]
 static ALLOC: AllocProfiler = AllocProfiler::system();
 
 const SMALL_FILES: usize = 2000;
+/// Files per directory in the scaling trees.
+const PER_DIR: usize = 1000;
 const SMALL_SIZE: usize = 4096;
 const LARGE_SIZE: usize = 128 << 20;
 const SPARSE_SIZE: u64 = 4 << 30;
@@ -53,7 +62,7 @@ impl Fixture {
         let home = root.join("home");
         fs::create_dir_all(&work).unwrap();
         fs::create_dir_all(&home).unwrap();
-        let store = ish_undo::store::root_for_home(home.as_os_str());
+        let store = ish_undo::testing::store::root_for_home(home.as_os_str());
         Fixture { root, work, store }
     }
 
@@ -65,6 +74,19 @@ impl Fixture {
             fs::create_dir_all(&dir).unwrap();
             for f in 0..SMALL_FILES / 20 {
                 fs::write(dir.join(format!("f{f:03}")), &data).unwrap();
+            }
+        }
+        fx
+    }
+
+    /// A tree of `entries` tiny files, `PER_DIR` to a directory.
+    fn wide_tree(label: &str, entries: usize) -> Fixture {
+        let fx = Fixture::new(label);
+        for d in 0..entries.div_ceil(PER_DIR) {
+            let dir = fx.work.join(format!("tree/d{d:04}"));
+            fs::create_dir_all(&dir).unwrap();
+            for f in 0..PER_DIR.min(entries - d * PER_DIR) {
+                fs::write(dir.join(format!("f{f:04}")), b"tiny file").unwrap();
             }
         }
         fx
@@ -89,10 +111,14 @@ impl Fixture {
         fx
     }
 
-    /// Run protected `rm -r` as one sealed transaction; returns its id.
-    fn protected_rm(&self, target: &str) -> u64 {
+    /// Run protected `rm -r` as the shell does: one transaction, sealed when
+    /// the command finishes, followed by the maintenance pass that runs
+    /// before the prompt returns. Returns the transaction id and how long
+    /// the removal, the seal, and the maintenance pass took.
+    fn protected_rm_timed(&self, target: &str) -> (u64, [std::time::Duration; 3]) {
+        let config = Config::default();
         let mut session = Session::new();
-        let txn = session.begin(self.store.clone(), Config::default(), &self.work, "rm -r");
+        let txn = session.begin(self.store.clone(), config.clone(), &self.work, "rm -r");
         let mut out = std::io::sink();
         let mut err = std::io::stderr();
         let mut confirm = |_: &str| Some(true);
@@ -102,18 +128,27 @@ impl Fixture {
             confirm: &mut confirm,
             cancel: &NEVER,
         };
-        let status = ops::rm(&txn, &self.work, &["-r".into(), target.into()], &mut io);
+        let t = Instant::now();
+        let status = rm(&txn, &self.work, &["-r".into(), target.into()], &mut io);
+        let removed = t.elapsed();
         assert_eq!(status, 0);
-        session.finish(txn, status).expect("recorded")
+        let t = Instant::now();
+        let id = session.finish(txn, status).expect("recorded");
+        let sealed = t.elapsed();
+        let t = Instant::now();
+        maybe_collect(&self.store, &config);
+        (id, [removed, sealed, t.elapsed()])
+    }
+
+    fn protected_rm(&self, target: &str) -> u64 {
+        self.protected_rm_timed(target).0
     }
 
     fn replay(&self, id: u64, redo: bool) -> replay::Report {
         let home = Home::open_existing(&self.store).unwrap().unwrap();
         let opts = replay::Options {
             redo,
-            force: false,
             dry_run: false,
-            only: Vec::new(),
             copy_limit: Config::default().copy_limit,
             min_free: Config::default().min_free,
             cancel: &NEVER,
@@ -165,8 +200,8 @@ fn report_row(name: &str, entries: usize, fx: &Fixture, id: u64, elapsed: std::t
 fn report() {
     let probe = Fixture::new("probe");
     let fs_type = {
-        let fd = ish_undo::sys::open_dir(&probe.work).unwrap();
-        ish_undo::sys::fs_type_name(std::os::fd::AsFd::as_fd(&fd))
+        let fd = ish_undo::testing::sys::open_dir(&probe.work).unwrap();
+        ish_undo::testing::sys::fs_type_name(std::os::fd::AsFd::as_fd(&fd))
     };
     println!(
         "ish-undo scenarios on {} {} ({fs_type}):",
@@ -233,32 +268,27 @@ fn report() {
         "sparse file allocation"
     );
 
-    let fx = Fixture::small_tree("report-scope");
-    let t = Instant::now();
-    let cp = scope::begin(
-        &fx.store,
-        &Config::default(),
-        1,
-        std::process::id(),
-        &fx.work,
-        "bench",
-        &fx.work.join("tree"),
-        &NEVER,
-    )
-    .unwrap();
-    let before = t.elapsed();
-    let id = cp.id;
-    let t = Instant::now();
-    let summary = cp.finish(0, &NEVER).unwrap();
-    let after = t.elapsed();
-    let home = Home::open_existing(&fx.store).unwrap().unwrap();
-    let model = Model::load(&home, id).unwrap();
-    let (entries, cloned, copied) = model.checkpoint.unwrap();
-    println!(
-        "  {:<28} {entries:>6} entries  before {before:.2?}, after {after:.2?}  {cloned} cloned, {copied} B copied, {} changes",
-        "scoped checkpoint",
-        summary.created + summary.modified + summary.removed
-    );
+    println!("protected rm as the shell runs it, by entry count (removal / seal / maintenance):");
+    for entries in scale_sizes() {
+        let fx = Fixture::wide_tree("report-scale", entries);
+        let total = entries + entries.div_ceil(PER_DIR) + 1;
+        let t = Instant::now();
+        let (id, [removed, sealed, maintenance]) = fx.protected_rm_timed("tree");
+        let to_prompt = t.elapsed();
+        let (clone, link, copy, copied) = strengths(&fx, id);
+        println!(
+            "  {total:>7} entries  {removed:>10.2?} / {sealed:>10.2?} / {maintenance:>10.2?}  to prompt {to_prompt:>10.2?}  backends: {clone} clone, {link} linked, {copy} copy  copied: {copied} B"
+        );
+        let t = Instant::now();
+        let r = fx.replay(id, false);
+        assert!(r.conflicts.is_empty() && r.failures.is_empty(), "{r:?}");
+        println!(
+            "  {:>7} entries  undo {:>10.2?} ({} steps)",
+            total,
+            t.elapsed(),
+            r.done
+        );
+    }
     println!();
 }
 
@@ -341,23 +371,31 @@ fn redo_small_files(bencher: Bencher) {
         });
 }
 
-#[rustybench::bench(sample_count = 10, sample_size = 1)]
-fn scoped_checkpoint_small_files(bencher: Bencher) {
+/// Entry counts of the scaling runs.
+fn scale_sizes() -> Vec<usize> {
+    let mut sizes = vec![1_000, 10_000];
+    if std::env::var_os("ISH_UNDO_BENCH_LARGE").is_some() {
+        sizes.push(100_000);
+    }
+    sizes
+}
+
+#[rustybench::bench(sample_count = 5, sample_size = 1)]
+fn rm_protected_1k_entries_to_prompt(bencher: Bencher) {
     bencher
-        .with_inputs(|| Fixture::small_tree("scope-small"))
+        .with_inputs(|| Fixture::wide_tree("scale-1k", 1_000))
         .bench_local_values(|fx| {
-            let cp = scope::begin(
-                &fx.store,
-                &Config::default(),
-                1,
-                std::process::id(),
-                &fx.work,
-                "bench",
-                &fx.work.join("tree"),
-                &NEVER,
-            )
-            .unwrap();
-            black_box(cp.finish(0, &NEVER).unwrap().id);
+            black_box(fx.protected_rm("tree"));
+            fx
+        });
+}
+
+#[rustybench::bench(sample_count = 3, sample_size = 1)]
+fn rm_protected_10k_entries_to_prompt(bencher: Bencher) {
+    bencher
+        .with_inputs(|| Fixture::wide_tree("scale-10k", 10_000))
+        .bench_local_values(|fx| {
+            black_box(fx.protected_rm("tree"));
             fx
         });
 }

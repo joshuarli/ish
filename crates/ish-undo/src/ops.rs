@@ -243,9 +243,6 @@ fn recorder_error(cmd: &str, e: &io::Error, err: &mut dyn Write) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// rm
-
 #[derive(Default)]
 struct RmOpts {
     recursive: bool,
@@ -883,9 +880,6 @@ pub fn list_dir(fd: BorrowedFd<'_>) -> io::Result<Vec<CString>> {
     Ok(names)
 }
 
-// ---------------------------------------------------------------------------
-// mv
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Overwrite {
     Always,
@@ -1009,6 +1003,17 @@ pub fn mv(txn: &Txn, cwd: &Path, args: &[OsString], io: &mut Io<'_>) -> i32 {
     status
 }
 
+/// Native `mv` only renames within one filesystem. A move between
+/// filesystems is a copy and a removal, which it does not do natively; the
+/// caller decides whether to run the unprotected external utility.
+fn cross_device(src: &[u8], target: &[u8]) -> String {
+    format!(
+        "mv: {} -> {}: on different filesystems, and native mv only renames within one filesystem; nothing was moved (use /bin/mv for an unprotected move)",
+        show(src),
+        show(target)
+    )
+}
+
 struct Mover<'t, 'g, 'b, 'r, 'i> {
     txn: &'t Txn,
     guard: &'g Guard,
@@ -1041,6 +1046,11 @@ impl Mover<'_, '_, '_, '_, '_> {
             .map_err(|r| r.message("mv", src_shown))?;
         let (tparent, tname) = open_parent(target).map_err(|e| fail(&e, target_shown))?;
         let tparent_st = sys::fstat(tparent.as_fd()).map_err(|e| fail(&e, target_shown))?;
+        // Decided from the two filesystems alone, before any question about
+        // overwriting a target that could never be reached.
+        if sst.dev != tparent_st.dev {
+            return Err(cross_device(src_shown, target_shown));
+        }
         let tst = match sys::lstat_at(tparent.as_fd(), &tname) {
             Ok(st) => Some(st),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -1112,52 +1122,25 @@ impl Mover<'_, '_, '_, '_, '_> {
         })?;
         let src_path = path_bytes(src);
         let target_path = path_bytes(target);
-        if sst.dev == tparent_st.dev {
-            match self.rename(
-                &mut rec,
-                &sparent,
-                &sname,
-                &sst,
-                &src_path,
-                &tparent,
-                &tname,
-                tst.as_ref(),
-                &target_path,
-                target_shown,
-            ) {
-                Ok(()) => {}
-                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                    self.move_across(
-                        &mut rec,
-                        &sparent,
-                        &sname,
-                        &sst,
-                        &src_path,
-                        src_shown,
-                        &tparent,
-                        &tname,
-                        tst.as_ref(),
-                        &target_path,
-                        target_shown,
-                    )?;
-                }
-                Err(e) => return Err(format!("mv: {}: {}", show(src_shown), e)),
+        self.rename(
+            &mut rec,
+            &sparent,
+            &sname,
+            &sst,
+            &src_path,
+            &tparent,
+            &tname,
+            tst.as_ref(),
+            &target_path,
+            target_shown,
+        )
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::EXDEV) {
+                cross_device(src_shown, target_shown)
+            } else {
+                format!("mv: {}: {}", show(src_shown), e)
             }
-        } else {
-            self.move_across(
-                &mut rec,
-                &sparent,
-                &sname,
-                &sst,
-                &src_path,
-                src_shown,
-                &tparent,
-                &tname,
-                tst.as_ref(),
-                &target_path,
-                target_shown,
-            )?;
-        }
+        })?;
         if self.verbose {
             let _ = writeln!(self.io.out, "{} -> {}", show(src_shown), show(target_shown));
         }
@@ -1251,388 +1234,7 @@ impl Mover<'_, '_, '_, '_, '_> {
             }
         }
     }
-
-    /// Cross-filesystem move: copy into a staging name beside the target,
-    /// publish it, then remove the source with its versions preserved.
-    #[allow(clippy::too_many_arguments)]
-    fn move_across(
-        &mut self,
-        rec: &mut Recorder,
-        sparent: &OwnedFd,
-        sname: &CStr,
-        sst: &Stat,
-        src_path: &[u8],
-        src_shown: &[u8],
-        tparent: &OwnedFd,
-        tname: &CStr,
-        tst: Option<&Stat>,
-        target_path: &[u8],
-        target_shown: &[u8],
-    ) -> Result<(), String> {
-        let staging = CString::new(format!(".ish-undo-mv-{:016x}", sys::random_u64())).unwrap();
-        let staging_path = join(&parent_path_of(target_path), staging.to_bytes());
-        let _ = rec.note(&[format!("staging copy for mv at {}", show(&staging_path))]);
-        let mut copier = Copier {
-            rec,
-            budget: self.budget,
-            cancel: self.io.cancel,
-            sources: Vec::new(),
-            created: Vec::new(),
-            depth: 0,
-        };
-        let copy = copier.copy_entry(
-            sparent.as_fd(),
-            sname,
-            sst,
-            src_path,
-            tparent.as_fd(),
-            &staging,
-            target_path,
-        );
-        let Copier {
-            sources, created, ..
-        } = copier;
-        if let Err(e) = copy {
-            remove_staging(tparent.as_fd(), &staging);
-            return Err(format!("mv: {}: {}", show(src_shown), e));
-        }
-
-        // Publish the staged copy at the target.
-        let mut actions = Vec::new();
-        if let Some(tst) = tst {
-            match self.displace_target(rec, tparent, tname, tst, target_path) {
-                Ok(action) => actions.push(action),
-                Err(e) => {
-                    remove_staging(tparent.as_fd(), &staging);
-                    return Err(format!("mv: {}: not replaced: {e}", show(target_shown)));
-                }
-            }
-        }
-        actions.extend(created);
-        let count = actions.len() as u32;
-        let op = match rec.prepare(actions) {
-            Ok(op) => op,
-            Err(e) => {
-                remove_staging(tparent.as_fd(), &staging);
-                return Err(format!("mv: cannot record undo information: {e}"));
-            }
-        };
-        let publish = if tst.is_some() {
-            sys::rename_replace(tparent.as_fd(), &staging, tparent.as_fd(), tname)
-        } else {
-            sys::rename_noreplace(tparent.as_fd(), &staging, tparent.as_fd(), tname)
-        };
-        if let Err(e) = publish {
-            let _ = rec.commit(op, 0, Some(e.to_string()));
-            remove_staging(tparent.as_fd(), &staging);
-            return Err(format!("mv: {}: {}", show(target_shown), errno_msg(&e)));
-        }
-        let _ = rec.commit(op, count, None);
-
-        // Remove the source, children first, each only if unchanged since
-        // it was copied. Anything changed stays in place.
-        let mut removed_all = true;
-        let mut batch: Vec<(Vec<u8>, Action, Stat)> = Vec::new();
-        for (path, action, st) in sources.into_iter().rev() {
-            batch.push((path, action, st));
-            if batch.len() >= BATCH {
-                removed_all &= remove_sources(rec, std::mem::take(&mut batch), self.io.err);
-            }
-        }
-        removed_all &= remove_sources(rec, batch, self.io.err);
-        if !removed_all {
-            return Err(format!(
-                "mv: {}: copied to {}, but the source was not completely removed",
-                show(src_shown),
-                show(target_shown)
-            ));
-        }
-        Ok(())
-    }
 }
-
-fn remove_staging(dir: BorrowedFd<'_>, name: &CStr) {
-    // The staging tree is private to this operation and was never
-    // published, so it is removed without preservation.
-    let _ = sys::remove_tree(dir, name);
-}
-
-/// Remove source entries of a cross-filesystem move, deepest first.
-fn remove_sources(
-    rec: &mut Recorder,
-    batch: Vec<(Vec<u8>, Action, Stat)>,
-    err: &mut dyn Write,
-) -> bool {
-    if batch.is_empty() {
-        return true;
-    }
-    let actions: Vec<Action> = batch.iter().map(|(_, a, _)| a.clone()).collect();
-    let op = match rec.prepare(actions) {
-        Ok(op) => op,
-        Err(e) => {
-            let _ = writeln!(err, "mv: cannot record undo information: {e}");
-            return false;
-        }
-    };
-    let mut done = 0;
-    let mut ok = true;
-    let mut error = None;
-    for (path, action, st) in &batch {
-        let p = Path::new(OsStr::from_bytes(path));
-        let result = open_parent(p).and_then(|(dir, name)| {
-            let now = sys::lstat_at(dir.as_fd(), &name)?;
-            if !now.unchanged_since(st) && !(st.kind == Kind::Dir && now.same_object(st)) {
-                return Err(io::Error::other("changed during the move; left in place"));
-            }
-            match action {
-                Action::Rmdir { .. } => sys::rmdir_at(dir.as_fd(), &name),
-                _ => sys::unlink_at(dir.as_fd(), &name),
-            }
-        });
-        match result {
-            Ok(()) => done += 1,
-            Err(e) => {
-                let _ = writeln!(err, "mv: {}: {}", show(path), errno_msg(&e));
-                error = Some(e.to_string());
-                ok = false;
-                break;
-            }
-        }
-    }
-    let _ = rec.commit(op, done, error);
-    ok
-}
-
-/// Copies a tree for a cross-filesystem move and collects the actions for
-/// both sides.
-struct Copier<'r, 'b, 'c> {
-    rec: &'r mut Recorder,
-    budget: &'r mut Budget<'b>,
-    cancel: &'c std::sync::atomic::AtomicBool,
-    /// Source entries in pre-order with the action that removes each.
-    sources: Vec<(Vec<u8>, Action, Stat)>,
-    /// Actions creating each destination entry, in pre-order.
-    created: Vec<Action>,
-    /// Directories currently open in the recursion; bounded because each
-    /// level holds two descriptors.
-    depth: usize,
-}
-
-/// Deepest tree a cross-filesystem move copies.
-const MAX_COPY_DEPTH: usize = 512;
-
-impl Copier<'_, '_, '_> {
-    #[allow(clippy::too_many_arguments)]
-    fn copy_dir(
-        &mut self,
-        sdir: BorrowedFd<'_>,
-        sname: &CStr,
-        sst: &Stat,
-        spath: &[u8],
-        ddir: BorrowedFd<'_>,
-        dname: &CStr,
-        dpath: &[u8],
-    ) -> io::Result<()> {
-        let sfd = sys::open_dir_at(sdir, sname)?;
-        let meta = preserve::dir_meta(sfd.as_fd(), sst);
-        sys::mkdir_at(ddir, dname, 0o700)?;
-        let dfd = sys::open_dir_at(ddir, dname)?;
-        let dst_st = sys::fstat(dfd.as_fd())?;
-        self.created.push(Action::Mkdir {
-            path: dpath.to_vec(),
-            ident: Ident::of(&dst_st),
-        });
-        self.sources.push((
-            spath.to_vec(),
-            Action::Rmdir {
-                path: spath.to_vec(),
-                ident: Ident::of(sst),
-                meta: meta.clone(),
-            },
-            *sst,
-        ));
-        for child in list_dir(sfd.as_fd())? {
-            let cst = sys::lstat_at(sfd.as_fd(), &child)?;
-            if cst.kind == Kind::Dir && cst.dev != sst.dev {
-                return Err(io::Error::other(format!(
-                    "{}: on a different filesystem; not crossing mount boundaries",
-                    show(&join(spath, child.to_bytes()))
-                )));
-            }
-            self.copy_entry(
-                sfd.as_fd(),
-                &child,
-                &cst,
-                &join(spath, child.to_bytes()),
-                dfd.as_fd(),
-                &child,
-                &join(dpath, child.to_bytes()),
-            )?;
-        }
-        let mut notes = Vec::new();
-        preserve::apply_dir_meta(dfd.as_fd(), &meta, &mut notes);
-        self.budget
-            .notes
-            .extend(notes.into_iter().map(|n| format!("{}: {n}", show(dpath))));
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn copy_entry(
-        &mut self,
-        sdir: BorrowedFd<'_>,
-        sname: &CStr,
-        sst: &Stat,
-        spath: &[u8],
-        ddir: BorrowedFd<'_>,
-        dname: &CStr,
-        dpath: &[u8],
-    ) -> io::Result<()> {
-        if self.cancel.load(Ordering::Relaxed) {
-            return Err(io::Error::from(io::ErrorKind::Interrupted));
-        }
-        match sst.kind {
-            Kind::Dir if self.depth >= MAX_COPY_DEPTH => Err(io::Error::other(format!(
-                "{}: directory tree too deep to move across filesystems",
-                show(spath)
-            ))),
-            Kind::Dir => {
-                self.depth += 1;
-                let result = self.copy_dir(sdir, sname, sst, spath, ddir, dname, dpath);
-                self.depth -= 1;
-                result
-            }
-            Kind::Symlink => {
-                let saved = preserve::preserve(
-                    &mut self.rec.stores,
-                    self.budget,
-                    sdir,
-                    sname,
-                    spath,
-                    sst,
-                    Need::Unlink,
-                )?;
-                let preserve_target = match &saved.content {
-                    crate::journal::Content::Symlink { target } => target.clone(),
-                    _ => unreachable!(),
-                };
-                sys::symlink_at(&preserve_target, ddir, dname)?;
-                let _ = sys::set_symlink_times(ddir, dname, sst.atime, sst.mtime);
-                let dst_st = sys::lstat_at(ddir, dname)?;
-                self.created.push(Action::Create {
-                    path: dpath.to_vec(),
-                    ident: Ident::of(&dst_st),
-                });
-                self.sources.push((
-                    spath.to_vec(),
-                    Action::Unlink {
-                        path: spath.to_vec(),
-                        saved,
-                    },
-                    *sst,
-                ));
-                Ok(())
-            }
-            Kind::File => {
-                // Prefer a frozen source version on the source filesystem
-                // and copy from it, so the published copy equals the
-                // preserved version.
-                let preserved = preserve::preserve(
-                    &mut self.rec.stores,
-                    self.budget,
-                    sdir,
-                    sname,
-                    spath,
-                    sst,
-                    Need::Unlink,
-                );
-                // Preserving by hard link changes the source's ctime; the
-                // removal later checks the source against this baseline.
-                let baseline = sys::lstat_at(sdir, sname)?;
-                if !baseline.same_object(sst)
-                    || baseline.size != sst.size
-                    || baseline.mtime != sst.mtime
-                {
-                    return Err(io::Error::other(format!(
-                        "{}: changed while being moved",
-                        show(spath)
-                    )));
-                }
-                let sst = &baseline;
-                let src = sys::open_read_at(sdir, sname)?;
-                let dst = sys::create_excl_at(ddir, dname, 0o600)?;
-                let from_obj = match &preserved {
-                    Ok(saved) if saved.strength().is_some_and(|s| s.frozen()) => {
-                        Some(self.rec.stores.open_object(saved.obj().unwrap())?)
-                    }
-                    _ => None,
-                };
-                let data_src = from_obj.as_ref().map(|f| f.as_fd()).unwrap_or(src.as_fd());
-                sys::copy_data(
-                    data_src,
-                    dst.as_fd(),
-                    sst.size,
-                    self.cancel,
-                    &mut self.budget.stats,
-                )?;
-                if let Some(note) = sys::copy_file_metadata(src.as_fd(), dst.as_fd()) {
-                    self.budget.notes.push(format!("{}: {note}", show(dpath)));
-                }
-                let mut notes = Vec::new();
-                preserve::apply_file_meta(dst.as_fd(), &Meta::of(sst), &mut notes);
-                self.budget
-                    .notes
-                    .extend(notes.into_iter().map(|n| format!("{}: {n}", show(dpath))));
-                sys::sync_file(dst.as_fd())?;
-                let dst_st = sys::fstat(dst.as_fd())?;
-                // Without a store on the source filesystem, keep a frozen
-                // version of the published copy instead.
-                let saved = match preserved {
-                    Ok(saved) => saved,
-                    Err(_) => {
-                        let mut saved = preserve::preserve(
-                            &mut self.rec.stores,
-                            self.budget,
-                            ddir,
-                            dname,
-                            dpath,
-                            &dst_st,
-                            Need::Frozen,
-                        )?;
-                        saved.ident = Ident::of(sst);
-                        saved.meta = Meta::of(sst);
-                        saved.nlink = sst.nlink;
-                        saved
-                    }
-                };
-                self.created.push(Action::Create {
-                    path: dpath.to_vec(),
-                    ident: Ident::of(&dst_st),
-                });
-                self.sources.push((
-                    spath.to_vec(),
-                    Action::Unlink {
-                        path: spath.to_vec(),
-                        saved,
-                    },
-                    *sst,
-                ));
-                Ok(())
-            }
-            other => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "{}: cannot move a {} across filesystems",
-                    show(spath),
-                    other.name()
-                ),
-            )),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Redirections
 
 /// How a writable redirection opens its target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

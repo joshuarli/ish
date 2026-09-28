@@ -5,32 +5,25 @@ use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 
-use crate::diff::{self, Diff};
-use crate::journal::{Action, Content, Evidence, Saved, Strength};
+use crate::journal::{Content, Saved, Strength};
 use crate::replay::{self, Committed, Lifecycle, Model};
 use crate::retention;
-use crate::scope::{self, Checkpoint};
 use crate::store::{self, Home, Stores, VolumeState};
 use crate::{Config, Io, human_bytes, sys};
 
 pub const USAGE: &str = "\
-usage: undo [id] [--dry-run] [--only <path>]... [--force]
-       undo redo [id] [--dry-run] [--only <path>]... [--force]
+usage: undo [id] [--dry-run]
+       undo redo [id] [--dry-run]
        undo list [-a]
        undo show [id]
-       undo diff [id]
-       undo run --scope <directory> -- <program> [arguments...]
        undo gc
        undo purge <id>
        undo doctor
        undo volume add <directory> | list | remove <directory|id>";
 
 /// Subcommands, for completion.
-pub const SUBCOMMANDS: &[&str] = &[
-    "diff", "doctor", "gc", "list", "purge", "redo", "run", "show", "volume",
-];
+pub const SUBCOMMANDS: &[&str] = &["doctor", "gc", "list", "purge", "redo", "show", "volume"];
 
 /// What the shell tells the builtin about where it runs.
 pub struct Context {
@@ -44,37 +37,15 @@ pub struct Context {
     pub may_mutate: bool,
 }
 
-/// Result of running a program under `undo run`.
-pub enum RunResult {
-    Exited(i32),
-    Stopped,
-}
-
-/// A scoped run whose program is stopped; finish it when the job ends.
-pub struct PendingRun {
-    checkpoint: Checkpoint,
-}
-
-pub enum Outcome {
-    Status(i32),
-    Suspended(PendingRun),
-}
-
 fn is_readonly(sub: &str) -> bool {
     matches!(
         sub,
-        "list" | "show" | "diff" | "doctor" | "help" | "-h" | "--help"
-    ) || sub == "volume-list"
+        "list" | "show" | "doctor" | "help" | "-h" | "--help" | "volume-list"
+    )
 }
 
-/// Run the builtin. `run` executes a program through the shell's normal
-/// foreground-job machinery.
-pub fn main(
-    ctx: &Context,
-    args: &[OsString],
-    io: &mut Io<'_>,
-    run: &mut dyn FnMut(&[OsString]) -> RunResult,
-) -> Outcome {
+/// Run the builtin and return its exit status.
+pub fn main(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
     let sub = args.first().and_then(|a| a.to_str()).unwrap_or("");
     let sub_key = if sub == "volume" && args.get(1).and_then(|a| a.to_str()) == Some("list") {
         "volume-list"
@@ -84,18 +55,7 @@ pub fn main(
     let rest = if args.is_empty() { &[][..] } else { &args[1..] };
     let is_sub = matches!(
         sub,
-        "redo"
-            | "list"
-            | "show"
-            | "diff"
-            | "run"
-            | "gc"
-            | "purge"
-            | "doctor"
-            | "volume"
-            | "help"
-            | "-h"
-            | "--help"
+        "redo" | "list" | "show" | "gc" | "purge" | "doctor" | "volume" | "help" | "-h" | "--help"
     );
     if !ctx.may_mutate && !is_readonly(sub_key) {
         let name = if is_sub { sub } else { "undo" };
@@ -103,9 +63,9 @@ pub fn main(
             io.err,
             "undo: {name} changes recovery state and must run in the shell itself, not in a pipeline or command substitution"
         );
-        return Outcome::Status(2);
+        return 2;
     }
-    let status = match sub {
+    match sub {
         "help" | "-h" | "--help" => {
             let _ = writeln!(io.out, "{USAGE}");
             0
@@ -113,15 +73,12 @@ pub fn main(
         "redo" => replay_command(ctx, rest, true, io),
         "list" => list(ctx, rest, io),
         "show" => show(ctx, rest, io),
-        "diff" => diff_command(ctx, rest, io),
-        "run" => return run_command(ctx, rest, io, run),
         "gc" => gc(ctx, io),
         "purge" => purge(ctx, rest, io),
         "doctor" => doctor(ctx, io),
         "volume" => volume(ctx, rest, io),
         _ => replay_command(ctx, args, false, io),
-    };
-    Outcome::Status(status)
+    }
 }
 
 fn open_home(ctx: &Context, io: &mut Io<'_>) -> Option<Home> {
@@ -171,40 +128,27 @@ fn command_text(model: &Model) -> String {
         .to_string()
 }
 
+/// Dry-run output is a plan of one line per step; a large removal has
+/// thousands, so only the first are shown.
+const DRY_RUN_LINES: usize = 200;
+
 fn replay_command(ctx: &Context, args: &[OsString], redo: bool, io: &mut Io<'_>) -> i32 {
     let name = if redo { "undo redo" } else { "undo" };
     let mut id = None;
     let mut dry_run = false;
-    let mut force = false;
-    let mut only = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_bytes();
-        match a {
+    for arg in args {
+        match arg.as_bytes() {
             b"--dry-run" | b"-n" => dry_run = true,
-            b"--force" | b"-f" => force = true,
-            b"--only" => {
-                i += 1;
-                match args.get(i) {
-                    Some(p) => only.push(p.clone()),
-                    None => {
-                        let _ = writeln!(io.err, "{name}: --only requires a path\n{USAGE}");
-                        return 2;
-                    }
-                }
-            }
-            _ if a.starts_with(b"--only=") => only.push(OsStr::from_bytes(&a[7..]).to_owned()),
-            _ if id.is_none() && parse_id(&args[i]).is_some() => id = parse_id(&args[i]),
+            _ if id.is_none() && parse_id(arg).is_some() => id = parse_id(arg),
             _ => {
                 let _ = writeln!(
                     io.err,
                     "{name}: unexpected argument {}\n{USAGE}",
-                    args[i].to_string_lossy()
+                    arg.to_string_lossy()
                 );
                 return 2;
             }
         }
-        i += 1;
     }
     let Some(home) = open_home(ctx, io) else {
         return 1;
@@ -242,6 +186,13 @@ fn replay_command(ctx: &Context, args: &[OsString], redo: bool, io: &mut Io<'_>)
             let _ = writeln!(io.err, "{name}: transaction {id} is still active");
             return 1;
         }
+        Lifecycle::Replaying => {
+            let _ = writeln!(
+                io.err,
+                "{name}: transaction {id} is being replayed by another shell"
+            );
+            return 1;
+        }
         Lifecycle::Interrupted => {
             let _ = writeln!(
                 io.err,
@@ -250,12 +201,9 @@ fn replay_command(ctx: &Context, args: &[OsString], redo: bool, io: &mut Io<'_>)
         }
         Lifecycle::Completed => {}
     }
-    let only = replay::resolve_only(&model, &only);
     let opts = replay::Options {
         redo,
-        force,
         dry_run,
-        only,
         copy_limit: ctx.config.copy_limit,
         min_free: ctx.config.min_free,
         cancel: io.cancel,
@@ -274,8 +222,15 @@ fn replay_command(ctx: &Context, args: &[OsString], redo: bool, io: &mut Io<'_>)
     let cmd = command_text(&model);
     if dry_run {
         let _ = writeln!(io.out, "{name}: dry run for transaction {id} ({cmd}):");
-        for step in &report.planned {
+        for step in report.planned.iter().take(DRY_RUN_LINES) {
             let _ = writeln!(io.out, "  {step}");
+        }
+        if report.planned.len() > DRY_RUN_LINES {
+            let _ = writeln!(
+                io.out,
+                "  ... and {} more",
+                report.planned.len() - DRY_RUN_LINES
+            );
         }
         if report.planned.is_empty() {
             let _ = writeln!(io.out, "  nothing to do");
@@ -297,17 +252,17 @@ fn replay_command(ctx: &Context, args: &[OsString], redo: bool, io: &mut Io<'_>)
     if !report.conflicts.is_empty() {
         let _ = writeln!(
             io.err,
-            "{name}: {} conflict{} (newer data was left in place):",
+            "{name}: {} conflict{} (left untouched):",
             report.conflicts.len(),
             if report.conflicts.len() == 1 { "" } else { "s" }
         );
         for (step, why) in &report.conflicts {
             let _ = writeln!(io.err, "  {step}: {why}");
         }
-        if !force {
+        if !dry_run {
             let _ = writeln!(
                 io.err,
-                "  use --force to preserve the current state and proceed, or --only <path> to select paths"
+                "  nothing newer was overwritten; resolve the conflicts, then run `{name} {id}` again"
             );
         }
     }
@@ -325,7 +280,6 @@ fn replay_command(ctx: &Context, args: &[OsString], redo: bool, io: &mut Io<'_>)
 struct Labels {
     state: String,
     flags: Vec<String>,
-    capture: String,
 }
 
 fn labels(home: &Home, stores: &mut Stores, model: &Model) -> Labels {
@@ -335,6 +289,7 @@ fn labels(home: &Home, stores: &mut Stores, model: &Model) -> Labels {
     let state = match life {
         Lifecycle::Active => "active".into(),
         Lifecycle::Interrupted => "interrupted".into(),
+        Lifecycle::Replaying => "replaying".into(),
         Lifecycle::Completed => match model.last_run() {
             Some(run) if run.redo && undoable > 0 => "redone".into(),
             _ if undoable == 0 && redoable > 0 => "undone".into(),
@@ -352,6 +307,9 @@ fn labels(home: &Home, stores: &mut Stores, model: &Model) -> Labels {
     if model.actions.iter().any(|a| a.conflict.is_some()) {
         flags.push("conflict".into());
     }
+    if model.actions.iter().any(|a| a.pending.is_some()) {
+        flags.push("replay interrupted".into());
+    }
     if model.has_linked() {
         flags.push("linked".into());
     }
@@ -361,15 +319,7 @@ fn labels(home: &Home, stores: &mut Stores, model: &Model) -> Labels {
     if model.opaque > 0 {
         flags.push(format!("{} uncaptured", model.opaque));
     }
-    let capture = match &model.begin.scope {
-        Some(root) => format!("scoped {}", String::from_utf8_lossy(root)),
-        None => "native".into(),
-    };
-    Labels {
-        state,
-        flags,
-        capture,
-    }
+    Labels { state, flags }
 }
 
 fn age(ns: u64) -> String {
@@ -437,28 +387,26 @@ fn list(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
     }
     let _ = writeln!(
         io.out,
-        "  {:>5}  {:>4}  {:<13} {:<7} {:>7} {:>6}  COMMAND",
-        "ID", "AGE", "STATE", "CAPTURE", "CHANGES", "SIZE"
+        "  {:>5}  {:>4}  {:<13} {:>7} {:>6}  COMMAND",
+        "ID", "AGE", "STATE", "CHANGES", "SIZE"
     );
     for id in ids {
         let model = match Model::load(&home, id) {
             Ok(m) => m,
             Err(e) => {
-                let _ = writeln!(io.out, "  {id:>5}  unreadable: {e}");
+                let _ = writeln!(
+                    io.out,
+                    "  {id:>5}  unreadable: {}; `undo purge {id}` removes it",
+                    sys::describe_error(&e)
+                );
                 continue;
             }
         };
         let l = labels(&home, &mut stores, &model);
-        let usage = retention::usage(&mut stores, id);
         let mine = if model.begin.session == ctx.session {
             '*'
         } else {
             ' '
-        };
-        let capture = if model.is_scoped() {
-            "scoped"
-        } else {
-            "native"
         };
         let mut command = command_text(&model);
         if !l.flags.is_empty() {
@@ -466,16 +414,15 @@ fn list(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
         }
         let _ = writeln!(
             io.out,
-            "{mine} {id:>5}  {:>4}  {:<13} {:<7} {:>7} {:>6}  {command}",
+            "{mine} {id:>5}  {:>4}  {:<13} {:>7} {:>6}  {command}",
             age(model.begin.started_ns),
             l.state,
-            capture,
             model
                 .actions
                 .iter()
                 .filter(|a| a.committed != Committed::NotDone)
                 .count(),
-            human_bytes(usage.logical),
+            human_bytes(model.retained),
         );
     }
     0
@@ -579,18 +526,16 @@ fn show(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
             let _ = writeln!(out, "finished: not recorded");
         }
     }
-    let coverage = match &model.begin.scope {
-        Some(_) => {
-            "changes observed under the scope between the before and after checkpoints".to_string()
-        }
-        None if model.opaque > 0 => format!(
+    let coverage = if model.opaque > 0 {
+        format!(
             "ish's rm, mv, and redirections only; {} other command{} ran without capture",
             model.opaque,
             if model.opaque == 1 { "" } else { "s" }
-        ),
-        None => "ish's rm, mv, and redirections only".to_string(),
+        )
+    } else {
+        "ish's rm, mv, and redirections only".to_string()
     };
-    let _ = writeln!(out, "capture:  {} ({coverage})", l.capture);
+    let _ = writeln!(out, "capture:  {coverage}");
     let _ = writeln!(
         out,
         "state:    {}{}",
@@ -605,9 +550,9 @@ fn show(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
     let _ = writeln!(
         out,
         "stored:   {} logical, {} allocated, {} copied",
-        human_bytes(usage.logical),
+        human_bytes(model.retained),
         human_bytes(usage.allocated),
-        human_bytes(copied + model.checkpoint.map(|c| c.2).unwrap_or(0))
+        human_bytes(copied)
     );
     let mut counts = [0usize; 3];
     for s in model.saved_versions() {
@@ -629,13 +574,6 @@ fn show(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
             "          linked versions retain the original inode; another hard link or an open writer can still change them"
         );
     }
-    if let Some((entries, cloned, copied)) = model.checkpoint {
-        let _ = writeln!(
-            out,
-            "checkpoint: {entries} entries, {cloned} cloned, {} copied",
-            human_bytes(copied)
-        );
-    }
     let _ = writeln!(out, "changes:");
     for state in &model.actions {
         let status = match (state.committed, state.applied, &state.conflict) {
@@ -644,6 +582,11 @@ fn show(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
             (Committed::Ambiguous, true, _) => "uncertain".to_string(),
             (_, true, _) => "applied".to_string(),
             (_, false, _) => "undone".to_string(),
+        };
+        let status = if state.pending.is_some() && state.committed != Committed::NotDone {
+            format!("{status}; a replay step was interrupted")
+        } else {
+            status
         };
         let mut line = replay::describe_action(&state.action);
         if let Some(saved) = state.action.saved() {
@@ -668,217 +611,6 @@ fn show(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
         );
     }
     0
-}
-
-fn read_bounded(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<(Vec<u8>, u64)> {
-    let size = sys::fstat(fd)?.size;
-    let mut buf = vec![0u8; (size as usize).min(diff::READ_LIMIT)];
-    let n = sys::read_full_at(fd, &mut buf, 0)?;
-    buf.truncate(n);
-    Ok((buf, size))
-}
-
-fn diff_command(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
-    let Some(home) = open_home(ctx, io) else {
-        return 1;
-    };
-    let Some(id) = pick_id(ctx, &home, args, "diff", io) else {
-        return 1;
-    };
-    let model = match Model::load(&home, id) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = writeln!(io.err, "undo diff: {e}");
-            return 1;
-        }
-    };
-    let Ok(mut stores) = Stores::new(home.clone(), id) else {
-        return 1;
-    };
-    let show_path = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
-    for state in &model.actions {
-        if state.committed == Committed::NotDone {
-            continue;
-        }
-        match &state.action {
-            Action::Write {
-                path,
-                saved: Some(saved),
-                ..
-            } => {
-                let Some(obj) = saved.obj() else { continue };
-                let before = match stores
-                    .open_object(obj)
-                    .and_then(|fd| read_bounded(fd.as_fd()))
-                {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = writeln!(
-                            io.out,
-                            "--- {} (recorded version unavailable: {e})",
-                            show_path(path)
-                        );
-                        continue;
-                    }
-                };
-                let (after, label) = match model.finals.get(path) {
-                    Some(Evidence::Frozen { obj, .. }) => (
-                        stores
-                            .open_object(obj)
-                            .and_then(|fd| read_bounded(fd.as_fd())),
-                        "after",
-                    ),
-                    _ => (
-                        std::fs::File::open(OsStr::from_bytes(path))
-                            .and_then(|f| read_bounded(f.as_fd())),
-                        "current",
-                    ),
-                };
-                let after = after.unwrap_or_default();
-                let _ = writeln!(io.out, "--- {} (before)", show_path(path));
-                let _ = writeln!(io.out, "+++ {} ({label})", show_path(path));
-                if before.1 as usize > diff::READ_LIMIT || after.1 as usize > diff::READ_LIMIT {
-                    let _ = writeln!(
-                        io.out,
-                        "@@ {} -> {}; larger than {}, not diffed @@",
-                        human_bytes(before.1),
-                        human_bytes(after.1),
-                        human_bytes(diff::READ_LIMIT as u64)
-                    );
-                    continue;
-                }
-                match diff::diff(&before.0, &after.0, 400) {
-                    Diff::Same => {
-                        let _ = writeln!(io.out, "@@ contents unchanged (metadata only) @@");
-                    }
-                    Diff::Binary => {
-                        let _ = writeln!(
-                            io.out,
-                            "@@ binary contents differ ({} -> {}) @@",
-                            human_bytes(before.1),
-                            human_bytes(after.1)
-                        );
-                    }
-                    Diff::Lines(lines) => {
-                        for line in lines {
-                            let _ = writeln!(io.out, "{line}");
-                        }
-                    }
-                }
-            }
-            other => {
-                let _ = writeln!(io.out, "* {}", replay::describe_action(other));
-            }
-        }
-    }
-    0
-}
-
-fn run_command(
-    ctx: &Context,
-    args: &[OsString],
-    io: &mut Io<'_>,
-    run: &mut dyn FnMut(&[OsString]) -> RunResult,
-) -> Outcome {
-    let mut scope = None;
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_bytes();
-        if a == b"--scope" {
-            i += 1;
-            scope = args.get(i).cloned();
-        } else if let Some(v) = a.strip_prefix(b"--scope=") {
-            scope = Some(OsStr::from_bytes(v).to_owned());
-        } else if a == b"--" {
-            i += 1;
-            break;
-        } else {
-            break;
-        }
-        i += 1;
-    }
-    let program = &args[i.min(args.len())..];
-    let Some(scope) = scope else {
-        let _ = writeln!(io.err, "undo run: --scope <directory> is required\n{USAGE}");
-        return Outcome::Status(2);
-    };
-    if program.is_empty() {
-        let _ = writeln!(io.err, "undo run: missing program\n{USAGE}");
-        return Outcome::Status(2);
-    }
-    let scope_path = crate::ops::resolve(&ctx.cwd, &scope);
-    let command: Vec<String> = program
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let checkpoint = match scope::begin(
-        &ctx.home_root,
-        &ctx.config,
-        ctx.session,
-        ctx.shell_pid,
-        &ctx.cwd,
-        &format!(
-            "undo run --scope {} -- {}",
-            scope.to_string_lossy(),
-            command.join(" ")
-        ),
-        &scope_path,
-        io.cancel,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = writeln!(io.err, "undo run: {e}; the program was not started");
-            return Outcome::Status(1);
-        }
-    };
-    match run(program) {
-        RunResult::Exited(status) => {
-            if let Err(e) = crate::fault::check("scope-finish") {
-                let _ = writeln!(io.err, "undo run: {e}");
-                return Outcome::Status(1);
-            }
-            Outcome::Status(finish_run(PendingRun { checkpoint }, status, io.err))
-        }
-        RunResult::Stopped => Outcome::Suspended(PendingRun { checkpoint }),
-    }
-}
-
-/// Take the after-checkpoint of a scoped run and report it. Returns the
-/// program's status.
-pub fn finish_run(pending: PendingRun, status: i32, err: &mut dyn Write) -> i32 {
-    let never = AtomicBool::new(false);
-    let root = pending.checkpoint.root.clone();
-    match pending.checkpoint.finish(status, &never) {
-        Ok(summary) => {
-            let metadata = match summary.metadata {
-                0 => String::new(),
-                1 => ", 1 directory's metadata changed".into(),
-                n => format!(", {n} directories' metadata changed"),
-            };
-            let _ = writeln!(
-                err,
-                "undo: transaction {}: {} created, {} modified, {} removed{metadata} under {}",
-                summary.id,
-                summary.created,
-                summary.modified,
-                summary.removed,
-                root.display()
-            );
-            for note in summary.notes {
-                let _ = writeln!(err, "undo: note: {note}");
-            }
-        }
-        Err(e) => {
-            let _ = writeln!(err, "undo: could not record the after-checkpoint: {e}");
-        }
-    }
-    status
-}
-
-impl PendingRun {
-    pub fn id(&self) -> u64 {
-        self.checkpoint.id
-    }
 }
 
 fn gc(ctx: &Context, io: &mut Io<'_>) -> i32 {
@@ -940,13 +672,20 @@ fn purge(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
             return 1;
         }
     };
-    match retention::delete_txn(&home, id) {
-        Ok(()) => {
+    match retention::purge(&home, id) {
+        Ok(true) => {
             let _ = writeln!(
                 io.out,
                 "undo purge: deleted transaction {id} and its saved versions"
             );
             0
+        }
+        Ok(false) => {
+            let _ = writeln!(
+                io.err,
+                "undo purge: transaction {id} is being replayed by another shell"
+            );
+            1
         }
         Err(e) => {
             let _ = writeln!(io.err, "undo purge: {e}");
@@ -1115,7 +854,7 @@ fn doctor(ctx: &Context, io: &mut Io<'_>) -> i32 {
                         .map(|d| {
                             d.flatten()
                                 .filter_map(|e| e.file_name().to_str()?.parse::<u64>().ok())
-                                .filter(|id| !catalog.contains(id))
+                                .filter(|id| catalog.binary_search(id).is_err())
                                 .count()
                         })
                         .unwrap_or(0);
@@ -1148,15 +887,15 @@ fn doctor(ctx: &Context, io: &mut Io<'_>) -> i32 {
                 match replay::lifecycle(&home, &model) {
                     Lifecycle::Active => active += 1,
                     Lifecycle::Interrupted => interrupted += 1,
-                    Lifecycle::Completed => {}
+                    Lifecycle::Completed | Lifecycle::Replaying => {}
                 }
                 if model.torn_bytes > 0 {
                     torn += 1;
                 }
+                logical += model.retained;
             }
             Err(_) => unreadable += 1,
         }
-        logical += retention::usage(&mut stores, id).logical;
     }
     let _ = writeln!(
         out,

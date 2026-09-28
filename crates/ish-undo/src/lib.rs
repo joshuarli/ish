@@ -1,35 +1,63 @@
 //! Recoverable filesystem operations for ish.
 //!
-//! This crate owns native `rm`/`mv`, protected redirection opens, scoped
-//! checkpoints for arbitrary programs, the recovery store and journals, and
-//! conditional undo/redo. It knows nothing about ish's parser, history, line
-//! editor, or renderer: the shell passes resolved paths, configuration,
-//! execution identity, cancellation, and output handles through the small
-//! interfaces here.
+//! This crate owns native `rm`/`mv`, protected redirection opens, the recovery
+//! store and journals, and conditional undo/redo. It knows nothing about
+//! ish's parser, history, line editor, or renderer: the shell passes resolved
+//! paths, configuration, execution identity, cancellation, and output
+//! handles through the small interfaces here.
 //!
-//! Capture is rootless. Native operations and redirections are recorded
-//! before they mutate anything; scoped runs compare checkpoints taken before
-//! and after a program. Other external commands run normally and are not
-//! captured.
+//! Capture is rootless and covers only what the shell itself performs:
+//! native operations and redirections are recorded before they mutate
+//! anything. Other external commands run normally and are not captured.
 
 pub mod cli;
-mod diff;
+mod fault;
+mod journal;
+mod ops;
+mod preserve;
+mod replay;
+mod retention;
+mod store;
+mod sys;
+mod txn;
+
+pub use ops::{RedirMode, mv, open_redirect, rm};
+pub use retention::maybe_collect;
+pub use store::root_for_home;
+pub use txn::{Session, Suspended, Txn};
+
+/// The internals that this crate's own integration tests, test fixture, and
+/// benchmarks reach into, listed item by item: journal and model inspection,
+/// stores, fault injection, and the nonexecuting refusal guards. Not part of
+/// the interface the shell uses, and free to change with the implementation.
 #[doc(hidden)]
-pub mod fault;
-pub mod journal;
-pub mod ops;
-pub mod preserve;
-pub mod replay;
-pub mod retention;
-pub mod scope;
-pub mod store;
-pub mod sys;
-pub mod txn;
+pub mod testing {
+    pub use crate::ops::{Guard, Refusal, resolve};
+
+    pub mod fault {
+        pub use crate::fault::inject_spec;
+    }
+    pub mod journal {
+        pub use crate::journal::{Action, Content, Displaced, Strength, read};
+    }
+    pub mod replay {
+        pub use crate::replay::{Committed, Model, Options, Report, run};
+    }
+    pub mod retention {
+        pub use crate::retention::{GcReport, collect, maybe_collect, usage};
+    }
+    pub mod store {
+        pub use crate::store::{Home, Stores, VolumeState, create_volume, root_for_home};
+    }
+    pub mod sys {
+        pub use crate::sys::{
+            clone_file, fs_type_name, fstat, lstat, open_dir, read_full_at, set_flags,
+        };
+    }
+}
 
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
-
-pub use txn::{Session, Suspended, Txn};
 
 /// Recovery settings, read from the shell's variables at each transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,8 +75,6 @@ pub struct Config {
     pub max_age_days: u64,
     /// `ISH_UNDO_MIN_FREE`: free space to keep on a store's filesystem.
     pub min_free: u64,
-    /// `ISH_UNDO_SCOPE_LIMIT`: entries a scoped checkpoint may catalog.
-    pub scope_max_entries: u64,
 }
 
 impl Default for Config {
@@ -60,7 +86,6 @@ impl Default for Config {
             max_entries: 500,
             max_age_days: 30,
             min_free: 1 << 30,
-            scope_max_entries: 250_000,
         }
     }
 }
@@ -91,7 +116,6 @@ impl Config {
         size("ISH_UNDO_MIN_FREE", &mut config.min_free);
         size("ISH_UNDO_MAX_ENTRIES", &mut config.max_entries);
         size("ISH_UNDO_MAX_DAYS", &mut config.max_age_days);
-        size("ISH_UNDO_SCOPE_LIMIT", &mut config.scope_max_entries);
         (config, warnings)
     }
 }

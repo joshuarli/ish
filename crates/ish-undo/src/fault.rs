@@ -1,9 +1,10 @@
 //! Deterministic fault injection for tests.
 //!
 //! The shell never installs a plan, so every check is a single relaxed atomic
-//! load. Tests install a plan in a dedicated fixture process to fail or abort
-//! at a named boundary (for example the third `unlink`, or right after a
-//! journal prepare record). Nothing here is reachable from shell input.
+//! load. Tests install a plan in a dedicated fixture process to fail, abort,
+//! or pause at a named boundary (for example the third `unlink`, or right
+//! after a journal prepare record). Nothing here is reachable from shell
+//! input.
 
 use std::io;
 use std::sync::Mutex;
@@ -18,6 +19,9 @@ pub enum FaultAction {
     Errno(i32),
     /// Terminate the process immediately, simulating a crash.
     Abort,
+    /// Print `blocked <point>` on stdout and wait for a line on stdin, so a
+    /// test can act while the operation is in progress.
+    Block,
 }
 
 #[derive(Clone, Debug)]
@@ -39,7 +43,8 @@ pub fn inject(point: &str, skip: u32, action: FaultAction) {
     ACTIVE.store(true, Ordering::Relaxed);
 }
 
-/// Parse `point[:skip]=errno|abort` specifications, as used by the fixture.
+/// Parse `point[:skip]=errno|abort|block` specifications, as used by the
+/// fixture.
 #[doc(hidden)]
 pub fn inject_spec(spec: &str) -> Result<(), String> {
     let (lhs, action) = spec.split_once('=').ok_or("expected point=action")?;
@@ -49,6 +54,7 @@ pub fn inject_spec(spec: &str) -> Result<(), String> {
     };
     let action = match action {
         "abort" => FaultAction::Abort,
+        "block" => FaultAction::Block,
         "ENOSPC" => FaultAction::Errno(libc::ENOSPC),
         "EXDEV" => FaultAction::Errno(libc::EXDEV),
         "EIO" => FaultAction::Errno(libc::EIO),
@@ -84,5 +90,13 @@ fn fire(point: &str) -> io::Result<()> {
     match fault.action {
         FaultAction::Errno(code) => Err(io::Error::from_raw_os_error(code)),
         FaultAction::Abort => std::process::abort(),
+        FaultAction::Block => {
+            use std::io::{BufRead, Write};
+            let mut out = std::io::stdout();
+            let _ = writeln!(out, "blocked {point}");
+            let _ = out.flush();
+            let _ = std::io::stdin().lock().read_line(&mut String::new());
+            Ok(())
+        }
     }
 }

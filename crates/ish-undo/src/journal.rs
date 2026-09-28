@@ -21,12 +21,12 @@ use crate::fault;
 use crate::sys::{self, Kind, Stat};
 
 pub const MAGIC: &[u8; 8] = b"ISHUNDOJ";
-pub const VERSION: u32 = 1;
+/// Version 2 dropped scoped-checkpoint records and gave replay steps a
+/// write-ahead record; version 1 journals are not read.
+pub const VERSION: u32 = 2;
 const HEADER_LEN: u64 = 12;
 /// Upper bound for a single record, to reject garbage lengths early.
 const MAX_RECORD: u32 = 64 * 1024 * 1024;
-
-// ---------------------------------------------------------------------------
 
 /// Identity and change evidence for a filesystem object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,8 +233,6 @@ pub enum Action {
         ident: Ident,
         meta: Meta,
     },
-    /// A directory was created.
-    Mkdir { path: Vec<u8>, ident: Ident },
     /// A regular file or symlink was created.
     Create { path: Vec<u8>, ident: Ident },
     /// A regular file was modified in place. `saved` is `None` when an
@@ -250,29 +248,9 @@ pub enum Action {
         to: Vec<u8>,
         ident: Ident,
     },
-    /// Metadata-only change observed by a scoped checkpoint.
-    Meta {
-        path: Vec<u8>,
-        kind: Kind,
-        before: Meta,
-        after: Meta,
-    },
 }
 
 impl Action {
-    /// Paths whose state this action changes.
-    pub fn paths(&self) -> Vec<&[u8]> {
-        match self {
-            Action::Rename { from, to, .. } => vec![from, to],
-            Action::Unlink { path, .. }
-            | Action::Rmdir { path, .. }
-            | Action::Mkdir { path, .. }
-            | Action::Create { path, .. }
-            | Action::Write { path, .. }
-            | Action::Meta { path, .. } => vec![path],
-        }
-    }
-
     pub fn saved(&self) -> Option<&Saved> {
         match self {
             Action::Unlink { saved, .. } => Some(saved),
@@ -287,8 +265,15 @@ impl Action {
 pub enum Displaced {
     None,
     Saved(Saved),
-    Dir(Meta),
-    Meta(Meta),
+}
+
+/// A staging entry a replay step created beside its destination, with the
+/// identity that proves it is ours: a restarted run removes it only while the
+/// recorded object is still what sits at that path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stage {
+    pub path: Vec<u8>,
+    pub ident: Ident,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -299,8 +284,6 @@ pub struct Begin {
     pub started_ns: u64,
     pub cwd: Vec<u8>,
     pub command: Vec<u8>,
-    /// Root of a scoped checkpoint; `None` for native capture.
-    pub scope: Option<Vec<u8>>,
     /// Allocated by a process that outlived its transaction.
     pub detached: bool,
 }
@@ -333,12 +316,6 @@ pub enum Record {
     Note {
         text: String,
     },
-    /// Scoped checkpoint captured before launching the program.
-    Checkpoint {
-        entries: u64,
-        cloned: u64,
-        copied_bytes: u64,
-    },
     End {
         status: i32,
         finished_ns: u64,
@@ -347,14 +324,17 @@ pub enum Record {
     RunBegin {
         run: u64,
         redo: bool,
-        force: bool,
-        only: Vec<Vec<u8>>,
         started_ns: u64,
     },
-    /// A replay step about to mutate; `displaced` is already preserved.
+    /// Written, durably when it holds a displaced version, before a replay
+    /// step's destructive mutation: the version the step is about to
+    /// displace (already preserved) and the staging entry it created.
+    /// Without a later `StepDone`, the step is unfinished and a restarted run
+    /// uses this record to reconcile it.
     StepPrepare {
         run: u64,
         action: u32,
+        stage: Option<Stage>,
         displaced: Displaced,
     },
     StepDone {
@@ -364,10 +344,16 @@ pub enum Record {
         placed: Evidence,
         displaced: Displaced,
     },
+    /// A step ended without changing anything. `settled` says the step had
+    /// written a prepare record in this run and undid everything it prepared
+    /// (its staging entry is gone), so that record no longer describes an
+    /// unfinished step. A conflict found without a prepare of its own says
+    /// nothing about an older interrupted attempt and leaves it pending.
     StepConflict {
         run: u64,
         action: u32,
         reason: String,
+        settled: bool,
     },
     RunEnd {
         run: u64,
@@ -376,9 +362,6 @@ pub enum Record {
         interrupted: bool,
     },
 }
-
-// ---------------------------------------------------------------------------
-// Encoding
 
 struct Enc(Vec<u8>);
 
@@ -511,14 +494,16 @@ impl Enc {
                 self.u8(1);
                 self.saved(s);
             }
-            Displaced::Dir(m) => {
-                self.u8(2);
-                self.meta(m);
+        }
+    }
+    fn stage(&mut self, s: &Option<Stage>) {
+        match s {
+            Some(s) => {
+                self.u8(1);
+                self.bytes(&s.path);
+                self.ident(&s.ident);
             }
-            Displaced::Meta(m) => {
-                self.u8(3);
-                self.meta(m);
-            }
+            None => self.u8(0),
         }
     }
     fn action(&mut self, a: &Action) {
@@ -534,39 +519,22 @@ impl Enc {
                 self.ident(ident);
                 self.meta(meta);
             }
-            Action::Mkdir { path, ident } => {
+            Action::Create { path, ident } => {
                 self.u8(2);
                 self.bytes(path);
                 self.ident(ident);
             }
-            Action::Create { path, ident } => {
-                self.u8(3);
-                self.bytes(path);
-                self.ident(ident);
-            }
             Action::Write { path, ident, saved } => {
-                self.u8(4);
+                self.u8(3);
                 self.bytes(path);
                 self.ident(ident);
                 self.opt_saved(saved);
             }
             Action::Rename { from, to, ident } => {
-                self.u8(5);
+                self.u8(4);
                 self.bytes(from);
                 self.bytes(to);
                 self.ident(ident);
-            }
-            Action::Meta {
-                path,
-                kind,
-                before,
-                after,
-            } => {
-                self.u8(6);
-                self.bytes(path);
-                self.u8(kind.code());
-                self.meta(before);
-                self.meta(after);
             }
         }
     }
@@ -583,13 +551,6 @@ pub fn encode(record: &Record) -> Vec<u8> {
             e.uv(b.started_ns);
             e.bytes(&b.cwd);
             e.bytes(&b.command);
-            match &b.scope {
-                Some(s) => {
-                    e.u8(1);
-                    e.bytes(s);
-                }
-                None => e.u8(0),
-            }
             e.bool(b.detached);
         }
         Record::Prepare { op, actions } => {
@@ -619,22 +580,12 @@ pub fn encode(record: &Record) -> Vec<u8> {
             e.u8(6);
             e.bytes(text.as_bytes());
         }
-        Record::Checkpoint {
-            entries,
-            cloned,
-            copied_bytes,
-        } => {
-            e.u8(7);
-            e.uv(*entries);
-            e.uv(*cloned);
-            e.uv(*copied_bytes);
-        }
         Record::End {
             status,
             finished_ns,
             interrupted,
         } => {
-            e.u8(8);
+            e.u8(7);
             e.iv(*status as i64);
             e.uv(*finished_ns);
             e.bool(*interrupted);
@@ -642,28 +593,23 @@ pub fn encode(record: &Record) -> Vec<u8> {
         Record::RunBegin {
             run,
             redo,
-            force,
-            only,
             started_ns,
         } => {
-            e.u8(9);
+            e.u8(8);
             e.uv(*run);
             e.bool(*redo);
-            e.bool(*force);
-            e.uv(only.len() as u64);
-            for p in only {
-                e.bytes(p);
-            }
             e.uv(*started_ns);
         }
         Record::StepPrepare {
             run,
             action,
+            stage,
             displaced,
         } => {
-            e.u8(10);
+            e.u8(9);
             e.uv(*run);
             e.uv(*action as u64);
+            e.stage(stage);
             e.displaced(displaced);
         }
         Record::StepDone {
@@ -673,7 +619,7 @@ pub fn encode(record: &Record) -> Vec<u8> {
             placed,
             displaced,
         } => {
-            e.u8(11);
+            e.u8(10);
             e.uv(*run);
             e.uv(*action as u64);
             e.bool(*redo);
@@ -684,11 +630,13 @@ pub fn encode(record: &Record) -> Vec<u8> {
             run,
             action,
             reason,
+            settled,
         } => {
-            e.u8(12);
+            e.u8(11);
             e.uv(*run);
             e.uv(*action as u64);
             e.bytes(reason.as_bytes());
+            e.bool(*settled);
         }
         Record::RunEnd {
             run,
@@ -696,7 +644,7 @@ pub fn encode(record: &Record) -> Vec<u8> {
             conflicts,
             interrupted,
         } => {
-            e.u8(13);
+            e.u8(12);
             e.uv(*run);
             e.uv(*done as u64);
             e.uv(*conflicts as u64);
@@ -858,9 +806,16 @@ impl<'a> Dec<'a> {
         Some(match self.u8()? {
             0 => Displaced::None,
             1 => Displaced::Saved(self.saved()?),
-            2 => Displaced::Dir(self.meta()?),
-            3 => Displaced::Meta(self.meta()?),
             _ => return None,
+        })
+    }
+    fn stage(&mut self) -> D<Option<Stage>> {
+        Some(match self.u8()? {
+            0 => None,
+            _ => Some(Stage {
+                path: self.bytes()?,
+                ident: self.ident()?,
+            }),
         })
     }
     fn action(&mut self) -> D<Action> {
@@ -874,29 +829,19 @@ impl<'a> Dec<'a> {
                 ident: self.ident()?,
                 meta: self.meta()?,
             },
-            2 => Action::Mkdir {
+            2 => Action::Create {
                 path: self.bytes()?,
                 ident: self.ident()?,
             },
-            3 => Action::Create {
-                path: self.bytes()?,
-                ident: self.ident()?,
-            },
-            4 => Action::Write {
+            3 => Action::Write {
                 path: self.bytes()?,
                 ident: self.ident()?,
                 saved: self.opt_saved()?,
             },
-            5 => Action::Rename {
+            4 => Action::Rename {
                 from: self.bytes()?,
                 to: self.bytes()?,
                 ident: self.ident()?,
-            },
-            6 => Action::Meta {
-                path: self.bytes()?,
-                kind: Kind::from_code(self.u8()?),
-                before: self.meta()?,
-                after: self.meta()?,
             },
             _ => return None,
         })
@@ -916,10 +861,6 @@ pub fn decode(payload: &[u8]) -> Option<Record> {
             started_ns: d.uv()?,
             cwd: d.bytes()?,
             command: d.bytes()?,
-            scope: match d.u8()? {
-                0 => None,
-                _ => Some(d.bytes()?),
-            },
             detached: d.bool()?,
         }),
         2 => {
@@ -942,51 +883,36 @@ pub fn decode(payload: &[u8]) -> Option<Record> {
         },
         5 => Record::Opaque { count: d.u32()? },
         6 => Record::Note { text: d.string()? },
-        7 => Record::Checkpoint {
-            entries: d.uv()?,
-            cloned: d.uv()?,
-            copied_bytes: d.uv()?,
-        },
-        8 => Record::End {
+        7 => Record::End {
             status: i32::try_from(d.iv()?).ok()?,
             finished_ns: d.uv()?,
             interrupted: d.bool()?,
         },
-        9 => {
-            let run = d.uv()?;
-            let redo = d.bool()?;
-            let force = d.bool()?;
-            let n = d.uv()?;
-            let mut only = Vec::new();
-            for _ in 0..n {
-                only.push(d.bytes()?);
-            }
-            Record::RunBegin {
-                run,
-                redo,
-                force,
-                only,
-                started_ns: d.uv()?,
-            }
-        }
-        10 => Record::StepPrepare {
+        8 => Record::RunBegin {
+            run: d.uv()?,
+            redo: d.bool()?,
+            started_ns: d.uv()?,
+        },
+        9 => Record::StepPrepare {
             run: d.uv()?,
             action: d.u32()?,
+            stage: d.stage()?,
             displaced: d.displaced()?,
         },
-        11 => Record::StepDone {
+        10 => Record::StepDone {
             run: d.uv()?,
             action: d.u32()?,
             redo: d.bool()?,
             placed: d.evidence()?,
             displaced: d.displaced()?,
         },
-        12 => Record::StepConflict {
+        11 => Record::StepConflict {
             run: d.uv()?,
             action: d.u32()?,
             reason: d.string()?,
+            settled: d.bool()?,
         },
-        13 => Record::RunEnd {
+        12 => Record::RunEnd {
             run: d.uv()?,
             done: d.u32()?,
             conflicts: d.u32()?,
@@ -1079,6 +1005,35 @@ pub fn scan_bytes(data: &[u8]) -> io::Result<Scan> {
 
 pub fn read(path: &Path) -> io::Result<Scan> {
     scan_bytes(&std::fs::read(path)?)
+}
+
+/// Read only the first record, which is always `Begin`. Maintenance uses it
+/// to learn a transaction's age without loading its whole journal.
+pub fn read_begin(path: &Path) -> io::Result<Begin> {
+    let file = File::open(path)?;
+    let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_owned());
+    let mut head = [0u8; HEADER_LEN as usize + 8];
+    if sys::read_full_at(file.as_fd(), &mut head, 0)? < head.len() || &head[..8] != MAGIC {
+        return Err(bad("not an ish-undo journal"));
+    }
+    if u32::from_le_bytes(head[8..12].try_into().unwrap()) != VERSION {
+        return Err(bad("unsupported journal version"));
+    }
+    let len = u32::from_le_bytes(head[12..16].try_into().unwrap());
+    let crc = u32::from_le_bytes(head[16..20].try_into().unwrap());
+    if len > MAX_RECORD {
+        return Err(bad("corrupt journal"));
+    }
+    let mut payload = vec![0u8; len as usize];
+    if sys::read_full_at(file.as_fd(), &mut payload, head.len() as u64)? < payload.len()
+        || crc32(&payload) != crc
+    {
+        return Err(bad("corrupt journal"));
+    }
+    match decode(&payload) {
+        Some(Record::Begin(begin)) => Ok(begin),
+        _ => Err(bad("journal does not start with a begin record")),
+    }
 }
 
 /// Create a new journal containing `records`, failing if it exists.
@@ -1200,115 +1155,51 @@ fn scan_tail(data: &[u8]) -> usize {
     pos
 }
 
-/// One entry of a scoped checkpoint catalog.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CatEntry {
-    /// Path relative to the scope root; empty for the root itself.
-    pub rel: Vec<u8>,
-    pub ident: Ident,
-    pub meta: Meta,
-    pub nlink: u64,
-    /// Frozen before-image of a regular file.
-    pub obj: Option<(ObjRef, Strength)>,
-    /// Symlink target.
-    pub target: Option<Vec<u8>>,
-}
-
-pub const CATALOG_MAGIC: &[u8; 8] = b"ISHUNDOC";
-
-fn encode_cat(entry: &CatEntry) -> Vec<u8> {
-    let mut e = Enc(Vec::with_capacity(96));
-    e.bytes(&entry.rel);
-    e.ident(&entry.ident);
-    e.meta(&entry.meta);
-    e.uv(entry.nlink);
-    match &entry.obj {
-        Some((obj, strength)) => {
-            e.u8(1);
-            e.obj(obj);
-            e.strength(*strength);
+/// Logical bytes of the stored objects `records` reference: saved
+/// pre-images, frozen post-images, and versions replay displaced or prepared
+/// to displace, each object counted once. Read from the journal, so it costs
+/// no filesystem walk.
+pub fn retained_logical(records: &[Record]) -> u64 {
+    fn displaced_object(d: &Displaced) -> Option<(&ObjRef, u64)> {
+        match d {
+            Displaced::Saved(s) => s.obj().map(|obj| (obj, s.ident.size)),
+            _ => None,
         }
-        None => e.u8(0),
     }
-    match &entry.target {
-        Some(t) => {
-            e.u8(1);
-            e.bytes(t);
+    fn count<'a>(
+        seen: &mut std::collections::HashSet<(u64, &'a [u8])>,
+        total: &mut u64,
+        obj: &'a ObjRef,
+        size: u64,
+    ) {
+        if seen.insert((obj.store, obj.name.as_slice())) {
+            *total = total.saturating_add(size);
         }
-        None => e.u8(0),
     }
-    e.0
-}
-
-fn decode_cat(payload: &[u8]) -> Option<CatEntry> {
-    let mut d = Dec {
-        buf: payload,
-        pos: 0,
-    };
-    let entry = CatEntry {
-        rel: d.bytes()?,
-        ident: d.ident()?,
-        meta: d.meta()?,
-        nlink: d.uv()?,
-        obj: match d.u8()? {
-            0 => None,
-            _ => Some((d.obj()?, d.strength()?)),
-        },
-        target: match d.u8()? {
-            0 => None,
-            _ => Some(d.bytes()?),
-        },
-    };
-    (d.pos == payload.len()).then_some(entry)
-}
-
-/// Write a catalog durably. Catalogs use the journal's framing.
-pub fn write_catalog(path: &Path, entries: &[CatEntry]) -> io::Result<()> {
-    let mut buf = Vec::with_capacity(64 + entries.len() * 96);
-    buf.extend_from_slice(CATALOG_MAGIC);
-    buf.extend_from_slice(&VERSION.to_le_bytes());
-    for entry in entries {
-        let payload = encode_cat(entry);
-        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&crc32(&payload).to_le_bytes());
-        buf.extend_from_slice(&payload);
-    }
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    write_all_at(&file, &buf, 0)?;
-    sys::sync_file(file.as_fd())
-}
-
-/// Read a catalog. A torn or corrupt catalog is an error: a checkpoint is
-/// only usable when complete.
-pub fn read_catalog(path: &Path) -> io::Result<Vec<CatEntry>> {
-    let data = std::fs::read(path)?;
-    if data.len() < HEADER_LEN as usize || &data[..8] != CATALOG_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not an ish-undo catalog",
-        ));
-    }
-    let mut pos = HEADER_LEN as usize;
-    let mut entries = Vec::new();
-    while pos < data.len() {
-        let bad = || io::Error::new(io::ErrorKind::InvalidData, "corrupt catalog");
-        if pos + 8 > data.len() {
-            return Err(bad());
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    for record in records {
+        match record {
+            Record::Prepare { actions, .. } => {
+                for saved in actions.iter().filter_map(Action::saved) {
+                    if let Some(obj) = saved.obj() {
+                        count(&mut seen, &mut total, obj, saved.ident.size);
+                    }
+                }
+            }
+            Record::Final {
+                evidence: Evidence::Frozen { ident, obj },
+                ..
+            } => count(&mut seen, &mut total, obj, ident.size),
+            Record::StepPrepare { displaced, .. } | Record::StepDone { displaced, .. } => {
+                if let Some((obj, size)) = displaced_object(displaced) {
+                    count(&mut seen, &mut total, obj, size);
+                }
+            }
+            _ => {}
         }
-        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        let crc = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-        let payload = data.get(pos + 8..pos + 8 + len).ok_or_else(bad)?;
-        if crc32(payload) != crc {
-            return Err(bad());
-        }
-        entries.push(decode_cat(payload).ok_or_else(bad)?);
-        pos += 8 + len;
     }
-    Ok(entries)
+    total
 }
 
 #[cfg(test)]
@@ -1353,7 +1244,6 @@ mod tests {
                 started_ns: 2,
                 cwd: vec![b'/', 0xff, 0xfe],
                 command: b"rm -r x".to_vec(),
-                scope: Some(b"/w".to_vec()),
                 detached: false,
             }),
             Record::Prepare {
@@ -1379,6 +1269,26 @@ mod tests {
                 op: 1,
                 done: 2,
                 error: Some("No space left".into()),
+            },
+            Record::RunBegin {
+                run: 3,
+                redo: true,
+                started_ns: 7,
+            },
+            Record::StepPrepare {
+                run: 3,
+                action: 1,
+                stage: Some(Stage {
+                    path: vec![b'/', 0xff, b'.', b's'],
+                    ident: ident(),
+                }),
+                displaced: Displaced::None,
+            },
+            Record::StepConflict {
+                run: 3,
+                action: 2,
+                reason: "changed while being removed".into(),
+                settled: true,
             },
             Record::StepDone {
                 run: 3,
@@ -1433,6 +1343,105 @@ mod tests {
         corrupt[second + 3] ^= 0x10;
         let scan = scan_bytes(&corrupt).unwrap();
         assert_eq!(scan.records, records[..1]);
+    }
+
+    #[test]
+    fn begin_is_readable_without_the_rest_of_the_journal() {
+        let dir = std::env::temp_dir().join(format!(
+            "ish-undo-journal-{}-{}",
+            std::process::id(),
+            sys::now_ns()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("journal");
+        let records = sample();
+        create(&path, &records).unwrap();
+        let Record::Begin(begin) = &records[0] else {
+            unreachable!()
+        };
+        assert_eq!(&read_begin(&path).unwrap(), begin);
+
+        // Garbage, a wrong version, and a truncated first record are errors,
+        // never a guess.
+        let good = std::fs::read(&path).unwrap();
+        for (name, bytes) in [
+            ("garbage", b"not a journal at all, really".to_vec()),
+            ("version", {
+                let mut b = good.clone();
+                b[8] = 99;
+                b
+            }),
+            ("truncated", good[..HEADER_LEN as usize + 12].to_vec()),
+            ("corrupt", {
+                let mut b = good.clone();
+                b[HEADER_LEN as usize + 10] ^= 0x40;
+                b
+            }),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(read_begin(&path).is_err(), "{name}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn retained_size_counts_each_object_once() {
+        let obj = |n: &str| ObjRef {
+            store: 1,
+            name: n.as_bytes().to_vec(),
+        };
+        let saved = |n: &str, size: u64| Saved {
+            content: Content::File {
+                obj: obj(n),
+                strength: Strength::Clone,
+            },
+            ident: Ident { size, ..ident() },
+            meta: Meta::default(),
+            nlink: 1,
+            copied: 0,
+        };
+        let records = vec![
+            Record::Prepare {
+                op: 1,
+                actions: vec![
+                    Action::Unlink {
+                        path: b"/a".to_vec(),
+                        saved: saved("obj/a", 100),
+                    },
+                    // A second name of the same inode shares its version.
+                    Action::Unlink {
+                        path: b"/b".to_vec(),
+                        saved: saved("obj/a", 100),
+                    },
+                    Action::Write {
+                        path: b"/c".to_vec(),
+                        ident: ident(),
+                        saved: Some(saved("obj/c", 30)),
+                    },
+                ],
+            },
+            Record::Final {
+                path: b"/c".to_vec(),
+                evidence: Evidence::Frozen {
+                    ident: Ident { size: 7, ..ident() },
+                    obj: obj("obj/post"),
+                },
+            },
+            Record::StepPrepare {
+                run: 1,
+                action: 2,
+                stage: None,
+                displaced: Displaced::Saved(saved("obj/d", 5)),
+            },
+            Record::StepDone {
+                run: 1,
+                action: 2,
+                redo: false,
+                placed: Evidence::Absent,
+                displaced: Displaced::Saved(saved("obj/d", 5)),
+            },
+        ];
+        assert_eq!(retained_logical(&records), 100 + 30 + 7 + 5);
     }
 
     #[test]

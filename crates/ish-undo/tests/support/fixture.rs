@@ -1,9 +1,8 @@
 //! Test fixture for ish-undo integration suites.
 //!
 //! Runs one operation per process so tests can crash it at a named boundary
-//! (`--fault point[:skip]=errno|abort`) and recover in a fresh process, hold
-//! descriptors and mappings open across a preservation, or act as an
-//! external program that changes files through child processes.
+//! (`--fault point[:skip]=errno|abort`) and recover in a fresh process, or
+//! hold descriptors and mappings open across a preservation.
 //!
 //! Every mode takes explicit paths; nothing reads HOME or the process
 //! environment for store locations.
@@ -14,14 +13,15 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use ish_undo::cli::{self, RunResult};
-use ish_undo::{Config, Io, Session, fault, ops};
+use ish_undo::cli;
+use ish_undo::testing::{fault, resolve};
+use ish_undo::{Config, Io, RedirMode, Session, mv, open_redirect, rm};
 
 fn usage() -> ! {
     eprintln!(
         "usage: ish-undo-fixture [--fault spec]... [--config NAME=VALUE]... MODE ...\n\
          modes:\n  shell <store> <cwd> <session> [--hold] <step>...   (steps: rm:ARGS mv:ARGS write:PATH=DATA append:PATH=DATA)\n  \
-         undo <store> <cwd> <session> [args...]\n  hold-open <path>\n  mutate <dir> <script>"
+         undo <store> <cwd> <session> [args...]\n  hold-open <path>"
     );
     std::process::exit(2);
 }
@@ -96,13 +96,15 @@ fn main() {
         "shell" => shell(rest, config),
         "undo" => undo(rest, config),
         "hold-open" => hold_open(Path::new(&rest[0])),
-        "mutate" => mutate(Path::new(&rest[0]), &rest[1..]),
         _ => usage(),
     };
     std::process::exit(code);
 }
 
-fn confirm_yes(_: &str) -> Option<bool> {
+/// Answers every question with yes, and says what was asked so tests can
+/// tell a prompt from its absence.
+fn confirm_yes(question: &str) -> Option<bool> {
+    eprintln!("asked: {question}");
     Some(true)
 }
 
@@ -133,7 +135,7 @@ fn shell(args: &[String], config: Config) -> i32 {
             cancel: &cancel,
         };
         status = match kind {
-            "rm" => ops::rm(
+            "rm" => rm(
                 &txn,
                 &cwd,
                 &args_of(arg)
@@ -142,7 +144,7 @@ fn shell(args: &[String], config: Config) -> i32 {
                     .collect::<Vec<_>>(),
                 &mut io,
             ),
-            "mv" => ops::mv(
+            "mv" => mv(
                 &txn,
                 &cwd,
                 &args_of(arg)
@@ -154,12 +156,12 @@ fn shell(args: &[String], config: Config) -> i32 {
             "write" | "append" | "readwrite" => {
                 let (path, data) = arg.split_once('=').expect("PATH=DATA");
                 let mode = match kind {
-                    "write" => ops::RedirMode::Truncate,
-                    "append" => ops::RedirMode::Append,
-                    _ => ops::RedirMode::ReadWrite,
+                    "write" => RedirMode::Truncate,
+                    "append" => RedirMode::Append,
+                    _ => RedirMode::ReadWrite,
                 };
-                let path = ops::resolve(&cwd, &raw(path));
-                match ops::open_redirect(&txn, &path, mode, &cancel) {
+                let path = resolve(&cwd, &raw(path));
+                match open_redirect(&txn, &path, mode, &cancel) {
                     Some(Ok(fd)) => {
                         let mut f = std::fs::File::from(fd);
                         f.write_all(data.as_bytes()).unwrap();
@@ -214,18 +216,7 @@ fn undo(args: &[String], config: Config) -> i32 {
         confirm: &mut confirm,
         cancel: &cancel,
     };
-    let mut run = |program: &[OsString]| {
-        let status = std::process::Command::new(&program[0])
-            .args(&program[1..])
-            .current_dir(&ctx.cwd)
-            .status()
-            .expect("spawn program");
-        RunResult::Exited(status.code().unwrap_or(128))
-    };
-    match cli::main(&ctx, &argv, &mut io, &mut run) {
-        cli::Outcome::Status(code) => code,
-        cli::Outcome::Suspended(_) => 148,
-    }
+    cli::main(&ctx, &argv, &mut io)
 }
 
 /// Open `path` for writing, report readiness, then on each stdin command
@@ -267,57 +258,6 @@ fn hold_open(path: &Path) -> i32 {
         }
         println!("done");
         std::io::stdout().flush().unwrap();
-    }
-    0
-}
-
-/// An external program that changes a tree through child processes:
-/// `create:NAME=DATA`, `rewrite:NAME=DATA` (same size, same mtime restored),
-/// `rename:FROM=TO`, `delete:NAME`, `child:STEP` (run STEP in a child
-/// process), `fail` (exit 3).
-fn mutate(dir: &Path, steps: &[String]) -> i32 {
-    for step in steps {
-        let (kind, arg) = step.split_once(':').unwrap_or((step.as_str(), ""));
-        match kind {
-            "create" => {
-                let (name, data) = arg.split_once('=').unwrap();
-                std::fs::write(dir.join(name), data).unwrap();
-            }
-            "rewrite" => {
-                let (name, data) = arg.split_once('=').unwrap();
-                let path = dir.join(name);
-                let before = std::fs::metadata(&path).unwrap();
-                assert_eq!(before.len() as usize, data.len(), "rewrite keeps the size");
-                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-                rustix::io::pwrite(&file, data.as_bytes(), 0).unwrap();
-                // Put the old mtime back: only ctime and content betray it.
-                file.set_modified(before.modified().unwrap()).unwrap();
-            }
-            "rename" => {
-                let (from, to) = arg.split_once('=').unwrap();
-                std::fs::rename(dir.join(from), dir.join(to)).unwrap();
-            }
-            "delete" => {
-                let path = dir.join(arg);
-                if path.is_dir() {
-                    std::fs::remove_dir_all(path).unwrap();
-                } else {
-                    std::fs::remove_file(path).unwrap();
-                }
-            }
-            "mkdir" => std::fs::create_dir(dir.join(arg)).unwrap(),
-            "child" => {
-                let status = std::process::Command::new(std::env::current_exe().unwrap())
-                    .arg("mutate")
-                    .arg(dir)
-                    .arg(arg.replacen('/', ":", 1))
-                    .status()
-                    .unwrap();
-                assert!(status.success());
-            }
-            "fail" => return 3,
-            other => panic!("unknown mutate step {other}"),
-        }
     }
     0
 }

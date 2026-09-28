@@ -6,10 +6,12 @@
 //! Screen assertions use `ptytest`'s independent terminal state, so terminal
 //! behavior is checked without a second parser in this consumer.
 
+use ptytest::{
+    CommandSpec, ExitStatus, ProtocolProfile, PtyTest, Scenario, Size, TerminalBaseline, TestEnv,
+};
 use std::cell::{Cell, RefCell};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use ptytest::{CommandSpec, ExitStatus, ProtocolProfile, PtyTest, Scenario, Size, TerminalBaseline, TestEnv};
 
 // ---------------------------------------------------------------------------
 // PTY harness
@@ -152,10 +154,10 @@ impl PtyShell {
             TestEnv::hermetic_utf8("C.UTF-8")
         }
         .expect("a supported hermetic locale must be available on PTY platforms")
-            .env("HOME", &home_path)
-            .env("USER", "testuser")
-            .env("PWD", &cwd)
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        .env("HOME", &home_path)
+        .env("USER", "testuser")
+        .env("PWD", &cwd)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
         let scenario = Scenario::new("ish interactive shell")
             .expect("valid scenario label")
             .command(command)
@@ -195,7 +197,9 @@ impl PtyShell {
     fn send(&self, input: &[u8]) {
         let mut terminal = self.terminal.borrow_mut();
         let deadline = terminal.deadline(std::time::Duration::from_secs(5));
-        terminal.send_bytes(deadline, input).expect("PTY write failed");
+        terminal
+            .send_bytes(deadline, input)
+            .expect("PTY write failed");
     }
 
     /// Send a string.
@@ -324,7 +328,9 @@ impl PtyShell {
         terminal.drain(deadline).expect("drain shell output");
         let output_length = terminal.raw_output().len();
         if output_length == self.output_offset.get() {
-            let _ = terminal.wait_for_output(deadline).expect("wait for shell output");
+            let _ = terminal
+                .wait_for_output(deadline)
+                .expect("wait for shell output");
         }
         let _ = terminal
             .wait_for_quiescence(deadline, std::time::Duration::from_millis(50))
@@ -380,9 +386,7 @@ impl PtyShell {
             }
         }
 
-        panic!(
-            "timed out after {timeout_ms}ms waiting for {marker:?}; output: {accumulated:?}"
-        );
+        panic!("timed out after {timeout_ms}ms waiting for {marker:?}; output: {accumulated:?}");
     }
 
     /// Wait for the shell prompt (` $ `).
@@ -497,7 +501,9 @@ fn snapshot_text(screen: &ptytest::ScreenSnapshot) -> String {
     let mut lines = (0..screen.row_count())
         .map(|row| screen.row(row).unwrap_or_default().trim_end().to_owned())
         .collect::<Vec<_>>();
-    while lines.last().is_some_and(String::is_empty) { lines.pop(); }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
     lines.join("\n")
 }
 
@@ -2009,8 +2015,7 @@ fn normal_resize_reanchors_wrapped_prompt() {
 
     let prompt_count = visible.matches("testuser@").count();
     assert_eq!(
-        prompt_count,
-        1,
+        prompt_count, 1,
         "resize should repaint one prompt, not duplicate the reflowed prompt: {:?}",
         screen
     );
@@ -3098,9 +3103,7 @@ fn external_commands_run_in_the_directory_a_list_cd_selected() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Recoverable filesystem operations (ish-undo) through the real shell
-// ---------------------------------------------------------------------------
+// Recoverable filesystem operations (ish-undo) through the real shell.
 
 fn undo_home(files: &[(&str, &str)]) -> PtyShell {
     PtyShell::spawn_with_opts(files, &[])
@@ -3290,23 +3293,6 @@ fn stopped_job_keeps_its_transaction_active_until_it_finishes() {
 }
 
 #[test]
-fn scoped_run_survives_stop_and_resume() {
-    let sh = undo_home(&[("proj/keep", "keep")]);
-    sh.type_str("undo run --scope proj -- sh -c 'echo a > proj/f; kill -STOP $$; echo b > proj/g; rm proj/keep'");
-    sh.enter();
-    sh.wait_for("stopped:", 3000);
-    sh.wait_for_prompt(3000);
-    let out = clean(&sh.run_command("fg"));
-    assert!(out.contains("2 created, 0 modified, 1 removed"), "{out}");
-    assert!(home_exists(&sh, "proj/g") && !home_exists(&sh, "proj/keep"));
-    // Three file changes and the scope directory's times.
-    let out = clean(&sh.run_command("undo"));
-    assert!(out.contains("reverted 4 changes"), "{out}");
-    assert!(!home_exists(&sh, "proj/f") && !home_exists(&sh, "proj/g"));
-    assert_eq!(home_file(&sh, "proj/keep").as_deref(), Some(&b"keep"[..]));
-}
-
-#[test]
 fn undo_builtins_are_registered_and_unsupported_options_fail() {
     let sh = undo_home(&[("f", "f")]);
     for name in ["undo", "rm", "mv"] {
@@ -3320,7 +3306,55 @@ fn undo_builtins_are_registered_and_unsupported_options_fail() {
     );
     assert!(home_exists(&sh, "f"));
     let out = clean(&sh.run_command("undo --help"));
-    assert!(out.contains("undo run --scope"), "{out}");
+    assert!(
+        out.contains("undo redo [id] [--dry-run]") && out.contains("undo volume"),
+        "{out}"
+    );
+    for gone in ["--force", "--only", "--scope", "undo diff"] {
+        assert!(!out.contains(gone), "{gone} is still advertised: {out}");
+    }
+    // What the interface no longer offers fails explicitly, and changes
+    // nothing.
+    let out = clean(&sh.run_command("undo --force; echo status $?"));
+    assert!(
+        out.contains("unexpected argument --force") && out.contains("status 2"),
+        "{out}"
+    );
+    let out = clean(&sh.run_command("undo run --scope . -- true; echo status $?"));
+    assert!(
+        out.contains("unexpected argument run") && out.contains("status 2"),
+        "{out}"
+    );
+    assert!(home_exists(&sh, "f"));
+}
+
+#[test]
+fn undo_reports_conflicts_and_leaves_newer_data_alone() {
+    let sh = undo_home(&[("f", "original")]);
+    sh.run_command("rm f");
+    sh.run_command("echo newer > f");
+    let out = clean(&sh.run_command("undo 1; echo status $?"));
+    assert!(
+        out.contains("conflict") && out.contains("status 1"),
+        "conflicts are reported and fail: {out}"
+    );
+    assert!(out.contains("run `undo 1` again"), "{out}");
+    assert_eq!(home_file(&sh, "f").as_deref(), Some(&b"newer\n"[..]));
+    let out = clean(&sh.run_command("undo --dry-run 1"));
+    assert!(out.contains("dry run") && out.contains("restore"), "{out}");
+    assert_eq!(home_file(&sh, "f").as_deref(), Some(&b"newer\n"[..]));
+}
+
+#[test]
+fn native_mv_renames_within_a_filesystem_and_undoes_it() {
+    let sh = undo_home(&[("a.txt", "a"), ("b.txt", "b")]);
+    sh.run_command("mv a.txt b.txt");
+    assert!(!home_exists(&sh, "a.txt"));
+    assert_eq!(home_file(&sh, "b.txt").as_deref(), Some(&b"a"[..]));
+    let out = clean(&sh.run_command("undo"));
+    assert!(out.contains("reverted 2 changes"), "{out}");
+    assert_eq!(home_file(&sh, "a.txt").as_deref(), Some(&b"a"[..]));
+    assert_eq!(home_file(&sh, "b.txt").as_deref(), Some(&b"b"[..]));
 }
 
 #[test]

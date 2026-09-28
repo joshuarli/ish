@@ -61,8 +61,11 @@ Subsystem ownership:
   integration.
 - `undo.rs`: per-input recovery transactions, native `rm`/`mv`/`undo`
   dispatch, and the redirection-open provider. The `crates/ish-undo` crate
-  owns filesystem operations, storage, journals, checkpoints, and replay; it
-  must not depend on ish's parser, history, line editor, or renderer.
+  owns filesystem operations, storage, journals, and replay; it must not
+  depend on ish's parser, history, line editor, or renderer. Its scope is
+  what the shell itself performs: do not add checkpointing of arbitrary
+  programs, selective or forced replay, or native cross-filesystem `mv`
+  without an explicit design decision. Design notes: `docs/UNDO.md`.
 
 Read the relevant module and its tests before changing behavior. Keep public
 interfaces narrow and preserve useful comments, especially comments explaining

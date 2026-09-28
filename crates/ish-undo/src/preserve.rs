@@ -538,47 +538,40 @@ pub fn check_evidence(
     }
 }
 
-/// Map from an original hard-link identity to the first restored name, so
-/// links within a restored set are rejoined.
-#[derive(Default)]
-pub struct LinkMap {
-    entries: Vec<((u64, u64), Vec<u8>)>,
-}
-
-impl LinkMap {
-    pub fn get(&self, key: (u64, u64)) -> Option<&[u8]> {
-        self.entries
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, p)| p.as_slice())
-    }
-
-    pub fn insert(&mut self, key: (u64, u64), path: Vec<u8>) {
-        self.entries.push((key, path));
-    }
-}
-
 /// Restore `saved` as a new entry named `tmp` in `dir`; the caller then
-/// publishes it with a no-replace or replacing rename. A stale entry of that
-/// name, left by an interrupted earlier attempt, is replaced. Frozen
-/// versions are restored through a new clone or copy, never by exposing the
-/// stored object itself.
+/// publishes it with a no-replace or replacing rename.
+///
+/// Creation is exclusive in every branch. An entry that already has the name
+/// is somebody else's: it is never touched and the error is `AlreadyExists`,
+/// so the caller can pick another name. Once created the entry is ours.
+/// `created` is called with its identity before any data goes into it, so the
+/// journal can name it, and the entry is removed again if that call or any
+/// later step fails. Frozen versions are restored through a new clone or
+/// copy, never by exposing the stored object itself.
 pub fn materialize(
     stores: &mut Stores,
     budget: &mut Budget<'_>,
     saved: &Saved,
     dir: BorrowedFd<'_>,
     tmp: &CStr,
+    created: &mut dyn FnMut(&Stat) -> io::Result<()>,
 ) -> io::Result<()> {
-    match sys::unlink_at(dir, tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    enum Made {
+        /// Complete on creation: a symlink or a relinked retained inode.
+        Whole,
+        /// A regular file to fill from `src`. A clone already has the data.
+        File {
+            src: OwnedFd,
+            size: u64,
+            fd: OwnedFd,
+            cloned: bool,
+        },
     }
-    match &saved.content {
+    let made = match &saved.content {
         Content::Symlink { target } => {
             sys::symlink_at(target, dir, tmp)?;
             let _ = sys::set_symlink_times(dir, tmp, saved.meta.atime, saved.meta.mtime);
+            Made::Whole
         }
         Content::Special { obj }
         | Content::File {
@@ -589,10 +582,12 @@ pub fn materialize(
             // object, still subject to the weaker linked-version contract.
             let (obj_dir, obj_name) = stores.object_entry(obj)?;
             sys::link_at(obj_dir.as_fd(), &obj_name, dir, tmp)?;
+            Made::Whole
         }
         Content::File { obj, .. } => {
             let src = stores.open_object(obj)?;
             let src_st = sys::fstat(src.as_fd())?;
+            let size = src_st.size;
             let dir_dev = sys::fstat(dir)?.dev;
             let cloned = src_st.dev == dir_dev
                 && !clone_known_unsupported(dir_dev)
@@ -605,42 +600,64 @@ pub fn materialize(
                     Err(e) => return Err(e),
                 };
             let fd = if cloned {
+                match open_for_meta(dir, tmp) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        let _ = sys::unlink_at(dir, tmp);
+                        return Err(e);
+                    }
+                }
+            } else {
+                sys::create_excl_at(dir, tmp, 0o600)?
+            };
+            Made::File {
+                src,
+                size,
+                fd,
+                cloned,
+            }
+        }
+    };
+    let result = (|| {
+        let st = match &made {
+            Made::Whole => sys::lstat_at(dir, tmp)?,
+            Made::File { fd, .. } => sys::fstat(fd.as_fd())?,
+        };
+        created(&st)?;
+        if let Made::File {
+            src,
+            size,
+            fd,
+            cloned,
+        } = &made
+        {
+            if *cloned {
                 budget.clones += 1;
-                let fd = open_for_meta(dir, tmp)?;
                 // Writable while attributes are copied; the recorded mode is
                 // applied below.
                 sys::set_mode(fd.as_fd(), 0o600)?;
-                if let Some(note) = sys::copy_file_metadata(src.as_fd(), fd.as_fd()) {
-                    budget.notes.push(note);
-                }
-                fd
             } else {
-                let dst = sys::create_excl_at(dir, tmp, 0o600)?;
-                let r = sys::copy_data(
+                sys::copy_data(
                     src.as_fd(),
-                    dst.as_fd(),
-                    src_st.size,
+                    fd.as_fd(),
+                    *size,
                     budget.cancel,
                     &mut budget.stats,
-                );
-                if r.is_ok()
-                    && let Some(note) = sys::copy_file_metadata(src.as_fd(), dst.as_fd())
-                {
-                    budget.notes.push(note);
-                }
-                if let Err(e) = r {
-                    drop(dst);
-                    let _ = sys::unlink_at(dir, tmp);
-                    return Err(e);
-                }
+                )?;
                 budget.copies += 1;
-                dst
-            };
+            }
+            if let Some(note) = sys::copy_file_metadata(src.as_fd(), fd.as_fd()) {
+                budget.notes.push(note);
+            }
             apply_file_meta(fd.as_fd(), &saved.meta, &mut budget.notes);
             sys::sync_file(fd.as_fd())?;
         }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = sys::unlink_at(dir, tmp);
     }
-    Ok(())
+    result
 }
 
 fn open_for_meta(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<OwnedFd> {

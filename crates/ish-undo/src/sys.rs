@@ -739,7 +739,7 @@ pub fn random_u64() -> u64 {
 
 /// Remove the entry `name` in `dir` and everything below it, without
 /// following symlinks and without crossing into other filesystems. Only
-/// used for trees ish itself owns (store directories, unpublished staging).
+/// used for trees ish itself owns (store directories).
 pub fn remove_tree(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<()> {
     fn remove(dir: BorrowedFd<'_>, name: &CStr, dev: u64, depth: usize) -> io::Result<()> {
         let st = match lstat_at(dir, name) {

@@ -17,6 +17,7 @@
 //! across `fg`.
 
 use std::cell::{RefCell, RefMut};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
@@ -26,6 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::Config;
 use crate::journal::{self, Action, Begin, Evidence, Record};
 use crate::preserve::{self, Budget};
+use crate::retention;
 use crate::store::{self, Home, Stores};
 use crate::sys;
 
@@ -82,7 +84,7 @@ pub struct Recorder {
     pub id: u64,
     pub home: Home,
     pub stores: Stores,
-    writer: journal::Writer,
+    pub(crate) writer: journal::Writer,
     op_counter: u64,
 }
 
@@ -199,7 +201,6 @@ impl Txn {
             started_ns: self.started_ns,
             cwd: self.cwd.clone(),
             command: self.command.clone(),
-            scope: None,
             detached: !current,
         };
         let id = home.allocate(begin, &lock)?;
@@ -361,10 +362,13 @@ pub fn seal(
         return Ok(());
     }
     let mut recorder = Recorder::open(&home, id)?;
+    // Held from the end record until the size is cached, so a replay cannot
+    // begin (and drop the cache) between the two.
+    let replay_lock = home.lock_replay(id).ok().flatten();
     let finals = final_paths(&scan.records);
     let never = AtomicBool::new(false);
     let mut budget = Budget::new(0, config.min_free, &never);
-    let mut records = Vec::new();
+    let mut records = Vec::with_capacity(finals.len() + 2);
     for path in finals {
         let p = Path::new(std::ffi::OsStr::from_bytes(&path));
         let evidence = match sys::split_parent(p)
@@ -391,39 +395,195 @@ pub fn seal(
         interrupted: status == 130,
     });
     recorder.stores.sync_objects()?;
-    recorder.append(&records, true)
+    recorder.append(&records, true)?;
+    if replay_lock.is_some() {
+        let retained =
+            journal::retained_logical(&scan.records) + journal::retained_logical(&records);
+        retention::cache_size(&home, id, retained, true);
+    }
+    Ok(())
 }
 
-/// Paths whose final recorded action created or wrote file content.
+/// Paths whose final recorded action created or wrote file content, which
+/// are the paths that need a post-image when the transaction is sealed.
+///
+/// Only operations that actually happened count: a commit record says how
+/// many of an operation's prepared actions were performed, and the rest say
+/// nothing about their paths. An operation with no commit (its writer was
+/// interrupted) is treated as performed, since evidence only records what is
+/// currently there. Linear in the number of recorded actions: a removal of
+/// any size has no create or write and costs one scan.
 fn final_paths(records: &[Record]) -> Vec<Vec<u8>> {
-    let mut last: Vec<(Vec<u8>, bool)> = Vec::new();
-    let mut set = |path: &[u8], needs: bool| {
-        if let Some(entry) = last.iter_mut().find(|(p, _)| p == path) {
-            entry.1 = needs;
-        } else {
-            last.push((path.to_vec(), needs));
+    fn visit<'a>(
+        wanted: &HashSet<&[u8]>,
+        seen: &mut HashSet<&'a [u8]>,
+        finals: &mut Vec<Vec<u8>>,
+        path: &'a [u8],
+        needs_post_image: bool,
+    ) {
+        if wanted.contains(path) && seen.insert(path) && needs_post_image {
+            finals.push(path.to_vec());
         }
-    };
+    }
+    let mut performed: HashMap<u64, u32> = HashMap::new();
+    let mut wanted: HashSet<&[u8]> = HashSet::new();
     for record in records {
-        if let Record::Prepare { actions, .. } = record {
-            for action in actions {
-                match action {
-                    Action::Create { path, .. } | Action::Write { path, .. } => set(path, true),
-                    Action::Rename { from, to, .. } => {
-                        set(from, false);
-                        set(to, false);
+        match record {
+            Record::Commit { op, done, .. } => {
+                performed.insert(*op, *done);
+            }
+            Record::Prepare { actions, .. } => {
+                for action in actions {
+                    if let Action::Create { path, .. } | Action::Write { path, .. } = action {
+                        wanted.insert(path);
                     }
-                    other => {
-                        for p in other.paths() {
-                            set(p, false);
-                        }
-                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    // The last performed action on each path decides, so walk backward and
+    // let the first one seen for a path shadow the earlier ones.
+    let mut seen: HashSet<&[u8]> = HashSet::new();
+    let mut finals = Vec::new();
+    for record in records.iter().rev() {
+        let Record::Prepare { op, actions } = record else {
+            continue;
+        };
+        let count = performed
+            .get(op)
+            .map_or(actions.len(), |&n| (n as usize).min(actions.len()));
+        for action in actions[..count].iter().rev() {
+            match action {
+                Action::Create { path, .. } | Action::Write { path, .. } => {
+                    visit(&wanted, &mut seen, &mut finals, path, true)
+                }
+                Action::Rename { from, to, .. } => {
+                    visit(&wanted, &mut seen, &mut finals, from, false);
+                    visit(&wanted, &mut seen, &mut finals, to, false);
+                }
+                Action::Unlink { path, .. } | Action::Rmdir { path, .. } => {
+                    visit(&wanted, &mut seen, &mut finals, path, false)
                 }
             }
         }
     }
-    last.into_iter()
-        .filter(|(_, needs)| *needs)
-        .map(|(p, _)| p)
-        .collect()
+    finals.reverse();
+    finals
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::{Ident, Meta, Saved};
+    use crate::sys::Kind;
+
+    fn ident() -> Ident {
+        Ident {
+            dev: 1,
+            ino: 1,
+            kind: Kind::File,
+            size: 0,
+            mtime: (0, 0),
+            ctime: (0, 0),
+        }
+    }
+
+    fn create(path: &str) -> Action {
+        Action::Create {
+            path: path.as_bytes().to_vec(),
+            ident: ident(),
+        }
+    }
+
+    fn unlink(path: &str) -> Action {
+        Action::Unlink {
+            path: path.as_bytes().to_vec(),
+            saved: Saved {
+                content: crate::journal::Content::Symlink { target: Vec::new() },
+                ident: ident(),
+                meta: Meta::default(),
+                nlink: 1,
+                copied: 0,
+            },
+        }
+    }
+
+    fn prepare(op: u64, actions: Vec<Action>) -> Record {
+        Record::Prepare { op, actions }
+    }
+
+    fn commit(op: u64, done: u32) -> Record {
+        Record::Commit {
+            op,
+            done,
+            error: None,
+        }
+    }
+
+    fn strs(paths: Vec<Vec<u8>>) -> Vec<String> {
+        paths
+            .into_iter()
+            .map(|p| String::from_utf8(p).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_last_performed_action_on_a_path_decides() {
+        let records = vec![
+            prepare(1, vec![create("/a"), create("/b"), create("/c")]),
+            commit(1, 3),
+            // /a is removed again, /b is moved away and /c stays.
+            prepare(2, vec![unlink("/a")]),
+            commit(2, 1),
+            prepare(
+                3,
+                vec![Action::Rename {
+                    from: b"/b".to_vec(),
+                    to: b"/d".to_vec(),
+                    ident: ident(),
+                }],
+            ),
+            commit(3, 1),
+        ];
+        assert_eq!(strs(final_paths(&records)), ["/c"]);
+    }
+
+    #[test]
+    fn actions_a_commit_says_did_not_happen_are_ignored() {
+        let records = vec![
+            prepare(1, vec![create("/a"), create("/b"), unlink("/a")]),
+            // Only the first action happened; the removal did not, so /a
+            // still holds the created file, and /b was never created.
+            commit(1, 1),
+        ];
+        assert_eq!(strs(final_paths(&records)), ["/a"]);
+    }
+
+    #[test]
+    fn an_operation_without_a_commit_is_treated_as_performed() {
+        let records = vec![prepare(1, vec![create("/a"), unlink("/b")])];
+        assert_eq!(strs(final_paths(&records)), ["/a"]);
+    }
+
+    #[test]
+    fn removals_need_no_bookkeeping() {
+        let actions: Vec<Action> = (0..50_000).map(|i| unlink(&format!("/d/f{i}"))).collect();
+        let records = vec![prepare(1, actions), commit(1, 50_000)];
+        assert!(final_paths(&records).is_empty());
+    }
+
+    #[test]
+    fn many_distinct_creations_keep_their_order() {
+        let n = 30_000;
+        let actions: Vec<Action> = (0..n).map(|i| create(&format!("/d/f{i}"))).collect();
+        let records = vec![prepare(1, actions), commit(1, n)];
+        let finals = strs(final_paths(&records));
+        assert_eq!(finals.len(), n as usize);
+        assert_eq!(finals[0], "/d/f0");
+        assert_eq!(finals[n as usize - 1], format!("/d/f{}", n - 1));
+    }
 }

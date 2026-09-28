@@ -6,7 +6,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::Stdio;
 
 use common::*;
-use ish_undo::journal::Displaced;
 
 #[test]
 fn same_path_recreation_blocks_restore_until_newer_change_is_undone() {
@@ -47,14 +46,63 @@ fn edits_after_capture_are_conflicts_not_casualties() {
     assert_eq!(fx.read("new"), b"generated, then edited by hand");
     let model = fx.model(id);
     assert!(model.actions.iter().any(|a| a.conflict.is_some()));
-    // A dry run reports the same conflict and changes nothing.
-    let (_, _, err) = fx.undo(&["--dry-run", &id.to_string()]);
-    assert!(err.contains("conflict"), "{err}");
-    assert_eq!(fx.read("new"), b"generated, then edited by hand");
+    assert!(
+        err.contains(&format!("undo {id}")),
+        "the retry is by id: {err}"
+    );
 }
 
 #[test]
-fn edits_after_undo_block_redo_and_force_preserves_them() {
+fn dry_run_shows_the_plan_and_changes_nothing() {
+    let fx = Fixture::new("dry-run");
+    fx.write("d/x", b"x");
+    fx.write("d/y", b"y");
+    let (_, id, _) = fx.shell(&[&format!("rm:{}", argv(&["-r", "d"]))]);
+    let journal = fx.home_store().journal_path(id);
+    let before = std::fs::read(&journal).unwrap();
+
+    let (status, out, err) = fx.undo(&["--dry-run"]);
+    assert_eq!(status, 0, "{err}");
+    assert!(out.contains("dry run for transaction"), "{out}");
+    for step in ["recreate directory", "restore", "d/x", "d/y"] {
+        assert!(out.contains(step), "{step}: {out}");
+    }
+    assert!(!fx.exists("d"), "nothing was restored");
+    assert_eq!(
+        std::fs::read(&journal).unwrap(),
+        before,
+        "a dry run writes no journal record"
+    );
+
+    // The real run performs exactly the planned steps.
+    let planned = out.lines().filter(|l| l.starts_with("  ")).count();
+    let (status, _, err) = fx.undo(&[]);
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains(&format!("reverted {planned} changes")),
+        "{err}"
+    );
+}
+
+#[test]
+fn dry_run_output_is_bounded() {
+    let fx = Fixture::new("dry-run-bounded");
+    for i in 0..260 {
+        fx.write(&format!("d/f{i:03}"), b"x");
+    }
+    fx.shell(&[&format!("rm:{}", argv(&["-r", "d"]))]);
+    let (status, out, err) = fx.undo(&["--dry-run"]);
+    assert_eq!(status, 0, "{err}");
+    // 260 files and their directory: 261 steps, of which 200 are shown.
+    assert!(out.contains("... and 61 more"), "{out}");
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with("  restore")).count(),
+        199
+    );
+}
+
+#[test]
+fn edits_after_undo_block_redo_until_the_user_resolves_them() {
     let fx = Fixture::new("edit-after-undo");
     fx.write("f", b"original");
     let (_, id, _) = fx.shell(&[&format!("rm:{}", argv(&["f"]))]);
@@ -62,19 +110,53 @@ fn edits_after_undo_block_redo_and_force_preserves_them() {
     assert_eq!(status, 0, "{err}");
     std::fs::write(fx.path("f"), b"edited after undo").unwrap();
 
+    // The edit is newer than anything redo recorded: redo reports a conflict
+    // and leaves it alone.
     let (status, _, err) = fx.undo(&["redo"]);
     assert_eq!(status, 1, "{err}");
+    assert!(err.contains("conflict"), "{err}");
+    assert_eq!(fx.read("f"), b"edited after undo");
+    let (status, _, err) = fx.undo(&["redo"]);
+    assert_eq!(status, 1, "a retry still conflicts: {err}");
     assert_eq!(fx.read("f"), b"edited after undo");
 
-    let (status, _, err) = fx.undo(&["redo", "--force"]);
+    // The user decides what happens to their edit, then retries by id.
+    std::fs::remove_file(fx.path("f")).unwrap();
+    let (status, _, err) = fx.undo(&["redo", &id.to_string()]);
     assert_eq!(status, 0, "{err}");
     assert!(!fx.exists("f"));
-    let model = fx.model(id);
-    let last = model.actions[0].last.as_ref().unwrap();
-    let Displaced::Saved(saved) = &last.displaced else {
-        panic!("the forced step preserved nothing: {:?}", last.displaced);
-    };
-    assert_eq!(saved.ident.size, b"edited after undo".len() as u64);
+    assert_eq!(fx.model(id).redoable(), 0);
+}
+
+#[test]
+fn removed_options_and_subcommands_are_refused() {
+    let fx = Fixture::new("removed-options");
+    fx.write("f", b"data");
+    let (_, id, _) = fx.shell(&[&format!("rm:{}", argv(&["f"]))]);
+    let id = id.to_string();
+    for args in [
+        vec!["--force", id.as_str()],
+        vec!["-f", id.as_str()],
+        vec!["--only", "f", id.as_str()],
+        vec!["redo", "--force"],
+        vec!["run", "--scope", ".", "--", "true"],
+        vec!["diff", id.as_str()],
+    ] {
+        let (status, _, err) = fx.undo(&args);
+        assert_eq!(status, 2, "{args:?}: {err}");
+        assert!(err.contains("unexpected argument"), "{args:?}: {err}");
+        let usage = err
+            .split("usage:")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{args:?}: {err}"));
+        for gone in ["--only", "--force", "scope", "diff", "undo run"] {
+            assert!(!usage.contains(gone), "{gone} is still advertised: {usage}");
+        }
+    }
+    assert!(!fx.exists("f"), "refused commands changed nothing");
+    let (status, _, err) = fx.undo(&[&id]);
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(fx.read("f"), b"data");
 }
 
 #[test]
@@ -123,30 +205,6 @@ fn overlapping_transactions_from_two_shells() {
     let (status, _, err) = fx.undo_with(SESSION, &[], &[]);
     assert_eq!(status, 0, "{err}");
     assert!(!fx.exists("f"));
-}
-
-#[test]
-fn selective_restore_includes_parents_and_later_run_finishes_the_rest() {
-    let fx = Fixture::new("only");
-    fx.write("d/x", b"x");
-    fx.write("d/y", b"y");
-    fx.write("d/sub/z", b"z");
-    let (_, id, _) = fx.shell(&[&format!("rm:{}", argv(&["-r", "d"]))]);
-
-    let (status, _, err) = fx.undo(&["--only", "d/sub/z"]);
-    assert_eq!(status, 0, "{err}");
-    assert_eq!(fx.read("d/sub/z"), b"z");
-    assert!(!fx.exists("d/x") && !fx.exists("d/y"));
-
-    // Changing the restored file must not be undone by the second run,
-    // which only performs the remaining steps.
-    std::fs::write(fx.path("d/sub/z"), b"z edited").unwrap();
-    let (status, _, err) = fx.undo(&[&id.to_string()]);
-    assert_eq!(status, 0, "{err}");
-    assert_eq!(fx.read("d/x"), b"x");
-    assert_eq!(fx.read("d/y"), b"y");
-    assert_eq!(fx.read("d/sub/z"), b"z edited");
-    assert_eq!(fx.model(id).undoable(), 0);
 }
 
 #[test]

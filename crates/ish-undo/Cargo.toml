@@ -2,7 +2,7 @@
 name = "ish-undo"
 version = "0.0.0"
 edition = "2024"
-description = "Recoverable filesystem operations and scoped checkpoints for ish"
+description = "Recoverable filesystem operations for ish"
 
 [dependencies]
 rustix = { version = "1.1.4", features = ["fs", "mm", "process", "termios", "time"] }

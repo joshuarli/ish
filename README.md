@@ -174,7 +174,6 @@ rm -r build            # removed, but recoverable
 undo                   # restores build/
 undo redo              # removes it again
 echo notes > log.txt   # truncation of an existing log.txt is recoverable too
-undo run --scope . -- make install   # record what an arbitrary program changes
 ```
 
 **What is captured.** One accepted input is one transaction. Within it, ish
@@ -187,26 +186,20 @@ captures:
   symlinks, in pipeline stages, and in command substitutions.
 
 Every other external command runs normally and is **not** captured; `undo
-list` and `undo show` report such inputs as having uncaptured commands.
-`undo run --scope <dir> -- <program> [args...]` covers arbitrary programs:
-it checkpoints the directory tree before the program starts and compares it
-after the program (and the children it waits for) completes. That records
-observed changes within one tree over one interval. It is not a sandbox,
-process attribution, or an atomic snapshot: concurrent writers and detached
-descendants that keep running can make recovery conflict or stay uncertain.
-Arguments expanded before the program starts, including command
-substitutions, are outside the checkpoint.
+list` and `undo show` report such inputs as having uncaptured commands. What
+a program does to files internally is outside what ish can record.
 
 **Native commands.** `rm` supports `-r`/`-R`, `-f`, `-i`, `-v`, and `--`;
 `mv` supports `-f`, `-i`, `-n`, `-v`, and `--`. Other options fail with
 status 2 instead of silently running an unprotected utility. Recursive
 removal does not cross mount points and never follows symlinks. The
-filesystem root, the undo store, and the store's ancestors are refused. A
-same-filesystem `mv` is a rename and copies nothing; its undo moves the same
-object back, carrying later edits along. A cross-filesystem `mv` copies to a
-staging name beside the target, publishes it, and only then removes the
-source. `rm -f` ignores missing files but never skips preservation: if a
-version cannot be preserved, the command fails and nothing is removed.
+filesystem root, the undo store, and the store's ancestors are refused.
+`mv` is a rename and copies nothing; its undo moves the same object back,
+carrying later edits along. A `mv` between filesystems is a copy and a
+removal, which native `mv` does not do: it is refused, nothing is moved, and
+the message points at `/bin/mv` for an unprotected move. `rm -f` ignores
+missing files but never skips preservation: if a version cannot be
+preserved, the command fails and nothing is removed.
 
 **Preservation.** Before anything is removed or overwritten, the affected
 version is saved and recorded durably:
@@ -215,7 +208,7 @@ version is saved and recorded durably:
 |---|---|---|
 | clone | the store is on the same filesystem and it supports cloning (APFS, btrfs, XFS) | frozen; no data moves |
 | linked | cloning is unavailable and the name is being unlinked | the retained inode; another hard link or an open writer can still change it |
-| copy | cloning is unavailable and contents must stay frozen (redirections, scoped checkpoints, other filesystems) | frozen, bounded by `ISH_UNDO_COPY_LIMIT` and `ISH_UNDO_MIN_FREE` |
+| copy | cloning is unavailable and contents must stay frozen (redirections, files on filesystems the store cannot clone from) | frozen, bounded by `ISH_UNDO_COPY_LIMIT` and `ISH_UNDO_MIN_FREE` |
 
 A write that needs a frozen pre-image and cannot get one is refused. `undo
 show` labels linked versions and every fidelity limitation (for example,
@@ -226,18 +219,18 @@ discards newer data: a deleted file is restored only where nothing exists
 now, a created or modified file is reverted only while it still matches what
 the transaction left (compared against a frozen post-image where one was
 taken), and a move is reversed only while the moved object is still there.
-Anything else is a conflict that is reported and left alone. `--force` first
-saves the conflicting current state, then proceeds; `undo redo` can bring it
-back. Runs are restartable: an interrupted or partly conflicting run is
-simply run again and skips completed steps.
+Anything else is a conflict: it is reported and left untouched, everything
+that can be undone still is, and there is no option to override a conflict.
+Resolve it (move your newer file aside, or delete it) and run `undo <id>`
+again; completed steps are skipped, so a retry only does what remains. The
+same holds for `undo redo`. `--dry-run` lists the steps a run would perform
+and touches nothing.
 
 ```
-undo [id] [--dry-run] [--only <path>] [--force]
-undo redo [id] [--dry-run] [--only <path>] [--force]
+undo [id] [--dry-run]
+undo redo [id] [--dry-run]
 undo list [-a]          # recent transactions; * marks this shell's
 undo show [id]          # coverage, state, stored versions, changes
-undo diff [id]          # bounded text diffs; binary and large files summarized
-undo run --scope <directory> -- <program> [arguments...]
 undo gc                 # apply the retention limits now
 undo purge <id>         # delete one transaction's saved versions
 undo doctor             # store health and capability probes
@@ -245,12 +238,12 @@ undo volume add <dir> | list | remove <dir|id>
 ```
 
 Plain `undo` and `undo redo` act on this shell's latest eligible
-transaction; ids address any shell's. `--only` paths are resolved against
-the directory the transaction ran in, and restoring a path also restores the
-directories and moves it depends on. `undo list`, `show`, `diff`, and
-`doctor` work in pipelines and command substitutions; commands that change
-recovery state must run in the shell itself. A job stopped with Ctrl+Z keeps
-its transaction open until it finishes after `fg`.
+transaction; ids address any shell's. `undo list`, `show`, and `doctor` work
+in pipelines and command substitutions; commands that change recovery state
+must run in the shell itself. A job stopped with Ctrl+Z keeps its
+transaction open until it finishes after `fg`. While a shell is undoing or
+redoing a transaction (state `replaying`), no other command touches it:
+`undo`, `undo redo`, `gc`, and `purge` all leave it alone.
 
 **Storage and retention.** Transactions and saved versions live under
 `~/.local/share/ish/undo` (private, versioned). Clones and hard links only
@@ -267,25 +260,37 @@ deleted. Retention is set with `set` in `config.ish` or at the prompt:
 | `ISH_UNDO_MAX_ENTRIES` | `500` | retained transactions |
 | `ISH_UNDO_MAX_DAYS` | `30` | age limit |
 | `ISH_UNDO_MIN_FREE` | `1G` | free space to leave when copying |
-| `ISH_UNDO_SCOPE_LIMIT` | `250000` | entries one scoped checkpoint may catalog |
 
 Collection runs at most hourly after a command that recorded something, or
 on `undo gc`, oldest first. It never collects active or interrupted
-transactions, those with versions on a disconnected volume, or the newest
-transaction. Sizes are shown as logical bytes, allocated blocks (an
-overestimate for clones, whose blocks may be shared), and bytes copied;
-exclusive copy-on-write usage is not measured.
+transactions, those with versions on a disconnected volume, those being
+replayed, or the newest completed transaction. Automatic collection is
+bounded by the work it does, not by how much it deletes: a pass loads at
+most 32 journals (and removes at most 32 orphaned volume directories), totals
+sizes from a small file written when each transaction is sealed, and picks up
+where it stopped at the next command boundary; `undo gc` has no such bound. Sizes are shown as logical bytes,
+allocated blocks (an overestimate for clones, whose blocks may be shared),
+and bytes copied; exclusive copy-on-write usage is not measured.
 
 **Durability.** Saved versions and the journal record describing them are
 flushed with `fsync` before the change they protect is made, in batches
-during recursive removal. A crashed or killed shell leaves a transaction
-that `undo list` shows as interrupted and that `undo` recovers from: records
-after a torn write are ignored, operations whose outcome was not recorded
-are checked against the filesystem, and saved versions are never deleted
-automatically. On macOS, `fsync` does not flush the drive's write cache
-(`F_FULLFSYNC` would), so after a power loss the most recent records may be
-missing; filesystems mounted without ordering guarantees can lose recent
-records on Linux too.
+during recursive removal. Undo and redo follow the same order: before a step
+removes or replaces anything, the version it displaces is saved, and a
+prepare record naming it and the hidden staging entry the step created beside
+its destination (`.ish-undo-<id>-<run>-<step>-<random>`, created exclusively
+and never reused) is flushed; only then does the step change the filesystem,
+and only afterwards is it recorded as done. A crashed or killed shell leaves
+a transaction that `undo list` shows as interrupted, or a replay that simply
+stopped, and the next run reconciles it: records after a torn write are
+ignored, operations whose outcome was not recorded are checked against the
+filesystem, a recorded staging entry is removed only while it is still the
+object that was recorded, and a step whose change already happened takes its
+displaced version from the prepare record, so redo still has it. Saved
+versions are never deleted automatically. A crash can leave a staging entry
+behind until the transaction is retried. On macOS, `fsync` does not flush
+the drive's write cache (`F_FULLFSYNC` would), so after a power loss the
+most recent records may be missing; filesystems mounted without ordering
+guarantees can lose recent records on Linux too.
 
 Directory and file metadata (modes, timestamps, extended attributes, ACLs
 and resource forks on macOS, BSD flags) is restored where an unprivileged
@@ -325,7 +330,7 @@ The result: the shell has a small, auditable interactive command evaluator. If y
 
 ## Architecture
 
-A Rust workspace: the `ish` package (library target and interactive binary) and `crates/ish-undo`, which owns native `rm`/`mv`, protected redirection opens, scoped checkpoints, the recovery store and journals, and replay. Platform code primarily uses `rustix`; `libc` remains a narrow compatibility escape hatch.
+A Rust workspace: the `ish` package (library target and interactive binary) and `crates/ish-undo`, which owns native `rm`/`mv`, protected redirection opens, the recovery store and journals, and replay. Platform code primarily uses `rustix`; `libc` remains a narrow compatibility escape hatch.
 
 Shell-owned operations stay native where possible: directory listing, git detection, pathname expansion, and completion do not spawn subprocesses. Running external commands, command substitutions, and the denv integration may spawn processes.
 

@@ -2565,9 +2565,7 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
 
             // Native builtins run after expansion, by exact command name.
             let is_main = rustix::process::getpid().as_raw_pid() == shell_pid;
-            if let Some(result) = ish::undo::dispatch(&name, args, is_main, &mut |argv| {
-                spawn_external(argv, env_pairs, shell_pid)
-            }) {
+            if let Some(result) = ish::undo::dispatch(&name, args, is_main) {
                 return result;
             }
             ish::undo::note_opaque();

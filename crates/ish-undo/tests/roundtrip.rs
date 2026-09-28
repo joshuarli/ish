@@ -12,7 +12,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::time::{Duration, SystemTime};
 
 use common::*;
-use ish_undo::journal::{Content, Strength};
+use ish_undo::testing::journal::{Content, Strength};
 
 fn set_mtime(path: &std::path::Path, secs: u64) {
     let t = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
@@ -29,7 +29,7 @@ fn dir_xattr_name() -> &'static std::ffi::CStr {
 }
 
 fn set_dir_xattr(path: &std::path::Path, value: &[u8]) -> bool {
-    let fd = ish_undo::sys::open_dir(path).unwrap();
+    let fd = ish_undo::testing::sys::open_dir(path).unwrap();
     rustix::fs::fsetxattr(
         &fd,
         dir_xattr_name(),
@@ -40,7 +40,7 @@ fn set_dir_xattr(path: &std::path::Path, value: &[u8]) -> bool {
 }
 
 fn get_dir_xattr(path: &std::path::Path) -> Option<Vec<u8>> {
-    let fd = ish_undo::sys::open_dir(path).unwrap();
+    let fd = ish_undo::testing::sys::open_dir(path).unwrap();
     let mut buf = vec![0u8; 256];
     let n = rustix::fs::fgetxattr(&fd, dir_xattr_name(), &mut buf[..]).ok()?;
     buf.truncate(n);
@@ -146,8 +146,8 @@ fn moving_a_directory_does_not_copy_it() {
     let (status, id, err) = fx.shell(&[&format!("mv:{}", argv(&["tree", "dest"]))]);
     assert_eq!(status, 0, "{err}");
     assert!(fx.path("dest/tree/f49").exists());
-    let mut stores = ish_undo::store::Stores::new(fx.home_store(), id).unwrap();
-    let usage = ish_undo::retention::usage(&mut stores, id);
+    let mut stores = ish_undo::testing::store::Stores::new(fx.home_store(), id).unwrap();
+    let usage = ish_undo::testing::retention::usage(&mut stores, id);
     assert_eq!(usage.objects, 0, "a rename preserves nothing");
     let (status, _, err) = fx.undo(&[]);
     assert_eq!(status, 0, "{err}");
@@ -351,13 +351,13 @@ fn byte_copy_fallback_keeps_sparse_files_sparse() {
 
 #[test]
 fn dangerous_targets_are_refused_without_executing() {
-    use ish_undo::ops::{Guard, Refusal};
+    use ish_undo::testing::{Guard, Refusal};
     let fx = Fixture::new("guards");
     fx.write("f", b"x");
     // Create the store so its ancestors are protected.
     fx.shell(&[&format!("rm:{}", argv(&["f"]))]);
     let guard = Guard::new(std::slice::from_ref(&fx.store));
-    let stat = |p: &std::path::Path| ish_undo::sys::lstat(p).unwrap();
+    let stat = |p: &std::path::Path| ish_undo::testing::sys::lstat(p).unwrap();
     let name = |p: &std::path::Path| {
         p.file_name()
             .unwrap_or(std::ffi::OsStr::new("/"))
@@ -381,7 +381,7 @@ fn dangerous_targets_are_refused_without_executing() {
         );
     }
     let inside = fx.store.join("txn");
-    let parent = ish_undo::sys::open_dir(&fx.store).unwrap();
+    let parent = ish_undo::testing::sys::open_dir(&fx.store).unwrap();
     use std::os::fd::AsFd;
     assert!(matches!(
         guard.check(&name(&inside), &stat(&inside), Some(parent.as_fd())),
@@ -391,7 +391,7 @@ fn dangerous_targets_are_refused_without_executing() {
         guard.check(std::ffi::OsStr::new(".."), &stat(&fx.work), None),
         Err(Refusal::DotOrDotDot)
     );
-    let work_parent = ish_undo::sys::open_dir(&fx.root).unwrap();
+    let work_parent = ish_undo::testing::sys::open_dir(&fx.root).unwrap();
     assert_eq!(
         guard.check(&name(&fx.work), &stat(&fx.work), Some(work_parent.as_fd())),
         Ok(())
@@ -441,7 +441,7 @@ fn file_metadata_survives_capture_and_restore() {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::fd::AsFd;
-        ish_undo::sys::set_flags(file.as_fd(), libc::UF_HIDDEN).unwrap();
+        ish_undo::testing::sys::set_flags(file.as_fd(), libc::UF_HIDDEN).unwrap();
     }
     drop(file);
 

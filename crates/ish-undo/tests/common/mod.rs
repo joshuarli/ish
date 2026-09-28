@@ -14,9 +14,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use ish_undo::journal::{Action, Strength};
-use ish_undo::replay::Model;
-use ish_undo::store::Home;
+use ish_undo::testing::journal::{Action, Strength};
+use ish_undo::testing::replay::Model;
+use ish_undo::testing::store::Home;
 
 pub const SESSION: u64 = 0x5e55_1011;
 pub const OTHER_SESSION: u64 = 0x5e55_2022;
@@ -44,7 +44,7 @@ impl Fixture {
         let home = root.join("home");
         std::fs::create_dir(&work).unwrap();
         std::fs::create_dir(&home).unwrap();
-        let store = ish_undo::store::root_for_home(home.as_os_str());
+        let store = ish_undo::testing::store::root_for_home(home.as_os_str());
         Fixture {
             root,
             work,
@@ -184,8 +184,8 @@ pub fn clone_supported(dir: &Path) -> bool {
     let a = dir.join(".clone-probe-a");
     std::fs::write(&a, b"probe").unwrap();
     let src = std::fs::File::open(&a).unwrap();
-    let d = ish_undo::sys::open_dir(dir).unwrap();
-    let ok = ish_undo::sys::clone_file(src.as_fd(), d.as_fd(), c".clone-probe-b").is_ok();
+    let d = ish_undo::testing::sys::open_dir(dir).unwrap();
+    let ok = ish_undo::testing::sys::clone_file(src.as_fd(), d.as_fd(), c".clone-probe-b").is_ok();
     let _ = std::fs::remove_file(&a);
     let _ = std::fs::remove_file(dir.join(".clone-probe-b"));
     ok

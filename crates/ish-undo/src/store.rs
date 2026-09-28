@@ -9,8 +9,9 @@
 //! volumes                registered volume stores (id and hex path per line)
 //! sessions/<id>.lock     held by each running shell that recorded something
 //! txn/<id>/journal       transaction journal
+//! txn/<id>/replay.lock   held while the transaction is replayed or deleted
+//! txn/<id>/size          cached logical size, and whether the journal is sealed
 //! txn/<id>/obj/<name>    saved versions on the home filesystem
-//! txn/<id>/before.cat    scoped checkpoint catalog
 //! ```
 //!
 //! A volume store (`<dir>/.ish-undo`) holds saved versions for another
@@ -19,8 +20,14 @@
 //! transaction, so associations can be rebuilt without the central catalog.
 //! The central journal and a volume store never commit atomically together;
 //! objects without a journal reference are orphan candidates, not garbage.
+//!
+//! `replay.lock` is created with the transaction and never again: replay,
+//! garbage collection, and purge all open it without `O_CREAT`, so a lock
+//! file cannot reappear inside a transaction directory that is being deleted.
+//! Whoever holds it is the only process allowed to write to or remove the
+//! transaction's directory after it was sealed.
 
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -152,6 +159,21 @@ impl Lock {
             .mode(0o600)
             .open(path)?
             .into();
+        Lock::try_lock(fd)
+    }
+
+    /// Try to take the lock on a file that must already exist. `Ok(None)`
+    /// means another process holds it; a missing file is `NotFound`.
+    pub fn try_acquire_existing(path: &Path) -> io::Result<Option<Lock>> {
+        let fd: OwnedFd = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .into();
+        Lock::try_lock(fd)
+    }
+
+    fn try_lock(fd: OwnedFd) -> io::Result<Option<Lock>> {
         match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(Some(Lock { fd })),
             Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
@@ -236,6 +258,14 @@ impl Home {
         self.txn_dir(id).join("journal")
     }
 
+    /// Take transaction `id`'s replay lock without waiting. `Ok(None)` means
+    /// another process is replaying (or deleting) it; `NotFound` means the
+    /// transaction has no lock file, which only a transaction that is gone
+    /// or damaged lacks.
+    pub fn lock_replay(&self, id: u64) -> io::Result<Option<Lock>> {
+        Lock::try_acquire_existing(&self.txn_dir(id).join("replay.lock"))
+    }
+
     pub fn session_lock_path(&self, session: u64) -> PathBuf {
         self.root
             .join("sessions")
@@ -259,6 +289,11 @@ impl Home {
         let dir = self.txn_dir(id);
         private_dir(&self.root.join("txn"))?;
         fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join("replay.lock"))?;
         begin.id = id;
         journal::create(&dir.join("journal"), &[Record::Begin(begin)])?;
         sys::sync_dir(sys::open_dir(&self.root.join("txn"))?.as_fd())?;
@@ -609,8 +644,4 @@ pub fn hold_session_lock(home: &Home, session: u64) -> io::Result<OwnedFd> {
         .into();
     rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
     Ok(fd)
-}
-
-pub fn cstr_name(name: &CStr) -> &OsStr {
-    OsStr::from_bytes(name.to_bytes())
 }
