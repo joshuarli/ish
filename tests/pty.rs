@@ -2955,12 +2955,12 @@ fn job_suspend_and_resume() {
     );
 }
 
-/// Paste a 2 KiB payload via bracketed paste and verify the shell
+/// Paste a 9 KiB payload via bracketed paste and verify the shell
 /// instantly rejects it with "[paste exceeded 8KB limit]".
 #[test]
 fn bracketed_paste_over_limit_rejected() {
-    let content: String = "x".repeat(2048);
-    assert!(content.len() > 1024);
+    let content: String = "x".repeat(9 * 1024);
+    assert!(content.len() > 8192);
 
     let sh = PtyShell::spawn();
 
