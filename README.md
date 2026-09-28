@@ -127,6 +127,9 @@ Expansion order: tilde, parameter expansion, command substitution, pathname expa
 | `true` / `false` | Return 0 / 1 |
 | `copy-scrollback` | Copy session to clipboard via OSC 52 |
 | `ish-dump` | Write the current layout state to `~/.cache/ish/dump-<random hex>` (same as Ctrl+P) |
+| `rm [-f \| -i] [-rRv] [--] file...` | Protected native removal (see [Undo](#undo)) |
+| `mv [-f \| -i \| -n] [-v] [--] source... target` | Protected native move |
+| `undo ...` | Revert, reapply, inspect, and manage recorded changes |
 
 ### `l` — Native Directory Listing
 
@@ -161,6 +164,135 @@ If an AND-OR list was suspended while running its first command (`a && b`, suspe
 
 Automatic `.envrc`/`.env` loading when [denv](https://github.com/joshuarli/denv) is in PATH. Runs on every `cd` with a fast-path check (file mtimes vs sentinel) to skip the subprocess when nothing changed. `denv allow`, `denv deny`, `denv reload` work as expected.
 
+### Undo
+
+ish records what its own filesystem operations change, so they can be
+reverted and reapplied:
+
+```
+rm -r build            # removed, but recoverable
+undo                   # restores build/
+undo redo              # removes it again
+echo notes > log.txt   # truncation of an existing log.txt is recoverable too
+undo run --scope . -- make install   # record what an arbitrary program changes
+```
+
+**What is captured.** One accepted input is one transaction. Within it, ish
+captures:
+
+- native `rm` and `mv`, resolved after expansion (aliases, globs, quoting,
+  and `command rm` all reach them; an explicit path such as `/bin/rm` runs
+  the external utility without capture);
+- writable redirections (`>`, `>|`, `>>`, `<>`, `&>`), including through
+  symlinks, in pipeline stages, and in command substitutions.
+
+Every other external command runs normally and is **not** captured; `undo
+list` and `undo show` report such inputs as having uncaptured commands.
+`undo run --scope <dir> -- <program> [args...]` covers arbitrary programs:
+it checkpoints the directory tree before the program starts and compares it
+after the program (and the children it waits for) completes. That records
+observed changes within one tree over one interval. It is not a sandbox,
+process attribution, or an atomic snapshot: concurrent writers and detached
+descendants that keep running can make recovery conflict or stay uncertain.
+Arguments expanded before the program starts, including command
+substitutions, are outside the checkpoint.
+
+**Native commands.** `rm` supports `-r`/`-R`, `-f`, `-i`, `-v`, and `--`;
+`mv` supports `-f`, `-i`, `-n`, `-v`, and `--`. Other options fail with
+status 2 instead of silently running an unprotected utility. Recursive
+removal does not cross mount points and never follows symlinks. The
+filesystem root, the undo store, and the store's ancestors are refused. A
+same-filesystem `mv` is a rename and copies nothing; its undo moves the same
+object back, carrying later edits along. A cross-filesystem `mv` copies to a
+staging name beside the target, publishes it, and only then removes the
+source. `rm -f` ignores missing files but never skips preservation: if a
+version cannot be preserved, the command fails and nothing is removed.
+
+**Preservation.** Before anything is removed or overwritten, the affected
+version is saved and recorded durably:
+
+| Kind | When | Contract |
+|---|---|---|
+| clone | the store is on the same filesystem and it supports cloning (APFS, btrfs, XFS) | frozen; no data moves |
+| linked | cloning is unavailable and the name is being unlinked | the retained inode; another hard link or an open writer can still change it |
+| copy | cloning is unavailable and contents must stay frozen (redirections, scoped checkpoints, other filesystems) | frozen, bounded by `ISH_UNDO_COPY_LIMIT` and `ISH_UNDO_MIN_FREE` |
+
+A write that needs a frozen pre-image and cannot get one is refused. `undo
+show` labels linked versions and every fidelity limitation (for example,
+ownership that could not be restored without privileges).
+
+**Replay.** `undo` checks the current filesystem before every step and never
+discards newer data: a deleted file is restored only where nothing exists
+now, a created or modified file is reverted only while it still matches what
+the transaction left (compared against a frozen post-image where one was
+taken), and a move is reversed only while the moved object is still there.
+Anything else is a conflict that is reported and left alone. `--force` first
+saves the conflicting current state, then proceeds; `undo redo` can bring it
+back. Runs are restartable: an interrupted or partly conflicting run is
+simply run again and skips completed steps.
+
+```
+undo [id] [--dry-run] [--only <path>] [--force]
+undo redo [id] [--dry-run] [--only <path>] [--force]
+undo list [-a]          # recent transactions; * marks this shell's
+undo show [id]          # coverage, state, stored versions, changes
+undo diff [id]          # bounded text diffs; binary and large files summarized
+undo run --scope <directory> -- <program> [arguments...]
+undo gc                 # apply the retention limits now
+undo purge <id>         # delete one transaction's saved versions
+undo doctor             # store health and capability probes
+undo volume add <dir> | list | remove <dir|id>
+```
+
+Plain `undo` and `undo redo` act on this shell's latest eligible
+transaction; ids address any shell's. `--only` paths are resolved against
+the directory the transaction ran in, and restoring a path also restores the
+directories and moves it depends on. `undo list`, `show`, `diff`, and
+`doctor` work in pipelines and command substitutions; commands that change
+recovery state must run in the shell itself. A job stopped with Ctrl+Z keeps
+its transaction open until it finishes after `fg`.
+
+**Storage and retention.** Transactions and saved versions live under
+`~/.local/share/ish/undo` (private, versioned). Clones and hard links only
+work within one filesystem, so for another volume, register a private store
+with `undo volume add <mount point>`; its versions stay there, and while the
+volume is disconnected its transactions are reported as unavailable, never
+deleted. Retention is set with `set` in `config.ish` or at the prompt:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ISH_UNDO` | `on` | `off` runs `rm`/`mv` as external commands and opens redirections unprotected |
+| `ISH_UNDO_COPY_LIMIT` | `64M` | bytes one operation may copy when cloning is unavailable |
+| `ISH_UNDO_MAX_SIZE` | `8G` | logical size of retained versions |
+| `ISH_UNDO_MAX_ENTRIES` | `500` | retained transactions |
+| `ISH_UNDO_MAX_DAYS` | `30` | age limit |
+| `ISH_UNDO_MIN_FREE` | `1G` | free space to leave when copying |
+| `ISH_UNDO_SCOPE_LIMIT` | `250000` | entries one scoped checkpoint may catalog |
+
+Collection runs at most hourly after a command that recorded something, or
+on `undo gc`, oldest first. It never collects active or interrupted
+transactions, those with versions on a disconnected volume, or the newest
+transaction. Sizes are shown as logical bytes, allocated blocks (an
+overestimate for clones, whose blocks may be shared), and bytes copied;
+exclusive copy-on-write usage is not measured.
+
+**Durability.** Saved versions and the journal record describing them are
+flushed with `fsync` before the change they protect is made, in batches
+during recursive removal. A crashed or killed shell leaves a transaction
+that `undo list` shows as interrupted and that `undo` recovers from: records
+after a torn write are ignored, operations whose outcome was not recorded
+are checked against the filesystem, and saved versions are never deleted
+automatically. On macOS, `fsync` does not flush the drive's write cache
+(`F_FULLFSYNC` would), so after a power loss the most recent records may be
+missing; filesystems mounted without ordering guarantees can lose recent
+records on Linux too.
+
+Directory and file metadata (modes, timestamps, extended attributes, ACLs
+and resource forks on macOS, BSD flags) is restored where an unprivileged
+user can set it; inode numbers and change times are not. Directory ACLs on
+macOS are not recorded. Files with hard links outside a removed set come
+back as independent files, and the other links keep their newer contents.
+
 ### Config
 
 `~/.config/ish/config.ish`:
@@ -193,7 +325,7 @@ The result: the shell has a small, auditable interactive command evaluator. If y
 
 ## Architecture
 
-Single Rust package with a library target and interactive binary. Platform code primarily uses `rustix`; `libc` remains a narrow compatibility escape hatch.
+A Rust workspace: the `ish` package (library target and interactive binary) and `crates/ish-undo`, which owns native `rm`/`mv`, protected redirection opens, scoped checkpoints, the recovery store and journals, and replay. Platform code primarily uses `rustix`; `libc` remains a narrow compatibility escape hatch.
 
 Shell-owned operations stay native where possible: directory listing, git detection, pathname expansion, and completion do not spawn subprocesses. Running external commands, command substitutions, and the denv integration may spawn processes.
 

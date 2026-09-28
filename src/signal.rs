@@ -75,6 +75,53 @@ fn set_default(sig: rustix::process::Signal) {
     }
 }
 
+static INTERRUPT_FLAG: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicBool> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+unsafe extern "C" fn interrupt_handler(_sig: i32) {
+    let flag = INTERRUPT_FLAG.load(std::sync::atomic::Ordering::Relaxed);
+    if !flag.is_null() {
+        // SAFETY: the flag is a `'static` atomic; storing to it is
+        // async-signal-safe.
+        unsafe { (*flag).store(true, std::sync::atomic::Ordering::Relaxed) };
+    }
+}
+
+/// While a native builtin runs in the shell (or a pipeline child forked from
+/// it), turn SIGINT into a cancellation flag instead of ignoring it. The
+/// handler is installed without `SA_RESTART`, so a blocking prompt read
+/// returns `EINTR`.
+pub fn catch_interrupts(flag: &'static std::sync::atomic::AtomicBool) {
+    flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    INTERRUPT_FLAG.store(
+        flag as *const _ as *mut std::sync::atomic::AtomicBool,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // libc `signal` would add SA_RESTART on musl; sigaction with no
+        // flags keeps blocking reads interruptible.
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = interrupt_handler as *const () as usize;
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        let _ = libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        darwin_sigaction(
+            rustix::process::Signal::INT.as_raw(),
+            interrupt_handler as *const () as usize,
+            0,
+        );
+    }
+}
+
+/// Return to ignoring SIGINT after a native builtin.
+pub fn ignore_interrupts() {
+    ignore(rustix::process::Signal::INT);
+}
+
 /// Read one signal byte from the self-pipe. Returns the signal number or None.
 pub fn read_signal() -> Option<i32> {
     let mut byte = 0u8;
