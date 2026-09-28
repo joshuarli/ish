@@ -2519,6 +2519,11 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
 
             let mut cmd = std::process::Command::new(args[0].to_os_string());
             cmd.args(args[1..].iter().map(|arg| arg.to_os_string()));
+            // `cd` inside a list changes epsh's working directory, not the
+            // process's; run the child where the shell is.
+            if let Some(cwd) = epsh::eval::external_command_cwd() {
+                cmd.current_dir(cwd);
+            }
 
             // Store-authoritative child environment: the child inherits
             // nothing from ish's process environment. Its env comes entirely

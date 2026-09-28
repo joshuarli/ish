@@ -3083,3 +3083,17 @@ fn bracketed_paste_exactly_at_limit_accepted() {
         "1024-byte paste was wrongly rejected: {clean:?}"
     );
 }
+
+/// `cd` earlier in a list changes epsh's working directory, not the
+/// process's; external commands later in the list must still run there.
+#[test]
+fn external_commands_run_in_the_directory_a_list_cd_selected() {
+    let sh = PtyShell::spawn_with_opts(&[("sub/.keep", "")], &[]);
+    let out = PtyShell::strip_ansi(&sh.run_command("cd sub && /bin/pwd"));
+    let sub = std::fs::canonicalize(sh.home_path().join("sub")).unwrap();
+    assert!(
+        out.contains(&*sub.to_string_lossy()),
+        "expected {} in: {out:?}",
+        sub.display()
+    );
+}
