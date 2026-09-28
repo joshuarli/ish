@@ -54,10 +54,19 @@ version = "0.0.0"
 dependencies = [
  "epsh",
  "fxhash",
+ "ish-undo",
  "laputa-ptytest",
  "libc",
  "rustix",
  "rustybench",
+]
+
+[[package]]
+name = "ish-undo"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]

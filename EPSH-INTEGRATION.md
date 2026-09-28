@@ -20,6 +20,15 @@ epsh's `cd` changes only its own working directory, not the process's. The
 external handler reads `epsh::eval::external_command_cwd()` and runs children
 there, so in `cd /tmp && ls`, `ls` runs in `/tmp`.
 
+## Recovery Hooks
+
+ish installs epsh's optional redirection-open provider
+(`set_redirect_open_handler`), which owns the actual `open` of `>`, `>|`,
+`>>`, and `<>` targets so ish-undo can preserve an existing file before it is
+truncated or exposed for writing. Without a provider, epsh opens as before.
+Native `rm` and `mv` resolve relative paths against the same
+`external_command_cwd()`.
+
 ## Exec Error Reporting
 
 Because ish replaces `eval_external` with its own handler (issue #2 below), it

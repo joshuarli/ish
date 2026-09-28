@@ -201,6 +201,12 @@ fn main() {
         shell_pid,
     };
 
+    // Writable redirections open through ish-undo so existing contents are
+    // preserved before truncation or writable exposure.
+    shell
+        .epsh
+        .set_redirect_open_handler(ish::undo::redirect_provider());
+
     denv::init(&mut shell.epsh);
     let changes = denv::on_startup(&shell.epsh);
     apply_denv_changes(&changes, &mut shell.epsh);
@@ -232,6 +238,11 @@ fn main() {
                 shell.session_log.push_str(&line);
                 shell.session_log.push('\n');
 
+                // One accepted input is one recovery transaction, begun
+                // before any expansion or command substitution runs.
+                let expanded = shell.aliases.expand_line(&line);
+                ish::undo::begin(&shell.epsh, &expanded);
+
                 // Handle ish-level commands that must be intercepted before epsh
                 let first_command_word = line.split_whitespace().next().unwrap_or("");
                 let simple_words = lex_simple_command_words(&line);
@@ -241,6 +252,7 @@ fn main() {
                         true
                     }
                     "exit" => {
+                        ish::undo::end(0, false);
                         if handle_exit_command(&line, &mut shell) {
                             break;
                         }
@@ -307,7 +319,11 @@ fn main() {
                         true
                     }
                     "fg" => {
-                        shell.last_status = ish::job::resume_job(&mut shell.job);
+                        let (status, work) = ish::job::resume_job(&mut shell.job);
+                        shell.last_status = status;
+                        if let Some(work) = work {
+                            ish::undo::finish_job(work, status);
+                        }
                         true
                     }
                     "z" => {
@@ -365,6 +381,7 @@ fn main() {
                 };
 
                 if handled {
+                    ish::undo::end(shell.last_status, false);
                     let reset_history = first_command_word == "history"
                         && line.split_whitespace().nth(1) == Some("reset");
                     if history_line.trim() != "l" && !reset_history {
@@ -372,9 +389,6 @@ fn main() {
                     }
                     continue;
                 }
-
-                // Expand aliases and run through epsh
-                let expanded = shell.aliases.expand_line(&line);
 
                 // If any command in the line is `history`, flush entries
                 // to the text file so forked children can read them.
@@ -400,13 +414,22 @@ fn main() {
                     sync_cwd_change(&mut shell, &prev_cwd, new_cwd);
                 }
 
-                // Detect job suspension (status 148 = 128 + SIGTSTP)
+                // Detect job suspension (status 148 = 128 + SIGTSTP). A
+                // stopped job keeps its recovery transaction active.
                 if shell.last_status == 148
                     && let Some((pgid, cmd, termios)) =
                         STOPPED_JOB.with(|cell| cell.borrow_mut().take())
                 {
                     eprintln!("ish: stopped: {} (pgid={})", cmd, pgid);
-                    shell.job = Some(Job { pgid, cmd, termios });
+                    let undo = ish::undo::end(148, true);
+                    shell.job = Some(Job {
+                        pgid,
+                        cmd,
+                        termios,
+                        undo,
+                    });
+                } else {
+                    ish::undo::end(shell.last_status, false);
                 }
 
                 if history_line.trim() != "l" {
@@ -1781,6 +1804,28 @@ fn start_completion(
     let first_command_word = text.split_whitespace().next().unwrap_or("");
     let dirs_only = first_command_word == "cd" && word_start > 0;
 
+    // `undo` takes a subcommand as its first argument.
+    if first_command_word == "undo" && word_start > 0 && existing.is_empty() && !in_quote {
+        for sub in ish_undo::cli::SUBCOMMANDS {
+            if sub.starts_with(partial.as_str()) {
+                comp.push(sub, false, false, false);
+            }
+        }
+        if !comp.is_empty() {
+            let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
+            return CompletionState {
+                comp,
+                selected: 0,
+                cols,
+                rows,
+                scroll: 0,
+                term_cols,
+                dir_prefix: String::new(),
+                in_quote,
+            };
+        }
+    }
+
     // SSH-aware completion: hostname and remote path
     const SSH_CMDS: &[&str] = &["ssh", "scp", "rsync", "sftp", "mosh"];
     if word_start > 0 && SSH_CMDS.contains(&first_command_word) {
@@ -2359,10 +2404,14 @@ fn render_dir_picker_mode(
 fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
     if shell.job.is_some() {
         if shell.exit_warned {
-            if let Some(job) = shell.job.take()
-                && let Some(pgid) = rustix::process::Pid::from_raw(job.pgid)
-            {
-                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::TERM);
+            if let Some(job) = shell.job.take() {
+                if let Some(pgid) = rustix::process::Pid::from_raw(job.pgid) {
+                    let _ =
+                        rustix::process::kill_process_group(pgid, rustix::process::Signal::TERM);
+                }
+                if let Some(work) = job.undo {
+                    ish::undo::finish_job(work, 143);
+                }
             }
             return true; // break
         } else {
@@ -2514,128 +2563,145 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                 _ => {}
             }
 
-            // External command: fork/exec with job control
+            // Native builtins run after expansion, by exact command name.
             let is_main = rustix::process::getpid().as_raw_pid() == shell_pid;
-
-            let mut cmd = std::process::Command::new(args[0].to_os_string());
-            cmd.args(args[1..].iter().map(|arg| arg.to_os_string()));
-            // `cd` inside a list changes epsh's working directory, not the
-            // process's; run the child where the shell is.
-            if let Some(cwd) = epsh::eval::external_command_cwd() {
-                cmd.current_dir(cwd);
+            if let Some(result) = ish::undo::dispatch(&name, args, is_main, &mut |argv| {
+                spawn_external(argv, env_pairs, shell_pid)
+            }) {
+                return result;
             }
-
-            // Store-authoritative child environment: the child inherits
-            // nothing from ish's process environment. Its env comes entirely
-            // from epsh's variable store (exported vars, inherited
-            // non-shell-name entries) plus any prefix assignments, so
-            // `set`/`export`/`unset` are reflected exactly in children.
-            cmd.env_clear();
-            for (k, v) in env_pairs {
-                cmd.env(k.to_os_string(), v.to_os_string());
-            }
-
-            if is_main {
-                // In the child: become its own process group leader and restore
-                // signal dispositions that the shell overrode (especially SIGTSTP,
-                // which the shell ignores — children must inherit SIG_DFL or
-                // Ctrl+Z will never stop them).
-                //
-                // setpgid(0, 0) here (in the child, before exec) is race-free;
-                // the parent's setpgid(child_id, child_id) after spawn() is a
-                // belt-and-suspenders duplicate for the parent-side view.
-                unsafe {
-                    cmd.pre_exec(|| {
-                        let _ = rustix::process::setpgid(None, None);
-                        ish::signal::restore_defaults();
-                        Ok(())
-                    });
-                }
-            }
-
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    let child_id = child.id() as i32;
-                    let child_pid = unsafe { rustix::process::Pid::from_raw_unchecked(child_id) };
-
-                    if is_main {
-                        // Parent: duplicate setpgid (child did it too — no race)
-                        // and hand the terminal to the new process group.
-                        let _ = rustix::process::setpgid(Some(child_pid), Some(child_pid));
-                        let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
-                        let _ = rustix::termios::tcsetpgrp(stdin, child_pid);
-
-                        // Wait with WUNTRACED for job control
-                        let status = rustix::process::waitpid(
-                            Some(child_pid),
-                            rustix::process::WaitOptions::UNTRACED,
-                        )
-                        .ok()
-                        .and_then(|result| result.map(|(_, status)| status));
-
-                        // Reclaim terminal
-                        let _ = rustix::termios::tcsetpgrp(stdin, rustix::process::getpgrp());
-
-                        if status.is_some_and(|status| status.stopped()) {
-                            // Capture the terminal state the stopped process left behind,
-                            // then save it in the thread-local so the main loop can build a Job.
-                            let saved_termios =
-                                term::save_termios().expect("terminal attributes unavailable");
-                            let cmd = args[0].to_shell_string();
-                            STOPPED_JOB.with(|cell| {
-                                *cell.borrow_mut() = Some((child_id, cmd, saved_termios));
-                            });
-                            Err(epsh::error::ShellError::Stopped {
-                                pid: child_id,
-                                pgid: child_id,
-                            })
-                        } else if let Some(status) = status.filter(|status| status.exited()) {
-                            Ok(epsh::error::ExitStatus::from(
-                                status.exit_status().unwrap_or(1),
-                            ))
-                        } else if let Some(status) = status.filter(|status| status.signaled()) {
-                            Ok(epsh::error::ExitStatus::from(
-                                128 + status.terminating_signal().unwrap_or(0),
-                            ))
-                        } else {
-                            Ok(epsh::error::ExitStatus::FAILURE)
-                        }
-                    } else {
-                        // Pipeline child: just wait normally
-                        match child.wait() {
-                            Ok(s) => Ok(epsh::error::ExitStatus::from(s.code().unwrap_or(128))),
-                            Err(e) => Err(epsh::error::ShellError::Io(e)),
-                        }
-                    }
-                }
-                Err(e) => {
-                    if let Some(code) = e.raw_os_error() {
-                        // Match epsh's default exec error reporting: an executable
-                        // script whose interpreter is broken surfaces as a bare
-                        // ENOTDIR/ENOENT/EACCES.
-                        let cwd = std::env::current_dir().unwrap_or_default();
-                        let path_env = env_pair_value(env_pairs, "PATH")
-                            .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
-                        if let Some(msg) =
-                            epsh::eval::bad_interpreter_message(&name, code, &cwd, &path_env)
-                        {
-                            eprintln!("{msg}");
-                            return Ok(epsh::error::ExitStatus::NOT_EXECUTABLE);
-                        }
-                    }
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        eprintln!("{name}: not found");
-                        Ok(epsh::error::ExitStatus::NOT_FOUND)
-                    } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        eprintln!("{name}: permission denied");
-                        Ok(epsh::error::ExitStatus::NOT_EXECUTABLE)
-                    } else {
-                        Err(epsh::error::ShellError::Io(e))
-                    }
-                }
-            }
+            ish::undo::note_opaque();
+            spawn_external(args, env_pairs, shell_pid)
         },
     )
+}
+
+/// Fork/exec an external command with job control when running in the
+/// shell process itself; pipeline children wait without terminal handoff.
+fn spawn_external(
+    args: &[epsh::shell_bytes::ShellBytes],
+    env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)],
+    shell_pid: i32,
+) -> epsh::error::Result<epsh::error::ExitStatus> {
+    let name = args[0].to_shell_string();
+    let is_main = rustix::process::getpid().as_raw_pid() == shell_pid;
+
+    let mut cmd = std::process::Command::new(args[0].to_os_string());
+    cmd.args(args[1..].iter().map(|arg| arg.to_os_string()));
+    // `cd` inside a list changes epsh's working directory, not the
+    // process's; run the child where the shell is.
+    if let Some(cwd) = epsh::eval::external_command_cwd() {
+        cmd.current_dir(cwd);
+    }
+
+    // Store-authoritative child environment: the child inherits
+    // nothing from ish's process environment. Its env comes entirely
+    // from epsh's variable store (exported vars, inherited
+    // non-shell-name entries) plus any prefix assignments, so
+    // `set`/`export`/`unset` are reflected exactly in children.
+    cmd.env_clear();
+    for (k, v) in env_pairs {
+        cmd.env(k.to_os_string(), v.to_os_string());
+    }
+
+    if is_main {
+        // In the child: become its own process group leader and restore
+        // signal dispositions that the shell overrode (especially SIGTSTP,
+        // which the shell ignores — children must inherit SIG_DFL or
+        // Ctrl+Z will never stop them).
+        //
+        // setpgid(0, 0) here (in the child, before exec) is race-free;
+        // the parent's setpgid(child_id, child_id) after spawn() is a
+        // belt-and-suspenders duplicate for the parent-side view.
+        unsafe {
+            cmd.pre_exec(|| {
+                let _ = rustix::process::setpgid(None, None);
+                ish::signal::restore_defaults();
+                Ok(())
+            });
+        }
+    }
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let child_id = child.id() as i32;
+            let child_pid = unsafe { rustix::process::Pid::from_raw_unchecked(child_id) };
+
+            if is_main {
+                // Parent: duplicate setpgid (child did it too — no race)
+                // and hand the terminal to the new process group.
+                let _ = rustix::process::setpgid(Some(child_pid), Some(child_pid));
+                let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
+                let _ = rustix::termios::tcsetpgrp(stdin, child_pid);
+
+                // Wait with WUNTRACED for job control
+                let status = rustix::process::waitpid(
+                    Some(child_pid),
+                    rustix::process::WaitOptions::UNTRACED,
+                )
+                .ok()
+                .and_then(|result| result.map(|(_, status)| status));
+
+                // Reclaim terminal
+                let _ = rustix::termios::tcsetpgrp(stdin, rustix::process::getpgrp());
+
+                if status.is_some_and(|status| status.stopped()) {
+                    // Capture the terminal state the stopped process left behind,
+                    // then save it in the thread-local so the main loop can build a Job.
+                    let saved_termios =
+                        term::save_termios().expect("terminal attributes unavailable");
+                    let cmd = args[0].to_shell_string();
+                    STOPPED_JOB.with(|cell| {
+                        *cell.borrow_mut() = Some((child_id, cmd, saved_termios));
+                    });
+                    Err(epsh::error::ShellError::Stopped {
+                        pid: child_id,
+                        pgid: child_id,
+                    })
+                } else if let Some(status) = status.filter(|status| status.exited()) {
+                    Ok(epsh::error::ExitStatus::from(
+                        status.exit_status().unwrap_or(1),
+                    ))
+                } else if let Some(status) = status.filter(|status| status.signaled()) {
+                    Ok(epsh::error::ExitStatus::from(
+                        128 + status.terminating_signal().unwrap_or(0),
+                    ))
+                } else {
+                    Ok(epsh::error::ExitStatus::FAILURE)
+                }
+            } else {
+                // Pipeline child: just wait normally
+                match child.wait() {
+                    Ok(s) => Ok(epsh::error::ExitStatus::from(s.code().unwrap_or(128))),
+                    Err(e) => Err(epsh::error::ShellError::Io(e)),
+                }
+            }
+        }
+        Err(e) => {
+            if let Some(code) = e.raw_os_error() {
+                // Match epsh's default exec error reporting: an executable
+                // script whose interpreter is broken surfaces as a bare
+                // ENOTDIR/ENOENT/EACCES.
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let path_env = env_pair_value(env_pairs, "PATH")
+                    .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+                if let Some(msg) = epsh::eval::bad_interpreter_message(&name, code, &cwd, &path_env)
+                {
+                    eprintln!("{msg}");
+                    return Ok(epsh::error::ExitStatus::NOT_EXECUTABLE);
+                }
+            }
+            if e.kind() == std::io::ErrorKind::NotFound {
+                eprintln!("{name}: not found");
+                Ok(epsh::error::ExitStatus::NOT_FOUND)
+            } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!("{name}: permission denied");
+                Ok(epsh::error::ExitStatus::NOT_EXECUTABLE)
+            } else {
+                Err(epsh::error::ShellError::Io(e))
+            }
+        }
+    }
 }
 
 /// Check if input needs a continuation line (open quotes, trailing operator, etc.)
@@ -2679,6 +2745,9 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
                 if let Some(pgid) = rustix::process::Pid::from_raw(job.pgid) {
                     let _ =
                         rustix::process::kill_process_group(pgid, rustix::process::Signal::TERM);
+                }
+                if let Some(work) = job.undo {
+                    ish::undo::finish_job(work, 143);
                 }
             }
             ReadResult::Exit

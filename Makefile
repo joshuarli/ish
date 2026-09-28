@@ -27,7 +27,7 @@ test-ci:
 
 release:
 	$(call cargo,release-static) clean -p $(NAME) --release --target $(TARGET)
-	$(call cargo,release-static) build --release \
+	$(call cargo,release-static) build --release -p $(NAME) \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
@@ -71,7 +71,7 @@ bench-syscalls:
 
 release-dynamic:
 	$(call cargo,release-dynamic) clean -p $(NAME) --release --target $(TARGET)
-	$(call cargo,release-dynamic) build --release \
+	$(call cargo,release-dynamic) build --release -p $(NAME) \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)

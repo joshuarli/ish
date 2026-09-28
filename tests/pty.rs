@@ -3097,3 +3097,245 @@ fn external_commands_run_in_the_directory_a_list_cd_selected() {
         sub.display()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Recoverable filesystem operations (ish-undo) through the real shell
+// ---------------------------------------------------------------------------
+
+fn undo_home(files: &[(&str, &str)]) -> PtyShell {
+    PtyShell::spawn_with_opts(files, &[])
+}
+
+fn home_file(sh: &PtyShell, rel: &str) -> Option<Vec<u8>> {
+    std::fs::read(sh.home_path().join(rel)).ok()
+}
+
+fn home_exists(sh: &PtyShell, rel: &str) -> bool {
+    std::fs::symlink_metadata(sh.home_path().join(rel)).is_ok()
+}
+
+fn clean(out: &str) -> String {
+    PtyShell::strip_ansi(out)
+}
+
+#[test]
+fn undo_restores_native_rm_through_aliases_globs_and_quoting() {
+    let sh = undo_home(&[
+        ("a.tmp", "a"),
+        ("b.tmp", "b"),
+        ("with space.txt", "spaced"),
+        ("keep.txt", "keep"),
+    ]);
+    sh.run_command("alias del rm -v");
+    let out = clean(&sh.run_command("del *.tmp 'with space.txt'"));
+    assert!(
+        out.contains("a.tmp") && out.contains("with space.txt"),
+        "{out}"
+    );
+    assert!(!home_exists(&sh, "a.tmp") && !home_exists(&sh, "with space.txt"));
+    let out = clean(&sh.run_command("undo"));
+    assert!(out.contains("reverted 3 changes"), "{out}");
+    assert_eq!(home_file(&sh, "a.tmp").as_deref(), Some(&b"a"[..]));
+    assert_eq!(
+        home_file(&sh, "with space.txt").as_deref(),
+        Some(&b"spaced"[..])
+    );
+
+    // `command rm` is ordinary lookup and still protected; an explicit path
+    // runs the external utility without capture.
+    sh.run_command("command rm keep.txt");
+    assert!(!home_exists(&sh, "keep.txt"));
+    let out = clean(&sh.run_command("undo"));
+    assert!(out.contains("reverted 1 change"), "{out}");
+    sh.run_command("/bin/rm keep.txt");
+    assert!(!home_exists(&sh, "keep.txt"));
+    let out = clean(&sh.run_command("undo"));
+    assert!(
+        out.contains("nothing to undo"),
+        "the /bin/rm input was not captured: {out}"
+    );
+    assert!(!home_exists(&sh, "keep.txt"));
+}
+
+#[test]
+fn undo_covers_pipeline_stages_substitutions_and_list_branches() {
+    let sh = undo_home(&[
+        ("p.txt", "pipeline"),
+        ("s.txt", "substitution"),
+        ("run.txt", "run"),
+        ("skip.txt", "skip"),
+        ("never.txt", "never"),
+    ]);
+    sh.run_command("rm p.txt | cat; echo $(rm s.txt; echo made) > made.txt");
+    assert!(!home_exists(&sh, "p.txt") && !home_exists(&sh, "s.txt"));
+    assert_eq!(home_file(&sh, "made.txt").as_deref(), Some(&b"made\n"[..]));
+    let out = clean(&sh.run_command("undo"));
+    assert!(
+        out.contains("reverted 3 changes"),
+        "one transaction spans forks: {out}"
+    );
+    assert!(home_exists(&sh, "p.txt") && home_exists(&sh, "s.txt"));
+    assert!(!home_exists(&sh, "made.txt"));
+
+    sh.run_command("false && rm skip.txt; rm run.txt || rm never.txt");
+    assert!(!home_exists(&sh, "run.txt"));
+    assert!(home_exists(&sh, "skip.txt") && home_exists(&sh, "never.txt"));
+    let out = clean(&sh.run_command("undo show"));
+    let changes: String = out
+        .split("changes:")
+        .nth(1)
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .take_while(|line| line.trim_start().starts_with('['))
+        .collect();
+    assert!(changes.contains("run.txt"), "{out}");
+    assert!(
+        !changes.contains("skip.txt") && !changes.contains("never.txt"),
+        "{out}"
+    );
+
+    // Read-only inspection may run in a pipeline; recovery may not.
+    let out = clean(&sh.run_command("undo list | cat"));
+    assert!(out.contains("rm run.txt"), "{out}");
+    let out = clean(&sh.run_command("undo | cat"));
+    assert!(out.contains("must run in the shell itself"), "{out}");
+    assert!(!home_exists(&sh, "run.txt"));
+}
+
+#[test]
+fn undo_records_redirections_in_order_including_failed_commands() {
+    let sh = undo_home(&[("existing.txt", "precious"), ("target.txt", "target")]);
+    sh.run_command("echo first > one.txt > two.txt");
+    assert_eq!(home_file(&sh, "one.txt").as_deref(), Some(&b""[..]));
+    assert_eq!(home_file(&sh, "two.txt").as_deref(), Some(&b"first\n"[..]));
+
+    // The first redirection truncates; the second fails, so the command
+    // never runs, but the truncation is still recorded.
+    let out = clean(&sh.run_command("echo lost > existing.txt 2> no/such/dir/err"));
+    assert!(out.contains("no/such/dir/err"), "{out}");
+    assert_eq!(home_file(&sh, "existing.txt").as_deref(), Some(&b""[..]));
+    sh.run_command("undo");
+    assert_eq!(
+        home_file(&sh, "existing.txt").as_deref(),
+        Some(&b"precious"[..])
+    );
+    sh.run_command("undo");
+    assert!(!home_exists(&sh, "one.txt") && !home_exists(&sh, "two.txt"));
+
+    // Appending through a symlink protects the target and keeps the link.
+    std::os::unix::fs::symlink("target.txt", sh.home_path().join("link.txt")).unwrap();
+    sh.run_command("echo more >> link.txt");
+    assert_eq!(
+        home_file(&sh, "target.txt").as_deref(),
+        Some(&b"targetmore\n"[..])
+    );
+    sh.run_command("undo");
+    assert_eq!(
+        home_file(&sh, "target.txt").as_deref(),
+        Some(&b"target"[..])
+    );
+    assert!(
+        std::fs::symlink_metadata(sh.home_path().join("link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    // Non-regular targets keep normal behavior and are not versions.
+    let out = clean(&sh.run_command("echo gone > /dev/null && echo ok"));
+    assert!(out.contains("ok"), "{out}");
+}
+
+#[test]
+fn native_commands_use_the_list_working_directory() {
+    let sh = undo_home(&[("sub/inner.txt", "inner")]);
+    sh.run_command("cd sub && rm inner.txt");
+    assert!(!home_exists(&sh, "sub/inner.txt"));
+    sh.run_command("undo");
+    assert!(home_exists(&sh, "sub/inner.txt"));
+}
+
+#[test]
+fn ctrl_c_interrupts_an_interactive_native_rm() {
+    let sh = undo_home(&[("d/a", "a"), ("d/b", "b")]);
+    sh.type_str("rm -ri d");
+    sh.enter();
+    sh.wait_for("descend into directory", 3000);
+    sh.ctrl_c();
+    let out = clean(&sh.wait_for_prompt(3000));
+    assert!(out.contains("interrupted"), "{out}");
+    assert!(home_exists(&sh, "d/a") && home_exists(&sh, "d/b"));
+    let out = clean(&sh.run_command("echo status $?"));
+    assert!(out.contains("status 130"), "{out}");
+}
+
+#[test]
+fn stopped_job_keeps_its_transaction_active_until_it_finishes() {
+    let sh = undo_home(&[]);
+    sh.type_str("echo x > s.txt; sh -c 'kill -STOP $$'");
+    sh.enter();
+    sh.wait_for("stopped:", 3000);
+    sh.wait_for_prompt(3000);
+    assert!(home_exists(&sh, "s.txt"));
+    let out = clean(&sh.run_command("undo list"));
+    assert!(out.contains("active"), "{out}");
+    let out = clean(&sh.run_command("undo"));
+    assert!(out.contains("nothing to undo"), "{out}");
+
+    sh.run_command("fg");
+    let out = clean(&sh.run_command("undo"));
+    assert!(out.contains("reverted 1 change"), "{out}");
+    assert!(!home_exists(&sh, "s.txt"));
+}
+
+#[test]
+fn scoped_run_survives_stop_and_resume() {
+    let sh = undo_home(&[("proj/keep", "keep")]);
+    sh.type_str("undo run --scope proj -- sh -c 'echo a > proj/f; kill -STOP $$; echo b > proj/g; rm proj/keep'");
+    sh.enter();
+    sh.wait_for("stopped:", 3000);
+    sh.wait_for_prompt(3000);
+    let out = clean(&sh.run_command("fg"));
+    assert!(out.contains("2 created, 0 modified, 1 removed"), "{out}");
+    assert!(home_exists(&sh, "proj/g") && !home_exists(&sh, "proj/keep"));
+    // Three file changes and the scope directory's times.
+    let out = clean(&sh.run_command("undo"));
+    assert!(out.contains("reverted 4 changes"), "{out}");
+    assert!(!home_exists(&sh, "proj/f") && !home_exists(&sh, "proj/g"));
+    assert_eq!(home_file(&sh, "proj/keep").as_deref(), Some(&b"keep"[..]));
+}
+
+#[test]
+fn undo_builtins_are_registered_and_unsupported_options_fail() {
+    let sh = undo_home(&[("f", "f")]);
+    for name in ["undo", "rm", "mv"] {
+        let out = clean(&sh.run_command(&format!("w {name}")));
+        assert!(out.contains("builtin"), "{out}");
+    }
+    let out = clean(&sh.run_command("rm -P f; echo status $?"));
+    assert!(
+        out.contains("unsupported option -P") && out.contains("status 2"),
+        "{out}"
+    );
+    assert!(home_exists(&sh, "f"));
+    let out = clean(&sh.run_command("undo --help"));
+    assert!(out.contains("undo run --scope"), "{out}");
+}
+
+#[test]
+fn inputs_without_mutations_never_create_the_undo_store() {
+    let sh = undo_home(&[("f", "x")]);
+    sh.run_command("echo hi; /bin/ls; cat f > /dev/null; cat < f; l");
+    assert!(
+        !home_exists(&sh, ".local/share/ish/undo"),
+        "read-only inputs must not allocate recovery storage"
+    );
+    // Subcommands complete after `undo`, and inspection creates nothing.
+    sh.type_str("undo sh");
+    sh.tab();
+    sh.wait_for("show", 2000);
+    let out = clean(&sh.run_command(""));
+    assert!(out.contains("nothing has been recorded yet"), "{out}");
+    assert!(!home_exists(&sh, ".local/share/ish/undo"));
+}

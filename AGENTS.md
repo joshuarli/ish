@@ -59,6 +59,10 @@ Subsystem ownership:
 - `history.rs`, `frecency.rs`: persistent history, fuzzy search, and ranking.
 - `alias.rs`, `config.rs`, `denv.rs`: aliases, `config.ish`, and denv
   integration.
+- `undo.rs`: per-input recovery transactions, native `rm`/`mv`/`undo`
+  dispatch, and the redirection-open provider. The `crates/ish-undo` crate
+  owns filesystem operations, storage, journals, checkpoints, and replay; it
+  must not depend on ish's parser, history, line editor, or renderer.
 
 Read the relevant module and its tests before changing behavior. Keep public
 interfaces narrow and preserve useful comments, especially comments explaining
@@ -80,7 +84,10 @@ details here that are likely to change.
 Notable builtin rules:
 
 - State-changing builtins (`cd`, `exit`, `fg`, `set`, `unset`, and `alias`) must
-  run in the shell process.
+  run in the shell process. `undo` subcommands that change recovery state
+  refuse to run in pipeline stages or command substitutions.
+- Native `rm` and `mv` fail closed: if a version cannot be preserved, nothing
+  is mutated. Do not add a silent fallback to an unprotected utility.
 - Pipeline-safe output builtins may participate in pipelines.
 - New builtins belong in the builtin registry and in the appropriate
   state-changing or pipeline-safe execution path, with integration/PTY coverage
