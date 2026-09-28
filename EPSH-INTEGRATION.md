@@ -14,6 +14,12 @@ The main loop flow:
 4. `epsh.run_script(&expanded)` — epsh does everything else
 5. Observe state changes (cwd, exit status) and run hooks
 
+## Working Directory of External Commands
+
+epsh's `cd` changes only its own working directory, not the process's. The
+external handler reads `epsh::eval::external_command_cwd()` and runs children
+there, so in `cd /tmp && ls`, `ls` runs in `/tmp`.
+
 ## Exec Error Reporting
 
 Because ish replaces `eval_external` with its own handler (issue #2 below), it
