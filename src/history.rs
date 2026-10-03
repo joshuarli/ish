@@ -1131,10 +1131,10 @@ impl History {
             return;
         }
 
-        let query_lower = lowercase_query(query);
+        let query = PreparedQuery::new(query);
         for &idx in candidates {
             let entry = self.entry_text(idx);
-            let Some(mut m) = classify_match(&query_lower, entry, idx) else {
+            let Some(mut m) = query.classify(entry, idx) else {
                 continue;
             };
             m.score += self.cwd_weight(idx, cwd);
@@ -1234,13 +1234,13 @@ impl History {
             return;
         }
 
-        let query_lower = lowercase_query(query);
+        let query = PreparedQuery::new(query);
         for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
             if !self.is_session_visible(idx) {
                 continue;
             }
             let entry = &self.arena[start as usize..start as usize + len as usize];
-            if let Some(mut m) = classify_match(&query_lower, entry, idx) {
+            if let Some(mut m) = query.classify(entry, idx) {
                 m.score += self.cwd_weight(idx, cwd);
                 results.push(m);
             }
@@ -1488,6 +1488,39 @@ pub struct FuzzyMatch {
     pub score: i16,
 }
 
+/// A lowercased query prepared once per search. ASCII queries also keep their
+/// bytes, so ASCII entries (nearly all history) are classified without char
+/// decoding. Entries with non-ASCII text keep the char path: it compares
+/// Unicode-lowercased chars and reports char positions, which byte matching
+/// would change.
+struct PreparedQuery {
+    chars: Vec<char>,
+    ascii: Option<([u8; 32], usize)>,
+}
+
+impl PreparedQuery {
+    fn new(query: &str) -> Self {
+        let chars = lowercase_query(query);
+        let ascii = (query.is_ascii() && query.len() <= 32).then(|| {
+            let mut bytes = [0u8; 32];
+            for (slot, byte) in bytes.iter_mut().zip(query.bytes()) {
+                *slot = byte.to_ascii_lowercase();
+            }
+            (bytes, query.len())
+        });
+        Self { chars, ascii }
+    }
+
+    fn classify(&self, text: &str, entry_idx: usize) -> Option<FuzzyMatch> {
+        match &self.ascii {
+            Some((bytes, len)) if text.is_ascii() => {
+                classify_match_ascii(&bytes[..*len], text, entry_idx)
+            }
+            _ => classify_match(&self.chars, text, entry_idx),
+        }
+    }
+}
+
 fn classify_match(query: &[char], text: &str, entry_idx: usize) -> Option<FuzzyMatch> {
     if starts_with_icase(query, text) {
         return Some(contiguous_match(entry_idx, 3, 0, query.len()));
@@ -1513,6 +1546,13 @@ fn classify_match(query: &[char], text: &str, entry_idx: usize) -> Option<FuzzyM
 fn classify_match_ascii(query: &[u8], text: &str, entry_idx: usize) -> Option<FuzzyMatch> {
     if starts_with_icase_ascii(query, text.as_bytes()) {
         return Some(contiguous_match(entry_idx, 3, 0, query.len()));
+    }
+
+    // Every substring is also a subsequence, so entries that fail this
+    // single-pass check skip both substring scans and the window search.
+    // Most entries fail it while the query is still being typed.
+    if !is_subsequence_ascii_bytes(query, text.as_bytes()) {
+        return None;
     }
 
     if let Some(start) = find_substring_icase_ascii_bytes(query, text.as_bytes(), true) {
@@ -1626,16 +1666,24 @@ fn find_substring_icase_ascii_bytes(
         return None;
     }
 
-    'start: for start in 0..=text.len() - query.len() {
-        if boundary_only && start > 0 && !is_word_boundary_byte(text[start - 1]) {
-            continue;
+    // `query` is ASCII-lowercased, so a start can only begin at its first byte
+    // in either case. Jump between those instead of testing every start.
+    let first = query[0];
+    let first_upper = first.to_ascii_uppercase();
+    let last_start = text.len() - query.len();
+    let mut start = 0;
+    while start <= last_start {
+        start += find_either_byte(&text[start..=last_start], first, first_upper)?;
+        let at_boundary = start == 0 || is_word_boundary_byte(text[start - 1]);
+        if (at_boundary || !boundary_only)
+            && text[start + 1..start + query.len()]
+                .iter()
+                .zip(&query[1..])
+                .all(|(&byte, &query_byte)| byte.to_ascii_lowercase() == query_byte)
+        {
+            return Some(start);
         }
-        for (offset, &query_byte) in query.iter().enumerate() {
-            if text[start + offset].to_ascii_lowercase() != query_byte {
-                continue 'start;
-            }
-        }
-        return Some(start);
+        start += 1;
     }
 
     None
@@ -1723,6 +1771,59 @@ fn subsequence_match_ascii(query: &[char], text: &str) -> Option<([u16; 32], u8)
     }
 
     Some((positions, qlen as u8))
+}
+
+const BYTE_WORD_ONES: u64 = 0x0101_0101_0101_0101;
+const BYTE_WORD_HIGHS: u64 = 0x8080_8080_8080_8080;
+
+#[inline]
+fn zero_byte_mask(word: u64) -> u64 {
+    word.wrapping_sub(BYTE_WORD_ONES) & !word & BYTE_WORD_HIGHS
+}
+
+/// Index of the first byte equal to `first` or `second`, eight bytes at a time.
+/// History entries are short, where this beats a libc `memchr` call per byte
+/// of the query.
+#[inline]
+fn find_either_byte(haystack: &[u8], first: u8, second: u8) -> Option<usize> {
+    let first_word = u64::from(first) * BYTE_WORD_ONES;
+    let second_word = u64::from(second) * BYTE_WORD_ONES;
+    let mut words = haystack.chunks_exact(8);
+    for (index, chunk) in (&mut words).enumerate() {
+        let word = u64::from_le_bytes(chunk.try_into().unwrap());
+        let matches = zero_byte_mask(word ^ first_word) | zero_byte_mask(word ^ second_word);
+        if matches != 0 {
+            return Some(index * 8 + matches.trailing_zeros() as usize / 8);
+        }
+    }
+    let offset = haystack.len() - words.remainder().len();
+    words
+        .remainder()
+        .iter()
+        .position(|&byte| byte == first || byte == second)
+        .map(|index| offset + index)
+}
+
+/// Whether `query` (already ASCII-lowercased) is a case-insensitive
+/// subsequence of `text`. Agrees with `subsequence_match_ascii_bytes` returning
+/// `Some`, without computing positions.
+fn is_subsequence_ascii_bytes(query: &[u8], mut text: &[u8]) -> bool {
+    for &byte in query {
+        let uppercase = byte.to_ascii_uppercase();
+        // Query bytes usually continue a run in the text, so test the next
+        // byte before setting up a word scan.
+        if let Some((&next, rest)) = text.split_first()
+            && (next == byte || next == uppercase)
+        {
+            text = rest;
+            continue;
+        }
+        let Some(position) = find_either_byte(text, byte, uppercase) else {
+            return false;
+        };
+        text = &text[position + 1..];
+    }
+    true
 }
 
 fn subsequence_match_ascii_bytes(query: &[u8], text: &[u8]) -> Option<([u16; 32], u8)> {
@@ -2004,6 +2105,106 @@ mod tests {
         let (positions, count) = subsequence_match(&q, "git checkout").unwrap();
         assert_eq!(count, 3);
         assert_eq!(&positions[..3], &[0, 4, 9]);
+    }
+
+    #[test]
+    fn subsequence_prefilter_agrees_with_window_search_across_word_boundaries() {
+        // Alphabet mixes cased letters, digits, separators, and non-ASCII bytes
+        // so both case arms and the word/remainder split are exercised.
+        let alphabet = "abcAB01 -/é".as_bytes();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        for width in 0..=40 {
+            for _ in 0..200 {
+                let text: Vec<u8> = (0..width).map(|_| alphabet[next() % alphabet.len()]).collect();
+                // Queries are lowercased ASCII, as the byte search path requires.
+                let query: Vec<u8> = (0..1 + next() % 5)
+                    .map(|_| alphabet[next() % 8].to_ascii_lowercase())
+                    .collect();
+                assert_eq!(
+                    is_subsequence_ascii_bytes(&query, &text),
+                    subsequence_match_ascii_bytes(&query, &text).is_some(),
+                    "query {query:?} text {text:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn substring_scan_agrees_with_testing_every_start() {
+        fn every_start(query: &[u8], text: &[u8], boundary_only: bool) -> Option<usize> {
+            if query.len() > text.len() {
+                return None;
+            }
+            (0..=text.len() - query.len()).find(|&start| {
+                (!boundary_only || start == 0 || is_word_boundary_byte(text[start - 1]))
+                    && query
+                        .iter()
+                        .enumerate()
+                        .all(|(offset, &byte)| text[start + offset].to_ascii_lowercase() == byte)
+            })
+        }
+        let alphabet = b"abAB0 -/_.";
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        for width in 0..=40 {
+            for _ in 0..300 {
+                let text: Vec<u8> = (0..width).map(|_| alphabet[next() % alphabet.len()]).collect();
+                let query: Vec<u8> = (0..1 + next() % 4)
+                    .map(|_| alphabet[next() % alphabet.len()].to_ascii_lowercase())
+                    .collect();
+                for boundary_only in [false, true] {
+                    assert_eq!(
+                        find_substring_icase_ascii_bytes(&query, &text, boundary_only),
+                        every_start(&query, &text, boundary_only),
+                        "query {query:?} text {text:?} boundary {boundary_only}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_query_classifies_like_the_char_path() {
+        let ascii = b"abcAB0 -/_.";
+        let mut state = 0xd1b5_4a32_d192_ed03_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        let mut check = |query: &str, text: &str| {
+            let chars = lowercase_query(query);
+            let expected = classify_match(&chars, text, 7);
+            let actual = PreparedQuery::new(query).classify(text, 7);
+            assert_eq!(
+                actual.map(|m| (m.entry_idx, m.score, m.match_positions, m.match_count)),
+                expected.map(|m| (m.entry_idx, m.score, m.match_positions, m.match_count)),
+                "query {query:?} text {text:?}",
+            );
+        };
+        for width in 0..=40 {
+            for _ in 0..200 {
+                let text: String = (0..width).map(|_| ascii[next() % ascii.len()] as char).collect();
+                let query: String = (0..1 + next() % 5).map(|_| ascii[next() % 8] as char).collect();
+                check(&query, &text);
+            }
+        }
+        // Non-ASCII entries must keep char semantics: Kelvin sign lowercases to
+        // `k`, and positions count chars rather than bytes.
+        check("k", "\u{212a}elvin");
+        check("ca", "é cafe");
     }
 
     #[test]
