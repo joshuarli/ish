@@ -77,7 +77,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "laputa-ptytest"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "libc",
  "vt100",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "rustybench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lexopt",
  "miniserde",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "rustybench-macros"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "syn"
