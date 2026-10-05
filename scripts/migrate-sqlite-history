@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Move history from the short-lived SQLite build into the native log."""
+
+import argparse
+import fcntl
+import os
+from pathlib import Path
+import sqlite3
+import struct
+import sys
+import tempfile
+import zlib
+
+
+def migrate(source):
+    if not source.name.endswith(".sqlite3"):
+        raise ValueError("source must end in .sqlite3")
+    target = source.with_name(source.name[:-8] + ".log")
+    lock_path = target.with_name(target.name + ".lock")
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    temporary = None
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if target.exists():
+            raise ValueError(f"history log already exists: {target}")
+        # A read transaction includes committed WAL data without modifying the
+        # database. Existing SQLite shells must be closed before the handoff.
+        with sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True) as database:
+            database.execute("BEGIN")
+            version = database.execute("PRAGMA user_version").fetchone()[0]
+            if version != 1:
+                raise ValueError(f"unsupported history database schema {version}")
+            state = database.execute(
+                "SELECT generation,migrated FROM history_state WHERE singleton=1"
+            ).fetchone()
+            if state is None or state[1] != 1 or not isinstance(state[0], int) or not 0 <= state[0] < 2**63:
+                raise ValueError("invalid history migration state")
+            fd, temporary = tempfile.mkstemp(prefix="." + target.name + "-", dir=target.parent)
+            count = 0
+            last_id = 0
+            with os.fdopen(fd, "wb") as output:
+                output.write(b"ISHLOG\x00\x01" + struct.pack("<q", state[0]))
+                for id, command, timestamp, session, cwd in database.execute(
+                    "SELECT id,command,timestamp,session_id,cwd FROM occurrences ORDER BY id"
+                ):
+                    if not isinstance(id, int) or not last_id < id < 2**63:
+                        raise ValueError("invalid history occurrence id")
+                    if not isinstance(command, str) or not command:
+                        raise ValueError("invalid history command")
+                    if not isinstance(timestamp, int) or not 0 <= timestamp < 2**64:
+                        raise ValueError("invalid history timestamp")
+                    if not isinstance(session, bytes) or len(session) != 8:
+                        raise ValueError("invalid history session id")
+                    if cwd is not None and not isinstance(cwd, bytes):
+                        raise ValueError("invalid history directory")
+                    encoded = command.encode("utf-8")
+                    directory = b"" if cwd is None else cwd
+                    if len(encoded) >= 2**32 or len(directory) >= 2**32 - 1:
+                        raise ValueError("history field exceeds log format limit")
+                    payload = (
+                        struct.pack("<qQ", id, timestamp) + session
+                        + struct.pack("<II", 2**32 - 1 if cwd is None else len(directory), len(encoded))
+                        + directory + encoded
+                    )
+                    length = struct.pack("<Q", len(payload))
+                    output.write(length + struct.pack("<II", zlib.crc32(length), zlib.crc32(payload)))
+                    output.write(payload)
+                    count += 1
+                    last_id = id
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, target)
+            temporary = None
+            parent_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        return target, count
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
+        os.close(lock_fd)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("database", nargs="?", type=Path,
+                        default=Path.home() / ".local/share/ish/history.sqlite3")
+    args = parser.parse_args()
+    try:
+        target, count = migrate(args.database)
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(f"Migrated {count} occurrences to {target}; SQLite source unchanged.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

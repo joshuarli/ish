@@ -80,12 +80,12 @@ impl History {
             last_id: 0, store: None }
     }
 
-    pub fn database_path(&self) -> Option<&Path> {
+    pub fn storage_path(&self) -> Option<&Path> {
         self.store.as_ref().map(|store| store.path.as_path())
     }
 
-    /// Synchronize a committed snapshot. Generation and rows are read in the
-    /// same transaction, so reset cannot mix old rows with a new generation.
+    /// Synchronize a committed snapshot while holding the storage lock, so a
+    /// reset cannot mix old occurrences with a new generation.
     pub fn sync(&mut self) -> io::Result<()> {
         let Some(store) = self.store.as_mut() else { return Ok(()); };
         let snapshot = store.snapshot(self.generation, self.last_id)?;
@@ -373,7 +373,7 @@ fn usage_bonus(usage: &Usage, now: u64) -> u32 {
     frequency + recency
 }
 
-pub fn render_history_database(path: &Path) -> io::Result<String> {
+pub fn render_history_log(path: &Path) -> io::Result<String> {
     store::render(path)
 }
 

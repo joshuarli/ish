@@ -403,10 +403,10 @@ fn main() {
 
                 // Set up external handler for ish-specific builtins
                 let shell_pid = shell.shell_pid;
-                let history_database = shell.history.database_path()
-                    .expect("interactive history has a database")
+                let history_log = shell.history.storage_path()
+                    .expect("interactive history has a storage path")
                     .to_path_buf();
-                let handler = make_external_handler(shell_pid, history_database);
+                let handler = make_external_handler(shell_pid, history_log);
                 shell.epsh.set_external_handler(handler);
 
                 shell.last_status = shell.epsh.run_script(&expanded);
@@ -2528,7 +2528,7 @@ fn env_pair_value(
 /// and fork/exec with job control for external commands.
 fn make_external_handler(
     shell_pid: i32,
-    history_database: std::path::PathBuf,
+    history_log: std::path::PathBuf,
 ) -> epsh::eval::ExternalHandler {
     Box::new(
         move |args: &[epsh::shell_bytes::ShellBytes],
@@ -2557,9 +2557,9 @@ fn make_external_handler(
                         eprintln!("ish: history: storage subcommands require a standalone command");
                         return Ok(epsh::error::ExitStatus::FAILURE);
                     }
-                    // Read the session's database through a new connection;
-                    // forked children must not use the parent's connection.
-                    match history::render_history_database(&history_database) {
+                    // Open the session's history log independently so forked
+                    // readers do not share file offsets or lock ownership.
+                    match history::render_history_log(&history_log) {
                         Ok(content) => {
                             print!("{content}");
                             return Ok(epsh::error::ExitStatus::SUCCESS);

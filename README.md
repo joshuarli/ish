@@ -56,25 +56,36 @@ Up/Down and autosuggestions use the history present when the session started,
 plus commands entered in that session. Ctrl+R also sees commands saved by other
 running sessions when search opens.
 
-Commands are saved before execution in `~/.local/share/ish/history.sqlite3`.
+Commands are saved before execution in `~/.local/share/ish/history.log`.
 Every occurrence is retained for ranking; the history list and search show
-each command once. Writes are transactional and storage errors are reported.
-An interrupted command or abruptly killed shell does not need a clean exit
-to save its accepted input. The bare `l` command is excluded from history.
+each command once. Writers serialize through `history.log.lock` and sync
+records before execution. Storage errors are reported. An interrupted command
+or abruptly killed shell does not need a clean exit to save its accepted
+input. The bare `l` command is excluded from history.
+
+The versioned log stores length-prefixed, checksummed records. An incomplete
+final write is removed on recovery; corruption in a complete record is reported
+without discarding history. Sessions read only newly appended records.
 
 The first start imports the old `history` text file and `history.bin` cache
 without modifying them. Import happens once. Restart old ish instances after
 upgrading: they still write to the old files, and those later writes are not
-imported into the new database.
-The legacy `scripts/import-fish-history` helper must run before this migration;
-it refuses to write once the database exists.
+imported into the new log. The legacy `scripts/import-fish-history` helper
+must run before migration; it refuses to write after migration.
 
-`history reset` clears the database and invalidates history in other running
-ish shells. Preserved legacy import files remain untouched. `history compact`
-reclaims database storage without losing
-commands from other sessions. The old cache-specific `history rebuild`
+If you used the short-lived SQLite history build, close those ish sessions
+and run `scripts/migrate-sqlite-history` before starting this build. This
+one-time tool uses Python's standard library to preserve every occurrence,
+timestamp, session, and raw directory name in the new log. It leaves the
+SQLite database untouched and refuses to overwrite an existing log. The
+shell itself has no SQLite dependency and does not launch the migration tool.
+
+`history reset` atomically replaces the log and invalidates history in other
+running ish shells. Preserved legacy import files remain untouched.
+`history compact` validates and atomically rewrites the log, preserving every
+occurrence and session recall. The old cache-specific `history rebuild`
 subcommand has been removed. Storage subcommands require a standalone command;
-plain `history` can be redirected or used in a pipeline without changing storage.
+plain `history` can be redirected or used in a pipeline.
 
 Run `history -h` for the available history storage commands.
 

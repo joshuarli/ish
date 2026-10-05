@@ -323,7 +323,7 @@ fn startup_fixture(bencher: Bencher, cold: bool) {
         bencher
             .with_inputs(|| {
                 fs::write(&history_path, &history_contents).unwrap();
-                for name in ["history.sqlite3", "history.sqlite3-wal", "history.sqlite3-shm"] {
+                for name in ["history.log", "history.log.lock"] {
                     let _ = fs::remove_file(fixture.path().join(name));
                 }
             })

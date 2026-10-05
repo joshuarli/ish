@@ -37,10 +37,10 @@ record character positions so the history pager can highlight Unicode text.
 Empty queries show global history in timestamp order. Ctrl+R normally asks for
 200 results; the caller supplies the limit rather than the matching primitive.
 
-Ctrl+R searches all commands synchronized from the database when the pager
+Ctrl+R searches all commands synchronized from the log when the pager
 opens. Up-arrow and autosuggestions use a separate startup snapshot plus
 commands entered in the current session. Changes from another session do not
-reorder that snapshot. SQLite retains every accepted command occurrence;
+reorder that snapshot. The append-only log retains every accepted command occurrence;
 search candidates are deduplicated by command text.
 
 The UI and rendering call sites are:

@@ -1523,18 +1523,18 @@ fn history_migrates_legacy_once_without_changing_originals() {
 
     let mut h = History::load_from(path.clone()).unwrap();
     assert_eq!(h.len(), 3);
-    h.add("echo database only").unwrap();
+    h.add("echo log only").unwrap();
     h.compact().unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
     assert_eq!(std::fs::read(dir.join("history.bin")).unwrap(), cache);
-    assert!(dir.join("history.sqlite3").exists());
+    assert!(dir.join("history.log").exists());
 
     std::fs::write(&path, format!("{legacy}echo late legacy\n")).unwrap();
     h.sync().unwrap();
     let fresh = History::load_from(path).unwrap();
     assert_eq!(fresh.len(), 4);
     assert!(fresh.prefix_search("echo late legacy", 0).is_none());
-    assert_eq!(fresh.prefix_search("echo database", 0), Some("echo database only"));
+    assert_eq!(fresh.prefix_search("echo log", 0), Some("echo log only"));
 }
 
 #[test]
@@ -1549,7 +1549,7 @@ fn history_corrupt_legacy_cache_reports_migration_error() {
 }
 
 #[test]
-fn history_concurrent_connections_preserve_all_appends_and_compaction() {
+fn history_concurrent_writers_preserve_all_appends_and_compaction() {
     let dir = tempdir_with_files(&[]);
     let path = dir.join("history");
     History::load_from(path.clone()).unwrap();
@@ -1648,15 +1648,22 @@ fn history_external_repeats_preserve_session_navigation_order() {
 }
 
 #[test]
-fn history_append_reports_database_failure() {
+fn history_append_reports_storage_failure() {
     let dir = tempdir_with_files(&[]);
     let mut h = History::load_from(dir.join("history")).unwrap();
     h.add("echo persisted").unwrap();
-    let connection = rusqlite::Connection::open(dir.join("history.sqlite3")).unwrap();
-    connection.execute_batch("DROP TABLE occurrences").unwrap();
+    let log = dir.join("history.log");
+    let saved_log = dir.join("saved-history.log");
+    std::fs::rename(&log, &saved_log).unwrap();
+    std::fs::create_dir(&log).unwrap();
     assert!(h.add("echo must fail").is_err());
     assert!(h.prefix_search("echo must fail", 0).is_none());
     assert!(!dir.join("history").exists());
+    std::fs::remove_dir(&log).unwrap();
+    std::fs::rename(saved_log, log).unwrap();
+    let persisted = History::load_from(dir.join("history")).unwrap();
+    assert_eq!(persisted.prefix_search("echo persisted", 0), Some("echo persisted"));
+    assert!(persisted.prefix_search("echo must fail", 0).is_none());
 }
 
 #[test]

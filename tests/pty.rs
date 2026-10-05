@@ -2575,6 +2575,27 @@ fn history_survives_abrupt_termination_and_restart() {
 }
 
 #[test]
+fn history_recovers_partial_append_after_abrupt_termination() {
+    let sh = PtyShell::spawn();
+    sh.run_command("/bin/echo durable_before_partial_append");
+    sh.type_str("/bin/sh -c 'printf \"\\001\\002\\003\" >> .local/share/ish/history.log; kill -KILL $PPID'");
+    sh.enter();
+    sh.wait_for_exit(3000);
+
+    let log = sh.home_path().join(".local/share/ish/history.log");
+    assert!(std::fs::read(&log).unwrap().ends_with(&[1, 2, 3]));
+    let restarted = PtyShell::spawn_in_home(sh._home.clone(), &[], 24, 80, None);
+    assert!(!restarted.startup_output().contains("history:"));
+    let text = PtyShell::strip_ansi(&restarted.run_command("/bin/echo durable_after_partial_append"));
+    assert!(!text.contains("command was not saved to history"), "partial append prevented saving: {text:?}");
+    let h = History::load_from(restarted.home_path().join(".local/share/ish/history")).unwrap();
+    assert_eq!(h.prefix_search("/bin/echo durable_before_partial_append", 0),
+        Some("/bin/echo durable_before_partial_append"));
+    assert_eq!(h.prefix_search("/bin/echo durable_after_partial_append", 0),
+        Some("/bin/echo durable_after_partial_append"));
+}
+
+#[test]
 fn history_shared_shell_processes_keep_all_commands() {
     let first = PtyShell::spawn();
     let second = PtyShell::spawn_in_home(first._home.clone(), &[], 24, 80, None);
@@ -2611,11 +2632,17 @@ fn history_shared_shell_processes_keep_all_commands() {
 #[test]
 fn history_write_failure_is_visible_and_command_still_runs() {
     let sh = PtyShell::spawn();
-    let connection = rusqlite::Connection::open(sh.home_path().join(".local/share/ish/history.sqlite3")).unwrap();
-    connection.execute_batch("DROP TABLE occurrences").unwrap();
+    let log = sh.home_path().join(".local/share/ish/history.log");
+    let saved_log = sh.home_path().join("saved-history.log");
+    std::fs::rename(&log, &saved_log).unwrap();
+    std::fs::create_dir(&log).unwrap();
     let text = PtyShell::strip_ansi(&sh.run_command(r"printf 'executed_%s\n' despite_failure"));
     assert!(text.contains("command was not saved to history"), "missing history failure diagnostic: {text:?}");
     assert!(text.contains("executed_despite_failure"), "command did not execute: {text:?}");
+    std::fs::remove_dir(&log).unwrap();
+    std::fs::rename(saved_log, log).unwrap();
+    let h = History::load_from(sh.home_path().join(".local/share/ish/history")).unwrap();
+    assert!(h.prefix_search("printf", 0).is_none());
 }
 
 #[test]
@@ -2634,16 +2661,37 @@ fn history_read_only_commands_and_compact_preserve_another_writer() {
 }
 
 #[test]
-fn history_readers_keep_startup_database_after_home_changes() {
-    let sh = PtyShell::spawn_with_opts(&[], &["echo startup_database_marker"]);
+fn history_reset_and_compact_reopen_storage_in_existing_shell_processes() {
+    let first = PtyShell::spawn_with_opts(&[], &["echo before_reset_marker"]);
+    let second = PtyShell::spawn_in_home(first._home.clone(), &[], 24, 80, None);
+    first.run_command("history reset");
+    second.run_command("history compact");
+    let text = PtyShell::strip_ansi(&second.run_command("history | /bin/cat"));
+    assert!(!text.contains("before_reset_marker"), "stale process restored reset history: {text:?}");
+
+    second.run_command("/bin/echo after_reset_second_process");
+    first.run_command("history compact");
+    first.run_command("/bin/echo after_compact_first_process");
+    second.run_command("history compact");
+    let h = History::load_from(first.home_path().join(".local/share/ish/history")).unwrap();
+    assert!(h.prefix_search("echo before_reset_marker", 0).is_none());
+    assert_eq!(h.prefix_search("/bin/echo after_reset_second_process", 0),
+        Some("/bin/echo after_reset_second_process"));
+    assert_eq!(h.prefix_search("/bin/echo after_compact_first_process", 0),
+        Some("/bin/echo after_compact_first_process"));
+}
+
+#[test]
+fn history_readers_keep_startup_log_after_home_changes() {
+    let sh = PtyShell::spawn_with_opts(&[], &["echo startup_log_marker"]);
     std::fs::create_dir(sh.home_path().join("new-home")).unwrap();
     sh.run_command(&format!("set HOME {}", sh.home_path().join("new-home").display()));
     let text = PtyShell::strip_ansi(&sh.run_command("history | /bin/cat"));
-    assert!(text.contains("echo startup_database_marker"), "history pipeline lost original database: {text:?}");
+    assert!(text.contains("echo startup_log_marker"), "history pipeline lost original log: {text:?}");
     sh.run_command("history > history-after-home-change");
     let output = std::fs::read_to_string(sh.home_path().join("history-after-home-change")).unwrap();
-    assert!(output.contains("echo startup_database_marker"));
-    assert!(!sh.home_path().join("new-home/.local/share/ish/history.sqlite3").exists());
+    assert!(output.contains("echo startup_log_marker"));
+    assert!(!sh.home_path().join("new-home/.local/share/ish/history.log").exists());
 }
 
 #[test]

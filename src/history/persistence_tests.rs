@@ -14,12 +14,10 @@ impl Fixture {
         Self(path)
     }
     fn path(&self) -> PathBuf { self.0.join("history") }
-    fn connection(&self) -> rusqlite::Connection {
-        rusqlite::Connection::open(store::database_path(&self.path())).unwrap()
+    fn occurrences(&self) -> usize {
+        store::Store::open(&self.path()).unwrap().snapshot(-1, 0).unwrap().occurrences.len()
     }
-    fn occurrences(&self) -> i64 {
-        self.connection().query_row("SELECT COUNT(*) FROM occurrences", [], |row| row.get(0)).unwrap()
-    }
+
 }
 impl Drop for Fixture {
     fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); }
@@ -107,6 +105,7 @@ fn migration_corruption_rolls_back_and_retry_imports_once() {
     fs::write(legacy::cache_path(&fixture.path()), b"ISH\x05bad").unwrap();
     assert!(History::load_from(fixture.path()).is_err());
     assert_eq!(fs::read(fixture.path()).unwrap(), b"preserve me\n");
+    assert!(!store::storage_path(&fixture.path()).exists());
     fs::remove_file(legacy::cache_path(&fixture.path())).unwrap();
     let history = History::load_from(fixture.path()).unwrap();
     assert_eq!(history.get(0), "preserve me");
@@ -208,12 +207,16 @@ fn append_failure_does_not_update_memory_or_usage() {
     let fixture = Fixture::new();
     let mut history = History::load_from(fixture.path()).unwrap();
     history.add_in_dir("saved", None).unwrap();
-    fixture.connection().execute_batch("CREATE TRIGGER reject_append BEFORE INSERT ON occurrences
-        BEGIN SELECT RAISE(ABORT, 'test write failure'); END;").unwrap();
+    let path = store::storage_path(&fixture.path());
+    let saved = fs::read(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
     assert!(history.add_in_dir("unsaved", None).is_err());
     assert_eq!(history.len(), 1);
     assert_eq!(history.session_get(0), Some("saved"));
     assert_eq!(history.frequency(0), 1);
+    fs::remove_dir(&path).unwrap();
+    fs::write(&path, saved).unwrap();
     assert_eq!(fixture.occurrences(), 1);
 }
 
@@ -240,7 +243,7 @@ fn read_only_render_matches_actual_time_order_without_mutating_store() {
     let fixture = Fixture::new();
     fs::write(fixture.path(), record(300, "later") + &record(100, "earlier") + &record(200, "later")).unwrap();
     let history = History::load_from(fixture.path()).unwrap();
-    assert_eq!(render_history_database(history.database_path().unwrap()).unwrap(), "earlier\nlater\n");
+    assert_eq!(render_history_log(history.storage_path().unwrap()).unwrap(), "earlier\nlater\n");
     let mut indices = Vec::new();
     history.command_indices_into(&mut indices);
     assert_eq!(indices.iter().map(|&idx| history.get(idx)).collect::<Vec<_>>(), ["earlier", "later"]);
@@ -256,7 +259,7 @@ fn separate_legacy_names_have_independent_stores() {
     fs::write(&b_path, "only b\n").unwrap();
     let mut a = History::load_from(a_path).unwrap();
     let mut b = History::load_from(b_path).unwrap();
-    assert_ne!(a.database_path(), b.database_path());
+    assert_ne!(a.storage_path(), b.storage_path());
     a.add_in_dir("new a", None).unwrap();
     b.sync().unwrap();
     assert_eq!(b.len(), 1);
@@ -268,25 +271,168 @@ fn separate_legacy_names_have_independent_stores() {
 }
 
 #[test]
-fn database_permissions_and_durability_are_explicit() {
+fn log_and_lock_permissions_are_private() {
     let fixture = Fixture::new();
     let history = History::load_from(fixture.path()).unwrap();
-    assert_eq!(fs::metadata(history.database_path().unwrap()).unwrap().permissions().mode() & 0o777, 0o600);
-    let connection = fixture.connection();
-    let journal: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
-    assert_eq!(journal, "wal");
-    let schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
-    assert_eq!(schema, 1);
+    for path in [history.storage_path().unwrap().to_path_buf(), fixture.0.join("history.log.lock")] {
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    assert_eq!(&fs::read(history.storage_path().unwrap()).unwrap()[..8], b"ISHLOG\0\x01");
 }
 
 #[test]
-fn future_schema_is_refused_without_import() {
+fn unsupported_or_corrupt_log_headers_are_preserved() {
     let fixture = Fixture::new();
-    let connection = rusqlite::Connection::open(store::database_path(&fixture.path())).unwrap();
-    connection.execute_batch("PRAGMA user_version=2;").unwrap();
     fs::write(fixture.path(), "must not import\n").unwrap();
-    assert!(History::load_from(fixture.path()).is_err());
-    assert_eq!(connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+    for bytes in [[b"ISHLOG\0\x02".as_slice(), &0i64.to_le_bytes()].concat(),
+        [b"ISHLOG\0\x00".as_slice(), &0i64.to_le_bytes()].concat(), b"ISHLOG\0\x01".to_vec(),
+        [b"ISHLOG\0\x01".as_slice(), &(-1i64).to_le_bytes()].concat()] {
+        fs::write(store::storage_path(&fixture.path()), &bytes).unwrap();
+        assert!(History::load_from(fixture.path()).is_err());
+        assert_eq!(fs::read(store::storage_path(&fixture.path())).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn sqlite_history_requires_explicit_conversion() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("history.sqlite3"), b"SQLite format 3\0").unwrap();
+    let error = History::load_from(fixture.path()).err().unwrap();
+    assert!(error.to_string().contains("scripts/migrate-sqlite-history"));
+    assert!(!store::storage_path(&fixture.path()).exists());
+}
+
+#[test]
+fn incomplete_final_frames_recover_the_valid_prefix() {
+    for tail in [vec![1, 2, 3], {
+        let length = 100u64.to_le_bytes();
+        let mut tail = length.to_vec();
+        tail.extend_from_slice(&store::crc32(&length).to_le_bytes());
+        tail.extend_from_slice(&0u32.to_le_bytes());
+        tail.extend_from_slice(b"partial");
+        tail
+    }] {
+        let fixture = Fixture::new();
+        let mut history = History::load_from(fixture.path()).unwrap();
+        history.add_in_dir("saved", None).unwrap();
+        let path = store::storage_path(&fixture.path());
+        let original = fs::read(&path).unwrap();
+        use std::io::Write;
+        fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&tail).unwrap();
+        history.sync().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        history.add_in_dir("next", None).unwrap();
+        assert_eq!(fixture.occurrences(), 2);
+    }
+}
+
+#[test]
+fn complete_frame_corruption_is_reported_without_truncation() {
+    for offset in [16, 24, 28, 32, 64] {
+        let fixture = Fixture::new();
+        let mut history = History::load_from(fixture.path()).unwrap();
+        history.add_in_dir("saved", None).unwrap();
+        let path = store::storage_path(&fixture.path());
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[offset] ^= 0x80;
+        fs::write(&path, &bytes).unwrap();
+        assert!(History::load_from(fixture.path()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn failed_append_retains_unseen_records_for_retry() {
+    let fixture = Fixture::new();
+    let mut local = store::Store::open(&fixture.path()).unwrap();
+    let mut other = History::load_from(fixture.path()).unwrap();
+    other.add_in_dir("foreign", None).unwrap();
+    let occurrence = store::Occurrence { id: 0, command: String::new(), timestamp: 0,
+        session_id: 0, cwd: None };
+    assert!(local.append(0, 0, occurrence).is_err());
+    let snapshot = local.snapshot(0, 0).unwrap();
+    assert_eq!(snapshot.occurrences.len(), 1);
+    assert_eq!(snapshot.occurrences[0].command, "foreign");
+}
+
+#[test]
+fn compact_preserves_ids_and_stale_session_recall() {
+    let fixture = Fixture::new();
+    let mut local = History::load_from(fixture.path()).unwrap();
+    local.add_in_dir("local", None).unwrap();
+    let mut other = History::load_from(fixture.path()).unwrap();
+    other.add_in_dir("foreign", None).unwrap();
+    let before = fs::read(store::storage_path(&fixture.path())).unwrap();
+    other.compact().unwrap();
+    assert_eq!(other.session_get(0), Some("foreign"));
+    assert_eq!(other.session_get(1), Some("local"));
+    assert_eq!(fs::read(store::storage_path(&fixture.path())).unwrap(), before);
+    local.sync().unwrap();
+    assert_eq!(local.frequency(0), 1);
+    assert_eq!(local.session_get(0), Some("local"));
+    assert_eq!(local.session_get(1), None);
+    local.add_in_dir("next", None).unwrap();
+    assert_eq!(fixture.occurrences(), 3);
+}
+
+#[test]
+fn history_writer_process() {
+    let Some(path) = std::env::var_os("ISH_HISTORY_TEST_WRITER") else { return; };
+    let mut history = History::load_from(PathBuf::from(path)).unwrap();
+    for i in 0..20 { history.add_in_dir(&format!("process {} {i}", std::process::id()), None).unwrap(); }
+}
+
+#[test]
+fn independent_processes_append_without_losing_occurrences() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path(), "seed\n").unwrap();
+    let mut children: Vec<_> = (0..2).map(|_| std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "history::persistence_tests::history_writer_process"])
+        .env("ISH_HISTORY_TEST_WRITER", fixture.path()).spawn().unwrap()).collect();
+    for child in &mut children { assert!(child.wait().unwrap().success()); }
+    assert_eq!(fixture.occurrences(), 41);
+}
+
+#[test]
+fn partial_write_failure_process() {
+    let Some(path) = std::env::var_os("ISH_HISTORY_TEST_PARTIAL_WRITE") else { return; };
+    let path = PathBuf::from(path);
+    let mut local = History::load_from(path.clone()).unwrap();
+    local.add_in_dir("saved", None).unwrap();
+    let mut other = History::load_from(path.clone()).unwrap();
+    other.add_in_dir("foreign", None).unwrap();
+    let log = store::storage_path(&path);
+    let before = fs::read(&log).unwrap();
+    let resource = rustix::process::Resource::Fsize;
+    let original_limit = rustix::process::getrlimit(resource);
+    rustix::process::setrlimit(resource, rustix::process::Rlimit {
+        current: Some(before.len() as u64+20), ..original_limit }).unwrap();
+    let result = local.add_in_dir("must not survive a partial write", None);
+    rustix::process::setrlimit(resource, original_limit).unwrap();
+    assert!(result.is_err());
+    assert_eq!(fs::read(&log).unwrap(), before);
+    assert_eq!(local.len(), 1);
+    assert_eq!(local.session_get(0), Some("saved"));
+    assert_eq!(local.frequency(0), 1);
+    local.add_in_dir("retry", None).unwrap();
+    assert_eq!(local.len(), 3);
+    assert_eq!(local.session_get(0), Some("retry"));
+    assert_eq!(local.session_get(1), Some("saved"));
+    assert_eq!(local.session_get(2), None);
+    for idx in 0..local.len() { assert_eq!(local.frequency(idx), 1); }
+}
+
+#[test]
+fn partial_append_rolls_back_and_retry_retains_unseen_occurrences() {
+    let fixture = Fixture::new();
+    // Ignoring the file-size signal in the isolated child turns a real partial
+    // filesystem write into an error without changing the test runner's limits.
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", "trap '' XFSZ; exec \"$ISH_HISTORY_TEST_EXECUTABLE\" --exact history::persistence_tests::partial_write_failure_process --test-threads=1"])
+        .env("ISH_HISTORY_TEST_EXECUTABLE", std::env::current_exe().unwrap())
+        .env("ISH_HISTORY_TEST_PARTIAL_WRITE", fixture.path()).status().unwrap();
+    assert!(status.success());
+    assert_eq!(fixture.occurrences(), 3);
 }
 
 fn use_command(history: &mut History, command: &str, timestamp: u64, cwd: Option<&Path>) {
@@ -396,11 +542,27 @@ fn startup_and_incremental_sync_merge_large_overlapping_uses_promptly() {
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     assert_eq!(history.len(), 6000);
     assert_eq!(fixture.occurrences(), 12_000);
-    let connection = fixture.connection();
-    connection.execute_batch("BEGIN IMMEDIATE;
-        INSERT INTO occurrences(command,timestamp,session_id,cwd)
-        SELECT command,timestamp+1,session_id,cwd FROM occurrences;
-        COMMIT;").unwrap();
+    let path = store::storage_path(&fixture.path());
+    let bytes = fs::read(&path).unwrap();
+    let mut additional = Vec::new();
+    let mut offset = 16;
+    let mut next_id = 12_001i64;
+    while offset < bytes.len() {
+        let length = u64::from_le_bytes(bytes[offset..offset+8].try_into().unwrap()) as usize;
+        let mut frame = bytes[offset..offset+16+length].to_vec();
+        frame[16..24].copy_from_slice(&next_id.to_le_bytes());
+        let timestamp = u64::from_le_bytes(frame[24..32].try_into().unwrap());
+        frame[24..32].copy_from_slice(&(timestamp+1).to_le_bytes());
+        let checksum = store::crc32(&frame[16..]);
+        frame[12..16].copy_from_slice(&checksum.to_le_bytes());
+        additional.extend_from_slice(&frame);
+        offset += 16+length;
+        next_id += 1;
+    }
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(&additional).unwrap();
+    file.sync_all().unwrap();
     let started = std::time::Instant::now();
     history.sync().unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
