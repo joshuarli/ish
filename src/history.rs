@@ -631,20 +631,60 @@ impl History {
             return;
         }
 
+        // Stage replacements so duplicates do not shift every entry and
+        // rebuild the entire index for each line in a large history tail.
+        let mut pending: Vec<Option<ParsedHistoryLine<'_>>> = Vec::new();
+        let mut pending_by_command: FxHashMap<&str, usize> = FxHashMap::default();
+        let mut removed = FxHashSet::default();
         let ts = now_millis();
         for line in tail.lines() {
             let Some(parsed) = parse_history_line(line, ts) else {
                 continue;
             };
-            let h = hash_str(parsed.command);
-            if let Some(idx) = self.find_entry_index(h, parsed.command) {
-                // Don't let a newer hidden duplicate disturb the entries this
-                // session can still recall with Up-arrow.
-                if self.is_session_visible(idx) {
+            if let Some(&idx) = pending_by_command.get(parsed.command) {
+                let previous = pending[idx].as_ref().unwrap();
+                if previous.timestamp <= self.session_cutoff {
                     continue;
                 }
-                self.remove_entry_at(idx);
+                pending[idx] = None;
+            } else {
+                let h = hash_str(parsed.command);
+                if let Some(idx) = self.find_entry_index(h, parsed.command) {
+                    // Don't let a newer hidden duplicate disturb the entries this
+                    // session can still recall with Up-arrow.
+                    if self.is_session_visible(idx) {
+                        continue;
+                    }
+                    removed.insert(idx);
+                }
             }
+            pending_by_command.insert(parsed.command, pending.len());
+            pending.push(Some(parsed));
+        }
+
+        if !removed.is_empty() {
+            let mut kept = 0;
+            for idx in 0..self.offsets.len() {
+                if removed.contains(&idx) {
+                    continue;
+                }
+                self.offsets.swap(kept, idx);
+                self.timestamps.swap(kept, idx);
+                self.session_ids.swap(kept, idx);
+                self.cwds.swap(kept, idx);
+                self.local.swap(kept, idx);
+                kept += 1;
+            }
+            self.offsets.truncate(kept);
+            self.timestamps.truncate(kept);
+            self.session_ids.truncate(kept);
+            self.cwds.truncate(kept);
+            self.local.truncate(kept);
+            self.rebuild_index();
+        }
+
+        for parsed in pending.into_iter().flatten() {
+            let h = hash_str(parsed.command);
             let start = self.arena.len() as u32;
             self.arena.push_str(parsed.command);
             self.offsets.push((start, parsed.command.len() as u16));
@@ -1406,25 +1446,16 @@ impl History {
     }
 
     fn find_entry_index(&self, hash: u64, text: &str) -> Option<usize> {
-        self.index_by_hash
-            .get(&hash)
-            .copied()
-            .filter(|&idx| self.entry_text(idx) == text)
-            .or_else(|| {
-                self.offsets
-                    .iter()
-                    .enumerate()
-                    .find_map(|(idx, _)| (self.entry_text(idx) == text).then_some(idx))
-            })
-    }
-
-    fn remove_entry_at(&mut self, idx: usize) {
-        self.offsets.remove(idx);
-        self.timestamps.remove(idx);
-        self.session_ids.remove(idx);
-        self.cwds.remove(idx);
-        self.local.remove(idx);
-        self.rebuild_index();
+        let idx = *self.index_by_hash.get(&hash)?;
+        if self.entry_text(idx) == text {
+            return Some(idx);
+        }
+        // Only scan for a hash collision; an absent hash means the command
+        // cannot exist, so new tail entries keep constant-time lookups.
+        self.offsets
+            .iter()
+            .enumerate()
+            .find_map(|(idx, _)| (self.entry_text(idx) == text).then_some(idx))
     }
 
     fn remove_entries_matching(&mut self, text: &str) {
@@ -2332,6 +2363,107 @@ mod tests {
         h.add("ddd");
         assert_eq!(h.offsets.len(), 4);
         assert_eq!(h.timestamps.len(), 4);
+    }
+
+    #[test]
+    fn startup_merges_large_overlapping_history_tail_promptly() {
+        let dir = std::env::temp_dir().join(format!(
+            "ish_history_startup_{}_{}", std::process::id(), now_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        let entries: Vec<String> = (0..6000).map(|i| format!("echo command {i}")).collect();
+        let mut cached = History::from_entries(entries.clone());
+        cached.path = path.clone();
+        cached.save_cache();
+        let tail: String = entries.iter().enumerate().map(|(i, command)| {
+            format!("{}\n", format_history_record_with_cwd(
+                1000 + i as u64, 7, Path::new("/new/cwd"), command
+            ))
+        }).collect();
+        fs::write(&path, tail).unwrap();
+
+        let started = std::time::Instant::now();
+        let loaded = History::load_from(path);
+        let elapsed = started.elapsed();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(elapsed < std::time::Duration::from_secs(2), "history startup took {elapsed:?}");
+        assert_eq!(loaded.len(), entries.len());
+        for (i, command) in entries.iter().enumerate() {
+            assert_eq!(loaded.get(i), command);
+            assert_eq!(loaded.timestamps[i], 1000 + i as u64);
+            assert_eq!(loaded.cwds[i].as_deref(), Some(Path::new("/new/cwd")));
+        }
+    }
+
+    #[test]
+    fn sync_preserves_visible_entries_and_latest_hidden_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "ish_history_sync_{}_{}", std::process::id(), now_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        let mut hist = History::from_entries(vec![
+            "visible".into(), "hidden".into(), "local".into(), "unchanged".into()
+        ]);
+        hist.path = path.clone();
+        hist.session_cutoff = 100;
+        hist.timestamps = vec![50, 150, 150, 50];
+        hist.local[2] = true;
+        let tail: String = [
+            ("visible", 200), ("local", 200), ("hidden", 200), ("new", 200),
+            ("hidden", 300), ("new", 300), ("older", 50), ("older", 300),
+        ].into_iter().map(|(command, timestamp)| {
+            format!("{}\n", format_history_record_with_cwd(
+                timestamp, timestamp, Path::new("/tail"), command
+            ))
+        }).collect();
+        fs::write(&path, tail).unwrap();
+        hist.sync();
+
+        let commands: Vec<&str> = (0..hist.len()).map(|i| hist.get(i)).collect();
+        assert_eq!(commands, ["visible", "local", "unchanged", "hidden", "new", "older"]);
+        assert_eq!(hist.timestamps, [50, 150, 50, 300, 300, 50]);
+        assert_eq!(hist.session_ids, [0, 0, 0, 300, 300, 50]);
+        assert_eq!(hist.local, [false, true, false, false, false, false]);
+        assert_eq!(hist.session_get(0), Some("older"));
+        assert_eq!(hist.session_get(1), Some("unchanged"));
+        for i in 0..hist.len() {
+            assert_eq!(hist.find_entry_index(hash_str(hist.get(i)), hist.get(i)), Some(i));
+            let expected = (i >= 3).then_some(Path::new("/tail"));
+            assert_eq!(hist.cwds[i].as_deref(), expected);
+        }
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", format_history_record(400, 9, "hidden")).unwrap();
+        hist.sync();
+        assert_eq!(hist.len(), 6);
+        assert_eq!(hist.get(5), "hidden");
+        assert_eq!(hist.timestamps[5], 400);
+        assert_eq!(hist.session_ids[5], 9);
+        assert_eq!(hist.cwds[5], None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_merges_large_new_history_tail_promptly() {
+        let dir = std::env::temp_dir().join(format!(
+            "ish_history_new_tail_{}_{}", std::process::id(), now_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        let mut cached = History::from_entries(vec!["cached".into()]);
+        cached.path = path.clone();
+        cached.save_cache();
+        let tail: String = (0..6000).map(|i| format!("echo new {i}\n")).collect();
+        fs::write(&path, tail).unwrap();
+        let started = std::time::Instant::now();
+        let loaded = History::load_from(path);
+        let elapsed = started.elapsed();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(elapsed < std::time::Duration::from_secs(2), "history startup took {elapsed:?}");
+        assert_eq!(loaded.len(), 6001);
+        assert_eq!(loaded.get(0), "cached");
+        assert_eq!(loaded.get(6000), "echo new 5999");
     }
 
     #[test]
