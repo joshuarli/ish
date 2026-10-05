@@ -254,7 +254,7 @@ fn completion_path_single_match(bencher: Bencher) {
 fn history_fuzzy_search_into_45k(bencher: Bencher) {
     let history = History::from_entries(synthetic_history_45k());
     let mut candidates = Vec::with_capacity(history.len());
-    history.visible_entry_indices_into(&mut candidates);
+    history.search_entry_indices_into(&mut candidates);
     let mut scratch = Vec::with_capacity(history.len());
     let mut results = Vec::with_capacity(200);
     bench_with_syscall_trace(bencher, || {
@@ -302,7 +302,7 @@ fn startup_fixture(bencher: Bencher, cold: bool) {
     .unwrap();
 
     let run = || {
-        let _history = black_box(History::load_from(history_path.clone()));
+        let _history = black_box(History::load_from(history_path.clone()).unwrap());
 
         let mut aliases = AliasMap::new();
         let mut epsh = epsh::eval::Shell::builder()
@@ -323,7 +323,9 @@ fn startup_fixture(bencher: Bencher, cold: bool) {
         bencher
             .with_inputs(|| {
                 fs::write(&history_path, &history_contents).unwrap();
-                let _ = fs::remove_file(fixture.path().join("history.bin"));
+                for name in ["history.sqlite3", "history.sqlite3-wal", "history.sqlite3-shm"] {
+                    let _ = fs::remove_file(fixture.path().join(name));
+                }
             })
             .bench_local_values(|_| {
                 trace_marker(TRACE_BEGIN);
@@ -504,8 +506,8 @@ fn command_enter_to_prompt(bencher: Bencher) {
         .bench_local_values(|mut fixture| {
             trace_marker(TRACE_BEGIN);
             let expanded = fixture.aliases.expand_line("t");
+            fixture.history.add("t").unwrap();
             let status = fixture.epsh.run_script(&expanded);
-            fixture.history.add("t");
             fixture
                 .prompt
                 .render_into(&mut fixture.prompt_buf, status, &fixture.pwd, false);
@@ -518,7 +520,7 @@ fn command_enter_to_prompt(bencher: Bencher) {
 fn history_search_trace(bencher: Bencher) {
     let history = History::from_entries(synthetic_history_45k());
     let mut all_candidates = Vec::with_capacity(history.len());
-    history.visible_entry_indices_into(&mut all_candidates);
+    history.search_entry_indices_into(&mut all_candidates);
     let mut candidates = Vec::with_capacity(history.len());
     let mut scratch = Vec::with_capacity(history.len());
     let mut matches = Vec::with_capacity(200);

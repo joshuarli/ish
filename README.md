@@ -46,16 +46,35 @@ Single kill ring shared across Ctrl+K/U/W. Full UTF-8 support.
 | Key | Action |
 |---|---|
 | Up / Down | Move by visual row in wrapped input; prefix search through history at the boundary |
-| Ctrl+R | Fuzzy search (subsequence, case-insensitive) |
+| Ctrl+R | Search saved commands across all sessions (case-insensitive) |
 
 Fuzzy search opens a pager with matching characters highlighted in yellow. Up/Down to navigate, Enter to accept, Escape to cancel.
 
-**Scored ranking**: results are ranked by match quality, not just recency. Entries recorded in the current directory or one of its ancestors get a priority boost. Contiguous matches (searching "target" finds literal `target/release/` first), word-boundary alignment (`deb` prefers `debug/` over scattered d-e-b), and optimal alignment via forward+backward scan find the tightest match window — "test" in "the best test" finds the contiguous "test" at the end, not scattered letters.
+**Ranking**: prefix matches come first, followed by word-boundary substrings, other substrings, and scattered-letter matches. Within the same match quality, commands used in the current directory or nearby ancestors are preferred; usage frequency and timestamps refine the order. A weak local match cannot outrank a stronger literal match elsewhere. An empty search shows recent commands first. Matching characters are highlighted, including Unicode text.
 
-Stored at `~/.local/share/ish/history`. Deduplicated on add.
+Up/Down and autosuggestions use the history present when the session started,
+plus commands entered in that session. Ctrl+R also sees commands saved by other
+running sessions when search opens.
 
-`history reset` deletes all saved history and invalidates cached history in
-other running ish shells.
+Commands are saved before execution in `~/.local/share/ish/history.sqlite3`.
+Every occurrence is retained for ranking; the history list and search show
+each command once. Writes are transactional and storage errors are reported.
+An interrupted command or abruptly killed shell does not need a clean exit
+to save its accepted input. The bare `l` command is excluded from history.
+
+The first start imports the old `history` text file and `history.bin` cache
+without modifying them. Import happens once. Restart old ish instances after
+upgrading: they still write to the old files, and those later writes are not
+imported into the new database.
+The legacy `scripts/import-fish-history` helper must run before this migration;
+it refuses to write once the database exists.
+
+`history reset` clears the database and invalidates history in other running
+ish shells. Preserved legacy import files remain untouched. `history compact`
+reclaims database storage without losing
+commands from other sessions. The old cache-specific `history rebuild`
+subcommand has been removed. Storage subcommands require a standalone command;
+plain `history` can be redirected or used in a pipeline without changing storage.
 
 Run `history -h` for the available history storage commands.
 

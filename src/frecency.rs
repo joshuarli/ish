@@ -37,7 +37,9 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
     // Collect directory scores from history
     let mut scores: Vec<(String, f64)> = Vec::new();
 
-    for i in 0..len {
+    let mut indices = Vec::with_capacity(len);
+    history.command_indices_into(&mut indices);
+    for (recency, i) in indices.into_iter().enumerate() {
         let entry = history.get(i);
         let dir = extract_cd_target(entry);
         let dir = match dir {
@@ -54,8 +56,9 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
             dir.to_string()
         };
 
-        // Recency weight: later entries score higher (i/len gives 0..1)
-        let weight = (i as f64 + 1.0) / len as f64;
+        // Candidate indices stay stable when another session repeats a
+        // command. Chronological ordering supplies recency independently.
+        let weight = (recency as f64 + 1.0) / len as f64;
 
         if let Some(entry) = scores.iter_mut().find(|(p, _)| *p == resolved) {
             entry.1 += weight;

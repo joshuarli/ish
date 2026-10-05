@@ -18,9 +18,9 @@ The implementation lives in `src/history.rs`:
 - `classify_match()` selects the first applicable match tier. The ASCII path is
   `classify_match_ascii()`; the alignment helpers are
   `subsequence_match_ascii_bytes()` and `subsequence_match_unicode()`.
-- `compare_fuzzy_match()` sorts stronger tiers first, then newer history
-  entries. `score_match()` and the `pwd_basename` parameter remain for API and
-  test compatibility, but current-directory weighting is not active.
+- History compares match quality first, then recorded directory proximity,
+  bounded usage frequency, and actual timestamps. Stable candidate indices
+  are identities, not recency ranks.
 
 Matching is intentionally literal-first:
 
@@ -29,10 +29,19 @@ Matching is intentionally literal-first:
 3. Case-insensitive substring anywhere, score `1`.
 4. Case-insensitive subsequence fallback, score `0`.
 
-Within a tier, newer entries win. Subsequence matches record positions so the
-history pager can highlight them. Empty queries return visible history in
-recency order. Ctrl+R normally asks for 200 results; the limit is supplied by
-the caller rather than hard-coded into the matching primitive.
+Within a tier, commands used in the current directory are preferred over
+commands used in an ancestor, with nearer ancestors preferred over distant
+ones. Bounded usage frequency and actual timestamps refine that ordering.
+Directory context never promotes a weaker text-match tier. Subsequence matches
+record character positions so the history pager can highlight Unicode text.
+Empty queries show global history in timestamp order. Ctrl+R normally asks for
+200 results; the caller supplies the limit rather than the matching primitive.
+
+Ctrl+R searches all commands synchronized from the database when the pager
+opens. Up-arrow and autosuggestions use a separate startup snapshot plus
+commands entered in the current session. Changes from another session do not
+reorder that snapshot. SQLite retains every accepted command occurrence;
+search candidates are deduplicated by command text.
 
 The UI and rendering call sites are:
 
@@ -118,6 +127,4 @@ and test both modes when changing ignore or traversal behavior.
 - Preserve comments that explain ranking choices, allocation behavior, or
   platform-specific filesystem decisions.
 
-Future ideas such as frecency or history-informed completion require persistent
-state and a clearer product decision; they are not part of the current ranking
-contract.
+History-informed completion remains outside the current completion contract.

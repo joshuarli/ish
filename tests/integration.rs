@@ -5,7 +5,6 @@
 //! completion, config parsing, etc.).
 
 use std::collections::HashSet;
-use std::io::Write;
 
 use ish::alias::AliasMap;
 use ish::builtin;
@@ -183,10 +182,10 @@ fn history_dedup_on_add() {
     ]);
     // Already deduped by from_entries? No, from_entries takes them as-is.
     // add() deduplicates.
-    h.add("ls");
+    h.add("ls").unwrap();
     // "ls" should appear only once, at the end
     assert_eq!((0..h.len()).filter(|&i| h.get(i) == "ls").count(), 1);
-    assert_eq!(h.get(h.len() - 1), "ls");
+    assert_eq!(h.prefix_search("ls", 0), Some("ls"));
 }
 
 #[test]
@@ -325,8 +324,7 @@ fn scoring_flag_matching() {
 
 #[test]
 fn scoring_pwd_bonus() {
-    // Current directory should not bias Ctrl+R results; recency and match tier
-    // are easier to reason about.
+    // Directory context comes from recorded metadata, not command text.
     let h = History::from_entries(vec![
         "cargo build".into(),                 // older, no "ish"
         "npm install".into(),                 // more recent, no "ish"
@@ -336,7 +334,7 @@ fn scoring_pwd_bonus() {
     assert!(!matches.is_empty());
     assert_eq!(h.get(matches[0].entry_idx), "cargo build");
 
-    // Identical match tier falls back to recency, not PWD context.
+    // Without recorded directory metadata, equal match quality uses recency.
     let h2 = History::from_entries(vec![
         "cd /tmp/ish && make".into(), // older, contains "ish"
         "cd /tmp/foo && make".into(), // more recent, no "ish"
@@ -550,8 +548,8 @@ fn scoring_into_respects_limit_without_changing_order() {
 #[test]
 fn history_add_whitespace_only_ignored() {
     let mut h = History::from_entries(vec![]);
-    h.add("   ");
-    h.add("");
+    h.add("   ").unwrap();
+    h.add("").unwrap();
     assert_eq!(h.len(), 0);
 }
 
@@ -1089,15 +1087,15 @@ fn alias_default_impl() {
 
 #[test]
 fn history_load_empty() {
-    let h = History::load();
-    // Just verify it doesn't panic and returns a valid history
-    let _ = h.len();
+    let dir = tempdir_with_files(&[]);
+    let h = History::load_from(dir.join("history")).unwrap();
+    assert!(h.is_empty());
 }
 
 #[test]
 fn history_add_with_newlines() {
     let mut h = History::from_entries(vec![]);
-    h.add("echo\nhello");
+    h.add("echo\nhello").unwrap();
     // Newlines should be collapsed to spaces
     assert_eq!(h.get(h.len() - 1), "echo hello");
 }
@@ -1105,8 +1103,10 @@ fn history_add_with_newlines() {
 #[test]
 fn history_add_dedup_preserves_order() {
     let mut h = History::from_entries(vec!["a".into(), "b".into(), "c".into()]);
-    h.add("a");
-    let entries: Vec<&str> = (0..h.len()).map(|i| h.get(i)).collect();
+    h.add("a").unwrap();
+    let mut indices = Vec::new();
+    h.command_indices_into(&mut indices);
+    let entries: Vec<&str> = indices.iter().map(|&i| h.get(i)).collect();
     assert_eq!(entries, &["b", "c", "a"]);
 }
 
@@ -1494,19 +1494,169 @@ fn history_file_io() {
     let hist_file = dir.join("history");
 
     // Write history
-    let mut h = History::load_from(hist_file.clone());
-    h.add("test command 1");
-    h.add("test command 2");
-    h.add("test command 1"); // dup — should be deduped in memory
+    let mut h = History::load_from(hist_file.clone()).unwrap();
+    h.add("test command 1").unwrap();
+    h.add("test command 2").unwrap();
+    h.add("test command 1").unwrap(); // dup — should be deduped in memory
 
-    // Verify file was written
-    let content = std::fs::read_to_string(&hist_file).unwrap();
-    assert!(content.contains("test command 1"));
-    assert!(content.contains("test command 2"));
+    drop(h);
+    let h2 = History::load_from(hist_file).unwrap();
+    let mut indices = Vec::new();
+    h2.command_indices_into(&mut indices);
+    let entries: Vec<&str> = indices.iter().map(|&i| h2.get(i)).collect();
+    assert_eq!(entries, &["test command 2", "test command 1"]);
+}
 
-    // Reload and verify dedup
-    let h2 = History::load_from(hist_file);
-    assert!(h2.len() >= 2);
+#[test]
+fn history_migrates_legacy_once_without_changing_originals() {
+    let dir = tempdir_with_files(&[]);
+    let path = dir.join("history");
+    let legacy = "echo imported\necho retained\n";
+    std::fs::write(&path, legacy).unwrap();
+    let command = b"echo cached\0";
+    let mut cache = b"ISH\x04".to_vec();
+    cache.extend_from_slice(&1u32.to_le_bytes());
+    cache.extend_from_slice(&(command.len() as u32).to_le_bytes());
+    cache.extend_from_slice(&1u64.to_le_bytes());
+    cache.extend_from_slice(command);
+    std::fs::write(dir.join("history.bin"), &cache).unwrap();
+
+    let mut h = History::load_from(path.clone()).unwrap();
+    assert_eq!(h.len(), 3);
+    h.add("echo database only").unwrap();
+    h.compact().unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+    assert_eq!(std::fs::read(dir.join("history.bin")).unwrap(), cache);
+    assert!(dir.join("history.sqlite3").exists());
+
+    std::fs::write(&path, format!("{legacy}echo late legacy\n")).unwrap();
+    h.sync().unwrap();
+    let fresh = History::load_from(path).unwrap();
+    assert_eq!(fresh.len(), 4);
+    assert!(fresh.prefix_search("echo late legacy", 0).is_none());
+    assert_eq!(fresh.prefix_search("echo database", 0), Some("echo database only"));
+}
+
+#[test]
+fn history_corrupt_legacy_cache_reports_migration_error() {
+    let dir = tempdir_with_files(&[]);
+    let path = dir.join("history");
+    std::fs::write(&path, "echo retained\n").unwrap();
+    std::fs::write(dir.join("history.bin"), b"corrupt legacy cache").unwrap();
+    assert!(History::load_from(path.clone()).is_err());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "echo retained\n");
+    assert_eq!(std::fs::read(dir.join("history.bin")).unwrap(), b"corrupt legacy cache");
+}
+
+#[test]
+fn history_concurrent_connections_preserve_all_appends_and_compaction() {
+    let dir = tempdir_with_files(&[]);
+    let path = dir.join("history");
+    History::load_from(path.clone()).unwrap();
+    let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let writers: Vec<_> = (0..4).map(|writer| {
+        let path = path.clone();
+        let start = start.clone();
+        std::thread::spawn(move || {
+            let mut h = History::load_from(path).unwrap();
+            start.wait();
+            for item in 0..20 {
+                h.add(&format!("writer-{writer} command-{item}")).unwrap();
+                if item == 10 {
+                    h.compact().unwrap();
+                }
+            }
+        })
+    }).collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    let h = History::load_from(path).unwrap();
+    assert_eq!(h.len(), 80);
+    for writer in 0..4 {
+        for item in 0..20 {
+            let command = format!("writer-{writer} command-{item}");
+            assert!((0..h.len()).any(|i| h.get(i) == command));
+        }
+    }
+}
+
+#[test]
+fn history_ranking_uses_recorded_directory_after_match_quality() {
+    let dir = tempdir_with_files(&[]);
+    let mut h = History::load_from(dir.join("history")).unwrap();
+    let project = dir.join("project");
+    let other = dir.join("other");
+    h.add_in_dir("cargo project", Some(&project)).unwrap();
+    h.add_in_dir("cargo elsewhere", Some(&other)).unwrap();
+    let matches = h.fuzzy_search_in_dir("cargo", &project);
+    assert_eq!(h.get(matches[0].entry_idx), "cargo project");
+
+    for _ in 0..20 {
+        h.add_in_dir("cat another remote git object", Some(&project)).unwrap();
+    }
+    let matches = h.fuzzy_search_in_dir("cargo", &project);
+    assert_eq!(h.get(matches[0].entry_idx), "cargo project");
+}
+
+#[test]
+fn history_usage_ranks_repeated_commands_without_duplicate_results() {
+    let dir = tempdir_with_files(&[]);
+    let path = dir.join("history");
+    let mut h = History::load_from(path.clone()).unwrap();
+    let mut other = History::load_from(path).unwrap();
+    for _ in 0..8 {
+        other.add("cargo repeated").unwrap();
+    }
+    other.add("cargo recent").unwrap();
+    h.sync().unwrap();
+    let matches = h.fuzzy_search("cargo");
+    assert_eq!(matches.len(), 2);
+    assert_eq!(h.get(matches[0].entry_idx), "cargo repeated");
+}
+
+#[test]
+fn history_match_positions_count_unicode_characters() {
+    let h = History::from_entries(vec!["echo café 東京".into()]);
+    let matches = h.fuzzy_search("é 東");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(&matches[0].match_positions[..matches[0].match_count as usize], &[8, 9, 10]);
+}
+
+#[test]
+fn history_external_repeats_preserve_session_navigation_order() {
+    let dir = tempdir_with_files(&[]);
+    let path = dir.join("history");
+    let mut seed = History::load_from(path.clone()).unwrap();
+    seed.add("echo oldest").unwrap();
+    seed.add("echo newest").unwrap();
+    let mut session = History::load_from(path.clone()).unwrap();
+    session.add("echo local").unwrap();
+    let mut other = History::load_from(path).unwrap();
+    for _ in 0..5 {
+        other.add("echo oldest").unwrap();
+    }
+    other.add("echo other").unwrap();
+    session.sync().unwrap();
+    assert_eq!(session.len(), 4);
+    assert_eq!(session.session_get(0), Some("echo local"));
+    assert_eq!(session.session_get(1), Some("echo newest"));
+    assert_eq!(session.session_get(2), Some("echo oldest"));
+    assert_eq!(session.session_get(3), None);
+    let matches = session.fuzzy_search("echo oldest");
+    assert_eq!(matches.len(), 1);
+}
+
+#[test]
+fn history_append_reports_database_failure() {
+    let dir = tempdir_with_files(&[]);
+    let mut h = History::load_from(dir.join("history")).unwrap();
+    h.add("echo persisted").unwrap();
+    let connection = rusqlite::Connection::open(dir.join("history.sqlite3")).unwrap();
+    connection.execute_batch("DROP TABLE occurrences").unwrap();
+    assert!(h.add("echo must fail").is_err());
+    assert!(h.prefix_search("echo must fail", 0).is_none());
+    assert!(!dir.join("history").exists());
 }
 
 #[test]
@@ -1514,24 +1664,27 @@ fn history_reset_invalidates_existing_shell_cache() {
     let dir = tempdir_with_files(&[]);
     let hist_file = dir.join("history");
 
-    let mut resetter = History::load_from(hist_file.clone());
-    resetter.add("old command");
-    let mut stale_shell = History::load_from(hist_file.clone());
+    let mut resetter = History::load_from(hist_file.clone()).unwrap();
+    resetter.add("old command").unwrap();
+    let mut stale_shell = History::load_from(hist_file.clone()).unwrap();
     assert_eq!(stale_shell.get(0), "old command");
 
     resetter.reset().unwrap();
-    stale_shell.sync();
+    stale_shell.compact().unwrap();
+    stale_shell.sync().unwrap();
     assert!(stale_shell.is_empty());
+    assert_eq!(stale_shell.session_get(0), None);
+    assert_eq!(stale_shell.session_prefix_search("old", 0), None);
 
-    stale_shell.add("new command");
-    stale_shell.compact();
-    let mut fresh_shell = History::load_from(hist_file.clone());
+    stale_shell.add("new command").unwrap();
+    stale_shell.compact().unwrap();
+    let mut fresh_shell = History::load_from(hist_file.clone()).unwrap();
     assert_eq!(fresh_shell.len(), 1);
     assert_eq!(fresh_shell.get(0), "new command");
 
-    fresh_shell.add("another new command");
-    fresh_shell.compact();
-    let persisted_shell = History::load_from(hist_file);
+    fresh_shell.add("another new command").unwrap();
+    fresh_shell.compact().unwrap();
+    let persisted_shell = History::load_from(hist_file).unwrap();
     assert_eq!(persisted_shell.len(), 2);
 }
 
@@ -1541,14 +1694,14 @@ fn history_up_arrow_uses_session_start_boundary() {
     let hist_file = dir.join("history");
     std::fs::write(&hist_file, "echo global one\necho global two\n").unwrap();
 
-    let mut h = History::load_from(hist_file.clone());
+    let mut h = History::load_from(hist_file.clone()).unwrap();
     assert_eq!(h.session_get(0), Some("echo global two"));
     assert_eq!(
         h.session_prefix_search("echo global", 0),
         Some("echo global two")
     );
 
-    h.add("echo local one");
+    h.add("echo local one").unwrap();
     assert_eq!(h.session_get(0), Some("echo local one"));
     assert_eq!(h.session_get(1), Some("echo global two"));
     assert_eq!(
@@ -1556,15 +1709,9 @@ fn history_up_arrow_uses_session_start_boundary() {
         Some("echo local one")
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(2));
-
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&hist_file)
-        .unwrap()
-        .write_all(b"echo global three\n")
-        .unwrap();
-    h.sync();
+    let mut other_shell = History::load_from(hist_file).unwrap();
+    other_shell.add("echo global three").unwrap();
+    h.sync().unwrap();
 
     assert_eq!(h.session_get(0), Some("echo local one"));
     assert_eq!(h.session_get(1), Some("echo global two"));
@@ -1576,40 +1723,31 @@ fn history_up_arrow_uses_session_start_boundary() {
 }
 
 #[test]
-fn history_ctrl_r_uses_session_start_boundary() {
+fn history_ctrl_r_searches_later_global_entries() {
     let dir = tempdir_with_files(&[]);
     let hist_file = dir.join("history");
     std::fs::write(&hist_file, "echo global one\necho global two\n").unwrap();
 
-    let mut h = History::load_from(hist_file.clone());
-    h.add("echo local one");
+    let mut h = History::load_from(hist_file.clone()).unwrap();
+    h.add("echo local one").unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(2));
-
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&hist_file)
-        .unwrap()
-        .write_all(b"echo global three\n")
-        .unwrap();
-    h.sync();
+    let mut other_shell = History::load_from(hist_file).unwrap();
+    other_shell.add("echo global three").unwrap();
+    h.sync().unwrap();
 
     let all = h.fuzzy_search("");
-    assert_eq!(h.get(all[0].entry_idx), "echo local one");
-    assert_eq!(h.get(all[1].entry_idx), "echo global two");
-    assert!(
-        all.iter()
-            .all(|m| h.get(m.entry_idx) != "echo global three")
-    );
+    assert_eq!(h.get(all[0].entry_idx), "echo global three");
+    assert_eq!(all.len(), 4);
 
     let filtered = h.fuzzy_search("global");
-    assert_eq!(h.get(filtered[0].entry_idx), "echo global two");
-    assert_eq!(h.get(filtered[1].entry_idx), "echo global one");
-    assert!(
-        filtered
-            .iter()
-            .all(|m| h.get(m.entry_idx) != "echo global three")
-    );
+    assert_eq!(h.get(filtered[0].entry_idx), "echo global three");
+    assert_eq!(filtered.len(), 3);
+
+    let mut candidates = Vec::new();
+    h.search_entry_indices_into(&mut candidates);
+    assert!(candidates.iter().any(|&i| h.get(i) == "echo global three"));
+    assert_eq!(h.session_get(0), Some("echo local one"));
+
 }
 
 // ---------------------------------------------------------------------------

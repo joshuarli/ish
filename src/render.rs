@@ -139,7 +139,7 @@ fn write_history_row(
             break;
         }
         col += w;
-        let is_match = pi < m.match_count as usize && m.match_positions[pi] == ci as u16;
+        let is_match = pi < m.match_count as usize && m.match_positions[pi] == ci;
         if is_match {
             pi += 1;
         }
@@ -175,7 +175,7 @@ struct HistoryHeaderKey {
 struct HistoryRowKey {
     entry_idx: usize,
     selected: bool,
-    match_positions: [u16; 32],
+    match_positions: [usize; 32],
     match_count: u8,
 }
 
@@ -1065,7 +1065,7 @@ mod tests {
         query_cursor: usize,
     ) -> (RenderedRegion, Vec<u8>) {
         let mut tw = TermWriter::new();
-        let hist = History::load_from(std::path::PathBuf::from("/tmp/ish_render_history_test"));
+        let hist = History::from_entries(Vec::new());
         let info = render_history_pager(
             &mut tw,
             query,
@@ -1284,7 +1284,7 @@ mod tests {
     #[test]
     fn history_pager_clears_from_top_on_wrapped_rerender() {
         let mut tw = TermWriter::new();
-        let hist = History::load_from(std::path::PathBuf::from("/tmp/ish_render_history_test"));
+        let hist = History::from_entries(Vec::new());
         let info = render_history_pager(
             &mut tw,
             "abc",
@@ -1344,7 +1344,7 @@ mod tests {
     #[test]
     fn history_row_groups_contiguous_match_highlights() {
         let mut tw = TermWriter::new();
-        let mut positions = [0u16; 32];
+        let mut positions = [0usize; 32];
         positions[..5].copy_from_slice(&[0, 1, 3, 4, 5]);
         let m = FuzzyMatch {
             entry_idx: 0,

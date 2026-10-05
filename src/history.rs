@@ -1,25 +1,11 @@
-use fxhash::{FxHashMap, FxHashSet};
-use std::fs;
+use fxhash::FxHashMap;
+use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::Write;
+use std::io;
 use std::path::{Path, PathBuf};
 
-const CACHE_MAGIC_V1: &[u8; 4] = b"ISH\x01";
-const CACHE_MAGIC_V2: &[u8; 4] = b"ISH\x02";
-const CACHE_MAGIC_V3: &[u8; 4] = b"ISH\x03";
-const CACHE_MAGIC_V4: &[u8; 4] = b"ISH\x04";
-const CACHE_MAGIC_V5: &[u8; 4] = b"ISH\x05";
-const LOG_RECORD_PREFIX: &str = ":ish-history:v1\t";
-const LOG_RECORD_PREFIX_V2: &str = ":ish-history:v2\t";
-
-/// v1/v2 header: magic(4) + reserved(8) + entry_count(4) + arena_size(4)
-const V2_HEADER_SIZE: usize = 20;
-/// v3 header: magic(4) + entry_count(4) + arena_size(4)
-const V3_HEADER_SIZE: usize = 12;
-const V5_HEADER_SIZE: usize = 16;
-
-/// 1998-01-01T00:00:00 UTC as Unix epoch milliseconds.
-const TS_EPOCH_MILLIS: u64 = 883_612_800_000;
+mod legacy;
+mod store;
 
 fn hash_str(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
@@ -28,1491 +14,384 @@ fn hash_str(s: &str) -> u64 {
 }
 
 fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock predates Unix epoch").as_millis() as u64
 }
 
 fn new_session_id() -> u64 {
-    now_millis().wrapping_shl(16) ^ rustix::process::getpid().as_raw_pid() as u64
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock predates Unix epoch").as_nanos() as u64;
+    nanos ^ (rustix::process::getpid().as_raw_pid() as u64).wrapping_shl(32)
 }
 
-struct ParsedHistoryLine<'a> {
-    command: &'a str,
+#[derive(Default)]
+struct Usage {
+    count: u64,
     timestamp: u64,
-    session_id: u64,
-    cwd: Option<PathBuf>,
 }
 
-fn parse_history_line<'a>(line: &'a str, fallback_ts: u64) -> Option<ParsedHistoryLine<'a>> {
-    if line.is_empty() {
-        return None;
-    }
-
-    if let Some(rest) = line.strip_prefix(LOG_RECORD_PREFIX_V2) {
-        let mut parts = rest.splitn(4, '\t');
-        if let (Some(ts), Some(session_id), Some(cwd), Some(command)) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-            && !command.is_empty()
-            && let (Ok(timestamp), Ok(session_id)) = (ts.parse::<u64>(), session_id.parse::<u64>())
-        {
-            return Some(ParsedHistoryLine {
-                command,
-                timestamp,
-                session_id,
-                cwd: unescape_history_field(cwd).map(PathBuf::from),
-            });
-        }
-    }
-
-    if let Some(rest) = line.strip_prefix(LOG_RECORD_PREFIX) {
-        let mut parts = rest.splitn(3, '\t');
-        if let (Some(ts), Some(session_id), Some(command)) =
-            (parts.next(), parts.next(), parts.next())
-            && !command.is_empty()
-            && let (Ok(timestamp), Ok(session_id)) = (ts.parse::<u64>(), session_id.parse::<u64>())
-        {
-            return Some(ParsedHistoryLine {
-                command,
-                timestamp,
-                session_id,
-                cwd: None,
-            });
-        }
-    }
-
-    Some(ParsedHistoryLine {
-        command: line,
-        timestamp: fallback_ts,
-        session_id: 0,
-        cwd: None,
-    })
-}
-
-fn format_history_record(timestamp: u64, session_id: u64, command: &str) -> String {
-    format!("{LOG_RECORD_PREFIX}{timestamp}\t{session_id}\t{command}")
-}
-
-fn format_history_record_with_cwd(
-    timestamp: u64,
-    session_id: u64,
-    cwd: &Path,
-    command: &str,
-) -> String {
-    format!(
-        "{LOG_RECORD_PREFIX_V2}{timestamp}\t{session_id}\t{}\t{command}",
-        escape_history_field(&cwd.to_string_lossy())
-    )
-}
-
-fn escape_history_field(field: &str) -> String {
-    let mut escaped = String::with_capacity(field.len());
-    for c in field.chars() {
-        match c {
-            '\\' => escaped.push_str("\\\\"),
-            '\t' => escaped.push_str("\\t"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            _ => escaped.push(c),
-        }
-    }
-    escaped
-}
-
-fn unescape_history_field(field: &str) -> Option<String> {
-    let mut unescaped = String::with_capacity(field.len());
-    let mut chars = field.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            unescaped.push(c);
-            continue;
-        }
-        match chars.next()? {
-            '\\' => unescaped.push('\\'),
-            't' => unescaped.push('\t'),
-            'n' => unescaped.push('\n'),
-            'r' => unescaped.push('\r'),
-            _ => return None,
-        }
-    }
-    Some(unescaped)
+struct EntryUsage {
+    latest_id: i64,
+    total: Usage,
+    directories: FxHashMap<PathBuf, Usage>,
+    session_occurrence_id: Option<i64>,
 }
 
 pub struct History {
-    /// All entry text packed into a single allocation.
+    /// Unique command text stays packed; updating usage never moves a candidate.
     arena: String,
-    /// (start, len) byte offsets into `arena` for each entry.
-    offsets: Vec<(u32, u16)>,
-    /// Epoch milliseconds when each entry was last used. Parallel to `offsets`.
-    timestamps: Vec<u64>,
-    /// Session ids parallel to `offsets`. Zero means unknown/legacy.
-    session_ids: Vec<u64>,
-    /// Working directory for each entry. None means unknown/legacy.
-    cwds: Vec<Option<PathBuf>>,
-    /// Maps command hash to its current in-memory position.
+    offsets: Vec<(usize, usize)>,
+    usages: Vec<EntryUsage>,
     index_by_hash: FxHashMap<u64, usize>,
-    path: PathBuf,
-    /// Byte offset into the text file we've read up to. Enables incremental
-    /// sync — only new bytes appended by other shells are read.
-    file_pos: u64,
-    /// Per-entry flag: true if the entry was added by this shell session
-    /// (`add()`).
-    local: Vec<bool>,
-    /// Entries with timestamps at or before this boundary are considered part
-    /// of the session-visible history. Up-arrow sees those entries plus any
-    /// entry added by this shell.
-    session_cutoff: u64,
-    /// Session id used for new entries written by this shell.
+    latest_occurrences: BTreeMap<i64, usize>,
+    /// Startup snapshot plus this shell's commands. Other sessions may update
+    /// global usage without changing the order or membership of Up-arrow recall.
+    session: BTreeMap<i64, usize>,
     session_id: u64,
-    /// Set when the cache was corrupt at load time. Prevents overwriting the
-    /// (possibly recoverable) cache file until the user resolves it.
-    cache_dirty: bool,
-    /// Generation written by `history reset`; stale shells clear their
-    /// in-memory entries before they can persist them again.
-    reset_generation: u64,
-    reset_marker_modified: Option<std::time::SystemTime>,
+    generation: i64,
+    last_id: i64,
+    store: Option<store::Store>,
 }
 
 impl History {
-    pub fn load() -> Self {
-        Self::load_from_home(None)
+    pub fn load() -> io::Result<Self> {
+        Self::load_from_home(std::env::var_os("HOME").as_deref())
     }
 
-    pub fn load_from_home(home: Option<&std::ffi::OsStr>) -> Self {
+    pub fn load_from_home(home: Option<&std::ffi::OsStr>) -> io::Result<Self> {
         Self::load_from(history_path_for_home(home))
     }
 
-    pub fn load_from(path: PathBuf) -> Self {
-        let cache = cache_path_for(&path);
-
-        match Self::load_from_cache(&path, &cache) {
-            Ok(Some(mut hist)) => {
-                // Cache loaded — sync any new entries from the text file
-                hist.sync();
-                hist.session_cutoff = now_millis();
-                hist
-            }
-            Ok(None) => {
-                // No cache file (first launch) — build from text, write cache
-                let mut hist = Self::load_from_text(&path);
-                hist.file_pos = fs::metadata(&hist.path).map(|m| m.len()).unwrap_or(0);
-                if !hist.offsets.is_empty() {
-                    hist.save_cache();
-                }
-                hist.session_cutoff = now_millis();
-                hist
-            }
-            Err(()) => {
-                // Cache corrupt — load text file but do NOT write cache or
-                // truncate the text file. The corrupt cache is left for the
-                // user to inspect/delete manually.
-                let mut hist = Self::load_from_text(&path);
-                hist.file_pos = fs::metadata(&hist.path).map(|m| m.len()).unwrap_or(0);
-                hist.cache_dirty = true;
-                hist.session_cutoff = now_millis();
-                hist
-            }
+    pub fn load_from(path: PathBuf) -> io::Result<Self> {
+        let mut history = Self::empty();
+        history.store = Some(store::Store::open(&path)?);
+        history.sync()?;
+        for (&id, &idx) in &history.latest_occurrences {
+            history.session.insert(id, idx);
+            history.usages[idx].session_occurrence_id = Some(id);
         }
+        Ok(history)
     }
 
-    /// Rebuild the binary cache from the text history file, replacing the
-    /// current in-memory state and overwriting any existing cache on disk.
-    pub fn rebuild(&mut self) {
-        let mut fresh = Self::load_from_text(&self.path);
-        fresh.file_pos = fs::metadata(&fresh.path).map(|m| m.len()).unwrap_or(0);
-        fresh.cache_dirty = false;
-        fresh.session_cutoff = now_millis();
-        fresh.session_id = self.session_id;
-        fresh.save_cache();
-        eprintln!(
-            "ish: rebuilt history cache — {} entries",
-            fresh.offsets.len()
-        );
-        *self = fresh;
+    fn empty() -> Self {
+        Self { arena: String::new(), offsets: Vec::new(), usages: Vec::new(),
+            index_by_hash: FxHashMap::default(), latest_occurrences: BTreeMap::new(),
+            session: BTreeMap::new(), session_id: new_session_id(), generation: 0,
+            last_id: 0, store: None }
     }
 
-    fn load_from_text(path: &Path) -> Self {
-        let (arena, offsets, timestamps, session_ids, cwds, index_by_hash) = match fs::read(path) {
-            Ok(data) => {
-                let line_count = memchr_count(b'\n', &data);
-                let mut seen = FxHashSet::with_capacity_and_hasher(line_count, Default::default());
-                let mut deduped: Vec<(String, u64, u64, Option<PathBuf>)> =
-                    Vec::with_capacity(line_count);
-                let fallback_ts = now_millis();
-
-                for chunk in data.rsplit(|&b| b == b'\n') {
-                    if let Ok(line) = std::str::from_utf8(chunk)
-                        && let Some(parsed) = parse_history_line(line, fallback_ts)
-                    {
-                        let h = hash_str(parsed.command);
-                        if seen.insert(h) {
-                            deduped.push((
-                                parsed.command.to_string(),
-                                parsed.timestamp,
-                                parsed.session_id,
-                                parsed.cwd,
-                            ));
-                        }
-                    }
-                }
-                deduped.reverse();
-
-                let total: usize = deduped.iter().map(|(s, _, _, _)| s.len()).sum();
-                let mut arena = String::with_capacity(total);
-                let mut offsets = Vec::with_capacity(deduped.len());
-                let mut timestamps = Vec::with_capacity(deduped.len());
-                let mut session_ids = Vec::with_capacity(deduped.len());
-                let mut cwds = Vec::with_capacity(deduped.len());
-                for (line, timestamp, session_id, cwd) in &deduped {
-                    let start = arena.len() as u32;
-                    arena.push_str(line);
-                    offsets.push((start, line.len() as u16));
-                    timestamps.push(*timestamp);
-                    session_ids.push(*session_id);
-                    cwds.push(cwd.clone());
-                }
-
-                let mut index_by_hash =
-                    FxHashMap::with_capacity_and_hasher(deduped.len(), Default::default());
-                for (idx, (line, _, _, _)) in deduped.iter().enumerate() {
-                    index_by_hash.insert(hash_str(line), idx);
-                }
-
-                (arena, offsets, timestamps, session_ids, cwds, index_by_hash)
-            }
-            Err(_) => (
-                String::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                FxHashMap::default(),
-            ),
-        };
-        let count = offsets.len();
-
-        let (reset_generation, reset_marker_modified) = read_reset_marker(path);
-        Self {
-            arena,
-            offsets,
-            timestamps,
-            session_ids,
-            cwds,
-            index_by_hash,
-            path: path.to_path_buf(),
-            file_pos: 0,
-            local: vec![false; count],
-            session_cutoff: 0,
-            session_id: new_session_id(),
-            cache_dirty: false,
-            reset_generation,
-            reset_marker_modified,
-        }
+    pub fn database_path(&self) -> Option<&Path> {
+        self.store.as_ref().map(|store| store.path.as_path())
     }
 
-    /// Returns `Ok(Some)` on success, `Ok(None)` if no cache file exists,
-    /// `Err(())` if the cache exists but is corrupt or unreadable.
-    fn load_from_cache(path: &Path, cache: &Path) -> Result<Option<Self>, ()> {
-        let data = match fs::read(cache) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                eprintln!("ish: history cache unreadable: {e}");
-                return Err(());
-            }
-        };
-
-        match Self::parse_cache(&data, path) {
-            Some(hist) => Ok(Some(hist)),
-            None => {
-                eprintln!(
-                    "ish: history cache corrupt ({} bytes) — loading text file only",
-                    data.len()
-                );
-                Err(())
-            }
-        }
-    }
-
-    fn parse_cache(data: &[u8], path: &Path) -> Option<Self> {
-        if data.len() < 4 {
-            return None;
-        }
-
-        match &data[0..4] {
-            x if x == CACHE_MAGIC_V5 => Self::parse_v5(data, path),
-            x if x == CACHE_MAGIC_V4 => Self::parse_v4(data, path),
-            x if x == CACHE_MAGIC_V3 => Self::parse_v3(data, path),
-            x if x == CACHE_MAGIC_V2 => Self::parse_v1v2(data, path, 2),
-            x if x == CACHE_MAGIC_V1 => Self::parse_v1v2(data, path, 1),
-            _ => None,
-        }
-    }
-
-    /// Parse v5 format: [magic(4)][entry_count(4)][arena_size(4)][cwd_arena_size(4)]
-    /// [timestamps: N×8][arena: \0-delimited][cwd arena: \0-delimited]
-    fn parse_v5(data: &[u8], path: &Path) -> Option<Self> {
-        if data.len() < V5_HEADER_SIZE {
-            return None;
-        }
-
-        let entry_count = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
-        let arena_size = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
-        let cwd_arena_size = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
-        let expected = V5_HEADER_SIZE
-            .checked_add(entry_count.checked_mul(8)?)?
-            .checked_add(arena_size)?
-            .checked_add(cwd_arena_size)?;
-        if data.len() != expected {
-            return None;
-        }
-
-        let ts_start = V5_HEADER_SIZE;
-        let mut timestamps = Vec::with_capacity(entry_count);
-        for i in 0..entry_count {
-            let off = ts_start + i * 8;
-            let stored = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
-            timestamps.push(stored.wrapping_add(TS_EPOCH_MILLIS));
-        }
-
-        let arena_start = ts_start + entry_count * 8;
-        let cwd_start = arena_start + arena_size;
-        let cwd_arena = std::str::from_utf8(&data[cwd_start..cwd_start + cwd_arena_size]).ok()?;
-        let mut cwd_parts = cwd_arena.split('\0');
-        let mut cwds = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            let cwd = cwd_parts.next()?;
-            cwds.push((!cwd.is_empty()).then(|| PathBuf::from(cwd)));
-        }
-        if cwd_parts.next() != Some("") || cwd_parts.next().is_some() {
-            return None;
-        }
-
-        Self::parse_delimited_arena(path, data, arena_start, arena_size, timestamps, cwds)
-    }
-
-    /// Parse v4 format: [magic(4)][entry_count(4)][arena_size(4)][timestamps: N×8][arena: \0-delimited]
-    fn parse_v4(data: &[u8], path: &Path) -> Option<Self> {
-        if data.len() < V3_HEADER_SIZE {
-            return None;
-        }
-
-        let entry_count = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
-        let arena_size = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
-
-        let expected = V3_HEADER_SIZE + entry_count * 8 + arena_size;
-        if data.len() != expected {
-            return None;
-        }
-
-        let ts_start = V3_HEADER_SIZE;
-        let mut timestamps = Vec::with_capacity(entry_count);
-        for i in 0..entry_count {
-            let off = ts_start + i * 8;
-            let stored = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
-            timestamps.push(stored.wrapping_add(TS_EPOCH_MILLIS));
-        }
-
-        Self::parse_delimited_arena(
-            path,
-            data,
-            ts_start + entry_count * 8,
-            arena_size,
-            timestamps,
-            vec![None; entry_count],
-        )
-    }
-
-    /// Parse v3 format: [magic(4)][entry_count(4)][arena_size(4)][timestamps: N×4][arena: \0-delimited]
-    fn parse_v3(data: &[u8], path: &Path) -> Option<Self> {
-        if data.len() < V3_HEADER_SIZE {
-            return None;
-        }
-
-        let entry_count = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
-        let arena_size = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
-
-        let expected = V3_HEADER_SIZE + entry_count * 4 + arena_size;
-        if data.len() != expected {
-            return None;
-        }
-
-        // Bulk-copy timestamps, converting from 1998-epoch to Unix epoch
-        let ts_start = V3_HEADER_SIZE;
-        let mut timestamps = Vec::with_capacity(entry_count);
-        for i in 0..entry_count {
-            let off = ts_start + i * 4;
-            let stored = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
-            timestamps.push(stored as u64 * 1000 + TS_EPOCH_MILLIS);
-        }
-
-        Self::parse_delimited_arena(
-            path,
-            data,
-            ts_start + entry_count * 4,
-            arena_size,
-            timestamps,
-            vec![None; entry_count],
-        )
-    }
-
-    fn parse_delimited_arena(
-        path: &Path,
-        data: &[u8],
-        arena_start: usize,
-        arena_size: usize,
-        timestamps: Vec<u64>,
-        cwds: Vec<Option<PathBuf>>,
-    ) -> Option<Self> {
-        let entry_count = timestamps.len();
-        if cwds.len() != entry_count {
-            return None;
-        }
-        let arena_bytes = &data[arena_start..arena_start + arena_size];
-        let arena_str = std::str::from_utf8(arena_bytes).ok()?;
-
-        let mut arena = String::with_capacity(arena_size);
-        let mut offsets = Vec::with_capacity(entry_count);
-        let mut index_by_hash =
-            FxHashMap::with_capacity_and_hasher(entry_count, Default::default());
-        let mut count = 0;
-        for entry in arena_str.split('\0') {
-            if entry.is_empty() {
-                continue;
-            }
-            let start = arena.len() as u32;
-            arena.push_str(entry);
-            offsets.push((start, entry.len() as u16));
-            index_by_hash.insert(hash_str(entry), count);
-            count += 1;
-        }
-
-        if count != entry_count {
-            return None;
-        }
-
-        let (reset_generation, reset_marker_modified) = read_reset_marker(path);
-        Some(Self {
-            arena,
-            offsets,
-            timestamps,
-            session_ids: vec![0; count],
-            cwds,
-            index_by_hash,
-            path: path.to_path_buf(),
-            file_pos: 0,
-            local: vec![false; count],
-            session_cutoff: 0,
-            session_id: new_session_id(),
-            cache_dirty: false,
-            reset_generation,
-            reset_marker_modified,
-        })
-    }
-
-    /// Parse legacy v1/v2 format for migration.
-    fn parse_v1v2(data: &[u8], path: &Path, version: u8) -> Option<Self> {
-        if data.len() < V2_HEADER_SIZE {
-            return None;
-        }
-
-        // Skip reserved field (bytes 4..12)
-        let entry_count = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
-        let arena_size = u32::from_le_bytes(data[16..20].try_into().ok()?) as usize;
-
-        let timestamps_size = if version >= 2 { entry_count * 4 } else { 0 };
-        let expected =
-            V2_HEADER_SIZE + entry_count * 8 + timestamps_size + entry_count * 6 + arena_size;
-        if data.len() != expected {
-            return None;
-        }
-
-        let mut pos = V2_HEADER_SIZE;
-
-        // Skip hashes (no longer stored in-memory)
-        let mut index_by_hash =
-            FxHashMap::with_capacity_and_hasher(entry_count, Default::default());
-        pos += entry_count * 8;
-
-        // Read timestamps (v2+) or default to 0 (v1)
-        let timestamps = if version >= 2 {
-            let mut ts = Vec::with_capacity(entry_count);
-            for _ in 0..entry_count {
-                ts.push(u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as u64 * 1000);
-                pos += 4;
-            }
-            ts
-        } else {
-            vec![0; entry_count]
-        };
-
-        // Read offsets
-        let mut offsets = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            let start = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
-            let len = u16::from_le_bytes(data[pos + 4..pos + 6].try_into().ok()?);
-            offsets.push((start, len));
-            pos += 6;
-        }
-
-        // Read arena
-        let arena = String::from_utf8(data[pos..pos + arena_size].to_vec()).ok()?;
-
-        // Validate offsets and build hash index
-        for &(start, len) in &offsets {
-            let s = start as usize;
-            let l = len as usize;
-            if s + l > arena.len() {
-                return None;
-            }
-        }
-        for (idx, &(start, len)) in offsets.iter().enumerate() {
-            index_by_hash.insert(
-                hash_str(&arena[start as usize..start as usize + len as usize]),
-                idx,
-            );
-        }
-
-        let count = offsets.len();
-        let (reset_generation, reset_marker_modified) = read_reset_marker(path);
-        Some(Self {
-            arena,
-            offsets,
-            timestamps,
-            session_ids: vec![0; count],
-            cwds: vec![None; count],
-            index_by_hash,
-            path: path.to_path_buf(),
-            file_pos: 0,
-            local: vec![false; count],
-            session_cutoff: 0,
-            session_id: new_session_id(),
-            cache_dirty: false,
-            reset_generation,
-            reset_marker_modified,
-        })
-    }
-
-    /// Read new entries appended to the text file by other shell instances.
-    /// One stat() call to check for growth; reads only the new tail bytes.
-    /// Called at each prompt and before Ctrl+R history search.
-    pub fn sync(&mut self) {
-        self.sync_reset_marker();
-        let file_size = match fs::metadata(&self.path) {
-            Ok(m) => m.len(),
-            Err(_) => return,
-        };
-
-        if file_size == self.file_pos {
-            return; // fast path: nothing new
-        }
-
-        if file_size < self.file_pos {
-            // File was truncated (compacted by another shell). Our in-memory
-            // entries are still valid — just reset the read position.
-            self.file_pos = file_size;
-            return;
-        }
-
-        // Read only the new tail
-        let mut f = match fs::File::open(&self.path) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-
-        use std::io::{Read, Seek, SeekFrom};
-        if f.seek(SeekFrom::Start(self.file_pos)).is_err() {
-            return;
-        }
-
-        let mut tail = String::new();
-        if f.read_to_string(&mut tail).is_err() {
-            return;
-        }
-
-        // Stage replacements so duplicates do not shift every entry and
-        // rebuild the entire index for each line in a large history tail.
-        let mut pending: Vec<Option<ParsedHistoryLine<'_>>> = Vec::new();
-        let mut pending_by_command: FxHashMap<&str, usize> = FxHashMap::default();
-        let mut removed = FxHashSet::default();
-        let ts = now_millis();
-        for line in tail.lines() {
-            let Some(parsed) = parse_history_line(line, ts) else {
-                continue;
-            };
-            if let Some(&idx) = pending_by_command.get(parsed.command) {
-                let previous = pending[idx].as_ref().unwrap();
-                if previous.timestamp <= self.session_cutoff {
-                    continue;
-                }
-                pending[idx] = None;
-            } else {
-                let h = hash_str(parsed.command);
-                if let Some(idx) = self.find_entry_index(h, parsed.command) {
-                    // Don't let a newer hidden duplicate disturb the entries this
-                    // session can still recall with Up-arrow.
-                    if self.is_session_visible(idx) {
-                        continue;
-                    }
-                    removed.insert(idx);
-                }
-            }
-            pending_by_command.insert(parsed.command, pending.len());
-            pending.push(Some(parsed));
-        }
-
-        if !removed.is_empty() {
-            let mut kept = 0;
-            for idx in 0..self.offsets.len() {
-                if removed.contains(&idx) {
-                    continue;
-                }
-                self.offsets.swap(kept, idx);
-                self.timestamps.swap(kept, idx);
-                self.session_ids.swap(kept, idx);
-                self.cwds.swap(kept, idx);
-                self.local.swap(kept, idx);
-                kept += 1;
-            }
-            self.offsets.truncate(kept);
-            self.timestamps.truncate(kept);
-            self.session_ids.truncate(kept);
-            self.cwds.truncate(kept);
-            self.local.truncate(kept);
-            self.rebuild_index();
-        }
-
-        for parsed in pending.into_iter().flatten() {
-            let h = hash_str(parsed.command);
-            let start = self.arena.len() as u32;
-            self.arena.push_str(parsed.command);
-            self.offsets.push((start, parsed.command.len() as u16));
-            self.timestamps.push(parsed.timestamp);
-            self.session_ids.push(parsed.session_id);
-            self.cwds.push(parsed.cwd);
-            self.local.push(false);
-            self.index_by_hash.insert(h, self.offsets.len() - 1);
-        }
-
-        self.file_pos = file_size;
-    }
-
-    fn sync_reset_marker(&mut self) {
-        let marker = reset_marker_for(&self.path);
-        let modified = fs::metadata(&marker).and_then(|m| m.modified()).ok();
-        if modified == self.reset_marker_modified {
-            return;
-        }
-
-        let generation = fs::read_to_string(&marker)
-            .ok()
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(0);
-        self.reset_marker_modified = modified;
-        if generation == self.reset_generation {
-            return;
-        }
-
-        self.arena.clear();
-        self.offsets.clear();
-        self.timestamps.clear();
-        self.session_ids.clear();
-        self.cwds.clear();
-        self.index_by_hash.clear();
-        self.local.clear();
-        self.file_pos = 0;
-        self.session_cutoff = now_millis();
-        self.reset_generation = generation;
-        self.cache_dirty = false;
-    }
-
-    /// Write v5 binary cache, then truncate text file.
-    /// v5 format: [magic(4)][entry_count(4)][arena_size(4)][cwd_arena_size(4)]
-    /// [timestamps: N×8][arena: \0-delimited][cwd arena: \0-delimited]
-    /// Atomic: writes cache to .tmp then renames.
-    pub fn save_cache(&self) {
-        if self.cache_dirty {
-            return;
-        }
-        let cache = cache_path_for(&self.path);
-        let tmp = cache.with_extension("bin.tmp");
-
-        let entry_count = self.offsets.len();
-
-        // Build null-delimited arena
-        let mut arena_buf = Vec::new();
-        for &(start, len) in &self.offsets {
-            arena_buf.extend_from_slice(
-                &self.arena.as_bytes()[start as usize..start as usize + len as usize],
-            );
-            arena_buf.push(0);
-        }
-        let arena_size = arena_buf.len();
-
-        let mut cwd_arena_buf = Vec::new();
-        for cwd in &self.cwds {
-            if let Some(cwd) = cwd {
-                cwd_arena_buf.extend_from_slice(cwd.to_string_lossy().as_bytes());
-            }
-            cwd_arena_buf.push(0);
-        }
-        let cwd_arena_size = cwd_arena_buf.len();
-
-        let total = V5_HEADER_SIZE + entry_count * 8 + arena_size + cwd_arena_size;
-        let mut buf = Vec::with_capacity(total);
-
-        // Header
-        buf.extend_from_slice(CACHE_MAGIC_V5);
-        buf.extend_from_slice(&(entry_count as u32).to_le_bytes());
-        buf.extend_from_slice(&(arena_size as u32).to_le_bytes());
-        buf.extend_from_slice(&(cwd_arena_size as u32).to_le_bytes());
-
-        // Timestamps (offset from 1998 epoch)
-        for &ts in &self.timestamps {
-            buf.extend_from_slice(&ts.wrapping_sub(TS_EPOCH_MILLIS).to_le_bytes());
-        }
-
-        // Null-delimited arena
-        buf.extend_from_slice(&arena_buf);
-        buf.extend_from_slice(&cwd_arena_buf);
-
-        // Guard: refuse to overwrite a larger cache with a much smaller one.
-        if let Ok(existing) = fs::read(&cache)
-            && existing.len() >= 4
-        {
-            let old_count = match &existing[0..4] {
-                x if x == CACHE_MAGIC_V5 && existing.len() >= V5_HEADER_SIZE => {
-                    u32::from_le_bytes(existing[4..8].try_into().unwrap_or_default()) as usize
-                }
-                x if x == CACHE_MAGIC_V4 && existing.len() >= V3_HEADER_SIZE => {
-                    u32::from_le_bytes(existing[4..8].try_into().unwrap_or_default()) as usize
-                }
-                x if x == CACHE_MAGIC_V3 && existing.len() >= V3_HEADER_SIZE => {
-                    u32::from_le_bytes(existing[4..8].try_into().unwrap_or_default()) as usize
-                }
-                _ if existing.len() >= V2_HEADER_SIZE => {
-                    u32::from_le_bytes(existing[12..16].try_into().unwrap_or_default()) as usize
-                }
-                _ => 0,
-            };
-            if entry_count < old_count / 2 && old_count > 100 {
-                eprintln!(
-                    "ish: refusing to shrink history cache from {old_count} to {entry_count} entries"
-                );
-                let _ = fs::remove_file(&tmp);
-                return;
-            }
-        }
-
-        if fs::write(&tmp, &buf).is_ok() && fs::rename(&tmp, &cache).is_ok() {
-            // Cache written — truncate text file since its contents
-            // are now in the cache. New commands append to a fresh file.
-            let _ = fs::File::create(&self.path);
-        }
-    }
-
-    /// Merge text tail into cache, dedup, rewrite cache + truncate text.
-    /// Uses flock to serialize across concurrent shells.
-    pub fn compact(&mut self) {
-        let lock = lock_path_for(&self.path);
-        if let Some(parent) = lock.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-
-        let lock_fd = match fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&lock)
-        {
-            Ok(f) => f,
-            Err(_) => {
-                self.file_pos = 0;
-                self.sync();
-                self.save_cache();
-                return;
-            }
-        };
-
-        // Try non-blocking lock — skip if another shell is compacting
-        let lock_result = rustix::fs::flock(
-            &lock_fd,
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        );
-        if lock_result.is_err() {
-            self.file_pos = 0;
-            self.sync();
-            self.save_cache();
-            return;
-        }
-
-        // Re-read text tail from other shells, merge into our state
-        self.file_pos = 0;
-        self.sync();
-
-        // save_cache writes cache + truncates text file
-        self.save_cache();
-        // lock released when lock_fd drops
-    }
-
-    /// Delete all history and invalidate the in-memory state of other shells.
-    pub fn reset(&mut self) -> std::io::Result<()> {
-        let marker = reset_marker_for(&self.path);
-        if let Some(parent) = marker.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let generation = new_session_id();
-        let tmp = marker.with_extension("reset.tmp");
-        fs::write(&tmp, generation.to_string())?;
-        fs::rename(&tmp, &marker)?;
-
-        remove_if_present(&self.path)?;
-        remove_if_present(&cache_path_for(&self.path))?;
-
-        self.arena.clear();
-        self.offsets.clear();
-        self.timestamps.clear();
-        self.session_ids.clear();
-        self.cwds.clear();
-        self.index_by_hash.clear();
-        self.local.clear();
-        self.file_pos = 0;
-        self.session_cutoff = now_millis();
-        self.reset_generation = generation;
-        self.reset_marker_modified = fs::metadata(&marker).and_then(|m| m.modified()).ok();
-        self.cache_dirty = false;
+    /// Synchronize a committed snapshot. Generation and rows are read in the
+    /// same transaction, so reset cannot mix old rows with a new generation.
+    pub fn sync(&mut self) -> io::Result<()> {
+        let Some(store) = self.store.as_mut() else { return Ok(()); };
+        let snapshot = store.snapshot(self.generation, self.last_id)?;
+        self.apply_snapshot(snapshot);
         Ok(())
     }
 
-    /// Create from pre-existing entries (for testing/benchmarks).
+    fn apply_snapshot(&mut self, snapshot: store::Snapshot) {
+        if snapshot.generation != self.generation {
+            self.clear();
+            self.generation = snapshot.generation;
+        }
+        for occurrence in snapshot.occurrences {
+            self.apply_occurrence(occurrence);
+        }
+    }
+
+    fn apply_occurrence(&mut self, occurrence: store::Occurrence) -> usize {
+        let hash = hash_str(&occurrence.command);
+        let idx = match self.find_entry_index(hash, &occurrence.command) {
+            Some(idx) => idx,
+            None => {
+                let idx = self.offsets.len();
+                let start = self.arena.len();
+                self.arena.push_str(&occurrence.command);
+                self.offsets.push((start, occurrence.command.len()));
+                self.usages.push(EntryUsage { latest_id: 0, total: Usage::default(),
+                    directories: FxHashMap::default(), session_occurrence_id: None });
+                self.index_by_hash.insert(hash, idx);
+                idx
+            }
+        };
+        let usage = &mut self.usages[idx];
+        self.latest_occurrences.remove(&usage.latest_id);
+        usage.latest_id = occurrence.id;
+        usage.total.count = usage.total.count.saturating_add(1);
+        usage.total.timestamp = usage.total.timestamp.max(occurrence.timestamp);
+        if let Some(cwd) = occurrence.cwd {
+            let directory = usage.directories.entry(cwd).or_default();
+            directory.count = directory.count.saturating_add(1);
+            directory.timestamp = directory.timestamp.max(occurrence.timestamp);
+        }
+        self.latest_occurrences.insert(occurrence.id, idx);
+        self.last_id = self.last_id.max(occurrence.id);
+        idx
+    }
+
+    fn remember_session(&mut self, idx: usize, id: i64) {
+        if let Some(previous) = self.usages[idx].session_occurrence_id {
+            self.session.remove(&previous);
+        }
+        self.usages[idx].session_occurrence_id = Some(id);
+        self.session.insert(id, idx);
+    }
+
+    fn clear(&mut self) {
+        self.arena.clear();
+        self.offsets.clear();
+        self.usages.clear();
+        self.index_by_hash.clear();
+        self.latest_occurrences.clear();
+        self.session.clear();
+        self.last_id = 0;
+    }
+
+    pub fn compact(&mut self) -> io::Result<()> {
+        if let Some(store) = self.store.as_mut() {
+            store.compact()?;
+        }
+        self.sync()
+    }
+
+    pub fn reset(&mut self) -> io::Result<()> {
+        let generation = match self.store.as_mut() {
+            Some(store) => store.reset()?,
+            None => self.generation + 1,
+        };
+        self.clear();
+        self.generation = generation;
+        Ok(())
+    }
+
+    /// Create an isolated history without filesystem access for tests and benchmarks.
     pub fn from_entries(entries: Vec<String>) -> Self {
-        let ts = now_millis();
-        let total: usize = entries.iter().map(|e| e.len()).sum();
-        let mut arena = String::with_capacity(total);
-        let mut offsets = Vec::with_capacity(entries.len());
-        let mut timestamps = Vec::with_capacity(entries.len());
-        let mut session_ids = Vec::with_capacity(entries.len());
-        let mut cwds = Vec::with_capacity(entries.len());
-        let mut index_by_hash =
-            FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
-        for e in &entries {
-            let start = arena.len() as u32;
-            let h = hash_str(e);
-            arena.push_str(e);
-            offsets.push((start, e.len() as u16));
-            timestamps.push(ts);
-            session_ids.push(0);
-            cwds.push(None);
-            index_by_hash.insert(h, offsets.len() - 1);
+        let mut history = Self::empty();
+        let timestamp = now_millis();
+        for (i, command) in entries.into_iter().enumerate() {
+            let id = i as i64 + 1;
+            let idx = history.apply_occurrence(store::Occurrence { id, command, timestamp,
+                session_id: 0, cwd: None });
+            history.remember_session(idx, id);
         }
-        let count = offsets.len();
-        Self {
-            arena,
-            offsets,
-            timestamps,
-            session_ids,
-            cwds,
-            index_by_hash,
-            path: PathBuf::from("/dev/null"),
-            file_pos: 0,
-            local: vec![false; count],
-            session_cutoff: ts,
-            session_id: new_session_id(),
-            cache_dirty: false,
-            reset_generation: 0,
-            reset_marker_modified: None,
-        }
+        history
     }
 
-    /// Add entry. Deduplicates (removes prior occurrence).
-    pub fn add(&mut self, line: &str) {
-        let cwd = std::env::current_dir().ok();
-        self.add_in_dir(line, cwd.as_deref());
+    pub fn add(&mut self, line: &str) -> io::Result<()> {
+        let cwd = std::env::current_dir()?;
+        self.add_in_dir(line, Some(&cwd))
     }
 
-    /// Add an entry with the directory in which it was entered.
-    pub fn add_in_dir(&mut self, line: &str, cwd: Option<&Path>) {
-        self.sync_reset_marker();
-        // Collapse newlines to spaces to prevent history file corruption.
+    /// Persist each use before updating the local search and recall snapshots.
+    pub fn add_in_dir(&mut self, line: &str, cwd: Option<&Path>) -> io::Result<()> {
         let line = line.trim().replace('\n', " ");
         let line = line.trim();
         if line.is_empty() {
-            return;
+            return Ok(());
         }
-
-        let h = hash_str(line);
-        if self.index_by_hash.contains_key(&h) {
-            self.remove_entries_matching(line);
-        }
-        // Truncate entries that exceed u16 max (64KB) — shouldn't happen in practice
-        let len = line.len().min(u16::MAX as usize);
-        let start = self.arena.len() as u32;
-        self.arena.push_str(&line[..len]);
-        self.offsets.push((start, len as u16));
-        self.timestamps.push(now_millis());
-        self.session_ids.push(self.session_id);
-        self.cwds.push(cwd.map(Path::to_path_buf));
-        self.local.push(true);
-        self.index_by_hash.insert(h, self.offsets.len() - 1);
-
-        // Append to file
-        self.append_to_file(line, cwd);
+        let occurrence = store::Occurrence { id: self.last_id + 1, command: line.to_string(),
+            timestamp: now_millis(), session_id: self.session_id, cwd: cwd.map(Path::to_path_buf) };
+        let id = if let Some(store) = self.store.as_mut() {
+            let (snapshot, id) = store.append(self.generation, self.last_id, occurrence)?;
+            self.apply_snapshot(snapshot);
+            id
+        } else {
+            let id = occurrence.id;
+            self.apply_occurrence(occurrence);
+            id
+        };
+        let idx = self.find_entry_index(hash_str(line), line).expect("committed command missing");
+        self.remember_session(idx, id);
+        Ok(())
     }
 
-    pub fn len(&self) -> usize {
-        self.offsets.len()
-    }
+    pub fn len(&self) -> usize { self.offsets.len() }
+    pub fn is_empty(&self) -> bool { self.offsets.is_empty() }
+    pub fn timestamp(&self, idx: usize) -> u64 { self.usages[idx].total.timestamp }
+    pub fn frequency(&self, idx: usize) -> u64 { self.usages[idx].total.count }
 
-    pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
-    }
-
-    /// Get the timestamp (epoch milliseconds) for entry at index.
-    pub fn timestamp(&self, idx: usize) -> u64 {
-        self.timestamps[idx]
-    }
-
-    /// Prefix search: find entries that start with `prefix`, starting from
-    /// the end and skipping `skip` matches. Returns the entry text.
     pub fn prefix_search(&self, prefix: &str, skip: usize) -> Option<&str> {
-        self.offsets
-            .iter()
-            .rev()
-            .filter_map(|&(start, len)| {
-                let s = &self.arena[start as usize..start as usize + len as usize];
-                s.starts_with(prefix).then_some(s)
-            })
-            .nth(skip)
+        self.latest_occurrences.values().rev().map(|&idx| self.get(idx))
+            .filter(|command| command.starts_with(prefix)).nth(skip)
     }
 
-    /// Get the `skip`'th session-visible entry from the end (for up-arrow
-    /// navigation). Session-visible entries are those present when the shell
-    /// started plus those added by this shell.
     pub fn session_get(&self, skip: usize) -> Option<&str> {
-        self.offsets
-            .iter()
-            .enumerate()
-            .rev()
-            .filter(|&(i, _)| self.is_session_visible(i))
-            .nth(skip)
-            .map(|(_, &(start, len))| &self.arena[start as usize..start as usize + len as usize])
+        self.session.values().rev().nth(skip).map(|&idx| self.get(idx))
     }
 
-    /// Prefix search over session-visible entries only (for up-arrow with
-    /// partial input).
     pub fn session_prefix_search(&self, prefix: &str, skip: usize) -> Option<&str> {
-        self.offsets
-            .iter()
-            .enumerate()
-            .rev()
-            .filter(|&(i, _)| self.is_session_visible(i))
-            .filter_map(|(_, &(start, len))| {
-                let s = &self.arena[start as usize..start as usize + len as usize];
-                s.starts_with(prefix).then_some(s)
-            })
-            .nth(skip)
+        self.session.values().rev().map(|&idx| self.get(idx))
+            .filter(|command| command.starts_with(prefix)).nth(skip)
     }
 
-    /// History search used by Ctrl+R.
-    ///
-    /// Ranking is intentionally simple and recency-friendly:
-    /// 1. prefix match
-    /// 2. substring match at a word boundary
-    /// 3. other substring match
-    /// 4. subsequence fallback
-    ///
-    /// Within a tier, newer entries win.
+    /// Unique commands ordered by actual last-use time, with commit IDs breaking ties.
+    pub fn command_indices_into(&self, out: &mut Vec<usize>) {
+        out.clear();
+        out.extend(self.latest_occurrences.values().copied());
+        out.sort_unstable_by(|&a, &b| self.timestamp(a).cmp(&self.timestamp(b))
+            .then(self.usages[a].latest_id.cmp(&self.usages[b].latest_id)));
+    }
+
+    /// All global candidates, independent of the session recall snapshot.
+    pub fn search_entry_indices_into(&self, out: &mut Vec<usize>) {
+        out.clear();
+        out.extend(self.latest_occurrences.values().rev().copied());
+    }
+
+    /// Text quality precedes directory context. Bounded usage and age bonuses
+    /// break ties within that context; old popularity cannot dominate forever.
     pub fn fuzzy_search(&self, query: &str) -> Vec<FuzzyMatch> {
         self.fuzzy_search_scored(query, "")
     }
 
-    /// Like `fuzzy_search` but keeps the old signature used by callers/tests.
     pub fn fuzzy_search_scored(&self, query: &str, cwd: &str) -> Vec<FuzzyMatch> {
-        let mut results = Vec::new();
-        let cwd = (!cwd.is_empty()).then(|| Path::new(cwd));
-        self.fill_search_results(query, &mut results, cwd);
-        results
+        self.search_all(query, (!cwd.is_empty()).then(|| Path::new(cwd)))
     }
 
-    /// Search with a priority boost for entries recorded in an ancestor directory.
     pub fn fuzzy_search_in_dir(&self, query: &str, cwd: &Path) -> Vec<FuzzyMatch> {
+        self.search_all(query, Some(cwd))
+    }
+
+    fn search_all(&self, query: &str, cwd: Option<&Path>) -> Vec<FuzzyMatch> {
         let mut results = Vec::new();
-        self.fill_search_results(query, &mut results, Some(cwd));
+        let matcher = PreparedQuery::new(query);
+        for idx in 0..self.len() {
+            if let Some(result) = matcher.classify(self.get(idx), idx) {
+                results.push(result);
+            }
+        }
+        let now = now_millis();
+        results.sort_unstable_by(|a, b| self.compare(a, b, cwd, query.is_empty(), now));
         results
     }
 
-    /// Like `fuzzy_search` but appends into a caller-owned Vec (zero-alloc reuse).
-    /// Caps at `limit` results since the pager only shows a screenful.
-    pub fn fuzzy_search_into(
-        &self,
-        query: &str,
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-        cwd: &str,
-    ) {
-        let cwd = (!cwd.is_empty()).then(|| Path::new(cwd));
-        self.fuzzy_search_into_with_cwd(query, results, limit, cwd);
+    pub fn fuzzy_search_into(&self, query: &str, results: &mut Vec<FuzzyMatch>, limit: usize, cwd: &str) {
+        self.search_limited(query, None, None, results, limit,
+            (!cwd.is_empty()).then(|| Path::new(cwd)));
     }
 
-    /// Search with cwd weighting into a caller-owned result buffer.
-    pub fn fuzzy_search_into_in_dir(
-        &self,
-        query: &str,
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-        cwd: &Path,
-    ) {
-        self.fuzzy_search_into_with_cwd(query, results, limit, Some(cwd));
+    pub fn fuzzy_search_into_in_dir(&self, query: &str, results: &mut Vec<FuzzyMatch>, limit: usize, cwd: &Path) {
+        self.search_limited(query, None, None, results, limit, Some(cwd));
     }
 
-    fn fuzzy_search_into_with_cwd(
-        &self,
-        query: &str,
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-        cwd: Option<&Path>,
-    ) {
-        if query.is_ascii() && query.len() <= 32 {
-            let mut query_lower = [0u8; 32];
-            for (slot, byte) in query_lower.iter_mut().zip(query.bytes()) {
-                *slot = byte.to_ascii_lowercase();
-            }
-            self.fill_search_results_limited_bytes(
-                &query_lower[..query.len()],
-                results,
-                limit,
-                cwd,
-            );
-        } else {
-            self.fill_search_results_limited(query, results, limit, cwd);
-        }
+    pub fn fuzzy_search_subset_into(&self, query: &str, candidates: &[usize], matched_indices: &mut Vec<usize>,
+        results: &mut Vec<FuzzyMatch>, limit: usize) {
+        self.search_limited(query, Some(candidates), Some(matched_indices), results, limit, None);
     }
 
-    /// Fill `out` with session-visible entry indices in recency order.
-    pub fn visible_entry_indices_into(&self, out: &mut Vec<usize>) {
-        out.clear();
-        out.extend(
-            (0..self.offsets.len())
-                .rev()
-                .filter(|&idx| self.is_session_visible(idx)),
-        );
+    pub fn fuzzy_search_subset_into_in_dir(&self, query: &str, candidates: &[usize], matched_indices: &mut Vec<usize>,
+        results: &mut Vec<FuzzyMatch>, limit: usize, cwd: &Path) {
+        self.search_limited(query, Some(candidates), Some(matched_indices), results, limit, Some(cwd));
     }
 
-    /// Search within an existing candidate set, preserving all matches in
-    /// `matched_indices` and the best `limit` ranked results in `results`.
-    pub fn fuzzy_search_subset_into(
-        &self,
-        query: &str,
-        candidates: &[usize],
-        matched_indices: &mut Vec<usize>,
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-    ) {
-        self.fuzzy_search_subset_into_with_cwd(
-            query,
-            candidates,
-            matched_indices,
-            results,
-            limit,
-            None,
-        );
-    }
-
-    /// Search a candidate set with a priority boost for entries recorded in an
-    /// ancestor of `cwd`.
-    pub fn fuzzy_search_subset_into_in_dir(
-        &self,
-        query: &str,
-        candidates: &[usize],
-        matched_indices: &mut Vec<usize>,
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-        cwd: &Path,
-    ) {
-        self.fuzzy_search_subset_into_with_cwd(
-            query,
-            candidates,
-            matched_indices,
-            results,
-            limit,
-            Some(cwd),
-        );
-    }
-
-    fn fuzzy_search_subset_into_with_cwd(
-        &self,
-        query: &str,
-        candidates: &[usize],
-        matched_indices: &mut Vec<usize>,
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-        cwd: Option<&Path>,
-    ) {
-        matched_indices.clear();
+    fn search_limited(&self, query: &str, candidates: Option<&[usize]>, mut matched: Option<&mut Vec<usize>>,
+        results: &mut Vec<FuzzyMatch>, limit: usize, cwd: Option<&Path>) {
         results.clear();
-        if limit == 0 {
-            return;
-        }
-
-        if query.is_empty() {
-            matched_indices.extend_from_slice(candidates);
-            results.extend(candidates.iter().map(|&idx| FuzzyMatch {
-                entry_idx: idx,
-                match_positions: [0; 32],
-                match_count: 0,
-                score: self.cwd_weight(idx, cwd),
-            }));
-            if cwd.is_some() {
-                results.sort_unstable_by(compare_fuzzy_match);
-            }
-            results.truncate(limit);
-            return;
-        }
-
-        let query = PreparedQuery::new(query);
-        for &idx in candidates {
-            let entry = self.entry_text(idx);
-            let Some(mut m) = query.classify(entry, idx) else {
-                continue;
+        if let Some(matched) = matched.as_mut() { matched.clear(); }
+        let now = now_millis();
+        let mut ascii = [0u8; 32];
+        let is_ascii = query.is_ascii() && query.len() <= ascii.len();
+        for (slot, byte) in ascii.iter_mut().zip(query.bytes()) { *slot = byte.to_ascii_lowercase(); }
+        let mut chars = (!is_ascii).then(|| lowercase_query(query));
+        let count = candidates.map_or(self.len(), |candidates| candidates.len());
+        for i in 0..count {
+            let idx = candidates.map_or(i, |candidates| candidates[i]);
+            let text = self.get(idx);
+            let result = if query.is_empty() {
+                Some(contiguous_match(idx, 0, 0, 0))
+            } else if is_ascii && text.is_ascii() {
+                classify_match_ascii(&ascii[..query.len()], text, idx)
+            } else if let Some(chars) = &chars {
+                classify_match(chars, text, idx)
+            } else {
+                classify_match(chars.get_or_insert_with(|| lowercase_query(query)), text, idx)
             };
-            m.score += self.cwd_weight(idx, cwd);
-            matched_indices.push(idx);
-            let insert_at = results
-                .binary_search_by(|existing| compare_fuzzy_match(existing, &m))
-                .unwrap_or_else(|pos| pos);
-            if insert_at >= limit {
-                continue;
-            }
-            results.insert(insert_at, m);
-            if results.len() > limit {
-                results.pop();
-            }
-            if results.len() == limit && self.can_stop_search(results, cwd) {
-                break;
+            let Some(result) = result else { continue; };
+            if let Some(matched) = matched.as_mut() { matched.push(idx); }
+            if limit == 0 { continue; }
+            let position = results.binary_search_by(|existing| self.compare(existing, &result, cwd, query.is_empty(), now))
+                .unwrap_or_else(|position| position);
+            if position < limit {
+                results.insert(position, result);
+                if results.len() > limit { results.pop(); }
             }
         }
     }
 
-    /// Get entry text by index.
+    fn context_usage(&self, idx: usize, cwd: Option<&Path>) -> (usize, &Usage) {
+        let usage = &self.usages[idx];
+        let Some(cwd) = cwd else { return (0, &usage.total); };
+        for (distance, directory) in cwd.ancestors().enumerate() {
+            if let Some(directory_usage) = usage.directories.get(directory) {
+                return (usize::MAX - distance, directory_usage);
+            }
+        }
+        (0, &usage.total)
+    }
+
+    fn compare(&self, a: &FuzzyMatch, b: &FuzzyMatch, cwd: Option<&Path>, empty: bool, now: u64)
+        -> std::cmp::Ordering {
+        if empty {
+            let timestamps = self.timestamp(b.entry_idx).cmp(&self.timestamp(a.entry_idx));
+            if !timestamps.is_eq() { return timestamps; }
+        } else {
+            let tiers = b.score.cmp(&a.score);
+            if !tiers.is_eq() { return tiers; }
+        }
+        let (a_context, a_usage) = self.context_usage(a.entry_idx, cwd);
+        let (b_context, b_usage) = self.context_usage(b.entry_idx, cwd);
+        b_context.cmp(&a_context)
+            .then_with(|| if empty { std::cmp::Ordering::Equal }
+                else { usage_bonus(b_usage, now).cmp(&usage_bonus(a_usage, now)) })
+            .then_with(|| b_usage.timestamp.cmp(&a_usage.timestamp))
+            .then_with(|| self.usages[b.entry_idx].latest_id.cmp(&self.usages[a.entry_idx].latest_id))
+    }
+
     pub fn get(&self, idx: usize) -> &str {
         let (start, len) = self.offsets[idx];
-        &self.arena[start as usize..start as usize + len as usize]
-    }
-
-    /// Write all entries to the text file so a forked child can read them.
-    /// Used before `history > file` or `history | cmd`.
-    pub fn flush_for_read(&self) {
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(mut f) = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)
-        {
-            use std::io::Write;
-            for (i, &(start, len)) in self.offsets.iter().enumerate() {
-                let entry = &self.arena[start as usize..start as usize + len as usize];
-                let record = self.cwds[i].as_deref().map_or_else(
-                    || format_history_record(self.timestamps[i], self.session_ids[i], entry),
-                    |cwd| {
-                        format_history_record_with_cwd(
-                            self.timestamps[i],
-                            self.session_ids[i],
-                            cwd,
-                            entry,
-                        )
-                    },
-                );
-                let _ = writeln!(f, "{record}");
-            }
-        }
-    }
-
-    fn append_to_file(&mut self, line: &str, cwd: Option<&Path>) {
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(mut f) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            let record = cwd.map_or_else(
-                || format_history_record(now_millis(), self.session_id, line),
-                |cwd| format_history_record_with_cwd(now_millis(), self.session_id, cwd, line),
-            );
-            let _ = writeln!(f, "{record}");
-            // Update file_pos so sync() doesn't re-read our own write
-            if let Ok(m) = f.metadata() {
-                self.file_pos = m.len();
-            }
-        }
-    }
-
-    fn fill_search_results(&self, query: &str, results: &mut Vec<FuzzyMatch>, cwd: Option<&Path>) {
-        results.clear();
-
-        if query.is_empty() {
-            results.extend(
-                (0..self.offsets.len())
-                    .rev()
-                    .filter(|&idx| self.is_session_visible(idx))
-                    .map(|idx| FuzzyMatch {
-                        entry_idx: idx,
-                        match_positions: [0; 32],
-                        match_count: 0,
-                        score: self.cwd_weight(idx, cwd),
-                    }),
-            );
-            if cwd.is_some() {
-                results.sort_unstable_by(compare_fuzzy_match);
-            }
-            return;
-        }
-
-        let query = PreparedQuery::new(query);
-        for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
-            if !self.is_session_visible(idx) {
-                continue;
-            }
-            let entry = &self.arena[start as usize..start as usize + len as usize];
-            if let Some(mut m) = query.classify(entry, idx) {
-                m.score += self.cwd_weight(idx, cwd);
-                results.push(m);
-            }
-        }
-
-        results.sort_unstable_by(compare_fuzzy_match);
-    }
-
-    fn fill_search_results_limited(
-        &self,
-        query: &str,
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-        cwd: Option<&Path>,
-    ) {
-        let query_lower = lowercase_query(query);
-        self.fill_search_results_limited_chars(&query_lower, results, limit, cwd);
-    }
-
-    fn fill_search_results_limited_bytes(
-        &self,
-        query_lower: &[u8],
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-        cwd: Option<&Path>,
-    ) {
-        results.clear();
-        if limit == 0 {
-            return;
-        }
-
-        if query_lower.is_empty() {
-            results.extend(
-                (0..self.offsets.len())
-                    .rev()
-                    .filter(|&idx| self.is_session_visible(idx))
-                    .take(limit)
-                    .map(|idx| FuzzyMatch {
-                        entry_idx: idx,
-                        match_positions: [0; 32],
-                        match_count: 0,
-                        score: self.cwd_weight(idx, cwd),
-                    }),
-            );
-            if cwd.is_some() {
-                results.sort_unstable_by(compare_fuzzy_match);
-                results.truncate(limit);
-            }
-            return;
-        }
-
-        for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
-            if !self.is_session_visible(idx) {
-                continue;
-            }
-            let entry = &self.arena[start as usize..start as usize + len as usize];
-            let Some(mut m) = classify_match_ascii(query_lower, entry, idx) else {
-                continue;
-            };
-            m.score += self.cwd_weight(idx, cwd);
-
-            let insert_at = results
-                .binary_search_by(|existing| compare_fuzzy_match(existing, &m))
-                .unwrap_or_else(|pos| pos);
-            if insert_at >= limit {
-                continue;
-            }
-            results.insert(insert_at, m);
-            if results.len() > limit {
-                results.pop();
-            }
-            if results.len() == limit && self.can_stop_search(results, cwd) {
-                break;
-            }
-        }
-    }
-
-    fn fill_search_results_limited_chars(
-        &self,
-        query_lower: &[char],
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-        cwd: Option<&Path>,
-    ) {
-        results.clear();
-        if limit == 0 {
-            return;
-        }
-
-        if query_lower.is_empty() {
-            results.extend(
-                (0..self.offsets.len())
-                    .rev()
-                    .filter(|&idx| self.is_session_visible(idx))
-                    .take(limit)
-                    .map(|idx| FuzzyMatch {
-                        entry_idx: idx,
-                        match_positions: [0; 32],
-                        match_count: 0,
-                        score: self.cwd_weight(idx, cwd),
-                    }),
-            );
-            if cwd.is_some() {
-                results.sort_unstable_by(compare_fuzzy_match);
-                results.truncate(limit);
-            }
-            return;
-        }
-
-        for (idx, &(start, len)) in self.offsets.iter().enumerate().rev() {
-            if !self.is_session_visible(idx) {
-                continue;
-            }
-            let entry = &self.arena[start as usize..start as usize + len as usize];
-            let Some(mut m) = classify_match(query_lower, entry, idx) else {
-                continue;
-            };
-            m.score += self.cwd_weight(idx, cwd);
-
-            let insert_at = results
-                .binary_search_by(|existing| compare_fuzzy_match(existing, &m))
-                .unwrap_or_else(|pos| pos);
-            if insert_at >= limit {
-                continue;
-            }
-            results.insert(insert_at, m);
-            if results.len() > limit {
-                results.pop();
-            }
-            if results.len() == limit && self.can_stop_search(results, cwd) {
-                break;
-            }
-        }
-    }
-
-    fn cwd_weight(&self, idx: usize, cwd: Option<&Path>) -> i16 {
-        const CWD_WEIGHT: i16 = 4;
-        if cwd.is_some_and(|cwd| {
-            self.cwds[idx]
-                .as_deref()
-                .is_some_and(|entry_cwd| cwd.starts_with(entry_cwd))
-        }) {
-            CWD_WEIGHT
-        } else {
-            0
-        }
-    }
-
-    fn can_stop_search(&self, results: &[FuzzyMatch], cwd: Option<&Path>) -> bool {
-        let best_possible_score = if cwd.is_some() { 7 } else { 3 };
-        results
-            .last()
-            .is_some_and(|m| m.score >= best_possible_score)
-    }
-
-    fn is_session_visible(&self, idx: usize) -> bool {
-        self.local[idx] || self.timestamps[idx] <= self.session_cutoff
-    }
-
-    fn entry_text(&self, idx: usize) -> &str {
-        let (start, len) = self.offsets[idx];
-        &self.arena[start as usize..start as usize + len as usize]
+        &self.arena[start..start+len]
     }
 
     fn find_entry_index(&self, hash: u64, text: &str) -> Option<usize> {
-        let idx = *self.index_by_hash.get(&hash)?;
-        if self.entry_text(idx) == text {
-            return Some(idx);
-        }
-        // Only scan for a hash collision; an absent hash means the command
-        // cannot exist, so new tail entries keep constant-time lookups.
-        self.offsets
-            .iter()
-            .enumerate()
-            .find_map(|(idx, _)| (self.entry_text(idx) == text).then_some(idx))
-    }
-
-    fn remove_entries_matching(&mut self, text: &str) {
-        let mut matches = Vec::new();
-        for idx in 0..self.offsets.len() {
-            if self.entry_text(idx) == text {
-                matches.push(idx);
-            }
-        }
-        for idx in matches.into_iter().rev() {
-            self.offsets.remove(idx);
-            self.timestamps.remove(idx);
-            self.session_ids.remove(idx);
-            self.cwds.remove(idx);
-            self.local.remove(idx);
-        }
-        self.rebuild_index();
-    }
-
-    fn rebuild_index(&mut self) {
-        self.index_by_hash.clear();
-        for idx in 0..self.offsets.len() {
-            self.index_by_hash
-                .insert(hash_str(self.entry_text(idx)), idx);
-        }
+        let &idx = self.index_by_hash.get(&hash)?;
+        if self.get(idx) == text { return Some(idx); }
+        // Hash collisions must not merge commands. This rare slow path keeps
+        // the common case at one lookup without allocating a second text copy.
+        (0..self.len()).find(|&idx| self.get(idx) == text)
     }
 }
 
-fn compare_fuzzy_match(a: &FuzzyMatch, b: &FuzzyMatch) -> std::cmp::Ordering {
-    b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx))
+fn usage_bonus(usage: &Usage, now: u64) -> u32 {
+    let frequency = usage.count.max(1).ilog2().min(10) * 2;
+    let hours = now.saturating_sub(usage.timestamp) / 3_600_000;
+    let recency = match hours { 0..=1 => 24, 2..=23 => 20, 24..=167 => 12,
+        168..=719 => 4, _ => 0 };
+    frequency + recency
 }
 
-pub fn render_history_file(path: &Path) -> std::io::Result<String> {
-    let data = fs::read(path)?;
-    let fallback_ts = now_millis();
-    let mut out = String::new();
-    for chunk in data.split(|&b| b == b'\n') {
-        if let Ok(line) = std::str::from_utf8(chunk)
-            && let Some(parsed) = parse_history_line(line, fallback_ts)
-        {
-            out.push_str(parsed.command);
-            out.push('\n');
-        }
-    }
-    Ok(out)
+pub fn render_history_database(path: &Path) -> io::Result<String> {
+    store::render(path)
 }
 
-/// Lowercase a query into a fixed stack buffer, returning the used slice.
+fn history_path_for_home(home: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(home) = home { PathBuf::from(home).join(".local/share/ish/history") }
+    else { PathBuf::from("/tmp/ish_history") }
+}
+
+/// Lowercase a query using Unicode character semantics.
 fn lowercase_query(query: &str) -> Vec<char> {
-    query.chars().flat_map(|c| c.to_lowercase()).collect()
+    query.chars().map(|c| c.to_lowercase().next().expect("lowercase scalar missing")).collect()
 }
 
 #[derive(Debug)]
 pub struct FuzzyMatch {
     pub entry_idx: usize,
-    /// Matched character indices (as u16 — entries are always <64K chars).
-    pub match_positions: [u16; 32],
+    /// Matched character indices, independent of UTF-8 byte lengths.
+    pub match_positions: [usize; 32],
     pub match_count: u8,
     /// Match tier. Higher = stronger literal match.
     /// 3 = prefix, 2 = boundary substring, 1 = substring, 0 = subsequence fallback.
@@ -1543,6 +422,7 @@ impl PreparedQuery {
     }
 
     fn classify(&self, text: &str, entry_idx: usize) -> Option<FuzzyMatch> {
+        if self.chars.is_empty() { return Some(contiguous_match(entry_idx, 0, 0, 0)); }
         match &self.ascii {
             Some((bytes, len)) if text.is_ascii() => {
                 classify_match_ascii(&bytes[..*len], text, entry_idx)
@@ -1604,10 +484,10 @@ fn classify_match_ascii(query: &[u8], text: &str, entry_idx: usize) -> Option<Fu
 }
 
 fn contiguous_match(entry_idx: usize, score: i16, start: usize, len: usize) -> FuzzyMatch {
-    let mut positions = [0u16; 32];
+    let mut positions = [0usize; 32];
     let count = len.min(positions.len()).min(u8::MAX as usize);
     for (offset, slot) in positions.iter_mut().take(count).enumerate() {
-        *slot = (start + offset) as u16;
+        *slot = start + offset;
     }
     FuzzyMatch {
         entry_idx,
@@ -1724,8 +604,8 @@ fn find_substring_icase_ascii_bytes(
 /// Uses a forward-then-backward scan to find the tightest match window,
 /// then a final forward pass within that window for optimal positions.
 /// Returns a fixed-size array of matched character indices and the count.
-/// Zero heap allocations — uses stack arrays only.
-pub fn subsequence_match(query: &[char], text: &str) -> Option<([u16; 32], u8)> {
+/// The ASCII path uses stack arrays without heap allocations.
+pub fn subsequence_match(query: &[char], text: &str) -> Option<([usize; 32], u8)> {
     if query.is_empty() {
         return Some(([0; 32], 0));
     }
@@ -1739,7 +619,7 @@ pub fn subsequence_match(query: &[char], text: &str) -> Option<([u16; 32], u8)> 
 }
 
 /// ASCII fast path — operates on bytes directly, no char decoding.
-fn subsequence_match_ascii(query: &[char], text: &str) -> Option<([u16; 32], u8)> {
+fn subsequence_match_ascii(query: &[char], text: &str) -> Option<([usize; 32], u8)> {
     let bytes = text.as_bytes();
     let qlen = query.len();
     let last_qchar = query[qlen - 1] as u8;
@@ -1784,7 +664,7 @@ fn subsequence_match_ascii(query: &[char], text: &str) -> Option<([u16; 32], u8)
     };
 
     // 4) Forward pass within the tight window to record optimal positions.
-    let mut positions = [0u16; 32];
+    let mut positions = [0usize; 32];
     let mut qi2 = 0;
     for (ti, &b) in bytes
         .iter()
@@ -1793,7 +673,7 @@ fn subsequence_match_ascii(query: &[char], text: &str) -> Option<([u16; 32], u8)
         .skip(window_start)
     {
         if b.to_ascii_lowercase() == query[qi2] as u8 {
-            positions[qi2] = ti as u16;
+            if qi2 < positions.len() { positions[qi2] = ti; }
             qi2 += 1;
             if qi2 == qlen {
                 break;
@@ -1801,7 +681,7 @@ fn subsequence_match_ascii(query: &[char], text: &str) -> Option<([u16; 32], u8)
         }
     }
 
-    Some((positions, qlen as u8))
+    Some((positions, qlen.min(32) as u8))
 }
 
 const BYTE_WORD_ONES: u64 = 0x0101_0101_0101_0101;
@@ -1857,7 +737,7 @@ fn is_subsequence_ascii_bytes(query: &[u8], mut text: &[u8]) -> bool {
     true
 }
 
-fn subsequence_match_ascii_bytes(query: &[u8], text: &[u8]) -> Option<([u16; 32], u8)> {
+fn subsequence_match_ascii_bytes(query: &[u8], text: &[u8]) -> Option<([usize; 32], u8)> {
     let qlen = query.len();
     let last_qchar = query[qlen - 1];
 
@@ -1897,7 +777,7 @@ fn subsequence_match_ascii_bytes(query: &[u8], text: &[u8]) -> Option<([u16; 32]
         }
     };
 
-    let mut positions = [0u16; 32];
+    let mut positions = [0usize; 32];
     let mut qi2 = 0;
     for (ti, &byte) in text
         .iter()
@@ -1906,7 +786,7 @@ fn subsequence_match_ascii_bytes(query: &[u8], text: &[u8]) -> Option<([u16; 32]
         .skip(window_start)
     {
         if byte.to_ascii_lowercase() == query[qi2] {
-            positions[qi2] = ti as u16;
+            if qi2 < positions.len() { positions[qi2] = ti; }
             qi2 += 1;
             if qi2 == qlen {
                 break;
@@ -1914,7 +794,7 @@ fn subsequence_match_ascii_bytes(query: &[u8], text: &[u8]) -> Option<([u16; 32]
         }
     }
 
-    Some((positions, qlen as u8))
+    Some((positions, qlen.min(32) as u8))
 }
 
 /// Backward scan from `end` (inclusive) to find the tightest window start.
@@ -1945,7 +825,7 @@ fn backward_ascii_bytes(bytes: &[u8], query: &[u8], end: usize) -> usize {
 }
 
 /// Unicode path — operates on chars.
-fn subsequence_match_unicode(query: &[char], text: &str) -> Option<([u16; 32], u8)> {
+fn subsequence_match_unicode(query: &[char], text: &str) -> Option<([usize; 32], u8)> {
     let qlen = query.len();
     let last_qchar = query[qlen - 1];
 
@@ -1994,7 +874,7 @@ fn subsequence_match_unicode(query: &[char], text: &str) -> Option<([u16; 32], u
     };
 
     // 4) Forward pass within the tight window to record optimal positions.
-    let mut positions = [0u16; 32];
+    let mut positions = [0usize; 32];
     let mut qi2 = 0;
     for (ti, tc) in text.chars().enumerate() {
         if ti < window_start {
@@ -2004,7 +884,7 @@ fn subsequence_match_unicode(query: &[char], text: &str) -> Option<([u16; 32], u
             break;
         }
         if tc.to_lowercase().next() == Some(query[qi2]) {
-            positions[qi2] = ti as u16;
+            if qi2 < positions.len() { positions[qi2] = ti; }
             qi2 += 1;
             if qi2 == qlen {
                 break;
@@ -2012,7 +892,7 @@ fn subsequence_match_unicode(query: &[char], text: &str) -> Option<([u16; 32], u
         }
     }
 
-    Some((positions, qlen as u8))
+    Some((positions, qlen.min(32) as u8))
 }
 
 /// Backward scan through collected chars to find tightest window start.
@@ -2042,13 +922,13 @@ fn is_word_boundary_byte(b: u8) -> bool {
 
 /// Compatibility helper retained for benchmarks.
 /// Returns the literal-match tier for a precomputed match window.
-pub fn score_match(positions: &[u16; 32], count: u8, text: &str, _pwd_basename: &str) -> i16 {
+pub fn score_match(positions: &[usize; 32], count: u8, text: &str, _pwd_basename: &str) -> i16 {
     let n = count as usize;
     if n == 0 {
         return 0;
     }
 
-    let start = positions[0] as usize;
+    let start = positions[0];
     for i in 1..n {
         if positions[i] != positions[i - 1] + 1 {
             return 0;
@@ -2068,66 +948,11 @@ pub fn score_match(positions: &[u16; 32], count: u8, text: &str, _pwd_basename: 
     }
 }
 
-/// Count occurrences of a byte in a slice.
-fn memchr_count(needle: u8, haystack: &[u8]) -> usize {
-    haystack.iter().filter(|&&b| b == needle).count()
-}
-
-fn history_path_for_home(home: Option<&std::ffi::OsStr>) -> PathBuf {
-    if let Some(home) = home {
-        PathBuf::from(home).join(".local/share/ish/history")
-    } else {
-        PathBuf::from("/tmp/ish_history")
-    }
-}
-
-fn cache_path_for(path: &Path) -> PathBuf {
-    let mut p = path.to_path_buf();
-    let mut name = p.file_name().unwrap_or_default().to_os_string();
-    name.push(".bin");
-    p.set_file_name(name);
-    p
-}
-
-fn lock_path_for(path: &Path) -> PathBuf {
-    let mut p = path.to_path_buf();
-    let mut name = p.file_name().unwrap_or_default().to_os_string();
-    name.push(".lock");
-    p.set_file_name(name);
-    p
-}
-
-fn reset_marker_for(path: &Path) -> PathBuf {
-    let mut p = path.to_path_buf();
-    let mut name = p.file_name().unwrap_or_default().to_os_string();
-    name.push(".reset");
-    p.set_file_name(name);
-    p
-}
-
-fn read_reset_marker(path: &Path) -> (u64, Option<std::time::SystemTime>) {
-    let marker = reset_marker_for(path);
-    let generation = fs::read_to_string(&marker)
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(0);
-    let modified = fs::metadata(marker).and_then(|m| m.modified()).ok();
-    (generation, modified)
-}
-
-fn remove_if_present(path: &Path) -> std::io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::fs;
     use std::os::unix::ffi::OsStringExt;
 
     #[test]
@@ -2215,7 +1040,7 @@ mod tests {
             state ^= state << 17;
             state as usize
         };
-        let mut check = |query: &str, text: &str| {
+        let check = |query: &str, text: &str| {
             let chars = lowercase_query(query);
             let expected = classify_match(&chars, text, 7);
             let actual = PreparedQuery::new(query).classify(text, 7);
@@ -2294,260 +1119,7 @@ mod tests {
         assert!(results.iter().any(|m| h.get(m.entry_idx) == "cargo build"));
     }
 
-    #[test]
-    fn cwd_weight_prefers_ancestor_entries() {
-        let mut hist = History::from_entries(vec!["echo cargo".into(), "cargo build".into()]);
-        hist.cwds[0] = Some(PathBuf::from("/work/project"));
-        hist.cwds[1] = Some(PathBuf::from("/other"));
-
-        let results = hist.fuzzy_search_in_dir("cargo", Path::new("/work/project/src"));
-        assert_eq!(hist.get(results[0].entry_idx), "echo cargo");
-        assert_eq!(results[0].score, 6);
-
-        let results = hist.fuzzy_search_in_dir("cargo", Path::new("/work/projects"));
-        assert_eq!(hist.get(results[0].entry_idx), "cargo build");
-    }
-
-    #[test]
-    fn cwd_metadata_round_trips_in_text_and_cache() {
-        let dir = std::env::temp_dir().join(format!("ish_history_cwd_{}", now_millis()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("history");
-        let cwd = dir.join("project\twith\\escapes");
-
-        let mut hist = History::load_from_text(&path);
-        hist.path = path.clone();
-        hist.add_in_dir("echo cwd", Some(&cwd));
-        hist.flush_for_read();
-
-        let loaded = History::load_from_text(&path);
-        assert_eq!(loaded.cwds[0].as_deref(), Some(cwd.as_path()));
-
-        hist.save_cache();
-        let cache = cache_path_for(&path);
-        let data = fs::read(&cache).unwrap();
-        let parsed = History::parse_cache(&data, &path).expect("v5 cache parse failed");
-        assert_eq!(parsed.cwds[0].as_deref(), Some(cwd.as_path()));
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn legacy_history_has_unknown_cwd() {
-        let dir = std::env::temp_dir().join(format!("ish_history_legacy_{}", now_millis()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("history");
-        fs::write(&path, format_history_record(111, 7, "echo legacy")).unwrap();
-
-        let hist = History::load_from_text(&path);
-        assert_eq!(hist.get(0), "echo legacy");
-        assert_eq!(hist.cwds[0], None);
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn parallel_vecs_sync_after_add() {
-        let entries: Vec<String> = vec!["aaa".into(), "bbb".into(), "ccc".into()];
-        let mut h = History::from_entries(entries);
-        assert_eq!(h.offsets.len(), 3);
-        assert_eq!(h.timestamps.len(), 3);
-
-        // Add duplicate — should remove old and append new
-        h.add("bbb");
-        assert_eq!(h.offsets.len(), 3); // aaa, ccc, bbb
-        assert_eq!(h.timestamps.len(), 3);
-        assert_eq!(h.get(h.len() - 1), "bbb");
-
-        // Add new
-        h.add("ddd");
-        assert_eq!(h.offsets.len(), 4);
-        assert_eq!(h.timestamps.len(), 4);
-    }
-
-    #[test]
-    fn startup_merges_large_overlapping_history_tail_promptly() {
-        let dir = std::env::temp_dir().join(format!(
-            "ish_history_startup_{}_{}", std::process::id(), now_millis()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("history");
-        let entries: Vec<String> = (0..6000).map(|i| format!("echo command {i}")).collect();
-        let mut cached = History::from_entries(entries.clone());
-        cached.path = path.clone();
-        cached.save_cache();
-        let tail: String = entries.iter().enumerate().map(|(i, command)| {
-            format!("{}\n", format_history_record_with_cwd(
-                1000 + i as u64, 7, Path::new("/new/cwd"), command
-            ))
-        }).collect();
-        fs::write(&path, tail).unwrap();
-
-        let started = std::time::Instant::now();
-        let loaded = History::load_from(path);
-        let elapsed = started.elapsed();
-        fs::remove_dir_all(dir).unwrap();
-        assert!(elapsed < std::time::Duration::from_secs(2), "history startup took {elapsed:?}");
-        assert_eq!(loaded.len(), entries.len());
-        for (i, command) in entries.iter().enumerate() {
-            assert_eq!(loaded.get(i), command);
-            assert_eq!(loaded.timestamps[i], 1000 + i as u64);
-            assert_eq!(loaded.cwds[i].as_deref(), Some(Path::new("/new/cwd")));
-        }
-    }
-
-    #[test]
-    fn sync_preserves_visible_entries_and_latest_hidden_metadata() {
-        let dir = std::env::temp_dir().join(format!(
-            "ish_history_sync_{}_{}", std::process::id(), now_millis()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("history");
-        let mut hist = History::from_entries(vec![
-            "visible".into(), "hidden".into(), "local".into(), "unchanged".into()
-        ]);
-        hist.path = path.clone();
-        hist.session_cutoff = 100;
-        hist.timestamps = vec![50, 150, 150, 50];
-        hist.local[2] = true;
-        let tail: String = [
-            ("visible", 200), ("local", 200), ("hidden", 200), ("new", 200),
-            ("hidden", 300), ("new", 300), ("older", 50), ("older", 300),
-        ].into_iter().map(|(command, timestamp)| {
-            format!("{}\n", format_history_record_with_cwd(
-                timestamp, timestamp, Path::new("/tail"), command
-            ))
-        }).collect();
-        fs::write(&path, tail).unwrap();
-        hist.sync();
-
-        let commands: Vec<&str> = (0..hist.len()).map(|i| hist.get(i)).collect();
-        assert_eq!(commands, ["visible", "local", "unchanged", "hidden", "new", "older"]);
-        assert_eq!(hist.timestamps, [50, 150, 50, 300, 300, 50]);
-        assert_eq!(hist.session_ids, [0, 0, 0, 300, 300, 50]);
-        assert_eq!(hist.local, [false, true, false, false, false, false]);
-        assert_eq!(hist.session_get(0), Some("older"));
-        assert_eq!(hist.session_get(1), Some("unchanged"));
-        for i in 0..hist.len() {
-            assert_eq!(hist.find_entry_index(hash_str(hist.get(i)), hist.get(i)), Some(i));
-            let expected = (i >= 3).then_some(Path::new("/tail"));
-            assert_eq!(hist.cwds[i].as_deref(), expected);
-        }
-        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(file, "{}", format_history_record(400, 9, "hidden")).unwrap();
-        hist.sync();
-        assert_eq!(hist.len(), 6);
-        assert_eq!(hist.get(5), "hidden");
-        assert_eq!(hist.timestamps[5], 400);
-        assert_eq!(hist.session_ids[5], 9);
-        assert_eq!(hist.cwds[5], None);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn startup_merges_large_new_history_tail_promptly() {
-        let dir = std::env::temp_dir().join(format!(
-            "ish_history_new_tail_{}_{}", std::process::id(), now_millis()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("history");
-        let mut cached = History::from_entries(vec!["cached".into()]);
-        cached.path = path.clone();
-        cached.save_cache();
-        let tail: String = (0..6000).map(|i| format!("echo new {i}\n")).collect();
-        fs::write(&path, tail).unwrap();
-        let started = std::time::Instant::now();
-        let loaded = History::load_from(path);
-        let elapsed = started.elapsed();
-        fs::remove_dir_all(dir).unwrap();
-        assert!(elapsed < std::time::Duration::from_secs(2), "history startup took {elapsed:?}");
-        assert_eq!(loaded.len(), 6001);
-        assert_eq!(loaded.get(0), "cached");
-        assert_eq!(loaded.get(6000), "echo new 5999");
-    }
-
-    #[test]
-    fn timestamps_are_set() {
-        let mut h = History::from_entries(vec!["old".into()]);
-        let before = now_millis();
-        h.add("new_cmd");
-        let after = now_millis();
-        let ts = h.timestamp(h.len() - 1);
-        assert!(ts >= before && ts <= after);
-    }
-
-    #[test]
-    fn v4_round_trip() {
-        let entries: Vec<String> = vec!["ls -la".into(), "git status".into(), "cargo test".into()];
-        let hist = History::from_entries(entries);
-
-        // Serialize to v4 format
-        let entry_count = hist.offsets.len();
-        let mut arena_buf = Vec::new();
-        for &(start, len) in &hist.offsets {
-            arena_buf.extend_from_slice(
-                &hist.arena.as_bytes()[start as usize..start as usize + len as usize],
-            );
-            arena_buf.push(0);
-        }
-        let arena_size = arena_buf.len();
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(CACHE_MAGIC_V4);
-        buf.extend_from_slice(&(entry_count as u32).to_le_bytes());
-        buf.extend_from_slice(&(arena_size as u32).to_le_bytes());
-        for &ts in &hist.timestamps {
-            buf.extend_from_slice(&ts.wrapping_sub(TS_EPOCH_MILLIS).to_le_bytes());
-        }
-        buf.extend_from_slice(&arena_buf);
-
-        // Parse it back
-        let path = PathBuf::from("/dev/null");
-        let parsed = History::parse_v4(&buf, &path).expect("v4 round-trip failed");
-        assert_eq!(parsed.len(), 3);
-        assert_eq!(parsed.get(0), "ls -la");
-        assert_eq!(parsed.get(1), "git status");
-        assert_eq!(parsed.get(2), "cargo test");
-        // Timestamps survive the round-trip
-        for i in 0..3 {
-            assert_eq!(parsed.timestamp(i), hist.timestamp(i));
-        }
-    }
-
-    #[test]
-    fn structured_log_load_preserves_metadata() {
-        let dir = std::env::temp_dir().join(format!("ish_history_meta_{}", now_millis()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("history");
-        let mut file = fs::File::create(&path).unwrap();
-        writeln!(file, "{}", format_history_record(111, 7, "echo one")).unwrap();
-        writeln!(file, "{}", format_history_record(222, 8, "echo two")).unwrap();
-        writeln!(file, "{}", format_history_record(333, 9, "echo one")).unwrap();
-
-        let hist = History::load_from_text(&path);
-        assert_eq!(hist.len(), 2);
-        assert_eq!(hist.get(0), "echo two");
-        assert_eq!(hist.timestamp(0), 222);
-        assert_eq!(hist.session_ids[0], 8);
-        assert_eq!(hist.get(1), "echo one");
-        assert_eq!(hist.timestamp(1), 333);
-        assert_eq!(hist.session_ids[1], 9);
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn render_history_file_strips_metadata() {
-        let dir = std::env::temp_dir().join(format!("ish_history_render_{}", now_millis()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("history");
-        let mut file = fs::File::create(&path).unwrap();
-        writeln!(file, "{}", format_history_record(111, 7, "echo one")).unwrap();
-        writeln!(file, "plain legacy line").unwrap();
-
-        let rendered = render_history_file(&path).unwrap();
-        assert_eq!(rendered, "echo one\nplain legacy line\n");
-
-        let _ = fs::remove_dir_all(dir);
-    }
 }
+
+#[cfg(test)]
+mod persistence_tests;

@@ -184,7 +184,10 @@ fn main() {
         dir_stack: Vec::with_capacity(32),
         rows,
         cols,
-        history: history::History::load_from_home(home_os.as_deref()),
+        history: history::History::load_from_home(home_os.as_deref()).unwrap_or_else(|error| {
+            eprintln!("ish: cannot open history: {error}");
+            std::process::exit(1);
+        }),
         prompt: prompt::Prompt::with_identity(&user, &home),
         prompt_buf: String::with_capacity(128),
         completion_buffer: complete::Completions::with_capacity(2048, 64),
@@ -214,7 +217,9 @@ fn main() {
 
     // Main loop
     loop {
-        shell.history.sync();
+        if let Err(error) = shell.history.sync() {
+            eprintln!("ish: cannot sync history: {error}");
+        }
         match read_line(&mut shell) {
             ReadResult::Line(line) => {
                 if line.trim().is_empty() {
@@ -233,6 +238,14 @@ fn main() {
                 let history_line =
                     resolve_cd_for_history(&expand_aliases_for_history(&line, &shell.aliases));
                 let history_cwd = shell.epsh.cwd().to_path_buf();
+
+                // Persist accepted input before execution so killing the shell
+                // or a long-running command cannot lose the command itself.
+                if history_line.trim() != "l"
+                    && let Err(error) = shell.history.add_in_dir(&history_line, Some(&history_cwd))
+                {
+                    eprintln!("ish: command was not saved to history: {error}");
+                }
 
                 // Log for session transcript
                 shell.session_log.push_str(&line);
@@ -291,7 +304,7 @@ fn main() {
                             false
                         }
                     }
-                    "history" => handle_history(&line, &mut shell),
+                    "history" if simple_words.is_some() => handle_history(&line, &mut shell),
                     "copy-scrollback" => {
                         use std::io::Write;
                         let encoded = base64_encode(shell.session_log.as_bytes());
@@ -382,18 +395,7 @@ fn main() {
 
                 if handled {
                     ish::undo::end(shell.last_status, false);
-                    let reset_history = first_command_word == "history"
-                        && line.split_whitespace().nth(1) == Some("reset");
-                    if history_line.trim() != "l" && !reset_history {
-                        shell.history.add_in_dir(&history_line, Some(&history_cwd));
-                    }
                     continue;
-                }
-
-                // If any command in the line is `history`, flush entries
-                // to the text file so forked children can read them.
-                if expanded.contains("history") {
-                    shell.history.flush_for_read();
                 }
 
                 // Save cwd before execution to detect cd
@@ -401,7 +403,10 @@ fn main() {
 
                 // Set up external handler for ish-specific builtins
                 let shell_pid = shell.shell_pid;
-                let handler = make_external_handler(shell_pid);
+                let history_database = shell.history.database_path()
+                    .expect("interactive history has a database")
+                    .to_path_buf();
+                let handler = make_external_handler(shell_pid, history_database);
                 shell.epsh.set_external_handler(handler);
 
                 shell.last_status = shell.epsh.run_script(&expanded);
@@ -432,13 +437,9 @@ fn main() {
                     ish::undo::end(shell.last_status, false);
                 }
 
-                if history_line.trim() != "l" {
-                    shell.history.add_in_dir(&history_line, Some(&history_cwd));
-                }
                 shell.prompt_needs_line_start = true;
             }
             ReadResult::Exit => {
-                shell.history.compact();
                 break;
             }
             ReadResult::Empty => {}
@@ -887,10 +888,12 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 region = render::RenderedRegion::default();
                             }
                             KeyAction::StartHistorySearch => {
-                                shell.history.sync();
+                                if let Err(error) = shell.history.sync() {
+                                    eprintln!("ish: cannot sync history: {error}");
+                                }
                                 saved_line = line.text().to_string();
                                 let mut candidates = Vec::new();
-                                shell.history.visible_entry_indices_into(&mut candidates);
+                                shell.history.search_entry_indices_into(&mut candidates);
                                 let mut scratch = Vec::new();
                                 let mut matches = std::mem::take(&mut shell.history_match_buffer);
                                 shell.history.fuzzy_search_subset_into_in_dir(
@@ -2198,7 +2201,7 @@ fn handle_history_search_key(
                 );
             } else {
                 candidate_stack.clear();
-                shell.history.visible_entry_indices_into(scratch);
+                shell.history.search_entry_indices_into(scratch);
                 shell.history.fuzzy_search_subset_into_in_dir(
                     new_text,
                     scratch,
@@ -2211,7 +2214,7 @@ fn handle_history_search_key(
             }
         } else {
             candidate_stack.clear();
-            shell.history.visible_entry_indices_into(scratch);
+            shell.history.search_entry_indices_into(scratch);
             shell.history.fuzzy_search_subset_into_in_dir(
                 new_text,
                 scratch,
@@ -2426,7 +2429,6 @@ fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    shell.history.compact();
     std::process::exit(code);
 }
 
@@ -2468,27 +2470,29 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
     let sub = line.split_whitespace().nth(1);
     match sub {
         None => {
-            for i in 0..shell.history.len() {
+            let mut indices = Vec::new();
+            shell.history.command_indices_into(&mut indices);
+            for i in indices {
                 println!("{}", shell.history.get(i));
             }
             shell.last_status = 0;
             true
         }
         Some("-h") | Some("--help") => {
-            println!("Usage: history [compact|rebuild|reset]");
+            println!("Usage: history [compact|reset]");
             println!();
-            println!("Show history, compact its storage, rebuild its cache, or reset it.");
+            println!("Show history, compact its storage, or reset it.");
             shell.last_status = 0;
             true
         }
         Some("compact") => {
-            shell.history.compact();
-            shell.last_status = 0;
-            true
-        }
-        Some("rebuild") => {
-            shell.history.rebuild();
-            shell.last_status = 0;
+            match shell.history.compact() {
+                Ok(()) => shell.last_status = 0,
+                Err(error) => {
+                    eprintln!("ish: history compact: {error}");
+                    shell.last_status = 1;
+                }
+            }
             true
         }
         Some("reset") => {
@@ -2522,7 +2526,10 @@ fn env_pair_value(
 
 /// Build the external handler for epsh. Handles ish-specific builtins
 /// and fork/exec with job control for external commands.
-fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
+fn make_external_handler(
+    shell_pid: i32,
+    history_database: std::path::PathBuf,
+) -> epsh::eval::ExternalHandler {
     Box::new(
         move |args: &[epsh::shell_bytes::ShellBytes],
               env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)]| {
@@ -2541,15 +2548,18 @@ fn make_external_handler(shell_pid: i32) -> epsh::eval::ExternalHandler {
                     return Ok(epsh::error::ExitStatus::SUCCESS);
                 }
                 "history" => {
-                    // In a pipeline context — read from text file. HOME comes
-                    // from the store (via env_pairs), not ish's process env.
-                    let home = env_pair_value(env_pairs, "HOME");
-                    let path = if let Some(home) = home.as_deref() {
-                        std::path::Path::new(home).join(".local/share/ish/history")
-                    } else {
-                        std::path::PathBuf::from("/tmp/ish_history")
-                    };
-                    match history::render_history_file(&path) {
+                    if args.len() > 1 {
+                        let argument = args[1].to_shell_string();
+                        if args.len() == 2 && matches!(argument.as_str(), "-h" | "--help") {
+                            println!("Usage: history [compact|reset]");
+                            return Ok(epsh::error::ExitStatus::SUCCESS);
+                        }
+                        eprintln!("ish: history: storage subcommands require a standalone command");
+                        return Ok(epsh::error::ExitStatus::FAILURE);
+                    }
+                    // Read the session's database through a new connection;
+                    // forked children must not use the parent's connection.
+                    match history::render_history_database(&history_database) {
                         Ok(content) => {
                             print!("{content}");
                             return Ok(epsh::error::ExitStatus::SUCCESS);

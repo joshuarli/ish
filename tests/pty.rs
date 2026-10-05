@@ -6,12 +6,14 @@
 //! Screen assertions use `ptytest`'s independent terminal state, so terminal
 //! behavior is checked without a second parser in this consumer.
 
+use ish::history::History;
 use ptytest::{
     CommandSpec, ExitStatus, ProtocolProfile, PtyTest, Scenario, Size, TerminalBaseline, TestEnv,
 };
 use std::cell::{Cell, RefCell};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // PTY harness
@@ -20,7 +22,7 @@ use std::path::{Path, PathBuf};
 struct PtyShell {
     terminal: RefCell<PtyTest>,
     terminal_baseline: TerminalBaseline,
-    _home: TempDir,
+    _home: Rc<TempDir>,
     startup_output: String,
     pending_output: RefCell<Vec<u8>>,
     output_offset: Cell<usize>,
@@ -104,8 +106,7 @@ impl PtyShell {
     where
         F: FnOnce(&Path),
     {
-        let home = TempDir::new("ish_pty_test");
-        let home_path = home.path().to_str().unwrap().to_string();
+        let home = Rc::new(TempDir::new("ish_pty_test"));
 
         // Create files
         for (name, content) in files {
@@ -135,6 +136,17 @@ impl PtyShell {
         let config_dir = home.path().join(".config/ish");
         std::fs::create_dir_all(&config_dir).unwrap();
 
+        Self::spawn_in_home(home, extra_env, rows, cols, cwd_rel)
+    }
+
+    fn spawn_in_home(
+        home: Rc<TempDir>,
+        extra_env: &[(&str, &str)],
+        rows: u16,
+        cols: u16,
+        cwd_rel: Option<&str>,
+    ) -> Self {
+        let home_path = home.path().to_str().unwrap().to_string();
         let binary = ish_binary();
         let cwd = cwd_rel
             .map(|rel| home.path().join(rel))
@@ -1258,26 +1270,19 @@ fn history_ctrl_r_search() {
 }
 
 #[test]
-fn history_ctrl_r_ignores_later_global_entries() {
-    use std::io::Write;
-
+fn history_ctrl_r_includes_later_global_entries() {
     let sh = PtyShell::spawn_with_opts(&[], &["echo startup"]);
     let hist_path = sh.home_path().join(".local/share/ish/history");
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&hist_path)
-        .unwrap()
-        .write_all(b"echo later_global\n")
-        .unwrap();
+    let mut other_shell = History::load_from(hist_path).unwrap();
+    other_shell.add("echo later_global").unwrap();
 
     sh.ctrl_r();
     let out = sh.wait_for("search:", 2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(text.contains("search:"), "expected search pager: {text:?}");
     assert!(
-        !text.contains("later_global"),
-        "later global entry leaked into initial history pager: {text:?}"
+        text.contains("later_global"),
+        "later global entry missing from initial history pager: {text:?}"
     );
 
     sh.type_str("later");
@@ -1286,8 +1291,8 @@ fn history_ctrl_r_ignores_later_global_entries() {
     let out = sh.wait_for_prompt(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
-        !text.contains("echo later_global"),
-        "later global entry leaked into Ctrl+R acceptance: {text:?}"
+        text.contains("echo later_global"),
+        "later global entry missing from Ctrl+R acceptance: {text:?}"
     );
 }
 
@@ -2537,7 +2542,6 @@ fn single_quotes_no_expansion() {
 #[test]
 fn history_persisted_across_commands() {
     let sh = PtyShell::spawn();
-    // Use /bin/echo (external command) — builtins are excluded from history
     sh.run_command("/bin/echo unique_cmd_12345");
     // Now up arrow should recall it
     sh.up();
@@ -2551,28 +2555,140 @@ fn history_persisted_across_commands() {
 }
 
 #[test]
+fn history_survives_abrupt_termination_and_restart() {
+    let sh = PtyShell::spawn();
+    sh.run_command("/bin/echo durable_before_kill");
+    sh.type_str("/bin/sh -c 'kill -KILL $PPID'");
+    sh.enter();
+    sh.wait_for_exit(3000);
+
+    let restarted = PtyShell::spawn_in_home(sh._home.clone(), &[], 24, 80, None);
+    restarted.ctrl_r();
+    restarted.wait_for("search:", 2000);
+    restarted.type_str("durable_before_kill");
+    restarted.wait_for_quiescence(200);
+    restarted.enter();
+    let text = PtyShell::strip_ansi(&restarted.wait_for_prompt(2000));
+    assert!(text.contains("/bin/echo durable_before_kill"), "lost durable command: {text:?}");
+    let h = History::load_from(restarted.home_path().join(".local/share/ish/history")).unwrap();
+    assert!(h.prefix_search("/bin/sh -c 'kill -KILL", 0).is_some());
+}
+
+#[test]
+fn history_shared_shell_processes_keep_all_commands() {
+    let first = PtyShell::spawn();
+    let second = PtyShell::spawn_in_home(first._home.clone(), &[], 24, 80, None);
+    for item in 0..2 {
+        first.type_str(&format!("/bin/echo first_process_{item}"));
+        second.type_str(&format!("/bin/echo second_process_{item}"));
+        first.enter();
+        second.enter();
+        first.wait_for_line_advance(2000);
+        second.wait_for_line_advance(2000);
+        first.wait_for_prompt(2000);
+        second.wait_for_prompt(2000);
+    }
+    first.type_str("exit");
+    first.enter();
+    first.wait_for_exit(3000);
+    second.run_command("/bin/echo second_process_after_exit");
+
+    second.ctrl_r();
+    second.wait_for("search:", 2000);
+    second.type_str("first_process_1");
+    second.wait_for_quiescence(200);
+    second.enter();
+    let text = PtyShell::strip_ansi(&second.wait_for_prompt(2000));
+    assert!(text.contains("/bin/echo first_process_1"), "missing other process command: {text:?}");
+
+    let third = PtyShell::spawn_in_home(first._home.clone(), &[], 24, 80, None);
+    let text = PtyShell::strip_ansi(&third.run_command("history | /bin/cat"));
+    for command in ["first_process_0", "first_process_1", "second_process_0", "second_process_1", "second_process_after_exit"] {
+        assert!(text.contains(command), "missing {command}: {text:?}");
+    }
+}
+
+#[test]
+fn history_write_failure_is_visible_and_command_still_runs() {
+    let sh = PtyShell::spawn();
+    let connection = rusqlite::Connection::open(sh.home_path().join(".local/share/ish/history.sqlite3")).unwrap();
+    connection.execute_batch("DROP TABLE occurrences").unwrap();
+    let text = PtyShell::strip_ansi(&sh.run_command(r"printf 'executed_%s\n' despite_failure"));
+    assert!(text.contains("command was not saved to history"), "missing history failure diagnostic: {text:?}");
+    assert!(text.contains("executed_despite_failure"), "command did not execute: {text:?}");
+}
+
+#[test]
+fn history_read_only_commands_and_compact_preserve_another_writer() {
+    let sh = PtyShell::spawn_with_opts(&[], &["echo startup"]);
+    let path = sh.home_path().join(".local/share/ish/history");
+    let mut writer = History::load_from(path.clone()).unwrap();
+    writer.add("echo concurrent_history_marker").unwrap();
+    sh.run_command("history | /bin/cat");
+    sh.run_command("history > history-output");
+    sh.run_command("history compact");
+    let h = History::load_from(path).unwrap();
+    assert_eq!(h.prefix_search("echo concurrent_history_marker", 0), Some("echo concurrent_history_marker"));
+    let output = std::fs::read_to_string(sh.home_path().join("history-output")).unwrap();
+    assert!(output.contains("echo concurrent_history_marker"));
+}
+
+#[test]
+fn history_readers_keep_startup_database_after_home_changes() {
+    let sh = PtyShell::spawn_with_opts(&[], &["echo startup_database_marker"]);
+    std::fs::create_dir(sh.home_path().join("new-home")).unwrap();
+    sh.run_command(&format!("set HOME {}", sh.home_path().join("new-home").display()));
+    let text = PtyShell::strip_ansi(&sh.run_command("history | /bin/cat"));
+    assert!(text.contains("echo startup_database_marker"), "history pipeline lost original database: {text:?}");
+    sh.run_command("history > history-after-home-change");
+    let output = std::fs::read_to_string(sh.home_path().join("history-after-home-change")).unwrap();
+    assert!(output.contains("echo startup_database_marker"));
+    assert!(!sh.home_path().join("new-home/.local/share/ish/history.sqlite3").exists());
+}
+
+#[test]
+fn history_reset_refuses_pipeline_and_command_substitution() {
+    let sh = PtyShell::spawn_with_opts(&[], &["echo preserved_history_marker"]);
+    for command in ["history reset | /bin/cat", "echo $(history reset)"] {
+        let text = PtyShell::strip_ansi(&sh.run_command(command));
+        assert!(text.contains("storage subcommands require a standalone command"), "missing history refusal diagnostic: {text:?}");
+        let h = History::load_from(sh.home_path().join(".local/share/ish/history")).unwrap();
+        assert_eq!(h.prefix_search("echo preserved_history_marker", 0), Some("echo preserved_history_marker"));
+    }
+}
+
+#[test]
+fn history_up_ignores_later_global_entries() {
+    let sh = PtyShell::spawn_with_opts(&[], &["echo startup"]);
+    let mut writer = History::load_from(sh.home_path().join(".local/share/ish/history")).unwrap();
+    writer.add("echo later_global").unwrap();
+    sh.ctrl_r();
+    sh.wait_for("search:", 2000);
+    sh.escape();
+    sh.wait_for_prompt(2000);
+    sh.up();
+    sh.enter();
+    let text = PtyShell::strip_ansi(&sh.wait_for_prompt(2000));
+    assert!(text.contains("echo startup"), "missing startup recall: {text:?}");
+    assert!(!text.contains("later_global"), "global write changed Up recall: {text:?}");
+}
+
+#[test]
 fn history_help() {
     let sh = PtyShell::spawn();
     let text = PtyShell::strip_ansi(&sh.run_command("history -h"));
     assert!(
-        text.contains("Usage: history [compact|rebuild|reset]"),
+        text.contains("Usage: history [compact|reset]"),
         "expected history help text: {text:?}"
     );
 }
 
 #[test]
 fn history_autosuggest_ignores_later_global_entries() {
-    use std::io::Write;
-
     let sh = PtyShell::spawn_with_opts(&[], &["echo startup"]);
     let hist_path = sh.home_path().join(".local/share/ish/history");
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&hist_path)
-        .unwrap()
-        .write_all(b"echo later_global\n")
-        .unwrap();
+    let mut other_shell = History::load_from(hist_path).unwrap();
+    other_shell.add("echo later_global").unwrap();
 
     sh.ctrl_r();
     sh.wait_for("search:", 2000);
