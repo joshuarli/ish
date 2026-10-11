@@ -9,7 +9,10 @@ const RECORD_V1: &str = ":ish-history:v1\t";
 const RECORD_V2: &str = ":ish-history:v2\t";
 
 fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("legacy history migration: {message}"))
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("legacy history migration: {message}"),
+    )
 }
 
 fn read_if_present(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -42,16 +45,23 @@ pub(super) fn read(path: &Path) -> io::Result<Vec<Occurrence>> {
     };
     // A legacy flush could copy cache entries into the text file. An identical
     // command and timestamp denotes that surviving occurrence, not another use.
-    let text_uses: FxHashSet<(&str, u64)> = text.iter()
-        .map(|entry| (entry.command.as_str(), entry.timestamp)).collect();
+    let text_uses: FxHashSet<(&str, u64)> = text
+        .iter()
+        .map(|entry| (entry.command.as_str(), entry.timestamp))
+        .collect();
     cached.retain(|entry| !text_uses.contains(&(entry.command.as_str(), entry.timestamp)));
     cached.extend(text);
     Ok(cached)
 }
 
 fn parse_line(line: &str) -> io::Result<Occurrence> {
-    let mut entry = Occurrence { id: 0, command: line.to_string(), timestamp: 0,
-        session_id: 0, cwd: None };
+    let mut entry = Occurrence {
+        id: 0,
+        command: line.to_string(),
+        timestamp: 0,
+        session_id: 0,
+        cwd: None,
+    };
     let (rest, has_cwd) = if let Some(rest) = line.strip_prefix(RECORD_V2) {
         (rest, true)
     } else if let Some(rest) = line.strip_prefix(RECORD_V1) {
@@ -63,17 +73,24 @@ fn parse_line(line: &str) -> io::Result<Occurrence> {
         return Ok(entry);
     };
     let mut parts = rest.splitn(if has_cwd { 4 } else { 3 }, '\t');
-    entry.timestamp = parts.next().and_then(|value| value.parse().ok())
+    entry.timestamp = parts
+        .next()
+        .and_then(|value| value.parse().ok())
         .ok_or_else(|| invalid("invalid timestamp"))?;
-    entry.session_id = parts.next().and_then(|value| value.parse().ok())
+    entry.session_id = parts
+        .next()
+        .and_then(|value| value.parse().ok())
         .ok_or_else(|| invalid("invalid session id"))?;
     if has_cwd {
         let field = parts.next().ok_or_else(|| invalid("missing directory"))?;
         let cwd = unescape(field).ok_or_else(|| invalid("invalid directory escaping"))?;
         entry.cwd = Some(PathBuf::from(cwd));
     }
-    entry.command = parts.next().filter(|command| !command.is_empty())
-        .ok_or_else(|| invalid("missing command"))?.to_string();
+    entry.command = parts
+        .next()
+        .filter(|command| !command.is_empty())
+        .ok_or_else(|| invalid("missing command"))?
+        .to_string();
     Ok(entry)
 }
 
@@ -85,7 +102,11 @@ fn unescape(field: &str) -> Option<String> {
             output.push(c);
         } else {
             output.push(match chars.next()? {
-                '\\' => '\\', 't' => '\t', 'n' => '\n', 'r' => '\r', _ => return None,
+                '\\' => '\\',
+                't' => '\t',
+                'n' => '\n',
+                'r' => '\r',
+                _ => return None,
             });
         }
     }
@@ -93,11 +114,15 @@ fn unescape(field: &str) -> Option<String> {
 }
 
 fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
 }
 
 fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?))
+    Some(u64::from_le_bytes(
+        bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
+    ))
 }
 
 fn parse_cache(bytes: &[u8]) -> Option<Vec<Occurrence>> {
@@ -108,13 +133,35 @@ fn parse_cache(bytes: &[u8]) -> Option<Vec<Occurrence>> {
     if !(1..=5).contains(&version) {
         return None;
     }
-    let header: usize = if version <= 2 { 20 } else if version == 5 { 16 } else { 12 };
+    let header: usize = if version <= 2 {
+        20
+    } else if version == 5 {
+        16
+    } else {
+        12
+    };
     let count = u32_at(bytes, if version <= 2 { 12 } else { 4 })? as usize;
     let arena_size = u32_at(bytes, if version <= 2 { 16 } else { 8 })? as usize;
-    let cwd_size = if version == 5 { u32_at(bytes, 12)? as usize } else { 0 };
-    let ts_width: usize = match version { 1 => 0, 2 | 3 => 4, _ => 8 };
-    let hashes_size = if version <= 2 { count.checked_mul(8)? } else { 0 };
-    let offsets_size = if version <= 2 { count.checked_mul(6)? } else { 0 };
+    let cwd_size = if version == 5 {
+        u32_at(bytes, 12)? as usize
+    } else {
+        0
+    };
+    let ts_width: usize = match version {
+        1 => 0,
+        2 | 3 => 4,
+        _ => 8,
+    };
+    let hashes_size = if version <= 2 {
+        count.checked_mul(8)?
+    } else {
+        0
+    };
+    let offsets_size = if version <= 2 {
+        count.checked_mul(6)?
+    } else {
+        0
+    };
     let ts_start = header.checked_add(hashes_size)?;
     let offsets_start = ts_start.checked_add(count.checked_mul(ts_width)?)?;
     let arena_start = offsets_start.checked_add(offsets_size)?;
@@ -124,15 +171,18 @@ fn parse_cache(bytes: &[u8]) -> Option<Vec<Occurrence>> {
     }
     let arena = std::str::from_utf8(bytes.get(arena_start..cwd_start)?).ok()?;
     let commands: Vec<&str> = if version <= 2 {
-        (0..count).map(|i| {
-            let offset = offsets_start + i * 6;
-            let start = u32_at(bytes, offset)? as usize;
-            let len = u16::from_le_bytes(bytes.get(offset+4..offset+6)?.try_into().ok()?) as usize;
-            arena.get(start..start.checked_add(len)?)
-        }).collect::<Option<_>>()?
+        (0..count)
+            .map(|i| {
+                let offset = offsets_start + i * 6;
+                let start = u32_at(bytes, offset)? as usize;
+                let len = u16::from_le_bytes(bytes.get(offset + 4..offset + 6)?.try_into().ok()?)
+                    as usize;
+                arena.get(start..start.checked_add(len)?)
+            })
+            .collect::<Option<_>>()?
     } else {
         let mut commands: Vec<&str> = arena.split('\0').collect();
-        if commands.pop()? != "" || commands.len() != count {
+        if !commands.pop()?.is_empty() || commands.len() != count {
             return None;
         }
         commands
@@ -140,10 +190,13 @@ fn parse_cache(bytes: &[u8]) -> Option<Vec<Occurrence>> {
     let cwds: Vec<Option<PathBuf>> = if version == 5 {
         let cwd_arena = std::str::from_utf8(bytes.get(cwd_start..)?).ok()?;
         let mut parts: Vec<&str> = cwd_arena.split('\0').collect();
-        if parts.pop()? != "" || parts.len() != count {
+        if !parts.pop()?.is_empty() || parts.len() != count {
             return None;
         }
-        parts.into_iter().map(|cwd| (!cwd.is_empty()).then(|| PathBuf::from(cwd))).collect()
+        parts
+            .into_iter()
+            .map(|cwd| (!cwd.is_empty()).then(|| PathBuf::from(cwd)))
+            .collect()
     } else {
         vec![None; count]
     };
@@ -155,12 +208,18 @@ fn parse_cache(bytes: &[u8]) -> Option<Vec<Occurrence>> {
         let timestamp = match version {
             1 => 0,
             2 => (u32_at(bytes, ts_start + i * 4)? as u64).checked_mul(1000)?,
-            3 => (u32_at(bytes, ts_start + i * 4)? as u64).checked_mul(1000)?
+            3 => (u32_at(bytes, ts_start + i * 4)? as u64)
+                .checked_mul(1000)?
                 .checked_add(TS_EPOCH_MILLIS)?,
             _ => u64_at(bytes, ts_start + i * 8)?.wrapping_add(TS_EPOCH_MILLIS),
         };
-        entries.push(Occurrence { id: 0, command: command.to_string(), timestamp,
-            session_id: 0, cwd });
+        entries.push(Occurrence {
+            id: 0,
+            command: command.to_string(),
+            timestamp,
+            session_id: 0,
+            cwd,
+        });
     }
     Some(entries)
 }

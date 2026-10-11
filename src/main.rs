@@ -403,7 +403,9 @@ fn main() {
 
                 // Set up external handler for ish-specific builtins
                 let shell_pid = shell.shell_pid;
-                let history_log = shell.history.storage_path()
+                let history_log = shell
+                    .history
+                    .storage_path()
                     .expect("interactive history has a storage path")
                     .to_path_buf();
                 let handler = make_external_handler(shell_pid, history_log);

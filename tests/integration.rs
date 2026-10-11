@@ -1545,7 +1545,10 @@ fn history_corrupt_legacy_cache_reports_migration_error() {
     std::fs::write(dir.join("history.bin"), b"corrupt legacy cache").unwrap();
     assert!(History::load_from(path.clone()).is_err());
     assert_eq!(std::fs::read_to_string(path).unwrap(), "echo retained\n");
-    assert_eq!(std::fs::read(dir.join("history.bin")).unwrap(), b"corrupt legacy cache");
+    assert_eq!(
+        std::fs::read(dir.join("history.bin")).unwrap(),
+        b"corrupt legacy cache"
+    );
 }
 
 #[test]
@@ -1554,20 +1557,22 @@ fn history_concurrent_writers_preserve_all_appends_and_compaction() {
     let path = dir.join("history");
     History::load_from(path.clone()).unwrap();
     let start = std::sync::Arc::new(std::sync::Barrier::new(4));
-    let writers: Vec<_> = (0..4).map(|writer| {
-        let path = path.clone();
-        let start = start.clone();
-        std::thread::spawn(move || {
-            let mut h = History::load_from(path).unwrap();
-            start.wait();
-            for item in 0..20 {
-                h.add(&format!("writer-{writer} command-{item}")).unwrap();
-                if item == 10 {
-                    h.compact().unwrap();
+    let writers: Vec<_> = (0..4)
+        .map(|writer| {
+            let path = path.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                let mut h = History::load_from(path).unwrap();
+                start.wait();
+                for item in 0..20 {
+                    h.add(&format!("writer-{writer} command-{item}")).unwrap();
+                    if item == 10 {
+                        h.compact().unwrap();
+                    }
                 }
-            }
+            })
         })
-    }).collect();
+        .collect();
     for writer in writers {
         writer.join().unwrap();
     }
@@ -1593,7 +1598,8 @@ fn history_ranking_uses_recorded_directory_after_match_quality() {
     assert_eq!(h.get(matches[0].entry_idx), "cargo project");
 
     for _ in 0..20 {
-        h.add_in_dir("cat another remote git object", Some(&project)).unwrap();
+        h.add_in_dir("cat another remote git object", Some(&project))
+            .unwrap();
     }
     let matches = h.fuzzy_search_in_dir("cargo", &project);
     assert_eq!(h.get(matches[0].entry_idx), "cargo project");
@@ -1620,7 +1626,10 @@ fn history_match_positions_count_unicode_characters() {
     let h = History::from_entries(vec!["echo café 東京".into()]);
     let matches = h.fuzzy_search("é 東");
     assert_eq!(matches.len(), 1);
-    assert_eq!(&matches[0].match_positions[..matches[0].match_count as usize], &[8, 9, 10]);
+    assert_eq!(
+        &matches[0].match_positions[..matches[0].match_count as usize],
+        &[8, 9, 10]
+    );
 }
 
 #[test]
@@ -1662,7 +1671,10 @@ fn history_append_reports_storage_failure() {
     std::fs::remove_dir(&log).unwrap();
     std::fs::rename(saved_log, log).unwrap();
     let persisted = History::load_from(dir.join("history")).unwrap();
-    assert_eq!(persisted.prefix_search("echo persisted", 0), Some("echo persisted"));
+    assert_eq!(
+        persisted.prefix_search("echo persisted", 0),
+        Some("echo persisted")
+    );
     assert!(persisted.prefix_search("echo must fail", 0).is_none());
 }
 
@@ -1754,7 +1766,6 @@ fn history_ctrl_r_searches_later_global_entries() {
     h.search_entry_indices_into(&mut candidates);
     assert!(candidates.iter().any(|&i| h.get(i) == "echo global three"));
     assert_eq!(h.session_get(0), Some("echo local one"));
-
 }
 
 // ---------------------------------------------------------------------------
