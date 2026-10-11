@@ -8,15 +8,15 @@ members = ["crates/ish-undo"]
 default-members = [".", "crates/ish-undo"]
 
 [dependencies]
-epsh = { path = "../epsh" }
+epsh = "0.0.9"
 ish-undo = { path = "crates/ish-undo" }
 fxhash = "0.2"
 rustix = { version = "1.1.4", features = ["event", "fs", "pipe", "process", "runtime", "system", "termios", "time"] }
 libc = "0.2"
 
 [dev-dependencies]
-rustybench = { path = "../rustybench" }
-laputa-ptytest = { path = "../ptytest" }
+rustybench = "0.3"
+laputa-ptytest = "0.2"
 
 [[bench]]
 name = "bench"
