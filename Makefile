@@ -76,7 +76,7 @@ release-dynamic:
 	  -Z build-std-features= \
 	  --target $(TARGET)
 
-install:
+install: release
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
 	@if test "$$(uname -s)" = Darwin; then \
 		codesign -fs - ~/usr/bin/$(NAME); \

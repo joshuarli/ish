@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "rustybench"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "lexopt",
  "miniserde",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "rustybench-macros"
-version = "0.2.0"
+version = "0.1.0"
 
 [[package]]
 name = "syn"
