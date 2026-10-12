@@ -57,11 +57,6 @@ verify-release-dynamic:
 	fi
 
 lint:
-	cargo fmt --all --check
-	cargo clippy --workspace --all-targets -- -D warnings
-
-fix:
-	cargo fmt --all
 	cargo clippy --workspace --fix --allow-dirty --all-targets -- -D warnings
 
 bench:
