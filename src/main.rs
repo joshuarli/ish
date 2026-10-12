@@ -1310,11 +1310,8 @@ enum KeyAction {
     StartCompletion,
 }
 
-/// Handle a newline during bracketed paste: merge any continuation and
-/// insert a space instead of executing.
 /// Expand the first word of each ;/&&/||-separated segment through aliases.
 /// Used to record expanded commands in history (e.g., "g status" → "git status").
-/// Get the first non-assignment command word from a single-command cmdline.
 fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
     aliases.expand_line(line).into_owned()
 }

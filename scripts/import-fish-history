@@ -1,9 +1,9 @@
 #!/bin/bash
 # Import fish shell history into the legacy ish history before history migration.
 #
-# Fish entries are prepended before existing ish entries so that ish's
-# deduplication (keep last occurrence) preserves the ish version when
-# the same command appears in both.
+# Fish entries are prepended before existing ish entries so the ish entries
+# stay the most recent. Every occurrence is retained; ish does not
+# deduplicate on load.
 
 set -euo pipefail
 

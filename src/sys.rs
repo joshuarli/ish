@@ -1,12 +1,13 @@
 //! Platform-specific syscall wrappers.
 //!
-//! Linux: uses pipe2 (atomic CLOEXEC/NONBLOCK), close_range (bulk fd close).
-//! macOS: falls back to pipe+fcntl, getdtablesize loop.
+//! Pipes are created with rustix `pipe` plus `fcntl` on every platform, so the
+//! close-on-exec and non-blocking flags are not set atomically.
+//! Linux: close_range (bulk fd close). macOS: getdtablesize loop.
 
 use std::os::fd::{IntoRawFd, RawFd};
 
 /// Create a pipe with O_CLOEXEC on both ends.
-/// Linux: 1 syscall (pipe2). macOS: 3 syscalls (pipe + 2x fcntl).
+/// 3 syscalls: pipe + 2x fcntl (not atomic with respect to fork).
 pub fn pipe_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
     let (read, write) = rustix::pipe::pipe()?;
     rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;
@@ -16,7 +17,7 @@ pub fn pipe_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
 
 /// Create a pipe with O_CLOEXEC | O_NONBLOCK on both ends.
 /// Used for the signal self-pipe.
-/// Linux: 1 syscall. macOS: 5 syscalls (pipe + 4x fcntl).
+/// 5 syscalls: pipe + 4x fcntl.
 pub fn pipe_nonblock_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
     let (read, write) = rustix::pipe::pipe()?;
     rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;

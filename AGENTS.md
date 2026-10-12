@@ -130,7 +130,7 @@ the interactive dispatch and README contract.
 the real binary and are especially important for terminal rendering, signals,
 completion, history, aliases, pipelines, redirections, and exit behavior.
 Run focused tests while iterating, then run the full suite before handoff.
-Benchmarks and fuzz targets are useful when changing hot paths, parsers,
+Benchmarks (`benches/`) are useful when changing hot paths, parsers,
 expansion, or safety-sensitive filesystem/process code.
 
 ## Coding style
@@ -179,7 +179,7 @@ verification of commits to the user.
   Keep expansion through the existing `epsh` integration.
 - Native filesystem or syscall code: prefer rustix, keep unsafe at the
   boundary, document unavoidable libc use, and test error paths. Start with
-  `src/sys.rs` (`pipe_cloexec()`, `close_fds_from()`,
+  `src/sys.rs` (`pipe_cloexec()`,
   `spawn_command_subst()`), `src/path.rs` (`PathCache`, `scan_path()`),
   `src/ls.rs` (`list_dir()`) as appropriate.
 - Parser/expansion behavior: inspect the call sites of

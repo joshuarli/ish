@@ -7,6 +7,8 @@
 //! lock                   flock for id allocation, GC, and the registry
 //! next                   next transaction id
 //! volumes                registered volume stores (id and hex path per line)
+//! gc-cursor              last transaction id a bounded collection pass examined
+//! gc-stamp               mtime records the last automatic collection
 //! sessions/<id>.lock     held by each running shell that recorded something
 //! txn/<id>/journal       transaction journal
 //! txn/<id>/replay.lock   held while the transaction is replayed or deleted
@@ -17,7 +19,8 @@
 //! A volume store (`<dir>/.ish-undo`) holds saved versions for another
 //! filesystem, because clones and hard links only work within one. Each
 //! transaction directory there carries an `owner` file naming the catalog
-//! transaction, so associations can be rebuilt without the central catalog.
+//! transaction (`<dir>/.ish-undo/txn/<id>/owner`), so associations can be
+//! rebuilt without the central catalog.
 //! The central journal and a volume store never commit atomically together;
 //! objects without a journal reference are orphan candidates, not garbage.
 //!

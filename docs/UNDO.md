@@ -126,9 +126,10 @@ is never exposed as a live file.
 
 ## Storage and journal
 
-Layout is documented at the top of `src/store.rs`. The catalog and
+Layout is documented at the top of `crates/ish-undo/src/store.rs`. The catalog and
 home-filesystem objects live in `~/.local/share/ish/undo` (ish's convention,
-independent of command history). Clones and hard links only work within one
+independent of command history), alongside `gc-cursor` (where a bounded
+collection pass resumes) and `gc-stamp` (its mtime times automatic collection). Clones and hard links only work within one
 filesystem, so other filesystems get an explicitly registered private volume
 store (`<dir>/.ish-undo`). Each volume transaction directory carries an `owner`
 file so associations can be rebuilt without the catalog; the catalog and a
@@ -202,7 +203,7 @@ transaction is retried.
 
 Two locks matter beyond the append lock:
 
-- the home lock serializes id allocation, collection, and the volume registry;
+- the home lock serializes id allocation, collection, purge, and the volume registry;
 - `txn/<id>/replay.lock` is held for a replay's whole run and for any deletion
   of that transaction. It is created with the transaction and opened without
   `O_CREAT` everywhere else, so a lock file cannot reappear inside a directory
@@ -246,7 +247,7 @@ test needs sudo or touches real root, home, or worktrees.
   operation per process so a test can crash it at a named boundary and recover
   in a fresh process, hold descriptors and mappings open across a preservation,
   or pause a replay while holding its lock.
-- Fault injection is test-only plumbing in `src/fault.rs`, driven by
+- Fault injection is test-only plumbing in `crates/ish-undo/src/fault.rs`, driven by
   `--fault point[:skip]=errno|abort|block`. Points include `journal-append`,
   `journal-appended`, `prepared`, `clone`, `link`, `copy`, `write`, `sync`,
   `rename`, `unlink`, `rmdir`, and the replay points `replay-prepared` (prepare

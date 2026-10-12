@@ -1,18 +1,18 @@
 # Search and ranking
 
-Design notes for the three interactive search surfaces: Ctrl+R history search,
-Tab completion, and Ctrl+F file finding. This document records behavior that
+Design notes for the two interactive search surfaces: Ctrl+R history search
+and Tab completion. This document records behavior that
 is easy to accidentally change while optimizing or refactoring the hot path.
 
 ## History search
 
 The implementation lives in `src/history.rs`:
 
-- `History::fuzzy_search_into()` is the normal Ctrl+R entry point. It reuses a
-  caller-owned `Vec<FuzzyMatch>` and keeps at most the requested limit.
-- `History::fuzzy_search_subset_into()` narrows an existing candidate set;
-  `src/main.rs::handle_history_search_key()` uses it while the query grows or
-  shrinks.
+- `History::fuzzy_search_subset_into_in_dir()` is the Ctrl+R entry point (opening
+  the pager and every query edit in `src/main.rs`). It takes the working
+  directory for proximity ranking, reuses a caller-owned `Vec<FuzzyMatch>`,
+  and keeps at most the requested limit. `fuzzy_search_into()` and
+  `fuzzy_search_subset_into()` are the directory-less variants.
 - `FuzzyMatch` stores the entry index, up to 32 match positions, match count,
   and the tier score used for ordering.
 - `classify_match()` selects the first applicable match tier. The ASCII path is
@@ -95,24 +95,6 @@ shell can reuse `Shell::completion_buffer`; use it instead of constructing a fre
 update `complete_candidates()` tests in `src/complete.rs` and the completion
 tests in `tests/integration.rs`/`tests/pty.rs`.
 
-## File finder
-
-Ctrl+F is a separate filesystem search, not path completion. Its implementation
-is in `src/finder.rs`:
-
-- `find()` is the synchronous/testable search primitive.
-- `find_async()` returns a `FinderHandle`; `drain_into()` collects results and
-  `stop()` cancels the worker.
-- `load_gitignores()`, `parse_gitignore()`, and `is_ignored()` implement the
-  default gitignore-aware filtering.
-- `walk_hidden()` is used for the hidden-results mode.
-- `filter_entries_pub()` exposes deterministic filtering behavior to tests.
-
-Results are represented as `(depth, path)` pairs internally and are presented
-shallowest-first. Normal mode hides dotfiles and applies gitignore rules;
-hidden mode disables those filters. Keep traversal bounded and cancellable,
-and test both modes when changing ignore or traversal behavior.
-
 ## Design constraints
 
 - Prefer the standard library or existing dependencies. Do not add a fuzzy
@@ -120,8 +102,8 @@ and test both modes when changing ignore or traversal behavior.
 - Keep matching deterministic, case-insensitive where documented, and stable
   under recency/mtime ties.
 - Preserve bounded interactive work: history callers cap displayed results,
-  completion scans one directory at a time, and finder searches can be
-  cancelled.
+  completion scans one directory at a time (fish-style partial paths
+  resolve up to 64 directories).
 - Keep allocation-sensitive code explicit. Reuse the buffers and arenas passed
   into the `*_into()` APIs.
 - Preserve comments that explain ranking choices, allocation behavior, or

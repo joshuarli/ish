@@ -20,7 +20,7 @@ RUN apk add --no-cache \
 # glibc runtime dependency.
 RUN ar rcs /usr/lib/libutil.a
 
-# Use the same prebuilt LLVM family as the Linux CI image. The archive is
+# Use a prebuilt LLVM toolchain. The archive is
 # musl-linked so clang, lld, and the LLVM tools run inside Alpine.
 ADD https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}-${LLVM_RELEASE_SHA}/clang+llvm-${LLVM_VERSION}-x86_64-linux-musl.tar.xz /tmp/llvm-x86_64.tar.xz
 ADD https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}-${LLVM_RELEASE_SHA}/clang+llvm-${LLVM_VERSION}-aarch64-linux-musl.tar.xz /tmp/llvm-aarch64.tar.xz

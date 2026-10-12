@@ -135,15 +135,9 @@ pub fn read_signal() -> Option<i32> {
 fn install_handler(sig: rustix::process::Signal) {
     #[cfg(target_os = "linux")]
     unsafe {
-        // The Rustix kernel_sigaction trampoline segfaults when a signal is
-        // delivered to a statically linked musl binary.
-        // let action = rustix::runtime::KernelSigaction {
-        //     sa_handler_kernel: Some(handler),
-        //     sa_flags: rustix::runtime::KernelSigactionFlags::RESTART,
-        //     sa_restorer: None,
-        //     sa_mask: rustix::runtime::KernelSigSet::empty(),
-        // };
-        // let _ = rustix::runtime::kernel_sigaction(sig, Some(action));
+        // rustix's kernel_sigaction trampoline segfaults when a signal is
+        // delivered to a statically linked musl binary, so handlers are
+        // installed through libc::signal instead.
         let _ = libc::signal(sig.as_raw(), handler as *const () as usize);
     }
 

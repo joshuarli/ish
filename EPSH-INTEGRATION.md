@@ -33,7 +33,7 @@ Native `rm` and `mv` resolve relative paths against the same
 
 Because ish replaces `eval_external` with its own handler (issue #2 below), it
 must reproduce epsh's exec error messages itself. Spawn failures in the handler
-call `epsh::eval::bad_interpreter_message` (`src/main.rs`, `make_external_handler`)
+call `epsh::eval::bad_interpreter_message` (`src/main.rs`, `spawn_external`)
 so a script whose `#!` interpreter is broken reports
 `cmd: interp: bad interpreter: <errno>` like the default exec path. The same
 function is used by `eval::handle_exec_error` in epsh (`src/eval.rs`), which is
@@ -52,8 +52,8 @@ process environment. denv's bash evaluator receives the same explicit pair
 list; its temporary process-environment mirror exists only for denv's own
 snapshot and restore bookkeeping. ish's own in-process PATH lookups (command coloring via
 `PathCache`, `which`/`type` via `path::scan_path`, completion via
-`path::complete_commands`) also take `$PATH` from the store, as do the
-handler's `history` HOME lookup and the SSH-completion child. denv still
+`path::complete_commands`) also take `$PATH` from the store, as does the
+SSH-completion child. denv still
 evaluates and restores its snapshot against that temporary process mirror.
 `EnvChange`s returned by denv are applied to epsh vars via
 `apply_denv_changes` in the main loop. The O(n) `sync_env_to_epsh`
@@ -66,8 +66,8 @@ reconciliation is gone.
 already does for pipelines. It exists because epsh's `eval_external` doesn't do
 terminal handoff or stop detection for single commands in interactive mode.
 
-**Why it's janky:** ~50 lines of fork/exec logic that mirrors epsh's pipeline code.
-Also needs a `getpid() == shell_pid` check to distinguish main process from
+**Why it's janky:** `spawn_external` (`Command` with `pre_exec`) mirrors epsh's pipeline
+code. Also needs a `getpid() == shell_pid` check to distinguish main process from
 pipeline children.
 
 **Fix on ish side:** Not cleanly fixable. The handler must fork/exec because
@@ -89,7 +89,7 @@ Compound commands (`cd /tmp && ls`) still fall through to epsh with cwd detectio
 ### 4. Large main-loop interception list
 
 **Problem:** The main loop matches on 10+ command names before falling through to
-epsh: alias, exit, cd, history, copy-scrollback, denv, fg, z, w/which/type, l, c.
+epsh: alias, exit, cd, history, copy-scrollback, ish-dump, denv, fg, z, w/which/type, l, c.
 
 **Why it's janky:** Long match block. Most of these don't actually need main-loop
 access — they just need shell state (job, history, aliases, session_log).

@@ -86,10 +86,10 @@ impl KeyEvent {
 pub enum InputEvent {
     Key(KeyEvent),
     Signal(i32),
-    /// A bracketed paste under the 1 KiB limit. Contains the full pasted text.
+    /// A bracketed paste under the paste limit (8192 bytes). Contains the full pasted text.
     /// The caller should insert it into the line buffer in one shot.
     Paste(String),
-    /// A bracketed paste exceeded the 1 KiB limit and was rejected.
+    /// A bracketed paste exceeded the paste limit and was rejected.
     /// The caller should replace the line buffer with an error message.
     PasteRejected,
 }

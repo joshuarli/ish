@@ -27,7 +27,9 @@ josh@mac ~/d/ish* main $
 | Ctrl+E / End | End of line |
 | Ctrl+K | Kill to end of line |
 | Ctrl+U | Kill to start of line |
-| Ctrl+W / Ctrl+Backspace | Kill word backward |
+| Ctrl+W / Ctrl+Delete | Kill word backward |
+| Alt+D | Kill word forward |
+| Ctrl+Backspace | Pick from the directory stack (most recent first) |
 | Ctrl+Y | Yank (paste) killed text |
 | Ctrl+D | Delete forward / exit on empty line |
 | Ctrl+C | Cancel line |
@@ -94,9 +96,12 @@ Run `history -h` for the available history storage commands.
 | Context | Behavior |
 |---|---|
 | Empty line | Inserts `cd ` |
+| First word | Builtins, aliases, `PATH` commands, directories |
 | After `cd ` | Directories only |
+| After `undo ` | `undo` subcommands |
+| After `ssh`/`scp`/`rsync`/`sftp`/`mosh` | Hosts from `~/.ssh/config` and `known_hosts`; `host:path` lists remote files over `ssh` |
 | `$` prefix | Environment variables |
-| Everything else | Files and directories |
+| Everything else | Files and directories; fish-style partial paths (`sr/m` finds `src/main.rs`) |
 
 Completions display in a column-major grid (up to 6 columns, 10 visible rows). Navigate with arrow keys or Tab, accept with Enter, cancel with Escape. Typing filters live. Path completions sorted by modification time (most recent first) so recently-built or recently-edited files appear at the top.
 
@@ -152,6 +157,8 @@ Expansion order: tilde, parameter expansion, command substitution, pathname expa
 | `l [path]` | Native directory listing |
 | `c` | Clear screen |
 | `w` / `which` / `type` | Locate command |
+| `z [query]` | Jump to the best-scoring directory from `cd`/`z` history (frecency); no args goes home |
+| `history [compact\|reset]` | Print history; storage subcommands above |
 | `echo [args]` | Print arguments |
 | `pwd` | Print working directory |
 | `true` / `false` | Return 0 / 1 |
@@ -188,11 +195,9 @@ Aliases expand inline when you press space. `w`/`which`/`type` check aliases fir
 
 Ctrl+Z suspends the foreground job. `fg` resumes it. One job slot — simple and intentional. Shell warns before exiting with a suspended job (exit again to force).
 
-If an AND-OR list was suspended while running its first command (`a && b`, suspended during `a`), `fg` resumes and continues the list.
-
 ### denv Integration
 
-Automatic `.envrc`/`.env` loading when [denv](https://github.com/joshuarli/denv) is in PATH. Runs on every `cd` with a fast-path check (file mtimes vs sentinel) to skip the subprocess when nothing changed. `denv allow`, `denv deny`, `denv reload` work as expected.
+Native `.envrc`/`.env` loading, implemented in `src/denv.rs` (no external `denv` binary). Runs on every `cd` with a fast-path check (file mtimes vs the recorded state) that skips re-evaluation when nothing changed. A trusted `.envrc` whose first line mentions `bash` is evaluated by spawning `bash`; otherwise it is evaluated in-process. `denv allow`, `denv deny`, `denv reload` work as expected.
 
 ### Undo
 
@@ -289,7 +294,7 @@ deleted. Retention is set with `set` in `config.ish` or at the prompt:
 | `ISH_UNDO_MAX_SIZE` | `8G` | logical size of retained versions |
 | `ISH_UNDO_MAX_ENTRIES` | `500` | retained transactions |
 | `ISH_UNDO_MAX_DAYS` | `30` | age limit |
-| `ISH_UNDO_MIN_FREE` | `1G` | free space to leave when copying |
+| `ISH_UNDO_MIN_FREE` | `1G` | free space to leave when copying; collection also runs while free space is below it |
 
 Collection runs at most hourly after a command that recorded something, or
 on `undo gc`, oldest first. It never collects active or interrupted
@@ -316,7 +321,7 @@ ignored, operations whose outcome was not recorded are checked against the
 filesystem, a recorded staging entry is removed only while it is still the
 object that was recorded, and a step whose change already happened takes its
 displaced version from the prepare record, so redo still has it. Saved
-versions are never deleted automatically. A crash can leave a staging entry
+versions are deleted only by retention (above) or `undo purge`. A crash can leave a staging entry
 behind until the transaction is retried. On macOS, `fsync` does not flush
 the drive's write cache (`F_FULLFSYNC` would), so after a power loss the
 most recent records may be missing; filesystems mounted without ordering
@@ -343,7 +348,7 @@ alias gs git status
 alias .. "cd .."
 ```
 
-Two directives: `set` and `alias`. Variables expand in values. Comments with `#`.
+Two directives: `set` and `alias`. Variables expand in values. Comments with `#`. An `init.sh` beside `config.ish` is also run through epsh after the config is read.
 
 ## Non-Features (by Design)
 
@@ -364,4 +369,4 @@ A Rust workspace: the `ish` package (library target and interactive binary) and 
 
 Shell-owned operations stay native where possible: directory listing, git detection, pathname expansion, and completion do not spawn subprocesses. Running external commands, command substitutions, and the denv integration may spawn processes.
 
-Signal handling uses the self-pipe pattern. Each pipeline gets its own process group. Terminal foreground control via `tcsetpgrp`. Raw mode via `termios`.
+SIGWINCH is delivered through a self-pipe; other signals are ignored or defaulted. Each pipeline gets its own process group. Terminal foreground control via `tcsetpgrp`. Raw mode via `termios`.
