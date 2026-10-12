@@ -659,12 +659,6 @@ fn purge(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
         );
         return 1;
     };
-    if let Ok(model) = Model::load(&home, id)
-        && replay::lifecycle(&home, &model) == Lifecycle::Active
-    {
-        let _ = writeln!(io.err, "undo purge: transaction {id} is still active");
-        return 1;
-    }
     let _lock = match home.lock() {
         Ok(l) => l,
         Err(e) => {
@@ -672,6 +666,14 @@ fn purge(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
             return 1;
         }
     };
+    // Checked under the store lock, so a transaction cannot become active
+    // between the check and the deletion.
+    if let Ok(model) = Model::load(&home, id)
+        && replay::lifecycle(&home, &model) == Lifecycle::Active
+    {
+        let _ = writeln!(io.err, "undo purge: transaction {id} is still active");
+        return 1;
+    }
     match retention::purge(&home, id) {
         Ok(true) => {
             let _ = writeln!(
@@ -988,7 +990,13 @@ fn volume(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
                     return 1;
                 }
             };
-            let mut entries = home.registry().unwrap_or_default();
+            let mut entries = match home.registry() {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = writeln!(io.err, "undo volume add: cannot read the registry: {e}");
+                    return 1;
+                }
+            };
             let entry = match store::create_volume(&home, &dir) {
                 Ok(e) => e,
                 Err(e) => {
@@ -1022,7 +1030,13 @@ fn volume(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
                     return 1;
                 }
             };
-            let mut entries = home.registry().unwrap_or_default();
+            let mut entries = match home.registry() {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = writeln!(io.err, "undo volume remove: cannot read the registry: {e}");
+                    return 1;
+                }
+            };
             let t = target.as_bytes();
             let resolved = crate::ops::resolve(&ctx.cwd, target);
             let Some(pos) = entries.iter().position(|e| {
@@ -1038,12 +1052,19 @@ fn volume(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
                 return 1;
             };
             let store_id = entries[pos].id;
-            let users: Vec<u64> = home
-                .txn_ids()
-                .unwrap_or_default()
+            let ids = match home.txn_ids() {
+                Ok(ids) => ids,
+                Err(e) => {
+                    let _ = writeln!(io.err, "undo volume remove: {e}");
+                    return 1;
+                }
+            };
+            // A journal that cannot be read might use the volume, so it
+            // blocks removal like one that does.
+            let users: Vec<u64> = ids
                 .into_iter()
                 .filter(|&id| {
-                    Model::load(&home, id).is_ok_and(|m| {
+                    Model::load(&home, id).map_or(true, |m| {
                         m.saved_versions()
                             .any(|s| s.obj().is_some_and(|o| o.store == store_id))
                     })
@@ -1053,7 +1074,7 @@ fn volume(ctx: &Context, args: &[OsString], io: &mut Io<'_>) -> i32 {
                 let ids: Vec<String> = users.iter().map(u64::to_string).collect();
                 let _ = writeln!(
                     io.err,
-                    "undo volume remove: transactions {} keep versions there; purge them first",
+                    "undo volume remove: transactions {} keep versions there or cannot be read; purge them first",
                     ids.join(", ")
                 );
                 return 1;

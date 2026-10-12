@@ -6,6 +6,29 @@ pub const STDOUT_FD: RawFd = 1;
 
 pub type Termios = rustix::termios::Termios;
 
+/// Terminal attributes captured at startup, for the panic hook. The shell
+/// builds with `panic = "abort"`, so a panic never unwinds to `RawMode::drop`.
+static STARTUP_TERMIOS: std::sync::OnceLock<Termios> = std::sync::OnceLock::new();
+
+/// Make a panic restore the terminal (cooked mode, no bracketed paste, cursor
+/// shown) before the panic message prints and the process aborts.
+pub fn install_panic_hook() {
+    if let Ok(termios) = save_termios() {
+        let _ = STARTUP_TERMIOS.set(termios);
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(termios) = STARTUP_TERMIOS.get() {
+            let stdout = unsafe { BorrowedFd::borrow_raw(STDOUT_FD) };
+            let _ = rustix::io::write(stdout, b"\x1b[?2004l\x1b[?25h");
+            let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+            let _ =
+                rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Now, termios);
+        }
+        previous(info);
+    }));
+}
+
 pub struct RawMode {
     orig: Termios,
 }

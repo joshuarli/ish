@@ -16,6 +16,11 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
     }
 
     let query = &args[0];
+    // An empty query would match every path and has no meaningful window.
+    if query.is_empty() {
+        eprintln!("ish: z: empty query");
+        return 1;
+    }
 
     // If argument is an existing directory, go there directly
     if std::path::Path::new(query).is_dir() {
@@ -137,6 +142,17 @@ mod tests {
     fn extract_cd_no_match() {
         assert_eq!(extract_cd_target("git commit -m fix"), None);
         assert_eq!(extract_cd_target("echo cd"), None);
+    }
+
+    #[test]
+    fn empty_query_is_rejected() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".work/tmp")
+            .join(format!("z-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let history = History::load_from(dir.join("history.log")).unwrap();
+        assert_eq!(builtin_z(&[String::new()], &history, "/"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

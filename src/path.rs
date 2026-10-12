@@ -1,6 +1,12 @@
 use fxhash::FxHashSet;
 use std::path::PathBuf;
 
+/// The one definition of "runnable command file": a regular file (not a
+/// socket, device, or directory) with at least one execute bit.
+fn is_executable_file(mode: libc::mode_t) -> bool {
+    mode & libc::S_IFMT == libc::S_IFREG && mode & 0o111 != 0
+}
+
 fn fnv1a(s: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in s {
@@ -36,10 +42,20 @@ impl PathCache {
     }
 
     /// Check if `cmd` is an executable on `$PATH` (given as raw bytes).
-    /// Rebuilds the cache if `$PATH` has changed since the last check.
+    /// Rebuilds the cache if `$PATH` has changed since the last check. A cache
+    /// miss is confirmed with a direct lookup so a binary installed after the
+    /// scan becomes valid without a restart or a full rescan per keystroke.
     pub fn contains(&mut self, cmd: &str, path_bytes: &[u8]) -> bool {
         self.ensure_fresh(path_bytes);
-        self.commands.contains(&fnv1a(cmd.as_bytes()))
+        let hash = fnv1a(cmd.as_bytes());
+        if self.commands.contains(&hash) {
+            return true;
+        }
+        if scan_path_bytes(cmd, path_bytes).is_some() {
+            self.commands.insert(hash);
+            return true;
+        }
+        false
     }
 
     /// Rebuild the cache if `$PATH` has changed.
@@ -110,7 +126,7 @@ impl PathCache {
                 }
 
                 // Regular file with at least one execute bit
-                if (st.st_mode & libc::S_IFREG != 0) && (st.st_mode & 0o111 != 0) {
+                if is_executable_file(st.st_mode) {
                     self.commands.insert(fnv1a(name_bytes));
                 }
             }
@@ -181,10 +197,7 @@ pub fn complete_commands(prefix: &str, comp: &mut crate::complete::Completions, 
             if unsafe { libc::stat(pathbuf.as_ptr() as *const libc::c_char, &mut st) } != 0 {
                 continue;
             }
-            if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                continue;
-            }
-            if st.st_mode & 0o111 == 0 {
+            if !is_executable_file(st.st_mode) {
                 continue;
             }
 
@@ -229,12 +242,38 @@ fn scan_path_bytes(cmd: &str, path_bytes: &[u8]) -> Option<PathBuf> {
         // SAFETY: buf is NUL-terminated, stat writes into a stack struct.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::stat(buf.as_ptr() as *const libc::c_char, &mut st) } == 0
-            && (st.st_mode & libc::S_IFREG != 0)
-            && (st.st_mode & 0o111 != 0)
+            && is_executable_file(st.st_mode)
         {
             use std::os::unix::ffi::OsStrExt;
             return Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..total])));
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn binary_installed_after_scan_is_found_and_socket_is_not() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".work/tmp")
+            .join(format!("path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_str().unwrap().as_bytes().to_vec();
+
+        let mut cache = PathCache::new();
+        assert!(!cache.contains("newtool", &path));
+
+        let tool = dir.join("newtool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(cache.contains("newtool", &path));
+
+        let _sock = std::os::unix::net::UnixListener::bind(dir.join("sock")).unwrap();
+        assert!(!cache.contains("sock", &path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

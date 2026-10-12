@@ -1,4 +1,2 @@
 /target
-fuzz/target
-scripts/__pycache__/
 benches/*-baseline.txt

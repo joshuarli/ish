@@ -5,7 +5,7 @@ use ish::input::{InputEvent, InputReader, Key, KeyEvent};
 use ish::job::Job;
 use ish::line::LineBuffer;
 use ish::term::TermWriter;
-use ish::{builtin, complete, config, denv, frecency, history, path, prompt, render, signal, term};
+use ish::{builtin, complete, config, denv, dispatch, frecency, history, path, prompt, render, signal, term};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -19,12 +19,13 @@ use std::path::Path;
 thread_local! {
     static STOPPED_JOB: RefCell<Option<(i32, String, term::Termios)>> =
         const { RefCell::new(None) };
+    /// Whether the shell already holds a suspended job while a command runs.
+    static JOB_SLOT_TAKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct Shell {
     aliases: AliasMap,
     last_status: i32,
-    prev_dir: Option<String>,
     dir_stack: Vec<String>,
     rows: u16,
     cols: u16,
@@ -54,6 +55,8 @@ struct Shell {
 enum ReadResult {
     Line(String),
     Exit,
+    /// SIGTERM or SIGHUP arrived through the self-pipe.
+    Terminated(i32),
     Empty,
 }
 
@@ -146,6 +149,7 @@ fn main() {
     // macOS login(1), the shell starts in a background process group behind the
     // login process; tcsetpgrp from that state raises SIGTTOU unless ignored.
     let signal_fd = signal::init();
+    term::install_panic_hook();
 
     // SAFETY: Set shell as its own process group leader and take foreground
     // control of the terminal. Called once at startup, single-threaded.
@@ -180,7 +184,6 @@ fn main() {
     let mut shell = Shell {
         aliases,
         last_status: 0,
-        prev_dir: None,
         dir_stack: Vec::with_capacity(32),
         rows,
         cols,
@@ -216,6 +219,7 @@ fn main() {
     sync_shell_store_derived(&mut shell);
 
     // Main loop
+    let mut exit_code = 0;
     loop {
         if let Err(error) = shell.history.sync() {
             eprintln!("ish: cannot sync history: {error}");
@@ -225,7 +229,10 @@ fn main() {
                 if line.trim().is_empty() {
                     continue;
                 }
-                shell.exit_warned = false;
+                // A second `exit` confirms the warning the first one printed.
+                if line.split_whitespace().next() != Some("exit") {
+                    shell.exit_warned = false;
+                }
 
                 // Rewrite shorthand cd forms before parsing:
                 //   ".." → "cd ..", "..." → "cd ../..", etc.
@@ -256,147 +263,27 @@ fn main() {
                 let expanded = shell.aliases.expand_line(&line);
                 ish::undo::begin(&shell.epsh, &expanded);
 
-                // Handle ish-level commands that must be intercepted before epsh
-                let first_command_word = line.split_whitespace().next().unwrap_or("");
-                let simple_words = lex_simple_command_words(&line);
-                let handled = match first_command_word {
-                    "alias" => {
-                        handle_alias(&line, &mut shell);
-                        true
+                let plan = match dispatch::plan(&expanded) {
+                    Ok(plan) => plan,
+                    Err(rejection) => {
+                        eprintln!("ish: {rejection}");
+                        shell.last_status = 2;
+                        ish::undo::end(2, false);
+                        continue;
                     }
-                    "exit" => {
-                        ish::undo::end(0, false);
-                        if handle_exit_command(&line, &mut shell) {
-                            break;
-                        }
-                        true
-                    }
-                    "cd" => {
-                        if let Some(words) = simple_words.as_deref() {
-                            match expand_builtin_args(&words[1..], &mut shell, "cd") {
-                                Some(args) if args.len() > 1 => {
-                                    eprintln!("ish: cd: too many arguments");
-                                    shell.last_status = 1;
-                                    true
-                                }
-                                Some(args) if args.first().map(String::as_str) == Some("-") => {
-                                    if let Some(prev) = store_env_os(&shell.epsh, "OLDPWD")
-                                        .filter(|s| !s.is_empty())
-                                    {
-                                        eprintln!("{}", Path::new(&prev).display());
-                                        shell.last_status =
-                                            change_directory_path(Path::new(&prev), &mut shell);
-                                    } else {
-                                        eprintln!("ish: cd: no previous directory");
-                                        shell.last_status = 1;
-                                    }
-                                    true
-                                }
-                                Some(args) => {
-                                    let target =
-                                        args.first().cloned().unwrap_or_else(|| shell.home.clone());
-                                    shell.last_status = change_directory(&target, &mut shell);
-                                    true
-                                }
-                                None => true,
-                            }
-                        } else {
-                            false
-                        }
-                    }
-                    "history" if simple_words.is_some() => handle_history(&line, &mut shell),
-                    "copy-scrollback" => {
-                        use std::io::Write;
-                        let encoded = base64_encode(shell.session_log.as_bytes());
-                        let osc = format!("\x1b]52;c;{encoded}\x07");
-                        let _ = std::io::stdout().write_all(osc.as_bytes());
-                        let _ = std::io::stdout().flush();
-                        shell.last_status = 0;
-                        true
-                    }
-                    "ish-dump" => {
-                        shell.last_status = write_layout_dump(&shell);
-                        true
-                    }
-                    "denv" => {
-                        let args = simple_words
-                            .as_deref()
-                            .and_then(|words| expand_builtin_args(&words[1..], &mut shell, "denv"))
-                            .unwrap_or_else(|| {
-                                line.split_whitespace().skip(1).map(String::from).collect()
-                            });
-                        let outcome = denv::command(&args, &shell.epsh);
-                        apply_denv_changes(&outcome.changes, &mut shell.epsh);
-                        sync_shell_store_derived(&mut shell);
-                        shell.last_status = outcome.status;
-                        true
-                    }
-                    "fg" => {
-                        let (status, work) = ish::job::resume_job(&mut shell.job);
-                        shell.last_status = status;
-                        if let Some(work) = work {
-                            ish::undo::finish_job(work, status);
-                        }
-                        true
-                    }
-                    "z" => {
-                        let args = simple_words
-                            .as_deref()
-                            .and_then(|words| expand_builtin_args(&words[1..], &mut shell, "z"))
-                            .unwrap_or_else(|| {
-                                line.split_whitespace().skip(1).map(String::from).collect()
-                            });
-                        shell.last_status = frecency::builtin_z(&args, &shell.history, &shell.home);
-                        if shell.last_status == 0 {
-                            // z already did chdir — run post-cd hooks
-                            let old_cwd = shell.epsh.cwd().to_path_buf();
-                            let new_cwd = std::env::current_dir().unwrap_or_default();
-                            sync_cwd_change(&mut shell, &old_cwd, new_cwd);
-                        }
-                        true
-                    }
-                    "w" | "which" | "type" => {
-                        let args = simple_words
-                            .as_deref()
-                            .and_then(|words| {
-                                expand_builtin_args(&words[1..], &mut shell, first_command_word)
-                            })
-                            .unwrap_or_else(|| {
-                                line.split_whitespace().skip(1).map(String::from).collect()
-                            });
-                        shell.last_status = builtin::locate_command(
-                            &args,
-                            &shell.aliases,
-                            |name| shell.epsh.functions().contains_key(name),
-                            store_path_env(&shell.epsh),
-                        );
-                        true
-                    }
-                    "l" => {
-                        if let Some(words) = simple_words.as_deref() {
-                            match expand_builtin_args(&words[1..], &mut shell, "l") {
-                                Some(args) => {
-                                    shell.last_status = builtin::list_directory(&args);
-                                    true
-                                }
-                                None => true,
-                            }
-                        } else {
-                            false
-                        }
-                    }
-                    "c" => {
-                        print!("\x1b[H\x1b[2J");
-                        shell.last_status = 0;
-                        true
-                    }
-                    _ => false,
                 };
 
-                if handled {
-                    ish::undo::end(shell.last_status, false);
-                    continue;
-                }
+                let program = match plan {
+                    dispatch::Plan::Builtin { name, args } => {
+                        let quit = run_shell_builtin(name, &args, &expanded, &mut shell);
+                        if quit {
+                            break;
+                        }
+                        ish::undo::end(shell.last_status, false);
+                        continue;
+                    }
+                    dispatch::Plan::Epsh(program) => program,
+                };
 
                 // Save cwd before execution to detect cd
                 let prev_cwd = shell.epsh.cwd().to_path_buf();
@@ -410,8 +297,9 @@ fn main() {
                     .to_path_buf();
                 let handler = make_external_handler(shell_pid, history_log);
                 shell.epsh.set_external_handler(handler);
+                JOB_SLOT_TAKEN.with(|taken| taken.set(shell.job.is_some()));
 
-                shell.last_status = shell.epsh.run_script(&expanded);
+                shell.last_status = shell.epsh.run_program(&program).code();
                 sync_shell_store_derived(&mut shell);
 
                 // Detect cwd change from epsh (compound commands with cd, pushd, etc.)
@@ -444,19 +332,124 @@ fn main() {
             ReadResult::Exit => {
                 break;
             }
+            ReadResult::Terminated(sig) => {
+                // The terminal is already restored: read_line's raw-mode guard
+                // dropped on its way out.
+                if let Some(job) = shell.job.take() {
+                    abandon_job(job);
+                }
+                exit_code = 128 + sig;
+                break;
+            }
             ReadResult::Empty => {}
         }
     }
+
+    drop(shell);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+/// Run a shell-owned builtin that is the whole input line. Returns true when
+/// the shell should quit. `line` is the alias-expanded text; `args` are the
+/// unexpanded shell words after the command name.
+fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &mut Shell) -> bool {
+    // Builtins that take arguments expand them first, so quoting, variables,
+    // command substitution, and globbing behave as for any command. A failed
+    // expansion has already reported itself and set the status.
+    macro_rules! expanded_args {
+        () => {
+            match expand_builtin_args(args, shell, name) {
+                Some(args) => args,
+                None => return false,
+            }
+        };
+    }
+
+    match name {
+        "alias" => handle_alias(line, shell),
+        "exit" => {
+            ish::undo::end(0, false);
+            return handle_exit_command(line, shell);
+        }
+        "cd" => {
+            let args = expanded_args!();
+            if args.len() > 1 {
+                eprintln!("ish: cd: too many arguments");
+                shell.last_status = 1;
+            } else if args.first().map(String::as_str) == Some("-") {
+                if let Some(prev) = store_env_os(&shell.epsh, "OLDPWD").filter(|s| !s.is_empty()) {
+                    eprintln!("{}", Path::new(&prev).display());
+                    shell.last_status = change_directory_path(Path::new(&prev), shell);
+                } else {
+                    eprintln!("ish: cd: no previous directory");
+                    shell.last_status = 1;
+                }
+            } else {
+                let target = args.first().cloned().unwrap_or_else(|| shell.home.clone());
+                shell.last_status = change_directory(&target, shell);
+            }
+        }
+        "history" => {
+            handle_history(line, shell);
+        }
+        "copy-scrollback" => {
+            use std::io::Write;
+            let encoded = base64_encode(shell.session_log.as_bytes());
+            let osc = format!("\x1b]52;c;{encoded}\x07");
+            let _ = std::io::stdout().write_all(osc.as_bytes());
+            let _ = std::io::stdout().flush();
+            shell.last_status = 0;
+        }
+        "ish-dump" => shell.last_status = write_layout_dump(shell),
+        "denv" => {
+            let args = expanded_args!();
+            let outcome = denv::command(&args, &shell.epsh);
+            apply_denv_changes(&outcome.changes, &mut shell.epsh);
+            sync_shell_store_derived(shell);
+            shell.last_status = outcome.status;
+        }
+        "fg" => {
+            let (status, work) = ish::job::resume_job(&mut shell.job);
+            shell.last_status = status;
+            if let Some(work) = work {
+                ish::undo::finish_job(work, status);
+            }
+        }
+        "z" => {
+            let args = expanded_args!();
+            shell.last_status = frecency::builtin_z(&args, &shell.history, &shell.home);
+            if shell.last_status == 0 {
+                // z already did chdir — run post-cd hooks
+                let old_cwd = shell.epsh.cwd().to_path_buf();
+                let new_cwd = std::env::current_dir().unwrap_or_default();
+                sync_cwd_change(shell, &old_cwd, new_cwd);
+            }
+        }
+        "w" | "which" | "type" => {
+            let args = expanded_args!();
+            shell.last_status = builtin::locate_command(
+                &args,
+                &shell.aliases,
+                |name| shell.epsh.functions().contains_key(name),
+                store_path_env(&shell.epsh),
+            );
+        }
+        other => {
+            eprintln!("ish: internal error: no shell handler for builtin {other}");
+            shell.last_status = 1;
+        }
+    }
+    false
 }
 
 fn capture_layout_dump(
     shell: &mut Shell,
     mode: &Mode,
     line: &LineBuffer,
-    prompt_str: &str,
     prompt_display_len: usize,
     region: render::RenderedRegion,
-    history_cache: &render::HistoryPagerCache,
 ) {
     let suggestion =
         if line.text().len() >= 3 && !line.has_newlines() && line.cursor() == line.text().len() {
@@ -475,9 +468,7 @@ fn capture_layout_dump(
     let _ = writeln!(out, "version: {}", env!("CARGO_PKG_VERSION"));
     let _ = writeln!(out, "terminal.rows: {}", shell.rows);
     let _ = writeln!(out, "terminal.cols: {}", shell.cols);
-    let _ = writeln!(out, "prompt.text: {prompt_str:?}");
     let _ = writeln!(out, "prompt.display_len: {prompt_display_len}");
-    let _ = writeln!(out, "line.text: {:?}", line.text());
     let _ = writeln!(out, "line.bytes: {}", line.text().len());
     let _ = writeln!(out, "line.cursor_byte: {}", line.cursor());
     let _ = writeln!(
@@ -486,7 +477,7 @@ fn capture_layout_dump(
         line.display_cursor_pos()
     );
     let _ = writeln!(out, "line.display_len: {}", line.display_len());
-    let _ = writeln!(out, "suggestion.text: {suggestion:?}");
+    let _ = writeln!(out, "suggestion.present: {}", suggestion.is_some());
     let _ = writeln!(out, "suggestion.display_len: {suggestion_display_len}");
     let _ = writeln!(out, "line.has_newlines: {}", line.has_newlines());
     let _ = writeln!(out, "rendered_region: {region:?}");
@@ -502,7 +493,6 @@ fn capture_layout_dump(
     match mode {
         Mode::Normal => {}
         Mode::Completion { state, base_line } => {
-            let _ = writeln!(out, "completion.base_line.text: {:?}", base_line.text());
             let _ = writeln!(
                 out,
                 "completion.base_line.cursor_byte: {}",
@@ -513,9 +503,8 @@ fn capture_layout_dump(
             let _ = writeln!(out, "completion.rows: {}", state.rows);
             let _ = writeln!(out, "completion.scroll: {}", state.scroll);
             let _ = writeln!(out, "completion.term_cols: {}", state.term_cols);
-            let _ = writeln!(out, "completion.dir_prefix: {:?}", state.dir_prefix);
+            let _ = writeln!(out, "completion.dir_prefix_bytes: {}", state.dir_prefix.len());
             let _ = writeln!(out, "completion.in_quote: {}", state.in_quote);
-            let _ = writeln!(out, "completion.names: {:?}", state.comp.names);
             let _ = writeln!(out, "completion.entries: {:?}", state.comp.entries);
             render::debug_dump_completion_layout(out, state);
         }
@@ -528,7 +517,6 @@ fn capture_layout_dump(
             selected,
             saved_line,
         } => {
-            let _ = writeln!(out, "history.query.text: {:?}", query.text());
             let _ = writeln!(out, "history.query.cursor_byte: {}", query.cursor());
             let _ = writeln!(
                 out,
@@ -540,37 +528,40 @@ fn capture_layout_dump(
             let _ = writeln!(out, "history.scratch: {scratch:?}");
             let _ = writeln!(out, "history.candidate_stack: {candidate_stack:?}");
             let _ = writeln!(out, "history.selected: {selected}");
-            let _ = writeln!(out, "history.saved_line: {saved_line:?}");
+            let _ = writeln!(out, "history.saved_line_bytes: {}", saved_line.len());
             render::debug_dump_pager_layout(
                 out,
-                ish::line::str_width("search: "),
-                ish::line::str_width(query.text()),
-                0,
-                query.display_cursor_pos(),
-                matches.len(),
-                *selected,
-                shell.rows,
-                shell.cols,
+                render::PagerInput {
+                    prefix_width: ish::line::str_width("search: "),
+                    query_width: ish::line::str_width(query.text()),
+                    suffix_width: 0,
+                    query_cursor: query.display_cursor_pos(),
+                    total_entries: matches.len(),
+                    selected: *selected,
+                    term_rows: shell.rows,
+                    term_cols: shell.cols,
+                },
             );
         }
         Mode::DirPicker { entries, selected } => {
-            let _ = writeln!(out, "dir_picker.entries: {entries:?}");
+            let _ = writeln!(out, "dir_picker.entry_count: {}", entries.len());
             let _ = writeln!(out, "dir_picker.selected: {selected}");
             render::debug_dump_pager_layout(
                 out,
-                ish::line::str_width("dirs:"),
-                0,
-                0,
-                0,
-                entries.len(),
-                *selected,
-                shell.rows,
-                shell.cols,
+                render::PagerInput {
+                    prefix_width: ish::line::str_width("dirs:"),
+                    query_width: 0,
+                    suffix_width: 0,
+                    query_cursor: 0,
+                    total_entries: entries.len(),
+                    selected: *selected,
+                    term_rows: shell.rows,
+                    term_cols: shell.cols,
+                },
             );
         }
     }
 
-    render::debug_dump_history_cache(out, history_cache);
 }
 
 fn mode_name(mode: &Mode) -> &'static str {
@@ -585,14 +576,20 @@ fn mode_name(mode: &Mode) -> &'static str {
 /// Write the captured layout dump to a fresh file in `~/.cache/ish/dump-<hex>`.
 /// Returns the written path on success, or an error message. Deliberately does
 /// not write to the terminal, so Ctrl+P can capture a corrupted screen without
-/// changing its contents.
+/// changing its contents. The dump holds geometry and lengths only, never typed
+/// text, and the directory and files are private to the user.
 fn write_layout_dump_to_file(shell: &Shell) -> Result<String, String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
     if shell.home.is_empty() {
         return Err("ish-dump: HOME is not set".to_string());
     }
 
     let dir = Path::new(&shell.home).join(".cache/ish");
-    std::fs::create_dir_all(&dir)
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
         .map_err(|error| format!("ish-dump: could not create {}: {error}", dir.display()))?;
 
     for _ in 0..8 {
@@ -600,6 +597,7 @@ fn write_layout_dump_to_file(shell: &Shell) -> Result<String, String> {
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&path)
         {
             Ok(mut file) => {
@@ -702,15 +700,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
         let pwd = shell.epsh.vars().get("PWD").unwrap_or("");
         if !pwd.is_empty() {
             let hostname = shell.epsh.vars().get("HOSTNAME").unwrap_or("");
-            // percent-encode spaces in the path
-            let mut osc = format!("\x1b]7;file://{hostname}");
-            for b in pwd.bytes() {
-                if b == b' ' {
-                    osc.push_str("%20");
-                } else {
-                    osc.push(b as char);
-                }
-            }
+            // Percent-encode every byte outside the URI unreserved set so
+            // control and non-ASCII bytes cannot end or inject sequences.
+            let mut osc = String::from("\x1b]7;file://");
+            prompt::push_percent_encoded(&mut osc, hostname.as_bytes(), false);
+            prompt::push_percent_encoded(&mut osc, pwd.as_bytes(), true);
             osc.push('\x07');
             let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
         }
@@ -750,6 +744,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
         let event = reader.read_event();
         match event {
             InputEvent::Signal(sig) => {
+                if sig == rustix::process::Signal::TERM.as_raw()
+                    || sig == rustix::process::Signal::HUP.as_raw()
+                {
+                    return ReadResult::Terminated(sig);
+                }
                 if sig == rustix::process::Signal::WINCH.as_raw() {
                     let (rows, cols) = term::term_size();
                     shell.rows = rows;
@@ -799,17 +798,9 @@ fn read_line(shell: &mut Shell) -> ReadResult {
             }
             InputEvent::PasteRejected => {
                 grid_column = None;
-                line.set("[paste exceeded 8KB limit]");
-                region = render_active_mode(
-                    &mut tw,
-                    &mode,
-                    shell,
-                    &line,
-                    &prompt_str,
-                    prompt_display_len,
-                    region,
-                    &mut history_cache,
-                );
+                // The line stays as typed (a message inserted into it could be
+                // run); ring the bell instead of repainting.
+                tw.write_str("\x07");
                 let _ = tw.flush_to_stdout();
                 continue;
             }
@@ -823,10 +814,8 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         shell,
                         &mode,
                         &line,
-                        &prompt_str,
                         prompt_display_len,
                         region,
-                        &history_cache,
                     );
                     if let Err(message) = write_layout_dump_to_file(shell) {
                         eprintln!("{message}");
@@ -850,10 +839,8 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                     shell,
                                     &mode,
                                     &line,
-                                    &prompt_str,
                                     prompt_display_len,
                                     region,
-                                    &history_cache,
                                 );
                                 // Clear autosuggestion ghost text before freezing the line
                                 if line.cursor() == line.text().len() {
@@ -1095,9 +1082,11 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                         key,
                         query,
                         matches,
-                        candidates,
-                        scratch,
-                        candidate_stack,
+                        HistoryCandidates {
+                            candidates,
+                            scratch,
+                            candidate_stack,
+                        },
                         selected,
                         shell,
                     ) {
@@ -1828,55 +1817,27 @@ fn start_completion(
         }
     }
 
-    // SSH-aware completion: hostname and remote path
+    // After ssh-like commands, offer hostnames beside local files. There is no
+    // remote path completion: it would run ssh from the completion path.
     const SSH_CMDS: &[&str] = &["ssh", "scp", "rsync", "sftp", "mosh"];
-    if word_start > 0 && SSH_CMDS.contains(&first_command_word) {
-        if let Some(colon_pos) = partial.find(':') {
-            // Remote path: host:/path/prefix → complete via SSH
-            let host = &partial[..colon_pos];
-            let remote_path = &partial[colon_pos + 1..];
-            // The ssh child gets its environment from the store, matching the
-            // contract that children never inherit ish's process environment.
-            let child_env = epsh.vars().env_for_command_os(&[]);
-            complete::complete_remote_path(host, remote_path, &mut comp, &child_env);
-            if !comp.is_empty() {
-                let dir_prefix = if let Some(slash) = remote_path.rfind('/') {
-                    format!("{}:{}", host, &remote_path[..=slash])
-                } else {
-                    format!("{host}:")
-                };
-                let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
-                return CompletionState {
-                    comp,
-                    selected: 0,
-                    cols,
-                    rows,
-                    scroll: 0,
-                    term_cols,
-                    dir_prefix,
-                    in_quote,
-                };
-            }
-        } else if !partial.contains('/') {
-            // No colon, no slash → hostname completion + local files
-            complete::complete_hostnames(&partial, home, &mut comp);
-            complete::complete_path_into(&partial, false, &mut comp);
-            comp.sort_entries();
-            comp.dedup_sorted();
-            filter_existing_args(&mut comp, &existing, "");
-            if !comp.is_empty() {
-                let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
-                return CompletionState {
-                    comp,
-                    selected: 0,
-                    cols,
-                    rows,
-                    scroll: 0,
-                    term_cols,
-                    dir_prefix: String::new(),
-                    in_quote,
-                };
-            }
+    if word_start > 0 && SSH_CMDS.contains(&first_command_word) && !partial.contains([':', '/']) {
+        complete::complete_hostnames(&partial, home, &mut comp);
+        complete::complete_path_into(&partial, false, &mut comp);
+        comp.sort_entries();
+        comp.dedup_sorted();
+        filter_existing_args(&mut comp, &existing, "");
+        if !comp.is_empty() {
+            let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
+            return CompletionState {
+                comp,
+                selected: 0,
+                cols,
+                rows,
+                scroll: 0,
+                term_cols,
+                dir_prefix: String::new(),
+                in_quote,
+            };
         }
     }
 
@@ -2071,13 +2032,23 @@ enum HistoryAction {
     Cancel,
 }
 
+/// The incremental-narrowing state of a history search, borrowed together so
+/// the key handler stays within a reasonable argument count.
+struct HistoryCandidates<'a> {
+    candidates: &'a mut Vec<usize>,
+    scratch: &'a mut Vec<usize>,
+    candidate_stack: &'a mut Vec<(usize, Vec<usize>)>,
+}
+
 fn handle_history_search_key(
     key: KeyEvent,
     query: &mut LineBuffer,
     matches: &mut Vec<FuzzyMatch>,
-    candidates: &mut Vec<usize>,
-    scratch: &mut Vec<usize>,
-    candidate_stack: &mut Vec<(usize, Vec<usize>)>,
+    HistoryCandidates {
+        candidates,
+        scratch,
+        candidate_stack,
+    }: HistoryCandidates<'_>,
     selected: &mut usize,
     shell: &Shell,
 ) -> HistoryAction {
@@ -2290,7 +2261,6 @@ fn sync_path_var(epsh: &mut epsh::eval::Shell, name: &str, path: &Path) {
 fn sync_cwd_change(shell: &mut Shell, old_cwd: &Path, new_cwd: std::path::PathBuf) {
     sync_path_var(&mut shell.epsh, "OLDPWD", old_cwd);
     sync_path_var(&mut shell.epsh, "PWD", &new_cwd);
-    shell.prev_dir = Some(old_cwd.to_string_lossy().into_owned());
     shell.epsh.set_cwd(new_cwd);
     push_dir_stack(&mut shell.dir_stack);
     shell.prompt.invalidate_git();
@@ -2402,18 +2372,24 @@ fn render_dir_picker_mode(
     }
 }
 
+/// Terminate a suspended job when the shell quits. SIGCONT follows SIGTERM
+/// because a stopped process does not act on SIGTERM until it is continued.
+fn abandon_job(job: Job) {
+    if let Some(pgid) = rustix::process::Pid::from_raw(job.pgid) {
+        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::TERM);
+        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::CONT);
+    }
+    if let Some(work) = job.undo {
+        ish::undo::finish_job(work, 143);
+    }
+}
+
 /// Handle the "exit" command typed at the prompt. Returns true if the shell should break.
 fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
     if shell.job.is_some() {
         if shell.exit_warned {
             if let Some(job) = shell.job.take() {
-                if let Some(pgid) = rustix::process::Pid::from_raw(job.pgid) {
-                    let _ =
-                        rustix::process::kill_process_group(pgid, rustix::process::Signal::TERM);
-                }
-                if let Some(work) = job.undo {
-                    ish::undo::finish_job(work, 143);
-                }
+                abandon_job(job);
             }
             return true; // break
         } else {
@@ -2472,26 +2448,16 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
             let mut indices = Vec::new();
             shell.history.command_indices_into(&mut indices);
             for i in indices {
-                println!("{}", shell.history.get(i));
+                println!("{}", shell.history.display(i));
             }
             shell.last_status = 0;
             true
         }
         Some("-h") | Some("--help") => {
-            println!("Usage: history [compact|reset]");
+            println!("Usage: history [reset]");
             println!();
-            println!("Show history, compact its storage, or reset it.");
+            println!("Show history or reset it.");
             shell.last_status = 0;
-            true
-        }
-        Some("compact") => {
-            match shell.history.compact() {
-                Ok(()) => shell.last_status = 0,
-                Err(error) => {
-                    eprintln!("ish: history compact: {error}");
-                    shell.last_status = 1;
-                }
-            }
             true
         }
         Some("reset") => {
@@ -2550,7 +2516,7 @@ fn make_external_handler(
                     if args.len() > 1 {
                         let argument = args[1].to_shell_string();
                         if args.len() == 2 && matches!(argument.as_str(), "-h" | "--help") {
-                            println!("Usage: history [compact|reset]");
+                            println!("Usage: history [reset]");
                             return Ok(epsh::error::ExitStatus::SUCCESS);
                         }
                         eprintln!("ish: history: storage subcommands require a standalone command");
@@ -2641,16 +2607,33 @@ fn spawn_external(
                 let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
                 let _ = rustix::termios::tcsetpgrp(stdin, child_pid);
 
-                // Wait with WUNTRACED for job control
-                let status = rustix::process::waitpid(
-                    Some(child_pid),
-                    rustix::process::WaitOptions::UNTRACED,
-                )
-                .ok()
-                .and_then(|result| result.map(|(_, status)| status));
+                // Wait with WUNTRACED for job control. The shell tracks one
+                // suspended job; while that slot is taken, a second stop is
+                // refused by continuing the new job, since it could never be
+                // resumed with `fg`.
+                let status = loop {
+                    let status = rustix::process::waitpid(
+                        Some(child_pid),
+                        rustix::process::WaitOptions::UNTRACED,
+                    )
+                    .ok()
+                    .and_then(|result| result.map(|(_, status)| status));
 
-                // Reclaim terminal
-                let _ = rustix::termios::tcsetpgrp(stdin, rustix::process::getpgrp());
+                    // Reclaim terminal
+                    let _ = rustix::termios::tcsetpgrp(stdin, rustix::process::getpgrp());
+
+                    if status.is_some_and(|status| status.stopped())
+                        && JOB_SLOT_TAKEN.with(|taken| taken.get())
+                        && let Ok(stopped_termios) = term::save_termios()
+                    {
+                        eprintln!(
+                            "\nish: a job is already suspended; resume it with fg before suspending another"
+                        );
+                        ish::job::continue_in_foreground(child_pid, &stopped_termios);
+                        continue;
+                    }
+                    break status;
+                };
 
                 if status.is_some_and(|status| status.stopped()) {
                     // Capture the terminal state the stopped process left behind,
@@ -2748,14 +2731,7 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
     if shell.job.is_some() {
         if shell.exit_warned {
             if let Some(job) = shell.job.take() {
-                // SAFETY: Send SIGTERM to the job's pgid before force-quit.
-                if let Some(pgid) = rustix::process::Pid::from_raw(job.pgid) {
-                    let _ =
-                        rustix::process::kill_process_group(pgid, rustix::process::Signal::TERM);
-                }
-                if let Some(work) = job.undo {
-                    ish::undo::finish_job(work, 143);
-                }
+                abandon_job(job);
             }
             ReadResult::Exit
         } else {

@@ -258,7 +258,39 @@ fn history_fuzzy_search_into_45k(bencher: Bencher) {
     let mut scratch = Vec::with_capacity(history.len());
     let mut results = Vec::with_capacity(200);
     bench_with_syscall_trace(bencher, || {
-        history.fuzzy_search_subset_into("gco", &candidates, &mut scratch, &mut results, 200);
+        history.fuzzy_search_subset_into_in_dir(
+            "gco",
+            &candidates,
+            &mut scratch,
+            &mut results,
+            200,
+            Path::new("/"),
+        );
+        black_box((&scratch, &results));
+    });
+}
+
+/// Ctrl+R with a deep working directory and per-command directory metadata,
+/// as in a real history. Without directory data the ranking never walks the
+/// directory ancestors, which is where the cost was.
+#[rustybench::bench]
+fn history_fuzzy_search_in_dir_45k(bencher: Bencher) {
+    let dirs: Vec<PathBuf> = (0..200)
+        .map(|i| PathBuf::from(format!("/Users/dev/projects/project-{}/src/module-{}", i % 40, i)))
+        .collect();
+    let history = History::from_entries_in_dirs(
+        synthetic_history_45k()
+            .into_iter()
+            .enumerate()
+            .map(|(i, command)| (command, Some(dirs[i * 7 % dirs.len()].clone()))),
+    );
+    let mut candidates = Vec::with_capacity(history.len());
+    history.search_entry_indices_into(&mut candidates);
+    let mut scratch = Vec::with_capacity(history.len());
+    let mut results = Vec::with_capacity(200);
+    let cwd = Path::new("/Users/dev/projects/project-3/src/module-3/deep/er");
+    bench_with_syscall_trace(bencher, || {
+        history.fuzzy_search_subset_into_in_dir("g", &candidates, &mut scratch, &mut results, 200, cwd);
         black_box((&scratch, &results));
     });
 }
@@ -535,13 +567,27 @@ fn history_search_trace(bencher: Bencher) {
         matches.clear();
         cache.clear();
         tw.clear_buffer();
-        history.fuzzy_search_subset_into("", &candidates, &mut scratch, &mut matches, 200);
+        history.fuzzy_search_subset_into_in_dir(
+            "",
+            &candidates,
+            &mut scratch,
+            &mut matches,
+            200,
+            Path::new("/"),
+        );
         region = render::render_history_pager_cached(
             &mut tw, "", &matches, &history, 0, 24, 80, 0, region, &mut cache,
         );
 
         for query in ["g", "gc", "gco"] {
-            history.fuzzy_search_subset_into(query, &candidates, &mut scratch, &mut matches, 200);
+            history.fuzzy_search_subset_into_in_dir(
+                query,
+                &candidates,
+                &mut scratch,
+                &mut matches,
+                200,
+                Path::new("/"),
+            );
             std::mem::swap(&mut candidates, &mut scratch);
             tw.clear_buffer();
             region = render::render_history_pager_cached(

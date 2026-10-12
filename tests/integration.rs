@@ -330,7 +330,7 @@ fn scoring_pwd_bonus() {
         "npm install".into(),                 // more recent, no "ish"
         "./target/release/ish --help".into(), // oldest, but contains "ish"
     ]);
-    let matches = h.fuzzy_search_scored("build", "ish");
+    let matches = h.fuzzy_search_in_dir("build", std::path::Path::new("ish"));
     assert!(!matches.is_empty());
     assert_eq!(h.get(matches[0].entry_idx), "cargo build");
 
@@ -339,7 +339,7 @@ fn scoring_pwd_bonus() {
         "cd /tmp/ish && make".into(), // older, contains "ish"
         "cd /tmp/foo && make".into(), // more recent, no "ish"
     ]);
-    let matches2 = h2.fuzzy_search_scored("make", "ish");
+    let matches2 = h2.fuzzy_search_in_dir("make", std::path::Path::new("ish"));
     assert_eq!(matches2.len(), 2);
     assert_eq!(h2.get(matches2[0].entry_idx), "cd /tmp/foo && make");
 }
@@ -523,7 +523,16 @@ fn scoring_into_matches_search() {
     ]);
     let search_results = h.fuzzy_search("target");
     let mut into_results = Vec::new();
-    h.fuzzy_search_into("target", &mut into_results, 200, "");
+    let (mut candidates, mut matched) = (Vec::new(), Vec::new());
+    h.search_entry_indices_into(&mut candidates);
+    h.fuzzy_search_subset_into_in_dir(
+        "target",
+        &candidates,
+        &mut matched,
+        &mut into_results,
+        200,
+        std::path::Path::new("/"),
+    );
     assert_eq!(search_results.len(), into_results.len());
     for (a, b) in search_results.iter().zip(into_results.iter()) {
         assert_eq!(a.entry_idx, b.entry_idx);
@@ -537,7 +546,16 @@ fn scoring_into_respects_limit_without_changing_order() {
     let h = History::from_entries(entries);
     let search_results = h.fuzzy_search("echo");
     let mut into_results = Vec::new();
-    h.fuzzy_search_into("echo", &mut into_results, 200, "");
+    let (mut candidates, mut matched) = (Vec::new(), Vec::new());
+    h.search_entry_indices_into(&mut candidates);
+    h.fuzzy_search_subset_into_in_dir(
+        "echo",
+        &candidates,
+        &mut matched,
+        &mut into_results,
+        200,
+        std::path::Path::new("/"),
+    );
     assert_eq!(into_results.len(), 200);
     for (a, b) in search_results.iter().take(200).zip(into_results.iter()) {
         assert_eq!(a.entry_idx, b.entry_idx);
@@ -1004,7 +1022,7 @@ fn prompt_render_multiple() {
 }
 
 // ---------------------------------------------------------------------------
-// Builtin: is_builtin, is_ish_extension_builtin
+// Builtin: is_builtin and the registry
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1093,11 +1111,12 @@ fn history_load_empty() {
 }
 
 #[test]
-fn history_add_with_newlines() {
+fn history_add_keeps_newlines_verbatim() {
     let mut h = History::from_entries(vec![]);
     h.add("echo\nhello").unwrap();
-    // Newlines should be collapsed to spaces
-    assert_eq!(h.get(h.len() - 1), "echo hello");
+    // Stored verbatim; only display flattens the newline.
+    assert_eq!(h.get(h.len() - 1), "echo\nhello");
+    assert_eq!(h.display(h.len() - 1), "echo\u{21b5}hello");
 }
 
 #[test]
@@ -1514,17 +1533,18 @@ fn history_migrates_legacy_once_without_changing_originals() {
     let legacy = "echo imported\necho retained\n";
     std::fs::write(&path, legacy).unwrap();
     let command = b"echo cached\0";
-    let mut cache = b"ISH\x04".to_vec();
+    let mut cache = b"ISH\x05".to_vec();
     cache.extend_from_slice(&1u32.to_le_bytes());
     cache.extend_from_slice(&(command.len() as u32).to_le_bytes());
+    cache.extend_from_slice(&1u32.to_le_bytes());
     cache.extend_from_slice(&1u64.to_le_bytes());
     cache.extend_from_slice(command);
+    cache.push(0);
     std::fs::write(dir.join("history.bin"), &cache).unwrap();
 
     let mut h = History::load_from(path.clone()).unwrap();
     assert_eq!(h.len(), 3);
     h.add("echo log only").unwrap();
-    h.compact().unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
     assert_eq!(std::fs::read(dir.join("history.bin")).unwrap(), cache);
     assert!(dir.join("history.log").exists());
@@ -1567,8 +1587,7 @@ fn history_concurrent_writers_preserve_all_appends_and_compaction() {
                 for item in 0..20 {
                     h.add(&format!("writer-{writer} command-{item}")).unwrap();
                     if item == 10 {
-                        h.compact().unwrap();
-                    }
+                                        }
                 }
             })
         })
@@ -1689,20 +1708,17 @@ fn history_reset_invalidates_existing_shell_cache() {
     assert_eq!(stale_shell.get(0), "old command");
 
     resetter.reset().unwrap();
-    stale_shell.compact().unwrap();
     stale_shell.sync().unwrap();
     assert!(stale_shell.is_empty());
     assert_eq!(stale_shell.session_get(0), None);
     assert_eq!(stale_shell.session_prefix_search("old", 0), None);
 
     stale_shell.add("new command").unwrap();
-    stale_shell.compact().unwrap();
     let mut fresh_shell = History::load_from(hist_file.clone()).unwrap();
     assert_eq!(fresh_shell.len(), 1);
     assert_eq!(fresh_shell.get(0), "new command");
 
     fresh_shell.add("another new command").unwrap();
-    fresh_shell.compact().unwrap();
     let persisted_shell = History::load_from(hist_file).unwrap();
     assert_eq!(persisted_shell.len(), 2);
 }
@@ -1934,4 +1950,23 @@ fn complete_path_symlink() {
         .find(|&i| comp.name(i) == "link.txt")
         .unwrap();
     assert!(comp.entries[link_idx].is_link());
+}
+
+#[test]
+fn builtin_registry_drives_names_and_execution_classes() {
+    let names: Vec<_> = builtin::all_builtin_names().collect();
+    let mut unique = names.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(names.len(), unique.len(), "completion names repeat: {names:?}");
+    for name in &names {
+        assert!(builtin::is_builtin(name), "{name}");
+    }
+    for name in ["rm", "mv", "undo"] {
+        assert!(builtin::is_undo_builtin(name), "{name}");
+    }
+    assert!(!builtin::is_undo_builtin("l"));
+    assert_eq!(builtin::lookup("z").map(|b| b.exec), Some(builtin::Exec::InShell));
+    assert_eq!(builtin::lookup("cd").map(|b| b.exec), Some(builtin::Exec::Hybrid));
+    assert!(builtin::lookup("echo").is_none());
 }

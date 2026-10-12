@@ -12,7 +12,7 @@ cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static r
 
 RUSTYBENCH ?= cargo run --quiet --manifest-path ../rustybench/Cargo.toml --
 
-.PHONY: build test test-ci release release-dynamic verify-release verify-release-dynamic bench bench-fast bench-syscalls install setup
+.PHONY: build test test-ci release release-dynamic verify-release verify-release-dynamic bench bench-syscalls install install-login-shell lint fix
 
 build:
 	$(call cargo,dev) build
@@ -57,14 +57,15 @@ verify-release-dynamic:
 	fi
 
 lint:
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets -- -D warnings
+
+fix:
 	cargo fmt --all
-	cargo clippy --fix --allow-dirty --all-targets --all-features -- --deny warnings
+	cargo clippy --workspace --fix --allow-dirty --all-targets -- -D warnings
 
 bench:
 	@$(RUSTYBENCH) baseline --root "$(CURDIR)" --baseline "$(CURDIR)/benches/baseline.json" -- cargo bench --bench bench
-
-bench-fast:
-	@$(RUSTYBENCH) baseline --root "$(CURDIR)" --baseline "$(CURDIR)/benches/fast-baseline.json" --fast -- cargo bench --bench bench
 
 bench-syscalls:
 	@$(RUSTYBENCH) syscalls --root "$(CURDIR)"
@@ -80,6 +81,14 @@ install: release
 	@set -eu; \
 	  install_dir="$(HOME)/usr/bin"; \
 	  mkdir -p "$$install_dir"; \
+	  install -m 755 "target/$(TARGET)/release/$(NAME)" "$$install_dir/$(NAME)"; \
+	  if test "$$(uname -s)" = Darwin; then codesign -fs - "$$install_dir/$(NAME)"; fi
+
+# Registers the installed binary in /etc/shells and makes it the login shell.
+# Separate from install because it needs privilege and changes account state.
+install-login-shell: install
+	@set -eu; \
+	  install_dir="$(HOME)/usr/bin"; \
 	  shell_path="$$(cd "$$install_dir" && pwd -P)/$(NAME)"; \
 	  login_user="$$(id -un)"; \
 	  test -f /etc/shells || { echo '/etc/shells is required to register ish as a login shell' >&2; exit 1; }; \
@@ -100,8 +109,6 @@ install: release
 	    elif command -v doas >/dev/null 2>&1; then privilege=doas; \
 	    else echo 'sudo or doas is required to register ish as a login shell' >&2; exit 1; fi; \
 	  fi; \
-	  install -m 755 "target/$(TARGET)/release/$(NAME)" "$$install_dir/$(NAME)"; \
-	  if test "$$(uname -s)" = Darwin; then codesign -fs - "$$install_dir/$(NAME)"; fi; \
 	  if test "$$needs_setup" -eq 1; then \
 	    run_privileged() { if test -n "$$privilege"; then "$$privilege" "$$@"; else "$$@"; fi; }; \
 	    run_privileged sh -c 'set -eu; \

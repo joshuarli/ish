@@ -207,6 +207,29 @@ fn torn_journal_tail_is_ignored_then_trimmed() {
 }
 
 #[test]
+fn damaged_record_mid_journal_refuses_append_and_keeps_later_records() {
+    let fx = Fixture::new("mid-flip");
+    rm_tree(&fx, 3);
+    let (_, id, _) = fx.shell(&[&format!("rm:{}", argv(&["-r", "d"]))]);
+    let journal = fx.home_store().journal_path(id);
+    let mut bytes = std::fs::read(&journal).unwrap();
+    // Walk the 12-byte header and length-prefixed frames to the end of the
+    // second record, then flip its last payload byte: a complete frame whose
+    // checksum fails, with valid records after it.
+    let mut pos = 12usize;
+    for _ in 0..2 {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 8 + len;
+    }
+    assert!(pos < bytes.len(), "records follow the flipped one");
+    bytes[pos - 1] ^= 0x40;
+    std::fs::write(&journal, &bytes).unwrap();
+    let (status, _, _) = fx.undo(&[&id.to_string()]);
+    assert_ne!(status, 0, "undo refuses to append to a damaged journal");
+    assert_eq!(std::fs::read(&journal).unwrap(), bytes, "no byte was cut");
+}
+
+#[test]
 fn journal_and_sync_failures_fail_closed() {
     for fault in ["journal-append=28", "sync=5", "prepared=28"] {
         let fx = Fixture::new("fail-closed");

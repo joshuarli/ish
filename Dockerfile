@@ -1,8 +1,13 @@
+# Toolchain bump: edit rust-toolchain.toml only; this image reads the channel
+# from it. Bump LLVM_* and RUSTUP_VERSION (plus its checksums) separately.
 FROM alpine:3.24.1
 
 ARG TARGETARCH
 ARG LLVM_VERSION=23.1.0-rc2
 ARG LLVM_RELEASE_SHA=6eb5fb9
+ARG RUSTUP_VERSION=1.29.1
+ARG RUSTUP_X86_64_SHA256=331228566cc931f32cd684f9bebc5956a5e5d7394c8d5de595f196a658ab98e6
+ARG RUSTUP_AARCH64_SHA256=1ddf36182ac5d1782dbeefcb9bea7f5f9412d88f4a0d5047b1564a223624e8c6
 
 RUN apk add --no-cache \
     binutils \
@@ -44,13 +49,14 @@ RUN for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do \
         done; \
     done
 
-ADD https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init /rustup-init-x86_64
-ADD https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-musl/rustup-init /rustup-init-aarch64
+ADD https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-musl/rustup-init /rustup-init-x86_64
+ADD https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/aarch64-unknown-linux-musl/rustup-init /rustup-init-aarch64
 RUN case "$TARGETARCH" in \
-        amd64) init=/rustup-init-x86_64 ;; \
-        arm64) init=/rustup-init-aarch64 ;; \
+        amd64) init=/rustup-init-x86_64; sum=$RUSTUP_X86_64_SHA256 ;; \
+        arm64) init=/rustup-init-aarch64; sum=$RUSTUP_AARCH64_SHA256 ;; \
         *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac \
+    && echo "$sum  $init" | sha256sum -c - \
     && cp "$init" /rustup-init \
     && chmod +x /rustup-init \
     && /rustup-init -y --default-toolchain none \
@@ -65,10 +71,15 @@ ENV PATH="/opt/llvm-musl/bin:/root/.cargo/bin:$PATH" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang"
 
-RUN rustup toolchain install nightly-2026-09-15 \
-    --target x86_64-unknown-linux-musl \
-    --target aarch64-unknown-linux-musl \
-    --component rust-src
+COPY rust-toolchain.toml /tmp/rust-toolchain.toml
+RUN channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' /tmp/rust-toolchain.toml)" \
+    && test -n "$channel" \
+    && rustup toolchain install "$channel" \
+        --target x86_64-unknown-linux-musl \
+        --target aarch64-unknown-linux-musl \
+        --component rust-src \
+    && rustup default "$channel" \
+    && rm /tmp/rust-toolchain.toml
 
 # Host proc-macro links search rustc's target library directory for CRT
 # startup objects. Keep those objects available there without changing the

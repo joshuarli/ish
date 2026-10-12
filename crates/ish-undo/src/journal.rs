@@ -1113,14 +1113,28 @@ impl Writer {
         let mut end = len;
         if len != self.known_end {
             // Other processes appended since we last looked. Validate only
-            // the new bytes. A torn tail can only come from a writer that
-            // died mid-write while holding this lock; cut it so new records
-            // stay reachable.
+            // the new bytes. A torn tail (an incomplete frame reaching EOF)
+            // can only come from a writer that died mid-write while holding
+            // this lock; cut it so new records stay reachable. A complete
+            // frame that fails validation is damage, not a torn write:
+            // cutting there would destroy the valid records after it, so
+            // refuse to append and leave every byte in place.
             let start = self.known_end.min(len);
             let mut tail = vec![0u8; (len - start) as usize];
             let n = sys::read_full_at(self.file.as_fd(), &mut tail, start)?;
             tail.truncate(n);
-            let valid = scan_tail(&tail);
+            let valid = match scan_tail(&tail) {
+                Tail::Clean(valid) | Tail::Torn(valid) => valid,
+                Tail::Damaged(valid) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "journal is damaged at byte {}; refusing to append",
+                            start + valid as u64
+                        ),
+                    ));
+                }
+            };
             end = start + valid as u64;
             if end < len {
                 rustix::fs::ftruncate(&self.file, end)?;
@@ -1136,23 +1150,39 @@ impl Writer {
     }
 }
 
-/// Length of the valid record prefix of `data` (which starts at a record
-/// boundary).
-fn scan_tail(data: &[u8]) -> usize {
+enum Tail {
+    /// Every byte is a valid record.
+    Clean(usize),
+    /// Valid prefix followed by an incomplete frame that reaches EOF.
+    Torn(usize),
+    /// Valid prefix followed by a frame that is complete or impossible yet
+    /// invalid.
+    Damaged(usize),
+}
+
+/// Classify `data` (which starts at a record boundary).
+fn scan_tail(data: &[u8]) -> Tail {
     let mut pos = 0usize;
     while pos + 8 <= data.len() {
         let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         let crc = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-        if len > MAX_RECORD || pos + 8 + len as usize > data.len() {
-            break;
+        if len > MAX_RECORD {
+            return Tail::Damaged(pos);
+        }
+        if pos + 8 + len as usize > data.len() {
+            return Tail::Torn(pos);
         }
         let payload = &data[pos + 8..pos + 8 + len as usize];
         if crc32(payload) != crc || decode(payload).is_none() {
-            break;
+            return Tail::Damaged(pos);
         }
         pos += 8 + len as usize;
     }
-    pos
+    if pos < data.len() {
+        Tail::Torn(pos)
+    } else {
+        Tail::Clean(pos)
+    }
 }
 
 /// Logical bytes of the stored objects `records` reference: saved

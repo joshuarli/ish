@@ -90,7 +90,7 @@ pub enum InputEvent {
     /// The caller should insert it into the line buffer in one shot.
     Paste(String),
     /// A bracketed paste exceeded the paste limit and was rejected.
-    /// The caller should replace the line buffer with an error message.
+    /// The caller must leave the line buffer untouched and tell the user.
     PasteRejected,
 }
 
@@ -138,6 +138,9 @@ impl InputReader {
             return;
         }
         match key.key {
+            // Control bytes 0x01-0x1a decode as Ctrl+letter; inserting the
+            // letter would turn pasted control data into ordinary text.
+            Key::Char(_) if key.mods.ctrl || key.mods.alt => {}
             Key::Char(c) => self.paste_buf.push(c),
             Key::Enter => self.paste_buf.push('\n'),
             Key::Tab => self.paste_buf.push('\t'),

@@ -32,7 +32,9 @@ pub(super) fn cache_path(path: &Path) -> PathBuf {
 pub(super) fn read(path: &Path) -> io::Result<Vec<Occurrence>> {
     let mut text = Vec::new();
     if let Some(bytes) = read_if_present(path)? {
-        let contents = std::str::from_utf8(&bytes).map_err(|_| invalid("text is not UTF-8"))?;
+        // Old shells could record arbitrary bytes. Import must not abort on
+        // them, so invalid sequences become U+FFFD.
+        let contents = String::from_utf8_lossy(&bytes);
         for line in contents.lines() {
             if !line.is_empty() {
                 text.push(parse_line(line)?);
@@ -125,100 +127,40 @@ fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
+/// Only the final binary cache layout is imported: a 16-byte header (magic,
+/// version 5, command count, command arena size, directory arena size), one
+/// 8-byte timestamp per command, then NUL-terminated commands and directories.
 fn parse_cache(bytes: &[u8]) -> Option<Vec<Occurrence>> {
-    if bytes.get(..3)? != b"ISH" {
+    const HEADER: usize = 16;
+    if bytes.get(..4)? != b"ISH\x05" {
         return None;
     }
-    let version = *bytes.get(3)?;
-    if !(1..=5).contains(&version) {
-        return None;
-    }
-    let header: usize = if version <= 2 {
-        20
-    } else if version == 5 {
-        16
-    } else {
-        12
-    };
-    let count = u32_at(bytes, if version <= 2 { 12 } else { 4 })? as usize;
-    let arena_size = u32_at(bytes, if version <= 2 { 16 } else { 8 })? as usize;
-    let cwd_size = if version == 5 {
-        u32_at(bytes, 12)? as usize
-    } else {
-        0
-    };
-    let ts_width: usize = match version {
-        1 => 0,
-        2 | 3 => 4,
-        _ => 8,
-    };
-    let hashes_size = if version <= 2 {
-        count.checked_mul(8)?
-    } else {
-        0
-    };
-    let offsets_size = if version <= 2 {
-        count.checked_mul(6)?
-    } else {
-        0
-    };
-    let ts_start = header.checked_add(hashes_size)?;
-    let offsets_start = ts_start.checked_add(count.checked_mul(ts_width)?)?;
-    let arena_start = offsets_start.checked_add(offsets_size)?;
+    let count = u32_at(bytes, 4)? as usize;
+    let arena_size = u32_at(bytes, 8)? as usize;
+    let cwd_size = u32_at(bytes, 12)? as usize;
+    let arena_start = HEADER.checked_add(count.checked_mul(8)?)?;
     let cwd_start = arena_start.checked_add(arena_size)?;
     if cwd_start.checked_add(cwd_size)? != bytes.len() {
         return None;
     }
-    let arena = std::str::from_utf8(bytes.get(arena_start..cwd_start)?).ok()?;
-    let commands: Vec<&str> = if version <= 2 {
-        (0..count)
-            .map(|i| {
-                let offset = offsets_start + i * 6;
-                let start = u32_at(bytes, offset)? as usize;
-                let len = u16::from_le_bytes(bytes.get(offset + 4..offset + 6)?.try_into().ok()?)
-                    as usize;
-                arena.get(start..start.checked_add(len)?)
-            })
-            .collect::<Option<_>>()?
-    } else {
-        let mut commands: Vec<&str> = arena.split('\0').collect();
-        if !commands.pop()?.is_empty() || commands.len() != count {
-            return None;
-        }
-        commands
+    let split = |range: std::ops::Range<usize>| -> Option<Vec<&str>> {
+        let text = std::str::from_utf8(bytes.get(range)?).ok()?;
+        let mut parts: Vec<&str> = text.split('\0').collect();
+        (parts.pop()?.is_empty() && parts.len() == count).then_some(parts)
     };
-    let cwds: Vec<Option<PathBuf>> = if version == 5 {
-        let cwd_arena = std::str::from_utf8(bytes.get(cwd_start..)?).ok()?;
-        let mut parts: Vec<&str> = cwd_arena.split('\0').collect();
-        if !parts.pop()?.is_empty() || parts.len() != count {
-            return None;
-        }
-        parts
-            .into_iter()
-            .map(|cwd| (!cwd.is_empty()).then(|| PathBuf::from(cwd)))
-            .collect()
-    } else {
-        vec![None; count]
-    };
+    let commands = split(arena_start..cwd_start)?;
+    let cwds = split(cwd_start..bytes.len())?;
     let mut entries = Vec::with_capacity(count);
     for (i, (command, cwd)) in commands.into_iter().zip(cwds).enumerate() {
         if command.is_empty() {
             return None;
         }
-        let timestamp = match version {
-            1 => 0,
-            2 => (u32_at(bytes, ts_start + i * 4)? as u64).checked_mul(1000)?,
-            3 => (u32_at(bytes, ts_start + i * 4)? as u64)
-                .checked_mul(1000)?
-                .checked_add(TS_EPOCH_MILLIS)?,
-            _ => u64_at(bytes, ts_start + i * 8)?.wrapping_add(TS_EPOCH_MILLIS),
-        };
         entries.push(Occurrence {
             id: 0,
             command: command.to_string(),
-            timestamp,
+            timestamp: u64_at(bytes, HEADER + i * 8)?.wrapping_add(TS_EPOCH_MILLIS),
             session_id: 0,
-            cwd,
+            cwd: (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
         });
     }
     Some(entries)

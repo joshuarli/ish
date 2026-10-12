@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  macos:
+    name: Lint and test (macOS)
+    runs-on: macos-26
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: macos-26
+      - name: Lint
+        run: |
+          rustup component add clippy
+          cargo clippy --workspace --all-targets -- -D warnings
+      - name: Mount second filesystem for undo tests
+        run: |
+          dev=$(hdiutil attach -nomount ram://131072 | tr -d '[:space:]')
+          diskutil erasevolume HFS+ ishvol "$dev"
+          echo "ISH_UNDO_TEST_VOLUME=/Volumes/ishvol" >> "$GITHUB_ENV"
+      - name: Test
+        run: cargo test --lib --tests
+
+  linux-musl:
+    name: Lint and test (Linux musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build Linux image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ish-builder:x86_64-unknown-linux-musl
+          cache-from: type=gha,scope=ish-x86_64-unknown-linux-musl
+      - name: Lint and test in image
+        run: |
+          docker run --rm --init \
+            --platform linux/amd64 \
+            --tmpfs /ish-vol \
+            -e ISH_UNDO_TEST_VOLUME=/ish-vol \
+            -e CI \
+            -v "$GITHUB_WORKSPACE:/ish" \
+            -w /ish \
+            ish-builder:x86_64-unknown-linux-musl \
+            sh -ec '
+              rustup component add clippy
+              MUSL_TARGET=x86_64-unknown-linux-musl MUSL_BUILD_MODE=test \
+                musl-cargo clippy --workspace --all-targets -- -D warnings
+              make test TARGET=x86_64-unknown-linux-musl
+            '

@@ -257,14 +257,10 @@ pub fn clean_path(path: &Path) -> std::path::PathBuf {
 /// Whether an error means the filesystem lacks a capability, as opposed to a
 /// permission, I/O, or space failure that must be reported as such.
 pub fn is_capability_error(err: &io::Error) -> bool {
+    use rustix::io::Errno;
     matches!(
-        err.raw_os_error(),
-        Some(code) if code == libc::ENOTSUP
-            || code == libc::EOPNOTSUPP
-            || code == libc::ENOTTY
-            || code == libc::EXDEV
-            || code == libc::ENOSYS
-            || code == libc::EINVAL
+        err.raw_os_error().map(Errno::from_raw_os_error),
+        Some(Errno::NOTSUP | Errno::NOTTY | Errno::XDEV | Errno::NOSYS | Errno::INVAL)
     ) || err.kind() == io::ErrorKind::Unsupported
 }
 
@@ -351,7 +347,7 @@ pub fn rename_noreplace(
         // Filesystems without no-replace support: check and rename. The
         // remaining race is reported by the caller's revalidation.
         Err(Errno::INVAL) | Err(Errno::NOSYS) | Err(Errno::NOTSUP) => match lstat_at(to_dir, to) {
-            Ok(_) => Err(io::Error::from_raw_os_error(libc::EEXIST)),
+            Ok(_) => Err(io::Error::from(rustix::io::Errno::EXIST)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 Ok(rustix::fs::renameat(from_dir, from, to_dir, to)?)
             }

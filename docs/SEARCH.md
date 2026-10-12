@@ -11,8 +11,10 @@ The implementation lives in `src/history.rs`:
 - `History::fuzzy_search_subset_into_in_dir()` is the Ctrl+R entry point (opening
   the pager and every query edit in `src/main.rs`). It takes the working
   directory for proximity ranking, reuses a caller-owned `Vec<FuzzyMatch>`,
-  and keeps at most the requested limit. `fuzzy_search_into()` and
-  `fuzzy_search_subset_into()` are the directory-less variants.
+  and keeps at most the requested limit. Each candidate's directory score is
+  computed once, and a candidate that cannot beat the current worst kept
+  result is rejected before any directory lookup. `fuzzy_search()` and
+  `fuzzy_search_in_dir()` are conveniences over the same path.
 - `FuzzyMatch` stores the entry index, up to 32 match positions, match count,
   and the tier score used for ordering.
 - `classify_match()` selects the first applicable match tier. The ASCII path is

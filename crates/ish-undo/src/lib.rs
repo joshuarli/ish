@@ -21,7 +21,7 @@ mod store;
 mod sys;
 mod txn;
 
-pub use ops::{RedirMode, mv, open_redirect, rm};
+pub use ops::{RedirMode, RedirOutcome, mv, open_redirect, rm};
 pub use retention::maybe_collect;
 pub use store::root_for_home;
 pub use txn::{Session, Suspended, Txn};

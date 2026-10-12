@@ -1,5 +1,4 @@
 .git
 target
-Dockerfile.test
 Dockerfile
 ish-*

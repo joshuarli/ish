@@ -238,11 +238,12 @@ impl Home {
             private_dir(&root.join(sub))?;
         }
         let id = sys::random_u64() | 1;
-        write_new_file(
+        // Written to a temporary name and renamed, so a crash never leaves a
+        // truncated `format` that would make the store unreadable.
+        replace_file(
             &root.join("format"),
             format!("{FORMAT}\n{id:016x}\n").as_bytes(),
         )?;
-        sys::sync_dir(sys::open_dir(root)?.as_fd())?;
         Ok(Home {
             root: root.to_path_buf(),
             id,
@@ -290,16 +291,26 @@ impl Home {
         }
         replace_file(&next_path, format!("{}\n", id + 1).as_bytes())?;
         let dir = self.txn_dir(id);
-        private_dir(&self.root.join("txn"))?;
-        fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        let txn_root = self.root.join("txn");
+        private_dir(&txn_root)?;
+        // Built under a name the catalog ignores and renamed into place, so
+        // a crash never leaves a transaction directory without a journal.
+        let building = txn_root.join(format!("{id}.new"));
+        if building.exists() {
+            let root_fd = sys::open_dir(&txn_root)?;
+            sys::remove_tree(root_fd.as_fd(), &sys::cstr(format!("{id}.new").as_bytes())?)?;
+        }
+        fs::DirBuilder::new().mode(0o700).create(&building)?;
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(dir.join("replay.lock"))?;
+            .open(building.join("replay.lock"))?;
         begin.id = id;
-        journal::create(&dir.join("journal"), &[Record::Begin(begin)])?;
-        sys::sync_dir(sys::open_dir(&self.root.join("txn"))?.as_fd())?;
+        journal::create(&building.join("journal"), &[Record::Begin(begin)])?;
+        sys::sync_dir(sys::open_dir(&building)?.as_fd())?;
+        fs::rename(&building, &dir)?;
+        sys::sync_dir(sys::open_dir(&txn_root)?.as_fd())?;
         Ok(id)
     }
 
@@ -448,6 +459,9 @@ pub fn next_object_name() -> CString {
 pub struct Stores {
     pub home: Home,
     home_dev: u64,
+    /// Registered volumes, read once so an unreadable registry fails the
+    /// whole operation instead of reading as "no volumes".
+    registry: Vec<VolumeEntry>,
     volumes: Option<Vec<(VolumeEntry, VolumeState)>>,
     /// Open object directories keyed by store id.
     obj_dirs: Vec<(u64, OwnedFd)>,
@@ -457,9 +471,11 @@ pub struct Stores {
 impl Stores {
     pub fn new(home: Home, txn: u64) -> io::Result<Stores> {
         let home_dev = sys::lstat(&home.root)?.dev;
+        let registry = home.registry()?;
         Ok(Stores {
             home,
             home_dev,
+            registry,
             volumes: None,
             obj_dirs: Vec::new(),
             txn,
@@ -468,11 +484,11 @@ impl Stores {
 
     fn volumes(&mut self) -> &[(VolumeEntry, VolumeState)] {
         if self.volumes.is_none() {
-            let entries = self.home.registry().unwrap_or_default();
             let home_id = self.home.id;
             self.volumes = Some(
-                entries
-                    .into_iter()
+                self.registry
+                    .iter()
+                    .cloned()
                     .map(|e| {
                         let state = e.state(home_id);
                         (e, state)

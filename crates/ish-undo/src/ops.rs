@@ -27,6 +27,9 @@ const MAX_OPEN_DIRS: usize = 48;
 /// Deepest tree a recursive walk descends into.
 const MAX_DEPTH: usize = 4096;
 
+/// Longest path the kernel resolves, including the terminating NUL.
+const PATH_MAX: usize = libc::PATH_MAX as usize;
+
 fn show(path: &[u8]) -> String {
     String::from_utf8_lossy(path).into_owned()
 }
@@ -114,7 +117,8 @@ pub struct Guard {
 /// A store root with its identity and the identities of its ancestors.
 struct GuardedStore {
     root: PathBuf,
-    ident: (u64, u64),
+    /// Absent until the store has been created.
+    ident: Option<(u64, u64)>,
     chain: Vec<(u64, u64)>,
 }
 
@@ -125,9 +129,12 @@ impl Guard {
             .unwrap_or((0, 0));
         let mut stores = Vec::new();
         for store_root in store_roots {
-            let Ok(st) = sys::stat(store_root) else {
-                continue;
-            };
+            // The store may not exist yet (it is created lazily by the first
+            // operation), but its lexical path and existing ancestors must
+            // already be protected: an operation that removes an ancestor
+            // would otherwise delete into a store that is about to appear
+            // inside the removed tree.
+            let ident = sys::stat(store_root).ok().map(|s| (s.dev, s.ino));
             let mut chain = Vec::new();
             let mut p = store_root.clone();
             while let Some(parent) = p.parent().map(Path::to_path_buf) {
@@ -141,24 +148,21 @@ impl Guard {
             }
             stores.push(GuardedStore {
                 root: store_root.clone(),
-                ident: (st.dev, st.ino),
+                ident,
                 chain,
             });
         }
         Guard { root, stores }
     }
 
-    pub fn for_txn(txn_home: &Path) -> Guard {
+    /// Fails when the volume registry cannot be read: guarding only the home
+    /// store would leave a registered volume's store unprotected.
+    pub fn for_txn(txn_home: &Path) -> io::Result<Guard> {
         let mut roots = vec![txn_home.to_path_buf()];
-        if let Ok(Some(home)) = store::Home::open_existing(txn_home) {
-            roots.extend(
-                home.registry()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|e| e.path),
-            );
+        if let Some(home) = store::Home::open_existing(txn_home)? {
+            roots.extend(home.registry()?.into_iter().map(|e| e.path));
         }
-        Guard::new(&roots)
+        Ok(Guard::new(&roots))
     }
 
     /// Check an operand. `name` is its final component, `st` its lstat, and
@@ -182,7 +186,8 @@ impl Guard {
                 return Err(Refusal::Store(store.root.clone()));
             }
             if let Some(parent) = parent
-                && inside(parent, store.ident)
+                && let Some(store_ident) = store.ident
+                && inside(parent, store_ident)
             {
                 return Err(Refusal::Store(store.root.clone()));
             }
@@ -320,7 +325,13 @@ pub fn rm(txn: &Txn, cwd: &Path, args: &[OsString], io: &mut Io<'_>) -> i32 {
         return 1;
     }
 
-    let guard = Guard::for_txn(&txn.home_root);
+    let guard = match Guard::for_txn(&txn.home_root) {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = writeln!(io.err, "rm: cannot read the undo store registry: {e}");
+            return 1;
+        }
+    };
     let mut budget = Budget::new(txn.config.copy_limit, txn.config.min_free, io.cancel);
     let mut status = 0;
     for operand in &operands {
@@ -752,6 +763,16 @@ impl Remover<'_, '_, '_, '_> {
         };
         let child_path = join(&stack[top].path, child.to_bytes());
         let child_shown = join(&stack[top].shown, child.to_bytes());
+        // Replay resolves recorded paths from the root, so a path the kernel
+        // cannot resolve could be removed but never restored.
+        if child_path.len() >= PATH_MAX {
+            self.fail(format!(
+                "rm: {}: path too long to restore; not removed",
+                show(&child_shown)
+            ));
+            stack[top].failed = true;
+            return;
+        }
         let st = match sys::lstat_at(dir.as_fd(), child) {
             Ok(st) => st,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return,
@@ -948,7 +969,13 @@ pub fn mv(txn: &Txn, cwd: &Path, args: &[OsString], io: &mut Io<'_>) -> i32 {
         let _ = writeln!(io.err, "mv: {}: not a directory", show(dest_arg.as_bytes()));
         return 1;
     }
-    let guard = Guard::for_txn(&txn.home_root);
+    let guard = match Guard::for_txn(&txn.home_root) {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = writeln!(io.err, "mv: cannot read the undo store registry: {e}");
+            return 1;
+        }
+    };
     let mut budget = Budget::new(txn.config.copy_limit, txn.config.min_free, io.cancel);
     let mut status = 0;
     for src_arg in &operands {
@@ -1135,7 +1162,7 @@ impl Mover<'_, '_, '_, '_, '_> {
             target_shown,
         )
         .map_err(|e| {
-            if e.raw_os_error() == Some(libc::EXDEV) {
+            if e.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error()) {
                 cross_device(src_shown, target_shown)
             } else {
                 format!("mv: {}: {}", show(src_shown), e)
@@ -1278,23 +1305,36 @@ fn resolve_final_symlinks(path: &Path) -> Option<(PathBuf, Option<Stat>)> {
     None
 }
 
-/// Open a writable redirection target with protection. Returns `None` to
-/// let the shell's default open handle targets that are not regular files
-/// (for example `/dev/null` or a FIFO), or when capture is disabled.
+/// The result of asking for a protected writable redirection target.
+pub enum RedirOutcome {
+    /// The target was opened with its prior contents preserved.
+    Protected(OwnedFd),
+    /// Nothing to protect (capture disabled, or a target that is not a
+    /// regular file such as `/dev/null` or a FIFO): the shell may open it.
+    NotApplicable,
+    /// Protection failed. The shell must not open the target itself, since
+    /// that would truncate it without a recovery point.
+    Refused(io::Error),
+}
+
+/// Open a writable redirection target with protection.
 pub fn open_redirect(
     txn: &Txn,
     path: &Path,
     mode: RedirMode,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Option<io::Result<OwnedFd>> {
+) -> RedirOutcome {
+    use RedirOutcome::{NotApplicable, Protected, Refused};
     if !txn.config.enabled {
-        return None;
+        return NotApplicable;
     }
     for _ in 0..8 {
-        let (target, st) = resolve_final_symlinks(path)?;
+        let Some((target, st)) = resolve_final_symlinks(path) else {
+            return Refused(io::Error::other("cannot resolve target"));
+        };
         let (dir, name) = match open_parent(&target) {
             Ok(v) => v,
-            Err(_) => return None,
+            Err(e) => return Refused(e),
         };
         let flags = redirect_flags(mode);
         match st {
@@ -1307,7 +1347,7 @@ pub fn open_redirect(
                 ) {
                     Ok(fd) => fd,
                     Err(rustix::io::Errno::EXIST) => continue,
-                    Err(e) => return Some(Err(e.into())),
+                    Err(e) => return Refused(e.into()),
                 };
                 // Creation destroys nothing, so it is recorded afterward.
                 if let Ok(st) = sys::fstat(fd.as_fd())
@@ -1318,9 +1358,9 @@ pub fn open_redirect(
                         target.display()
                     );
                 }
-                return Some(Ok(fd));
+                return Protected(fd);
             }
-            Some(st) if st.kind != Kind::File => return None,
+            Some(st) if st.kind != Kind::File => return NotApplicable,
             Some(st) => {
                 let fd = match rustix::fs::openat(
                     dir.as_fd(),
@@ -1330,22 +1370,20 @@ pub fn open_redirect(
                 ) {
                     Ok(fd) => fd,
                     Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::NOENT) => continue,
-                    Err(e) => return Some(Err(e.into())),
+                    Err(e) => return Refused(e.into()),
                 };
                 match sys::fstat(fd.as_fd()) {
                     Ok(now) if now.same_object(&st) && now.kind == Kind::File => {}
                     _ => continue,
                 }
                 if let Err(e) = protect_write(txn, &dir, &name, &target, &st, &fd, mode, cancel) {
-                    return Some(Err(e));
+                    return Refused(e);
                 }
-                return Some(Ok(fd));
+                return Protected(fd);
             }
         }
     }
-    Some(Err(io::Error::other(
-        "target kept changing while being opened",
-    )))
+    Refused(io::Error::other("target kept changing while being opened"))
 }
 
 fn record_create(txn: &Txn, path: &Path, st: &Stat) -> io::Result<()> {

@@ -11,7 +11,6 @@ use ptytest::{
     CommandSpec, ExitStatus, ProtocolProfile, PtyTest, Scenario, Size, TerminalBaseline, TestEnv,
 };
 use std::cell::{Cell, RefCell};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -1334,7 +1333,6 @@ fn history_ctrl_r_narrow_repaint_does_not_stack_rows() {
     sh.up();
     sh.wait_for_quiescence(200);
 
-    sh.read_timeout(600);
     let screen = snapshot_text(&sh.screen());
     assert_screen_contains_once(&screen, "search:");
     assert_screen_contains_once(&screen, "abc1");
@@ -1740,7 +1738,6 @@ fn tab_completion_first_tab_has_no_selection_second_tab_selects_first() {
     sh.type_str("echo aa");
     sh.tab();
     sh.wait_for_quiescence(150);
-    sh.read_timeout(400);
     let first = snapshot_text(&sh.screen());
     assert_eq!(
         first.matches("aaa.txt").count(),
@@ -1750,7 +1747,6 @@ fn tab_completion_first_tab_has_no_selection_second_tab_selects_first() {
 
     sh.tab();
     sh.wait_for_quiescence(150);
-    sh.read_timeout(400);
     let second = snapshot_text(&sh.screen());
     assert_eq!(
         second.matches("aaa.txt").count(),
@@ -1780,7 +1776,6 @@ fn tab_completion_narrow_repaint_does_not_stack_rows() {
     sh.up();
     sh.wait_for_quiescence(200);
 
-    sh.read_timeout(600);
     let screen = snapshot_text(&sh.screen());
     let flattened = screen.replace('\n', "");
     assert_eq!(
@@ -1981,12 +1976,10 @@ fn completion_resize_rerenders_grid() {
     sh.type_str("echo a");
     sh.tab();
     sh.wait_for_quiescence(200);
-    sh.read_timeout(300);
 
     sh.resize(24, 12);
     sh.wait_for_quiescence(200);
 
-    sh.read_timeout(800);
     let screen = snapshot_text(&sh.screen());
     assert_screen_contains_once(&screen, "aaa.txt");
     assert_screen_contains_once(&screen, "aab.txt");
@@ -2043,12 +2036,10 @@ fn history_resize_rerenders_pager() {
     sh.wait_for("search:", 2000);
     sh.type_str("abc");
     sh.wait_for_quiescence(200);
-    sh.read_timeout(300);
 
     sh.resize(24, 10);
     sh.wait_for_quiescence(200);
 
-    sh.read_timeout(800);
     let screen = snapshot_text(&sh.screen());
     assert_screen_contains_once(&screen, "search:");
     assert_screen_contains_once(&screen, "abc1");
@@ -2287,14 +2278,13 @@ fn script_mode_refused() {
 }
 
 #[test]
-fn source_nonexistent_error() {
+fn source_is_refused() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("source foo.sh");
     let text = PtyShell::strip_ansi(&out);
-    // epsh handles source natively — nonexistent file gives an error
     assert!(
-        text.contains("No such file") || text.contains("not found") || text.contains("error"),
-        "expected file-not-found error: {text:?}"
+        text.contains("`source` is not supported"),
+        "expected refusal: {text:?}"
     );
 }
 
@@ -2305,7 +2295,8 @@ fn ctrl_l_clears_screen() {
     let _ = sh.read_timeout(200);
     sh.type_str("echo after_clear");
     sh.ctrl_l();
-    out.push_str(&sh.read_timeout(500));
+    out.push_str(&sh.wait_for("after_clear", 2000));
+    sh.wait_for_quiescence(200);
     let screen = snapshot_text(&sh.screen());
     let normalized = normalize_screen_text(&screen);
     assert!(
@@ -2377,7 +2368,6 @@ fn dir_picker_narrow_repaint_does_not_stack_rows() {
     sh.up();
     sh.wait_for_quiescence(200);
 
-    sh.read_timeout(800);
     let screen = snapshot_text(&sh.screen());
     let (_, picker) = screen
         .split_once("dirs:\n")
@@ -2674,14 +2664,13 @@ fn history_write_failure_is_visible_and_command_still_runs() {
 }
 
 #[test]
-fn history_read_only_commands_and_compact_preserve_another_writer() {
+fn history_read_only_commands_preserve_another_writer() {
     let sh = PtyShell::spawn_with_opts(&[], &["echo startup"]);
     let path = sh.home_path().join(".local/share/ish/history");
     let mut writer = History::load_from(path.clone()).unwrap();
     writer.add("echo concurrent_history_marker").unwrap();
     sh.run_command("history | /bin/cat");
     sh.run_command("history > history-output");
-    sh.run_command("history compact");
     let h = History::load_from(path).unwrap();
     assert_eq!(
         h.prefix_search("echo concurrent_history_marker", 0),
@@ -2692,11 +2681,10 @@ fn history_read_only_commands_and_compact_preserve_another_writer() {
 }
 
 #[test]
-fn history_reset_and_compact_reopen_storage_in_existing_shell_processes() {
+fn history_reset_reopens_storage_in_existing_shell_processes() {
     let first = PtyShell::spawn_with_opts(&[], &["echo before_reset_marker"]);
     let second = PtyShell::spawn_in_home(first._home.clone(), &[], 24, 80, None);
     first.run_command("history reset");
-    second.run_command("history compact");
     let text = PtyShell::strip_ansi(&second.run_command("history | /bin/cat"));
     assert!(
         !text.contains("before_reset_marker"),
@@ -2704,9 +2692,7 @@ fn history_reset_and_compact_reopen_storage_in_existing_shell_processes() {
     );
 
     second.run_command("/bin/echo after_reset_second_process");
-    first.run_command("history compact");
-    first.run_command("/bin/echo after_compact_first_process");
-    second.run_command("history compact");
+    first.run_command("/bin/echo after_reset_first_process");
     let h = History::load_from(first.home_path().join(".local/share/ish/history")).unwrap();
     assert!(h.prefix_search("echo before_reset_marker", 0).is_none());
     assert_eq!(
@@ -2714,8 +2700,8 @@ fn history_reset_and_compact_reopen_storage_in_existing_shell_processes() {
         Some("/bin/echo after_reset_second_process")
     );
     assert_eq!(
-        h.prefix_search("/bin/echo after_compact_first_process", 0),
-        Some("/bin/echo after_compact_first_process")
+        h.prefix_search("/bin/echo after_reset_first_process", 0),
+        Some("/bin/echo after_reset_first_process")
     );
 }
 
@@ -2786,7 +2772,7 @@ fn history_help() {
     let sh = PtyShell::spawn();
     let text = PtyShell::strip_ansi(&sh.run_command("history -h"));
     assert!(
-        text.contains("Usage: history [compact|reset]"),
+        text.contains("Usage: history [reset]"),
         "expected history help text: {text:?}"
     );
 }
@@ -2841,15 +2827,42 @@ fn denv_trust_key(path: &Path) -> String {
     key
 }
 
-fn allow_envrc(home: &Path, rel_envrc: &str) {
-    let envrc = home
-        .join(rel_envrc)
-        .canonicalize()
-        .unwrap_or_else(|_| home.join(rel_envrc));
+/// SHA-256 hex of `path`'s bytes via the system tool, so the tests check the
+/// on-disk trust format independently of the implementation's own hasher.
+fn sha256_hex_of_file(path: &Path) -> String {
+    let out = ["sha256sum", "shasum"]
+        .iter()
+        .find_map(|tool| {
+            let mut cmd = std::process::Command::new(tool);
+            if *tool == "shasum" {
+                cmd.args(["-a", "256"]);
+            }
+            cmd.arg(path).output().ok().filter(|o| o.status.success())
+        })
+        .expect("sha256sum or shasum is required by the denv tests");
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// Grants trust to a `.envrc` or `.env` in the on-disk format: the file is
+/// keyed by its canonical path and holds the SHA-256 of its content.
+fn allow_envrc(home: &Path, rel: &str) {
+    let file = home.join(rel).canonicalize().unwrap();
     let allow_dir = home.join(".local/share/denv/allow");
     std::fs::create_dir_all(&allow_dir).unwrap();
-    let mtime = std::fs::metadata(&envrc).unwrap().mtime();
-    std::fs::write(allow_dir.join(denv_trust_key(&envrc)), format!("{mtime}")).unwrap();
+    std::fs::write(allow_dir.join(denv_trust_key(&file)), sha256_hex_of_file(&file)).unwrap();
+}
+
+fn spawn_with_allowed(files: &[(&str, &str)], allowed: &[&str]) -> PtyShell {
+    PtyShell::spawn_with_setup(files, &[], &[], 24, 80, None, |home| {
+        for rel in allowed {
+            allow_envrc(home, rel);
+        }
+    })
 }
 
 fn spawn_with_allowed_envrc(files: &[(&str, &str)], rel_envrc: &str) -> PtyShell {
@@ -2883,13 +2896,23 @@ fn denv_loads_allowed_envrc_on_cd() {
 }
 
 #[test]
-fn denv_loads_dotenv_on_cd_without_allow() {
-    let sh = PtyShell::spawn_with_opts(&[("project/.env", "DENV_TEST_VAR=loaded\n")], &[]);
+fn denv_loads_dotenv_on_cd_only_after_allow() {
+    let sh = PtyShell::spawn_with_opts(
+        &[("project/.env", "DENV_TEST_VAR=loaded\nPATH=/nonexistent\n")],
+        &[],
+    );
     sh.run_command("cd project");
+    let text = PtyShell::strip_ansi(&sh.run_command("echo =$DENV_TEST_VAR= $PATH"));
+    assert!(
+        text.contains("==") && !text.contains("/nonexistent"),
+        "un-allowed .env must not change the environment: {text:?}"
+    );
+
+    sh.run_command("denv allow");
     let text = PtyShell::strip_ansi(&sh.run_command("echo $DENV_TEST_VAR"));
     assert!(
         text.contains("loaded"),
-        "expected dotenv var after cd: {text:?}"
+        "expected dotenv var after denv allow: {text:?}"
     );
 }
 
@@ -2948,7 +2971,7 @@ fn denv_deny_removes_env_and_marks_dirty() {
 }
 
 #[test]
-fn denv_startup_loads_dotenv_in_initial_cwd() {
+fn denv_startup_loads_allowed_dotenv_in_initial_cwd() {
     let sh = PtyShell::spawn_with_setup(
         &[("project/.env", "DENV_TEST_VAR=from_startup\n")],
         &[],
@@ -2956,12 +2979,12 @@ fn denv_startup_loads_dotenv_in_initial_cwd() {
         24,
         80,
         Some("project"),
-        |_| {},
+        |home| allow_envrc(home, "project/.env"),
     );
     let text = PtyShell::strip_ansi(&sh.run_command("echo $DENV_TEST_VAR"));
     assert!(
         text.contains("from_startup"),
-        "expected dotenv to load on startup: {text:?}"
+        "expected allowed dotenv to load on startup: {text:?}"
     );
 }
 
@@ -2981,7 +3004,7 @@ fn denv_startup_loads_allowed_envrc_in_initial_cwd() {
 
 #[test]
 fn denv_dotenv_overrides_envrc() {
-    let sh = spawn_with_allowed_envrc(
+    let sh = spawn_with_allowed(
         &[
             (
                 "project/.envrc",
@@ -2989,7 +3012,7 @@ fn denv_dotenv_overrides_envrc() {
             ),
             ("project/.env", "SHARED=from_dotenv\nDOTENV_ONLY=1\n"),
         ],
-        "project/.envrc",
+        &["project/.envrc", "project/.env"],
     );
     sh.run_command("cd project");
     let text = PtyShell::strip_ansi(&sh.run_command("echo $SHARED $ENVRC_ONLY $DOTENV_ONLY"));
@@ -3011,9 +3034,6 @@ fn denv_reload_after_reallow_picks_up_envrc_edit() {
     );
     sh.run_command("cd project");
 
-    // `denv` deliberately uses filesystem modification timestamps as its
-    // trust invalidation contract; cross the one-second timestamp boundary.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
     std::fs::write(
         sh.home_path().join("project/.envrc"),
         "export DENV_TEST_VAR='updated'\n",
@@ -3037,9 +3057,6 @@ fn denv_edit_envrc_invalidates_trust() {
     );
     sh.run_command("cd project");
 
-    // `denv` deliberately uses filesystem modification timestamps as its
-    // trust invalidation contract; cross the one-second timestamp boundary.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
     std::fs::write(
         sh.home_path().join("project/.envrc"),
         "export DENV_TEST_VAR='changed'\n",
@@ -3108,12 +3125,12 @@ fn denv_path_add_relative_dir() {
 
 #[test]
 fn denv_dotenv_helper_loads_env_file() {
-    let sh = spawn_with_allowed_envrc(
+    let sh = spawn_with_allowed(
         &[
             ("project/.envrc", "dotenv\nexport AFTER='1'\n"),
             ("project/.env", "FROM_ENV=loaded\n"),
         ],
-        "project/.envrc",
+        &["project/.envrc", "project/.env"],
     );
     sh.run_command("cd project");
     let text = PtyShell::strip_ansi(&sh.run_command("echo $FROM_ENV $AFTER"));
@@ -3124,14 +3141,67 @@ fn denv_dotenv_helper_loads_env_file() {
 }
 
 #[test]
-fn denv_allow_requires_envrc() {
-    let sh = PtyShell::spawn_with_opts(&[("project/.env", "DENV_TEST_VAR=loaded\n")], &[]);
+fn denv_allow_without_any_env_file_fails() {
+    let sh = PtyShell::spawn_with_opts(&[("project/note.txt", "x\n")], &[]);
     sh.run_command("cd project");
     let text = PtyShell::strip_ansi(&sh.run_command("denv allow"));
     assert!(
-        text.contains("no .envrc"),
-        "expected allow failure without envrc: {text:?}"
+        text.contains("no .envrc or .env"),
+        "expected allow failure without env files: {text:?}"
     );
+}
+
+#[test]
+fn ctrl_c_interrupts_running_child() {
+    let sh = PtyShell::spawn();
+    sh.type_str("sleep 60");
+    sh.enter();
+    sh.wait_for_line_advance(1000);
+    sh.wait_for_quiescence(200);
+    sh.ctrl_c();
+    sh.wait_for_prompt(3000);
+
+    let out = sh.run_command("echo alive");
+    assert!(out.contains("alive"), "shell unresponsive after ^C: {out:?}");
+}
+
+#[test]
+fn ctrl_d_with_stopped_job_warns_then_exits() {
+    let sh = PtyShell::spawn();
+    sh.type_str("sleep 60");
+    sh.enter();
+    sh.wait_for_line_advance(1000);
+    sh.wait_for_quiescence(200);
+    sh.ctrl_z();
+    sh.wait_for("stopped:", 3000);
+    sh.wait_for_prompt(3000);
+
+    sh.ctrl_d();
+    let out = sh.wait_for("suspended job", 3000);
+    assert!(out.contains("Ctrl+D again"), "expected warning: {out:?}");
+    sh.ctrl_d();
+    sh.wait_for_exit(3000);
+}
+
+#[test]
+fn exit_twice_with_stopped_job_warns_then_exits() {
+    let sh = PtyShell::spawn();
+    sh.type_str("sleep 60");
+    sh.enter();
+    sh.wait_for_line_advance(1000);
+    sh.wait_for_quiescence(200);
+    sh.ctrl_z();
+    sh.wait_for("stopped:", 3000);
+    sh.wait_for_prompt(3000);
+
+    sh.type_str("exit");
+    sh.enter();
+    let out = sh.wait_for("suspended job", 3000);
+    assert!(out.contains("Exit again"), "expected warning: {out:?}");
+    sh.wait_for_prompt(3000);
+    sh.type_str("exit");
+    sh.enter();
+    sh.wait_for_exit(3000);
 }
 
 #[test]
@@ -3192,6 +3262,7 @@ fn bracketed_paste_over_limit_rejected() {
     assert!(content.len() > 8192);
 
     let sh = PtyShell::spawn();
+    sh.send(b"echo ");
 
     // Build the bracketed paste payload: \x1b[200~ CONTENT \x1b[201~
     let mut payload = Vec::with_capacity(6 + content.len() + 6);
@@ -3205,20 +3276,20 @@ fn bracketed_paste_over_limit_rejected() {
     let clean = PtyShell::strip_ansi(&out);
 
     assert!(
-        clean.contains("[paste exceeded 8KB limit]"),
-        "expected paste-rejection message, got: {clean:?}"
+        !clean.contains("[paste exceeded 8KB limit]"),
+        "a rejected paste must not insert text into the line: {clean:?}"
     );
     // No 'x's from the paste content should appear on screen.
     assert!(
         !clean.contains("xxxxx"),
         "paste content appeared on screen — limit bypassed: {clean:?}"
     );
-    // Shell must still be responsive after rejection.
-    let out2 = sh.run_command("echo ok");
+    // The line typed before the paste is untouched, so completing it runs it.
+    let out2 = sh.run_command("kept");
     let clean2 = PtyShell::strip_ansi(&out2);
     assert!(
-        clean2.contains("ok"),
-        "shell unresponsive after paste: {clean2:?}"
+        clean2.lines().any(|line| line.trim() == "kept"),
+        "line was altered by the rejected paste: {clean2:?}"
     );
 }
 
@@ -3241,12 +3312,13 @@ fn bracketed_paste_agents_md_rejected() {
 
     sh.send(&payload);
 
-    let out = sh.wait_for_prompt(5000);
+    // A rejected paste rings the bell and repaints nothing else.
+    let out = sh.wait_for("\x07", 5000);
     let clean = PtyShell::strip_ansi(&out);
 
     assert!(
-        clean.contains("[paste exceeded 8KB limit]"),
-        "expected paste-rejection message, got: {clean:?}"
+        !clean.contains("[paste exceeded 8KB limit]"),
+        "a rejected paste must not insert text into the line: {clean:?}"
     );
     // The first line of AGENTS.md must NOT appear on screen.
     let first_line = content.lines().next().unwrap_or("");
@@ -3596,4 +3668,95 @@ fn inputs_without_mutations_never_create_the_undo_store() {
     let out = clean(&sh.run_command(""));
     assert!(out.contains("nothing has been recorded yet"), "{out}");
     assert!(!home_exists(&sh, ".local/share/ish/undo"));
+}
+
+// ---------------------------------------------------------------------------
+// Signals, job slot, dispatch refusals, dump privacy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sigterm_and_sighup_restore_the_terminal_and_exit_with_the_signal_status() {
+    for (name, status) in [("TERM", 143), ("HUP", 129)] {
+        let sh = PtyShell::spawn();
+        // The signal is queued while the child runs and read at the next
+        // prompt, which is where the shell restores the terminal and exits.
+        sh.type_str(&format!("/bin/sh -c 'kill -{name} $PPID'"));
+        sh.enter();
+        let mut terminal = sh.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::from_secs(5));
+        let exit = terminal.wait_for_exit(deadline).expect("ish exits on SIG{name}");
+        assert_eq!(exit, ExitStatus::Code(status), "SIG{name}");
+        terminal
+            .assert_terminal_restored(&sh.terminal_baseline)
+            .unwrap_or_else(|e| panic!("terminal not restored after SIG{name}: {e:?}"));
+    }
+}
+
+#[test]
+fn second_ctrl_z_is_refused_and_the_first_job_stays_resumable() {
+    let sh = PtyShell::spawn();
+    sh.type_str("sleep 60");
+    sh.enter();
+    sh.wait_for_line_advance(1000);
+    sh.wait_for_quiescence(200);
+    sh.ctrl_z();
+    sh.wait_for("stopped:", 3000);
+    sh.wait_for_prompt(3000);
+
+    // A second command that stops itself must not take (or replace) the slot.
+    sh.type_str("sh -c 'kill -STOP $$; echo continued$((1+1))'");
+    sh.enter();
+    let out = sh.wait_for("continued2", 3000);
+    assert!(out.contains("already suspended"), "{out:?}");
+    sh.wait_for_prompt(3000);
+
+    // The original job is still the one `fg` resumes.
+    sh.type_str("fg");
+    sh.enter();
+    let out = sh.wait_for("resuming: sleep", 3000);
+    assert!(out.contains("sleep"), "{out:?}");
+    sh.wait_for_quiescence(100);
+    sh.ctrl_c();
+    sh.wait_for_prompt(3000);
+}
+
+#[test]
+fn state_builtin_in_a_list_and_undocumented_syntax_are_refused_without_running_anything() {
+    let sh = PtyShell::spawn();
+    for (line, message) in [
+        ("z nothing; echo ran$((1+1))", "only command"),
+        ("fg && echo ran$((1+1))", "only command"),
+        ("sleep 1 & echo ran$((1+1))", "background jobs"),
+        ("if true; then echo ran$((1+1)); fi", "if commands"),
+        ("eval echo ran$((1+1))", "`eval` is not supported"),
+        ("echo ${HOME:-ran$((1+1))}", "parameter operators"),
+    ] {
+        let out = clean(&sh.run_command(line));
+        assert!(out.contains(message), "{line}: {out}");
+        assert!(!out.contains("ran2"), "{line} ran: {out}");
+    }
+    let out = clean(&sh.run_command("echo ok${HOME}; echo ran$((1+1)) | cat"));
+    assert!(out.contains("ran2"), "documented syntax must still run: {out}");
+}
+
+#[test]
+fn ctrl_p_dump_is_private_and_omits_typed_text() {
+    use std::os::unix::fs::PermissionsExt;
+    let sh = PtyShell::spawn();
+    sh.type_str("secret-token-123");
+    sh.send(b"\x10");
+    sh.wait_for_quiescence(200);
+    let dir = sh.home_path().join(".cache/ish");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700);
+    let dumps: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("dump-"))
+        .collect();
+    assert_eq!(dumps.len(), 1, "{dumps:?}");
+    assert_eq!(mode(&dumps[0]), 0o600);
+    let text = std::fs::read_to_string(&dumps[0]).unwrap();
+    assert!(text.contains("line.bytes: 16"), "{text}");
+    assert!(!text.contains("secret-token-123"), "{text}");
 }

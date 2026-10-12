@@ -1,5 +1,6 @@
 #!/bin/bash
-# Import fish shell history into the legacy ish history before history migration.
+# Import fish shell history into the legacy ish history file. ish imports that
+# file once, on its first start; after the log exists this script refuses to run.
 #
 # Fish entries are prepended before existing ish entries so the ish entries
 # stay the most recent. Every occurrence is retained; ish does not
@@ -10,9 +11,8 @@ set -euo pipefail
 fish_history="$HOME/.local/share/fish/fish_history"
 ish_history="$HOME/.local/share/ish/history"
 ish_log="$HOME/.local/share/ish/history.log"
-ish_database="$HOME/.local/share/ish/history.sqlite3"
 
-if [[ -e "$ish_log" || -e "$ish_database" ]]; then
+if [[ -e "$ish_log" ]]; then
     printf 'error: this legacy importer must run before history migration; migrated history already exists\n' >&2
     exit 1
 fi

@@ -260,7 +260,7 @@ test needs sudo or touches real root, home, or worktrees.
 
 Tests that need a second filesystem use `ISH_UNDO_TEST_VOLUME`, a writable
 directory on a different filesystem (the Linux container mounts a tmpfs) and
-skip explicitly without it. Capability-specific assertions establish that the
+skip explicitly without it (and fail when `CI` is set). Capability-specific assertions establish that the
 intended backend actually ran, and clone-dependent ones are guarded by a probe.
 
 Linux validation reuses the repository Dockerfile and `musl-cargo`: build from a

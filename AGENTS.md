@@ -41,9 +41,10 @@ without an explicit decision.
 The main flow is:
 
 ```text
-input → line editing → alias handling → command dispatch → render
-                                      ├→ ish builtin
-                                      └→ epsh parse/expand/evaluate → job or external command
+input → line editing → alias handling → epsh parse → dispatch plan → render
+                                                     ├→ ish builtin (whole line)
+                                                     ├→ refusal (outside the documented subset)
+                                                     └→ epsh expand/evaluate → job or external command
 ```
 
 Subsystem ownership:
@@ -52,6 +53,8 @@ Subsystem ownership:
 - `input.rs`, `line.rs`: terminal byte decoding and UTF-8 line editing.
 - `render.rs`, `prompt.rs`, `term.rs`: terminal output, prompt, raw mode, and
   repainting.
+- `dispatch.rs`: parses an accepted line once, refuses syntax outside the
+  documented subset, and decides whether a shell-owned builtin is the whole line.
 - `builtin.rs`, `job.rs`, `sys.rs`, `signal.rs`: builtins, foreground job
   control, process/file-descriptor plumbing, and signal handling.
 - `complete.rs`, `path.rs`, `ls.rs`: native completion, PATH lookup, and
@@ -86,14 +89,21 @@ details here that are likely to change.
 
 Notable builtin rules:
 
-- State-changing builtins (`cd`, `exit`, `fg`, `set`, `unset`, and `alias`) must
-  run in the shell process. `undo` subcommands that change recovery state
+- State-changing builtins (`exit`, `fg`, `alias`, `z`, `denv`, and the like) must
+  run in the shell process and only as the whole input line; inside a list or
+  pipeline they are refused. `cd` and `history` run in the shell when alone and
+  fall back to epsh's `cd` or the history listing inside lists. `undo` subcommands that change recovery state
   refuse to run in pipeline stages or command substitutions.
 - Native `rm` and `mv` fail closed: if a version cannot be preserved, nothing
   is mutated. Do not add a silent fallback to an unprotected utility.
 - Pipeline-safe output builtins may participate in pipelines.
-- New builtins belong in the builtin registry and in the appropriate
-  state-changing or pipeline-safe execution path, with integration/PTY coverage
+- Syntax outside the README's documented subset (background `&`, compound
+  commands, functions, `source`/`eval`, parameter operators) is refused in
+  `dispatch::plan()`; do not let it reach epsh.
+- New builtins get one entry in the registry in `src/builtin.rs` with an
+  execution class, and, for shell-state builtins, a handler arm in
+  `run_shell_builtin()`; name lists elsewhere derive from the registry. Add
+  integration/PTY coverage, with integration/PTY coverage
   as applicable.
 
 ## Shell terminology
@@ -149,10 +159,10 @@ verification of commits to the user.
 
 ## Common changes
 
-- Builtin: start at `src/builtin.rs` (`ISH_EXTENSION_BUILTINS`,
-  `is_ish_extension_builtin()`, `is_builtin()`, `all_builtin_names()`,
-  `locate_command()`, `list_directory()`). Commands that must change shell
-  state are intercepted by the `first_command_word` match in `src/main.rs`;
+- Builtin: start at `src/builtin.rs` (`ISH_BUILTINS`, `Exec`, `lookup()`,
+  `is_builtin()`, `all_builtin_names()`, `locate_command()`,
+  `list_directory()`). Commands that must change shell state are chosen by
+  `dispatch::plan()` and run by `run_shell_builtin()` in `src/main.rs`;
   relevant handlers include `handle_alias()`, `handle_exit_command()`,
   `change_directory()`, `handle_history()`, `denv::command()`, and
   `job::resume_job()`. Add behavior tests in `tests/integration.rs` or
@@ -166,8 +176,8 @@ verification of commits to the user.
   `complete::compute_grid()` in `src/complete.rs`; orchestration and accept/
   refilter behavior live in `start_completion()` and
   `handle_completion_key()` in `src/main.rs`.
-- History search: use `History::fuzzy_search_into()` or
-  `History::fuzzy_search_subset_into()` and `FuzzyMatch` in `src/history.rs`;
+- History search: use
+  `History::fuzzy_search_subset_into_in_dir()` and `FuzzyMatch` in `src/history.rs`;
   input and selection are handled by `handle_history_search_key()` and
   `render_history_mode()` in `src/main.rs`.
 - Prompt or rendering: prompt data and git inspection are in `Prompt` and
@@ -179,8 +189,7 @@ verification of commits to the user.
   Keep expansion through the existing `epsh` integration.
 - Native filesystem or syscall code: prefer rustix, keep unsafe at the
   boundary, document unavoidable libc use, and test error paths. Start with
-  `src/sys.rs` (`pipe_cloexec()`,
-  `spawn_command_subst()`), `src/path.rs` (`PathCache`, `scan_path()`),
+  `src/sys.rs` (`pipe_cloexec()`), `src/path.rs` (`PathCache`, `scan_path()`),
   `src/ls.rs` (`list_dir()`) as appropriate.
 - Parser/expansion behavior: inspect the call sites of
   `expand_builtin_args()` and the `epsh::lexer`/`epsh::expand` integration in

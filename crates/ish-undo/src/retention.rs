@@ -26,6 +26,7 @@
 
 use std::io;
 use std::os::fd::AsFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -119,10 +120,21 @@ fn cached_size(home: &Home, id: u64) -> Option<CachedSize> {
 /// catalog directory. The caller holds the transaction's replay lock.
 pub fn delete_txn(home: &Home, id: u64) -> io::Result<()> {
     let mut stores = Stores::new(home.clone(), id)?;
+    let name = id.to_string();
+    let tombstone = format!("{id}.dead");
+    let catalog = home.root.join("txn");
+    let catalog_fd = sys::open_dir(&catalog)?;
+    // The catalog entry goes first, by an atomic rename: a crash afterwards
+    // leaves no completed-looking transaction with missing objects, only
+    // leftovers that `sweep_leftovers` and orphan removal clean up.
+    if catalog.join(&tombstone).exists() {
+        sys::remove_tree(catalog_fd.as_fd(), &sys::cstr(tombstone.as_bytes())?)?;
+    }
+    std::fs::rename(catalog.join(&name), catalog.join(&tombstone))?;
+    sys::sync_dir(catalog_fd.as_fd())?;
     for (entry, state) in stores.volume_list() {
         if let VolumeState::Available { .. } = state {
             let txn = entry.path.join("txn");
-            let name = id.to_string();
             if txn.join(&name).exists() {
                 let owner =
                     std::fs::read_to_string(txn.join(&name).join("owner")).unwrap_or_default();
@@ -133,10 +145,27 @@ pub fn delete_txn(home: &Home, id: u64) -> io::Result<()> {
             }
         }
     }
-    let txn = home.root.join("txn");
-    let dir = sys::open_dir(&txn)?;
-    sys::remove_tree(dir.as_fd(), &sys::cstr(id.to_string().as_bytes())?)?;
-    sys::sync_dir(dir.as_fd())
+    sys::remove_tree(catalog_fd.as_fd(), &sys::cstr(tombstone.as_bytes())?)?;
+    sys::sync_dir(catalog_fd.as_fd())
+}
+
+/// Remove directories an interrupted allocation or deletion left in the
+/// catalog. The caller holds the store lock, so none is in progress.
+fn sweep_leftovers(home: &Home) -> io::Result<()> {
+    let catalog = home.root.join("txn");
+    let entries = match std::fs::read_dir(&catalog) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let dir = sys::open_dir(&catalog)?;
+    for entry in entries {
+        let name = entry?.file_name();
+        if name.to_str().is_some_and(|n| n.ends_with(".dead") || n.ends_with(".new")) {
+            sys::remove_tree(dir.as_fd(), &sys::cstr(name.as_bytes())?)?;
+        }
+    }
+    Ok(())
 }
 
 /// Whether a volume transaction's `owner` file names this home store.
@@ -240,28 +269,31 @@ pub fn collect(home: &Home, config: &Config, work: Option<usize>) -> io::Result<
         spent: 0,
     };
     let mut report = GcReport::default();
+    sweep_leftovers(home)?;
     let ids = home.txn_ids()?;
     let mut stores = Stores::new(home.clone(), 0)?;
 
     // Sizes come from the cache; a transaction without one is measured from
     // its journal, which costs work.
+    // Only sealed transactions count toward the budgets: an active,
+    // interrupted, or unreadable one cannot be collected by size pressure, so
+    // counting it would delete healthy history to make room it never frees.
     let mut sizes = Vec::with_capacity(ids.len());
     let mut unsealed = Vec::with_capacity(ids.len());
     for &id in &ids {
-        let cached = cached_size(home, id);
-        unsealed.push(cached.is_some_and(|c| !c.sealed));
-        let size = match cached {
-            Some(cached) => cached.bytes,
+        let (size, sealed) = match cached_size(home, id) {
+            Some(cached) => (cached.bytes, cached.sealed),
             None if work.spend() => measure(home, id),
             None => {
                 report.more = true;
-                0
+                (0, true)
             }
         };
-        sizes.push(size);
+        unsealed.push(!sealed);
+        sizes.push(if sealed { size } else { 0 });
     }
     let mut total: u64 = sizes.iter().sum();
-    let mut count = ids.len() as u64;
+    let mut count = unsealed.iter().filter(|u| !**u).count() as u64;
 
     let now_ns = sys::now_ns();
     let max_age_ns = config.max_age_days.saturating_mul(86_400_000_000_000);
@@ -286,8 +318,11 @@ pub fn collect(home: &Home, config: &Config, work: Option<usize>) -> io::Result<
             continue;
         };
         let too_old = now_ns.saturating_sub(begin.started_ns) > max_age_ns;
-        let over =
-            count > config.max_entries || total > config.max_bytes || free(home) < config.min_free;
+        // Low free space only justifies deleting while something collectable
+        // remains to free it.
+        let over = count > config.max_entries
+            || total > config.max_bytes
+            || (count > 1 && free(home) < config.min_free);
         if !too_old && !over {
             if bounded {
                 // Ids are in age order and deleting only tightens the
@@ -304,9 +339,14 @@ pub fn collect(home: &Home, config: &Config, work: Option<usize>) -> io::Result<
         }
         if unsealed[i] {
             // Its cached size says its journal never got an end record:
-            // interrupted or unreadable, which nothing collects. There is no
-            // journal to load to find that out again.
-            report.kept_protected += 1;
+            // active, interrupted, or unreadable. Size pressure never
+            // collects it; only an interrupted one past the age limit does,
+            // after its shell is confirmed dead under the replay lock.
+            if too_old && try_delete_interrupted(home, &mut stores, id)? == Fate::Deleted {
+                report.deleted.push(id);
+            } else {
+                report.kept_protected += 1;
+            }
             resume_after = id;
             continue;
         }
@@ -380,7 +420,7 @@ fn find_newest_completed(home: &Home, ids: &[u64], work: &mut Work) -> Newest {
 /// The size is written only while holding the transaction's replay lock: a
 /// replay drops the cached size before it appends to the journal, so a size
 /// measured before a replay started must not be written after it.
-fn measure(home: &Home, id: u64) -> u64 {
+fn measure(home: &Home, id: u64) -> (u64, bool) {
     let lock = lock_for_delete(home, id);
     let idle = matches!(lock, Ok(Some(_)));
     match Model::load(home, id) {
@@ -390,7 +430,7 @@ fn measure(home: &Home, id: u64) -> u64 {
             if idle && recorded_lifecycle(home, &model) != Lifecycle::Active {
                 cache_size(home, id, model.retained, model.end.is_some());
             }
-            model.retained
+            (model.retained, model.end.is_some())
         }
         Err(e) => {
             // A journal in a format this build does not read holds nothing it
@@ -399,7 +439,7 @@ fn measure(home: &Home, id: u64) -> u64 {
             if idle && e.kind() == io::ErrorKind::InvalidData {
                 cache_size(home, id, 0, false);
             }
-            0
+            (0, false)
         }
     }
 }
@@ -418,6 +458,7 @@ fn is_protected(home: &Home, stores: &mut Stores, id: u64) -> bool {
     }
 }
 
+#[derive(PartialEq, Eq)]
 enum Fate {
     Deleted,
     Protected,
@@ -436,6 +477,23 @@ fn try_delete(home: &Home, stores: &mut Stores, id: u64) -> io::Result<Fate> {
     };
     // The lock is ours, so `lifecycle`'s probe would only find it held.
     if recorded_lifecycle(home, &model) != Lifecycle::Completed || unavailable(stores, &model) {
+        return Ok(Fate::Protected);
+    }
+    delete_txn(home, id)?;
+    Ok(Fate::Deleted)
+}
+
+/// Delete an interrupted transaction (no end record, shell dead). The caller
+/// has checked its age. Liveness is rechecked under the replay lock, so a
+/// transaction that is still being written is never removed.
+fn try_delete_interrupted(home: &Home, stores: &mut Stores, id: u64) -> io::Result<Fate> {
+    let Some(_replay) = lock_for_delete(home, id)? else {
+        return Ok(Fate::Protected);
+    };
+    let Ok(model) = Model::load(home, id) else {
+        return Ok(Fate::Protected);
+    };
+    if recorded_lifecycle(home, &model) != Lifecycle::Interrupted || unavailable(stores, &model) {
         return Ok(Fate::Protected);
     }
     delete_txn(home, id)?;

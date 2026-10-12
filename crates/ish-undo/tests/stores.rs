@@ -36,7 +36,13 @@ impl Drop for Volume {
     }
 }
 
+/// Skips locally, but fails under CI, where a silent skip would leave the
+/// cross-filesystem paths untested without anyone noticing.
 fn skip(what: &str) {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "{what} needs ISH_UNDO_TEST_VOLUME in CI"
+    );
     eprintln!("skipping {what}: set ISH_UNDO_TEST_VOLUME to a directory on another filesystem");
 }
 
@@ -674,5 +680,44 @@ fn explicit_collection_reports_everything_it_left_alone() {
     assert!(
         out.contains("deleted 0") && out.contains("kept 1 protected"),
         "{out}"
+    );
+}
+
+#[test]
+fn interrupted_transactions_do_not_count_toward_the_budget_until_aged_out() {
+    let fx = Fixture::new("gc-interrupted-budget");
+    fx.write("stuck", b"x");
+    fx.shell_with(
+        SESSION,
+        &["--fault", "prepared=abort"],
+        &[&format!("rm:{}", argv(&["stuck"]))],
+    );
+    let mut done = Vec::new();
+    for i in 0..2 {
+        fx.write(&format!("f{i}"), b"x");
+        let (_, id, _) = fx.shell(&[&format!("rm:{}", argv(&[&format!("f{i}")]))]);
+        done.push(id);
+    }
+    let home = fx.home_store();
+    let config = ish_undo::Config {
+        max_entries: 2,
+        min_free: 0,
+        ..ish_undo::Config::default()
+    };
+    collect(&home, &config, None).unwrap();
+    assert_eq!(
+        home.txn_ids().unwrap(),
+        vec![1, done[0], done[1]],
+        "two completed transactions fit; the interrupted one is not budget"
+    );
+    let aged = ish_undo::Config {
+        max_age_days: 0,
+        ..config
+    };
+    collect(&home, &aged, None).unwrap();
+    assert_eq!(
+        home.txn_ids().unwrap(),
+        vec![done[1]],
+        "past the age limit the interrupted one is collected too"
     );
 }

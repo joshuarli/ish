@@ -123,6 +123,20 @@ fn restore_cursor_smart(tw: &mut TermWriter, region: RenderedRegion, rows_up_fro
     }
 }
 
+/// Write user-controlled text with control characters replaced by a visible
+/// placeholder. Terminals would otherwise execute them (or draw nothing), and
+/// the width math counts each as one column.
+fn write_text(tw: &mut TermWriter, s: &str) {
+    if !s.chars().any(char::is_control) {
+        tw.write_str(s);
+        return;
+    }
+    let mut buf = [0u8; 4];
+    for c in s.chars() {
+        tw.write_str(crate::line::display_char(c).encode_utf8(&mut buf));
+    }
+}
+
 fn write_history_row(
     tw: &mut TermWriter,
     text: &str,
@@ -153,7 +167,7 @@ fn write_history_row(
             }
         }
         let mut buf = [0u8; 4];
-        tw.write_str(ch.encode_utf8(&mut buf));
+        tw.write_str(crate::line::display_char(ch).encode_utf8(&mut buf));
     }
     if in_match {
         tw.write_str("\x1b[0m");
@@ -239,15 +253,15 @@ struct PagerLayout {
     term_cols: u16,
 }
 
-struct PagerInput {
-    prefix_width: usize,
-    query_width: usize,
-    suffix_width: usize,
-    query_cursor: usize,
-    total_entries: usize,
-    selected: usize,
-    term_rows: u16,
-    term_cols: u16,
+pub struct PagerInput {
+    pub prefix_width: usize,
+    pub query_width: usize,
+    pub suffix_width: usize,
+    pub query_cursor: usize,
+    pub total_entries: usize,
+    pub selected: usize,
+    pub term_rows: u16,
+    pub term_cols: u16,
 }
 
 #[derive(Debug)]
@@ -461,27 +475,9 @@ pub fn debug_dump_prompt_layout(
 }
 
 /// Dump the computed pager geometry used by history and directory picker.
-pub fn debug_dump_pager_layout(
-    out: &mut String,
-    prefix_width: usize,
-    query_width: usize,
-    suffix_width: usize,
-    query_cursor: usize,
-    total_entries: usize,
-    selected: usize,
-    term_rows: u16,
-    term_cols: u16,
-) {
-    let layout = layout_pager(PagerInput {
-        prefix_width,
-        query_width,
-        suffix_width,
-        query_cursor,
-        total_entries,
-        selected,
-        term_rows,
-        term_cols,
-    });
+pub fn debug_dump_pager_layout(out: &mut String, input: PagerInput) {
+    let layout = layout_pager(input);
+
     let _ = writeln!(out, "pager_layout: {layout:?}");
 }
 
@@ -534,17 +530,17 @@ pub fn render_line(
             let color = if valid { "\x1b[32m" } else { "\x1b[31m" };
             let first_end = text.find(|c: char| c.is_whitespace()).unwrap_or(text.len());
             tw.write_str(color);
-            tw.write_str(&text[..first_end]);
+            write_text(tw, &text[..first_end]);
             tw.write_str("\x1b[0m");
-            tw.write_str(&text[first_end..]);
+            write_text(tw, &text[first_end..]);
         }
-        None => tw.write_str(text),
+        None => write_text(tw, text),
     }
 
     // Autosuggestion ghost text (dim gray, after line content)
     if !opts.suggestion.is_empty() {
         tw.write_str("\x1b[38;5;8m");
-        tw.write_str(opts.suggestion);
+        write_text(tw, opts.suggestion);
         tw.write_str("\x1b[0m");
     }
 
@@ -589,16 +585,16 @@ fn render_line_multiline(
                         .find(|c: char| c.is_whitespace())
                         .unwrap_or(segment.len());
                     tw.write_str(color);
-                    tw.write_str(&segment[..first_end]);
+                    write_text(tw, &segment[..first_end]);
                     tw.write_str("\x1b[0m");
-                    tw.write_str(&segment[first_end..]);
+                    write_text(tw, &segment[first_end..]);
                 }
-                None => tw.write_str(segment),
+                None => write_text(tw, segment),
             }
         } else {
             tw.write_str("\r\n");
             tw.write_str(cont_prompt);
-            tw.write_str(segment);
+            write_text(tw, segment);
         }
     }
 
@@ -747,7 +743,7 @@ fn write_completion_name(
             break;
         }
         let mut buf = [0u8; 4];
-        tw.write_str(ch.encode_utf8(&mut buf));
+        tw.write_str(crate::line::display_char(ch).encode_utf8(&mut buf));
         written += w;
     }
 
@@ -762,7 +758,7 @@ fn write_completion_name(
         && written < max_width
     {
         let mut buf = [0u8; 4];
-        tw.write_str(ch.encode_utf8(&mut buf));
+        tw.write_str(crate::line::display_char(ch).encode_utf8(&mut buf));
         written += 1;
     }
 
@@ -851,8 +847,8 @@ pub fn render_history_pager_cached(
             if row_key.selected {
                 tw.write_str("\x1b[7m"); // reverse video
             }
-            let text = history.get(m.entry_idx);
-            write_history_row(tw, text, m, layout.max_width, row_key.selected);
+            let text = history.display(m.entry_idx);
+            write_history_row(tw, &text, m, layout.max_width, row_key.selected);
             if row_key.selected {
                 tw.write_str("\x1b[0m");
             }
@@ -874,7 +870,7 @@ pub fn render_history_pager_cached(
     tw.write_str("\x1b[1m"); // bold
     tw.write_str(prefix);
     tw.write_str("\x1b[0m");
-    tw.write_str(query);
+    write_text(tw, query);
 
     if layout.needs_forced_wrap {
         tw.write_str(" \r");
@@ -899,8 +895,8 @@ pub fn render_history_pager_cached(
             tw.write_str("\x1b[7m"); // reverse video
         }
 
-        let text = history.get(m.entry_idx);
-        write_history_row(tw, text, m, layout.max_width, row_key.selected);
+        let text = history.display(m.entry_idx);
+        write_history_row(tw, &text, m, layout.max_width, row_key.selected);
         if row_key.selected {
             tw.write_str("\x1b[0m");
         }
@@ -984,7 +980,7 @@ pub fn render_dir_picker(
                 }
                 col += w;
                 let mut buf = [0u8; 4];
-                tw.write_str(ch.encode_utf8(&mut buf));
+                tw.write_str(crate::line::display_char(ch).encode_utf8(&mut buf));
             }
         } else {
             for ch in dir.chars() {
@@ -994,7 +990,7 @@ pub fn render_dir_picker(
                 }
                 col += w;
                 let mut buf = [0u8; 4];
-                tw.write_str(ch.encode_utf8(&mut buf));
+                tw.write_str(crate::line::display_char(ch).encode_utf8(&mut buf));
             }
         }
 

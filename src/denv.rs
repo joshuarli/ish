@@ -13,9 +13,25 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+mod sha256;
+
+/// Child-environment variable carrying the `.envrc` bytes that were hashed, so
+/// bash evaluates exactly what was trusted rather than re-reading the path.
+const ENVRC_SOURCE_VAR: &str = "__DENV_ENVRC_SOURCE";
+
+/// Prefix of child-environment variables carrying `.env` values, so values
+/// never become shell script text.
+const DOTENV_VALUE_VAR_PREFIX: &str = "__DENV_DOT_";
+
+/// Upper bound for one bash `.envrc` evaluation. The child holds the terminal
+/// while ish waits, so a hung `.envrc` must fail loudly instead of wedging cd.
+const ENVRC_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 const BASH_STDLIB: &str = include_str!("denv_stdlib.sh");
 
@@ -188,14 +204,30 @@ fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, Stri
     let envrc_mtime = found.envrc.as_ref().map(|(_, m)| *m).unwrap_or(0);
     let dotenv_mtime = found.dotenv.as_ref().map(|(_, m)| *m).unwrap_or(0);
 
-    if let Some((envrc_path, _)) = found.envrc.as_ref()
-        && !is_allowed(envrc_path)
+    // Each file is read once; the trust check and the evaluation below both use
+    // these bytes, so a file swapped after the check cannot run untrusted.
+    let envrc_file = found
+        .envrc
+        .as_ref()
+        .map(|(path, _)| read_trusted_candidate(path))
+        .transpose()?;
+    let dotenv_file = found
+        .dotenv
+        .as_ref()
+        .map(|(path, _)| read_trusted_candidate(path))
+        .transpose()?;
+
+    // `.env` is as powerful as `.envrc` (it can set PATH or LD_*), so it needs
+    // the same trust.
+    if let Some(blocked) = [&envrc_file, &dotenv_file]
+        .into_iter()
+        .flatten()
+        .find(|file| !is_allowed(file))
     {
         let dir = canonicalize_fallback(&found.dir);
-        let envrc = canonicalize_fallback(envrc_path);
         eprintln!(
             "denv: {} is blocked. Run `denv allow` to trust it.",
-            envrc.display()
+            blocked.path.display()
         );
         set_change(
             &mut changes,
@@ -210,7 +242,10 @@ fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, Stri
         return Ok(changes);
     }
 
-    let dotenv_entries = load_dotenv_entries(&found)?;
+    let dotenv_entries = match &dotenv_file {
+        Some(file) => load_dotenv_entries(&file.bytes)?,
+        None => Vec::new(),
+    };
     if found.envrc.is_some() {
         eprintln!("denv: loading .envrc");
     }
@@ -218,15 +253,9 @@ fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, Stri
         eprintln!("denv: loading .env");
     }
 
-    let diff = if found.envrc.is_none() {
-        diff_dotenv_only(&dotenv_entries)
-    } else {
+    let diff = if let Some(envrc_file) = &envrc_file {
         let dir = canonicalize_fallback(&found.dir);
-        let envrc = found
-            .envrc
-            .as_ref()
-            .map(|(path, _)| canonicalize_fallback(path));
-        match eval_env(&dir, envrc.as_deref(), &dotenv_entries, &env_pairs) {
+        match eval_env(&dir, Some(&envrc_file.bytes), &dotenv_entries, &env_pairs) {
             Ok(diff) => diff,
             Err(err) => {
                 let dir = canonicalize_fallback(&found.dir);
@@ -241,6 +270,8 @@ fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, Stri
                 return Ok(changes);
             }
         }
+    } else {
+        diff_dotenv_only(&dotenv_entries)
     };
 
     let prev = capture_prev(&diff);
@@ -278,22 +309,18 @@ fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, Stri
 fn allow_current_dir(epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
     let cwd = current_dir_from_store(epsh);
     let found = find_env_files(&cwd).ok_or("no .envrc or .env found")?;
-    let Some((envrc, _)) = found.envrc else {
-        return Err("no .envrc found".to_string());
-    };
-    let envrc = envrc.canonicalize().unwrap_or(envrc);
-    allow_envrc(&envrc)?;
+    for (path, _) in found.envrc.iter().chain(found.dotenv.iter()) {
+        allow_file(&read_trusted_candidate(path)?)?;
+    }
     refresh(true, epsh)
 }
 
 fn deny_current_dir(epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
     let cwd = current_dir_from_store(epsh);
     let found = find_env_files(&cwd).ok_or("no .envrc or .env found")?;
-    let Some((envrc, _)) = found.envrc else {
-        return Err("no .envrc found".to_string());
-    };
-    let envrc = envrc.canonicalize().unwrap_or(envrc);
-    deny_envrc(&envrc)?;
+    for (path, _) in found.envrc.iter().chain(found.dotenv.iter()) {
+        deny_file(&canonicalize_fallback(path))?;
+    }
     refresh(true, epsh)
 }
 
@@ -425,48 +452,53 @@ fn stat_regular_file_mtime(path: &Path) -> Option<u64> {
         .then_some(st.st_mtime as u64)
 }
 
-fn is_allowed(envrc: &Path) -> bool {
-    let allow_dir = match allow_dir() {
-        Ok(dir) => dir,
-        Err(_) => return false,
-    };
-    let stored = match fs::read_to_string(allow_dir.join(trust_key(envrc))) {
-        Ok(stored) => stored,
-        Err(_) => {
-            let canonical = canonicalize_fallback(envrc);
-            if canonical == envrc {
-                return false;
-            }
-            match fs::read_to_string(allow_dir.join(trust_key(&canonical))) {
-                Ok(stored) => stored,
-                Err(_) => return false,
-            }
-        }
-    };
-    let current = match stat_regular_file_mtime(&canonicalize_fallback(envrc)) {
-        Some(mtime) => mtime,
-        None => return false,
-    };
-    stored.trim().parse::<u64>() == Ok(current)
+/// A `.envrc` or `.env` read once, with the canonical path it was read from
+/// and the hash of exactly those bytes.
+struct TrustCandidate {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    hash: String,
 }
 
-fn allow_envrc(envrc: &Path) -> Result<(), String> {
+fn read_trusted_candidate(path: &Path) -> Result<TrustCandidate, String> {
+    let path = path
+        .canonicalize()
+        .map_err(|e| format!("resolve {}: {e}", path.display()))?;
+    let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let hash = sha256::hex_digest(&bytes);
+    Ok(TrustCandidate { path, bytes, hash })
+}
+
+/// Trust binds the canonical path to the content hash, so touching mtimes or
+/// replacing the file's contents revokes it.
+fn is_allowed(file: &TrustCandidate) -> bool {
+    allow_dir().is_ok_and(|dir| is_allowed_in(&dir, file))
+}
+
+fn is_allowed_in(allow_dir: &Path, file: &TrustCandidate) -> bool {
+    fs::read_to_string(allow_dir.join(trust_key(&file.path)))
+        .is_ok_and(|stored| stored.trim() == file.hash)
+}
+
+fn allow_file(file: &TrustCandidate) -> Result<(), String> {
     let dir = allow_dir()?;
-    fs::create_dir_all(&dir).map_err(|e| format!("failed to create allow dir: {e}"))?;
-    let mtime =
-        stat_regular_file_mtime(envrc).ok_or("failed to read .envrc mtime: not a regular file")?;
-    fs::write(dir.join(trust_key(envrc)), mtime.to_string())
-        .map_err(|e| format!("failed to write trust file: {e}"))?;
-    eprintln!("denv: allowed {}", envrc.display());
+    allow_file_in(&dir, file)?;
+    eprintln!("denv: allowed {}", file.path.display());
     Ok(())
 }
 
-fn deny_envrc(envrc: &Path) -> Result<(), String> {
-    let trust_file = allow_dir()?.join(trust_key(envrc));
+fn allow_file_in(dir: &Path, file: &TrustCandidate) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("failed to create allow dir: {e}"))?;
+    fs::write(dir.join(trust_key(&file.path)), &file.hash)
+        .map_err(|e| format!("failed to write trust file: {e}"))
+}
+
+fn deny_file(path: &Path) -> Result<(), String> {
+    let trust_file = allow_dir()?.join(trust_key(path));
     match fs::remove_file(&trust_file) {
-        Ok(_) => eprintln!("denv: denied {}", envrc.display()),
+        Ok(_) => eprintln!("denv: denied {}", path.display()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            eprintln!("denv: not currently allowed");
+            eprintln!("denv: {} not currently allowed", path.display());
         }
         Err(err) => return Err(format!("failed to remove trust file: {err}")),
     }
@@ -582,15 +614,37 @@ fn clear_active(pid: &str) {
     }
 }
 
-fn load_dotenv_entries(found: &EnvFiles) -> Result<Vec<(String, String)>, String> {
-    let Some((path, _)) = &found.dotenv else {
-        return Ok(Vec::new());
-    };
-    let content = fs::read_to_string(path).map_err(|e| format!("read .env: {e}"))?;
-    Ok(parse_dotenv(&content)
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value.into_owned()))
-        .collect())
+/// Keys the `.env` file may never set: the trust store location and denv's own
+/// bookkeeping.
+fn is_reserved_dotenv_key(key: &str) -> bool {
+    key == "DENV_DATA_DIR" || key.starts_with("__DENV_")
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Parse `.env` bytes, skipping (with a warning) entries that cannot be set
+/// safely: malformed keys, NUL in values, and reserved names.
+fn load_dotenv_entries(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    let content = std::str::from_utf8(bytes).map_err(|e| format!("read .env: {e}"))?;
+    let mut entries = Vec::new();
+    for (key, value) in parse_dotenv(content) {
+        if !is_valid_env_key(key) {
+            eprintln!("denv: .env: skipping invalid variable name {key:?}");
+        } else if is_reserved_dotenv_key(key) {
+            eprintln!("denv: .env: refusing to set {key}");
+        } else if value.contains('\0') {
+            eprintln!("denv: .env: skipping {key}: value contains NUL");
+        } else {
+            entries.push((key.to_string(), value.into_owned()));
+        }
+    }
+    Ok(entries)
 }
 
 fn parse_dotenv(content: &str) -> Vec<(&str, Cow<'_, str>)> {
@@ -661,6 +715,8 @@ fn diff_dotenv_only(dotenv_entries: &[(String, String)]) -> EnvDiff {
 
 fn is_ignored_env_key(key: &str) -> bool {
     matches!(key, "_" | "SHLVL" | "PWD" | "OLDPWD")
+        || key.starts_with(ENVRC_SOURCE_VAR)
+        || key.starts_with(DOTENV_VALUE_VAR_PREFIX)
 }
 
 fn parse_env_null(data: &[u8]) -> Vec<(&str, &str)> {
@@ -723,36 +779,17 @@ fn diff_sorted_env(before: &[(&str, &str)], after: &[(&str, &str)]) -> EnvDiff {
     EnvDiff { set, unset }
 }
 
-fn push_sh_escaped(out: &mut String, value: &str) {
-    out.push('\'');
-    let bytes = value.as_bytes();
-    let mut start = 0;
-    for i in 0..bytes.len() {
-        if bytes[i] == b'\'' {
-            out.push_str(&value[start..i]);
-            out.push_str("'\\''");
-            start = i + 1;
-        }
-    }
-    out.push_str(&value[start..]);
-    out.push('\'');
-}
-
 fn first_line_uses_bash(line: &[u8]) -> bool {
     line.windows(4).any(|window| window == b"bash")
 }
 
-fn envrc_interpreter(envrc: &Path) -> Result<EnvRcInterpreter, String> {
-    let mut file = fs::File::open(envrc).map_err(|e| format!("read {}: {e}", envrc.display()))?;
-    let mut buf = [0_u8; 256];
-    let n = file
-        .read(&mut buf)
-        .map_err(|e| format!("read {}: {e}", envrc.display()))?;
-    let first_line = buf[..n].split(|&b| b == b'\n').next().unwrap_or_default();
+fn envrc_interpreter(source: &[u8]) -> EnvRcInterpreter {
+    let head = &source[..source.len().min(256)];
+    let first_line = head.split(|&b| b == b'\n').next().unwrap_or_default();
     if first_line_uses_bash(first_line) {
-        Ok(EnvRcInterpreter::Bash)
+        EnvRcInterpreter::Bash
     } else {
-        Ok(EnvRcInterpreter::Epsh)
+        EnvRcInterpreter::Epsh
     }
 }
 
@@ -814,25 +851,36 @@ impl Write for SharedStderr {
 
 fn eval_env(
     dir: &Path,
-    envrc: Option<&Path>,
+    envrc_source: Option<&[u8]>,
     dotenv_entries: &[(String, String)],
     env_pairs: &[(OsString, OsString)],
 ) -> Result<EnvDiff, String> {
-    let Some(envrc) = envrc else {
+    let Some(source) = envrc_source else {
         return Ok(diff_dotenv_only(dotenv_entries));
     };
-    match envrc_interpreter(envrc)? {
-        EnvRcInterpreter::Bash => eval_env_bash(dir, envrc, dotenv_entries, env_pairs),
-        EnvRcInterpreter::Epsh => eval_env_epsh(dir, envrc, dotenv_entries, env_pairs),
+    match envrc_interpreter(source) {
+        EnvRcInterpreter::Bash => eval_env_bash(
+            dir,
+            source,
+            dotenv_entries,
+            env_pairs,
+            ENVRC_EVAL_TIMEOUT,
+        ),
+        EnvRcInterpreter::Epsh => eval_env_epsh(dir, source, dotenv_entries, env_pairs),
     }
 }
 
 fn eval_env_bash(
     dir: &Path,
-    envrc: &Path,
+    source: &[u8],
     dotenv_entries: &[(String, String)],
     env_pairs: &[(OsString, OsString)],
+    timeout: Duration,
 ) -> Result<EnvDiff, String> {
+    // An environment variable cannot carry NUL, and bash would truncate there.
+    if source.contains(&0) {
+        return Err(".envrc contains a NUL byte".to_string());
+    }
     let (before_r, before_w) =
         crate::sys::pipe_cloexec().map_err(|e| format!("create before pipe: {e}"))?;
     let (after_r, after_w) =
@@ -858,16 +906,15 @@ fn eval_env_bash(
     let mut script = String::with_capacity(BASH_STDLIB.len() + 256);
     script.push_str(BASH_STDLIB);
     script.push('\n');
-    script.push_str("env -0 >&3\n");
-    script.push_str(". ");
-    push_sh_escaped(&mut script, &envrc.to_string_lossy());
-    script.push('\n');
-    for (key, value) in dotenv_entries {
-        script.push_str("export ");
-        script.push_str(key);
-        script.push('=');
-        push_sh_escaped(&mut script, value);
-        script.push('\n');
+    // Keep the source out of the exported environment seen by the .envrc.
+    script.push_str("__denv_src=$");
+    script.push_str(ENVRC_SOURCE_VAR);
+    script.push_str("\nunset ");
+    script.push_str(ENVRC_SOURCE_VAR);
+    script.push_str("\nenv -0 >&3\neval \"$__denv_src\"\nunset __denv_src\n");
+    // Keys were validated as identifiers; values travel through the environment.
+    for (i, (key, _)) in dotenv_entries.iter().enumerate() {
+        writeln!(script, "export {key}=\"${DOTENV_VALUE_VAR_PREFIX}{i}\"").unwrap();
     }
     script.push_str("env -0 >&4\n");
 
@@ -893,10 +940,17 @@ fn eval_env_bash(
     for (key, value) in env_pairs {
         cmd.env(key, value);
     }
-    // SAFETY: pre_exec runs in the child after fork and before exec. We only
-    // dup the dedicated pipe fds into 3/4 for the shell snapshot script.
+    cmd.env(ENVRC_SOURCE_VAR, OsStr::from_bytes(source));
+    for (i, (_, value)) in dotenv_entries.iter().enumerate() {
+        cmd.env(format!("{DOTENV_VALUE_VAR_PREFIX}{i}"), value);
+    }
+    // SAFETY: pre_exec runs in the child after fork and before exec. We reset
+    // signal dispositions (ish ignores SIGINT, which exec would otherwise
+    // preserve, making the .envrc uninterruptible) and dup the dedicated pipe
+    // fds into 3/4 for the shell snapshot script.
     unsafe {
         cmd.pre_exec(move || {
+            crate::signal::restore_defaults();
             let mut before_target = OwnedFd::from_raw_fd(3);
             rustix::io::dup2(&before_src, &mut before_target).map_err(io::Error::from)?;
             std::mem::forget(before_target);
@@ -906,7 +960,7 @@ fn eval_env_bash(
             Ok(())
         });
     }
-    let status = cmd
+    let mut child = cmd
         .arg("-e")
         .arg("-c")
         .arg(&script)
@@ -918,11 +972,30 @@ fn eval_env_bash(
                 .try_clone_to_owned()
                 .map_err(|e| format!("dup stderr for child: {e}"))?,
         )
-        .status()
+        .spawn()
         .map_err(|e| format!("failed to run bash: {e}"))?;
     drop(cmd);
     drop(before_w);
     drop(after_w);
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                // Reader threads are left detached: a grandchild may still hold
+                // the pipe write ends open.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    ".envrc evaluation timed out after {}s",
+                    timeout.as_secs_f32()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => return Err(format!("wait for bash: {e}")),
+        }
+    };
 
     let before_data = before_read
         .join()
@@ -944,10 +1017,11 @@ fn eval_env_bash(
 
 fn eval_env_epsh(
     dir: &Path,
-    envrc: &Path,
+    source: &[u8],
     dotenv_entries: &[(String, String)],
     env_pairs: &[(OsString, OsString)],
 ) -> Result<EnvDiff, String> {
+    let source = std::str::from_utf8(source).map_err(|e| format!(".envrc is not UTF-8: {e}"))?;
     let process_before = capture_process_env();
     restore_process_env(env_pairs);
     let before_process = env_pairs.to_vec();
@@ -961,20 +1035,27 @@ fn eval_env_epsh(
     let mut script = String::with_capacity(BASH_STDLIB.len() + 256);
     script.push_str(BASH_STDLIB);
     script.push('\n');
-    script.push_str(". ");
-    push_sh_escaped(&mut script, &envrc.to_string_lossy());
+    script.push_str(source);
     script.push('\n');
-    for (key, value) in dotenv_entries {
-        script.push_str("export ");
-        script.push_str(key);
-        script.push('=');
-        push_sh_escaped(&mut script, value);
-        script.push('\n');
-    }
 
     let status = shell.run_script(&script);
+    // Applied through the variable store, never as script text.
+    let mut dotenv_failed = None;
+    if status == 0 {
+        let vars = shell.vars_mut();
+        for (key, value) in dotenv_entries {
+            if let Err(err) = vars.set(key, value) {
+                dotenv_failed = Some(format!("set {key} from .env: {err:?}"));
+                break;
+            }
+            vars.export(key);
+        }
+    }
     let after_process = shell.vars().exported_env();
     restore_process_env(&process_before);
+    if let Some(err) = dotenv_failed {
+        return Err(err);
+    }
 
     if status != 0 {
         return Err(".envrc evaluation failed".to_string());
@@ -1178,13 +1259,6 @@ mod tests {
     }
 
     #[test]
-    fn push_sh_escaped_handles_single_quotes() {
-        let mut out = String::new();
-        push_sh_escaped(&mut out, "it's here");
-        assert_eq!(out, "'it'\\''s here'");
-    }
-
-    #[test]
     fn parse_denv_state_supports_spaces_in_dir() {
         let parsed = parse_denv_state("1 2 /tmp/path with spaces").unwrap();
         assert_eq!(parsed.0, 1);
@@ -1210,12 +1284,11 @@ mod tests {
         let tmp = TempDir::new("ish_denv_epsh_eval");
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let envrc = project.join(".envrc");
-        std::fs::write(&envrc, "#!/bin/sh\nexport DENV_EPSH_TEST=ok\n").unwrap();
+        let source: &[u8] = b"#!/bin/sh\nexport DENV_EPSH_TEST=ok\n";
 
         let epsh = epsh::eval::Shell::new();
         let env_pairs = epsh.vars().env_for_command_os(&[]);
-        let diff = eval_env(&project, Some(&envrc), &[], &env_pairs).unwrap();
+        let diff = eval_env(&project, Some(source), &[], &env_pairs).unwrap();
         assert!(
             diff.set
                 .iter()
@@ -1228,17 +1301,13 @@ mod tests {
         let tmp = TempDir::new("ish_denv_bash_env");
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let envrc = project.join(".envrc");
-        std::fs::write(
-            &envrc,
-            "#!/usr/bin/env bash\nif [ -n \"${DENV_AMBIENT_ONLY+x}\" ]; then export DENV_LEAK=1; fi\n",
-        )
-        .unwrap();
+        let source: &[u8] =
+            b"#!/usr/bin/env bash\nif [ -n \"${DENV_AMBIENT_ONLY+x}\" ]; then export DENV_LEAK=1; fi\n";
 
         unsafe { std::env::set_var("DENV_AMBIENT_ONLY", "ambient") };
         let epsh = epsh::eval::Shell::builder().env_clear().build();
         let env_pairs = epsh.vars().env_for_command_os(&[]);
-        let diff = eval_env(&project, Some(&envrc), &[], &env_pairs).unwrap();
+        let diff = eval_env(&project, Some(source), &[], &env_pairs).unwrap();
         assert!(!diff.set.iter().any(|(key, _)| key == "DENV_LEAK"));
         unsafe { std::env::remove_var("DENV_AMBIENT_ONLY") };
     }
@@ -1248,17 +1317,12 @@ mod tests {
         let tmp = TempDir::new("ish_denv_epsh_restore");
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let envrc = project.join(".envrc");
-        std::fs::write(
-            &envrc,
-            "#!/bin/sh\nexport DENV_TMP_SHOULD_ROLLBACK=1\nfalse\n",
-        )
-        .unwrap();
+        let source: &[u8] = b"#!/bin/sh\nexport DENV_TMP_SHOULD_ROLLBACK=1\nfalse\n";
 
         crate::shell_unsetenv("DENV_TMP_SHOULD_ROLLBACK");
         let epsh = epsh::eval::Shell::new();
         let env_pairs = epsh.vars().env_for_command_os(&[]);
-        let err = match eval_env_epsh(&project, &envrc, &[], &env_pairs) {
+        let err = match eval_env_epsh(&project, source, &[], &env_pairs) {
             Ok(_) => panic!("expected epsh envrc evaluation to fail"),
             Err(err) => err,
         };
@@ -1323,5 +1387,93 @@ mod tests {
         unsafe {
             std::env::remove_var("__DENV_STATE");
         }
+    }
+
+    #[test]
+    fn dotenv_rejects_injection_keys_nul_and_reserved_names() {
+        let entries = load_dotenv_entries(
+            b"A;touch X;B=1\nGOOD=ok\nBAD=a\0b\nDENV_DATA_DIR=/x\n__DENV_STATE=1\n1X=2\n",
+        )
+        .unwrap();
+        assert_eq!(entries, vec![("GOOD".to_string(), "ok".to_string())]);
+    }
+
+    #[test]
+    fn dotenv_values_reach_bash_as_data_not_script() {
+        let tmp = TempDir::new("ish_denv_dotenv_data");
+        let marker = tmp.path().join("marker");
+        let value = format!("it's \"q\" $(touch {}) `x`\nline2", marker.display());
+        let entries = vec![("DENV_DOTENV_VALUE".to_string(), value.clone())];
+        let epsh = epsh::eval::Shell::builder().env_clear().build();
+        let env_pairs = epsh.vars().env_for_command_os(&[]);
+        let diff = eval_env_bash(
+            tmp.path(),
+            b"#!/usr/bin/env bash\n:\n",
+            &entries,
+            &env_pairs,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(diff.set, vec![("DENV_DOTENV_VALUE".to_string(), value)]);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn dotenv_values_reach_epsh_as_data_not_script() {
+        let tmp = TempDir::new("ish_denv_dotenv_epsh");
+        let marker = tmp.path().join("marker");
+        let value = format!("it's $(touch {}) `x`", marker.display());
+        let entries = vec![("DENV_DOTENV_VALUE".to_string(), value.clone())];
+        let epsh = epsh::eval::Shell::new();
+        let env_pairs = epsh.vars().env_for_command_os(&[]);
+        let diff = eval_env_epsh(tmp.path(), b"#!/bin/sh\n:\n", &entries, &env_pairs).unwrap();
+        assert!(diff.set.contains(&("DENV_DOTENV_VALUE".to_string(), value)));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn bash_envrc_evaluation_times_out() {
+        let tmp = TempDir::new("ish_denv_timeout");
+        let epsh = epsh::eval::Shell::new();
+        let env_pairs = epsh.vars().env_for_command_os(&[]);
+        let start = Instant::now();
+        let err = match eval_env_bash(
+            tmp.path(),
+            b"#!/usr/bin/env bash\nexec sleep 30\n",
+            &[],
+            &env_pairs,
+            Duration::from_millis(300),
+        ) {
+            Ok(_) => panic!("expected timeout"),
+            Err(err) => err,
+        };
+        assert!(err.contains("timed out"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn trust_binds_content_hash_not_mtime() {
+        let tmp = TempDir::new("ish_denv_trust");
+        let data = tmp.path().join("data");
+        let file = tmp.path().join(".env");
+        std::fs::write(&file, "A=1\n").unwrap();
+        // The process environment is shared with tests that rewrite it, so
+        // the allow directory is passed explicitly.
+        let allow = data.join("allow");
+
+        let before = read_trusted_candidate(&file).unwrap();
+        assert!(!is_allowed_in(&allow, &before));
+        allow_file_in(&allow, &before).unwrap();
+        assert!(is_allowed_in(&allow, &read_trusted_candidate(&file).unwrap()));
+
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, "A=2\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert!(!is_allowed_in(&allow, &read_trusted_candidate(&file).unwrap()));
     }
 }

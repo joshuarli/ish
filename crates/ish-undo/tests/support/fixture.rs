@@ -15,7 +15,7 @@ use std::sync::atomic::AtomicBool;
 
 use ish_undo::cli;
 use ish_undo::testing::{fault, resolve};
-use ish_undo::{Config, Io, RedirMode, Session, mv, open_redirect, rm};
+use ish_undo::{Config, Io, RedirMode, RedirOutcome, Session, mv, open_redirect, rm};
 
 fn usage() -> ! {
     eprintln!(
@@ -162,16 +162,16 @@ fn shell(args: &[String], config: Config) -> i32 {
                 };
                 let path = resolve(&cwd, &raw(path));
                 match open_redirect(&txn, &path, mode, &cancel) {
-                    Some(Ok(fd)) => {
+                    RedirOutcome::Protected(fd) => {
                         let mut f = std::fs::File::from(fd);
                         f.write_all(data.as_bytes()).unwrap();
                         0
                     }
-                    Some(Err(e)) => {
+                    RedirOutcome::Refused(e) => {
                         eprintln!("redirect: {}: {e}", path.display());
                         1
                     }
-                    None => {
+                    RedirOutcome::NotApplicable => {
                         let mut f = std::fs::OpenOptions::new()
                             .append(true)
                             .create(true)

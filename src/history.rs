@@ -28,6 +28,10 @@ fn new_session_id() -> u64 {
     nanos ^ (rustix::process::getpid().as_raw_pid() as u64).wrapping_shl(32)
 }
 
+/// Ranking key: (text tier or last-use time for an empty query, directory
+/// proximity, usage bonus, usage time, latest occurrence id).
+type RankKey = (u64, usize, u32, u64, i64);
+
 #[derive(Default)]
 struct Usage {
     count: u64,
@@ -63,13 +67,27 @@ impl History {
     }
 
     pub fn load_from_home(home: Option<&std::ffi::OsStr>) -> io::Result<Self> {
-        Self::load_from(history_path_for_home(home))
+        Self::load_from(history_path_for_home(home)?)
     }
 
     pub fn load_from(path: PathBuf) -> io::Result<Self> {
         let mut history = Self::empty();
         history.store = Some(store::Store::open(&path)?);
-        history.sync()?;
+        if let Err(error) = history.sync() {
+            // A damaged record must not keep the shell from starting. Keep
+            // the valid prefix and preserve the rest in a separate file.
+            if !store::is_frame_corruption(&error) {
+                return Err(error);
+            }
+            let store = history.store.as_mut().expect("store was just opened");
+            let salvage = store.salvage()?;
+            eprintln!(
+                "ish: history log damaged ({error}); kept {} bytes and moved the rest to {}",
+                salvage.kept,
+                salvage.moved_to.display()
+            );
+            history.sync()?;
+        }
         for (&id, &idx) in &history.latest_occurrences {
             history.session.insert(id, idx);
             history.usages[idx].session_occurrence_id = Some(id);
@@ -169,13 +187,6 @@ impl History {
         self.last_id = 0;
     }
 
-    pub fn compact(&mut self) -> io::Result<()> {
-        if let Some(store) = self.store.as_mut() {
-            store.compact()?;
-        }
-        self.sync()
-    }
-
     pub fn reset(&mut self) -> io::Result<()> {
         let generation = match self.store.as_mut() {
             Some(store) => store.reset()?,
@@ -188,16 +199,21 @@ impl History {
 
     /// Create an isolated history without filesystem access for tests and benchmarks.
     pub fn from_entries(entries: Vec<String>) -> Self {
+        Self::from_entries_in_dirs(entries.into_iter().map(|command| (command, None)))
+    }
+
+    /// Like `from_entries`, recording the directory each command ran in.
+    pub fn from_entries_in_dirs(entries: impl IntoIterator<Item = (String, Option<PathBuf>)>) -> Self {
         let mut history = Self::empty();
         let timestamp = now_millis();
-        for (i, command) in entries.into_iter().enumerate() {
+        for (i, (command, cwd)) in entries.into_iter().enumerate() {
             let id = i as i64 + 1;
             let idx = history.apply_occurrence(store::Occurrence {
                 id,
                 command,
                 timestamp,
                 session_id: 0,
-                cwd: None,
+                cwd,
             });
             history.remember_session(idx, id);
         }
@@ -211,9 +227,9 @@ impl History {
 
     /// Persist each use before updating the local search and recall snapshots.
     pub fn add_in_dir(&mut self, line: &str, cwd: Option<&Path>) -> io::Result<()> {
-        let line = line.trim().replace('\n', " ");
-        let line = line.trim();
-        if line.is_empty() {
+        // Stored verbatim: recalling an entry must run what originally ran,
+        // including multi-line input. Display code flattens it instead.
+        if line.trim().is_empty() {
             return Ok(());
         }
         let occurrence = store::Occurrence {
@@ -295,78 +311,11 @@ impl History {
         out.extend(self.latest_occurrences.values().rev().copied());
     }
 
-    /// Text quality precedes directory context. Bounded usage and age bonuses
-    /// break ties within that context; old popularity cannot dominate forever.
-    pub fn fuzzy_search(&self, query: &str) -> Vec<FuzzyMatch> {
-        self.fuzzy_search_scored(query, "")
-    }
-
-    pub fn fuzzy_search_scored(&self, query: &str, cwd: &str) -> Vec<FuzzyMatch> {
-        self.search_all(query, (!cwd.is_empty()).then(|| Path::new(cwd)))
-    }
-
-    pub fn fuzzy_search_in_dir(&self, query: &str, cwd: &Path) -> Vec<FuzzyMatch> {
-        self.search_all(query, Some(cwd))
-    }
-
-    fn search_all(&self, query: &str, cwd: Option<&Path>) -> Vec<FuzzyMatch> {
-        let mut results = Vec::new();
-        let matcher = PreparedQuery::new(query);
-        for idx in 0..self.len() {
-            if let Some(result) = matcher.classify(self.get(idx), idx) {
-                results.push(result);
-            }
-        }
-        let now = now_millis();
-        results.sort_unstable_by(|a, b| self.compare(a, b, cwd, query.is_empty(), now));
-        results
-    }
-
-    pub fn fuzzy_search_into(
-        &self,
-        query: &str,
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-        cwd: &str,
-    ) {
-        self.search_limited(
-            query,
-            None,
-            None,
-            results,
-            limit,
-            (!cwd.is_empty()).then(|| Path::new(cwd)),
-        );
-    }
-
-    pub fn fuzzy_search_into_in_dir(
-        &self,
-        query: &str,
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-        cwd: &Path,
-    ) {
-        self.search_limited(query, None, None, results, limit, Some(cwd));
-    }
-
-    pub fn fuzzy_search_subset_into(
-        &self,
-        query: &str,
-        candidates: &[usize],
-        matched_indices: &mut Vec<usize>,
-        results: &mut Vec<FuzzyMatch>,
-        limit: usize,
-    ) {
-        self.search_limited(
-            query,
-            Some(candidates),
-            Some(matched_indices),
-            results,
-            limit,
-            None,
-        );
-    }
-
+    /// Ctrl+R search: keep the best `limit` matches of `query` among
+    /// `candidates`, and report every matching candidate in `matched` so the
+    /// next keystroke can refine within it. Text quality precedes directory
+    /// context. Bounded usage and age bonuses break ties within that context;
+    /// old popularity cannot dominate forever.
     pub fn fuzzy_search_subset_into_in_dir(
         &self,
         query: &str,
@@ -386,6 +335,20 @@ impl History {
         );
     }
 
+    /// Convenience over the production search path for callers without a
+    /// candidate subset or scratch buffers.
+    pub fn fuzzy_search(&self, query: &str) -> Vec<FuzzyMatch> {
+        let mut results = Vec::new();
+        self.search_limited(query, None, None, &mut results, self.len(), None);
+        results
+    }
+
+    pub fn fuzzy_search_in_dir(&self, query: &str, cwd: &Path) -> Vec<FuzzyMatch> {
+        let mut results = Vec::new();
+        self.search_limited(query, None, None, &mut results, self.len(), Some(cwd));
+        results
+    }
+
     fn search_limited(
         &self,
         query: &str,
@@ -400,6 +363,8 @@ impl History {
             matched.clear();
         }
         let now = now_millis();
+        let empty = query.is_empty();
+        let mut keys: Vec<RankKey> = Vec::with_capacity(limit.min(self.len()) + 1);
         let mut ascii = [0u8; 32];
         let is_ascii = query.is_ascii() && query.len() <= ascii.len();
         for (slot, byte) in ascii.iter_mut().zip(query.bytes()) {
@@ -432,18 +397,49 @@ impl History {
             if limit == 0 {
                 continue;
             }
-            let position = results
-                .binary_search_by(|existing| {
-                    self.compare(existing, &result, cwd, query.is_empty(), now)
-                })
-                .unwrap_or_else(|position| position);
-            if position < limit {
-                results.insert(position, result);
-                if results.len() > limit {
-                    results.pop();
-                }
+            let primary = if empty {
+                self.timestamp(idx)
+            } else {
+                result.score as u64
+            };
+            // The text tier alone rejects most candidates once the result
+            // list is full, before any directory lookup.
+            if keys.len() == limit && keys.last().is_some_and(|worst| primary < worst.0) {
+                continue;
             }
+            let key = self.rank_key(idx, primary, empty, cwd, now);
+            if keys.len() == limit && keys.last().is_some_and(|worst| key <= *worst) {
+                continue;
+            }
+            let position = keys.partition_point(|existing| *existing > key);
+            if keys.len() == limit {
+                keys.pop();
+                results.pop();
+            }
+            keys.insert(position, key);
+            results.insert(position, result);
         }
+    }
+
+    /// Larger is better. Each candidate's directory score is computed once, so
+    /// ordering never repeats the ancestor walk per comparison.
+    fn rank_key(
+        &self,
+        idx: usize,
+        primary: u64,
+        empty: bool,
+        cwd: Option<&Path>,
+        now: u64,
+    ) -> RankKey {
+        let (context, usage) = self.context_usage(idx, cwd);
+        let bonus = if empty { 0 } else { usage_bonus(usage, now) };
+        (
+            primary,
+            context,
+            bonus,
+            usage.timestamp,
+            self.usages[idx].latest_id,
+        )
     }
 
     fn context_usage(&self, idx: usize, cwd: Option<&Path>) -> (usize, &Usage) {
@@ -459,44 +455,9 @@ impl History {
         (0, &usage.total)
     }
 
-    fn compare(
-        &self,
-        a: &FuzzyMatch,
-        b: &FuzzyMatch,
-        cwd: Option<&Path>,
-        empty: bool,
-        now: u64,
-    ) -> std::cmp::Ordering {
-        if empty {
-            let timestamps = self
-                .timestamp(b.entry_idx)
-                .cmp(&self.timestamp(a.entry_idx));
-            if !timestamps.is_eq() {
-                return timestamps;
-            }
-        } else {
-            let tiers = b.score.cmp(&a.score);
-            if !tiers.is_eq() {
-                return tiers;
-            }
-        }
-        let (a_context, a_usage) = self.context_usage(a.entry_idx, cwd);
-        let (b_context, b_usage) = self.context_usage(b.entry_idx, cwd);
-        b_context
-            .cmp(&a_context)
-            .then_with(|| {
-                if empty {
-                    std::cmp::Ordering::Equal
-                } else {
-                    usage_bonus(b_usage, now).cmp(&usage_bonus(a_usage, now))
-                }
-            })
-            .then_with(|| b_usage.timestamp.cmp(&a_usage.timestamp))
-            .then_with(|| {
-                self.usages[b.entry_idx]
-                    .latest_id
-                    .cmp(&self.usages[a.entry_idx].latest_id)
-            })
+    /// Single-row form of entry `idx` for the pager and `history` output.
+    pub fn display(&self, idx: usize) -> std::borrow::Cow<'_, str> {
+        display_line(self.get(idx))
     }
 
     pub fn get(&self, idx: usize) -> &str {
@@ -532,12 +493,35 @@ pub fn render_history_log(path: &Path) -> io::Result<String> {
     store::render(path)
 }
 
-fn history_path_for_home(home: Option<&std::ffi::OsStr>) -> PathBuf {
-    if let Some(home) = home {
-        PathBuf::from(home).join(".local/share/ish/history")
-    } else {
-        PathBuf::from("/tmp/ish_history")
+/// History holds typed secrets, so it never falls back to a shared or
+/// launch-relative location: without a usable HOME the shell cannot start.
+fn history_path_for_home(home: Option<&std::ffi::OsStr>) -> io::Result<PathBuf> {
+    match home {
+        Some(home) if !home.is_empty() => Ok(PathBuf::from(home).join(".local/share/ish/history")),
+        _ => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "HOME is unset or empty; cannot locate the history log",
+        )),
     }
+}
+
+/// A command as one terminal row. History keeps commands verbatim, so
+/// multi-line input and control characters are replaced one char for one char
+/// (match positions stay valid) only when shown.
+pub fn display_line(command: &str) -> std::borrow::Cow<'_, str> {
+    if !command.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(command);
+    }
+    std::borrow::Cow::Owned(
+        command
+            .chars()
+            .map(|c| match c {
+                '\n' => '\u{21b5}',
+                c if c.is_control() => '\u{fffd}',
+                c => c,
+            })
+            .collect(),
+    )
 }
 
 /// Lowercase a query using Unicode character semantics.
@@ -557,42 +541,6 @@ pub struct FuzzyMatch {
     /// Match tier. Higher = stronger literal match.
     /// 3 = prefix, 2 = boundary substring, 1 = substring, 0 = subsequence fallback.
     pub score: i16,
-}
-
-/// A lowercased query prepared once per search. ASCII queries also keep their
-/// bytes, so ASCII entries (nearly all history) are classified without char
-/// decoding. Entries with non-ASCII text keep the char path: it compares
-/// Unicode-lowercased chars and reports char positions, which byte matching
-/// would change.
-struct PreparedQuery {
-    chars: Vec<char>,
-    ascii: Option<([u8; 32], usize)>,
-}
-
-impl PreparedQuery {
-    fn new(query: &str) -> Self {
-        let chars = lowercase_query(query);
-        let ascii = (query.is_ascii() && query.len() <= 32).then(|| {
-            let mut bytes = [0u8; 32];
-            for (slot, byte) in bytes.iter_mut().zip(query.bytes()) {
-                *slot = byte.to_ascii_lowercase();
-            }
-            (bytes, query.len())
-        });
-        Self { chars, ascii }
-    }
-
-    fn classify(&self, text: &str, entry_idx: usize) -> Option<FuzzyMatch> {
-        if self.chars.is_empty() {
-            return Some(contiguous_match(entry_idx, 0, 0, 0));
-        }
-        match &self.ascii {
-            Some((bytes, len)) if text.is_ascii() => {
-                classify_match_ascii(&bytes[..*len], text, entry_idx)
-            }
-            _ => classify_match(&self.chars, text, entry_idx),
-        }
-    }
 }
 
 fn classify_match(query: &[char], text: &str, entry_idx: usize) -> Option<FuzzyMatch> {
@@ -864,17 +812,16 @@ fn zero_byte_mask(word: u64) -> u64 {
 fn find_either_byte(haystack: &[u8], first: u8, second: u8) -> Option<usize> {
     let first_word = u64::from(first) * BYTE_WORD_ONES;
     let second_word = u64::from(second) * BYTE_WORD_ONES;
-    let mut words = haystack.chunks_exact(8);
-    for (index, chunk) in (&mut words).enumerate() {
-        let word = u64::from_le_bytes(chunk.try_into().unwrap());
+    let (words, remainder) = haystack.as_chunks::<8>();
+    for (index, chunk) in words.iter().enumerate() {
+        let word = u64::from_le_bytes(*chunk);
         let matches = zero_byte_mask(word ^ first_word) | zero_byte_mask(word ^ second_word);
         if matches != 0 {
             return Some(index * 8 + matches.trailing_zeros() as usize / 8);
         }
     }
-    let offset = haystack.len() - words.remainder().len();
-    words
-        .remainder()
+    let offset = haystack.len() - remainder.len();
+    remainder
         .iter()
         .position(|&byte| byte == first || byte == second)
         .map(|index| offset + index)
@@ -1203,43 +1150,6 @@ mod tests {
     }
 
     #[test]
-    fn prepared_query_classifies_like_the_char_path() {
-        let ascii = b"abcAB0 -/_.";
-        let mut state = 0xd1b5_4a32_d192_ed03_u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state as usize
-        };
-        let check = |query: &str, text: &str| {
-            let chars = lowercase_query(query);
-            let expected = classify_match(&chars, text, 7);
-            let actual = PreparedQuery::new(query).classify(text, 7);
-            assert_eq!(
-                actual.map(|m| (m.entry_idx, m.score, m.match_positions, m.match_count)),
-                expected.map(|m| (m.entry_idx, m.score, m.match_positions, m.match_count)),
-                "query {query:?} text {text:?}",
-            );
-        };
-        for width in 0..=40 {
-            for _ in 0..200 {
-                let text: String = (0..width)
-                    .map(|_| ascii[next() % ascii.len()] as char)
-                    .collect();
-                let query: String = (0..1 + next() % 5)
-                    .map(|_| ascii[next() % 8] as char)
-                    .collect();
-                check(&query, &text);
-            }
-        }
-        // Non-ASCII entries must keep char semantics: Kelvin sign lowercases to
-        // `k`, and positions count chars rather than bytes.
-        check("k", "\u{212a}elvin");
-        check("ca", "é cafe");
-    }
-
-    #[test]
     fn subsequence_no_match() {
         let q: Vec<char> = "xyz".chars().collect();
         assert!(subsequence_match(&q, "hello").is_none());
@@ -1248,7 +1158,7 @@ mod tests {
     #[test]
     fn history_path_uses_non_utf8_home() {
         let raw = OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xf0, 0x80, 0x80, b'h']);
-        let path = history_path_for_home(Some(raw.as_os_str()));
+        let path = history_path_for_home(Some(raw.as_os_str())).unwrap();
         assert_eq!(path, PathBuf::from(raw).join(".local/share/ish/history"));
     }
 
@@ -1290,7 +1200,16 @@ mod tests {
         entries.extend((0..220).map(|i| format!("c-x-{i}-a-x-r-x-g-x-o")));
         let h = History::from_entries(entries);
         let mut results = Vec::new();
-        h.fuzzy_search_into("cargo", &mut results, 200, "ish");
+        let mut candidates = Vec::new();
+        h.search_entry_indices_into(&mut candidates);
+        h.fuzzy_search_subset_into_in_dir(
+            "cargo",
+            &candidates,
+            &mut Vec::new(),
+            &mut results,
+            200,
+            Path::new("ish"),
+        );
         assert_eq!(h.get(results[0].entry_idx), "cargo build");
         assert!(results.iter().any(|m| h.get(m.entry_idx) == "cargo build"));
     }

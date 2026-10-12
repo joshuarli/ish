@@ -7,6 +7,18 @@ pub struct Job {
     pub undo: Option<crate::undo::JobUndo>,
 }
 
+/// Give a stopped process group the foreground, restore the terminal settings
+/// it left behind, and continue it.
+///
+/// Restoring the settings is critical for programs like vim/less that set raw
+/// mode: without it they would resume with the shell's terminal settings.
+pub fn continue_in_foreground(pgid: rustix::process::Pid, termios: &crate::term::Termios) {
+    let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
+    let _ = rustix::termios::tcsetpgrp(stdin, pgid);
+    let _ = rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Drain, termios);
+    let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::CONT);
+}
+
 /// Resume a suspended job in the foreground.
 /// Returns exit status (148 if stopped again) and, when the job finished, its
 /// recovery work so the caller can seal it.
@@ -25,14 +37,9 @@ pub fn resume_job(job: &mut Option<Job>) -> (i32, Option<crate::undo::JobUndo>) 
         Some(pgid) => pgid,
         None => return (1, j.undo),
     };
-    // Give the job the foreground and restore its terminal settings.
-    // This is critical for programs like vim/less that set raw mode —
-    // without this, they'd resume with the shell's terminal settings.
-    let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
-    let _ = rustix::termios::tcsetpgrp(stdin, pgid);
-    let _ = rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Drain, &j.termios);
-    let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::CONT);
+    continue_in_foreground(pgid, &j.termios);
 
+    let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
     // Wait for the job, detecting if it stops again
     let result = rustix::process::waitpgid(pgid, rustix::process::WaitOptions::UNTRACED);
 

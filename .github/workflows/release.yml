@@ -63,6 +63,12 @@ jobs:
       - name: Build macOS release
         if: matrix.docker_platform == ''
         run: make release TARGET="${{ matrix.target }}"
+      - name: Mount second filesystem for undo tests
+        if: matrix.docker_platform == ''
+        run: |
+          dev=$(hdiutil attach -nomount ram://131072 | tr -d '[:space:]')
+          diskutil erasevolume HFS+ ishvol "$dev"
+          echo "ISH_UNDO_TEST_VOLUME=/Volumes/ishvol" >> "$GITHUB_ENV"
       - name: Run macOS tests
         if: matrix.docker_platform == ''
         run: make test-ci TARGET="${{ matrix.target }}"
@@ -74,6 +80,9 @@ jobs:
         run: |
           docker run --rm --init \
             --platform "${{ matrix.docker_platform }}" \
+            --tmpfs /ish-vol \
+            -e ISH_UNDO_TEST_VOLUME=/ish-vol \
+            -e CI \
             -v "$GITHUB_WORKSPACE:/ish" \
             -w /ish \
             ish-builder:${{ matrix.target }} \
@@ -84,6 +93,7 @@ jobs:
               cp target/${{ matrix.target }}/release/ish ish-${{ matrix.target }}
               make release TARGET=${{ matrix.target }}
               make verify-release TARGET=${{ matrix.target }}
+              make test-ci TARGET=${{ matrix.target }}
               cp target/${{ matrix.target }}/release/ish ish-${{ matrix.target }}-static
             '
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -74,6 +74,9 @@ impl Prompt {
         if pwd != self.pwd_last {
             self.pwd_short.clear();
             shorten_pwd_into(pwd, &self.home, &mut self.pwd_short);
+            if self.pwd_short.chars().any(char::is_control) {
+                self.pwd_short = self.pwd_short.chars().map(crate::line::display_char).collect();
+            }
             self.pwd_last.clear();
             self.pwd_last.push_str(pwd);
         }
@@ -293,8 +296,25 @@ fn read_head_into(head_path: &Path, out: &mut String) -> bool {
     if branch.is_empty() {
         return false;
     }
-    out.push_str(branch);
+    // HEAD comes from the checkout, not the user: a control character in it
+    // would reach the terminal as an escape sequence.
+    out.extend(branch.chars().map(crate::line::display_char));
     true
+}
+
+/// Append `bytes` percent-encoded byte-wise: only URI unreserved bytes (and
+/// `/` when `keep_slash`) pass through.
+pub fn push_percent_encoded(out: &mut String, bytes: &[u8], keep_slash: bool) {
+    for &b in bytes {
+        if b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'.' | b'_' | b'~')
+            || (keep_slash && b == b'/')
+        {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
 }
 
 fn hostname() -> String {
@@ -337,6 +357,36 @@ mod tests {
     #[test]
     fn pwd_outside_home() {
         assert_eq!(shorten_pwd("/var/log/syslog", "/home/u"), "/v/l/syslog");
+    }
+
+    #[test]
+    fn prompt_neutralizes_control_characters() {
+        let mut prompt = Prompt::with_identity("u", "/home/u");
+        let pwd = "/tmp/a\x1b]52;c;aGk=\x07b";
+        let out = prompt.render_with_state(0, pwd, false);
+        assert!(!out.contains('\x07'));
+        assert!(!out.contains("\x1b]"));
+    }
+
+    #[test]
+    fn head_with_escape_is_sanitized() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".work/tmp")
+            .join(format!("head-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = dir.join("HEAD");
+        std::fs::write(&head, "ref: refs/heads/main\x1b]52;c;aGk=\x07\x1b[2J").unwrap();
+        let mut out = String::new();
+        assert!(read_head_into(&head, &mut out));
+        assert!(!out.chars().any(char::is_control));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn osc7_path_is_percent_encoded_bytewise() {
+        let mut out = String::new();
+        push_percent_encoded(&mut out, "/a b\x07\u{e9}".as_bytes(), true);
+        assert_eq!(out, "/a%20b%07%C3%A9");
     }
 
     #[test]

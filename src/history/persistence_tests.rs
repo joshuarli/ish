@@ -39,60 +39,31 @@ fn record(timestamp: u64, command: &str) -> String {
     format!(":ish-history:v2\t{timestamp}\t7\t/work/project\t{command}\n")
 }
 
-fn cache_fixture(version: u8, commands: &[&str], timestamps: &[u64]) -> Vec<u8> {
+fn cache_fixture(commands: &[&str], timestamps: &[u64]) -> Vec<u8> {
     const EPOCH: u64 = 883_612_800_000;
-    let arena: String = if version <= 2 {
-        commands.concat()
-    } else {
-        commands
-            .iter()
-            .map(|command| format!("{command}\0"))
-            .collect()
-    };
+    let arena: String = commands
+        .iter()
+        .map(|command| format!("{command}\0"))
+        .collect();
     let cwd_arena: String = commands.iter().map(|_| "/cached\0").collect();
-    let mut bytes = vec![b'I', b'S', b'H', version];
-    if version <= 2 {
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-    }
+    let mut bytes = b"ISH\x05".to_vec();
     bytes.extend_from_slice(&(commands.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&(arena.len() as u32).to_le_bytes());
-    if version == 5 {
-        bytes.extend_from_slice(&(cwd_arena.len() as u32).to_le_bytes());
-    }
-    if version <= 2 {
-        for _ in commands {
-            bytes.extend_from_slice(&0u64.to_le_bytes());
-        }
-    }
+    bytes.extend_from_slice(&(cwd_arena.len() as u32).to_le_bytes());
     for &timestamp in timestamps {
-        match version {
-            1 => {}
-            2 => bytes.extend_from_slice(&((timestamp / 1000) as u32).to_le_bytes()),
-            3 => bytes.extend_from_slice(&(((timestamp - EPOCH) / 1000) as u32).to_le_bytes()),
-            _ => bytes.extend_from_slice(&timestamp.wrapping_sub(EPOCH).to_le_bytes()),
-        }
-    }
-    if version <= 2 {
-        let mut start = 0u32;
-        for command in commands {
-            bytes.extend_from_slice(&start.to_le_bytes());
-            bytes.extend_from_slice(&(command.len() as u16).to_le_bytes());
-            start += command.len() as u32;
-        }
+        bytes.extend_from_slice(&timestamp.wrapping_sub(EPOCH).to_le_bytes());
     }
     bytes.extend_from_slice(arena.as_bytes());
-    if version == 5 {
-        bytes.extend_from_slice(cwd_arena.as_bytes());
-    }
+    bytes.extend_from_slice(cwd_arena.as_bytes());
     bytes
 }
 
 #[test]
-fn migrates_every_cache_version_without_changing_originals() {
-    for version in 1..=5 {
+fn migrates_cache_without_changing_originals() {
+    {
         let fixture = Fixture::new();
         let timestamp = 1_700_000_000_000;
-        let bytes = cache_fixture(version, &["cached", "repeated"], &[timestamp, timestamp]);
+        let bytes = cache_fixture(&["cached", "repeated"], &[timestamp, timestamp]);
         let text = record(timestamp + 1000, "repeated") + &record(timestamp + 2000, "repeated");
         fs::write(legacy::cache_path(&fixture.path()), &bytes).unwrap();
         fs::write(fixture.path(), &text).unwrap();
@@ -124,7 +95,7 @@ fn migrates_every_cache_version_without_changing_originals() {
 fn migration_prefers_newest_metadata_and_does_not_double_count_flush_copy() {
     let fixture = Fixture::new();
     let timestamp = 1_700_000_000_000;
-    let bytes = cache_fixture(5, &["same", "newer-cache"], &[timestamp, timestamp + 2000]);
+    let bytes = cache_fixture(&["same", "newer-cache"], &[timestamp, timestamp + 2000]);
     fs::write(legacy::cache_path(&fixture.path()), bytes).unwrap();
     fs::write(
         fixture.path(),
@@ -167,19 +138,26 @@ fn migration_corruption_rolls_back_and_retry_imports_once() {
 }
 
 #[test]
-fn malformed_structured_text_and_utf8_offsets_are_reported() {
+fn malformed_structured_text_and_cache_are_reported() {
     let fixture = Fixture::new();
-    for text in [b":ish-history:v2\tbad\n".as_slice(), &[0xff, b'\n']] {
-        fs::write(fixture.path(), text).unwrap();
-        assert!(History::load_from(fixture.path()).is_err());
-    }
+    fs::write(fixture.path(), b":ish-history:v2\tbad\n").unwrap();
+    assert!(History::load_from(fixture.path()).is_err());
     fs::write(fixture.path(), "okay\n").unwrap();
-    let mut bytes = cache_fixture(1, &["é"], &[0]);
-    // The cache offset starts in the middle of a UTF-8 code point.
-    bytes[28..32].copy_from_slice(&1u32.to_le_bytes());
-    bytes[32..34].copy_from_slice(&1u16.to_le_bytes());
+    let mut bytes = cache_fixture(&["cached"], &[0]);
+    // The command arena is not valid UTF-8.
+    let arena = bytes.len() - "cached\0/cached\0".len();
+    bytes[arena] = 0xff;
     fs::write(legacy::cache_path(&fixture.path()), bytes).unwrap();
     assert!(History::load_from(fixture.path()).is_err());
+}
+
+#[test]
+fn non_utf8_legacy_text_does_not_abort_import() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path(), b"echo ok\necho \xff\n").unwrap();
+    let history = History::load_from(fixture.path()).unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history.get(1), "echo \u{fffd}");
 }
 
 #[test]
@@ -254,7 +232,6 @@ fn reset_invalidates_stale_sessions_before_their_next_append() {
     resetting.sync().unwrap();
     assert_eq!(resetting.len(), 1);
     assert_eq!(resetting.session_get(0), None);
-    resetting.compact().unwrap();
     assert_eq!(fixture.occurrences(), 1);
     assert_eq!(fs::read(fixture.path()).unwrap(), b"legacy\n");
     let reopened = History::load_from(fixture.path()).unwrap();
@@ -305,7 +282,16 @@ fn cwd_bytes_and_full_unicode_commands_round_trip() {
         [70_001, 70_002, 70_003, 70_004, 70_005, 70_006]
     );
     let mut limited = Vec::new();
-    loaded.fuzzy_search_into("target", &mut limited, 1, "");
+    let mut candidates = Vec::new();
+    loaded.search_entry_indices_into(&mut candidates);
+    loaded.fuzzy_search_subset_into_in_dir(
+        "target",
+        &candidates,
+        &mut Vec::new(),
+        &mut limited,
+        1,
+        Path::new("/"),
+    );
     assert_eq!(limited[0].match_positions, matches[0].match_positions);
 }
 
@@ -393,15 +379,6 @@ fn unsupported_or_corrupt_log_headers_are_preserved() {
 }
 
 #[test]
-fn sqlite_history_requires_explicit_conversion() {
-    let fixture = Fixture::new();
-    fs::write(fixture.0.join("history.sqlite3"), b"SQLite format 3\0").unwrap();
-    let error = History::load_from(fixture.path()).err().unwrap();
-    assert!(error.to_string().contains("scripts/migrate-sqlite-history"));
-    assert!(!store::storage_path(&fixture.path()).exists());
-}
-
-#[test]
 fn incomplete_final_frames_recover_the_valid_prefix() {
     for tail in [vec![1, 2, 3], {
         let length = 100u64.to_le_bytes();
@@ -430,19 +407,130 @@ fn incomplete_final_frames_recover_the_valid_prefix() {
     }
 }
 
+fn two_frame_log(fixture: &Fixture) -> (PathBuf, Vec<u8>, usize) {
+    let mut history = History::load_from(fixture.path()).unwrap();
+    history.add_in_dir("first", None).unwrap();
+    let path = store::storage_path(&fixture.path());
+    let first_end = fs::read(&path).unwrap().len();
+    history.add_in_dir("second", None).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    (path, bytes, first_end)
+}
+
 #[test]
-fn complete_frame_corruption_is_reported_without_truncation() {
-    for offset in [16, 24, 28, 32, 64] {
+fn damaged_final_frame_is_a_torn_tail() {
+    // Payload bytes, then the stored checksum: all mismatch at EOF.
+    for offset in [12, 16, 24, 28, 32, 40] {
+        let fixture = Fixture::new();
+        let (path, mut bytes, first_end) = two_frame_log(&fixture);
+        bytes[first_end + offset] ^= 0x80;
+        fs::write(&path, &bytes).unwrap();
+        let history = History::load_from(fixture.path()).unwrap();
+        assert_eq!(history.len(), 1, "offset {offset}");
+        assert_eq!(history.get(0), "first");
+        assert_eq!(fs::read(&path).unwrap().len(), first_end);
+    }
+}
+
+#[test]
+fn zero_fill_after_the_last_frame_is_a_torn_tail() {
+    for fill in [1usize, 15, 16, 64, 20_000] {
+        let fixture = Fixture::new();
+        let (path, mut bytes, _) = two_frame_log(&fixture);
+        let valid = bytes.len();
+        bytes.resize(valid + fill, 0);
+        fs::write(&path, &bytes).unwrap();
+        let mut history = History::load_from(fixture.path()).unwrap();
+        assert_eq!(history.len(), 2, "fill {fill}");
+        assert_eq!(fs::read(&path).unwrap().len(), valid);
+        history.add_in_dir("third", None).unwrap();
+        assert_eq!(fixture.occurrences(), 3);
+    }
+}
+
+#[test]
+fn damage_before_the_last_frame_is_salvaged_loudly() {
+    for offset in [12, 16, 24, 28, 32, 40] {
         let fixture = Fixture::new();
         let mut history = History::load_from(fixture.path()).unwrap();
-        history.add_in_dir("saved", None).unwrap();
+        history.add_in_dir("first", None).unwrap();
+        let first_end = fs::read(store::storage_path(&fixture.path())).unwrap().len();
+        history.add_in_dir("second", None).unwrap();
+        history.add_in_dir("third", None).unwrap();
         let path = store::storage_path(&fixture.path());
         let mut bytes = fs::read(&path).unwrap();
-        bytes[offset] ^= 0x80;
+        bytes[first_end + offset] ^= 0x80;
         fs::write(&path, &bytes).unwrap();
-        assert!(History::load_from(fixture.path()).is_err());
-        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let reopened = History::load_from(fixture.path()).unwrap();
+        assert_eq!(reopened.len(), 1, "offset {offset}");
+        assert_eq!(reopened.get(0), "first");
+        assert_eq!(fs::read(&path).unwrap().len(), first_end);
+        let moved: Vec<_> = fs::read_dir(&fixture.0)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("history.log.corrupt-")
+            })
+            .collect();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(
+            fs::read(moved[0].path()).unwrap(),
+            bytes[first_end..],
+            "the discarded remainder is preserved"
+        );
     }
+}
+
+#[test]
+fn reset_works_on_a_log_with_damaged_records_or_header() {
+    let fixture = Fixture::new();
+    let (path, mut bytes, first_end) = two_frame_log(&fixture);
+    let mut history = History::load_from(fixture.path()).unwrap();
+    bytes[16 + 12] ^= 0x80;
+    fs::write(&path, &bytes).unwrap();
+    history.reset().unwrap();
+    assert_eq!(fixture.occurrences(), 0);
+    assert_eq!(History::load_from(fixture.path()).unwrap().len(), 0);
+    let _ = first_end;
+
+    fs::write(&path, b"not a history log at all").unwrap();
+    history.reset().unwrap();
+    assert_eq!(fixture.occurrences(), 0);
+    let kept = fs::read_dir(&fixture.0)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("history.log.corrupt-")
+        })
+        .count();
+    assert_eq!(kept, 1);
+}
+
+#[test]
+fn commands_are_stored_verbatim_and_display_on_one_row() {
+    let fixture = Fixture::new();
+    let mut history = History::load_from(fixture.path()).unwrap();
+    history.add_in_dir("rm -rf build\nls", None).unwrap();
+    history.add_in_dir("echo a \\\nb", None).unwrap();
+    drop(history);
+    let reopened = History::load_from(fixture.path()).unwrap();
+    assert_eq!(reopened.get(0), "rm -rf build\nls");
+    assert_eq!(reopened.get(1), "echo a \\\nb");
+    assert_eq!(reopened.display(0), "rm -rf build\u{21b5}ls");
+    assert_eq!(display_line("plain"), "plain");
+}
+
+#[test]
+fn history_path_requires_a_home() {
+    assert!(history_path_for_home(None).is_err());
+    assert!(history_path_for_home(Some(std::ffi::OsStr::new(""))).is_err());
 }
 
 #[test]
@@ -462,29 +550,6 @@ fn failed_append_retains_unseen_records_for_retry() {
     let snapshot = local.snapshot(0, 0).unwrap();
     assert_eq!(snapshot.occurrences.len(), 1);
     assert_eq!(snapshot.occurrences[0].command, "foreign");
-}
-
-#[test]
-fn compact_preserves_ids_and_stale_session_recall() {
-    let fixture = Fixture::new();
-    let mut local = History::load_from(fixture.path()).unwrap();
-    local.add_in_dir("local", None).unwrap();
-    let mut other = History::load_from(fixture.path()).unwrap();
-    other.add_in_dir("foreign", None).unwrap();
-    let before = fs::read(store::storage_path(&fixture.path())).unwrap();
-    other.compact().unwrap();
-    assert_eq!(other.session_get(0), Some("foreign"));
-    assert_eq!(other.session_get(1), Some("local"));
-    assert_eq!(
-        fs::read(store::storage_path(&fixture.path())).unwrap(),
-        before
-    );
-    local.sync().unwrap();
-    assert_eq!(local.frequency(0), 1);
-    assert_eq!(local.session_get(0), Some("local"));
-    assert_eq!(local.session_get(1), None);
-    local.add_in_dir("next", None).unwrap();
-    assert_eq!(fixture.occurrences(), 3);
 }
 
 #[test]
@@ -705,7 +770,15 @@ fn subset_preserves_every_match_and_matches_full_top_k_on_refinement() {
     history.search_entry_indices_into(&mut candidates);
     let mut matches = Vec::new();
     let mut results = Vec::new();
-    history.fuzzy_search_subset_into("cargo", &candidates, &mut matches, &mut results, 200);
+    let cwd = Path::new("/");
+    history.fuzzy_search_subset_into_in_dir(
+        "cargo",
+        &candidates,
+        &mut matches,
+        &mut results,
+        200,
+        cwd,
+    );
     assert_eq!(matches.len(), 351);
     let full = history.fuzzy_search("cargo");
     assert_eq!(
@@ -720,7 +793,14 @@ fn subset_preserves_every_match_and_matches_full_top_k_on_refinement() {
     );
     assert_eq!(history.get(results[0].entry_idx), "cargo older special");
     let mut refined = Vec::new();
-    history.fuzzy_search_subset_into("cargo older", &matches, &mut refined, &mut results, 200);
+    history.fuzzy_search_subset_into_in_dir(
+        "cargo older",
+        &matches,
+        &mut refined,
+        &mut results,
+        200,
+        cwd,
+    );
     assert_eq!(refined.len(), 1);
     assert_eq!(history.get(results[0].entry_idx), "cargo older special");
 }
@@ -766,7 +846,16 @@ fn context_lookup_does_not_scan_historical_directories() {
     }
     let started = std::time::Instant::now();
     let mut results = Vec::new();
-    history.fuzzy_search_into_in_dir("cargo", &mut results, 200, Path::new("/work/src"));
+    let mut candidates = Vec::new();
+    history.search_entry_indices_into(&mut candidates);
+    history.fuzzy_search_subset_into_in_dir(
+        "cargo",
+        &candidates,
+        &mut Vec::new(),
+        &mut results,
+        200,
+        Path::new("/work/src"),
+    );
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     assert_eq!(history.get(results[0].entry_idx), "cargo popular");
 }
@@ -779,7 +868,7 @@ fn startup_and_incremental_sync_merge_large_overlapping_uses_promptly() {
     let timestamps = vec![1_700_000_000_000; refs.len()];
     fs::write(
         legacy::cache_path(&fixture.path()),
-        cache_fixture(5, &refs, &timestamps),
+        cache_fixture(&refs, &timestamps),
     )
     .unwrap();
     let text: String = commands

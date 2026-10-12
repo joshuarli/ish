@@ -280,6 +280,13 @@ impl Session {
     /// Start the transaction for an accepted input.
     pub fn begin(&mut self, home_root: PathBuf, config: Config, cwd: &Path, command: &str) -> Txn {
         self.generation += 1;
+        // Take the liveness lock before anything is recorded when the store
+        // already exists, so a transaction allocated by a forked child never
+        // reads as interrupted while this shell lives. On the very first use
+        // the store does not exist yet; the pid check covers that window.
+        if let Err(e) = self.hold_lock(&home_root) {
+            eprintln!("ish: undo: could not take the session lock: {e}");
+        }
         let mut slot = self.next_slot;
         for _ in 0..SLOTS {
             if !self.reserved[slot] {
@@ -308,22 +315,25 @@ impl Session {
         }
     }
 
-    /// Hold the session liveness lock once this shell has recorded
-    /// something, so other shells can tell an active transaction from an
-    /// interrupted one.
-    pub fn hold_lock(&mut self, home_root: &Path) {
+    /// Hold the session liveness lock, so other shells can tell an active
+    /// transaction from an interrupted one. Does nothing while the store does
+    /// not exist yet.
+    pub fn hold_lock(&mut self, home_root: &Path) -> io::Result<()> {
         if self.lock.is_none()
-            && let Ok(Some(home)) = Home::open_existing(home_root)
+            && let Some(home) = Home::open_existing(home_root)?
         {
-            self.lock = store::hold_session_lock(&home, self.id).ok();
+            self.lock = Some(store::hold_session_lock(&home, self.id)?);
         }
+        Ok(())
     }
 
     /// The foreground job stopped: keep the transaction active.
     pub fn suspend(&mut self, txn: Txn) -> Suspended {
         self.reserved[txn.slot] = true;
-        if txn.allocated_id().is_some() {
-            self.hold_lock(&txn.home_root.clone());
+        if txn.allocated_id().is_some()
+            && let Err(e) = self.hold_lock(&txn.home_root.clone())
+        {
+            eprintln!("ish: undo: could not take the session lock: {e}");
         }
         Suspended { txn }
     }
@@ -333,7 +343,9 @@ impl Session {
     pub fn finish(&mut self, txn: Txn, status: i32) -> Option<u64> {
         self.reserved[txn.slot] = false;
         let id = txn.allocated_id()?;
-        self.hold_lock(&txn.home_root);
+        if let Err(e) = self.hold_lock(&txn.home_root) {
+            eprintln!("ish: undo: could not take the session lock: {e}");
+        }
         if let Err(e) = seal(&txn.home_root, id, status, txn.opaque_count(), &txn.config) {
             eprintln!("ish: undo: could not seal transaction {id}: {e}");
         }

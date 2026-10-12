@@ -65,29 +65,28 @@ records before execution. Storage errors are reported. An interrupted command
 or abruptly killed shell does not need a clean exit to save its accepted
 input. The bare `l` command is excluded from history.
 
-The versioned log stores length-prefixed, checksummed records. An incomplete
-final write is removed on recovery; corruption in a complete record is reported
-without discarding history. Sessions read only newly appended records.
+The versioned log stores length-prefixed, checksummed records. Commands are
+stored verbatim, including newlines; the history list and pager show them on
+one row with newlines drawn as `↵`. A final record that is incomplete, fails
+its checksum at the end of the file, or is followed only by zero bytes is
+treated as an interrupted write and removed. If a record in the middle of the
+log is damaged, startup keeps the valid prefix, moves the rest to
+`history.log.corrupt-*`, and says so. Sessions read only newly appended
+records.
 
-The first start imports the old `history` text file and `history.bin` cache
-without modifying them. Import happens once. Restart old ish instances after
-upgrading: they still write to the old files, and those later writes are not
-imported into the new log. The legacy `scripts/import-fish-history` helper
-must run before migration; it refuses to write after migration.
-
-If you used the short-lived SQLite history build, close those ish sessions
-and run `scripts/migrate-sqlite-history` before starting this build. This
-one-time tool uses Python's standard library to preserve every occurrence,
-timestamp, session, and raw directory name in the new log. It leaves the
-SQLite database untouched and refuses to overwrite an existing log. The
-shell itself has no SQLite dependency and does not launch the migration tool.
+The first start imports the old `history` text file and the final `history.bin`
+cache format without modifying them. Import happens once. Restart old ish
+instances after upgrading: they still write to the old files, and those later
+writes are not imported into the new log. The legacy
+`scripts/import-fish-history` helper must run before the first start; it
+refuses to write once the log exists.
 
 `history reset` atomically replaces the log and invalidates history in other
-running ish shells. Preserved legacy import files remain untouched.
-`history compact` validates and atomically rewrites the log, preserving every
-occurrence and session recall. The old cache-specific `history rebuild`
-subcommand has been removed. Storage subcommands require a standalone command;
-plain `history` can be redirected or used in a pipeline.
+running ish shells. It reads only the log header, so it also works on a log
+with damaged records; a log with an unreadable header is moved to
+`history.log.corrupt-*`. Preserved legacy import files remain untouched.
+Storage subcommands require a standalone command; plain `history` can be
+redirected or used in a pipeline.
 
 Run `history -h` for the available history storage commands.
 
@@ -99,7 +98,7 @@ Run `history -h` for the available history storage commands.
 | First word | Builtins, aliases, `PATH` commands, directories |
 | After `cd ` | Directories only |
 | After `undo ` | `undo` subcommands |
-| After `ssh`/`scp`/`rsync`/`sftp`/`mosh` | Hosts from `~/.ssh/config` and `known_hosts`; `host:path` lists remote files over `ssh` |
+| After `ssh`/`scp`/`rsync`/`sftp`/`mosh` | Hosts from `~/.ssh/config` and `known_hosts`, beside local files (no remote path completion) |
 | `$` prefix | Environment variables |
 | Everything else | Files and directories; fish-style partial paths (`sr/m` finds `src/main.rs`) |
 
@@ -158,12 +157,12 @@ Expansion order: tilde, parameter expansion, command substitution, pathname expa
 | `c` | Clear screen |
 | `w` / `which` / `type` | Locate command |
 | `z [query]` | Jump to the best-scoring directory from `cd`/`z` history (frecency); no args goes home |
-| `history [compact\|reset]` | Print history; storage subcommands above |
+| `history [reset]` | Print history; storage subcommands above |
 | `echo [args]` | Print arguments |
 | `pwd` | Print working directory |
 | `true` / `false` | Return 0 / 1 |
 | `copy-scrollback` | Copy session to clipboard via OSC 52 |
-| `ish-dump` | Write the current layout state to `~/.cache/ish/dump-<random hex>` (same as Ctrl+P) |
+| `ish-dump` | Write the current layout state to `~/.cache/ish/dump-<random hex>` (same as Ctrl+P). The dump is mode 0600 in a 0700 directory and holds geometry and lengths, not typed text |
 | `rm [-f \| -i] [-rRv] [--] file...` | Protected native removal (see [Undo](#undo)) |
 | `mv [-f \| -i \| -n] [-v] [--] source... target` | Protected native move |
 | `undo ...` | Revert, reapply, inspect, and manage recorded changes |
@@ -193,11 +192,11 @@ Aliases expand inline when you press space. `w`/`which`/`type` check aliases fir
 
 ### Job Control
 
-Ctrl+Z suspends the foreground job. `fg` resumes it. One job slot — simple and intentional. Shell warns before exiting with a suspended job (exit again to force).
+Ctrl+Z suspends the foreground job. `fg` resumes that process and waits for it. One job slot — simple and intentional: while a job is suspended, Ctrl+Z on another command is refused and the command keeps running. The rest of a list the suspended command belonged to (`a && b`, `a; b`) is dropped; `fg` does not run it. The shell warns before exiting with a suspended job (exit again to force). SIGTERM and SIGHUP restore the terminal, end the suspended job, and exit with status 128 plus the signal number once the shell is back at the prompt; a panic restores the terminal before aborting.
 
 ### denv Integration
 
-Native `.envrc`/`.env` loading, implemented in `src/denv.rs` (no external `denv` binary). Runs on every `cd` with a fast-path check (file mtimes vs the recorded state) that skips re-evaluation when nothing changed. A trusted `.envrc` whose first line mentions `bash` is evaluated by spawning `bash`; otherwise it is evaluated in-process. `denv allow`, `denv deny`, `denv reload` work as expected.
+Native `.envrc`/`.env` loading, implemented in `src/denv.rs` (no external `denv` binary). Runs on every `cd` with a fast-path check (file mtimes vs the recorded state) that skips re-evaluation when nothing changed. A trusted `.envrc` whose first line mentions `bash` is evaluated by spawning `bash`; otherwise it is evaluated in-process. Both `.envrc` and `.env` must be trusted with `denv allow` before anything is loaded; `denv allow` and `denv deny` cover both files, and if either is untrusted neither loads. Trust is bound to the file's canonical path and a SHA-256 of its content, so editing a file revokes trust (even if its mtime is preserved), and allows recorded by earlier versions must be granted again. `.envrc` evaluation is stopped after 60 seconds. `denv reload` re-evaluates the current directory.
 
 ### Undo
 
@@ -289,12 +288,12 @@ deleted. Retention is set with `set` in `config.ish` or at the prompt:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ISH_UNDO` | `on` | `off` runs `rm`/`mv` as external commands and opens redirections unprotected |
+| `ISH_UNDO` | `on` | `off` runs `rm`/`mv` as external commands and opens redirections unprotected; with `on` and no usable `HOME`, `rm`, `mv`, and writable redirections fail |
 | `ISH_UNDO_COPY_LIMIT` | `64M` | bytes one operation may copy when cloning is unavailable |
 | `ISH_UNDO_MAX_SIZE` | `8G` | logical size of retained versions |
 | `ISH_UNDO_MAX_ENTRIES` | `500` | retained transactions |
 | `ISH_UNDO_MAX_DAYS` | `30` | age limit |
-| `ISH_UNDO_MIN_FREE` | `1G` | free space to leave when copying; collection also runs while free space is below it |
+| `ISH_UNDO_MIN_FREE` | `1G` | free space to leave when copying; collection also deletes the oldest completed transactions (never the newest) while free space is below it; interrupted transactions are collected only once past `ISH_UNDO_MAX_DAYS` |
 
 Collection runs at most hourly after a command that recorded something, or
 on `undo gc`, oldest first. It never collects active or interrupted
@@ -348,18 +347,20 @@ alias gs git status
 alias .. "cd .."
 ```
 
-Two directives: `set` and `alias`. Variables expand in values. Comments with `#`. An `init.sh` beside `config.ish` is also run through epsh after the config is read.
+Two directives: `set` and `alias`. Variables expand in values. Comments with `#`. Every bad line is reported with its line number and the rest of the file still loads. `init.sh` is not run; if one sits beside `config.ish`, ish says so at startup.
 
 ## Non-Features (by Design)
 
-Every omission is deliberate. No scripting engine means no code injection, no `source`-based exploits, no eval chains. No `if`/`for`/`while`/functions means no control flow to hijack. No `${VAR}` brace expansion means no expansion-based attacks. One suspended job (no `&` backgrounding) means no resource exhaustion through job spawning. No plugins means no supply chain.
+Every omission is deliberate. No scripting engine means no code injection, no `source`-based exploits, no eval chains. No `if`/`for`/`while`/functions means no control flow to hijack. No `${VAR}` parameter operators means no expansion-based attacks. One suspended job (no `&` backgrounding) means no resource exhaustion through job spawning. No plugins means no supply chain.
 
-The result: the shell has a small, auditable interactive command evaluator. If you can't `source` it, you can't trick a user into `source`-ing it.
+The result: the shell has a small, auditable interactive command evaluator. If you can't `source` it, you can't trick a user into `source`-ing it. The subset is enforced, not just documented: a line that uses background `&`, a compound command, a function definition, `source`/`.`/`eval`, or a parameter operator is refused with an error before anything runs.
+
+Builtins that read or change shell state (`alias`, `exit`, `fg`, `z`, `w`/`which`/`type`, `denv`, `copy-scrollback`, `ish-dump`) must be the only command on their line; in a list or pipeline they are refused with an error instead of running in a child or being skipped. `cd` and `history` work in lists too.
 
 - No scripting. `ish script.sh` prints an error.
 - No POSIX compliance.
-- No `source`, no `eval`, no `${VAR}` brace expansion.
-- No `if`/`for`/`while`/functions.
+- No `source`, no `eval`, no `${VAR:-x}`-style parameter operators (plain `${VAR}` is the same as `$VAR`).
+- No `if`/`for`/`while`/`case`, subshells, brace groups, or functions.
 - No plugins, no prompt customization, no themes.
 - No background jobs (`&`). One suspended job only.
 

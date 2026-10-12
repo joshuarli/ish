@@ -102,15 +102,6 @@ impl Store {
         match fs::metadata(&path) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match fs::metadata(suffixed_path(legacy_path, ".sqlite3")) {
-                    Ok(_) => {
-                        return Err(io::Error::other(
-                            "SQLite history exists; run scripts/migrate-sqlite-history before opening ish",
-                        ));
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
                 let mut occurrences = legacy::read(legacy_path)?;
                 for (index, occurrence) in occurrences.iter_mut().enumerate() {
                     occurrence.id = i64::try_from(index)
@@ -175,37 +166,108 @@ impl Store {
         Ok((snapshot, id))
     }
 
+    /// Replace the log with an empty one. Only the header is consulted, so
+    /// reset still works when records are damaged. A file with an unreadable
+    /// header is kept aside rather than destroyed.
     pub fn reset(&mut self) -> io::Result<i64> {
         let _lock = lock(&self.path)?;
         let mut file = open_file(&self.path, rustix::fs::OFlags::RDWR)?;
-        let mut cursor = Cursor::default();
-        let snapshot = read_snapshot(&mut file, &mut cursor, -1, 0)?;
-        let generation = snapshot
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| invalid("generation exhausted"))?;
+        let generation = match read_header(&mut file) {
+            Ok(current) => current
+                .checked_add(1)
+                .ok_or_else(|| invalid("generation exhausted"))?,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                let aside = corrupt_path(&self.path);
+                fs::rename(&self.path, &aside)?;
+                // Other shells hold an older generation; a time-derived one
+                // cannot collide with a small counter.
+                i64::try_from(super::now_millis()).map_err(|_| invalid("clock out of range"))?
+            }
+            Err(error) => return Err(error),
+        };
+        drop(file);
         replace(&self.path, generation, &[])?;
         self.cursor = Cursor::default();
         Ok(generation)
     }
 
-    pub fn compact(&mut self) -> io::Result<()> {
+    /// Keep the valid prefix of a log with a damaged record and move the rest
+    /// to a `.corrupt-*` file next to it.
+    pub fn salvage(&mut self) -> io::Result<Salvage> {
         let _lock = lock(&self.path)?;
         let mut file = open_file(&self.path, rustix::fs::OFlags::RDWR)?;
-        let mut cursor = Cursor::default();
-        let snapshot = read_snapshot(&mut file, &mut cursor, -1, 0)?;
-        // Rewriting preserves every occurrence, its id, and its generation;
-        // another shell can keep its recall order and synchronize by id.
-        replace(&self.path, snapshot.generation, &snapshot.occurrences)
+        let kept = match read_snapshot(&mut file, &mut Cursor::default(), -1, 0) {
+            Ok(_) => return Err(invalid("salvage requested but the log is intact")),
+            Err(error) => match error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<FrameCorruption>())
+            {
+                Some(corruption) => corruption.offset,
+                None => return Err(error),
+            },
+        };
+        let moved_to = corrupt_path(&self.path);
+        let mut destination = open_file(
+            &moved_to,
+            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL,
+        )?;
+        file.seek(SeekFrom::Start(kept))?;
+        io::copy(&mut file, &mut destination)?;
+        destination.sync_all()?;
+        file.set_len(kept)?;
+        file.sync_all()?;
+        self.cursor = Cursor::default();
+        Ok(Salvage { kept, moved_to })
     }
 }
 
-fn read_snapshot(
-    file: &mut File,
-    cursor: &mut Cursor,
-    generation: i64,
-    last_id: i64,
-) -> io::Result<Snapshot> {
+pub(super) struct Salvage {
+    pub kept: u64,
+    pub moved_to: PathBuf,
+}
+
+fn corrupt_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    suffixed_path(
+        path,
+        &format!(
+            ".corrupt-{}-{}",
+            super::now_millis(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ),
+    )
+}
+
+/// A record that fails validation at a known offset, as opposed to an I/O
+/// failure or an unusable header.
+#[derive(Debug)]
+struct FrameCorruption {
+    offset: u64,
+    message: &'static str,
+}
+
+impl std::fmt::Display for FrameCorruption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "history log: {} at offset {}", self.message, self.offset)
+    }
+}
+
+impl std::error::Error for FrameCorruption {}
+
+fn corrupt(offset: u64, message: &'static str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        FrameCorruption { offset, message },
+    )
+}
+
+pub(super) fn is_frame_corruption(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<FrameCorruption>())
+}
+
+fn read_header(file: &mut File) -> io::Result<i64> {
     file.seek(SeekFrom::Start(0))?;
     let mut header = [0u8; HEADER_SIZE as usize];
     file.read_exact(&mut header).map_err(|error| {
@@ -222,6 +284,16 @@ fn read_snapshot(
     if current < 0 {
         return Err(invalid("negative generation"));
     }
+    Ok(current)
+}
+
+fn read_snapshot(
+    file: &mut File,
+    cursor: &mut Cursor,
+    generation: i64,
+    last_id: i64,
+) -> io::Result<Snapshot> {
+    let current = read_header(file)?;
     let metadata = file.metadata()?;
     let identity = (metadata.dev(), metadata.ino());
     if cursor.identity != Some(identity)
@@ -263,10 +335,15 @@ fn read_snapshot(
         let length = u64::from_le_bytes(length_bytes);
         let length_crc = u32::from_le_bytes(frame_header[8..12].try_into().unwrap());
         if crc32(&length_bytes) != length_crc {
-            return Err(invalid("frame length checksum mismatch"));
+            // A size-extended torn write leaves zero fill, not a frame.
+            if frame_header.iter().all(|&b| b == 0) && rest_is_zero(&mut reader)? {
+                recover_tail(reader.get_ref(), cursor.offset)?;
+                break;
+            }
+            return Err(corrupt(cursor.offset, "frame length checksum mismatch"));
         }
         if length < 32 {
-            return Err(invalid("frame payload is too short"));
+            return Err(corrupt(cursor.offset, "frame payload is too short"));
         }
         let frame_size = FRAME_HEADER_SIZE
             .checked_add(length)
@@ -284,11 +361,21 @@ fn read_snapshot(
         reader.read_exact(&mut payload)?;
         let checksum = u32::from_le_bytes(frame_header[12..].try_into().unwrap());
         if crc32(&payload) != checksum {
-            return Err(invalid("frame payload checksum mismatch"));
+            // A final frame that runs exactly to EOF is a torn write; the
+            // same mismatch before further records is real corruption.
+            if frame_size == remaining {
+                recover_tail(reader.get_ref(), cursor.offset)?;
+                break;
+            }
+            return Err(corrupt(cursor.offset, "frame payload checksum mismatch"));
         }
-        let occurrence = decode(&payload)?;
+        let occurrence =
+            decode(&payload).map_err(|_| corrupt(cursor.offset, "invalid record"))?;
         if occurrence.id <= cursor.last_id {
-            return Err(invalid("occurrence ids are not strictly increasing"));
+            return Err(corrupt(
+                cursor.offset,
+                "occurrence ids are not strictly increasing",
+            ));
         }
         cursor.last_id = occurrence.id;
         cursor.offset = cursor
@@ -303,6 +390,19 @@ fn read_snapshot(
         generation: current,
         occurrences,
     })
+}
+
+fn rest_is_zero(reader: &mut impl Read) -> io::Result<bool> {
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        if chunk[..n].iter().any(|&b| b != 0) {
+            return Ok(false);
+        }
+    }
 }
 
 fn recover_tail(file: &File, offset: u64) -> io::Result<()> {

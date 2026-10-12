@@ -272,16 +272,15 @@ impl LineBuffer {
             Some(i) => i + 1,
             None => return false, // already on first line
         };
-        let col = self.cursor - cur_line_start;
+        let col = str_width(&self.buf[cur_line_start..self.cursor]);
 
         // Find start of previous line
         let prev_line_start = self.buf[..cur_line_start - 1]
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        let prev_line_len = (cur_line_start - 1) - prev_line_start;
-
-        self.cursor = prev_line_start + col.min(prev_line_len);
+        self.cursor =
+            prev_line_start + offset_at_column(&self.buf[prev_line_start..cur_line_start - 1], col);
         true
     }
 
@@ -293,7 +292,7 @@ impl LineBuffer {
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        let col = self.cursor - cur_line_start;
+        let col = str_width(&self.buf[cur_line_start..self.cursor]);
 
         // Find end of current line (\n position)
         let cur_line_end = match self.buf[self.cursor..].find('\n') {
@@ -306,9 +305,8 @@ impl LineBuffer {
             .find('\n')
             .map(|i| next_line_start + i)
             .unwrap_or(self.buf.len());
-        let next_line_len = next_line_end - next_line_start;
-
-        self.cursor = next_line_start + col.min(next_line_len);
+        self.cursor =
+            next_line_start + offset_at_column(&self.buf[next_line_start..next_line_end], col);
         true
     }
 
@@ -438,23 +436,60 @@ impl LineBuffer {
     }
 }
 
-/// Display width of a string in terminal columns.
+/// Byte offset of the first char boundary in `line` whose display column is at
+/// least `col`, or the line length when the line is narrower. Vertical motion
+/// uses display columns because byte offsets can land inside a character.
+fn offset_at_column(line: &str, col: usize) -> usize {
+    let mut width = 0;
+    for (i, c) in line.char_indices() {
+        if width >= col {
+            return i;
+        }
+        width += char_width(c);
+    }
+    line.len()
+}
+
+/// Character drawn for `c`: controls become a visible placeholder so a pasted
+/// tab or escape never reaches the terminal as an instruction.
+pub fn display_char(c: char) -> char {
+    if c.is_control() { '\u{FFFD}' } else { c }
+}
+
+/// Display width of a string in terminal columns. An emoji sequence joined by
+/// ZWJ draws as one glyph, so a character right after a joiner adds nothing.
 pub fn str_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
+    let mut width = 0;
+    let mut after_joiner = false;
+    for c in s.chars() {
+        if !after_joiner {
+            width += char_width(c);
+        }
+        after_joiner = c == '\u{200D}';
+    }
+    width
 }
 
 /// Display width of a character in terminal columns.
 pub fn char_width(c: char) -> usize {
     let cp = c as u32;
     if cp < 0x7F {
-        return if cp >= 0x20 { 1 } else { 0 };
+        return 1;
     }
-    // Control chars, soft hyphen
-    if cp < 0xA0 || cp == 0xAD {
+    // Controls are drawn as a one-column placeholder (see `display_char`).
+    if c.is_control() {
+        return 1;
+    }
+    if cp == 0xAD {
         return 0;
     }
     // Zero-width characters
     if matches!(cp, 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064 | 0xFEFF) {
+        return 0;
+    }
+    // Variation selectors and emoji skin-tone modifiers attach to the
+    // preceding glyph.
+    if matches!(cp, 0xFE00..=0xFE0F | 0x1F3FB..=0x1F3FF) {
         return 0;
     }
     // Combining marks
@@ -556,13 +591,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn emoji_sequences_and_controls_have_terminal_widths() {
+        assert_eq!(str_width("\u{2764}\u{FE0F}"), 2);
+        assert_eq!(str_width("\u{1F44D}\u{1F3FD}"), 2);
+        assert_eq!(str_width("\u{1F468}\u{200D}\u{1F469}"), 2);
+        assert_eq!(str_width("\t"), 1);
+        assert_eq!(display_char('\t'), '\u{FFFD}');
+    }
+
+    #[test]
+    fn vertical_motion_never_lands_inside_a_char() {
+        let mut line = LineBuffer::new();
+        line.set("\u{e9}a\nxyz");
+        line.set_with_cursor("\u{e9}a\nxyz", "\u{e9}a\nx".len());
+        assert!(line.move_line_up());
+        assert!(line.text().is_char_boundary(line.cursor()));
+        line.move_line_down();
+        assert!(line.text().is_char_boundary(line.cursor()));
+    }
+
+    #[test]
     fn char_widths() {
         // ASCII
         assert_eq!(char_width('a'), 1);
         assert_eq!(char_width(' '), 1);
         // Control
-        assert_eq!(char_width('\0'), 0);
-        assert_eq!(char_width('\x1b'), 0);
+        assert_eq!(char_width('\0'), 1);
+        assert_eq!(char_width('\x1b'), 1);
         // Fullwidth
         assert_eq!(char_width('｜'), 2); // U+FF5C fullwidth vertical bar
         assert_eq!(char_width('Ａ'), 2); // U+FF21 fullwidth A

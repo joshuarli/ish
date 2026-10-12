@@ -17,7 +17,7 @@ use std::sync::atomic::AtomicBool;
 use epsh::error::ExitStatus;
 use epsh::shell_bytes::ShellBytes;
 use ish_undo::cli;
-use ish_undo::{Config, Session, Suspended, Txn};
+use ish_undo::{Config, RedirOutcome, Session, Suspended, Txn};
 
 /// Set by the SIGINT handler while a native builtin runs.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -25,6 +25,9 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 struct State {
     session: Option<Session>,
     current: Option<Txn>,
+    /// Protection is on but HOME gives no store location, so native `rm`,
+    /// `mv`, and writable redirections must refuse rather than run unprotected.
+    home_missing: bool,
     warnings: String,
 }
 
@@ -33,6 +36,7 @@ thread_local! {
         RefCell::new(State {
             session: None,
             current: None,
+            home_missing: false,
             warnings: String::new(),
         })
     };
@@ -69,8 +73,10 @@ pub fn begin(epsh: &epsh::eval::Shell, command: &str) {
         state.warnings = warnings;
         let Some(root) = home_root(epsh) else {
             state.current = None;
+            state.home_missing = config.enabled;
             return;
         };
+        state.home_missing = false;
         let session = state.session.get_or_insert_with(Session::new);
         let txn = session.begin(root, config, epsh.cwd(), command);
         state.current = Some(txn);
@@ -154,7 +160,7 @@ pub fn dispatch(
     args: &[ShellBytes],
     is_main: bool,
 ) -> Option<epsh::error::Result<ExitStatus>> {
-    if !matches!(name, "rm" | "mv" | "undo") {
+    if !crate::builtin::is_undo_builtin(name) {
         return None;
     }
     let cwd = epsh::eval::external_command_cwd()
@@ -165,8 +171,9 @@ pub fn dispatch(
         let state = state.borrow();
         let txn = state.current.as_ref();
         if name != "undo" && !txn.is_some_and(|t| t.config.enabled) {
-            if txn.is_none() {
-                eprintln!("ish: {name}: HOME is not set, so this runs without undo protection");
+            if txn.is_none() && state.home_missing {
+                eprintln!("ish: {name}: HOME is not set, so there is no undo store; set ISH_UNDO=off to run without protection");
+                return Some(Ok(ExitStatus::FAILURE));
             }
             return None;
         }
@@ -220,8 +227,18 @@ pub fn redirect_provider() -> epsh::eval::RedirectOpenHandler {
         };
         STATE.with(|state| {
             let state = state.borrow();
-            let txn = state.current.as_ref()?;
-            ish_undo::open_redirect(txn, request.path, mode, &INTERRUPTED)
+            let Some(txn) = state.current.as_ref() else {
+                return state.home_missing.then(|| {
+                    Err(std::io::Error::other(
+                        "HOME is not set, so there is no undo store; set ISH_UNDO=off to run without protection",
+                    ))
+                });
+            };
+            match ish_undo::open_redirect(txn, request.path, mode, &INTERRUPTED) {
+                RedirOutcome::Protected(fd) => Some(Ok(fd)),
+                RedirOutcome::NotApplicable => None,
+                RedirOutcome::Refused(e) => Some(Err(e)),
+            }
         })
     })
 }

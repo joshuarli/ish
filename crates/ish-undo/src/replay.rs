@@ -1090,8 +1090,10 @@ impl Runner<'_> {
                 displaced,
             },
             Err(e)
-                if e.raw_os_error() == Some(libc::ENOTEMPTY)
-                    || e.raw_os_error() == Some(libc::EEXIST) =>
+                if matches!(
+                    e.raw_os_error().map(rustix::io::Errno::from_raw_os_error),
+                    Some(rustix::io::Errno::NOTEMPTY | rustix::io::Errno::EXIST)
+                ) =>
             {
                 Outcome::Conflict("the directory contains newer data".into())
             }
@@ -1238,7 +1240,7 @@ impl Runner<'_> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 Outcome::Conflict("something newer appeared at the destination".into())
             }
-            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            Err(e) if e.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error()) => {
                 Outcome::Conflict("the paths are now on different filesystems".into())
             }
             Err(e) => Outcome::Failed(sys::describe_error(&e)),

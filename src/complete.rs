@@ -1,4 +1,7 @@
-use std::os::fd::BorrowedFd;
+
+/// Longest entry name the u8 length field can hold. Longer names are dropped
+/// rather than truncated, because a cut could fall inside a character.
+const MAX_ENTRY_NAME_LEN: usize = u8::MAX as usize;
 
 /// Completion entry — mtime + u32 offset + u8 len + u8 display_width + u8 flags.
 /// name_len is u8: NAME_MAX is 255 on Linux/macOS.
@@ -107,12 +110,15 @@ impl Completions {
         is_exec: bool,
         mtime: i64,
     ) {
+        if name.len() > MAX_ENTRY_NAME_LEN {
+            return;
+        }
         let start = self.names.len() as u32;
         self.names.push_str(name);
         self.entries.push(CompletionEntry {
             mtime,
             name_start: start,
-            name_len: name.len().min(255) as u8,
+            name_len: name.len() as u8,
             name_display_width: crate::line::str_width(name).min(255) as u8,
             flags: pack_flags(is_dir, is_link, is_exec),
         });
@@ -138,7 +144,13 @@ impl Completions {
         mtime: i64,
     ) {
         let name = &self.names[start as usize..];
-        let name_len = name.len().min(255) as u8;
+        if name.len() > MAX_ENTRY_NAME_LEN {
+            // A truncated length could end inside a character, so drop the
+            // entry and its arena bytes instead.
+            self.names.truncate(start as usize);
+            return;
+        }
+        let name_len = name.len() as u8;
         let name_display_width = crate::line::str_width(name).min(255) as u8;
         self.entries.push(CompletionEntry {
             mtime,
@@ -384,7 +396,12 @@ pub fn complete_candidates(
     let mut prefix_count = 0usize;
 
     for &(name, is_dir, is_link, is_exec) in entries {
-        if add_candidate(comp, name, is_dir, is_link, is_exec, 0, prefix, dirs_only) {
+        let kind = EntryKind {
+            is_dir,
+            is_link,
+            is_exec,
+        };
+        if add_candidate(comp, name, kind, 0, prefix, dirs_only) {
             prefix_count += 1;
         }
     }
@@ -392,12 +409,17 @@ pub fn complete_candidates(
     finish_candidates(comp, before, prefix, prefix_count);
 }
 
-fn add_candidate(
-    comp: &mut Completions,
-    name: &str,
+#[derive(Clone, Copy)]
+struct EntryKind {
     is_dir: bool,
     is_link: bool,
     is_exec: bool,
+}
+
+fn add_candidate(
+    comp: &mut Completions,
+    name: &str,
+    kind: EntryKind,
     mtime: i64,
     prefix: &str,
     dirs_only: bool,
@@ -411,10 +433,10 @@ fn add_candidate(
     if !is_prefix && (prefix_bytes.is_empty() || !contains_icase(name_bytes, prefix_bytes)) {
         return false;
     }
-    if dirs_only && !is_dir {
+    if (dirs_only && !kind.is_dir) || name.len() > MAX_ENTRY_NAME_LEN {
         return false;
     }
-    comp.push_with_mtime(name, is_dir, is_link, is_exec, mtime);
+    comp.push_with_mtime(name, kind.is_dir, kind.is_link, kind.is_exec, mtime);
     is_prefix
 }
 
@@ -550,16 +572,12 @@ fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completi
             Err(_) => continue,
         };
 
-        if add_candidate(
-            comp,
-            name,
+        let kind = EntryKind {
             is_dir,
             is_link,
             is_exec,
-            st.st_mtime,
-            prefix,
-            dirs_only,
-        ) {
+        };
+        if add_candidate(comp, name, kind, st.st_mtime, prefix, dirs_only) {
             prefix_count += 1;
         }
     }
@@ -868,126 +886,21 @@ pub fn complete_hostnames(prefix: &str, home: &str, comp: &mut Completions) {
     }
 }
 
-/// Complete remote paths via SSH. Runs `ssh -o BatchMode=yes -o ConnectTimeout=2`
-/// to list files on the remote host. Nearly instant when ControlMaster is active.
-/// Returns after at most ~2 seconds.
-///
-/// `env` is the child environment as `K=V` pairs from epsh's variable store —
-/// the child never inherits ish's process environment.
-pub fn complete_remote_path(
-    host: &str,
-    path_prefix: &str,
-    comp: &mut Completions,
-    env: &[(std::ffi::OsString, std::ffi::OsString)],
-) {
-    // Build the remote ls command — shell-quote the glob pattern
-    let cmd = format!(
-        "ssh -o BatchMode=yes -o ConnectTimeout=2 {} 'ls -dp {}* 2>/dev/null'",
-        host,
-        shell_escape(path_prefix),
-    );
-
-    let (pid, pipe_r) = match crate::sys::spawn_command_subst(&cmd, env) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    // Read output with a 3-second deadline
-    let deadline_ns = monotonic_ns() + 3_000_000_000;
-    let mut output = String::new();
-    let mut buf = [0u8; 4096];
-
-    // Set pipe to non-blocking so we can enforce the deadline
-    // SAFETY: pipe_r is a valid fd from spawn_command_subst.
-    let pipe_fd = unsafe { BorrowedFd::borrow_raw(pipe_r) };
-    let flags = match rustix::fs::fcntl_getfl(pipe_fd) {
-        Ok(flags) => flags,
-        Err(_) => rustix::fs::OFlags::empty(),
-    };
-    let _ = rustix::fs::fcntl_setfl(pipe_fd, flags | rustix::fs::OFlags::NONBLOCK);
-
-    loop {
-        let pipe_fd = unsafe { BorrowedFd::borrow_raw(pipe_r) };
-        match rustix::io::read(pipe_fd, &mut buf) {
-            Ok(n) if n > 0 => {
-                if let Ok(s) = std::str::from_utf8(&buf[..n]) {
-                    output.push_str(s);
-                }
-            }
-            Ok(_) => break,
-            Err(err) if err == rustix::io::Errno::AGAIN => {
-                if monotonic_ns() >= deadline_ns {
-                    if let Some(pid) = rustix::process::Pid::from_raw(pid) {
-                        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-                    }
-                    break;
-                }
-                let mut pfd = [rustix::event::PollFd::from_borrowed_fd(
-                    pipe_fd,
-                    rustix::event::PollFlags::IN,
-                )];
-                let timeout = rustix::event::Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 100_000_000,
-                };
-                match rustix::event::poll(&mut pfd, Some(&timeout)) {
-                    Ok(_) => continue,
-                    Err(err) if err == rustix::io::Errno::INTR => continue,
-                    Err(_) => break,
-                }
-            }
-            Err(err) if err == rustix::io::Errno::INTR => continue,
-            Err(_) => break,
-        }
-    }
-
-    unsafe { rustix::io::close(pipe_r) };
-    if let Some(pid) = rustix::process::Pid::from_raw(pid) {
-        let _ = rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty());
-    }
-
-    // Determine the directory prefix to strip (everything up to and including the last /)
-    let dir_prefix = match path_prefix.rfind('/') {
-        Some(i) => &path_prefix[..=i],
-        None => "",
-    };
-
-    for line in output.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let is_dir = line.ends_with('/');
-        let path = line.trim_end_matches('/');
-        // Strip the directory prefix to get just the filename
-        let name = if !dir_prefix.is_empty() {
-            path.strip_prefix(dir_prefix).unwrap_or(path)
-        } else {
-            // ls -dp without a leading / returns relative names
-            path.rsplit('/').next().unwrap_or(path)
-        };
-        if !name.is_empty() {
-            comp.push(name, is_dir, false, false);
-        }
-    }
-}
-
-/// Minimal shell escaping for use inside single quotes in an ssh command.
-fn shell_escape(s: &str) -> String {
-    // Inside single quotes, only ' needs escaping (as '\'' — end quote, escaped quote, reopen)
-    if !s.contains('\'') {
-        return s.to_string();
-    }
-    s.replace('\'', "'\\''")
-}
-
-/// Monotonic clock in nanoseconds.
-fn monotonic_ns() -> u64 {
-    let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn over_long_names_are_dropped_not_truncated_mid_char() {
+        let mut comp = Completions::new();
+        let long = "\u{e9}".repeat(200); // 400 bytes
+        comp.push(&long, false, false, false);
+        let mark = comp.begin_entry();
+        comp.names.push_str(&long);
+        comp.finish_entry(mark, false, false, false);
+        comp.push("ok", false, false, false);
+        assert_eq!(comp.entries.len(), 1);
+        assert_eq!(comp.name(0), "ok");
+    }
+
     use super::*;
 
     #[test]
@@ -1006,17 +919,6 @@ mod tests {
         assert!(comp.entries[0].is_host());
         assert!(!comp.entries[0].is_dir());
         assert_eq!(comp.entries[0].display_width(), 7); // "myhost" + ":"
-    }
-
-    #[test]
-    fn shell_escape_no_quotes() {
-        assert_eq!(shell_escape("hello"), "hello");
-        assert_eq!(shell_escape("/tmp/foo"), "/tmp/foo");
-    }
-
-    #[test]
-    fn shell_escape_with_quotes() {
-        assert_eq!(shell_escape("it's"), "it'\\''s");
     }
 
     #[test]

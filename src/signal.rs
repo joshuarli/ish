@@ -6,6 +6,7 @@ use std::os::fd::RawFd;
 // (main thread). The shell is single-threaded, so no data race.
 static mut PIPE_WRITE: RawFd = -1;
 static mut PIPE_READ: RawFd = -1;
+static SHELL_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Initialize signal handling: create self-pipe, install handlers.
 /// Returns the read-end fd for polling.
@@ -25,6 +26,14 @@ pub fn init() -> RawFd {
     // segfault after child exit on Alpine/musl.
     // install_handler(rustix::process::Signal::CHILD);
     install_handler(rustix::process::Signal::WINCH);
+    // TERM and HUP reach the prompt as events, so the shell restores the
+    // terminal and ends any suspended job before exiting.
+    SHELL_PID.store(
+        rustix::process::getpid().as_raw_pid(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    install_handler(rustix::process::Signal::TERM);
+    install_handler(rustix::process::Signal::HUP);
 
     // Shell ignores these — it must not be suspended/stopped
     ignore(rustix::process::Signal::TSTP);
@@ -166,6 +175,19 @@ fn ignore(sig: rustix::process::Signal) {
 }
 
 unsafe extern "C" fn handler(sig: i32) {
+    // A process forked from the shell without exec (a pipeline stage) inherits
+    // this handler. TERM and HUP must still end it: restore the default
+    // action and re-raise instead of queueing the signal for the shell.
+    // getpid, signal, and raise are async-signal-safe.
+    if (sig == libc::SIGTERM || sig == libc::SIGHUP)
+        && unsafe { libc::getpid() } != SHELL_PID.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+        return;
+    }
     let byte = sig as u8;
     // SAFETY: write() is async-signal-safe. PIPE_WRITE is valid (set in init).
     // O_NONBLOCK ensures we never block in the handler. If the pipe is full,
