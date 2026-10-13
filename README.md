@@ -2,7 +2,7 @@
 
 ish is an interactive shell for macOS and Linux. It provides a native prompt,
 line editing, history search, completion, aliases, minimal job control, and
-protected native file operations. It does not run scripts.
+protected native file operations. It has no script-file or command-string mode.
 
 ## Install and run
 
@@ -75,16 +75,19 @@ prints the list and `history reset` clears it. Run `history -h` for help.
 
 ## Commands and syntax
 
-ish accepts pipelines with `|` or `|&`, lists joined by `&&`, `||`, or `;`, and
-file redirections such as `2>errors.txt` and `&>output.txt`. It supports
-quoting, escaping, comments, continuation lines, tilde and parameter expansion,
-command substitution, and pathname expansion (globbing). An unmatched quote
-or a trailing `|`, `&&`, or `||` requests another input line.
+ish accepts pipelines with `|` or `|&`, lists joined by `&&`, `||`, or `;`,
+command negation with `!`, and file redirections such as `2>errors.txt` and
+`&>output.txt`. It supports quoting, escaping, comments, continuation lines,
+tilde, parameter and arithmetic expansion, command substitution, and pathname
+expansion (globbing). An unmatched quote or a trailing `|`, `&&`, or `||`
+requests another input line.
 
 ```sh
 ls -la | grep src && echo found > result.txt
 cat 'literal $HOME' "expanded $HOME"
 echo ~/projects/*.rs
+echo $((1 + 2))
+! false || echo fallback
 ```
 
 `${NAME}` is accepted alongside `$NAME`; parameter operators such as
