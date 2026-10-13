@@ -1,197 +1,33 @@
-ish is a small, interactive-only shell written in Rust. It prioritizes a fast
-native prompt, line editing, history search, completion, aliases, and minimal
-job control. It is intentionally not a general-purpose scripting shell.
+ish is an interactive-only shell written in Rust. The README is the user-facing
+behavior contract.
 
-The important design constraints are:
+## Commands
 
-- Interactive use only. Do not add scripting, POSIX-compatibility, `source`,
-  `eval`, control flow, functions, background jobs, plugins, themes, or prompt
-  configuration without an explicit design decision.
-- Shell-owned operations stay in-process. Directory listing, completion,
-  globbing, prompt/git inspection, and similar operations must
-  not spawn a subprocess. Running a user command or the existing denv
-  integration may spawn one.
-- Keep the execution model and data structures simple and flat. Avoid adding
-  an ish-owned AST, a general configuration language, or abstraction layers
-  that do not pay for themselves.
-- Preserve the interactive hot path. Reuse buffers where practical and avoid
-  allocations in code that runs on every keystroke; measure before making a
-  performance claim.
+- `make build` builds the shell.
+- `make test` runs the library, integration, and PTY tests.
+- `cargo check --workspace` checks the Rust workspace.
 
-## Dependencies and platform code
+## Invariants
 
-Prefer `rustix` to the greatest extent possible for Unix/system calls and file
-descriptor, process, terminal, signal-adjacent, and time operations. Use
-`libc` only when rustix does not expose the required API or when a measured,
-allocation-sensitive libc interface is deliberately retained. Keep such
-exceptions narrow and document the reason in the code. Do not add another
-crate without checking whether the standard library or an existing dependency
-already solves the problem.
+- Keep ish interactive-only; adding scripts, POSIX compatibility, `source`, `eval`, control flow, functions, background jobs, plugins, themes, or prompt configuration requires an explicit design decision.
+- Keep shell-owned operations such as listing, completion, globbing, and prompt Git inspection in-process; only user commands and denv evaluation may spawn children.
+- Keep execution and data structures flat; do not add an ish-owned AST or general configuration language.
+- Preserve the interactive hot path by reusing buffers where practical and avoiding allocations on each keystroke.
+- Use epsh for parsing and evaluation, but expose only syntax accepted by the README and `dispatch::plan()`.
+- Refuse unsupported syntax before evaluation; do not pass background jobs, compound commands, functions, `source`, `eval`, or parameter operators to epsh.
+- Run shell-state builtins in ish only as a whole input line; `cd` and `history` also have list forms, and undo mutations refuse pipeline stages and command substitutions.
+- Register each ish-owned builtin once in `src/builtin.rs` with its execution class; route shell-state handlers through `src/main.rs`.
+- Native `rm`, `mv`, and writable redirections fail closed if a required version cannot be preserved; never fall back silently to an unprotected operation.
+- Keep `crates/ish-undo` independent of ish's parser, history, line editor, and renderer; its boundary is the filesystem work ish performs.
+- Keep at most one suspended foreground job.
+- Prefer rustix for Unix and system calls; keep any libc exception narrow and explain it where it is used.
+- Localize unsafe code at platform boundaries and preserve descriptor ownership and error handling.
+- Update the README and relevant integration or PTY coverage when user-visible behavior changes.
 
-Unsafe code should remain localized to low-level platform boundaries. Prefer
-safe rustix APIs and RAII-owned descriptors; audit any new unsafe code for
-ownership, aliasing, error handling, and platform differences.
+## Topic map
 
-`epsh` is used for config/alias parsing and expansion. Do not accidentally
-turn it into a general shell execution path or expand ish's supported syntax
-without an explicit decision.
-
-## Architecture
-
-The main flow is:
-
-```text
-input → line editing → alias handling → epsh parse → dispatch plan → render
-                                                     ├→ ish builtin (whole line)
-                                                     ├→ refusal (outside the documented subset)
-                                                     └→ epsh expand/evaluate → job or external command
-```
-
-Subsystem ownership:
-
-- `main.rs`: shell state, event loop, modes, and key dispatch.
-- `input.rs`, `line.rs`: terminal byte decoding and UTF-8 line editing.
-- `render.rs`, `prompt.rs`, `term.rs`: terminal output, prompt, raw mode, and
-  repainting.
-- `dispatch.rs`: parses an accepted line once, refuses syntax outside the
-  documented subset, and decides whether a shell-owned builtin is the whole line.
-- `builtin.rs`, `job.rs`, `sys.rs`, `signal.rs`: builtins, foreground job
-  control, process/file-descriptor plumbing, and signal handling.
-- `complete.rs`, `path.rs`, `ls.rs`: native completion, PATH lookup, and
-  directory listing.
-- `history.rs`, `frecency.rs`: persistent history, fuzzy search, and ranking.
-- `alias.rs`, `config.rs`, `denv.rs`: aliases, `config.ish`, and denv
-  integration.
-- `undo.rs`: per-input recovery transactions, native `rm`/`mv`/`undo`
-  dispatch, and the redirection-open provider. The `crates/ish-undo` crate
-  owns filesystem operations, storage, journals, and replay; it must not
-  depend on ish's parser, history, line editor, or renderer. Its scope is
-  what the shell itself performs: do not add checkpointing of arbitrary
-  programs, selective or forced replay, or native cross-filesystem `mv`
-  without an explicit design decision. Design notes: `docs/UNDO.md`.
-
-Read the relevant module and its tests before changing behavior. Keep public
-interfaces narrow and preserve useful comments, especially comments explaining
-platform workarounds, safety, allocation behavior, or non-obvious constants.
-
-## User-visible behavior
-
-Supported shell behavior includes pipelines, AND-OR lists (`&&`/`||`),
-sequential lists (`;`), redirections, quoting and escaping, comments,
-continuation lines, tilde expansion, parameter expansion, command substitution,
-pathname expansion (globbing), aliases, history search, file completion, and
-one suspended foreground job.
-
-Builtins and keybindings are documented in [README.md](README.md). Treat the
-README and existing tests as the behavior contract; update both when a
-user-visible behavior intentionally changes. Avoid documenting implementation
-details here that are likely to change.
-
-Notable builtin rules:
-
-- State-changing builtins (`exit`, `fg`, `alias`, `z`, `denv`, and the like) must
-  run in the shell process and only as the whole input line; inside a list or
-  pipeline they are refused. `cd` and `history` run in the shell when alone and
-  fall back to epsh's `cd` or the history listing inside lists. `undo` subcommands that change recovery state
-  refuse to run in pipeline stages or command substitutions.
-- Native `rm` and `mv` fail closed: if a version cannot be preserved, nothing
-  is mutated. Do not add a silent fallback to an unprotected utility.
-- Pipeline-safe output builtins may participate in pipelines.
-- Syntax outside the README's documented subset (background `&`, compound
-  commands, functions, `source`/`eval`, parameter operators) is refused in
-  `dispatch::plan()`; do not let it reach epsh.
-- New builtins get one entry in the registry in `src/builtin.rs` with an
-  execution class, and, for shell-state builtins, a handler arm in
-  `run_shell_builtin()`; name lists elsewhere derive from the registry. Add
-  integration/PTY coverage, with integration/PTY coverage
-  as applicable.
-
-## Shell terminology
-
-Use these terms consistently in code, comments, tests, and documentation:
-
-- An input line is raw text from the line editor.
-- A token is a lexical unit, including operators such as `|`, `&&`, and `>`.
-- A shell word is an unexpanded syntactic word; `epsh::ast::Word` contains its
-  word parts.
-- A word part is literal text, quoting, parameter expansion, command
-  substitution, or tilde expansion.
-- A field is an argument produced after expansion, suitable for `argv`.
-- A simple command contains assignments, a command name, arguments, and
-  redirections.
-- A pipeline joins commands with `|` or `|&`.
-- An AND-OR list joins commands with `&&` or `||`.
-- A sequential list joins commands with `;` or a newline. Use list as the
-  umbrella term; do not call every composition a pipeline or a chain.
-- A redirection routes a file descriptor, such as `>file`, `2>file`, or `&>file`.
-- Parameter expansion handles `$HOME` and `$PATH`; pathname expansion, also
-  called globbing, handles patterns such as `*.rs`.
-- A builtin is implemented by the shell. An external command is launched as a
-  child process. A job is the process group and terminal state for a foreground
-  command or pipeline.
-
-The `epsh` AST supports more shell constructs than `ish` intentionally exposes.
-Do not describe parser capabilities as supported `ish` behavior without checking
-the interactive dispatch and README contract.
-
-## Testing
-
-`cargo test` includes library, integration, and PTY tests. PTY tests exercise
-the real binary and are especially important for terminal rendering, signals,
-completion, history, aliases, pipelines, redirections, and exit behavior.
-Run focused tests while iterating, then run the full suite before handoff.
-Benchmarks (`benches/`) are useful when changing hot paths, parsers,
-expansion, or safety-sensitive filesystem/process code.
-
-## Coding style
-
-Prefer the simplest correct implementation. Avoid premature abstraction and
-unnecessary dependencies. Never add banner/separator comments. Do not remove
-useful comments during refactors; update them when the behavior changes.
-
-Before editing, inspect the worktree and preserve unrelated user changes. Keep
-changes scoped to the request. For behavior changes, add or update the smallest
-test that locks in the intended result; use temporary directories and isolated
-environment state in filesystem/environment tests.
-
-Do not run pre-commit hooks. Do not push to a remote. Leave commits and
-verification of commits to the user.
-
-## Common changes
-
-- Builtin: start at `src/builtin.rs` (`ISH_BUILTINS`, `Exec`, `lookup()`,
-  `is_builtin()`, `all_builtin_names()`, `locate_command()`,
-  `list_directory()`). Commands that must change shell state are chosen by
-  `dispatch::plan()` and run by `run_shell_builtin()` in `src/main.rs`;
-  relevant handlers include `handle_alias()`, `handle_exit_command()`,
-  `change_directory()`, `handle_history()`, `denv::command()`, and
-  `job::resume_job()`. Add behavior tests in `tests/integration.rs` or
-  `tests/pty.rs`.
-- Keybinding or mode behavior: update `handle_normal_key()`,
-  `handle_completion_key()`, or `handle_history_search_key()` in `src/main.rs`.
-  The mode state is the `Mode` enum; terminal actions are represented by
-  `KeyAction`, `CompletionAction`, and `HistoryAction`.
-- Completion: use `complete::complete_path_into()`,
-  `complete::complete_candidates()`, `complete::CompletionState`, and
-  `complete::compute_grid()` in `src/complete.rs`; orchestration and accept/
-  refilter behavior live in `start_completion()` and
-  `handle_completion_key()` in `src/main.rs`.
-- History search: use
-  `History::fuzzy_search_subset_into_in_dir()` and `FuzzyMatch` in `src/history.rs`;
-  input and selection are handled by `handle_history_search_key()` and
-  `render_history_mode()` in `src/main.rs`.
-- Prompt or rendering: prompt data and git inspection are in `Prompt` and
-  `shorten_pwd()` in `src/prompt.rs`; terminal composition is in
-  `render_line()`, `render_completions()`, and `render_history_pager_cached()`
-  in `src/render.rs`. Run PTY tests for changes visible on screen.
-- Config or aliases: `config::load()`, `parse_set()`, and `parse_alias()` are
-  in `src/config.rs`; `AliasMap` and `lex_words()` are in `src/alias.rs`.
-  Keep expansion through the existing `epsh` integration.
-- Native filesystem or syscall code: prefer rustix, keep unsafe at the
-  boundary, document unavoidable libc use, and test error paths. Start with
-  `src/sys.rs` (`pipe_cloexec()`), `src/path.rs` (`PathCache`, `scan_path()`),
-  `src/ls.rs` (`list_dir()`) as appropriate.
-- Parser/expansion behavior: inspect the call sites of
-  `expand_builtin_args()` and the `epsh::lexer`/`epsh::expand` integration in
-  `src/main.rs` and `src/alias.rs`. Distinguish shell words from expanded
-  fields, and extend that integration rather than introducing a parallel parser.
+- Execution flow, epsh integration, command routing, process boundaries, and module ownership: [Architecture](docs/architecture.md).
+- History search ranking and session snapshots: [History search](docs/history-search.md).
+- Completion matching, ordering, and hot-path constraints: [Completion](docs/completion.md).
+- Recovery boundaries, durability, replay, and retention: [Undo recovery](docs/UNDO.md).
+- PTY test environment and synchronization: [PTY tests](docs/ptytest.md).

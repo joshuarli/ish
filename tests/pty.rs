@@ -3293,8 +3293,8 @@ fn bracketed_paste_over_limit_rejected() {
     );
 }
 
-/// Paste the real AGENTS.md (14.8 KB) via bracketed paste and verify it's
-/// instantly rejected without displaying the content.
+/// Paste a large document and verify it is rejected without displaying its
+/// contents.
 #[test]
 fn bracketed_paste_agents_md_rejected() {
     let content = include_str!("../AGENTS.md");
@@ -3320,7 +3320,7 @@ fn bracketed_paste_agents_md_rejected() {
         !clean.contains("[paste exceeded 8KB limit]"),
         "a rejected paste must not insert text into the line: {clean:?}"
     );
-    // The first line of AGENTS.md must NOT appear on screen.
+    // The document's first line must NOT appear on screen.
     let first_line = content.lines().next().unwrap_or("");
     assert!(
         !clean.contains(first_line),

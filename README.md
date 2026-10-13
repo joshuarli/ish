@@ -1,373 +1,177 @@
 # ish
 
-A purely interactive shell.
+ish is an interactive shell for macOS and Linux. It provides a native prompt,
+line editing, history search, completion, aliases, minimal job control, and
+protected native file operations. It does not run scripts.
 
-No scripting, no POSIX compat, no plugins.
+## Install and run
 
+Download a pre-release archive for your platform from
+[GitHub Releases](https://github.com/joshuarli/ish/releases). The release
+workflow provides macOS Apple silicon and Linux x86_64 and ARM64 builds; Linux
+has static and dynamic variants. Extract the archive, rename its `ish-*`
+executable to `ish`, and place it in a directory on your `PATH`, such as
+`~/.local/bin`.
 
-## Features
+Start the shell with:
 
-### Prompt
-
-```
-josh@mac ~/d/ish* main $
-```
-
-- User, host, abbreviated working directory, git branch, exit status color
-- PWD shortens middle components: `~/.config/fish` becomes `~/.c/fish`
-- Green on success, red on failure
-- Git branch from `.git/HEAD` (cached, no subprocess). Detached HEAD shows short hash
-- Red `*` when `__DENV_DIRTY=1`
-
-### Line Editing
-
-| Key | Action |
-|---|---|
-| Ctrl+A / Home | Beginning of line |
-| Ctrl+E / End | End of line |
-| Ctrl+K | Kill to end of line |
-| Ctrl+U | Kill to start of line |
-| Ctrl+W / Ctrl+Delete | Kill word backward |
-| Alt+D | Kill word forward |
-| Ctrl+Backspace | Pick from the directory stack (most recent first) |
-| Ctrl+Y | Yank (paste) killed text |
-| Ctrl+D | Delete forward / exit on empty line |
-| Ctrl+C | Cancel line |
-| Ctrl+L | Clear screen |
-| Ctrl+P (any mode) | Write a layout dump to `~/.cache/ish/dump-<random hex>` without changing the screen |
-| Left / Right | Move by character |
-| Ctrl+Left / Alt+B | Move word left |
-| Ctrl+Right / Alt+F | Move word right |
-
-Single kill ring shared across Ctrl+K/U/W. Full UTF-8 support.
-
-**Multiline editing**: paste a multi-line command (with `\` continuations or unclosed quotes) and move freely with Up/Down between lines. Long single-line input also behaves like a wrapped grid: Up/Down move by visual row and preserve the target column. At the first or last input row, Up/Down resume history navigation.
-
-### History
-
-| Key | Action |
-|---|---|
-| Up / Down | Move by visual row in wrapped input; prefix search through history at the boundary |
-| Ctrl+R | Search saved commands across all sessions (case-insensitive) |
-
-Fuzzy search opens a pager with matching characters highlighted in yellow. Up/Down to navigate, Enter to accept, Escape to cancel.
-
-**Ranking**: prefix matches come first, followed by word-boundary substrings, other substrings, and scattered-letter matches. Within the same match quality, commands used in the current directory or nearby ancestors are preferred; usage frequency and timestamps refine the order. A weak local match cannot outrank a stronger literal match elsewhere. An empty search shows recent commands first. Matching characters are highlighted, including Unicode text.
-
-Up/Down and autosuggestions use the history present when the session started,
-plus commands entered in that session. Ctrl+R also sees commands saved by other
-running sessions when search opens.
-
-Commands are saved before execution in `~/.local/share/ish/history.log`.
-Every occurrence is retained for ranking; the history list and search show
-each command once. Writers serialize through `history.log.lock` and sync
-records before execution. Storage errors are reported. An interrupted command
-or abruptly killed shell does not need a clean exit to save its accepted
-input. The bare `l` command is excluded from history.
-
-The versioned log stores length-prefixed, checksummed records. Commands are
-stored verbatim, including newlines; the history list and pager show them on
-one row with newlines drawn as `↵`. A final record that is incomplete, fails
-its checksum at the end of the file, or is followed only by zero bytes is
-treated as an interrupted write and removed. If a record in the middle of the
-log is damaged, startup keeps the valid prefix, moves the rest to
-`history.log.corrupt-*`, and says so. Sessions read only newly appended
-records.
-
-The first start imports the old `history` text file and the final `history.bin`
-cache format without modifying them. Import happens once. Restart old ish
-instances after upgrading: they still write to the old files, and those later
-writes are not imported into the new log. The legacy
-`scripts/import-fish-history` helper must run before the first start; it
-refuses to write once the log exists.
-
-`history reset` atomically replaces the log and invalidates history in other
-running ish shells. It reads only the log header, so it also works on a log
-with damaged records; a log with an unreadable header is moved to
-`history.log.corrupt-*`. Preserved legacy import files remain untouched.
-Storage subcommands require a standalone command; plain `history` can be
-redirected or used in a pipeline.
-
-Run `history -h` for the available history storage commands.
-
-### Tab Completion
-
-| Context | Behavior |
-|---|---|
-| Empty line | Inserts `cd ` |
-| First word | Builtins, aliases, `PATH` commands, directories |
-| After `cd ` | Directories only |
-| After `undo ` | `undo` subcommands |
-| After `ssh`/`scp`/`rsync`/`sftp`/`mosh` | Hosts from `~/.ssh/config` and `known_hosts`, beside local files (no remote path completion) |
-| `$` prefix | Environment variables |
-| Everything else | Files and directories; fish-style partial paths (`sr/m` finds `src/main.rs`) |
-
-Completions display in a column-major grid (up to 6 columns, 10 visible rows). Navigate with arrow keys or Tab, accept with Enter, cancel with Escape. Typing filters live. Path completions sorted by modification time (most recent first) so recently-built or recently-edited files appear at the top.
-
-Colors: blue for directories, cyan for symlinks, green for executables.
-
-### Syntax
-
-Pipelines, command lists, and redirections:
-```
-ls -la | grep foo > out.txt && echo done
-cat err.log |& head          # pipe stderr too
-make 2> err.log              # redirect stderr
-make &> all.log              # redirect both
-cmd1 || cmd2 ; cmd3
+```sh
+ish
 ```
 
-Quoting:
-```
-echo 'literal $HOME'         # single quotes: no expansion
-echo "hello $USER"           # double quotes: variables expand
-echo it\'s\ a\ test          # backslash escaping
-```
+Use `ish --help` for command-line options. `-c PATH` selects a config file,
+`--no-config` skips config loading, and `-V` prints the version.
 
-Continuation: unclosed quotes, trailing `|`, `&&`, `||` prompt for more input.
+## Configuration
 
-Comments with `#`.
+By default, ish reads `~/.config/ish/config.ish`. If `HOME` is unset, it checks
+`/etc/ish/config.ish`. Use `-c PATH` to select another file.
 
-### Expansion
+The file supports `set` and `alias` directives. A `set` value is one shell word;
+quote values that contain spaces. `$NAME` is expanded when the config loads.
+Lines beginning with `#` are comments. Invalid lines are reported and do not
+prevent later lines from loading. A nearby `init.sh` is not run.
 
-```
-~/file             # tilde → $HOME
-$PATH              # environment variables
-$(whoami)          # command substitution
-`date`             # backtick substitution
-*.rs               # glob: any characters
-test?              # glob: single character
-src/**/*.py        # glob: recursive descent
-```
-
-Expansion order: tilde, parameter expansion, command substitution, pathname expansion (globbing). Quoted characters skip expansion. No match on glob is an error.
-
-### Builtins
-
-| Command | Description |
-|---|---|
-| `cd [dir]` | Change directory. `cd -` for previous |
-| `exit [code]` | Exit (warns if job suspended) |
-| `fg` | Resume suspended job |
-| `export [NAME[=value]]` | Export a variable to child processes. No args lists all |
-| `set [VAR [val]]` | Set env var. No args lists all |
-| `unset VAR...` | Remove env vars |
-| `alias [name [cmd]]` | Define/list aliases |
-| `l [path]` | Native directory listing |
-| `c` | Clear screen |
-| `w` / `which` / `type` | Locate command |
-| `z [query]` | Jump to the best-scoring directory from `cd`/`z` history (frecency); no args goes home |
-| `history [reset]` | Print history; storage subcommands above |
-| `echo [args]` | Print arguments |
-| `pwd` | Print working directory |
-| `true` / `false` | Return 0 / 1 |
-| `copy-scrollback` | Copy session to clipboard via OSC 52 |
-| `ish-dump` | Write the current layout state to `~/.cache/ish/dump-<random hex>` (same as Ctrl+P). The dump is mode 0600 in a 0700 directory and holds geometry and lengths, not typed text |
-| `rm [-f \| -i] [-rRv] [--] file...` | Protected native removal (see [Undo](#undo)) |
-| `mv [-f \| -i \| -n] [-v] [--] source... target` | Protected native move |
-| `undo ...` | Revert, reapply, inspect, and manage recorded changes |
-
-### `l` — Native Directory Listing
-
-Equivalent to `ls -plAhG`, implemented without forking:
-
-```
-drwxr-xr-x  12 josh  staff   384B  Mar 17 10:23  src/
--rw-r--r--   1 josh  staff   1.2K  Mar 17 09:15  Cargo.toml
-lrwxr-xr-x   1 josh  staff    11B  Mar 10 14:02  link -> target/debug
--rwxr-xr-x   1 josh  staff   184K  Mar 17 17:54  ish
-```
-
-Human-readable sizes. Colors: blue dirs, cyan symlinks, green executables, red setuid. Sorted case-insensitively. Resolves owner/group names via `getpwuid`/`getgrgid`.
-
-### Aliases
-
-Define at the prompt or in config:
-```
-alias ll l
-alias gs git status
-```
-
-Aliases expand inline when you press space. `w`/`which`/`type` check aliases first.
-
-### Job Control
-
-Ctrl+Z suspends the foreground job. `fg` resumes that process and waits for it. One job slot — simple and intentional: while a job is suspended, Ctrl+Z on another command is refused and the command keeps running. The rest of a list the suspended command belonged to (`a && b`, `a; b`) is dropped; `fg` does not run it. The shell warns before exiting with a suspended job (exit again to force). SIGTERM and SIGHUP restore the terminal, end the suspended job, and exit with status 128 plus the signal number once the shell is back at the prompt; a panic restores the terminal before aborting.
-
-### denv Integration
-
-Native `.envrc`/`.env` loading, implemented in `src/denv.rs` (no external `denv` binary). Runs on every `cd` with a fast-path check (file mtimes vs the recorded state) that skips re-evaluation when nothing changed. A trusted `.envrc` whose first line mentions `bash` is evaluated by spawning `bash`; otherwise it is evaluated in-process. Both `.envrc` and `.env` must be trusted with `denv allow` before anything is loaded; `denv allow` and `denv deny` cover both files, and if either is untrusted neither loads. Trust is bound to the file's canonical path and a SHA-256 of its content, so editing a file revokes trust (even if its mtime is preserved), and allows recorded by earlier versions must be granted again. `.envrc` evaluation is stopped after 60 seconds. `denv reload` re-evaluates the current directory.
-
-### Undo
-
-ish records what its own filesystem operations change, so they can be
-reverted and reapplied:
-
-```
-rm -r build            # removed, but recoverable
-undo                   # restores build/
-undo redo              # removes it again
-echo notes > log.txt   # truncation of an existing log.txt is recoverable too
-```
-
-**What is captured.** One accepted input is one transaction. Within it, ish
-captures:
-
-- native `rm` and `mv`, resolved after expansion (aliases, globs, quoting,
-  and `command rm` all reach them; an explicit path such as `/bin/rm` runs
-  the external utility without capture);
-- writable redirections (`>`, `>|`, `>>`, `<>`, `&>`), including through
-  symlinks, in pipeline stages, and in command substitutions.
-
-Every other external command runs normally and is **not** captured; `undo
-list` and `undo show` report such inputs as having uncaptured commands. What
-a program does to files internally is outside what ish can record.
-
-**Native commands.** `rm` supports `-r`/`-R`, `-f`, `-i`, `-v`, and `--`;
-`mv` supports `-f`, `-i`, `-n`, `-v`, and `--`. Other options fail with
-status 2 instead of silently running an unprotected utility. Recursive
-removal does not cross mount points and never follows symlinks. The
-filesystem root, the undo store, and the store's ancestors are refused.
-`mv` is a rename and copies nothing; its undo moves the same object back,
-carrying later edits along. A `mv` between filesystems is a copy and a
-removal, which native `mv` does not do: it is refused, nothing is moved, and
-the message points at `/bin/mv` for an unprotected move. `rm -f` ignores
-missing files but never skips preservation: if a version cannot be
-preserved, the command fails and nothing is removed.
-
-**Preservation.** Before anything is removed or overwritten, the affected
-version is saved and recorded durably:
-
-| Kind | When | Contract |
-|---|---|---|
-| clone | the store is on the same filesystem and it supports cloning (APFS, btrfs, XFS) | frozen; no data moves |
-| linked | cloning is unavailable and the name is being unlinked | the retained inode; another hard link or an open writer can still change it |
-| copy | cloning is unavailable and contents must stay frozen (redirections, files on filesystems the store cannot clone from) | frozen, bounded by `ISH_UNDO_COPY_LIMIT` and `ISH_UNDO_MIN_FREE` |
-
-A write that needs a frozen pre-image and cannot get one is refused. `undo
-show` labels linked versions and every fidelity limitation (for example,
-ownership that could not be restored without privileges).
-
-**Replay.** `undo` checks the current filesystem before every step and never
-discards newer data: a deleted file is restored only where nothing exists
-now, a created or modified file is reverted only while it still matches what
-the transaction left (compared against a frozen post-image where one was
-taken), and a move is reversed only while the moved object is still there.
-Anything else is a conflict: it is reported and left untouched, everything
-that can be undone still is, and there is no option to override a conflict.
-Resolve it (move your newer file aside, or delete it) and run `undo <id>`
-again; completed steps are skipped, so a retry only does what remains. The
-same holds for `undo redo`. `--dry-run` lists the steps a run would perform
-and touches nothing.
-
-```
-undo [id] [--dry-run]
-undo redo [id] [--dry-run]
-undo list [-a]          # recent transactions; * marks this shell's
-undo show [id]          # coverage, state, stored versions, changes
-undo gc                 # apply the retention limits now
-undo purge <id>         # delete one transaction's saved versions
-undo doctor             # store health and capability probes
-undo volume add <dir> | list | remove <dir|id>
-```
-
-Plain `undo` and `undo redo` act on this shell's latest eligible
-transaction; ids address any shell's. `undo list`, `show`, and `doctor` work
-in pipelines and command substitutions; commands that change recovery state
-must run in the shell itself. A job stopped with Ctrl+Z keeps its
-transaction open until it finishes after `fg`. While a shell is undoing or
-redoing a transaction (state `replaying`), no other command touches it:
-`undo`, `undo redo`, `gc`, and `purge` all leave it alone.
-
-**Storage and retention.** Transactions and saved versions live under
-`~/.local/share/ish/undo` (private, versioned). Clones and hard links only
-work within one filesystem, so for another volume, register a private store
-with `undo volume add <mount point>`; its versions stay there, and while the
-volume is disconnected its transactions are reported as unavailable, never
-deleted. Retention is set with `set` in `config.ish` or at the prompt:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `ISH_UNDO` | `on` | `off` runs `rm`/`mv` as external commands and opens redirections unprotected; with `on` and no usable `HOME`, `rm`, `mv`, and writable redirections fail |
-| `ISH_UNDO_COPY_LIMIT` | `64M` | bytes one operation may copy when cloning is unavailable |
-| `ISH_UNDO_MAX_SIZE` | `8G` | logical size of retained versions |
-| `ISH_UNDO_MAX_ENTRIES` | `500` | retained transactions |
-| `ISH_UNDO_MAX_DAYS` | `30` | age limit |
-| `ISH_UNDO_MIN_FREE` | `1G` | free space to leave when copying; collection also deletes the oldest completed transactions (never the newest) while free space is below it; interrupted transactions are collected only once past `ISH_UNDO_MAX_DAYS` |
-
-Collection runs at most hourly after a command that recorded something, or
-on `undo gc`, oldest first. It never collects active or interrupted
-transactions, those with versions on a disconnected volume, those being
-replayed, or the newest completed transaction. Automatic collection is
-bounded by the work it does, not by how much it deletes: a pass loads at
-most 32 journals (and removes at most 32 orphaned volume directories), totals
-sizes from a small file written when each transaction is sealed, and picks up
-where it stopped at the next command boundary; `undo gc` has no such bound. Sizes are shown as logical bytes,
-allocated blocks (an overestimate for clones, whose blocks may be shared),
-and bytes copied; exclusive copy-on-write usage is not measured.
-
-**Durability.** Saved versions and the journal record describing them are
-flushed with `fsync` before the change they protect is made, in batches
-during recursive removal. Undo and redo follow the same order: before a step
-removes or replaces anything, the version it displaces is saved, and a
-prepare record naming it and the hidden staging entry the step created beside
-its destination (`.ish-undo-<id>-<run>-<step>-<random>`, created exclusively
-and never reused) is flushed; only then does the step change the filesystem,
-and only afterwards is it recorded as done. A crashed or killed shell leaves
-a transaction that `undo list` shows as interrupted, or a replay that simply
-stopped, and the next run reconciles it: records after a torn write are
-ignored, operations whose outcome was not recorded are checked against the
-filesystem, a recorded staging entry is removed only while it is still the
-object that was recorded, and a step whose change already happened takes its
-displaced version from the prepare record, so redo still has it. Saved
-versions are deleted only by retention (above) or `undo purge`. A crash can leave a staging entry
-behind until the transaction is retried. On macOS, `fsync` does not flush
-the drive's write cache (`F_FULLFSYNC` would), so after a power loss the
-most recent records may be missing; filesystems mounted without ordering
-guarantees can lose recent records on Linux too.
-
-Directory and file metadata (modes, timestamps, extended attributes, ACLs
-and resource forks on macOS, BSD flags) is restored where an unprivileged
-user can set it; inode numbers and change times are not. Directory ACLs on
-macOS are not recorded. Files with hard links outside a removed set come
-back as independent files, and the other links keep their newer contents.
-
-### Config
-
-`~/.config/ish/config.ish`:
-
-```
-# Environment
+```sh
 set EDITOR nvim
-set PAGER less
-
-# Aliases
+set GREETING "hello $USER"
 alias ll l
 alias gs git status
 alias .. "cd .."
 ```
 
-Two directives: `set` and `alias`. Variables expand in values. Comments with `#`. Every bad line is reported with its line number and the rest of the file still loads. `init.sh` is not run; if one sits beside `config.ish`, ish says so at startup.
+## Interactive use
 
-## Non-Features (by Design)
+The prompt shows the user, host, shortened working directory, Git branch, and
+last command status. A red `*` marks a dirty denv environment.
 
-Every omission is deliberate. No scripting engine means no code injection, no `source`-based exploits, no eval chains. No `if`/`for`/`while`/functions means no control flow to hijack. No `${VAR}` parameter operators means no expansion-based attacks. One suspended job (no `&` backgrounding) means no resource exhaustion through job spawning. No plugins means no supply chain.
+| Key | Action |
+|---|---|
+| Up / Down | Move through wrapped input; search history at the input boundary |
+| Ctrl+R | Search history |
+| Tab | Complete commands, hosts, files, or directories |
+| Ctrl+A / Ctrl+E | Move to the start / end of the line |
+| Ctrl+W / Ctrl+Delete | Delete the previous word |
+| Alt+D | Delete the next word |
+| Ctrl+U / Ctrl+K | Delete to the start / end of the line |
+| Ctrl+Y | Restore the last killed text |
+| Ctrl+Backspace | Pick a recent directory |
+| Left / Right | Move by character; Ctrl+Left / Ctrl+Right move by word |
+| Ctrl+C / Ctrl+D | Cancel input / delete forward or exit on an empty line |
+| Ctrl+L | Clear the screen |
+| Ctrl+Z | Suspend the foreground job |
+| Ctrl+P | Write a layout dump under `~/.cache/ish/` |
 
-The result: the shell has a small, auditable interactive command evaluator. If you can't `source` it, you can't trick a user into `source`-ing it. The subset is enforced, not just documented: a line that uses background `&`, a compound command, a function definition, `source`/`.`/`eval`, or a parameter operator is refused with an error before anything runs.
+Completion filters as you type and prefers prefix matches. Recent files appear
+first; partial paths and SSH hosts are supported. SSH host completion reads
+`~/.ssh/config` and `~/.ssh/known_hosts`. Use the arrows or Tab to move through
+results, Enter to accept, and Escape to cancel.
 
-Builtins that read or change shell state (`alias`, `exit`, `fg`, `z`, `w`/`which`/`type`, `denv`, `copy-scrollback`, `ish-dump`) must be the only command on their line; in a list or pipeline they are refused with an error instead of running in a child or being skipped. `cd` and `history` work in lists too.
+Ctrl+R opens a case-insensitive fuzzy-search pager with matches highlighted.
+Use Up and Down to navigate, Enter to accept, and Escape to cancel. History is
+saved in `~/.local/share/ish/history`; Ctrl+R searches saved commands across
+sessions, while Up and Down use this session's history snapshot. `history`
+prints the list and `history reset` clears it. Run `history -h` for help.
 
-- No scripting. `ish script.sh` prints an error.
-- No POSIX compliance.
-- No `source`, no `eval`, no `${VAR:-x}`-style parameter operators (plain `${VAR}` is the same as `$VAR`).
-- No `if`/`for`/`while`/`case`, subshells, brace groups, or functions.
-- No plugins, no prompt customization, no themes.
-- No background jobs (`&`). One suspended job only.
+## Commands and syntax
 
-## Architecture
+ish accepts pipelines with `|` or `|&`, lists joined by `&&`, `||`, or `;`, and
+file redirections such as `2>errors.txt` and `&>output.txt`. It supports
+quoting, escaping, comments, continuation lines, tilde and parameter expansion,
+command substitution, and pathname expansion (globbing). An unmatched quote
+or a trailing `|`, `&&`, or `||` requests another input line.
 
-A Rust workspace: the `ish` package (library target and interactive binary) and `crates/ish-undo`, which owns native `rm`/`mv`, protected redirection opens, the recovery store and journals, and replay. Platform code primarily uses `rustix`; `libc` remains a narrow compatibility escape hatch.
+```sh
+ls -la | grep src && echo found > result.txt
+cat 'literal $HOME' "expanded $HOME"
+echo ~/projects/*.rs
+```
 
-Shell-owned operations stay native where possible: directory listing, git detection, pathname expansion, and completion do not spawn subprocesses. Running external commands, command substitutions, and the denv integration may spawn processes.
+`${NAME}` is accepted alongside `$NAME`; parameter operators such as
+`${NAME:-default}` are refused. Background `&`, scripts, conditionals (`if`,
+`for`, `while`, `case`), subshells, brace groups, functions, `source`, `.`, and
+`eval` are not supported. Commands that need shell state, including `alias`,
+`exit`, `fg`, `denv`, and `z`, must be the whole input line. `cd` and `history`
+can also be used in lists.
 
-SIGWINCH is delivered through a self-pipe; other signals are ignored or defaulted. Each pipeline gets its own process group. Terminal foreground control via `tcsetpgrp`. Raw mode via `termios`.
+ish-specific commands include:
+
+| Command | Action |
+|---|---|
+| `cd [dir]` | Change directory; `cd -` returns to the previous directory |
+| `exit [status]` | Exit, warning if a job is suspended |
+| `fg` | Resume the suspended foreground job |
+| `alias [name [command...]]` | Define or list aliases |
+| `history [reset]` | List or clear saved history |
+| `z [query]` | Jump to a frequently used directory; no query goes home |
+| `w`, `which`, `type` | Locate a command or alias |
+| `l [path...]` | List files with colors and human-readable sizes |
+| `c` | Clear the screen |
+| `denv` | Trust, revoke, or reload environment files for this directory |
+| `copy-scrollback` | Copy the terminal scrollback through OSC 52 |
+| `ish-dump` | Write the current layout dump |
+| `rm` | Protected removal; supports `-f`, `-i`, `-r`/`-R`, `-v`, and `--` |
+| `mv` | Protected move; supports `-f`, `-i`, `-n`, `-v`, and `--` |
+| `undo` | Revert, reapply, inspect, and manage recorded changes |
+
+The shell also provides epsh's environment and output builtins, including
+`set`, `export`, `unset`, `echo`, `pwd`, `true`, and `false`. Aliases can be
+defined at the prompt or in config and expand as you type.
+
+### Job control
+
+Ctrl+Z suspends a foreground job and `fg` resumes it. ish keeps one suspended
+job. If a command in a list suspends, the rest of that list is discarded.
+
+### denv
+
+When the directory changes, ish looks for `.envrc` and `.env`. Run
+`denv allow` to trust the files in the current directory, `denv deny` to revoke
+trust, and `denv reload` to reevaluate them. Editing a trusted file revokes its
+trust. If either discovered file is untrusted, neither is loaded. `.envrc`
+files whose first line mentions `bash` run in a `bash` child; other `.envrc`
+files are evaluated by epsh. `.env` files are read as variable assignments.
+Evaluation stops after 60 seconds.
+
+### Protected file operations
+
+ish records its native `rm`, native same-filesystem `mv`, and writable
+redirections so they can be undone. Changes made inside arbitrary external
+programs are not recorded. Explicit paths such as `/bin/rm` run the external
+program without protection. If ish cannot preserve a required version, the
+native operation fails without changing the files. Cross-filesystem `mv` is
+refused.
+
+```sh
+rm -r build
+undo                   # restore the latest eligible change from this session
+undo redo              # reapply it
+undo list [-a]
+undo show [id]
+undo [id] --dry-run
+```
+
+Recovery data lives under `~/.local/share/ish/undo`. Use `undo list [-a]`
+(`-a` includes other sessions), `undo show [id]`, `undo gc`, `undo purge ID`,
+`undo doctor`, and `undo volume ...` to inspect and manage recovery records. Use
+`undo volume add DIRECTORY` to register another filesystem for its own saved
+versions. Undo and redo check for newer changes before replay and leave
+conflicts untouched. `undo show` reports saved-version limitations. Process
+interruption recovery is supported; after power loss, recent records may be
+missing.
+
+Undo settings can be set in `config.ish` or at the prompt:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `ISH_UNDO` | `on` | `off` disables protection for native operations and redirections |
+| `ISH_UNDO_COPY_LIMIT` | `64M` | Maximum userspace copy for one saved version |
+| `ISH_UNDO_MAX_SIZE` | `8G` | Retained logical data limit |
+| `ISH_UNDO_MAX_ENTRIES` | `500` | Retained transaction limit |
+| `ISH_UNDO_MAX_DAYS` | `30` | Transaction age limit |
+| `ISH_UNDO_MIN_FREE` | `1G` | Free space reserved for copying |
+
+## Help and license
+
+Report issues at [GitHub Issues](https://github.com/joshuarli/ish/issues). This
+repository does not specify a license.
