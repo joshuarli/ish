@@ -8,7 +8,7 @@ mod common;
 use std::io::Write;
 
 use common::*;
-use ish_undo::testing::journal::Displaced;
+use ish_undo::testing::journal::{Displaced, Strength};
 use ish_undo::testing::replay::Committed;
 
 fn rm_tree(fx: &Fixture, n: usize) {
@@ -456,7 +456,12 @@ fn interrupted_replay_keeps_what_it_displaced(
     let id = setup(&fx);
     let (status, _, _) = fx.undo_with(
         SESSION,
-        &["--fault", &format!("{point}=abort")],
+        &[
+            "--fault",
+            "clone=ENOTSUP",
+            "--fault",
+            &format!("{point}=abort"),
+        ],
         &[&id.to_string()],
     );
     assert_ne!(status, 0, "{label}: the replay was interrupted");
@@ -477,6 +482,11 @@ fn interrupted_replay_keeps_what_it_displaced(
         );
     };
     assert_eq!(prepared.ident.size, displaced_size, "{label}");
+    assert_eq!(
+        prepared.strength(),
+        Some(Strength::Link),
+        "{label}"
+    );
 
     let (status, _, err) = fx.undo(&[&id.to_string()]);
     assert_eq!(status, 0, "{label}: {err}");
@@ -554,6 +564,31 @@ fn crash_after_the_prepare_record_before_any_mutation_is_retried_cleanly() {
         &[("f", Some(b"one"))],
         &[("f", Some(b"second"))],
     );
+}
+
+#[test]
+fn a_prepared_link_does_not_hide_a_later_edit_to_the_live_file() {
+    let fx = Fixture::new("crash-prepared-edited");
+    fx.write("f", b"one");
+    let (status, id, err) = fx.shell(&["write:f=second"]);
+    assert_eq!(status, 0, "{err}");
+    let (status, _, _) = fx.undo_with(
+        SESSION,
+        &[
+            "--fault",
+            "clone=ENOTSUP",
+            "--fault",
+            "replay-prepared=abort",
+        ],
+        &[&id.to_string()],
+    );
+    assert_ne!(status, 0, "the replay was interrupted");
+
+    fx.write("f", b"third!");
+    let (status, _, err) = fx.undo(&[&id.to_string()]);
+    assert_eq!(status, 1, "{err}");
+    assert_eq!(fx.read("f"), b"third!");
+    assert!(fx.model(id).actions[0].pending.is_some());
 }
 
 #[test]

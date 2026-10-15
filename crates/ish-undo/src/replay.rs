@@ -720,6 +720,32 @@ impl Runner<'_> {
         }
     }
 
+    fn expected_after_interrupted_preservation(
+        &self,
+        action: u32,
+        expected: &Evidence,
+    ) -> Evidence {
+        match (expected, self.interrupted.get(&action)) {
+            (Evidence::Stat(_), Some(Displaced::Saved(saved))) => Evidence::Stat(saved.ident),
+            _ => expected.clone(),
+        }
+    }
+
+    fn take_interrupted_displaced(
+        &mut self,
+        action: u32,
+        current: &sys::Stat,
+    ) -> Option<Displaced> {
+        if matches!(
+            self.interrupted.get(&action),
+            Some(Displaced::Saved(saved)) if saved.ident.unchanged(current)
+        ) {
+            self.interrupted.remove(&action)
+        } else {
+            None
+        }
+    }
+
     /// Preserve whatever is at `name` before it is removed or replaced.
     fn displace(
         &mut self,
@@ -921,16 +947,18 @@ impl Runner<'_> {
                 expect: e,
                 dir,
             } => {
-                let e = expect(&self.placed_at, path, e);
-                self.remove(action, path, &e, *dir)
+                let expected = expect(&self.placed_at, path, e);
+                let expected = self.expected_after_interrupted_preservation(action, &expected);
+                self.remove(action, path, &expected, *dir)
             }
             StepKind::Replace {
                 path,
                 expect: e,
                 source,
             } => {
-                let e = expect(&self.placed_at, path, e);
-                self.replace(action, path, &e, source)
+                let expected = expect(&self.placed_at, path, e);
+                let expected = self.expected_after_interrupted_preservation(action, &expected);
+                self.replace(action, path, &expected, source)
             }
             StepKind::Move {
                 from,
@@ -1064,9 +1092,12 @@ impl Runner<'_> {
             Ok(Check::Mismatch(why)) => return Outcome::Conflict(why),
             Err(e) => return Outcome::Failed(sys::describe_error(&e)),
         }
-        let displaced = match self.displace(dir.as_fd(), &name, path, &current, expect) {
-            Ok(d) => d,
-            Err(e) => return Outcome::Conflict(e),
+        let displaced = match self.take_interrupted_displaced(action, &current) {
+            Some(displaced) => displaced,
+            None => match self.displace(dir.as_fd(), &name, path, &current, expect) {
+                Ok(displaced) => displaced,
+                Err(e) => return Outcome::Conflict(e),
+            },
         };
         if let Err(e) = self.prepare_removal(action, &displaced) {
             return Outcome::Failed(format!(
@@ -1126,9 +1157,12 @@ impl Runner<'_> {
             Ok(Check::Mismatch(why)) => return Outcome::Conflict(why),
             Err(e) => return Outcome::Failed(sys::describe_error(&e)),
         }
-        let displaced = match self.displace(dir.as_fd(), &name, path, &current, expect) {
-            Ok(d) => d,
-            Err(e) => return Outcome::Conflict(e),
+        let displaced = match self.take_interrupted_displaced(action, &current) {
+            Some(displaced) => displaced,
+            None => match self.displace(dir.as_fd(), &name, path, &current, expect) {
+                Ok(displaced) => displaced,
+                Err(e) => return Outcome::Conflict(e),
+            },
         };
         if let Err(e) = self.rec.stores.sync_objects() {
             return Outcome::Failed(format!(

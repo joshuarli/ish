@@ -167,12 +167,20 @@ pub fn preserve(
             {
                 let obj_dir = stores.obj_dir(&store)?;
                 let (obj_name, ()) = with_new_name(obj_dir, |d, n| sys::link_at(dir, name, d, n))?;
+                let linked = sys::lstat_at(stores.obj_dir(&store)?, &obj_name)?;
+                if !linked.same_object(st) {
+                    let _ = sys::unlink_at(stores.obj_dir(&store)?, &obj_name);
+                    return Err(err(
+                        io::ErrorKind::Other,
+                        format!("{}: changed while being preserved", describe(path)),
+                    ));
+                }
                 budget.links += 1;
                 return Ok(Saved {
                     content: Content::Special {
                         obj: obj_ref(&store, &obj_name),
                     },
-                    ident,
+                    ident: Ident::of(&linked),
                     meta,
                     nlink: st.nlink,
                     copied: 0,
@@ -304,13 +312,15 @@ fn preserve_file(
             ));
         }
         budget.links += 1;
-        return Ok(saved(
+        let mut retained = saved(
             Content::File {
                 obj: obj_ref(store, &obj_name),
                 strength: Strength::Link,
             },
             0,
-        ));
+        );
+        retained.ident = Ident::of(&linked);
+        return Ok(retained);
     }
 
     let Some(fd) = file else {
