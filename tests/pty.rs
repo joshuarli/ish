@@ -2448,6 +2448,22 @@ fn implicit_cd_quoted_path() {
 }
 
 #[test]
+fn path_binary_wins_over_implicit_cd() {
+    let sh = PtyShell::spawn_with_opts(
+        &[("foo/.keep", ""), ("bin/foo", "#!/bin/sh\necho path-foo-ran\n")],
+        &[],
+    );
+    let bin = sh.home_path().join("bin");
+    sh.run_command(&format!("export PATH={}", bin.display()));
+    let out = PtyShell::strip_ansi(&sh.run_command("foo"));
+    assert!(out.contains("path-foo-ran"), "expected PATH binary: {out:?}");
+
+    let out = PtyShell::strip_ansi(&sh.run_command("pwd"));
+    let foo_dir = sh.home_path().join("foo").display().to_string();
+    assert!(!out.contains(&foo_dir), "expected to stay in HOME: {out:?}");
+}
+
+#[test]
 fn l_tilde_subdir() {
     // Regression: `l ~/subdir` passed the literal "~/subdir" to list_directory without tilde
     // expansion, producing "No such file or directory".

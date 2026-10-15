@@ -234,10 +234,12 @@ fn main() {
                     shell.exit_warned = false;
                 }
 
-                // Rewrite shorthand cd forms before parsing:
-                //   ".." → "cd ..", "..." → "cd ../..", etc.
-                //   single-arg directory that isn't an executable → "cd <dir>"
-                let line = maybe_rewrite_cd(&line, &shell.aliases, &shell.home);
+                let line = maybe_rewrite_cd(
+                    &line,
+                    &shell.aliases,
+                    &shell.home,
+                    store_path_env(&shell.epsh),
+                );
 
                 // Expand aliases before recording in history so "g status"
                 // becomes "git status" — matches what actually runs.
@@ -2744,10 +2746,7 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
     }
 }
 
-/// Rewrite shorthand cd forms:
-///   ".." → "cd ..", "..." → "cd ../..", "...." → "cd ../../..", etc.
-///   single-arg that is a directory (and not an alias/builtin/executable) → "cd <arg>"
-fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &str) -> String {
+fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &str, path_env: &[u8]) -> String {
     let trimmed = line.trim();
     let words = match lex_simple_command_words(trimmed) {
         Some(words) => words,
@@ -2760,34 +2759,32 @@ fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &str) -> String {
     let first_text = epsh::lexer::parts_to_text(&first.parts);
     let first_quoted = epsh::lexer::parts_have_quoting(&first.parts);
 
-    // Plain cd commands pass through — intercepted in main loop
     if !first_quoted && first_text == "cd" {
         return line.to_string();
     }
 
-    // Dot-dot shorthand: ".." is already valid, "..." → "../..", etc.
     if words.len() == 1
         && !first_quoted
         && first_text.len() >= 2
         && first_text.bytes().all(|b| b == b'.')
     {
-        let levels = first_text.len() - 1; // ".." = 1 level, "..." = 2, etc.
+        let levels = first_text.len() - 1;
         let path = (0..levels).map(|_| "..").collect::<Vec<_>>().join("/");
         return format!("cd {path}");
     }
 
-    // Implicit cd: single word that is a directory (and not a builtin/alias/executable).
     if words.len() != 1 || builtin::is_builtin(&first_text) || aliases.get(&first_text).is_some() {
         return line.to_string();
     }
 
-    let expanded = if let Some(rest) = first_text.strip_prefix('~') {
-        format!("{home}{rest}")
-    } else {
-        first_text
-    };
-    let path = std::path::Path::new(&expanded);
-    if path.is_dir() && !is_executable(path) {
+    let expanded = first_text
+        .strip_prefix('~')
+        .map(|rest| format!("{home}{rest}"));
+    let path = std::path::Path::new(expanded.as_deref().unwrap_or(&first_text));
+    if path.is_dir()
+        && !is_executable(path)
+        && (first_text.contains('/') || path::scan_path(&first_text, path_env).is_none())
+    {
         return format!("cd {trimmed}");
     }
 

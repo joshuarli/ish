@@ -97,6 +97,10 @@ echo $((1 + 2))
 `exit`, `fg`, `denv`, and `z`, must be the whole input line. `cd` and `history`
 can also be used in lists.
 
+A bare directory name becomes an implicit `cd` only when it does not match a
+builtin, alias, or executable on `PATH`. Use `cd name` to enter a directory
+when a command has the same name.
+
 ish-specific commands include:
 
 | Command | Action |
