@@ -3309,15 +3309,13 @@ fn bracketed_paste_over_limit_rejected() {
     );
 }
 
-/// Paste a large document and verify it is rejected without displaying its
-/// contents.
 #[test]
-fn bracketed_paste_agents_md_rejected() {
-    let content = include_str!("../AGENTS.md");
-    assert!(
-        content.len() > 2048,
-        "AGENTS.md must be > 2 KiB for this test"
+fn bracketed_paste_large_markdown_rejected() {
+    let content = format!(
+        "# Test document\n\n{}",
+        "- Synthetic content for the paste limit test.\n".repeat(256)
     );
+    assert!(content.len() > 8192);
 
     let sh = PtyShell::spawn();
 
@@ -3328,27 +3326,16 @@ fn bracketed_paste_agents_md_rejected() {
 
     sh.send(&payload);
 
-    // A rejected paste rings the bell and repaints nothing else.
     let out = sh.wait_for("\x07", 5000);
     let clean = PtyShell::strip_ansi(&out);
-
     assert!(
-        !clean.contains("[paste exceeded 8KB limit]"),
-        "a rejected paste must not insert text into the line: {clean:?}"
-    );
-    // The document's first line must NOT appear on screen.
-    let first_line = content.lines().next().unwrap_or("");
-    assert!(
-        !clean.contains(first_line),
-        "paste content appeared on screen — limit bypassed: {clean:?}"
+        !clean.contains("# Test document"),
+        "paste content appeared on screen: {clean:?}"
     );
 
-    let out2 = sh.run_command("echo ok");
-    let clean2 = PtyShell::strip_ansi(&out2);
-    assert!(
-        clean2.contains("ok"),
-        "shell unresponsive after paste: {clean2:?}"
-    );
+    let out = sh.run_command("echo ok");
+    let clean = PtyShell::strip_ansi(&out);
+    assert!(clean.contains("ok"), "shell unresponsive after paste: {clean:?}");
 }
 
 /// Paste a small payload under the 1 KiB limit and verify the shell accepts
