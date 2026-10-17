@@ -646,6 +646,11 @@ impl Shell {
     pub fn exit_status(&self) -> ExitStatus {
         self.exit_status
     }
+
+    /// Set the status exposed by `$?` after a command executed by the embedder.
+    pub fn set_exit_status(&mut self, status: ExitStatus) {
+        self.exit_status = status;
+    }
     /// Shell's PID (`$$`).
     pub fn pid(&self) -> u32 {
         self.pid
