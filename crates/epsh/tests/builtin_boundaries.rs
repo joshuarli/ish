@@ -201,7 +201,7 @@ fn exec_uses_the_requested_program_as_argv_zero() {
 fn successful_exec_does_not_leak_the_saved_cwd_descriptor() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
-        .args(["-c", "exec /bin/sh -c 'test ! -e /proc/self/fd/3'"])
+        .args(["-c", "exec 3<&-; exec /bin/sh -c 'test ! -e /proc/self/fd/3'"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
