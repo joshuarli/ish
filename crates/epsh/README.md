@@ -58,6 +58,11 @@ capture builtin output and output relayed by epsh's default child executor.
 Embedders that execute commands themselves can call
 `Shell::set_exit_status(ExitStatus)` to set the next `$?` expansion.
 
+`ExitStatus` constructors normalize integer codes to 0–255 modulo 256.
+The `exit` and `return` builtins accept signed 32-bit integer operands and use
+the previous status when the operand is omitted. Invalid or out-of-range
+operands print a diagnostic and terminate the shell with status 2.
+
 Shell values preserve arbitrary bytes; operations at OS and C-string
 boundaries may reject NUL. Use set_var_bytes and get_var_bytes when Rust code
 needs raw variable values; get_var returns a string only when the value is

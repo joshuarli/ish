@@ -27,14 +27,6 @@ Next: 22
 
 
 
-### ISH-12 · P2 · Exit operands and status constructors violate the status contract
-
-- **Area:** Errors
-- **Where:** `crates/epsh/src/builtins.rs:102`, `crates/epsh/src/error.rs:131`, `crates/epsh/src/error.rs:183`
-- **Problem:** ExitStatus documents 0–255 but From<i32> accepts arbitrary values. Library probes returned 256 for `exit 256` and treated that status as failure, while the native shell returns 0. The installed epsh CLI accepted `exit bad` with status 0 and no diagnostic; the native shell rejected it with status 2. Operand parse failure currently falls back to the previous status.
-- **Recommendation:** Validate numeric operands explicitly, report invalid operands, and normalize valid exit codes at a single status boundary. Audit return and other status-producing builtins for the same constructor behavior.
-- **Fix with:** make-invalid-states-unrepresentable, error-model
-- **Effort:** S (hours)
 
 ### ISH-13 · P2 · Pipeline setup errors terminate unrelated background children
 

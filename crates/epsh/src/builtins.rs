@@ -100,19 +100,11 @@ impl Shell {
                 Some(ExitStatus::SUCCESS)
             }
             "exit" => {
-                let code = args
-                    .get(1)
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .map(ExitStatus::from)
-                    .unwrap_or(self.exit_status);
+                let code = self.builtin_status_operand(name, args)?;
                 return Err(ShellError::Exit(code));
             }
             "return" => {
-                let code = args
-                    .get(1)
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .map(ExitStatus::from)
-                    .unwrap_or(self.exit_status);
+                let code = self.builtin_status_operand(name, args)?;
                 return Err(ShellError::Return(code));
             }
             "break" => {
@@ -188,6 +180,19 @@ impl Shell {
         };
 
         Ok(status)
+    }
+
+    fn builtin_status_operand(&self, name: &str, args: &[String]) -> crate::error::Result<ExitStatus> {
+        let Some(operand) = args.get(1) else {
+            return Ok(self.exit_status);
+        };
+        match operand.parse::<i32>() {
+            Ok(code) => Ok(ExitStatus::from(code)),
+            Err(_) => {
+                self.err_msg(&format!("{name}: Illegal number: {operand}"));
+                Err(ShellError::Exit(ExitStatus::MISUSE))
+            }
+        }
     }
 
     fn builtin_echo(&self, args: &[String]) -> ExitStatus {

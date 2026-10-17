@@ -135,6 +135,7 @@ pub type Result<T> = std::result::Result<T, ShellError>;
 /// `NOT_FOUND` (127), `NOT_EXECUTABLE` (126).
 ///
 /// The inner field is private — use `.code()` to extract, `From<i32>` to construct.
+/// Integer inputs are reduced modulo 256, including negative inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ExitStatus(i32);
 
@@ -168,21 +169,21 @@ impl ExitStatus {
     /// Create from a raw waitpid status (decodes WIFEXITED/WEXITSTATUS/WTERMSIG).
     pub fn from_wait(status: i32) -> Self {
         if crate::sys::wifexited(status) {
-            ExitStatus(crate::sys::wexitstatus(status))
+            Self::from(crate::sys::wexitstatus(status))
         } else {
-            ExitStatus(128 + crate::sys::wtermsig(status))
+            Self::from_signal(crate::sys::wtermsig(status))
         }
     }
 
-    /// Create from a signal number (128 + sig).
+    /// Create from a signal number (128 + sig), reduced modulo 256.
     pub fn from_signal(sig: i32) -> Self {
-        ExitStatus(128 + sig)
+        Self::from(sig.wrapping_add(128))
     }
 }
 
 impl From<i32> for ExitStatus {
     fn from(n: i32) -> Self {
-        ExitStatus(n)
+        ExitStatus(n.rem_euclid(256))
     }
 }
 
