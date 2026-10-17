@@ -17,7 +17,7 @@ pub struct CaseScratch {
 
 impl CaseScratch {
     pub fn create(case: &Case) -> Result<Self, String> {
-        let temp_root = validated_temp_root()?;
+        let temp_root = conformance_temp_root()?;
         let directory = tempfile::Builder::new()
             .prefix("epsh-conformance-")
             .tempdir_in(temp_root)
@@ -53,32 +53,32 @@ impl CaseScratch {
     }
 }
 
-fn validated_temp_root() -> Result<PathBuf, String> {
-    let root = std::env::var_os("TMPDIR")
-        .ok_or_else(|| "TMPDIR must point to the repository .work/tmp directory".to_owned())?;
-    let root = PathBuf::from(root);
-    if !root.is_absolute() {
-        return Err("TMPDIR must be an absolute path".to_owned());
-    }
-    if root.file_name() != Some(OsStr::new("tmp"))
-        || root.parent().and_then(Path::file_name) != Some(OsStr::new(".work"))
-    {
-        return Err("TMPDIR must end in .work/tmp".to_owned());
-    }
-
+fn conformance_temp_root() -> Result<PathBuf, String> {
+    let manifest = fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
+        .map_err(|error| format!("cannot resolve package directory: {error}"))?;
+    let repository = manifest.ancestors().find(|path| path.join(".git").exists()).unwrap_or(&manifest);
+    let root = repository.join(".work/tmp");
     let mut prefix = PathBuf::new();
     for component in root.components() {
         prefix.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&prefix)
-            .map_err(|error| format!("cannot inspect TMPDIR component: {error}"))?;
-        if metadata.file_type().is_symlink() {
-            return Err("TMPDIR cannot contain symlinks".to_owned());
+        let metadata = match fs::symlink_metadata(&prefix) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match DirBuilder::new().mode(0o700).create(&prefix) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(format!("cannot create conformance scratch directory: {error}")),
+                }
+                fs::symlink_metadata(&prefix)
+                    .map_err(|error| format!("cannot inspect conformance scratch directory: {error}"))?
+            }
+            Err(error) => return Err(format!("cannot inspect conformance scratch directory: {error}")),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("conformance scratch path contains a symlink or non-directory".to_owned());
         }
     }
-    if !fs::metadata(&root).map_err(|error| format!("cannot inspect TMPDIR: {error}"))?.is_dir() {
-        return Err("TMPDIR must be a directory".to_owned());
-    }
-    fs::canonicalize(root).map_err(|error| format!("cannot resolve TMPDIR: {error}"))
+    Ok(root)
 }
 
 fn create_file_fixture(cwd: &Path, file: &super::parser::FileSetup) -> Result<(), String> {
@@ -214,6 +214,32 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     use super::{confined_path, validate_fixture_path};
+
+    #[test]
+    fn case_scratch_stays_in_work_root_with_ambient_tmpdir() {
+        const CHILD: &str = "EPSH_CONFORMANCE_SCRATCH_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let cases = super::super::parser::parse_corpus(b"name: scratch-root\nscript: true\n---\n").unwrap();
+            let scratch = super::CaseScratch::create(&cases[0]).expect("repository-owned scratch");
+            assert_eq!(std::fs::read(scratch.script.as_ref().unwrap()).unwrap(), b"true\n");
+            let root = scratch.cwd.parent().unwrap().parent().unwrap();
+            assert_eq!(root.file_name(), Some(std::ffi::OsStr::new("tmp")));
+            assert_eq!(root.parent().unwrap().file_name(), Some(std::ffi::OsStr::new(".work")));
+            scratch.close().unwrap();
+            return;
+        }
+        for ambient in [None, Some("/var/folders/ambient-test-tmpdir")] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "conformance::fixture::tests::case_scratch_stays_in_work_root_with_ambient_tmpdir"]);
+            command.env(CHILD, "1");
+            match ambient {
+                Some(path) => { command.env("TMPDIR", path); }
+                None => { command.env_remove("TMPDIR"); }
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{ambient:?}: {}", String::from_utf8_lossy(&output.stdout));
+        }
+    }
 
     #[test]
     fn rejects_parent_components_and_existing_symlink_parents() {

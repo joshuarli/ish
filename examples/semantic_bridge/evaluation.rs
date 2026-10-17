@@ -1056,6 +1056,12 @@ fn actual_in_scratch(
             .ok_or_else(|| ShellError::CommandNotFound(String::new()))?;
         let index = callback_index(command.as_bytes())
             .map_err(|error| ShellError::CommandNotFound(error.to_string()))?;
+        OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(callback_dir.join("invocation-order"))
+            .and_then(|mut file| file.write_all(format!("{index}\n").as_bytes()))
+            .map_err(ShellError::Io)?;
         let observation = callback_observations
             .get(index)
             .ok_or_else(|| ShellError::CommandNotFound(command.to_shell_string()))?;
@@ -1111,7 +1117,7 @@ fn actual_in_scratch(
         .map_err(|_| BridgeError::new("production shell returned a status outside 0..255"))?;
     let program = program_json(parsed)?;
     let state = resulting_state(&program, initial_state, &shell, status)?;
-    let trace = recorded_trace(scratch, observations.len())?;
+    let trace = recorded_trace(scratch, &program, observations.len())?;
     Ok(json!({
         "tag": "success",
         "value": {
@@ -1197,13 +1203,66 @@ fn collect_persistent_assignment_names(
     Ok(())
 }
 
-fn recorded_trace(scratch: &Scratch, observation_count: usize) -> BridgeResult<Vec<Value>> {
+fn pipeline_observation_groups(program: &Value, groups: &mut Vec<Vec<usize>>) -> BridgeResult<()> {
+    match program["tag"].as_str() {
+        Some("pipeline") => {
+            let commands = program["commands"].as_array()
+                .ok_or_else(|| BridgeError::new("evaluation pipeline commands are malformed"))?;
+            let indices = commands.iter().map(|command| {
+                command["observation"].as_u64()
+                    .and_then(|index| usize::try_from(index).ok())
+                    .ok_or_else(|| BridgeError::new("evaluation pipeline observation is malformed"))
+            }).collect::<BridgeResult<Vec<_>>>()?;
+            groups.push(indices);
+        }
+        Some("sequence" | "and" | "or") => {
+            pipeline_observation_groups(&program["left"], groups)?;
+            pipeline_observation_groups(&program["right"], groups)?;
+        }
+        Some("not" | "subshell") => pipeline_observation_groups(&program["body"], groups)?,
+        Some("simple") => {}
+        _ => return Err(BridgeError::new("evaluation expression tag is malformed")),
+    }
+    Ok(())
+}
+
+fn project_invocation_order(program: &Value, mut order: Vec<usize>) -> BridgeResult<Vec<usize>> {
+    let mut pipelines = Vec::new();
+    pipeline_observation_groups(program, &mut pipelines)?;
+    let mut start = 0;
+    while start < order.len() {
+        let Some(pipeline) = pipelines.iter().find(|indices| indices.contains(&order[start])) else {
+            start += 1;
+            continue;
+        };
+        let end = start + order[start..].iter().take_while(|index| pipeline.contains(index)).count();
+        order[start..end].sort_by_key(|index| pipeline.iter().position(|candidate| candidate == index));
+        start = end;
+    }
+    Ok(order)
+}
+
+fn recorded_trace(scratch: &Scratch, program: &Value, observation_count: usize) -> BridgeResult<Vec<Value>> {
+    let order = match fs::read_to_string(scratch.path.join("invocation-order")) {
+        Ok(order) => order,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(BridgeError::new(format!("cannot read evaluation invocation order: {error}"))),
+    };
+    let mut seen = HashSet::new();
+    let order = order.lines().map(|line| {
+        let index = line.parse::<usize>()
+            .map_err(|error| BridgeError::new(format!("invalid evaluation invocation index: {error}")))?;
+        if index >= observation_count || !seen.insert(index) {
+            return Err(BridgeError::new("evaluation invocation index is duplicated or out of range"));
+        }
+        Ok(index)
+    }).collect::<BridgeResult<Vec<_>>>()?;
+    let order = project_invocation_order(program, order)?;
     let mut trace = Vec::new();
-    for index in 0..observation_count {
+    for index in order {
         let path = scratch.path.join(event_name(index));
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(BridgeError::new(format!(
                     "cannot read evaluation callback event {}: {error}",
@@ -1421,5 +1480,39 @@ fn replace_fd(source: &impl AsRawFd, target: i32) -> std::io::Result<()> {
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequential_callback_trace_preserves_observed_invocation_order() {
+        let scratch = Scratch::new().expect("evaluation scratch");
+        for index in [1, 0] {
+            let event = json!({
+                "argv": [callback_name(index).as_bytes()],
+                "environment": [], "cwd": [47], "stdout": [], "stderr": [],
+            });
+            fs::write(scratch.path.join(event_name(index)), serde_json::to_vec(&event).unwrap()).unwrap();
+        }
+        fs::write(scratch.path.join("invocation-order"), b"1\n0\n").unwrap();
+        let program = program_json(&parse_source(format!("{}; {}", callback_name(0), callback_name(1)).as_bytes()).unwrap()).unwrap();
+        let trace = recorded_trace(&scratch, &program, 2).expect("recorded trace");
+        assert_eq!(trace.iter().map(|event| event["argv"].clone()).collect::<Vec<_>>(), vec![
+            json!([callback_name(1).as_bytes()]),
+            json!([callback_name(0).as_bytes()]),
+        ]);
+        scratch.remove().expect("removed scratch");
+    }
+
+    #[test]
+    fn pipeline_projection_preserves_order_between_sequential_groups() {
+        let source = format!("{}; {} | {}; {}", callback_name(0), callback_name(1), callback_name(2), callback_name(3));
+        let program = program_json(&parse_source(source.as_bytes()).unwrap()).unwrap();
+        assert_eq!(project_invocation_order(&program, vec![0, 2, 1, 3]).unwrap(), [0, 1, 2, 3]);
+        assert_eq!(project_invocation_order(&program, vec![3, 2, 1, 0]).unwrap(), [3, 1, 2, 0]);
+        assert_eq!(project_invocation_order(&program, vec![0, 2, 3, 1]).unwrap(), [0, 2, 3, 1]);
     }
 }

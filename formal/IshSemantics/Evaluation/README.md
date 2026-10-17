@@ -98,6 +98,9 @@ These choices are projections, not assertions about kernel event order.
 Compare pipeline status and parent state separately from process traces.
 Compare pipeline output only when the fixture makes scheduling and pipe consumption irrelevant.
 Ordered sequential traces remain comparable when commands contain no pipeline or subshell fork.
+The Rust adapter records callback invocation order. It sorts only contiguous
+callbacks from the same pipeline into stage order, preserving order between
+sequential commands and separate pipelines.
 
 The admitted leaf oracle returns statuses and bytes without callback errors.
 Expansion, redirection, process creation, cancellation, and callback failures require
