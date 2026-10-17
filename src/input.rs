@@ -95,6 +95,7 @@ pub enum InputEvent {
 }
 
 pub struct InputReader {
+    stdin_fd: RawFd,
     signal_fd: RawFd,
     in_paste: bool,
     paste_buf: String,
@@ -112,9 +113,20 @@ enum PollResult {
     StdinHup,
 }
 
+enum SkipPasteResult {
+    Complete,
+    Signal,
+}
+
 impl InputReader {
+    /// The process-owned stdin and signal descriptors must stay open while this reader is used.
     pub fn new(signal_fd: RawFd) -> Self {
+        Self::with_fds(STDIN_FD, signal_fd)
+    }
+
+    fn with_fds(stdin_fd: RawFd, signal_fd: RawFd) -> Self {
         Self {
+            stdin_fd,
             signal_fd,
             in_paste: false,
             paste_buf: String::new(),
@@ -161,7 +173,7 @@ impl InputReader {
     pub fn read_event(&mut self) -> InputEvent {
         loop {
             // Drain buffered data without polling the kernel for every byte.
-            while self.buf_pos < self.buf_end {
+            while self.buf_pos < self.buf_end && !(self.in_paste && self.paste_limit_hit) {
                 if let Some(key) = self.decode_key() {
                     if self.in_paste {
                         self.accumulate_paste_key(key);
@@ -184,13 +196,18 @@ impl InputReader {
                 return InputEvent::Paste(std::mem::take(&mut self.paste_buf));
             }
 
-            // Paste exceeded limit — scan raw bytes for the paste-end marker
-            // (\x1b[201~) without per-byte decode_key overhead.  This blocks
-            // in read() until the marker is found or EOF, so no polling needed.
             if self.in_paste && self.paste_limit_hit {
-                self.skip_paste_remainder();
-                self.paste_limit_hit = false;
-                return InputEvent::PasteRejected;
+                match self.skip_paste_remainder() {
+                    SkipPasteResult::Complete => {
+                        self.paste_limit_hit = false;
+                        return InputEvent::PasteRejected;
+                    }
+                    SkipPasteResult::Signal => {
+                        if let Some(sig) = signal::read_signal() {
+                            return InputEvent::Signal(sig);
+                        }
+                    }
+                }
             }
 
             match self.poll(-1) {
@@ -228,10 +245,11 @@ impl InputReader {
     }
 
     fn poll(&self, timeout_ms: i32) -> PollResult {
-        self.poll_fds(STDIN_FD, timeout_ms)
+        self.poll_fds(self.stdin_fd, timeout_ms)
     }
 
     fn poll_fds(&self, stdin_fd: RawFd, timeout_ms: i32) -> PollResult {
+        // SAFETY: the input fd stays open for this call and the signal fd stays open with the reader.
         let stdin = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
         let signal = unsafe { BorrowedFd::borrow_raw(self.signal_fd) };
         let mut fds = [
@@ -270,14 +288,13 @@ impl InputReader {
         self.buf_pos < self.buf_end || self.poll_stdin(0)
     }
 
-    /// Returns true if the internal buffer has data or stdin is readable within
-    /// `timeout_ms` milliseconds.
     fn poll_stdin(&self, timeout_ms: i32) -> bool {
         // Data already buffered — no need to ask the kernel.
         if self.buf_pos < self.buf_end {
             return true;
         }
-        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        // SAFETY: `stdin_fd` is borrowed and remains open for this reader's lifetime.
+        let stdin = unsafe { BorrowedFd::borrow_raw(self.stdin_fd) };
         let mut fds = [rustix::event::PollFd::from_borrowed_fd(
             stdin,
             rustix::event::PollFlags::IN,
@@ -292,13 +309,12 @@ impl InputReader {
             && fds[0].revents().contains(rustix::event::PollFlags::IN)
     }
 
-    /// Read up to `READ_BUF_SIZE` bytes from stdin into the internal buffer.
-    /// Callers must have fully consumed the buffer (`buf_pos >= buf_end`) first.
     fn fill_buf(&mut self) -> Option<()> {
         debug_assert!(self.buf_pos >= self.buf_end);
         self.buf_pos = 0;
         self.buf_end = 0;
-        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        // SAFETY: `stdin_fd` is borrowed and remains open for this reader's lifetime.
+        let stdin = unsafe { BorrowedFd::borrow_raw(self.stdin_fd) };
         match rustix::io::read(stdin, &mut self.buf) {
             Ok(0) => None,
             Ok(n) => {
@@ -326,83 +342,71 @@ impl InputReader {
         }
     }
 
-    /// Scan raw input buffer for the paste-end marker `\x1b[201~` and consume
-    /// everything up to (and including) it.  When the marker is found,
-    /// `in_paste` is set to false and the buffer position is advanced past it.
-    /// If the paste-end may be split across the end of the current buffer
-    /// (i.e. an ESC was found but there aren't enough bytes to check the
-    /// full 6-byte marker), the bytes from ESC onward are kept at the front
-    /// of the buffer and more data is read so the check can complete.
-    /// Returns with `in_paste = false` when done (paste-end found or EOF).
-    fn skip_paste_remainder(&mut self) {
-        // paste-end = ESC [ 2 0 1 ~
+    fn skip_paste_remainder(&mut self) -> SkipPasteResult {
         const PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
 
         loop {
             if self.buf_pos >= self.buf_end {
-                // Poll for data before reading — on macOS PTY, read() can
-                // return 0 even when more data is coming.  Poll gives a
-                // reliable indication of whether stdin is truly at EOF.
-                if !self.poll_stdin(100) {
-                    // No data available within 100ms; keep waiting.
-                    continue;
-                }
-                if self.fill_buf().is_none() {
-                    // read() failed despite poll saying ready — truly EOF.
-                    self.in_paste = false;
-                    return;
+                match self.poll(100) {
+                    PollResult::Stdin => {
+                        if self.fill_buf().is_none() {
+                            self.in_paste = false;
+                            return SkipPasteResult::Complete;
+                        }
+                    }
+                    PollResult::Signal => return SkipPasteResult::Signal,
+                    PollResult::Timeout => continue,
+                    PollResult::StdinHup => {
+                        self.in_paste = false;
+                        return SkipPasteResult::Complete;
+                    }
                 }
             } else {
                 let remaining = &self.buf[self.buf_pos..self.buf_end];
 
-                // memchr for ESC (0x1b) — first byte of paste-end.
                 if let Some(esc_off) = remaining.iter().position(|&b| b == 0x1b) {
                     let after_esc = &remaining[esc_off..];
                     if after_esc.len() >= PASTE_END.len()
                         && after_esc[..PASTE_END.len()] == *PASTE_END
                     {
-                        // Found the paste-end marker — consume it and exit paste.
                         self.buf_pos += esc_off + PASTE_END.len();
                         self.in_paste = false;
-                        return;
+                        return SkipPasteResult::Complete;
                     }
-                    // Not enough bytes to check the full marker — the paste-end
-                    // may be split across a read boundary.  Keep the bytes from
-                    // ESC onward at the front of the buffer and read more so we
-                    // can check the complete 6-byte sequence on the next iteration.
                     if after_esc.len() < PASTE_END.len() {
                         let partial_len = after_esc.len();
                         self.buf_pos += esc_off;
-                        // Move the partial bytes to the front of the buffer.
                         self.buf.copy_within(self.buf_pos..self.buf_end, 0);
                         self.buf_pos = 0;
                         self.buf_end = partial_len;
-                        // Try to read more bytes after the partial sequence.
-                        if !self.poll_stdin(100) {
-                            continue; // keep waiting
+                        match self.poll(100) {
+                            PollResult::Signal => return SkipPasteResult::Signal,
+                            PollResult::Timeout => continue,
+                            PollResult::StdinHup => {
+                                self.in_paste = false;
+                                return SkipPasteResult::Complete;
+                            }
+                            PollResult::Stdin => {}
                         }
-                        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+                        // SAFETY: `stdin_fd` is borrowed and remains open for this reader's lifetime.
+                        let stdin = unsafe { BorrowedFd::borrow_raw(self.stdin_fd) };
                         match rustix::io::read(stdin, &mut self.buf[self.buf_end..]) {
                             Ok(0) => {
                                 self.in_paste = false;
-                                return;
+                                return SkipPasteResult::Complete;
                             }
                             Ok(n) => {
                                 self.buf_end += n;
-                                // Loop again — now we should have enough bytes.
                                 continue;
                             }
                             Err(_) => {
                                 self.in_paste = false;
-                                return;
+                                return SkipPasteResult::Complete;
                             }
                         }
                     }
-                    // An ESC that isn't paste-end (and we had enough bytes to
-                    // confirm that).  Skip it and continue scanning.
                     self.buf_pos += esc_off + 1;
                 } else {
-                    // No ESC in this buffer — discard it all and refill.
                     self.buf_pos = self.buf_end;
                 }
             }
@@ -679,5 +683,33 @@ mod tests {
         ));
         assert!(started.elapsed() >= Duration::from_millis(25));
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_paste_drain_returns_when_signal_pipe_is_ready() {
+        let (stdin_read, stdin_write) = rustix::pipe::pipe().unwrap();
+        let (signal_read, signal_write) = rustix::pipe::pipe().unwrap();
+        let mut reader = InputReader::with_fds(stdin_read.as_raw_fd(), signal_read.as_raw_fd());
+        reader.in_paste = true;
+        reader.paste_limit_hit = true;
+        let (send_result, receive_result) = std::sync::mpsc::sync_channel(1);
+        let signal_sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            rustix::io::write(&signal_write, b"x").unwrap();
+        });
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            let result = reader.skip_paste_remainder();
+            send_result.send(()).unwrap();
+            result
+        });
+        let observed = receive_result.recv_timeout(Duration::from_secs(1));
+        drop(stdin_write);
+        let returned = worker.join().unwrap();
+        signal_sender.join().unwrap();
+
+        observed.expect("paste drain should observe the signal");
+        assert!(matches!(returned, SkipPasteResult::Signal));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

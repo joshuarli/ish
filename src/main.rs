@@ -9,9 +9,9 @@ use ish::{builtin, complete, config, denv, dispatch, frecency, history, path, pr
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
+mod static_word;
 
 // Thread-local storage for a stopped job's info, written by the external handler
 // and consumed by the main loop. Avoids needing to thread state through epsh's
@@ -44,7 +44,7 @@ struct Shell {
     job: Option<Job>,
     path_cache: path::PathCache,
     exit_warned: bool,
-    signal_fd: RawFd,
+    input_reader: Option<InputReader>,
     home: Option<String>,
     home_display: String,
     session_log: String,
@@ -207,7 +207,7 @@ fn main() {
         job: None,
         path_cache: path::PathCache::new(),
         exit_warned: false,
-        signal_fd,
+        input_reader: Some(InputReader::new(signal_fd)),
         home,
         home_display,
         session_log: String::new(),
@@ -227,6 +227,9 @@ fn main() {
     // Main loop
     let mut exit_code = 0;
     loop {
+        shell
+            .epsh
+            .set_exit_status(epsh::error::ExitStatus::from(shell.last_status));
         if let Err(error) = shell.history.sync() {
             eprintln!("ish: cannot sync history: {error}");
         }
@@ -696,6 +699,16 @@ fn sync_shell_store_derived(shell: &mut Shell) {
 }
 
 fn read_line(shell: &mut Shell) -> ReadResult {
+    let mut reader = shell
+        .input_reader
+        .take()
+        .expect("input reader is present between prompts");
+    let result = read_line_with_reader(shell, &mut reader);
+    shell.input_reader = Some(reader);
+    result
+}
+
+fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadResult {
     let _raw = match term::RawMode::enable() {
         Ok(r) => r,
         Err(e) => {
@@ -705,7 +718,6 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     };
 
     let mut tw = TermWriter::new();
-    let mut reader = InputReader::new(shell.signal_fd);
     let mut line = LineBuffer::new();
     let mut mode = Mode::Normal;
     let mut history_idx: Option<usize> = None;
@@ -1321,16 +1333,7 @@ fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
 }
 
 fn resolve_cd_for_history(line: &str) -> String {
-    use epsh::ast::WordPart;
     use epsh::lexer::{Lexer, Token};
-
-    fn is_static(parts: &[WordPart]) -> bool {
-        parts.iter().all(|part| match part {
-            WordPart::Literal(_) | WordPart::SingleQuoted(_) => true,
-            WordPart::DoubleQuoted(parts) => is_static(parts),
-            _ => false,
-        })
-    }
 
     let trimmed = line.trim();
     let (prefix, rest) = if let Some(rest) = trimmed.strip_prefix("cd ") {
@@ -1345,10 +1348,9 @@ fn resolve_cd_for_history(line: &str) -> String {
     let Ok((Token::Word(parts, _), _)) = lexer.next_token() else {
         return line.to_string();
     };
-    if !is_static(&parts) {
+    let Some(text) = static_word::static_word(&parts) else {
         return line.to_string();
-    }
-    let text = epsh::lexer::parts_to_text(&parts);
+    };
     if text.is_empty() || text.starts_with(['/', '~']) || text == "-" || text.contains(['*', '?', '[']) {
         return line.to_string();
     }

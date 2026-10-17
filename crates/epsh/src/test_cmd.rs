@@ -1,15 +1,15 @@
 use crate::error::ExitStatus;
 use crate::shell_bytes::ShellBytes;
 use crate::sys;
+use std::os::fd::AsFd;
+use std::path::{Path, PathBuf};
 
-/// Full POSIX test/[ implementation with compound expressions.
-pub(crate) fn test_eval(args: &[&str]) -> ExitStatus {
+pub(crate) fn test_eval(args: &[&str], cwd: &Path) -> ExitStatus {
     if args.is_empty() {
         return ExitStatus::FAILURE;
     }
     let mut pos = 0;
-    let result = test_or(args, &mut pos);
-    // If there are unconsumed arguments, it's a syntax error
+    let result = test_or(args, &mut pos, cwd);
     if pos < args.len() {
         eprintln!("test: too many arguments");
         return ExitStatus::MISUSE;
@@ -21,51 +21,49 @@ pub(crate) fn test_eval(args: &[&str]) -> ExitStatus {
     }
 }
 
-fn test_or(args: &[&str], pos: &mut usize) -> bool {
-    let mut result = test_and(args, pos);
+fn test_or(args: &[&str], pos: &mut usize, cwd: &Path) -> bool {
+    let mut result = test_and(args, pos, cwd);
     while *pos < args.len() && args[*pos] == "-o" {
         *pos += 1;
-        let right = test_and(args, pos);
+        let right = test_and(args, pos, cwd);
         result = result || right;
     }
     result
 }
 
-fn test_and(args: &[&str], pos: &mut usize) -> bool {
-    let mut result = test_not(args, pos);
+fn test_and(args: &[&str], pos: &mut usize, cwd: &Path) -> bool {
+    let mut result = test_not(args, pos, cwd);
     while *pos < args.len() && args[*pos] == "-a" {
         *pos += 1;
-        let right = test_not(args, pos);
+        let right = test_not(args, pos, cwd);
         result = result && right;
     }
     result
 }
 
-fn test_not(args: &[&str], pos: &mut usize) -> bool {
+fn test_not(args: &[&str], pos: &mut usize, cwd: &Path) -> bool {
     if *pos < args.len() && args[*pos] == "!" {
         *pos += 1;
-        !test_primary(args, pos)
+        !test_primary(args, pos, cwd)
     } else {
-        test_primary(args, pos)
+        test_primary(args, pos, cwd)
     }
 }
 
-fn test_primary(args: &[&str], pos: &mut usize) -> bool {
+fn test_primary(args: &[&str], pos: &mut usize, cwd: &Path) -> bool {
     if *pos >= args.len() {
         return false;
     }
 
-    // Parenthesized expression
     if args[*pos] == "(" {
         *pos += 1;
-        let result = test_or(args, pos);
+        let result = test_or(args, pos, cwd);
         if *pos < args.len() && args[*pos] == ")" {
             *pos += 1;
         }
         return result;
     }
 
-    // Binary operators (check if next token is binary op)
     if *pos + 2 <= args.len() {
         let maybe_op = if *pos + 1 < args.len() {
             args[*pos + 1]
@@ -124,7 +122,6 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
                 };
             }
             "-nt" | "-ot" | "-ef" => {
-                // File comparison operators
                 let left = args[*pos];
                 *pos += 2;
                 let right = if *pos < args.len() {
@@ -135,8 +132,8 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
                     *pos += 1;
                     ""
                 };
-                let lm = std::fs::metadata(ShellBytes::from_str_lossless(left).to_path_buf()).ok();
-                let rm = std::fs::metadata(ShellBytes::from_str_lossless(right).to_path_buf()).ok();
+                let lm = std::fs::metadata(test_path(cwd, left)).ok();
+                let rm = std::fs::metadata(test_path(cwd, right)).ok();
                 return match maybe_op {
                     "-nt" => match (lm, rm) {
                         (Some(l), Some(r)) => l.modified().ok() > r.modified().ok(),
@@ -162,8 +159,6 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
         }
     }
 
-    // Unary operators — only match if there's a following operand
-    // (and the operand isn't a closing paren or binary op)
     let op = args[*pos];
     let has_operand = *pos + 1 < args.len()
         && !matches!(
@@ -197,7 +192,7 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
             } else {
                 ""
             };
-            ShellBytes::from_str_lossless(p).to_path_buf().exists()
+            test_path(cwd, p).exists()
         }
         "-f" if has_operand => {
             *pos += 1;
@@ -208,7 +203,7 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
             } else {
                 ""
             };
-            ShellBytes::from_str_lossless(p).to_path_buf().is_file()
+            test_path(cwd, p).is_file()
         }
         "-d" if has_operand => {
             *pos += 1;
@@ -219,7 +214,7 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
             } else {
                 ""
             };
-            ShellBytes::from_str_lossless(p).to_path_buf().is_dir()
+            test_path(cwd, p).is_dir()
         }
         "-L" | "-h" if has_operand => {
             *pos += 1;
@@ -230,8 +225,7 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
             } else {
                 ""
             };
-            ShellBytes::from_str_lossless(p)
-                .to_path_buf()
+            test_path(cwd, p)
                 .symlink_metadata()
                 .map(|m| m.file_type().is_symlink())
                 .unwrap_or(false)
@@ -247,7 +241,7 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
             };
             use std::os::unix::fs::MetadataExt;
             let uid = sys::getuid();
-            match std::fs::metadata(ShellBytes::from_str_lossless(p).to_path_buf()) {
+            match std::fs::metadata(test_path(cwd, p)) {
                 Ok(m) => {
                     let mode = m.mode();
                     let is_owner = m.uid() == uid;
@@ -288,7 +282,9 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
             } else {
                 ""
             };
-            std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+            std::fs::metadata(test_path(cwd, p))
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
         }
         "-t" if has_operand => {
             *pos += 1;
@@ -299,8 +295,11 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
             } else {
                 "1"
             };
-            let fd = fd.parse::<i32>().unwrap_or(1);
-            unsafe { rustix::termios::isatty(std::os::fd::BorrowedFd::borrow_raw(fd)) }
+            let Ok(fd) = fd.parse::<i32>() else {
+                return false;
+            };
+            sys::duplicate_fd_above(fd, 0)
+                .is_ok_and(|fd| rustix::termios::isatty(fd.as_fd()))
         }
         "-p" if has_operand => {
             *pos += 1;
@@ -312,7 +311,7 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
                 ""
             };
             use std::os::unix::fs::FileTypeExt;
-            std::fs::metadata(p)
+            std::fs::metadata(test_path(cwd, p))
                 .map(|m| m.file_type().is_fifo())
                 .unwrap_or(false)
         }
@@ -326,7 +325,7 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
                 ""
             };
             use std::os::unix::fs::FileTypeExt;
-            std::fs::metadata(p)
+            std::fs::metadata(test_path(cwd, p))
                 .map(|m| m.file_type().is_block_device())
                 .unwrap_or(false)
         }
@@ -340,7 +339,7 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
                 ""
             };
             use std::os::unix::fs::FileTypeExt;
-            std::fs::metadata(p)
+            std::fs::metadata(test_path(cwd, p))
                 .map(|m| m.file_type().is_char_device())
                 .unwrap_or(false)
         }
@@ -354,7 +353,7 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
                 ""
             };
             use std::os::unix::fs::FileTypeExt;
-            std::fs::metadata(p)
+            std::fs::metadata(test_path(cwd, p))
                 .map(|m| m.file_type().is_socket())
                 .unwrap_or(false)
         }
@@ -368,7 +367,7 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
                 ""
             };
             use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(p)
+            std::fs::metadata(test_path(cwd, p))
                 .map(|m| m.mode() & 0o4000 != 0)
                 .unwrap_or(false)
         }
@@ -382,7 +381,7 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
                 ""
             };
             use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(p)
+            std::fs::metadata(test_path(cwd, p))
                 .map(|m| m.mode() & 0o2000 != 0)
                 .unwrap_or(false)
         }
@@ -396,14 +395,22 @@ fn test_primary(args: &[&str], pos: &mut usize) -> bool {
                 ""
             };
             use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(p)
+            std::fs::metadata(test_path(cwd, p))
                 .map(|m| m.mode() & 0o1000 != 0)
                 .unwrap_or(false)
         }
         _ => {
-            // Bare string: true if non-empty
             *pos += 1;
             !op.is_empty()
         }
+    }
+}
+
+fn test_path(cwd: &Path, operand: &str) -> PathBuf {
+    let path = ShellBytes::from_str_lossless(operand).to_path_buf();
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
     }
 }

@@ -2,6 +2,9 @@
 //! Derives scores from shell history — no separate database needed.
 
 use crate::history::History;
+use crate::static_word::static_word;
+use epsh::ast::Command;
+use epsh::parser::Parser;
 
 /// `z <query>` — jump to the highest-scoring directory matching query.
 /// Scores are derived from cd/z commands in history, weighted by recency.
@@ -104,21 +107,31 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
     0
 }
 
-/// Extract the target directory from a cd/z history entry.
-fn extract_cd_target(entry: &str) -> Option<&str> {
-    let trimmed = entry.trim();
-    // Handle: "cd dir", "z dir", "cd dir && ...", "cd dir; ..."
-    let rest = trimmed
-        .strip_prefix("cd ")
-        .or_else(|| trimmed.strip_prefix("z "))?;
+fn extract_cd_target(entry: &str) -> Option<String> {
+    let program = Parser::new(entry).parse().ok()?;
+    let command = first_command(program.commands.first()?)?;
+    let Command::Simple { assigns, args, .. } = command else {
+        return None;
+    };
+    if !assigns.is_empty() {
+        return None;
+    }
 
-    // Take just the first argument (stop at whitespace, &&, ||, ;, |)
-    let arg = rest
-        .trim_start()
-        .split(|c: char| c.is_whitespace() || c == '&' || c == '|' || c == ';')
-        .next()?;
+    let name = static_word(&args.first()?.parts)?;
+    if !matches!(name.as_str(), "cd" | "z") {
+        return None;
+    }
+    static_word(&args.get(1)?.parts)
+}
 
-    if arg.is_empty() { None } else { Some(arg) }
+fn first_command(command: &Command) -> Option<&Command> {
+    match command {
+        Command::And(left, _) | Command::Or(left, _) | Command::Sequence(left, _) => {
+            first_command(left)
+        }
+        Command::Pipeline { commands, .. } => first_command(commands.first()?),
+        command => Some(command),
+    }
 }
 
 #[cfg(test)]
@@ -127,15 +140,24 @@ mod tests {
 
     #[test]
     fn extract_cd_simple() {
-        assert_eq!(extract_cd_target("cd /tmp"), Some("/tmp"));
-        assert_eq!(extract_cd_target("cd ~/d/ish"), Some("~/d/ish"));
-        assert_eq!(extract_cd_target("z ish"), Some("ish"));
+        assert_eq!(extract_cd_target("cd /tmp").as_deref(), Some("/tmp"));
+        assert_eq!(extract_cd_target("cd ~/d/ish").as_deref(), Some("~/d/ish"));
+        assert_eq!(extract_cd_target("z ish").as_deref(), Some("ish"));
     }
 
     #[test]
     fn extract_cd_from_command_list() {
-        assert_eq!(extract_cd_target("cd /tmp && ls"), Some("/tmp"));
-        assert_eq!(extract_cd_target("cd src; make"), Some("src"));
+        assert_eq!(extract_cd_target("cd /tmp && ls").as_deref(), Some("/tmp"));
+        assert_eq!(extract_cd_target("cd src; make").as_deref(), Some("src"));
+        assert_eq!(
+            extract_cd_target("cd 'project space'").as_deref(),
+            Some("project space")
+        );
+        assert_eq!(
+            extract_cd_target("cd project\\ space").as_deref(),
+            Some("project space")
+        );
+        assert_eq!(extract_cd_target("cd \"$PROJECT\"").as_deref(), None);
     }
 
     #[test]
@@ -157,7 +179,6 @@ mod tests {
 
     #[test]
     fn extract_cd_dash() {
-        assert_eq!(extract_cd_target("cd -"), Some("-"));
-        // The caller filters out "-"
+        assert_eq!(extract_cd_target("cd -").as_deref(), Some("-"));
     }
 }

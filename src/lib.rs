@@ -31,5 +31,6 @@ pub mod path;
 pub mod prompt;
 pub mod render;
 pub mod signal;
+mod static_word;
 pub mod sys;
 pub mod term;
