@@ -1,32 +1,33 @@
 # Testing
 
-Run the full Rust test suite with:
+Run the Rust tests from the workspace root:
 
-    cargo test
+    mkdir -p .work/tmp
+    TMPDIR="$PWD/.work/tmp" cargo test -p epsh
 
-For a focused check, choose the test target that covers the change:
+Run the native conformance suite and print each case result:
 
-    cargo test --test api_stability
-    cargo test --test embedding
-    cargo test --test integration
+    TMPDIR="$PWD/.work/tmp" cargo test -p epsh --test conformance -- --nocapture
 
-Unit tests also live beside the implementation and run under cargo test.
-Integration behavior tests are in [integration.rs](../tests/integration.rs);
-embedding API checks are in [embedding.rs](../tests/embedding.rs); public API
-surface checks are in [api_stability.rs](../tests/api_stability.rs).
+Run one case by ID:
 
-The filtered mksh conformance suite uses the built CLI:
+    EPSH_CONFORMANCE_ID=glob-range-3 TMPDIR="$PWD/.work/tmp" cargo test -p epsh --test conformance legacy_conformance -- --exact --nocapture
 
-    cargo build
-    perl check.pl -p ./target/debug/epsh -s check-epsh.t
+Run cases with one corpus category:
 
-Regenerate the filtered suite from check.t with:
+    EPSH_CONFORMANCE_CATEGORY=shell:legacy-no TMPDIR="$PWD/.work/tmp" cargo test -p epsh --test conformance legacy_conformance -- --exact --nocapture
 
-    perl filter-tests.pl check.t > check-epsh.t
+The conformance runner keeps case data as bytes, creates an isolated working
+directory under `TMPDIR`, and reports host-category exclusions. The corpus and
+its license notice are in `check-epsh.t` and [tests/conformance/NOTICE](../tests/conformance/NOTICE).
+
+Focused Rust targets include [integration.rs](../tests/integration.rs),
+[embedding.rs](../tests/embedding.rs), and [api_stability.rs](../tests/api_stability.rs).
+Unit tests run with `cargo test`.
 
 The stress runner compares output and elapsed time against dash:
 
-    sh tests/stress/run.sh ./target/debug/epsh dash
+    TMPDIR="$PWD/.work/tmp" sh tests/stress/run.sh ./target/debug/epsh dash
 
-Its timings are exploratory and vary with host load; they are not fixed
+Its timings are exploratory and vary with host load. They are not fixed
 performance gates.
