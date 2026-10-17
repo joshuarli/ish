@@ -17,7 +17,10 @@ pub struct Prompt {
 enum GitCache {
     Unknown,
     Repo { root: PathBuf, head: PathBuf },
-    NoRepo { from: PathBuf },
+    NoRepo {
+        from: PathBuf,
+        checked_markers: Vec<PathBuf>,
+    },
 }
 
 impl Default for Prompt {
@@ -141,46 +144,59 @@ impl Prompt {
 
     /// Write git branch into self.branch_buf. Returns true if branch found.
     fn git_branch_into(&mut self, cwd: &Path) -> bool {
-        // Check cache first
         match &self.git {
             GitCache::Repo { root, head } if cwd.starts_with(root) => {
                 self.branch_buf.clear();
                 return read_head_into(head, &mut self.branch_buf);
             }
-            GitCache::NoRepo { from } if from.starts_with(cwd) => {
+            GitCache::NoRepo {
+                from,
+                checked_markers,
+            } if (from.starts_with(cwd) || cwd.starts_with(from))
+                && checked_markers
+                    .iter()
+                    .all(|marker| std::fs::symlink_metadata(marker).is_err()) =>
+            {
+                if from.starts_with(cwd) {
+                    return false;
+                }
+                if let Some(git_dir) = find_git_dir(cwd, Some(from), None) {
+                    return self.cache_git_dir(git_dir, cwd);
+                }
                 return false;
             }
             _ => {}
         }
 
-        // Walk up from cwd, using cached NoRepo as ceiling if applicable
-        let ceiling = match &self.git {
-            GitCache::NoRepo { from } if cwd.starts_with(from) => Some(from.clone()),
-            _ => None,
-        };
-        self.resolve_git(cwd, ceiling.as_ref())
+        self.resolve_git(cwd)
     }
 
-    fn resolve_git(&mut self, cwd: &Path, ceiling: Option<&PathBuf>) -> bool {
-        match find_git_dir(cwd, ceiling) {
+    fn resolve_git(&mut self, cwd: &Path) -> bool {
+        let mut checked_markers = Vec::new();
+        match find_git_dir(cwd, None, Some(&mut checked_markers)) {
             Some(git_dir) => {
-                let root = git_dir.parent().unwrap_or(cwd).to_path_buf();
-                let head_path = git_dir.join("HEAD");
-                self.branch_buf.clear();
-                let found = read_head_into(&head_path, &mut self.branch_buf);
-                self.git = GitCache::Repo {
-                    root,
-                    head: head_path,
-                };
-                found
+                self.cache_git_dir(git_dir, cwd)
             }
             None => {
                 self.git = GitCache::NoRepo {
                     from: cwd.to_path_buf(),
+                    checked_markers,
                 };
                 false
             }
         }
+    }
+
+    fn cache_git_dir(&mut self, git_dir: PathBuf, cwd: &Path) -> bool {
+        let root = git_dir.parent().unwrap_or(cwd).to_path_buf();
+        let head_path = git_dir.join("HEAD");
+        self.branch_buf.clear();
+        let found = read_head_into(&head_path, &mut self.branch_buf);
+        self.git = GitCache::Repo {
+            root,
+            head: head_path,
+        };
+        found
     }
 }
 
@@ -239,7 +255,11 @@ fn shorten_pwd_into(pwd: &str, home: &str, out: &mut String) {
 
 // -- Git helpers --
 
-fn find_git_dir(start: &Path, ceiling: Option<&PathBuf>) -> Option<PathBuf> {
+fn find_git_dir(
+    start: &Path,
+    ceiling: Option<&Path>,
+    mut checked_markers: Option<&mut Vec<PathBuf>>,
+) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
         let dot_git = dir.join(".git");
@@ -248,10 +268,19 @@ fn find_git_dir(start: &Path, ceiling: Option<&PathBuf>) -> Option<PathBuf> {
                 return Some(dot_git);
             }
             if meta.is_file() {
-                return resolve_gitdir_file(&dot_git);
+                let git_dir = resolve_gitdir_file(&dot_git);
+                if git_dir.is_none()
+                    && let Some(markers) = checked_markers.as_deref_mut()
+                {
+                    markers.push(dot_git);
+                }
+                return git_dir;
             }
         }
-        if ceiling.is_some_and(|c| dir == *c) {
+        if let Some(markers) = checked_markers.as_deref_mut() {
+            markers.push(dot_git);
+        }
+        if ceiling.is_some_and(|c| dir == c) {
             return None;
         }
         if !dir.pop() {

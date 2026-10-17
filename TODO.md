@@ -43,14 +43,6 @@ Next: 22
 
 
 
-### ISH-20 · P3 · Prompt retains a no-repository result after repository creation
-
-- **Area:** Data
-- **Where:** `src/prompt.rs:150`, `src/main.rs:308`, `src/main.rs:2272`
-- **Problem:** The prompt caches a negative Git lookup until directory invalidation. A Prompt API probe rendered outside a repository, created .git/HEAD in that same directory, and rendered again: the branch remained absent until explicit invalidation. Running git init without changing directory follows the same cache lifecycle.
-- **Recommendation:** Revalidate a cached negative lookup after commands that may change repository state, or use bounded filesystem freshness checks without spawning Git.
-- **Fix with:** isolate-effects
-- **Effort:** S (hours)
 
 ### ISH-21 · P3 · Default epsh installation exposes conformance fixture binaries
 

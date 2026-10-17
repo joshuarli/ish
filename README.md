@@ -43,7 +43,8 @@ alias .. "cd .."
 ## Interactive use
 
 The prompt shows the user, host, shortened working directory, Git branch, and
-last command status. A red `*` marks a dirty denv environment.
+last command status. A red `*` marks a dirty denv environment. After you run
+`git init` in the current directory, the next prompt shows its branch.
 Control characters in the user, host, directory, and branch appear as `�`.
 
 | Key | Action |
