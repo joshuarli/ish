@@ -97,11 +97,18 @@ pub(crate) struct SavedFd {
     pub(crate) was_closed: bool,
 }
 
+#[derive(Default)]
+pub(crate) struct SavedRedirections {
+    fds: Vec<SavedFd>,
+    previous_pending_stdin: Option<OwnedFd>,
+    pending_stdin_changed: bool,
+}
+
 impl Shell {
     pub(crate) fn setup_redirections(
         &mut self,
         redirs: &[Redir],
-    ) -> crate::error::Result<Vec<SavedFd>> {
+    ) -> crate::error::Result<SavedRedirections> {
         let saved_fd_min = redirs
             .iter()
             .map(|redir| redir.fd)
@@ -115,7 +122,7 @@ impl Shell {
                     "redirection descriptor leaves no room for saved descriptors",
                 ))
             })?;
-        let mut saved = Vec::new();
+        let mut saved = SavedRedirections::default();
         match self.apply_redirections(redirs, &mut saved, saved_fd_min) {
             Ok(()) => Ok(saved),
             Err(error) => {
@@ -194,12 +201,20 @@ impl Shell {
     fn apply_redirections(
         &mut self,
         redirs: &[Redir],
-        saved: &mut Vec<SavedFd>,
+        saved: &mut SavedRedirections,
         saved_fd_min: RawFd,
     ) -> crate::error::Result<()> {
         for redir in redirs {
             let target_fd = redir.fd;
             self.move_backup_for_target(target_fd, saved_fd_min)?;
+            if target_fd == 0 {
+                if saved.pending_stdin_changed {
+                    self.pending_stdin = None;
+                } else {
+                    saved.previous_pending_stdin = self.pending_stdin.take();
+                    saved.pending_stdin_changed = true;
+                }
+            }
             let preserve_fd = !(target_fd == 0
                 && matches!(
                     redir.kind,
@@ -219,7 +234,7 @@ impl Shell {
                     Err(error) => return Err(ShellError::Io(error)),
                 };
 
-                saved.push(SavedFd {
+                saved.fds.push(SavedFd {
                     target_fd,
                     backup_slot,
                     was_closed,
@@ -277,7 +292,6 @@ impl Shell {
                 }
                 RedirKind::HereDoc(body) | RedirKind::HereDocStrip(body) => {
                     let (read_end, write_end) = sys::pipe_owned()?;
-                    let read_end = std::fs::File::from(read_end);
                     let write_end = std::fs::File::from(write_end);
 
                     let expanded = match body {
@@ -297,13 +311,9 @@ impl Shell {
 
                     if target_fd == 0 && (self.stdout_sink.is_some() || self.stderr_sink.is_some())
                     {
-                        if let Some(old) = self.pending_stdin.take() {
-                            // SAFETY: old is a valid fd we own.
-                            sys::close(old)?;
-                        }
-                        self.pending_stdin = Some(read_end.into_raw_fd());
+                        self.pending_stdin = Some(read_end);
                     } else {
-                        install_redirection(read_end.into(), target_fd).map_err(ShellError::Io)?;
+                        install_redirection(read_end, target_fd).map_err(ShellError::Io)?;
                     }
                 }
             }
@@ -312,9 +322,17 @@ impl Shell {
         Ok(())
     }
 
-    pub(crate) fn restore_redirections(&mut self, saved: Vec<SavedFd>) -> crate::error::Result<()> {
+    pub(crate) fn restore_redirections(
+        &mut self,
+        saved: SavedRedirections,
+    ) -> crate::error::Result<()> {
+        let SavedRedirections {
+            fds,
+            previous_pending_stdin,
+            pending_stdin_changed,
+        } = saved;
         let mut errors = Vec::new();
-        for s in saved.into_iter().rev() {
+        for s in fds.into_iter().rev() {
             if let Some(index) = s.backup_slot {
                 let copy = self.redirection_backups[index].take().unwrap().into_raw_fd();
                 if let Err(error) = sys::dup2_result(copy, s.target_fd) {
@@ -335,6 +353,9 @@ impl Shell {
                 }
             }
         }
+        if pending_stdin_changed {
+            self.pending_stdin = previous_pending_stdin;
+        }
         self.trim_redirection_backups();
         if errors.is_empty() {
             Ok(())
@@ -346,7 +367,7 @@ impl Shell {
     pub(crate) fn finish_redirections<T>(
         &mut self,
         primary: crate::error::Result<T>,
-        saved: Vec<SavedFd>,
+        saved: SavedRedirections,
     ) -> crate::error::Result<T> {
         let cleanup = self.restore_redirections(saved);
         self.combine_redirection_cleanup(primary, cleanup)
@@ -355,9 +376,15 @@ impl Shell {
     pub(crate) fn finish_saved_redirections<T>(
         &mut self,
         primary: crate::error::Result<T>,
-        saved: Vec<SavedFd>,
+        saved: SavedRedirections,
     ) -> crate::error::Result<T> {
-        let errors: Vec<_> = saved
+        let SavedRedirections {
+            fds,
+            previous_pending_stdin,
+            ..
+        } = saved;
+        drop(previous_pending_stdin);
+        let errors: Vec<_> = fds
             .into_iter()
             .filter_map(|state| state.backup_slot)
             .filter_map(|index| {

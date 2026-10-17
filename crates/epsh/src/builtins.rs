@@ -5,6 +5,7 @@ use crate::parser::Parser;
 use crate::shell_bytes::ShellBytes;
 use crate::sys;
 use crate::test_cmd::test_eval;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
@@ -480,7 +481,6 @@ impl Shell {
     }
 
     fn builtin_read(&mut self, args: &[String]) -> ExitStatus {
-        // Parse options
         let mut i = 1;
         let mut raw_mode = false;
         while i < args.len() && args[i].starts_with('-') {
@@ -496,16 +496,19 @@ impl Shell {
             vec!["REPLY"]
         };
 
-        // Read a line char-by-char from fd 0 (works with redirections)
+        let stdin_fd = self
+            .pending_stdin
+            .as_ref()
+            .map(AsRawFd::as_raw_fd)
+            .unwrap_or(0);
         let mut line = Vec::new();
         let mut buf = [0u8; 1];
-        let mut hit_eof = true; // assume EOF until we see a newline
+        let mut hit_eof = true;
         let mut continued = false;
         loop {
-            // SAFETY: fd 0 (stdin) is valid; buf is a live 1-byte array.
-            let n = sys::read(0, buf.as_mut_ptr().cast(), 1);
+            let n = sys::read(stdin_fd, buf.as_mut_ptr().cast(), 1);
             if n <= 0 {
-                break; // EOF or error
+                break;
             }
             let ch = buf[0] as char;
             if ch == '\n' {
@@ -517,9 +520,7 @@ impl Shell {
                 break;
             }
             if ch == '\\' && !raw_mode {
-                // Line continuation: peek at next char
-                // SAFETY: fd 0 (stdin) is valid; buf is a live 1-byte array.
-                let n2 = sys::read(0, buf.as_mut_ptr().cast(), 1);
+                let n2 = sys::read(stdin_fd, buf.as_mut_ptr().cast(), 1);
                 if n2 <= 0 {
                     line.push(b'\\');
                     break;
@@ -537,7 +538,6 @@ impl Shell {
         }
 
         if hit_eof && line.is_empty() {
-            // Pure EOF with no data: set variables to empty
             for name in &var_names {
                 if let Err(e) = self.vars.set_shell(name, "") {
                     self.err_msg(&format!("read: {e}"));
@@ -551,7 +551,6 @@ impl Shell {
         let ifs = self.vars.ifs();
         let delimiters: Vec<&str> = crate::encoding::shell_chars(&ifs).collect();
         if var_names.len() == 1 {
-            // Single variable gets the whole line (with leading/trailing IFS stripped)
             let units: Vec<&str> = crate::encoding::shell_chars(&line).collect();
             let start = units.iter().position(|unit| !delimiters.contains(unit)).unwrap_or(units.len());
             let end = units.iter().rposition(|unit| !delimiters.contains(unit)).map_or(start, |index| index + 1);
@@ -561,30 +560,25 @@ impl Shell {
                 return ExitStatus::FAILURE;
             }
         } else {
-            // Multiple variables: split on IFS, last gets remainder
             let mut fields = Vec::new();
             let chars: Vec<&str> = crate::encoding::shell_chars(&line).collect();
             let mut pos = 0;
 
-            // Skip leading IFS whitespace
             while pos < chars.len() && delimiters.contains(&chars[pos]) && chars[pos].chars().all(char::is_whitespace) {
                 pos += 1;
             }
 
             for vi in 0..var_names.len() {
                 if vi == var_names.len() - 1 {
-                    // Last variable gets the rest
                     let end = chars[pos..].iter().rposition(|unit| !delimiters.contains(unit) || !unit.chars().all(char::is_whitespace))
                         .map_or(pos, |index| pos + index + 1);
                     fields.push(chars[pos..end].iter().copied().collect::<String>());
                 } else {
-                    // Accumulate until next IFS char
                     let start = pos;
                     while pos < chars.len() && !delimiters.contains(&chars[pos]) {
                         pos += 1;
                     }
                     fields.push(chars[start..pos].iter().copied().collect::<String>());
-                    // Skip IFS delimiters
                     while pos < chars.len() && delimiters.contains(&chars[pos]) {
                         pos += 1;
                     }
@@ -599,7 +593,6 @@ impl Shell {
                 }
             }
         }
-        // POSIX: return >0 if EOF was detected, even if data was read
         if hit_eof {
             ExitStatus::FAILURE
         } else {
