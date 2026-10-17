@@ -2800,7 +2800,7 @@ fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &std::ffi::OsStr, path
         return format!("cd {path}");
     }
 
-    if words.len() != 1 || builtin::is_builtin(&first_text) || aliases.get(&first_text).is_some() {
+    if words.len() != 1 || builtin::is_builtin(first_text) || aliases.get(first_text).is_some() {
         return line.to_string();
     }
 
@@ -2812,7 +2812,7 @@ fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &std::ffi::OsStr, path
     let path = expanded.as_deref().unwrap_or_else(|| Path::new(first_text));
     if path.is_dir()
         && !is_executable(path)
-        && (first_text.contains('/') || path::scan_path(&first_text, path_env).is_none())
+        && (first_text.contains('/') || path::scan_path(first_text, path_env).is_none())
     {
         return format!("cd {trimmed}");
     }
