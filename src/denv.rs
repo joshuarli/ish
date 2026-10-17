@@ -414,6 +414,10 @@ fn state_var_matches(found: &EnvFiles) -> bool {
 }
 
 fn trust_key(path: &Path) -> String {
+    format!("sha256-{}", sha256::hex_digest(path.as_os_str().as_bytes()))
+}
+
+fn legacy_trust_key(path: &Path) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let bytes = path.as_os_str().as_encoded_bytes();
     let mut key = String::with_capacity(bytes.len() * 2);
@@ -462,8 +466,13 @@ fn read_trusted_candidate(path: &Path) -> Result<TrustCandidate, String> {
 }
 
 fn is_allowed_in(allow_dir: &Path, file: &TrustCandidate) -> bool {
-    fs::read_to_string(allow_dir.join(trust_key(&file.path)))
-        .is_ok_and(|stored| stored.trim() == file.hash)
+    let stored = match fs::read_to_string(allow_dir.join(trust_key(&file.path))) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::read_to_string(allow_dir.join(legacy_trust_key(&file.path)))
+        }
+        result => result,
+    };
+    stored.is_ok_and(|stored| stored.trim() == file.hash)
 }
 
 fn allow_file_in(dir: &Path, file: &TrustCandidate) -> Result<(), String> {
@@ -473,13 +482,23 @@ fn allow_file_in(dir: &Path, file: &TrustCandidate) -> Result<(), String> {
 }
 
 fn deny_file(data_dir: &Path, path: &Path) -> Result<(), String> {
-    let trust_file = data_dir.join("allow").join(trust_key(path));
-    match fs::remove_file(&trust_file) {
-        Ok(_) => eprintln!("denv: denied {}", path.display()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            eprintln!("denv: {} not currently allowed", path.display());
+    let allow = data_dir.join("allow");
+    let mut removed = false;
+    for (key, legacy) in [(legacy_trust_key(path), true), (trust_key(path), false)] {
+        match fs::remove_file(allow.join(key)) {
+            Ok(()) => removed = true,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err)
+                if legacy
+                    && err.raw_os_error()
+                        == Some(rustix::io::Errno::NAMETOOLONG.raw_os_error()) => {}
+            Err(err) => return Err(format!("failed to remove trust file: {err}")),
         }
-        Err(err) => return Err(format!("failed to remove trust file: {err}")),
+    }
+    if removed {
+        eprintln!("denv: denied {}", path.display());
+    } else {
+        eprintln!("denv: {} not currently allowed", path.display());
     }
     Ok(())
 }
@@ -2088,6 +2107,90 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(400));
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn trust_long_project_paths_allow_edit_and_deny() {
+        let tmp = TempDir::new("t14");
+        let data = tmp.path().join("data");
+        let project = tmp.path()
+            .join("ordinary-project")
+            .join("nested-directory")
+            .join("another-directory")
+            .join("project-workspace");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join(".env");
+        fs::write(&path, "A=1\n").unwrap();
+        let file = read_trusted_candidate(&path).unwrap();
+        assert!(file.path.as_os_str().as_bytes().len() > 127);
+        let allow = data.join("allow");
+
+        allow_file_in(&allow, &file).unwrap();
+        assert!(is_allowed_in(&allow, &file));
+        fs::write(&path, "A=2\n").unwrap();
+        let edited = read_trusted_candidate(&path).unwrap();
+        assert!(!is_allowed_in(&allow, &edited));
+        allow_file_in(&allow, &edited).unwrap();
+        assert!(is_allowed_in(&allow, &edited));
+        deny_file(&data, &edited.path).unwrap();
+        assert!(!is_allowed_in(&allow, &edited));
+        deny_file(&data, &edited.path).unwrap();
+    }
+
+    #[test]
+    fn trust_legacy_approval_remains_valid_and_deny_removes_both_formats() {
+        let tmp = TempDir::new("t14");
+        let data = tmp.path().join("data");
+        let allow = data.join("allow");
+        fs::create_dir_all(&allow).unwrap();
+        let path = tmp.path().join(".env");
+        fs::write(&path, "A=1\n").unwrap();
+        let file = read_trusted_candidate(&path).unwrap();
+        let legacy_key: String = file.path.as_os_str().as_bytes().iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        fs::write(allow.join(&legacy_key), &file.hash).unwrap();
+
+        assert!(is_allowed_in(&allow, &file));
+        deny_file(&data, &file.path).unwrap();
+        assert!(!is_allowed_in(&allow, &file));
+        fs::write(allow.join(&legacy_key), &file.hash).unwrap();
+        fs::write(&path, "A=2\n").unwrap();
+        let edited = read_trusted_candidate(&path).unwrap();
+        assert!(!is_allowed_in(&allow, &edited));
+        allow_file_in(&allow, &edited).unwrap();
+        assert!(is_allowed_in(&allow, &edited));
+        assert!(!is_allowed_in(&allow, &file));
+        fs::write(allow.join(trust_key(&file.path)), [0xff]).unwrap();
+        assert!(!is_allowed_in(&allow, &file));
+        assert!(!is_allowed_in(&allow, &edited));
+        allow_file_in(&allow, &edited).unwrap();
+        deny_file(&data, &file.path).unwrap();
+        assert!(!is_allowed_in(&allow, &edited));
+        assert!(!is_allowed_in(&allow, &file));
+        assert!(!allow.join(legacy_key).exists());
+    }
+
+    #[test]
+    fn trust_preserves_non_utf8_identity_and_canonical_aliases() {
+        let tmp = TempDir::new("t14");
+        let data = tmp.path().join("data");
+        let project = tmp.path().join("ordinary-project").join("nested-directory");
+        fs::create_dir_all(&project).unwrap();
+        let first = project.join(OsString::from_vec(vec![b'.', b'e', b'n', b'v', 0xfe]));
+        let second = project.join(OsString::from_vec(vec![b'.', b'e', b'n', b'v', 0xff]));
+        fs::write(&first, "A=1\n").unwrap();
+        fs::write(&second, "A=1\n").unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let allow = data.join("allow");
+        let file = read_trusted_candidate(&first).unwrap();
+
+        allow_file_in(&allow, &file).unwrap();
+        assert!(is_allowed_in(&allow, &read_trusted_candidate(&alias).unwrap()));
+        assert!(!is_allowed_in(&allow, &read_trusted_candidate(&second).unwrap()));
+        deny_file(&data, &file.path).unwrap();
+        assert!(!is_allowed_in(&allow, &read_trusted_candidate(&alias).unwrap()));
     }
 
     #[test]

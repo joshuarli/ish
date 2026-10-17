@@ -154,6 +154,8 @@ Evaluation stops after 60 seconds.
 `denv` fixes its trust and restoration storage directory when the shell starts,
 using `DENV_DATA_DIR` or `$HOME/.local/share/denv`. Project changes to `HOME` or
 `DENV_DATA_DIR` do not move that storage. Leaving a project restores its variables.
+Trust records use bounded SHA-256 filenames derived from each file's canonical
+path bytes. Existing approvals remain valid; `denv deny` revokes both formats.
 
 ## Help and license
 

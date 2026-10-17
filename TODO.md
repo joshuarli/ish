@@ -29,14 +29,6 @@ Next: 22
 
 
 
-### ISH-14 · P2 · Denv trust filenames reject ordinary long project paths
-
-- **Area:** Data
-- **Where:** `src/denv.rs:400`, `src/denv.rs:468`
-- **Problem:** The trust key hex-encodes the entire canonical path as one filename, doubling its byte length. On a filesystem with a 255-byte component limit, a public-API probe using a 134-byte .env path made `denv allow` fail with Filename too long and status 1. Such paths need no unusually long individual directory name.
-- **Recommendation:** Use a bounded digest of the canonical path for the trust filename, retaining the existing content validation and checking existing trust-format migration requirements.
-- **Fix with:** os-boundaries, durable-state
-- **Effort:** S (hours)
 
 ### ISH-15 · P2 · Safe library APIs conceal environment mutation preconditions
 
