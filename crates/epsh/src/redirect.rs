@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 
 use crate::ast::*;
 use crate::error::ShellError;
@@ -100,8 +100,11 @@ impl Shell {
                         self.err_msg(&format!("{filename}: {e}"));
                         ShellError::Io(e)
                     })?;
-                    // SAFETY: file fd is valid from File::open; target_fd is the redirect target.
-                    sys::dup2(file.as_raw_fd(), target_fd);
+                    if file.as_raw_fd() == target_fd {
+                        let _ = file.into_raw_fd();
+                    } else {
+                        sys::dup2(file.as_raw_fd(), target_fd);
+                    }
                 }
                 RedirKind::Output(word)
                 | RedirKind::Clobber(word)
@@ -121,14 +124,16 @@ impl Shell {
                             self.err_msg(&format!("{filename}: {e}"));
                             ShellError::Io(e)
                         })?;
-                    // SAFETY: file is an open descriptor owned for this call; target_fd is the redirect target.
-                    sys::dup2(file.as_raw_fd(), target_fd);
+                    if file.as_raw_fd() == target_fd {
+                        let _ = file.into_raw_fd();
+                    } else {
+                        sys::dup2(file.as_raw_fd(), target_fd);
+                    }
                 }
                 RedirKind::DupInput(word) | RedirKind::DupOutput(word) => {
                     let fd_str = self.expand_string(word)?;
                     if fd_str == "-" {
-                        // SAFETY: target_fd is a valid fd number from the redirect syntax.
-                        sys::close(target_fd);
+                        sys::close(target_fd)?;
                     } else if let Ok(source_fd) = fd_str.parse::<i32>() {
                         // SAFETY: source_fd is user-specified (may fail at OS level); target_fd is from redirect syntax.
                         sys::dup2(source_fd, target_fd);
@@ -171,17 +176,16 @@ impl Shell {
                     // is still used since they run in-process on this thread.
                     if target_fd == 0 && (self.stdout_sink.is_some() || self.stderr_sink.is_some())
                     {
-                        // Close any previously pending stdin (shouldn't happen in practice).
                         if let Some(old) = self.pending_stdin.take() {
                             // SAFETY: old is a valid fd we own.
-                            sys::close(old);
+                            let _ = sys::close(old);
                         }
                         self.pending_stdin = Some(read_fd);
                         // No SavedFd entry needed: we never touched fd 0.
                     } else {
                         // SAFETY: read_fd is valid from pipe(); target_fd is the redirect target.
                         sys::dup2(read_fd, target_fd);
-                        sys::close(read_fd);
+                        let _ = sys::close(read_fd);
                     }
                 }
             }
@@ -196,7 +200,7 @@ impl Shell {
             if let Some(copy) = s.saved_copy {
                 // SAFETY: copy is a valid fd from fcntl_dupfd_cloexec; target_fd is the original fd being restored.
                 sys::dup2(copy, s.target_fd);
-                sys::close(copy);
+                let _ = sys::close(copy);
             } else if s.was_closed
                 // SAFETY: only queried; a redirection that failed before its
                 // dup2 left the descriptor closed, and closing it again would
@@ -206,7 +210,7 @@ impl Shell {
                 })
                 .is_ok()
             {
-                sys::close(s.target_fd);
+                let _ = sys::close(s.target_fd);
             }
         }
     }

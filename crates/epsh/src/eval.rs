@@ -656,12 +656,11 @@ impl Shell {
         target: &str,
         span: Span,
     ) -> crate::error::Result<()> {
+        let Some(policy) = self.command_policy.as_mut() else {
+            return Ok(());
+        };
         let target = ShellBytes::from_str_lossless(target);
-        if let Some(diagnostic) = self
-            .command_policy
-            .as_mut()
-            .and_then(|policy| policy(&target))
-        {
+        if let Some(diagnostic) = policy(&target) {
             return Err(ShellError::Runtime {
                 msg: diagnostic,
                 span,
@@ -675,17 +674,21 @@ impl Shell {
         args: &[String],
         span: Span,
     ) -> crate::error::Result<()> {
-        let Some(target) = args.first() else {
-            return Ok(());
-        };
-        self.check_command_policy(target, span)?;
-        if target == "command"
-            && let crate::builtins::CommandAction::Execute(nested_args) =
-                crate::builtins::command_action(args)
-        {
-            self.check_command_policy_for_dispatch(nested_args, span)?;
+        let mut args = args;
+        loop {
+            let Some(target) = args.first() else {
+                return Ok(());
+            };
+            self.check_command_policy(target, span)?;
+            if target != "command" {
+                return Ok(());
+            }
+            match crate::builtins::command_action(args) {
+                crate::builtins::CommandAction::Execute(nested_args) => args = nested_args,
+                crate::builtins::CommandAction::Empty
+                | crate::builtins::CommandAction::Describe { .. } => return Ok(()),
+            }
         }
-        Ok(())
     }
 
     /// Check cancellation flag and timeout deadline.
@@ -1421,8 +1424,7 @@ impl Shell {
             // exec redirections are permanent — close saved copies instead of restoring
             for s in saved_fds {
                 if let Some(copy) = s.saved_copy {
-                    // SAFETY: copy is a valid fd from fcntl_dupfd_cloexec.
-                    sys::close(copy);
+                    let _ = sys::close(copy);
                 }
             }
         } else {
@@ -1696,10 +1698,9 @@ impl Shell {
             unsafe {
                 let pid = sys::fork();
                 if pid < 0 {
-                    // Fork failed — clean up pipes and kill already-forked children
                     for &(r, w) in &pipes {
-                        sys::close(r);
-                        sys::close(w);
+                        let _ = sys::close(r);
+                        let _ = sys::close(w);
                     }
                     self.kill_children();
                     return Err(ShellError::Io(std::io::Error::last_os_error()));
@@ -1726,10 +1727,9 @@ impl Shell {
                     if i < commands.len() - 1 {
                         sys::dup2(pipes[i].1, 1);
                     }
-                    // Close all pipe fds
                     for &(read_fd, write_fd) in &pipes {
-                        sys::close(read_fd);
-                        sys::close(write_fd);
+                        let _ = sys::close(read_fd);
+                        let _ = sys::close(write_fd);
                     }
 
                     // Mark this as exit context — eval_external can exec
@@ -1758,9 +1758,8 @@ impl Shell {
 
         // Parent: close all pipe fds
         for &(read_fd, write_fd) in &pipes {
-            // SAFETY: fds are valid from pipe() and not yet closed in parent.
-            sys::close(read_fd);
-            sys::close(write_fd);
+            let _ = sys::close(read_fd);
+            let _ = sys::close(write_fd);
         }
 
         // Interactive mode: give the pipeline the terminal
@@ -2048,7 +2047,7 @@ impl Shell {
             }
 
             // Parent: read from read end
-            sys::close(fds[1]);
+            let _ = sys::close(fds[1]);
             self.child_pids.push(pid);
 
             let mut raw_output = Vec::new();
@@ -2194,7 +2193,6 @@ mod tests {
     #[test]
     fn run_pipeline_external() {
         let mut shell = Shell::new();
-        // Simple pipeline test using external commands
         let status = shell.run_script("echo hello | cat");
         assert_eq!(status, 0);
     }
@@ -2208,7 +2206,7 @@ mod tests {
         shell.vars_mut().export("EPSH_PIPELINE_ENV");
 
         let status = shell.run_script(&format!(
-            "/usr/bin/env | /usr/bin/grep EPSH_PIPELINE_ENV > {output_path}"
+            "/usr/bin/env | /bin/grep EPSH_PIPELINE_ENV > {output_path}"
         ));
         assert_eq!(status, 0);
         assert_eq!(

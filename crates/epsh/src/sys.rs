@@ -37,8 +37,8 @@ pub fn pipe(fds: *mut i32) -> i32 {
             ))
             .is_err()
             {
-                close(read_fd);
-                close(write_fd);
+                let _ = close(read_fd);
+                let _ = close(write_fd);
                 return -1;
             }
             unsafe {
@@ -51,12 +51,21 @@ pub fn pipe(fds: *mut i32) -> i32 {
     }
 }
 
-/// Close a file descriptor (ignores EBADF, matching the libc close semantics
-/// used by callers that may close an already-closed fd).
-pub fn close(fd: RawFd) {
-    // SAFETY: fd is a raw fd; rustix closes it. Invalid fds return EBADF,
-    // which we intentionally ignore.
-    unsafe { rustix::io::close(fd) };
+/// Close a descriptor, accepting EBADF for shell redirections that close an already-closed fd.
+pub fn close(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: libc close accepts any raw descriptor value and closes only the descriptor named by fd.
+    // rustix's raw close assumes fd is valid and panics on EBADF, which shell close redirections allow.
+    let result = unsafe { libc::close(fd) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EBADF) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 /// Read up to `len` bytes from `fd` into `buf`. Returns bytes read (>= 0)
@@ -176,8 +185,8 @@ mod tests {
             .expect("read end flags");
         let write_flags = rustix::io::fcntl_getfd(unsafe { BorrowedFd::borrow_raw(fds[1]) })
             .expect("write end flags");
-        close(fds[0]);
-        close(fds[1]);
+        let _ = close(fds[0]);
+        let _ = close(fds[1]);
 
         assert!(read_flags.contains(rustix::io::FdFlags::CLOEXEC));
         assert!(write_flags.contains(rustix::io::FdFlags::CLOEXEC));

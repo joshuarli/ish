@@ -1860,13 +1860,9 @@ mod raw_bytes {
         );
         let out = run_script_os(tmp.path(), &script, &[]);
         assert_eq!(out.status.code().unwrap(), 0);
-        assert_eq!(
-            String::from_utf8(out.stdout).unwrap(),
-            format!(
-                "{}\n",
-                ShellBytes::from_os_str(dir.as_os_str()).to_shell_string()
-            )
-        );
+        let mut expected = dir.as_os_str().as_bytes().to_vec();
+        expected.push(b'\n');
+        assert_eq!(out.stdout, expected);
         assert_eq!(fs::read(dir.join("child.txt")).unwrap(), b"ok");
     }
 
@@ -1945,16 +1941,9 @@ mod raw_bytes {
             &[],
         );
         assert_eq!(out.status.code().unwrap(), 0);
-        let stdout = String::from_utf8(out.stdout).unwrap();
-        assert_eq!(
-            stdout,
-            format!(
-                "{}\n{}\n",
-                encoding::bytes_to_str(b"match-a-\x80.txt"),
-                encoding::bytes_to_str(b"match-b-\x81.txt")
-            )
-        );
-        assert!(!stdout.contains("miss-"));
+        let mut expected = b"match-a-".to_vec();
+        expected.extend_from_slice(b"\x80.txt\nmatch-b-\x81.txt\n");
+        assert_eq!(out.stdout, expected);
     }
 
     #[test]
