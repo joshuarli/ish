@@ -8,6 +8,9 @@ static PENDING_SIGNALS: [AtomicBool; PENDING_SIGNAL_COUNT] =
     [const { AtomicBool::new(false) }; PENDING_SIGNAL_COUNT];
 
 pub fn name_to_signal(name: &str) -> Option<Signal> {
+    if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()) {
+        return name.parse::<i32>().ok().and_then(Signal::from_named_raw);
+    }
     let name = name.strip_prefix("SIG").unwrap_or(name);
     match name {
         "HUP" => Some(Signal::HUP),
