@@ -2544,7 +2544,7 @@ fn multiline_preserves_unicode_quotes_and_backslash_newlines() {
 }
 
 #[test]
-fn history_replays_relative_cd_from_shell_special_directory() {
+fn interactive_final_history_replay_restores_the_recorded_directory() {
     let sh = PtyShell::spawn_with_setup(
         &[], &[], &[], 24, 120, Some("parent space'quote"),
         |home| std::fs::create_dir_all(home.join("parent space'quote/child")).unwrap(),
@@ -2553,10 +2553,11 @@ fn history_replays_relative_cd_from_shell_special_directory() {
     sh.up();
     sh.enter();
     sh.wait_for_prompt_after_line_advance(2000);
-    sh.run_command("echo $? > replay-status");
+    sh.run_command("pwd > replay-pwd");
+    let child = sh.home_path().join("parent space'quote/child");
     assert_eq!(
-        std::fs::read(sh.home_path().join("parent space'quote/child/replay-status")).unwrap(),
-        b"0\n",
+        std::fs::read_to_string(child.join("replay-pwd")).unwrap().trim(),
+        std::fs::canonicalize(child).unwrap().to_str().unwrap(),
     );
 }
 
@@ -3607,6 +3608,78 @@ fn bracketed_paste_exactly_at_limit_accepted() {
     assert!(
         !clean.contains("[paste exceeded 8KB limit]"),
         "1024-byte paste was wrongly rejected: {clean:?}"
+    );
+}
+
+#[test]
+fn interactive_final_typeahead_after_enter_survives_the_next_prompt() {
+    let sh = PtyShell::spawn();
+    sh.send(b"echo first > first\recho second > second\recho $((12345+67890))\r");
+    sh.wait_for("80235", 3000);
+
+    assert!(sh.home_path().join("first").exists());
+    assert!(sh.home_path().join("second").exists());
+}
+
+#[test]
+fn interactive_final_sigterm_interrupts_oversized_paste_drain() {
+    let sh = PtyShell::spawn();
+    let mut payload = Vec::with_capacity(6 + 9 * 1024);
+    payload.extend_from_slice(b"\x1b[200~");
+    payload.extend(std::iter::repeat_n(b'x', 9 * 1024));
+    sh.send(&payload);
+    sh.wait_for_quiescence(100);
+
+    let mut terminal = sh.terminal.borrow_mut();
+    terminal.signal(libc::SIGTERM).unwrap();
+    let deadline = terminal.deadline(std::time::Duration::from_secs(2));
+    let status = terminal.wait_for_exit(deadline).expect("ish exits after SIGTERM");
+    assert_eq!(status, ExitStatus::Code(143));
+    terminal
+        .assert_terminal_restored(&sh.terminal_baseline)
+        .expect("terminal modes are restored after SIGTERM during paste");
+}
+
+#[test]
+fn interactive_final_failed_shell_builtins_update_question_status() {
+    let sh = PtyShell::spawn();
+    let failed_cd = sh.run_command("cd missing-directory");
+    assert!(failed_cd.contains("missing-directory"));
+    let status = PtyShell::strip_ansi(&sh.run_command("echo builtin-status-$?"));
+    assert!(
+        status.lines().any(|line| line.trim() == "builtin-status-1"),
+        "expected failed cd status 1, got {status:?}"
+    );
+
+    let rejected = sh.run_command("z project && true");
+    assert!(
+        rejected.contains("z changes shell state"),
+        "expected out-of-line z refusal, got {rejected:?}"
+    );
+    let status = PtyShell::strip_ansi(&sh.run_command("echo rejected-status-$?"));
+    assert!(
+        status.lines().any(|line| line.trim() == "rejected-status-2"),
+        "expected rejected command status 2, got {status:?}"
+    );
+}
+
+#[test]
+fn interactive_final_z_matches_quoted_directory_history() {
+    let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 120, None, |home| {
+        std::fs::create_dir(home.join("project space")).unwrap();
+    });
+    sh.run_command("cd 'project space'");
+    sh.run_command("cd ..");
+    let output = PtyShell::strip_ansi(&sh.run_command("z project"));
+    assert!(
+        !output.contains("no match"),
+        "quoted directory history should match z: {output:?}"
+    );
+    sh.run_command("pwd > z-pwd");
+    let target = sh.home_path().join("project space");
+    assert_eq!(
+        std::fs::read_to_string(target.join("z-pwd")).unwrap().trim(),
+        std::fs::canonicalize(target).unwrap().to_str().unwrap(),
     );
 }
 
