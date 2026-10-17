@@ -67,6 +67,43 @@ impl Request {
             "input": self.input,
         })
     }
+
+    pub(crate) fn from_json(value: Value) -> BridgeResult<Self> {
+        exact_object(
+            &value,
+            &["version", "id", "family", "source", "state", "fuel", "input"],
+            "request",
+        )?;
+        if value["version"] != 1 {
+            return Err(BridgeError::new("request has an unsupported version"));
+        }
+        let id = value["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| BridgeError::new("request ID is missing or empty"))?
+            .to_string();
+        let family = Family::parse(
+            value["family"]
+                .as_str()
+                .ok_or_else(|| BridgeError::new("request family is not text"))?,
+        )?;
+        let source = require_bytes(&value["source"], "request source")?;
+        validate_state(&value["state"])?;
+        let fuel = value["fuel"]
+            .as_u64()
+            .ok_or_else(|| BridgeError::new("request fuel is not a natural number"))?;
+        if !value["input"].is_object() {
+            return Err(BridgeError::new("request input is not an object"));
+        }
+        Ok(Self {
+            id,
+            family,
+            source,
+            state: value["state"].clone(),
+            fuel,
+            input: value["input"].clone(),
+        })
+    }
 }
 
 pub(crate) fn empty_state() -> Value {
@@ -140,7 +177,88 @@ pub(crate) fn validate_response(value: Value, expected_id: &str) -> BridgeResult
             error.remove("message");
         }
     }
+    normalize_maps(&mut normalized)?;
     Ok(normalized)
+}
+
+fn normalize_maps(value: &mut Value) -> BridgeResult<()> {
+    match value {
+        Value::Object(object) => {
+            for key in ["variables", "exported"] {
+                if let Some(entries) = object.get_mut(key) {
+                    validate_bindings(entries, key)?;
+                    entries
+                        .as_array_mut()
+                        .expect("validated binding array")
+                        .sort_by(|left, right| {
+                            left[0]
+                                .as_str()
+                                .expect("validated binding name")
+                                .cmp(right[0].as_str().expect("validated binding name"))
+                        });
+                }
+            }
+            for key in ["inherited", "environment"] {
+                if let Some(entries) = object.get_mut(key) {
+                    validate_pairs(entries, key)?;
+                    entries
+                        .as_array_mut()
+                        .expect("validated byte-pair array")
+                        .sort_by(|left, right| byte_key(&left[0]).cmp(&byte_key(&right[0])));
+                }
+            }
+            if let Some(entries) = object.get_mut("descriptors") {
+                validate_descriptors(entries)?;
+                entries
+                    .as_array_mut()
+                    .expect("validated descriptor array")
+                    .sort_by_key(|entry| entry[0].as_u64().expect("validated descriptor key"));
+            }
+            for child in object.values_mut() {
+                normalize_maps(child)?;
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                normalize_maps(child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn byte_key(value: &Value) -> Vec<u8> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .map(|byte| byte as u8)
+        .collect()
+}
+
+fn validate_descriptors(value: &Value) -> BridgeResult<()> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| BridgeError::new("descriptor map is not an array"))?;
+    let mut descriptors = std::collections::HashSet::new();
+    for entry in entries {
+        let pair = entry
+            .as_array()
+            .filter(|pair| pair.len() == 2)
+            .ok_or_else(|| BridgeError::new("descriptor entry is not a pair"))?;
+        let descriptor = pair[0]
+            .as_u64()
+            .ok_or_else(|| BridgeError::new("descriptor key is not a natural number"))?;
+        if !descriptors.insert(descriptor) {
+            return Err(BridgeError::new("descriptor map has duplicate keys"));
+        }
+        if pair[1].as_u64().is_none() {
+            return Err(BridgeError::new("descriptor value is not a natural number"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_error(value: &Value) -> BridgeResult<()> {
@@ -285,11 +403,15 @@ fn validate_pairs(value: &Value, context: &str) -> BridgeResult<()> {
     let pairs = value
         .as_array()
         .ok_or_else(|| BridgeError::new(format!("{context} is not an array")))?;
+    let mut names = std::collections::HashSet::new();
     for pair in pairs {
         if pair.as_array().is_none_or(|pair| pair.len() != 2) {
             return Err(BridgeError::new(format!("{context} entry is not a pair")));
         }
-        require_bytes(&pair[0], context)?;
+        let name = require_bytes(&pair[0], context)?;
+        if !names.insert(name) {
+            return Err(BridgeError::new(format!("{context} has duplicate names")));
+        }
         require_bytes(&pair[1], context)?;
     }
     Ok(())

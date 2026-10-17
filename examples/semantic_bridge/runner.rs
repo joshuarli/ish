@@ -1,10 +1,13 @@
 use crate::semantic_bridge::arithmetic;
+use crate::semantic_bridge::effects;
+use crate::semantic_bridge::evaluation;
 use crate::semantic_bridge::expansion;
 use crate::semantic_bridge::interactive;
 use crate::semantic_bridge::policy;
 use crate::semantic_bridge::protocol::{Family, Request, validate_response};
 use crate::semantic_bridge::{BridgeError, BridgeResult};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -33,19 +36,38 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
     fs::create_dir_all(&tmpdir).map_err(|error| {
         BridgeError::new(format!("cannot create {}: {error}", tmpdir.display()))
     })?;
+    verify_rust_protocol_boundary(&root)?;
     verify_protocol_boundary(&binary, &tmpdir, &root)?;
     let mut groups = Vec::new();
     for family in options.families.iter().copied() {
-        let cases = generate_cases(family, options.cases, options.seed, options.selected_id.as_deref())?;
+        let (mut cases, generated_count) = match options.selected_id.as_deref() {
+            Some(id) => match load_regression_by_id(&root, family, id)? {
+                Some(request) => (vec![request], 0),
+                None => {
+                    let cases = generate_cases(family, options.cases, options.seed, Some(id))?;
+                    let count = cases.len();
+                    (cases, count)
+                }
+            },
+            None => {
+                let cases = generate_cases(family, options.cases, options.seed, None)?;
+                let count = cases.len();
+                (cases, count)
+            }
+        };
+        if options.selected_id.is_none() {
+            cases.extend(load_regressions(&root, family)?);
+        }
         for case in &cases {
             validate_case(case)?;
         }
-        groups.push((family, cases));
+        groups.push((family, cases, generated_count));
     }
     let requests: Vec<Request> = groups
         .iter()
-        .flat_map(|(_, cases)| cases.iter().cloned())
+        .flat_map(|(_, cases, _)| cases.iter().cloned())
         .collect();
+    validate_unique_ids(&requests)?;
     let responses = run_lean(&binary, &tmpdir, &requests)?;
     if responses.len() != requests.len() {
         return Err(BridgeError::new(format!(
@@ -58,7 +80,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
         verify_response_corruption(response.clone())?;
     }
     let mut offset = 0;
-    for (family, cases) in groups {
+    for (family, cases, generated_count) in groups {
         let mut normalized = Vec::with_capacity(cases.len());
         for (index, request) in cases.iter().enumerate() {
             let actual = actual(request)?;
@@ -66,7 +88,10 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
             let expected = normalize_actual(&actual, &request.id)?;
             if expected != observed {
                 let minimized = minimize_mismatch(&binary, &tmpdir, family, request)?;
-                retain_regression(&root, family, &minimized)?;
+                let mut retained = minimized;
+                retained.id = regression_filename(family, &retained.id);
+                let retained_id = retained.id.clone();
+                retain_regression(&root, family, &retained)?;
                 return Err(BridgeError::new(format!(
                     "{} mismatch at {}; expected {}, Lean returned {}; minimized request saved to formal/fixtures/bridge-regressions/{}/{}.json",
                     family.name(),
@@ -74,7 +99,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
                     expected,
                     observed,
                     family.name(),
-                    minimized.id
+                    retained_id
                 )));
             }
             normalized.push(expected);
@@ -95,13 +120,73 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
             }
         }
         println!(
-            "{}: {} cases, negative control detected",
+            "{}: {} generated, {} retained, negative control detected",
             family.name(),
-            cases.len()
+            generated_count,
+            cases.len() - generated_count,
         );
         offset += cases.len();
     }
     Ok(())
+}
+
+fn load_regressions(root: &Path, family: Family) -> BridgeResult<Vec<Request>> {
+    let directory = root
+        .join("formal/fixtures/bridge-regressions")
+        .join(family.name());
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(BridgeError::new(format!("cannot read regression fixtures: {error}"))),
+    };
+    let mut paths = entries
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| BridgeError::new(format!("cannot read regression entry: {error}")))
+        })
+        .collect::<BridgeResult<Vec<_>>>()?;
+    paths.sort();
+    let mut requests = Vec::new();
+    for path in paths.into_iter().filter(|path| path.extension().is_some_and(|extension| extension == "json")) {
+        let bytes = fs::read(&path)
+            .map_err(|error| BridgeError::new(format!("cannot read regression {}: {error}", path.display())))?;
+        let json = serde_json::from_slice(&bytes)
+            .map_err(|error| BridgeError::new(format!("regression {} is malformed: {error}", path.display())))?;
+        let mut request = Request::from_json(json)?;
+        if request.family != family {
+            return Err(BridgeError::new(format!("regression {} has the wrong family", path.display())));
+        }
+        request.id = format!("{}-regression-{}", family.name(), request.id);
+        requests.push(request);
+    }
+    Ok(requests)
+}
+
+fn load_regression_by_id(root: &Path, family: Family, id: &str) -> BridgeResult<Option<Request>> {
+    selected_index(id, family)?;
+    let path = root
+        .join("formal/fixtures/bridge-regressions")
+        .join(family.name())
+        .join(format!("{id}.json"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(BridgeError::new(format!("cannot read regression {}: {error}", path.display()))),
+    };
+    let json = serde_json::from_slice(&bytes)
+        .map_err(|error| BridgeError::new(format!("regression {} is malformed: {error}", path.display())))?;
+    let request = Request::from_json(json)?;
+    if request.family != family || request.id != id {
+        return Err(BridgeError::new(format!("regression {} has the wrong family or ID", path.display())));
+    }
+    Ok(Some(request))
+}
+
+fn regression_filename(family: Family, id: &str) -> String {
+    id.strip_prefix(&format!("{}-regression-", family.name()))
+        .unwrap_or(id)
+        .to_string()
 }
 
 fn verify_response_corruption(response: Value) -> BridgeResult<()> {
@@ -239,8 +324,8 @@ fn generate(family: Family, index: usize, seed: u64) -> BridgeResult<Request> {
         Family::Interactive => Ok(interactive::generate(index, seed)),
         Family::Policy => policy::generate(index, seed),
         Family::Expansion => expansion::generate(index, seed),
-        Family::Evaluation => Err(BridgeError::new("evaluation adapter is not integrated")),
-        Family::Effects => Err(BridgeError::new("effects adapter is not integrated")),
+        Family::Evaluation => evaluation::generate(index, seed),
+        Family::Effects => effects::generate(index, seed),
     }
 }
 
@@ -250,7 +335,8 @@ fn validate_case(request: &Request) -> BridgeResult<()> {
         Family::Interactive => interactive::validate_case(request),
         Family::Policy => policy::validate_case(request),
         Family::Expansion => expansion::validate_case(request),
-        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family adapter is not integrated")),
+        Family::Evaluation => evaluation::validate_case(request),
+        Family::Effects => effects::validate_case(request),
     }
 }
 
@@ -260,7 +346,8 @@ fn actual(request: &Request) -> BridgeResult<Value> {
         Family::Interactive => interactive::actual(request),
         Family::Policy => policy::actual(request),
         Family::Expansion => expansion::actual(request),
-        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family adapter is not integrated")),
+        Family::Evaluation => evaluation::actual(request),
+        Family::Effects => effects::actual(request),
     }
 }
 
@@ -270,7 +357,8 @@ fn negative_control(family: Family, outcome: &Value) -> BridgeResult<Value> {
         Family::Interactive => interactive::negative_control(outcome),
         Family::Policy => policy::negative_control(outcome),
         Family::Expansion => expansion::negative_control(outcome),
-        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family negative control is not integrated")),
+        Family::Evaluation => evaluation::negative_control(outcome),
+        Family::Effects => effects::negative_control(outcome),
     }
 }
 
@@ -332,6 +420,8 @@ fn run_lean(binary: &Path, tmpdir: &Path, requests: &[Request]) -> BridgeResult<
 fn verify_protocol_boundary(binary: &Path, tmpdir: &Path, root: &Path) -> BridgeResult<()> {
     let invalid = fs::read_to_string(root.join("formal/fixtures/protocol-invalid.jsonl"))
         .map_err(|error| BridgeError::new(format!("cannot read protocol rejection goldens: {error}")))?;
+    let valid = fs::read_to_string(root.join("formal/fixtures/protocol-v1.jsonl"))
+        .map_err(|error| BridgeError::new(format!("cannot read protocol acceptance goldens: {error}")))?;
     let mut input = String::new();
     let expected = [
         "unsupported_version",
@@ -355,19 +445,22 @@ fn verify_protocol_boundary(binary: &Path, tmpdir: &Path, root: &Path) -> Bridge
         input.push_str(line);
         input.push('\n');
     }
-    let mut duplicate_request = policy::generate(0, DEFAULT_SEED)?.to_json();
-    duplicate_request["input"] = json!({});
-    let duplicate = serde_json::to_string(&duplicate_request)
-        .map_err(|error| BridgeError::new(format!("cannot encode duplicate probe: {error}")))?;
-    input.push_str(&duplicate);
-    input.push('\n');
-    input.push_str(&duplicate);
+    let valid_lines: Vec<&str> = valid.lines().collect();
+    if valid_lines.len() != Family::ALL.len() {
+        return Err(BridgeError::new("protocol-v1 fixture count changed"));
+    }
+    for line in &valid_lines {
+        input.push_str(line);
+        input.push('\n');
+    }
+    input.push_str(valid_lines[0]);
     input.push('\n');
     let outputs = run_lean_text(binary, tmpdir, root.join("formal"), &input)?;
-    if outputs.len() != expected.len() + 2 {
+    if outputs.len() != expected.len() + valid_lines.len() + 1 {
         return Err(BridgeError::new("Lean protocol rejection response count changed"));
     }
     for (line_index, (response, expected_tag)) in outputs.iter().zip(expected).enumerate() {
+        validate_boundary_error(response, expected_tag, None)?;
         if response["error"]["tag"] != expected_tag {
             return Err(BridgeError::new(format!(
                 "protocol rejection golden {} returned {:?}, expected {expected_tag}",
@@ -376,11 +469,117 @@ fn verify_protocol_boundary(binary: &Path, tmpdir: &Path, root: &Path) -> Bridge
             )));
         }
     }
-    if outputs[expected.len()]["outcome"]["tag"] != "unsupported_domain" {
-        return Err(BridgeError::new("valid protocol probe was not accepted"));
+    for (line, response) in valid_lines
+        .iter()
+        .zip(&outputs[expected.len()..expected.len() + valid_lines.len()])
+    {
+        let request: Value = serde_json::from_str(line)
+            .map_err(|error| BridgeError::new(format!("protocol-v1 fixture is malformed: {error}")))?;
+        let normalized = validate_response(response.clone(), request["id"].as_str().unwrap_or(""))?;
+        if normalized["tag"] != "unsupported_domain" {
+            return Err(BridgeError::new("valid protocol golden did not reach family validation"));
+        }
     }
-    if outputs[expected.len() + 1]["error"]["tag"] != "duplicate_id" {
-        return Err(BridgeError::new("duplicate case ID was accepted"));
+    validate_boundary_error(
+        &outputs[expected.len() + valid_lines.len()],
+        "duplicate_id",
+        Some("golden-policy"),
+    )?;
+    Ok(())
+}
+
+fn validate_boundary_error(response: &Value, tag: &str, id: Option<&str>) -> BridgeResult<()> {
+    crate::semantic_bridge::protocol::exact_object(response, &["version", "error"], "boundary error response")?;
+    if response["version"] != 1 {
+        return Err(BridgeError::new("boundary error has an unsupported response version"));
+    }
+    let fields = match tag {
+        "malformed" => &["tag", "message"][..],
+        "unsupported_version" => &["tag", "version"][..],
+        "duplicate_id" => &["tag", "id"][..],
+        _ => return Err(BridgeError::new(format!("unknown expected boundary tag {tag:?}"))),
+    };
+    crate::semantic_bridge::protocol::exact_object(&response["error"], fields, "boundary error payload")?;
+    if response["error"]["tag"] != tag {
+        return Err(BridgeError::new(format!("boundary error tag is not {tag:?}")));
+    }
+    match tag {
+        "malformed" if response["error"]["message"].is_string() => {}
+        "unsupported_version" if response["error"]["version"] == 2 => {}
+        "duplicate_id" if response["error"]["id"].as_str() == id => {}
+        _ => return Err(BridgeError::new(format!("boundary {tag:?} payload is invalid"))),
+    }
+    Ok(())
+}
+
+fn verify_rust_protocol_boundary(root: &Path) -> BridgeResult<()> {
+    let invalid = fs::read_to_string(root.join("formal/fixtures/protocol-invalid.jsonl"))
+        .map_err(|error| BridgeError::new(format!("cannot read protocol rejection goldens: {error}")))?;
+    let valid = fs::read_to_string(root.join("formal/fixtures/protocol-v1.jsonl"))
+        .map_err(|error| BridgeError::new(format!("cannot read protocol acceptance goldens: {error}")))?;
+    let invalid_lines: Vec<&str> = invalid.lines().collect();
+    if invalid_lines.len() != 12 {
+        return Err(BridgeError::new("protocol-invalid fixture count changed"));
+    }
+    for (index, line) in invalid_lines.iter().enumerate() {
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(_) if index != 0 => continue,
+            Err(error) => {
+                return Err(BridgeError::new(format!(
+                    "unsupported-version golden is malformed: {error}"
+                )));
+            }
+        };
+        if index == 0 && value["version"] != 2 {
+            return Err(BridgeError::new("unsupported-version golden changed"));
+        }
+        if index != 0 && value["version"] != 1 {
+            return Err(BridgeError::new(format!(
+                "malformed protocol golden {} has the wrong version",
+                index + 1
+            )));
+        }
+        if Request::from_json(value).is_ok() {
+            return Err(BridgeError::new(format!(
+                "Rust accepted invalid protocol golden {}",
+                index + 1
+            )));
+        }
+    }
+    let valid_lines: Vec<&str> = valid.lines().collect();
+    if valid_lines.len() != Family::ALL.len() {
+        return Err(BridgeError::new("protocol-v1 fixture count changed"));
+    }
+    let mut requests = Vec::with_capacity(valid_lines.len());
+    for (line, expected_family) in valid_lines.iter().zip(Family::ALL) {
+        let value: Value = serde_json::from_str(line)
+            .map_err(|error| BridgeError::new(format!("protocol-v1 fixture is malformed: {error}")))?;
+        let request = Request::from_json(value)?;
+        if request.family != expected_family {
+            return Err(BridgeError::new("protocol-v1 family order changed"));
+        }
+        requests.push(request);
+    }
+    validate_unique_ids(&requests)?;
+    let mut duplicate_requests = requests;
+    let duplicate = duplicate_requests[0].clone();
+    duplicate_requests.push(duplicate);
+    if validate_unique_ids(&duplicate_requests).is_ok() {
+        return Err(BridgeError::new("Rust accepted a duplicate protocol ID"));
+    }
+    Ok(())
+}
+
+fn validate_unique_ids(requests: &[Request]) -> BridgeResult<()> {
+    let mut ids = HashSet::new();
+    for request in requests {
+        if !ids.insert(request.id.as_str()) {
+            return Err(BridgeError::new(format!(
+                "duplicate request ID {:?}",
+                request.id
+            )));
+        }
     }
     Ok(())
 }
@@ -472,7 +671,8 @@ fn shrink(family: Family, request: &Request) -> BridgeResult<Vec<Request>> {
         Family::Interactive => interactive::shrink(request),
         Family::Policy => policy::shrink(request),
         Family::Expansion => expansion::shrink(request),
-        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family shrinker is not integrated")),
+        Family::Evaluation => evaluation::shrink(request),
+        Family::Effects => effects::shrink(request),
     }
 }
 
@@ -492,7 +692,7 @@ fn retain_regression(root: &Path, family: Family, request: &Request) -> BridgeRe
     fs::create_dir_all(&directory).map_err(|error| {
         BridgeError::new(format!("cannot create regression directory: {error}"))
     })?;
-    let path = directory.join(format!("{}.json", request.id));
+    let path = directory.join(format!("{}.json", regression_filename(family, &request.id)));
     let bytes = serde_json::to_vec_pretty(&request.to_json())
         .map_err(|error| BridgeError::new(format!("cannot encode regression fixture: {error}")))?;
     fs::write(&path, bytes)
