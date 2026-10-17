@@ -36,15 +36,25 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
     verify_protocol_boundary(&binary, &tmpdir, &root)?;
     let mut groups = Vec::new();
     for family in options.families.iter().copied() {
-        let cases = generate_cases(family, options.cases, options.seed, options.selected_id.as_deref())?;
+        let mut cases = match options.selected_id.as_deref() {
+            Some(id) => match load_regression_by_id(&root, family, id)? {
+                Some(request) => vec![request],
+                None => generate_cases(family, options.cases, options.seed, Some(id))?,
+            },
+            None => generate_cases(family, options.cases, options.seed, None)?,
+        };
+        let generated_count = cases.len();
+        if options.selected_id.is_none() {
+            cases.extend(load_regressions(&root, family)?);
+        }
         for case in &cases {
             validate_case(case)?;
         }
-        groups.push((family, cases));
+        groups.push((family, cases, generated_count));
     }
     let requests: Vec<Request> = groups
         .iter()
-        .flat_map(|(_, cases)| cases.iter().cloned())
+        .flat_map(|(_, cases, _)| cases.iter().cloned())
         .collect();
     let responses = run_lean(&binary, &tmpdir, &requests)?;
     if responses.len() != requests.len() {
@@ -58,7 +68,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
         verify_response_corruption(response.clone())?;
     }
     let mut offset = 0;
-    for (family, cases) in groups {
+    for (family, cases, generated_count) in groups {
         let mut normalized = Vec::with_capacity(cases.len());
         for (index, request) in cases.iter().enumerate() {
             let actual = actual(request)?;
@@ -74,7 +84,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
                     expected,
                     observed,
                     family.name(),
-                    minimized.id
+                    regression_filename(family, &minimized.id)
                 )));
             }
             normalized.push(expected);
@@ -95,13 +105,73 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
             }
         }
         println!(
-            "{}: {} cases, negative control detected",
+            "{}: {} generated, {} retained, negative control detected",
             family.name(),
-            cases.len()
+            generated_count,
+            cases.len() - generated_count,
         );
         offset += cases.len();
     }
     Ok(())
+}
+
+fn load_regressions(root: &Path, family: Family) -> BridgeResult<Vec<Request>> {
+    let directory = root
+        .join("formal/fixtures/bridge-regressions")
+        .join(family.name());
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(BridgeError::new(format!("cannot read regression fixtures: {error}"))),
+    };
+    let mut paths = entries
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| BridgeError::new(format!("cannot read regression entry: {error}")))
+        })
+        .collect::<BridgeResult<Vec<_>>>()?;
+    paths.sort();
+    let mut requests = Vec::new();
+    for path in paths.into_iter().filter(|path| path.extension().is_some_and(|extension| extension == "json")) {
+        let bytes = fs::read(&path)
+            .map_err(|error| BridgeError::new(format!("cannot read regression {}: {error}", path.display())))?;
+        let json = serde_json::from_slice(&bytes)
+            .map_err(|error| BridgeError::new(format!("regression {} is malformed: {error}", path.display())))?;
+        let mut request = Request::from_json(json)?;
+        if request.family != family {
+            return Err(BridgeError::new(format!("regression {} has the wrong family", path.display())));
+        }
+        request.id = format!("{}-regression-{}", family.name(), request.id);
+        requests.push(request);
+    }
+    Ok(requests)
+}
+
+fn load_regression_by_id(root: &Path, family: Family, id: &str) -> BridgeResult<Option<Request>> {
+    selected_index(id, family)?;
+    let path = root
+        .join("formal/fixtures/bridge-regressions")
+        .join(family.name())
+        .join(format!("{id}.json"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(BridgeError::new(format!("cannot read regression {}: {error}", path.display()))),
+    };
+    let json = serde_json::from_slice(&bytes)
+        .map_err(|error| BridgeError::new(format!("regression {} is malformed: {error}", path.display())))?;
+    let request = Request::from_json(json)?;
+    if request.family != family || request.id != id {
+        return Err(BridgeError::new(format!("regression {} has the wrong family or ID", path.display())));
+    }
+    Ok(Some(request))
+}
+
+fn regression_filename(family: Family, id: &str) -> String {
+    id.strip_prefix(&format!("{}-regression-", family.name()))
+        .unwrap_or(id)
+        .to_string()
 }
 
 fn verify_response_corruption(response: Value) -> BridgeResult<()> {
@@ -332,6 +402,8 @@ fn run_lean(binary: &Path, tmpdir: &Path, requests: &[Request]) -> BridgeResult<
 fn verify_protocol_boundary(binary: &Path, tmpdir: &Path, root: &Path) -> BridgeResult<()> {
     let invalid = fs::read_to_string(root.join("formal/fixtures/protocol-invalid.jsonl"))
         .map_err(|error| BridgeError::new(format!("cannot read protocol rejection goldens: {error}")))?;
+    let valid = fs::read_to_string(root.join("formal/fixtures/protocol-v1.jsonl"))
+        .map_err(|error| BridgeError::new(format!("cannot read protocol acceptance goldens: {error}")))?;
     let mut input = String::new();
     let expected = [
         "unsupported_version",
@@ -355,19 +427,22 @@ fn verify_protocol_boundary(binary: &Path, tmpdir: &Path, root: &Path) -> Bridge
         input.push_str(line);
         input.push('\n');
     }
-    let mut duplicate_request = policy::generate(0, DEFAULT_SEED)?.to_json();
-    duplicate_request["input"] = json!({});
-    let duplicate = serde_json::to_string(&duplicate_request)
-        .map_err(|error| BridgeError::new(format!("cannot encode duplicate probe: {error}")))?;
-    input.push_str(&duplicate);
-    input.push('\n');
-    input.push_str(&duplicate);
+    let valid_lines: Vec<&str> = valid.lines().collect();
+    if valid_lines.len() != Family::ALL.len() {
+        return Err(BridgeError::new("protocol-v1 fixture count changed"));
+    }
+    for line in &valid_lines {
+        input.push_str(line);
+        input.push('\n');
+    }
+    input.push_str(valid_lines[0]);
     input.push('\n');
     let outputs = run_lean_text(binary, tmpdir, root.join("formal"), &input)?;
-    if outputs.len() != expected.len() + 2 {
+    if outputs.len() != expected.len() + valid_lines.len() + 1 {
         return Err(BridgeError::new("Lean protocol rejection response count changed"));
     }
     for (line_index, (response, expected_tag)) in outputs.iter().zip(expected).enumerate() {
+        validate_boundary_error(response, expected_tag, None)?;
         if response["error"]["tag"] != expected_tag {
             return Err(BridgeError::new(format!(
                 "protocol rejection golden {} returned {:?}, expected {expected_tag}",
@@ -376,11 +451,45 @@ fn verify_protocol_boundary(binary: &Path, tmpdir: &Path, root: &Path) -> Bridge
             )));
         }
     }
-    if outputs[expected.len()]["outcome"]["tag"] != "unsupported_domain" {
-        return Err(BridgeError::new("valid protocol probe was not accepted"));
+    for (line, response) in valid_lines
+        .iter()
+        .zip(&outputs[expected.len()..expected.len() + valid_lines.len()])
+    {
+        let request: Value = serde_json::from_str(line)
+            .map_err(|error| BridgeError::new(format!("protocol-v1 fixture is malformed: {error}")))?;
+        let normalized = validate_response(response.clone(), request["id"].as_str().unwrap_or(""))?;
+        if normalized["tag"] != "unsupported_domain" {
+            return Err(BridgeError::new("valid protocol golden did not reach family validation"));
+        }
     }
-    if outputs[expected.len() + 1]["error"]["tag"] != "duplicate_id" {
-        return Err(BridgeError::new("duplicate case ID was accepted"));
+    validate_boundary_error(
+        &outputs[expected.len() + valid_lines.len()],
+        "duplicate_id",
+        Some("golden-policy"),
+    )?;
+    Ok(())
+}
+
+fn validate_boundary_error(response: &Value, tag: &str, id: Option<&str>) -> BridgeResult<()> {
+    crate::semantic_bridge::protocol::exact_object(response, &["version", "error"], "boundary error response")?;
+    if response["version"] != 1 {
+        return Err(BridgeError::new("boundary error has an unsupported response version"));
+    }
+    let fields = match tag {
+        "malformed" => &["tag", "message"][..],
+        "unsupported_version" => &["tag", "version"][..],
+        "duplicate_id" => &["tag", "id"][..],
+        _ => return Err(BridgeError::new(format!("unknown expected boundary tag {tag:?}"))),
+    };
+    crate::semantic_bridge::protocol::exact_object(&response["error"], fields, "boundary error payload")?;
+    if response["error"]["tag"] != tag {
+        return Err(BridgeError::new(format!("boundary error tag is not {tag:?}")));
+    }
+    match tag {
+        "malformed" if response["error"]["message"].is_string() => {}
+        "unsupported_version" if response["error"]["version"] == 2 => {}
+        "duplicate_id" if response["error"]["id"].as_str() == id => {}
+        _ => return Err(BridgeError::new(format!("boundary {tag:?} payload is invalid"))),
     }
     Ok(())
 }
@@ -492,7 +601,7 @@ fn retain_regression(root: &Path, family: Family, request: &Request) -> BridgeRe
     fs::create_dir_all(&directory).map_err(|error| {
         BridgeError::new(format!("cannot create regression directory: {error}"))
     })?;
-    let path = directory.join(format!("{}.json", request.id));
+    let path = directory.join(format!("{}.json", regression_filename(family, &request.id)));
     let bytes = serde_json::to_vec_pretty(&request.to_json())
         .map_err(|error| BridgeError::new(format!("cannot encode regression fixture: {error}")))?;
     fs::write(&path, bytes)

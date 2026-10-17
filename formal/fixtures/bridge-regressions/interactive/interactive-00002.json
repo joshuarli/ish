@@ -1,0 +1,32 @@
+{
+  "family": "interactive",
+  "fuel": 128,
+  "id": "interactive-00002",
+  "input": {
+    "cursor": 4,
+    "operations": [
+      {
+        "op": "move_word_right"
+      }
+    ]
+  },
+  "source": [
+    99,
+    97,
+    102,
+    195,
+    169,
+    32,
+    206,
+    187
+  ],
+  "state": {
+    "cwd": [],
+    "exported": [],
+    "inherited": [],
+    "last_status": 0,
+    "positional": [],
+    "variables": []
+  },
+  "version": 1
+}
