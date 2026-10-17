@@ -78,3 +78,15 @@ fn quoted_raw_bytes_and_effect_results_preserve_expansion_contract() {
     assert_eq!(expanded, [vec![255, 0, b'*'], vec![255, 0, b'*']]);
     assert_eq!(fields("\"$(printf 'a\\n\\n')\" \"$((1 + 2))\"", &mut shell), ["a", "3"]);
 }
+
+#[test]
+fn quoted_literal_directory_component_allows_following_glob() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["*dir", "?dir", "[dir]", "\\dir"] {
+        std::fs::create_dir(dir.path().join(name)).unwrap();
+        std::fs::write(dir.path().join(name).join("file"), []).unwrap();
+    }
+    let mut shell = Shell::builder().cwd(dir.path().to_path_buf()).build();
+    assert_eq!(fields("'*dir'/* '?dir'/* '[dir]'/* '\\dir'/*", &mut shell),
+        ["*dir/file", "?dir/file", "[dir]/file", "\\dir/file"]);
+}

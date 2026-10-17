@@ -63,8 +63,9 @@ fn glob_recursive(
     let remaining = &components[1..];
 
     if !has_glob_chars(&pattern_shell) {
-        let fs_candidate = fs_dir.join(pattern.to_os_string());
-        let display_candidate = display_dir.join(pattern.to_os_string());
+        let literal = literal_component(&pattern_shell).to_os_string();
+        let fs_candidate = fs_dir.join(&literal);
+        let display_candidate = display_dir.join(&literal);
         if remaining.is_empty() {
             if fs_candidate.symlink_metadata().is_ok() {
                 results.push(path_to_string(&display_candidate));
@@ -104,6 +105,19 @@ fn glob_recursive(
             }
         }
     }
+}
+
+fn literal_component(pattern: &str) -> ShellBytes {
+    let mut literal = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if is_escape(ch) {
+            literal.push(chars.next().unwrap_or(ch));
+        } else {
+            literal.push(ch);
+        }
+    }
+    ShellBytes::from_str_lossless(&literal)
 }
 
 /// Check if a string contains glob metacharacters.
