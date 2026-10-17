@@ -1,14 +1,6 @@
 Prefix: ISH
 Next: 22
 
-### ISH-4 · P2 · Pipeline commands inherit ignored terminal signals
-
-- **Area:** Concurrency
-- **Where:** `src/main.rs:2600`, `src/main.rs:2683`, `crates/epsh/src/eval.rs:650`, `src/signal.rs:35`
-- **Problem:** ish ignores terminal signals, but its external handler resets them only in the main process. Forked pipeline stages inherit the ignored dispositions. A fresh-build PTY running `/bin/sleep 30 | /bin/cat` survived both Ctrl+C and Ctrl+Z; its process group retained the terminal until explicitly terminated.
-- **Recommendation:** Restore command signal dispositions in every external execution path, including forked pipeline stages, before executing user commands. Keep ish’s own dispositions unchanged.
-- **Fix with:** lifecycle-concurrency, os-boundaries
-- **Effort:** M (days)
 
 ### ISH-5 · P2 · Stopped pipelines disappear from foreground job control
 

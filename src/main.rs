@@ -2597,22 +2597,15 @@ fn spawn_external(
         cmd.env(k.to_os_string(), v.to_os_string());
     }
 
-    if is_main {
-        // In the child: become its own process group leader and restore
-        // signal dispositions that the shell overrode (especially SIGTSTP,
-        // which the shell ignores — children must inherit SIG_DFL or
-        // Ctrl+Z will never stop them).
-        //
-        // setpgid(0, 0) here (in the child, before exec) is race-free;
-        // the parent's setpgid(child_id, child_id) after spawn() is a
-        // belt-and-suspenders duplicate for the parent-side view.
-        unsafe {
-            cmd.pre_exec(|| {
+    // SAFETY: the child only changes its process group and signal dispositions before exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if is_main {
                 let _ = rustix::process::setpgid(None, None);
-                ish::signal::restore_defaults();
-                Ok(())
-            });
-        }
+            }
+            ish::signal::restore_defaults();
+            Ok(())
+        });
     }
 
     match cmd.spawn() {

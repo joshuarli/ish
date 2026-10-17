@@ -135,6 +135,7 @@ defined at the prompt or in config and expand as you type.
 
 ### Job control
 
+Ctrl+C interrupts foreground commands, including pipelines.
 Ctrl+Z suspends a foreground job and `fg` resumes it. ish keeps one suspended
 job. If a command in a list suspends, the rest of that list is discarded.
 
