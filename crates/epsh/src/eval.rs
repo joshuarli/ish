@@ -326,6 +326,7 @@ pub struct Shell {
     /// when a heredoc targets fd 0 in sink mode (avoids process-wide dup2 on fd 0
     /// which would race with other threads reading stdin, e.g. nerv's input loop).
     pub(crate) pending_stdin: Option<RawFd>,
+    pub(crate) redirection_backups: Vec<Option<std::os::fd::OwnedFd>>,
 }
 
 /// Shell option flags (`set -e`, `set -u`, etc.).
@@ -573,6 +574,7 @@ impl ShellBuilder {
             redirect_open_handler: self.redirect_open_handler,
             last_bg_pid: None,
             pending_stdin: None,
+            redirection_backups: Vec::new(),
         }
     }
 }
@@ -614,6 +616,7 @@ impl Shell {
             redirect_open_handler: None,
             last_bg_pid: None,
             pending_stdin: None,
+            redirection_backups: Vec::new(),
         }
     }
 

@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io::Write;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use crate::ast::*;
 use crate::error::ShellError;
@@ -93,7 +93,7 @@ fn install_redirection(file: OwnedFd, target_fd: RawFd) -> std::io::Result<()> {
 
 pub(crate) struct SavedFd {
     pub(crate) target_fd: RawFd,
-    pub(crate) saved_copy: Option<RawFd>,
+    pub(crate) backup_slot: Option<usize>,
     pub(crate) was_closed: bool,
 }
 
@@ -118,35 +118,52 @@ impl Shell {
         let mut saved = Vec::new();
         match self.apply_redirections(redirs, &mut saved, saved_fd_min) {
             Ok(()) => Ok(saved),
-            Err(error) => combine_cleanup(Err(error), self.restore_redirections(saved)),
+            Err(error) => {
+                let cleanup = self.restore_redirections(saved);
+                self.combine_redirection_cleanup(Err(error), cleanup)
+            }
         }
     }
 
-    fn move_saved_descriptor_for_source(
-        &self,
-        saved: &mut [SavedFd],
-        source_fd: RawFd,
+    fn move_backup_for_target(
+        &mut self,
+        target_fd: RawFd,
         saved_fd_min: RawFd,
     ) -> crate::error::Result<()> {
-        let Some(index) = saved
-            .iter()
-            .position(|state| state.saved_copy == Some(source_fd))
-        else {
+        let Some(index) = self.redirection_backups.iter().position(|backup| {
+            backup.as_ref().is_some_and(|fd| fd.as_raw_fd() == target_fd)
+        }) else {
             return Ok(());
         };
-        let min_fd = source_fd
-            .checked_add(1)
-            .map(|fd| fd.max(saved_fd_min))
-            .ok_or_else(|| {
-                ShellError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "redirection source descriptor leaves no room for saved descriptors",
-                ))
-            })?;
-        let moved = sys::duplicate_fd_above(source_fd, min_fd).map_err(ShellError::Io)?;
-        saved[index].saved_copy = Some(moved.into_raw_fd());
-        sys::close(source_fd)?;
+        let moved = sys::duplicate_fd_above(target_fd, saved_fd_min)?;
+        let old = self.redirection_backups[index].replace(moved).unwrap();
+        sys::close(old.into_raw_fd())?;
         Ok(())
+    }
+
+    fn combine_redirection_cleanup<T>(
+        &self,
+        primary: crate::error::Result<T>,
+        cleanup: crate::error::Result<()>,
+    ) -> crate::error::Result<T> {
+        if matches!(&primary, Err(
+            ShellError::Exit(_) | ShellError::Return(_) | ShellError::Break(_)
+            | ShellError::Continue(_) | ShellError::Cancelled | ShellError::TimedOut
+            | ShellError::Stopped { .. }
+        )) {
+            if let Err(error) = cleanup {
+                self.err_msg(&format!("epsh: {error}"));
+            }
+            primary
+        } else {
+            combine_cleanup(primary, cleanup)
+        }
+    }
+
+    fn trim_redirection_backups(&mut self) {
+        while self.redirection_backups.last().is_some_and(Option::is_none) {
+            self.redirection_backups.pop();
+        }
     }
 
     fn open_writable_redirection(
@@ -182,6 +199,7 @@ impl Shell {
     ) -> crate::error::Result<()> {
         for redir in redirs {
             let target_fd = redir.fd;
+            self.move_backup_for_target(target_fd, saved_fd_min)?;
             let preserve_fd = !(target_fd == 0
                 && matches!(
                     redir.kind,
@@ -190,16 +208,20 @@ impl Shell {
                 && (self.stdout_sink.is_some() || self.stderr_sink.is_some()));
 
             if preserve_fd {
-                let (saved_copy, was_closed) = match sys::duplicate_fd_above(target_fd, saved_fd_min)
+                let (backup_slot, was_closed) = match sys::duplicate_fd_above(target_fd, saved_fd_min)
                 {
-                    Ok(copy) => (Some(std::os::fd::IntoRawFd::into_raw_fd(copy)), false),
+                    Ok(copy) => {
+                        let index = self.redirection_backups.len();
+                        self.redirection_backups.push(Some(copy));
+                        (Some(index), false)
+                    }
                     Err(error) if error.raw_os_error() == Some(libc::EBADF) => (None, true),
                     Err(error) => return Err(ShellError::Io(error)),
                 };
 
                 saved.push(SavedFd {
                     target_fd,
-                    saved_copy,
+                    backup_slot,
                     was_closed,
                 });
             }
@@ -240,7 +262,11 @@ impl Shell {
                     if fd_str == "-" {
                         sys::close(target_fd)?;
                     } else if let Ok(source_fd) = fd_str.parse::<i32>() {
-                        self.move_saved_descriptor_for_source(saved, source_fd, saved_fd_min)?;
+                        if self.redirection_backups.iter().any(|backup| {
+                            backup.as_ref().is_some_and(|fd| fd.as_raw_fd() == source_fd)
+                        }) {
+                            return Err(ShellError::Io(std::io::Error::from_raw_os_error(libc::EBADF)));
+                        }
                         sys::dup2_result(source_fd, target_fd).map_err(ShellError::Io)?;
                     } else {
                         return Err(ShellError::Runtime {
@@ -250,13 +276,9 @@ impl Shell {
                     }
                 }
                 RedirKind::HereDoc(body) | RedirKind::HereDocStrip(body) => {
-                    let mut fds = [0i32; 2];
-                    // SAFETY: fds is a valid 2-element array for pipe() to write into.
-                    sys::pipe(fds.as_mut_ptr());
-                    // SAFETY: fds[1] is a valid fd just returned by pipe().
-                    let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
-                    // SAFETY: fds[0] is a valid fd just returned by pipe().
-                    let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+                    let (read_end, write_end) = sys::pipe_owned()?;
+                    let read_end = std::fs::File::from(read_end);
+                    let write_end = std::fs::File::from(write_end);
 
                     let expanded = match body {
                         HereDocBody::Literal(s) => s.clone(),
@@ -270,7 +292,7 @@ impl Shell {
                             )
                         }
                     };
-                    let _ = (&write_end).write_all(expanded.as_bytes());
+                    (&write_end).write_all(expanded.as_bytes())?;
                     drop(write_end);
 
                     if target_fd == 0 && (self.stdout_sink.is_some() || self.stderr_sink.is_some())
@@ -290,10 +312,11 @@ impl Shell {
         Ok(())
     }
 
-    pub(crate) fn restore_redirections(&self, saved: Vec<SavedFd>) -> crate::error::Result<()> {
+    pub(crate) fn restore_redirections(&mut self, saved: Vec<SavedFd>) -> crate::error::Result<()> {
         let mut errors = Vec::new();
         for s in saved.into_iter().rev() {
-            if let Some(copy) = s.saved_copy {
+            if let Some(index) = s.backup_slot {
+                let copy = self.redirection_backups[index].take().unwrap().into_raw_fd();
                 if let Err(error) = sys::dup2_result(copy, s.target_fd) {
                     errors.push(error);
                 }
@@ -312,6 +335,7 @@ impl Shell {
                 }
             }
         }
+        self.trim_redirection_backups();
         if errors.is_empty() {
             Ok(())
         } else {
@@ -320,28 +344,33 @@ impl Shell {
     }
 
     pub(crate) fn finish_redirections<T>(
-        &self,
+        &mut self,
         primary: crate::error::Result<T>,
         saved: Vec<SavedFd>,
     ) -> crate::error::Result<T> {
-        combine_cleanup(primary, self.restore_redirections(saved))
+        let cleanup = self.restore_redirections(saved);
+        self.combine_redirection_cleanup(primary, cleanup)
     }
 
     pub(crate) fn finish_saved_redirections<T>(
-        &self,
+        &mut self,
         primary: crate::error::Result<T>,
         saved: Vec<SavedFd>,
     ) -> crate::error::Result<T> {
         let errors: Vec<_> = saved
             .into_iter()
-            .filter_map(|state| state.saved_copy)
-            .filter_map(|fd| sys::close(fd).err())
+            .filter_map(|state| state.backup_slot)
+            .filter_map(|index| {
+                let fd = self.redirection_backups[index].take().unwrap().into_raw_fd();
+                sys::close(fd).err()
+            })
             .collect();
+        self.trim_redirection_backups();
         let cleanup = if errors.is_empty() {
             Ok(())
         } else {
             Err(restoration_error(errors))
         };
-        combine_cleanup(primary, cleanup)
+        self.combine_redirection_cleanup(primary, cleanup)
     }
 }
