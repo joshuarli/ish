@@ -8,6 +8,46 @@ use crate::test_cmd::test_eval;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
+pub(crate) enum CommandAction<'a> {
+    Empty,
+    Describe { verbose: bool, names: &'a [String] },
+    Execute(&'a [String]),
+}
+
+pub(crate) fn command_action(args: &[String]) -> CommandAction<'_> {
+    let mut mode = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-v" => {
+                mode = Some(false);
+                index += 1;
+            }
+            "-V" => {
+                mode = Some(true);
+                index += 1;
+            }
+            "-p" => index += 1,
+            "--" => {
+                index += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    if index >= args.len() {
+        return CommandAction::Empty;
+    }
+    if let Some(verbose) = mode {
+        CommandAction::Describe {
+            verbose,
+            names: &args[index..],
+        }
+    } else {
+        CommandAction::Execute(&args[index..])
+    }
+}
+
 fn kill_with_rustix(pid: i32, signum: i32) -> Result<(), rustix::io::Errno> {
     if signum == 0 {
         return match pid {
@@ -600,54 +640,23 @@ impl Shell {
     }
 
     fn builtin_command(&mut self, args: &[String], span: Span) -> crate::error::Result<ExitStatus> {
-        if args.len() <= 1 {
-            return Ok(ExitStatus::SUCCESS);
-        }
-        let mut mode = None; // None = execute, Some('v') = -v, Some('V') = -V
-        let mut i = 1;
-        while i < args.len() {
-            match args[i].as_str() {
-                "-v" => {
-                    mode = Some('v');
-                    i += 1;
-                }
-                "-V" => {
-                    mode = Some('V');
-                    i += 1;
-                }
-                "-p" => {
-                    i += 1;
-                } // -p: use default PATH (ignored for now)
-                "--" => {
-                    i += 1;
-                    break;
-                }
-                _ => break,
-            }
-        }
-        if i >= args.len() {
-            return Ok(ExitStatus::SUCCESS);
-        }
-
-        if let Some(m) = mode {
-            // Describe commands instead of executing them
-            let mut status = ExitStatus::SUCCESS;
-            for name in &args[i..] {
-                if m == 'V' {
-                    // -V: verbose, like `type`
-                    if self.functions.contains_key(name.as_str()) {
-                        self.write_out(&format!("{name} is a function\n"));
-                    } else if is_builtin(name) {
-                        self.write_out(&format!("{name} is a shell builtin\n"));
-                    } else if let Ok(path) = self.which(name) {
-                        self.write_out(&format!("{name} is {path}\n"));
-                    } else {
-                        self.err_msg(&format!("{name}: not found"));
-                        status = ExitStatus::FAILURE;
-                    }
-                } else {
-                    // -v: terse — print path, or name for builtins/functions
-                    if self.functions.contains_key(name.as_str()) || is_builtin(name) {
+        match command_action(args) {
+            CommandAction::Empty => Ok(ExitStatus::SUCCESS),
+            CommandAction::Describe { verbose, names } => {
+                let mut status = ExitStatus::SUCCESS;
+                for name in names {
+                    if verbose {
+                        if self.functions.contains_key(name.as_str()) {
+                            self.write_out(&format!("{name} is a function\n"));
+                        } else if is_builtin(name) {
+                            self.write_out(&format!("{name} is a shell builtin\n"));
+                        } else if let Ok(path) = self.which(name) {
+                            self.write_out(&format!("{name} is {path}\n"));
+                        } else {
+                            self.err_msg(&format!("{name}: not found"));
+                            status = ExitStatus::FAILURE;
+                        }
+                    } else if self.functions.contains_key(name.as_str()) || is_builtin(name) {
                         self.write_out(&format!("{name}\n"));
                     } else if let Ok(path) = self.which(name) {
                         self.write_out(&format!("{path}\n"));
@@ -655,20 +664,18 @@ impl Shell {
                         status = ExitStatus::FAILURE;
                     }
                 }
+                Ok(status)
             }
-            return Ok(status);
-        }
-
-        let new_args: Vec<String> = args[i..].to_vec();
-
-        // `command` bypasses functions but NOT builtins. External commands use
-        // the embedder's handler when one is installed, like ordinary lookup.
-        if let Some(status) = self.try_builtin(&new_args[0], &new_args, &[], &[], span)? {
-            Ok(status)
-        } else if self.has_external_handler() {
-            self.call_external_handler(&new_args, &[])
-        } else {
-            self.eval_external(&new_args, &[], &[], span)
+            CommandAction::Execute(new_args) => {
+                self.check_command_policy_for_dispatch(new_args, span)?;
+                if let Some(status) = self.try_builtin(&new_args[0], new_args, &[], &[], span)? {
+                    Ok(status)
+                } else if self.has_external_handler() {
+                    self.call_external_handler(new_args, &[])
+                } else {
+                    self.eval_external(new_args, &[], &[], span)
+                }
+            }
         }
     }
 
