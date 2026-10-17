@@ -605,10 +605,6 @@ fn save_active(pid: &str, state: &ActiveState) -> Result<(), String> {
         .write_all(buf.as_bytes())
         .map_err(|e| format!("failed to write active file: {e}"))
         .and_then(|()| {
-            file.sync_all()
-                .map_err(|e| format!("failed to sync active file: {e}"))
-        })
-        .and_then(|()| {
             fs::rename(&temp_path, &path)
                 .map_err(|e| format!("failed to replace active file: {e}"))
         });
