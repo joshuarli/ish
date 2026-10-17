@@ -2521,6 +2521,46 @@ fn multiline_continuation() {
 }
 
 #[test]
+fn multiline_preserves_unicode_quotes_and_backslash_newlines() {
+    let sh = PtyShell::spawn();
+    sh.type_str("printf '%s' 'é");
+    sh.enter();
+    sh.wait_for_line_advance(1000);
+    sh.type_str("日本\\");
+    sh.enter();
+    sh.wait_for_line_advance(1000);
+    sh.type_str("語' > quoted");
+    sh.enter();
+    sh.wait_for_prompt_after_line_advance(2000);
+    assert_eq!(std::fs::read(sh.home_path().join("quoted")).unwrap(), "é\n日本\\\n語".as_bytes());
+
+    sh.type_str("printf '%s' é\\");
+    sh.enter();
+    sh.wait_for_line_advance(1000);
+    sh.type_str("語 > escaped");
+    sh.enter();
+    sh.wait_for_prompt_after_line_advance(2000);
+    assert_eq!(std::fs::read(sh.home_path().join("escaped")).unwrap(), "é語".as_bytes());
+}
+
+#[test]
+fn history_replays_relative_cd_from_shell_special_directory() {
+    let sh = PtyShell::spawn_with_setup(
+        &[], &[], &[], 24, 120, Some("parent space'quote"),
+        |home| std::fs::create_dir_all(home.join("parent space'quote/child")).unwrap(),
+    );
+    sh.run_command("cd child");
+    sh.up();
+    sh.enter();
+    sh.wait_for_prompt_after_line_advance(2000);
+    sh.run_command("echo $? > replay-status");
+    assert_eq!(
+        std::fs::read(sh.home_path().join("parent space'quote/child/replay-status")).unwrap(),
+        b"0\n",
+    );
+}
+
+#[test]
 fn multiline_completion_on_continuation_line() {
     let sh = PtyShell::spawn_with_opts(&[("bin/upper", "#!/bin/sh\ntr a-z A-Z\n")], &[]);
     sh.type_str("echo hello |");

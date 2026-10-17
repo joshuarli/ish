@@ -865,11 +865,10 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 tw.write_str("\r\n");
                                 let _ = tw.flush_to_stdout();
                                 shell.prompt_buf = prompt_str;
-                                let joined = join_continuation_lines(&text);
-                                return if joined.is_empty() {
+                                return if text.is_empty() {
                                     ReadResult::Empty
                                 } else {
-                                    ReadResult::Line(joined)
+                                    ReadResult::Line(text)
                                 };
                             }
                             KeyAction::Continuation => {
@@ -1321,65 +1320,62 @@ fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
     aliases.expand_line(line).into_owned()
 }
 
-/// Resolve relative cd/z paths to absolute for history, so `z` can match them.
-/// "cd src" → "cd /Users/josh/d/ish/src", "cd ~/d" stays as-is.
 fn resolve_cd_for_history(line: &str) -> String {
+    use epsh::ast::WordPart;
+    use epsh::lexer::{Lexer, Token};
+
+    fn is_static(parts: &[WordPart]) -> bool {
+        parts.iter().all(|part| match part {
+            WordPart::Literal(_) | WordPart::SingleQuoted(_) => true,
+            WordPart::DoubleQuoted(parts) => is_static(parts),
+            _ => false,
+        })
+    }
+
     let trimmed = line.trim();
-    let (prefix, rest) = if let Some(r) = trimmed.strip_prefix("cd ") {
-        ("cd ", r.trim_start())
-    } else if let Some(r) = trimmed.strip_prefix("z ") {
-        ("z ", r.trim_start())
+    let (prefix, rest) = if let Some(rest) = trimmed.strip_prefix("cd ") {
+        ("cd ", rest.trim_start())
+    } else if let Some(rest) = trimmed.strip_prefix("z ") {
+        ("z ", rest.trim_start())
     } else {
         return line.to_string();
     };
-
-    // Already absolute or tilde-prefixed — no resolution needed
-    if rest.starts_with('/') || rest.starts_with('~') || rest == "-" || rest.is_empty() {
+    let mut lexer = Lexer::new(rest);
+    lexer.recognize_reserved = false;
+    let Ok((Token::Word(parts, _), _)) = lexer.next_token() else {
+        return line.to_string();
+    };
+    if !is_static(&parts) {
         return line.to_string();
     }
-
-    // Split at first whitespace/operator to get just the path argument
-    let (path_arg, suffix) =
-        match rest.find(|c: char| c.is_whitespace() || c == '&' || c == '|' || c == ';') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, ""),
-        };
-
-    // Resolve relative to PWD
-    if let Ok(pwd) = std::env::current_dir() {
-        let resolved = pwd.join(path_arg);
-        if let Ok(canonical) = resolved.canonicalize() {
-            return format!("{prefix}{}{suffix}", canonical.display());
-        }
-        // canonicalize failed (dir doesn't exist yet?) — use joined path
-        return format!("{prefix}{}{suffix}", resolved.display());
+    let text = epsh::lexer::parts_to_text(&parts);
+    if text.is_empty() || text.starts_with(['/', '~']) || text == "-" || text.contains(['*', '?', '[']) {
+        return line.to_string();
     }
-
-    line.to_string()
-}
-
-/// Join continuation lines for execution: strip `\<newline>` sequences,
-/// replace remaining newlines with spaces.
-fn join_continuation_lines(input: &str) -> String {
-    if !input.contains('\n') {
-        return input.to_string();
+    let Ok((_, next_span)) = lexer.next_token() else {
+        return line.to_string();
+    };
+    let suffix_start = rest.char_indices().nth(next_span.offset).map_or(rest.len(), |(i, _)| i);
+    let suffix = &rest[suffix_start..];
+    let Ok(cwd) = std::env::current_dir() else {
+        return line.to_string();
+    };
+    let target = epsh::shell_bytes::ShellBytes::from_str_lossless(&text).to_path_buf();
+    let resolved = cwd.join(target);
+    let resolved = resolved.canonicalize().unwrap_or(resolved);
+    let Some(path) = resolved.to_str() else {
+        return line.to_string();
+    };
+    let target = if needs_quoting(path) || path.contains('\'') || path.chars().any(char::is_control) {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    } else {
+        path.to_string()
+    };
+    if suffix.is_empty() {
+        format!("{prefix}{target}")
+    } else {
+        format!("{prefix}{target} {suffix}")
     }
-    let mut result = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-            // Line continuation: skip \ and \n
-            i += 2;
-        } else if bytes[i] == b'\n' {
-            result.push(' ');
-            i += 1;
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    result
 }
 
 fn handle_normal_key(
@@ -1486,8 +1482,7 @@ fn handle_normal_key(
             return KeyAction::StartCompletion;
         }
         (Key::Enter, _, _) => {
-            let text = join_continuation_lines(line.text());
-            if needs_continuation(&text) {
+            if needs_continuation(line.text()) {
                 return KeyAction::Continuation;
             }
             return KeyAction::Execute(line.text().to_string());
@@ -2726,7 +2721,7 @@ fn needs_continuation(input: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    let (in_single, in_double, escape) = scan_quote_state(trimmed.as_bytes());
+    let (in_single, in_double, escape) = scan_quote_state(input.as_bytes());
     if in_single || in_double || escape {
         return true;
     }
