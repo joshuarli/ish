@@ -22,10 +22,13 @@ Run the differential bridge from the repository root:
 cargo run --example semantic_bridge -p ish -- --family all --cases 1000
 ```
 
-The command generates 1,000 cases for each of the policy, expansion,
+The command generates 1,000 requests for each of the policy, expansion,
 arithmetic, evaluation, effects, and interactive families. It also runs
 retained regression cases, protocol boundary checks, and one negative control
-per family. A detected semantic mismatch is reduced and saved under
+per family. The bridge accepts `unsupported_domain` and `fuel_exhausted` as
+comparable outcomes, so the request count does not mean every request exercised
+a supported operation. The coverage matrix records known domain limits. A
+detected semantic mismatch is reduced and saved under
 `formal/fixtures/bridge-regressions/`.
 
 The bridge calls production Rust entry points for each family. Its generated
