@@ -73,7 +73,7 @@ fn delimited_expression(source: &[u8]) -> Result<(&[u8], bool), String> {
         .enumerate()
         .filter(|(index, byte)| **byte == b'/' && !is_escaped(&source[1..], *index))
         .map(|(index, _)| index + 1)
-        .last()
+        .next_back()
         .ok_or_else(|| "pattern delimiter is not closed".to_owned())?;
     let expression = &source[1..end];
     let modifier = &source[end + 1..];

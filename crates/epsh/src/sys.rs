@@ -159,9 +159,10 @@ pub fn getuid() -> u32 {
 
 /// Set the process file-mode creation mask. Returns the previous mask.
 pub fn umask(mask: u32) -> u32 {
-    rustix::process::umask(Mode::from_bits_retain(mask as _))
-        .bits()
-        .into()
+    let previous_mask = rustix::process::umask(Mode::from_bits_retain(mask as _)).bits();
+    #[cfg(target_vendor = "apple")]
+    let previous_mask = u32::from(previous_mask);
+    previous_mask
 }
 
 /// Exit the process, flushing Rust's stdout first.
