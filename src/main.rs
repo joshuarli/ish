@@ -132,6 +132,22 @@ fn print_help() {
     println!("  -h, --help     Show this help message");
 }
 
+fn ish_command_policy(target: &epsh::shell_bytes::ShellBytes) -> Option<String> {
+    let name = target.as_utf8_str()?;
+    if matches!(name, "eval" | "source" | ".") {
+        return Some(format!("`{name}` is not supported"));
+    }
+
+    builtin::lookup(name)
+        .filter(|spec| spec.exec == builtin::Exec::InShell)
+        .map(|spec| {
+            format!(
+                "{} changes shell state and requires a statically named whole-line command",
+                spec.name
+            )
+        })
+}
+
 fn main() {
     let cli = parse_args();
 
@@ -211,6 +227,9 @@ fn main() {
     let changes = denv::on_startup(&shell.epsh);
     apply_denv_changes(&changes, &mut shell.epsh);
     sync_shell_store_derived(&mut shell);
+    shell
+        .epsh
+        .set_command_policy(Box::new(ish_command_policy));
 
     // Main loop
     let mut exit_code = 0;
