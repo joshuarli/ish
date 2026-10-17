@@ -28,6 +28,11 @@ The byte-preserving paths include:
 - Redirection paths, path arguments to builtins, and glob directory entries.
 - Captured command-substitution output.
 
+The OS and filesystem decide which path names they accept. A filesystem may
+return `EILSEQ` for a path component containing invalid UTF-8. The shell passes
+those bytes through and does not retry the path using a literal private-use
+Unicode name.
+
 The child environment merges inherited entries, exported shell variables, and
 command-prefix assignments. Exported variables and prefix assignments shadow
 inherited entries with the same name. A prefix assignment takes precedence for
@@ -48,6 +53,8 @@ Byte-preservation coverage lives in the `raw_bytes` module of
 in [embedding.rs](../tests/embedding.rs), and
 [byte_codec.rs](../tests/byte_codec.rs). ish also checks raw `HOME` path use and
 the text-only `z` and completion errors in [pty.rs](../../../tests/pty.rs).
-Tests for invalid path bytes skip when the host filesystem does not accept
-them. Argument and environment round-trip checks do not depend on invalid path
-support.
+Some integration tests that need raw path entries make raw-name assertions
+only when the host filesystem accepts those names. The file-predicate, glob,
+interpreter-lookup, and PTY tests also check that `EILSEQ` does not alias a
+matching literal private-use name. Argument and environment round-trip checks
+run on every host.

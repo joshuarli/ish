@@ -37,7 +37,7 @@ jobs:
           rustup component add clippy
           cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace --lib --tests
+        run: cargo test --workspace --lib --tests --no-fail-fast
 
   linux-musl:
     name: Lint and test (Linux ${{ matrix.arch }} musl)

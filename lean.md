@@ -628,6 +628,6 @@ are documented in the existing READMEs. The denv persistence change retains
 atomic mode-0600 temporary writes, write-all, rename, and error rollback. It
 changes no file format or crash-recovery contract.
 
-The remaining hard stops are native macOS Apple silicon and Linux ARM64 test
-execution and green remote CI. The changes are local and have not been pushed.
-Cross-compilation checks do not close the native execution requirement.
+The first remote hardening run passed native Linux ARM64 musl tests. Native
+macOS and Linux x86_64 musl failures and the fresh Lean setup failure require
+corrections before remote acceptance is complete.

@@ -1,5 +1,7 @@
 #[path = "common/unix.rs"]
 mod unix_support;
+#[path = "common/raw_filename.rs"]
+mod raw_filename_support;
 
 use epsh::eval::Shell;
 use epsh::shell_bytes::ShellBytes;
@@ -83,24 +85,41 @@ fn test_file_predicates_preserve_raw_path_bytes() {
     let directory = tempfile::tempdir().unwrap();
     let raw_name = OsString::from_vec(b"raw-\x80-name".to_vec());
     let raw_path = directory.path().join(&raw_name);
-    fs::write(&raw_path, b"raw contents").unwrap();
-    fs::set_permissions(&raw_path, fs::Permissions::from_mode(0o777)).unwrap();
+    let literal_name = OsString::from("raw-\u{e080}-name");
+    let literal_path = directory.path().join(&literal_name);
+    fs::write(&literal_path, b"literal PUA contents").unwrap();
+    let raw_name_created = raw_filename_support::create_raw_filename(&raw_path, |path| {
+        fs::write(path, b"raw contents")
+    })
+    .unwrap();
+    if raw_name_created {
+        fs::set_permissions(&raw_path, fs::Permissions::from_mode(0o777)).unwrap();
+    }
     let mut shell = Shell::builder().cwd(directory.path().to_path_buf()).build();
     shell
         .set_var_bytes("RAW", ShellBytes::from_os_str(raw_name.as_os_str()))
         .unwrap();
+    shell
+        .set_var_bytes("LITERAL", ShellBytes::from_os_str(literal_name.as_os_str()))
+        .unwrap();
 
-    for script in [
-        "test -e \"$RAW\"",
-        "test -f \"$RAW\"",
-        "test -r \"$RAW\"",
-        "test -w \"$RAW\"",
-        "test -x \"$RAW\"",
-        "test -s \"$RAW\"",
-        "test \"$RAW\" -ef \"$RAW\"",
-    ] {
-        assert_eq!(shell.run_script(script), 0, "{script}");
+    if raw_name_created {
+        for script in [
+            "test -e \"$RAW\"",
+            "test -f \"$RAW\"",
+            "test -r \"$RAW\"",
+            "test -w \"$RAW\"",
+            "test -x \"$RAW\"",
+            "test -s \"$RAW\"",
+            "test \"$RAW\" -ef \"$RAW\"",
+        ] {
+            assert_eq!(shell.run_script(script), 0, "{script}");
+        }
+    } else {
+        assert_eq!(shell.run_script("test -e \"$RAW\""), 1);
     }
+    assert_eq!(shell.run_script("test -f \"$LITERAL\""), 0);
+    assert_eq!(shell.run_script("test \"$RAW\" -ef \"$LITERAL\""), 1);
 }
 
 #[test]

@@ -18,7 +18,7 @@ All three baseline and candidate ranges overlap. Candidate medians moved by -1.6
 
 ## Retained changes
 
-The retained verification changes produce a byte-for-byte identical static,
+The initial verification revision `ee1a2c1` produces a byte-for-byte identical static,
 stripped release to the baseline: 1,229,016 bytes. Both builds use `make release`
 with the pinned toolchain and musl target.
 
@@ -29,6 +29,6 @@ GNU time records the shell's peak resident memory in KiB:
 | Source | Minimum | Median | Maximum |
 | --- | ---: | ---: | ---: |
 | Baseline | 11,696 | 12,072 | 13,088 |
-| Verification changes | 11,944 | 12,256 | 12,504 |
+| Initial verification revision | 11,944 | 12,256 | 12,504 |
 
 The ranges overlap, and the retained changes pass the 2× memory ceiling.

@@ -12,7 +12,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -35,6 +35,9 @@ const DOTENV_VALUE_VAR_PREFIX: &str = "__DENV_DOT_";
 /// while ish waits, so a hung `.envrc` must fail loudly instead of wedging cd.
 const ENVRC_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
 const ACTIVE_TEMP_NAME_ATTEMPTS: u64 = 128;
+const BEFORE_SNAPSHOT_FD: RawFd = 3;
+const AFTER_SNAPSHOT_FD: RawFd = 4;
+const SNAPSHOT_SOURCE_FD_MIN: RawFd = AFTER_SNAPSHOT_FD + 1;
 
 static NEXT_ACTIVE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -910,15 +913,7 @@ fn eval_env_bash(
     let after_r = unsafe { OwnedFd::from_raw_fd(after_r) };
     // SAFETY: these fds come directly from pipe_cloexec and are uniquely owned here.
     let after_w = unsafe { OwnedFd::from_raw_fd(after_w) };
-    // Keep stable source fds for the child remap. The pipe fds can occupy 3 or
-    // 4 themselves, so remapping directly from them can overwrite the other
-    // source before it has been installed.
-    let before_src = rustix::io::dup(&before_w).map_err(|e| format!("dup before pipe: {e}"))?;
-    let after_src = rustix::io::dup(&after_w).map_err(|e| format!("dup after pipe: {e}"))?;
-    rustix::io::fcntl_setfd(&before_src, rustix::io::FdFlags::CLOEXEC)
-        .map_err(|e| format!("set before pipe close-on-exec: {e}"))?;
-    rustix::io::fcntl_setfd(&after_src, rustix::io::FdFlags::CLOEXEC)
-        .map_err(|e| format!("set after pipe close-on-exec: {e}"))?;
+    let (before_src, after_src) = duplicate_snapshot_writers(&before_w, &after_w)?;
     rustix::fs::fcntl_setfl(&before_r, rustix::fs::OFlags::NONBLOCK)
         .map_err(|e| format!("set before pipe nonblocking: {e}"))?;
     rustix::fs::fcntl_setfl(&after_r, rustix::fs::OFlags::NONBLOCK)
@@ -956,20 +951,11 @@ fn eval_env_bash(
     for (i, (_, value)) in dotenv_entries.iter().enumerate() {
         cmd.env(format!("{DOTENV_VALUE_VAR_PREFIX}{i}"), value);
     }
-    // SAFETY: pre_exec runs in the child after fork and before exec. We reset
-    // signal dispositions (ish ignores SIGINT, which exec would otherwise
-    // preserve, making the .envrc uninterruptible) and dup the dedicated pipe
-    // fds into 3/4 for the shell snapshot script.
+    // SAFETY: the hook runs after fork and only resets signals and remaps owned snapshot descriptors.
     unsafe {
         cmd.pre_exec(move || {
             crate::signal::restore_defaults();
-            let mut before_target = OwnedFd::from_raw_fd(3);
-            rustix::io::dup2(&before_src, &mut before_target).map_err(io::Error::from)?;
-            std::mem::forget(before_target);
-            let mut after_target = OwnedFd::from_raw_fd(4);
-            rustix::io::dup2(&after_src, &mut after_target).map_err(io::Error::from)?;
-            std::mem::forget(after_target);
-            Ok(())
+            remap_snapshot_writers(&before_src, &after_src)
         });
     }
     let mut child = cmd
@@ -1104,6 +1090,37 @@ fn eval_env_bash(
     let before = parse_env_null(&before_data);
     let after = parse_env_null(&after_data);
     Ok(diff_sorted_env(&before, &after))
+}
+
+fn duplicate_snapshot_writers(
+    before_w: &OwnedFd,
+    after_w: &OwnedFd,
+) -> Result<(OwnedFd, OwnedFd), String> {
+    let before_src = rustix::io::fcntl_dupfd_cloexec(before_w, SNAPSHOT_SOURCE_FD_MIN)
+        .map_err(|e| format!("dup before pipe: {e}"))?;
+    let after_src = rustix::io::fcntl_dupfd_cloexec(after_w, SNAPSHOT_SOURCE_FD_MIN)
+        .map_err(|e| format!("dup after pipe: {e}"))?;
+    Ok((before_src, after_src))
+}
+
+fn remap_snapshot_writers(
+    before_src: &OwnedFd,
+    after_src: &OwnedFd,
+) -> io::Result<()> {
+    dup_snapshot_writer_to(before_src, BEFORE_SNAPSHOT_FD)?;
+    dup_snapshot_writer_to(after_src, AFTER_SNAPSHOT_FD)?;
+    Ok(())
+}
+
+fn dup_snapshot_writer_to(source: &OwnedFd, target: RawFd) -> io::Result<()> {
+    // rustix::io::dup2 requires an owned target, but these child targets may be closed.
+    // SAFETY: dup2 accepts a closed target and replaces it with the owned source descriptor.
+    let result = unsafe { libc::dup2(source.as_raw_fd(), target) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn drain_env_pipe(file: &mut fs::File, data: &mut Vec<u8>, label: &str) -> Result<bool, String> {
@@ -1326,6 +1343,7 @@ pub fn apply_bash_output_bench(output: &str) -> usize {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Mutex, MutexGuard};
@@ -1845,6 +1863,81 @@ mod tests {
     }
 
     #[test]
+    fn bash_snapshot_writers_survive_exec_when_low_fds_are_free() {
+        const CHILD_MODE: &str = "ISH_DENV_SNAPSHOT_FD_CHILD";
+        if env::var_os(CHILD_MODE).is_none() {
+            let output = std::process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "denv::tests::bash_snapshot_writers_survive_exec_when_low_fds_are_free",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_MODE, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+
+        // SAFETY: this subprocess reserves descriptors 3 and 4 for this test.
+        unsafe {
+            libc::close(BEFORE_SNAPSHOT_FD);
+            libc::close(AFTER_SNAPSHOT_FD);
+        }
+        let blockers = [
+            std::fs::File::open("/dev/null").unwrap(),
+            std::fs::File::open("/dev/null").unwrap(),
+        ];
+        assert_eq!(blockers[0].as_raw_fd(), BEFORE_SNAPSHOT_FD);
+        assert_eq!(blockers[1].as_raw_fd(), AFTER_SNAPSHOT_FD);
+
+        let (before_read, before_w) = rustix::pipe::pipe().unwrap();
+        let (after_read, after_w) = rustix::pipe::pipe().unwrap();
+        drop(blockers);
+        let (before_src, after_src) = duplicate_snapshot_writers(&before_w, &after_w).unwrap();
+        drop(before_w);
+        drop(after_w);
+
+        let mut command = std::process::Command::new("bash");
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("DENV_FD_SNAPSHOT", "before")
+            .arg("-e")
+            .arg("-c")
+            .arg("env -0 >&3\nexport DENV_FD_SNAPSHOT=after\nenv -0 >&4");
+        // SAFETY: the child hook remaps the owned snapshot descriptors before exec.
+        unsafe {
+            command.pre_exec(move || remap_snapshot_writers(&before_src, &after_src));
+        }
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        assert!(child.wait().unwrap().success());
+
+        let mut before_data = Vec::new();
+        let mut after_data = Vec::new();
+        std::fs::File::from(before_read)
+            .read_to_end(&mut before_data)
+            .unwrap();
+        std::fs::File::from(after_read)
+            .read_to_end(&mut after_data)
+            .unwrap();
+        let before = parse_env_null(&before_data);
+        let after = parse_env_null(&after_data);
+        let diff = diff_sorted_env(&before, &after);
+        assert!(before.iter().any(|&(key, value)| {
+            key == "DENV_FD_SNAPSHOT" && value == "before"
+        }));
+        assert!(after
+            .iter()
+            .any(|&(key, value)| key == "DENV_FD_SNAPSHOT" && value == "after"));
+        assert!(diff
+            .set
+            .contains(&("DENV_FD_SNAPSHOT".into(), "after".into())));
+    }
+
+    #[test]
     fn dotenv_values_reach_epsh_as_data_not_script() {
         let _process_env = ProcessEnvGuard::new();
         let tmp = TempDir::new("ish_denv_dotenv_epsh");
@@ -1907,7 +2000,7 @@ mod tests {
             Ok(_) => panic!("expected descendant timeout"),
             Err(err) => err,
         };
-        assert!(err.contains("timed out"));
+        assert!(err.contains("timed out"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(400));
         assert!(!marker.exists());

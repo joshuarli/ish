@@ -6,6 +6,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+#[path = "common/raw_filename.rs"]
+mod raw_filename_support;
+
 #[test]
 fn codec_preserves_every_private_use_scalar_and_invalid_byte() {
     for scalar in 0xe000..=0xf8ff {
@@ -122,10 +125,15 @@ fn quoted_private_use_heredocs_and_nested_scripts_preserve_bytes() {
 #[test]
 fn private_use_and_invalid_path_names_remain_distinct_during_globbing() {
     let directory = tempfile::tempdir().unwrap();
-    let names = [vec![0xee, 0x80, 0x80], vec![0xee, 0x82, 0x80], vec![0x80]];
-    for name in &names {
+    let private_use_names = [vec![0xee, 0x80, 0x80], vec![0xee, 0x82, 0x80]];
+    for name in &private_use_names {
         std::fs::write(directory.path().join(OsString::from_vec(name.clone())), b"").unwrap();
     }
+    let raw_name_created = raw_filename_support::create_raw_filename(
+        &directory.path().join(OsString::from_vec(vec![0x80])),
+        |path| std::fs::write(path, b""),
+    )
+    .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
         .current_dir(directory.path())
         .arg("-c")
@@ -135,7 +143,25 @@ fn private_use_and_invalid_path_names_remain_distinct_during_globbing() {
     assert!(output.status.success(), "{:?}", output.stderr);
     let mut lines: Vec<_> = output.stdout.split(|b| *b == b'\n').filter(|line| !line.is_empty()).collect();
     lines.sort_unstable();
-    assert_eq!(lines, vec![b"80".as_slice(), b"ee8080", b"ee8280"]);
+    let expected = if raw_name_created {
+        vec![b"80".as_slice(), b"ee8080", b"ee8280"]
+    } else {
+        vec![b"ee8080".as_slice(), b"ee8280"]
+    };
+    assert_eq!(lines, expected);
+
+    let mut shell = Shell::builder().cwd(directory.path().to_path_buf()).build();
+    shell
+        .set_var_bytes("RAW_NAME", epsh::shell_bytes::ShellBytes::from_vec(vec![0x80]))
+        .unwrap();
+    shell.set_var("LITERAL_NAME", "\u{e080}").unwrap();
+    assert_eq!(
+        shell.run_script("test -e \"$RAW_NAME\""),
+        if raw_name_created { 0 } else { 1 }
+    );
+    assert_eq!(shell.run_script("test -f \"$LITERAL_NAME\""), 0);
+    assert_eq!(shell.run_script("test \"$RAW_NAME\" -ef \"$LITERAL_NAME\""), 1);
+
     let path = directory.path().join("\u{e080}");
     assert_eq!(epsh::glob::glob("\u{e080}", directory.path()), vec![bytes_to_str(path.file_name().unwrap().as_bytes())]);
 }
@@ -173,27 +199,99 @@ fn builtin_byte_consumers_preserve_unicode_units_and_raw_data() {
 fn bad_interpreter_lookup_and_diagnostics_preserve_os_bytes() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
-    let bin = directory.path().join(OsString::from_vec(b"bin\xee\x82\x80\x80".to_vec()));
-    std::fs::create_dir(&bin).unwrap();
+    let raw_bin = directory
+        .path()
+        .join(OsString::from_vec(b"bin\xee\x82\x80\x80".to_vec()));
+    let collision_bin = directory.path().join("bin\u{e080}\u{e080}");
+    std::fs::create_dir(&collision_bin).unwrap();
+    let raw_bin_created =
+        raw_filename_support::create_raw_filename(&raw_bin, |path| std::fs::create_dir(path))
+            .unwrap();
     let name = OsString::from_vec(b"cmd\xee\x82\x80\xff".to_vec());
+    let collision_name = OsString::from("cmd\u{e080}\u{e0ff}");
     let interpreter = b"/absent-codec-interpreter/\xee\x82\x80\x80";
     let mut source = b"#!".to_vec();
     source.extend_from_slice(interpreter);
     source.push(b'\n');
-    let path = bin.join(&name);
-    std::fs::write(&path, source).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let diagnostic = epsh::eval::bad_interpreter_message_os(&name, libc::ENOENT, directory.path(), bin.as_os_str()).unwrap();
-    let mut prefix = name.as_bytes().to_vec();
+    let collision_path = collision_bin.join(&collision_name);
+    assert!(
+        raw_filename_support::create_raw_filename(&collision_path, |path| {
+            std::fs::write(path, &source)
+        })
+        .unwrap()
+    );
+    std::fs::set_permissions(
+        &collision_path,
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let name_directory = if raw_bin_created {
+        &raw_bin
+    } else {
+        &collision_bin
+    };
+    let path = name_directory.join(&name);
+    let raw_name_created = raw_filename_support::create_raw_filename(&path, |path| {
+        std::fs::write(path, &source)
+    })
+    .unwrap();
+    if raw_name_created {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path_env = if raw_name_created {
+        name_directory
+    } else {
+        &collision_bin
+    };
+    let diagnostic_name = if raw_name_created {
+        &name
+    } else {
+        &collision_name
+    };
+    let diagnostic = epsh::eval::bad_interpreter_message_os(
+        diagnostic_name,
+        libc::ENOENT,
+        directory.path(),
+        path_env.as_os_str(),
+    )
+    .unwrap();
+    let mut prefix = diagnostic_name.as_bytes().to_vec();
     prefix.extend_from_slice(b": ");
     prefix.extend_from_slice(interpreter);
     prefix.extend_from_slice(b": bad interpreter: ");
     assert!(diagnostic.as_bytes().starts_with(&prefix));
     let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
-        .current_dir(directory.path()).env("PATH", &bin)
+        .current_dir(directory.path()).env("PATH", path_env)
         .arg("-c").arg(name).output().unwrap();
+    if raw_name_created {
+        assert_eq!(output.status.code(), Some(126));
+        assert!(output.stderr.starts_with(&prefix), "{:?}", output.stderr);
+    } else {
+        assert_eq!(output.status.code(), Some(127));
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
+        .current_dir(directory.path())
+        .env("PATH", &raw_bin)
+        .arg("-c")
+        .arg(collision_name.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(127));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
+        .current_dir(directory.path())
+        .env("PATH", &collision_bin)
+        .arg("-c")
+        .arg(collision_name.to_str().unwrap())
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(126));
-    assert!(output.stderr.starts_with(&prefix), "{:?}", output.stderr);
+    let mut collision_prefix = collision_name.as_bytes().to_vec();
+    collision_prefix.extend_from_slice(b": ");
+    collision_prefix.extend_from_slice(interpreter);
+    collision_prefix.extend_from_slice(b": bad interpreter: ");
+    assert!(output.stderr.starts_with(&collision_prefix), "{:?}", output.stderr);
 }
 
 #[test]

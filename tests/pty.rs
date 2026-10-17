@@ -3795,32 +3795,69 @@ fn ctrl_p_dump_is_private_and_omits_typed_text() {
 #[test]
 fn native_listing_and_standalone_cd_preserve_private_use_and_raw_path_bytes() {
     use std::ffi::OsString;
+    let raw_directory_created = Cell::new(false);
     let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
-        for directory in [OsString::from("\u{e000}\u{e080}"), OsString::from_vec(vec![0x80])] {
+        for (directory, marker) in [
+            (OsString::from("\u{e000}\u{e080}"), "codec-path-marker"),
+            (OsString::from("\u{e080}"), "pua-collision-marker"),
+        ] {
             let directory = home.join(directory);
             std::fs::create_dir(&directory).unwrap();
-            std::fs::write(directory.join("codec-path-marker"), b"").unwrap();
+            std::fs::write(directory.join(marker), b"").unwrap();
         }
+        let raw_directory = home.join(OsString::from_vec(vec![0x80]));
+        let created = match std::fs::create_dir(&raw_directory) {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => false,
+            Err(error) => panic!("{error}"),
+        };
+        if created {
+            std::fs::write(raw_directory.join("raw-byte-marker"), b"").unwrap();
+        }
+        raw_directory_created.set(created);
     });
-    for directory in ["\u{e000}\u{e080}".to_string(), "$(printf '\\0200')".to_string()] {
-        let out = clean(&sh.run_command(&format!("l \"$HOME/{directory}\"")));
-        assert!(out.contains("codec-path-marker"), "{out}");
-        let out = clean(&sh.run_command(&format!("cd \"$HOME/{directory}\"")));
-        assert!(!out.contains("No such file"), "{out}");
-        let out = clean(&sh.run_command("l"));
-        assert!(out.contains("codec-path-marker"), "{out}");
-        sh.run_command("cd \"$HOME\"");
-    }
-    sh.run_command("HOME=\"$HOME/$(printf '\\0200')\"");
-    sh.run_command("cd");
+
+    let out = clean(&sh.run_command("l \"$HOME/\u{e000}\u{e080}\""));
+    assert!(out.contains("codec-path-marker"), "{out}");
+    let out = clean(&sh.run_command("cd \"$HOME/\u{e000}\u{e080}\""));
+    assert!(!out.contains("No such file"), "{out}");
     let out = clean(&sh.run_command("l"));
     assert!(out.contains("codec-path-marker"), "{out}");
-    sh.send(b"\x10");
-    sh.wait_for_quiescence(200);
-    let dump_dir = sh.home_path().join(OsString::from_vec(vec![0x80])).join(".cache/ish");
-    assert!(std::fs::read_dir(dump_dir).unwrap().any(|entry| {
-        entry.unwrap().file_name().to_string_lossy().starts_with("dump-")
-    }));
+    sh.run_command("cd \"$HOME\"");
+
+    let out = clean(&sh.run_command("cd \"$HOME/\u{e080}\""));
+    assert!(!out.contains("No such file"), "{out}");
+    let out = clean(&sh.run_command("l"));
+    assert!(out.contains("pua-collision-marker"), "{out}");
+    sh.run_command("cd \"$HOME\"");
+
+    if raw_directory_created.get() {
+        let out = clean(&sh.run_command("l \"$HOME/$(printf '\\0200')\""));
+        assert!(out.contains("raw-byte-marker"), "{out}");
+        let out = clean(&sh.run_command("cd \"$HOME/$(printf '\\0200')\""));
+        assert!(!out.contains("No such file"), "{out}");
+        let out = clean(&sh.run_command("l"));
+        assert!(out.contains("raw-byte-marker"), "{out}");
+        sh.run_command("cd \"$HOME\"");
+    } else {
+        let out = clean(&sh.run_command("cd \"$HOME/$(printf '\\0200')\""));
+        assert!(out.contains("ish: cd:"), "{out}");
+        let out = clean(&sh.run_command("l"));
+        assert!(!out.contains("pua-collision-marker"), "{out}");
+    }
+
+    sh.run_command("HOME_ORIGINAL=\"$HOME\"");
+    sh.run_command("HOME=\"$HOME/$(printf '\\0200')\"");
+    if raw_directory_created.get() {
+        sh.run_command("cd");
+        let out = clean(&sh.run_command("l"));
+        assert!(out.contains("raw-byte-marker"), "{out}");
+    } else {
+        let out = clean(&sh.run_command("cd"));
+        assert!(out.contains("ish: cd:"), "{out}");
+        let out = clean(&sh.run_command("l"));
+        assert!(!out.contains("pua-collision-marker"), "{out}");
+    }
     let out = clean(&sh.run_command("z"));
     assert!(out.contains("ish: z: HOME is not UTF-8"), "{out}");
     sh.type_str("cd ~/");
@@ -3828,6 +3865,21 @@ fn native_listing_and_standalone_cd_preserve_private_use_and_raw_path_bytes() {
     let out = clean(&sh.read_timeout(300));
     assert!(out.contains("ish: completion: HOME is not UTF-8"), "{out}");
     sh.ctrl_c();
+    if !raw_directory_created.get() {
+        sh.run_command("HOME=\"$HOME_ORIGINAL\"");
+        sh.run_command("cd");
+    }
+    sh.send(b"\x10");
+    sh.wait_for_quiescence(200);
+    let dump_home = if raw_directory_created.get() {
+        sh.home_path().join(OsString::from_vec(vec![0x80]))
+    } else {
+        sh.home_path().to_path_buf()
+    };
+    let dump_dir = dump_home.join(".cache/ish");
+    assert!(std::fs::read_dir(dump_dir).unwrap().any(|entry| {
+        entry.unwrap().file_name().to_string_lossy().starts_with("dump-")
+    }));
 }
 
 #[test]

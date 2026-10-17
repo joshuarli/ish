@@ -24,15 +24,18 @@ The proof audits its transitive axioms against `propext`, `Quot.sound`, and
 Run `make verify-refinement` with Lean 4.35.0 and Python 3.12 or later on `PATH`.
 The pinned official tools support Linux x86_64 and ARM64. On musl hosts, the
 checker runs Charon in a Debian container and requires Docker.
+Lean commands run from `formal/` so Elan finds the project pin without a global
+default toolchain.
 
 The checker downloads [Aeneas nightly-2026.10.17-e62dd83](https://github.com/AeneasVerif/aeneas/releases/tag/nightly-2026.10.17-e62dd83)
 and its matching Charon under `.work/tools/`. Both tools use Apache 2.0 licenses.
 The extractor needs a separate Rust nightly-2026-09-17 toolchain under that
 directory. The production Rust pin remains nightly-2026-09-15.
 
-The main bundle is about 153.4 MiB. The observed installed tool tree occupies
-about 6.5 GiB, including GNU Rust, the Aeneas Lean backend, and mathlib sources
-and compiled caches. A clean bootstrap duration has not been measured. Ordinary
+The main bundle is about 153.4 MiB. A fresh installed tool tree occupies about
+3.75 GiB, including GNU Rust, the Aeneas Lean backend, and mathlib sources and
+compiled caches. The compressed mathlib cache uses another 0.1 GiB.
+A clean bootstrap duration has not been measured. Ordinary
 Cargo builds do not run these tools or add their dependencies to the shell.
 
 ## Trust and scope

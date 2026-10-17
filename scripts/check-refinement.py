@@ -111,8 +111,8 @@ def main():
              "-dest", output, output / "epsh_shift.llbc"])
         leanenv = dict(ENV, LEAN_PATH=os.pathsep.join(map(str, [output, *search, ROOT / "formal/.lake/build/lib/lean"])))
         run(["lean", "--root=" + str(output), "-o", output / "EpshShift.olean", output / "EpshShift.lean"],
-            env=leanenv)
-        run(["lean", ROOT / "formal/Refinement/Shift.lean"], env=leanenv)
+            cwd=ROOT / "formal", env=leanenv)
+        run(["lean", ROOT / "formal/Refinement/Shift.lean"], cwd=ROOT / "formal", env=leanenv)
     print("Production shift-count extraction, refinement, and axiom audit passed", flush=True)
 
 
