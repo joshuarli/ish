@@ -326,7 +326,7 @@ fn fixed_pipeline(
 }
 
 fn initial_state(index: usize) -> Value {
-    let shared = if index % 2 == 0 {
+    let shared = if index.is_multiple_of(2) {
         b"exported".to_vec()
     } else {
         vec![b'e', 0xff]
@@ -342,7 +342,7 @@ fn initial_state(index: usize) -> Value {
         "inherited": [],
         "cwd": [47],
         "positional": [b"positional".to_vec(), vec![b'p', 0xff]],
-        "last_status": if index == 1 { 9 } else if index % 6 == 0 { 11 } else { 0 },
+        "last_status": if index == 1 { 9 } else if index.is_multiple_of(6) { 11 } else { 0 },
     })
 }
 
@@ -1110,7 +1110,7 @@ fn actual_in_scratch(
     let status = u8::try_from(returned)
         .map_err(|_| BridgeError::new("production shell returned a status outside 0..255"))?;
     let program = program_json(parsed)?;
-    let state = resulting_state(&program, &initial_state, &shell, status)?;
+    let state = resulting_state(&program, initial_state, &shell, status)?;
     let trace = recorded_trace(scratch, observations.len())?;
     Ok(json!({
         "tag": "success",

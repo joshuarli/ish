@@ -133,8 +133,8 @@ pub(crate) fn generate(index: usize, seed: u64) -> Request {
     let input = json!({"tree": expr.tree()});
     let variables = vec![
         ("v0", b"7".to_vec()),
-        ("v1", if index % 7 == 0 { vec![255] } else { b"-3".to_vec() }),
-        ("v2", if index % 11 == 0 { b"not-an-int".to_vec() } else { b"9223372036854775808".to_vec() }),
+        ("v1", if index.is_multiple_of(7) { vec![255] } else { b"-3".to_vec() }),
+        ("v2", if index.is_multiple_of(11) { b"not-an-int".to_vec() } else { b"9223372036854775808".to_vec() }),
         ("min", i64::MIN.to_string().into_bytes()),
     ];
     let state = json!({

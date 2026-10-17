@@ -559,11 +559,11 @@ fn active_prompt_text(screen: &ptytest::ScreenSnapshot) -> String {
         .unwrap_or_else(|| cursor_row.saturating_sub(4));
     let last = (cursor_row + 4).min(screen.row_count().saturating_sub(1));
     let mut active = String::new();
-    for row in first..=last {
+    for (row, text) in rows.iter().enumerate().take(last + 1).skip(first) {
         if row > first && screen.row_wrapped(row - 1) != Some(true) {
             active.push(' ');
         }
-        active.push_str(&rows[row]);
+        active.push_str(text);
     }
     active
 }
