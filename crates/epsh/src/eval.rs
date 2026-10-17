@@ -710,12 +710,16 @@ impl Shell {
         Ok(())
     }
 
-    fn fork_evaluator(&self) -> i32 {
+    fn fork_evaluator(&self) -> crate::error::Result<i32> {
+        let stdout = std::io::stdout();
+        let mut stdout_guard = stdout.lock();
+        stdout_guard.flush()?;
         let guards: Vec<_> = self.redirection_fds.iter().flatten().map(|descriptor| descriptor.lock().unwrap()).collect();
-        // SAFETY: descriptor readers are paused across fork; both processes release their copied guards before evaluating.
+        // SAFETY: stdout is flushed and locked, and descriptor readers are paused; both processes release copied guards before evaluating.
         let pid = unsafe { sys::fork() };
         drop(guards);
-        pid
+        drop(stdout_guard);
+        Ok(pid)
     }
 
     fn track_child(&mut self, pid: i32, pgid: i32) {
@@ -1859,7 +1863,15 @@ impl Shell {
         let mut pgid = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
         for (i, cmd) in commands.iter().enumerate() {
             // SAFETY: every descriptor has an owner in the parent; the child installs its endpoints and exits without unwinding.
-            let pid = self.fork_evaluator();
+            let pid = match self.fork_evaluator() {
+                Ok(pid) => pid,
+                Err(error) => {
+                    drop(pipes);
+                    drop(outputs);
+                    self.kill_children();
+                    return Err(error);
+                }
+            };
             if pid < 0 {
                 let error = std::io::Error::last_os_error();
                 drop(pipes);
@@ -1975,7 +1987,7 @@ impl Shell {
         let outputs = self.fork_outputs(true)?;
         let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
         // SAFETY: the child has independent evaluator state and exits without unwinding into its caller.
-        let pid = self.fork_evaluator();
+        let pid = self.fork_evaluator()?;
         if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
         if pid == 0 {
             if self.enter_forked_child(&outputs, parent_group).is_err() {
@@ -2013,7 +2025,7 @@ impl Shell {
         let outputs = self.fork_outputs(true)?;
         let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
         // SAFETY: the parent retains the child PID and its output relays; the child exits without unwinding.
-        let pid = self.fork_evaluator();
+        let pid = self.fork_evaluator()?;
         if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
         if pid == 0 {
             if self.enter_forked_child(&outputs, parent_group).is_err() {
@@ -2051,7 +2063,7 @@ impl Shell {
         rustix::fs::fcntl_setfl(&read_end, flags | rustix::fs::OFlags::NONBLOCK).map_err(std::io::Error::from)?;
         let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
         // SAFETY: the child has its own evaluator state and exits without unwinding into the embedder.
-        let pid = self.fork_evaluator();
+        let pid = self.fork_evaluator()?;
         if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
         if pid == 0 {
             if self.enter_forked_child(&outputs, parent_group).is_err()

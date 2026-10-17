@@ -80,6 +80,77 @@ fn quoted_raw_bytes_and_effect_results_preserve_expansion_contract() {
 }
 
 #[test]
+fn command_substitution_does_not_inherit_locked_stdout() {
+    const PROBE: &str = "EPSH_STDOUT_LOCK_PROBE";
+    const NAME: &str = "command_substitution_does_not_inherit_locked_stdout";
+
+    fn buffered_handler_output(
+        _: &[epsh::shell_bytes::ShellBytes],
+        _: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)],
+    ) -> epsh::error::Result<epsh::error::ExitStatus> {
+        use std::io::Write as _;
+        let stdout = std::io::stdout();
+        stdout.lock().write_all(b"handler-output")?;
+        Ok(epsh::error::ExitStatus::SUCCESS)
+    }
+
+    if std::env::var_os(PROBE).is_some() {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let stdout = std::io::stdout();
+            let _stdout = stdout.lock();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        locked_rx.recv().unwrap();
+
+        let timeout = std::time::Duration::from_secs(1);
+        let mut shell = Shell::builder().timeout(timeout).build();
+        let result = fields("\"$(printf value)\"", &mut shell);
+        holder.join().unwrap();
+        assert_eq!(result, ["value"]);
+
+        use std::io::Write as _;
+        let stdout = std::io::stdout();
+        stdout.lock().write_all(b"pending-parent-output").unwrap();
+        let mut shell = Shell::builder().timeout(timeout).build();
+        assert_eq!(fields("\"$(printf value)\"", &mut shell), ["value"]);
+
+        let handler: epsh::eval::ExternalHandler = Box::new(buffered_handler_output);
+        let mut shell = Shell::builder().external_handler(handler).timeout(timeout).build();
+        assert_eq!(fields("\"$(handler)\"", &mut shell), ["handler-output"]);
+        return;
+    }
+
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture"])
+        .env(PROBE, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let process_group = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL).unwrap();
+            let status = child.wait().unwrap();
+            panic!("stdout lock probe timed out: {status}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(status.success(), "stdout lock probe failed: {status}");
+}
+
+#[test]
 fn quoted_literal_directory_component_allows_following_glob() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["*dir", "?dir", "[dir]", "\\dir"] {

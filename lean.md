@@ -1,8 +1,9 @@
 # Execute the ish semantic foundations campaign
 
-Status: incomplete. Local Rust tests, Clippy, the semantic bridge, compiled
-production mutations, and the extracted shift-count proof pass. Native macOS
-Apple silicon and Linux ARM64 execution and green remote CI remain unverified.
+The hardening pass checks Rust behavior against Lean models, compiles production
+mutations, and proves correspondence for an extracted production shift-count
+helper. Remote acceptance requires native macOS Apple silicon, Linux x86_64 and
+ARM64 musl, and semantic verification to pass at the same revision.
 
 The verification-hardening changes fix both Apple FIFO call sites, PTY pointer
 types, the Python-dependent heredoc test, and the missing Lean manifest. Linux
@@ -23,9 +24,6 @@ overlapped the baseline on all three workloads and allocations were unchanged.
 The [measurement reference](docs/verification/history-search-profile.md) records
 that rejected experiment. The resource tables below retain the earlier campaign
 comparison and do not describe this hardening pass.
-
-The owner granted implementation, local commits, the unsquashed epsh import, and
-the described CI edits on 2026-10-17. No pushes or publication were authorized.
 
 Build one Rust workspace containing ish and epsh, replace Perl conformance testing,
 and establish an audited Lean model connected to production Rust behavior.

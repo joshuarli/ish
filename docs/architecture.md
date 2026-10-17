@@ -44,6 +44,11 @@ undo effects from earlier commands or expansion.
   run in-process. External commands and command substitutions may start child
   processes. A `.envrc` that requests bash evaluation may also start one.
 
+Before an evaluator fork, epsh locks and flushes Rust stdout, then releases the
+copied guard in both processes. This prevents inherited stdout locks and parent
+buffer duplication. Flush errors abort the fork and clean up earlier pipeline
+children.
+
 ## Subsystem ownership
 
 | Area | Owner |

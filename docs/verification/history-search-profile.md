@@ -33,14 +33,33 @@ GNU time records the shell's peak resident memory in KiB:
 
 The ranges overlap, and the retained changes pass the 2× memory ceiling.
 
-After the descriptor correction in `b120b0f`, the same static release checks
-pass at 1,228,536 bytes. Five new interleaved PTY pairs give these peak memory
-results:
+After the descriptor and fork stdout corrections, the same static release
+checks pass at 1,229,464 bytes. Five new interleaved PTY pairs give these peak
+memory results:
 
 | Source | Minimum | Median | Maximum |
 | --- | ---: | ---: | ---: |
-| Baseline | 12,028 | 12,168 | 12,472 |
-| Descriptor correction | 11,924 | 12,096 | 12,328 |
+| Baseline | 11,440 | 12,248 | 12,584 |
+| Final corrections | 11,864 | 12,080 | 12,556 |
 
 This revision also passes the 2× memory ceiling. These size and memory checks
 establish no latency improvement.
+
+## Fork cost check
+
+Five interleaved PTY pairs each execute 2,000 command substitutions in 100
+batches of 20 `printf '<%s>' "$(printf value)"` commands. Every batch must produce
+20 `<value>` fields before the next prompt, and every shell must exit with
+status 0. A separate syscall trace confirms one evaluator fork per substitution.
+
+`wait4` records cumulative user and system CPU for the shell, its waited
+children, and the GNU time wrapper, including startup. Each measured run passed
+`perf-gate-ready` before and `perf-gate-ready -1` immediately afterward.
+
+| Source | Minimum CPU s | Median CPU s | Maximum CPU s |
+| --- | ---: | ---: | ---: |
+| Baseline | 0.125565 | 0.129066 | 0.146971 |
+| Final corrections | 0.125243 | 0.130484 | 0.138105 |
+
+The ranges overlap and pass the 2× CPU ceiling. This process-creation workload
+establishes no measurable CPU-cost change and makes no latency claim.

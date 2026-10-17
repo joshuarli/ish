@@ -626,7 +626,8 @@ mod tests {
     fn process_active_in_group(group: Pid, descendant: Pid) -> Result<bool, String> {
         let stat = match fs::read_to_string(format!("/proc/{}/stat", descendant.as_raw_pid())) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
             Err(error) => return Err(format!("cannot inspect descendant {descendant}: {error}")),
         };
         let fields = stat
