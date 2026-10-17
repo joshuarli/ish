@@ -22,13 +22,14 @@ Run the differential bridge from the repository root:
 cargo run --example semantic_bridge -p ish -- --family all --cases 1000
 ```
 
-The command generates 1,000 requests for each of the policy, expansion,
-arithmetic, evaluation, effects, and interactive families. It also runs
-retained regression cases, protocol boundary checks, and one negative control
-per family. The bridge accepts `unsupported_domain` and `fuel_exhausted` as
-comparable outcomes, so the request count does not mean every request exercised
-a supported operation. The coverage matrix records known domain limits. A
-detected semantic mismatch is reduced and saved under
+The command generates 1,000 semantic requests for each of the policy,
+expansion, arithmetic, evaluation, effects, and interactive families. It also
+runs retained regression cases, protocol boundary checks, and one negative
+control per family. A family comparison fails if either side returns
+`unsupported_domain` or `fuel_exhausted`. Separate effects boundary checks
+require those outcomes for invalid environment inputs and a zero-fuel request.
+The coverage matrix records each adapter's domain. A detected semantic
+mismatch is reduced and saved under
 `formal/fixtures/bridge-regressions/`.
 
 The bridge calls production Rust entry points for each family. Its generated
@@ -38,7 +39,12 @@ environment, cwd, and redirection operations subject to host OS preconditions.
 The [coverage matrix](../docs/verification/coverage.md) describes those limits
 for each adapter.
 
+The mismatch minimizer accepts only validated candidates with a strictly
+smaller serialized request key. It tracks visited candidates to avoid shrink
+cycles. Focused runner tests cover semantic versus nonsemantic outcomes,
+boundary rejection, strict decrease, and repeated shrink candidates.
+
 The Rust PUA codec and the Lean octet map are separate representations. The
 bridge tests their selected observable behavior; it does not derive a Rust
-refinement proof from the Lean theorem. Aeneas and Charon are not available in
-this toolchain, so no Rust-to-Lean translation or refinement proof is claimed.
+refinement proof from the Lean theorem. Aeneas is unavailable, so no
+translation from Rust to Lean or refinement proof is claimed.

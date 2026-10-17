@@ -66,6 +66,11 @@ boundaries may reject NUL. Use set_var_bytes and get_var_bytes when Rust code
 needs raw variable values; get_var returns a string only when the value is
 valid UTF-8. See [byte preservation](docs/byte-preservation.md).
 
+`Variables::bindings_bytes()` returns an owned snapshot of defined variable
+names and raw values, sorted by name. It includes local and exported values,
+omits unset placeholders, and does not expose variable flags or storage. Later
+mutations to the variable store do not change the returned snapshot.
+
 ## Builder options
 
 | Method | Effect |
