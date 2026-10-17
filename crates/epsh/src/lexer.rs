@@ -138,6 +138,10 @@ pub struct Lexer {
 
 impl Lexer {
     pub fn new(source: &str) -> Self {
+        Self::new_bytes(source.as_bytes())
+    }
+
+    pub(crate) fn from_shell_string(source: &str) -> Self {
         Lexer {
             src: source.chars().collect(),
             pos: 0,
@@ -150,7 +154,7 @@ impl Lexer {
     }
 
     pub fn new_bytes(source: &[u8]) -> Self {
-        Self::new(&crate::encoding::bytes_to_str(source))
+        Self::from_shell_string(&crate::encoding::bytes_to_str(source))
     }
 
     /// Return the current source position.
@@ -1066,7 +1070,7 @@ impl Lexer {
                 }
                 Some(')') if self.peek() == Some(')') && depth == 1 => {
                     self.advance();
-                    let inner_parts = crate::parser::parse_word_parts(&content);
+                    let inner_parts = crate::parser::parse_word_parts_shell(&content);
                     return Ok(WordPart::Arith(inner_parts));
                 }
                 Some(')') => {

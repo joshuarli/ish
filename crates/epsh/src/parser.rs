@@ -30,6 +30,13 @@ impl Parser {
         }
     }
 
+    pub(crate) fn from_shell_string(source: &str) -> Self {
+        Parser {
+            lexer: Lexer::from_shell_string(source),
+            heredoc_bodies: Vec::new(),
+        }
+    }
+
     pub fn new_bytes(source: &[u8]) -> Self {
         Parser {
             lexer: Lexer::new_bytes(source),
@@ -1028,12 +1035,16 @@ impl Parser {
 /// Parse a raw word string into WordPart nodes.
 /// Kept for heredoc body expansion (called from redirect.rs).
 pub fn parse_word_parts(raw: &str) -> Vec<WordPart> {
+    parse_word_parts_bytes(raw.as_bytes())
+}
+
+pub(crate) fn parse_word_parts_shell(raw: &str) -> Vec<WordPart> {
     parse_word_parts_impl(raw, false)
 }
 
 /// Parse a raw byte string into WordPart nodes.
 pub fn parse_word_parts_bytes(raw: &[u8]) -> Vec<WordPart> {
-    parse_word_parts(&crate::encoding::bytes_to_str(raw))
+    parse_word_parts_shell(&crate::encoding::bytes_to_str(raw))
 }
 
 /// Build a HereDocBody from a raw heredoc body string.
@@ -1325,7 +1336,7 @@ fn parse_dollar(chars: &[char], i: &mut usize, in_dquote: bool) -> Option<WordPa
                     }
                 }
                 let text: String = content.into_iter().collect();
-                let inner_parts = parse_word_parts(&text);
+                let inner_parts = parse_word_parts_shell(&text);
                 Some(WordPart::Arith(inner_parts))
             } else {
                 // $( — command substitution
@@ -1622,7 +1633,7 @@ pub(crate) fn coalesce_literals(parts: Vec<WordPart>) -> Vec<WordPart> {
 
 /// Parse command substitution content by recursively invoking the parser.
 pub(crate) fn parse_cmdsubst_content(content: &str) -> Command {
-    match Parser::new(content).parse() {
+    match Parser::from_shell_string(content).parse() {
         Ok(program) => {
             if program.commands.is_empty() {
                 Command::Simple {

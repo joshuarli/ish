@@ -1,59 +1,54 @@
-//! Byte-preserving encoding for non-UTF-8 shell data.
-//!
-//! POSIX shells handle arbitrary bytes. Rust strings are UTF-8. We bridge
-//! the gap by mapping invalid UTF-8 bytes (0x80-0xFF) to Unicode Private
-//! Use Area codepoints (U+E080-U+E0FF) on input, and mapping them back
-//! to raw bytes on output. Internal processing uses valid UTF-8 throughout.
-//!
-//! This is the same idea as Python 3's `surrogateescape` error handler.
+//! Reversible compatibility encoding for arbitrary shell bytes in UTF-8 strings.
 
-/// PUA base for encoding raw bytes. Byte 0xHH maps to U+E000+HH.
 const PUA_BASE: u32 = 0xE000;
+const ESCAPE: char = '\u{E000}';
 
-/// Decode raw bytes into a shell string, mapping invalid UTF-8 bytes
-/// to PUA codepoints.
+fn push_text(result: &mut String, text: &str) {
+    for c in text.chars() {
+        if c == ESCAPE || (PUA_BASE + 0x80..=PUA_BASE + 0xFF).contains(&(c as u32)) {
+            result.push(ESCAPE);
+        }
+        result.push(c);
+    }
+}
+
+/// Encode raw bytes as shell text. Invalid UTF-8 bytes use U+E080–U+E0FF;
+/// literal occurrences of those characters and U+E000 receive a U+E000 prefix.
 pub fn bytes_to_str(bytes: &[u8]) -> String {
     let mut result = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        // Try to decode a valid UTF-8 sequence
-        match std::str::from_utf8(&bytes[i..]) {
-            Ok(s) => {
-                result.push_str(s);
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(text) => {
+                push_text(&mut result, text);
                 break;
             }
-            Err(e) => {
-                let valid_up_to = e.valid_up_to();
-                // Push the valid prefix
-                if valid_up_to > 0 {
-                    // SAFETY: from_utf8 confirmed these bytes are valid
-                    result.push_str(unsafe {
-                        std::str::from_utf8_unchecked(&bytes[i..i + valid_up_to])
-                    });
-                }
-                i += valid_up_to;
-                // Map the invalid byte to PUA
-                let b = bytes[i] as u32;
-                result.push(char::from_u32(PUA_BASE + b).unwrap());
-                i += 1;
+            Err(error) => {
+                let (valid, invalid) = remaining.split_at(error.valid_up_to());
+                push_text(&mut result, std::str::from_utf8(valid).unwrap());
+                result.push(char::from_u32(PUA_BASE + u32::from(invalid[0])).unwrap());
+                remaining = &invalid[1..];
             }
         }
     }
     result
 }
 
-/// Encode a shell string back to raw bytes, mapping PUA codepoints
-/// back to their original byte values.
+/// Decode compatibility-encoded shell text to its original bytes.
 pub fn str_to_bytes(s: &str) -> Vec<u8> {
     let mut result = Vec::with_capacity(s.len());
-    for c in s.chars() {
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
         let cp = c as u32;
-        if (PUA_BASE + 0x80..=PUA_BASE + 0xFF).contains(&cp) {
+        if c == ESCAPE {
+            let literal = chars.next().unwrap_or(ESCAPE);
+            let mut buf = [0u8; 4];
+            result.extend_from_slice(literal.encode_utf8(&mut buf).as_bytes());
+        } else if (PUA_BASE + 0x80..=PUA_BASE + 0xFF).contains(&cp) {
             result.push((cp - PUA_BASE) as u8);
         } else {
             let mut buf = [0u8; 4];
-            let encoded = c.encode_utf8(&mut buf);
-            result.extend_from_slice(encoded.as_bytes());
+            result.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         }
     }
     result
@@ -81,9 +76,9 @@ mod tests {
 
     #[test]
     fn roundtrip_invalid_byte() {
-        let input = &[0x5B, 0xA3]; // [ followed by raw 0xA3
+        let input = &[0x5B, 0xA3];
         let s = bytes_to_str(input);
-        assert_eq!(s.len(), 4); // '[' (1) + PUA char (3 UTF-8 bytes)
+        assert_eq!(s.len(), 4);
         let output = str_to_bytes(&s);
         assert_eq!(output, input);
     }
@@ -98,11 +93,8 @@ mod tests {
 
     #[test]
     fn pure_utf8_passthrough() {
-        // Normal UTF-8 chars in the PUA range that are NOT our encoded bytes
-        // should pass through unchanged (we only use PUA_BASE+0x80 to PUA_BASE+0xFF)
-        let s = "\u{E000}hello"; // U+E000 is below our range (PUA_BASE+0x80)
-        let bytes = str_to_bytes(s);
-        let roundtrip = bytes_to_str(&bytes);
-        assert_eq!(roundtrip, s);
+        let s = "\u{E000}hello";
+        let encoded = bytes_to_str(s.as_bytes());
+        assert_eq!(str_to_bytes(&encoded), s.as_bytes());
     }
 }
