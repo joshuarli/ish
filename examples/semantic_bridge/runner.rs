@@ -83,7 +83,10 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
             let expected = normalize_actual(&actual, &request.id)?;
             if expected != observed {
                 let minimized = minimize_mismatch(&binary, &tmpdir, family, request)?;
-                retain_regression(&root, family, &minimized)?;
+                let mut retained = minimized;
+                retained.id = regression_filename(family, &retained.id);
+                let retained_id = retained.id.clone();
+                retain_regression(&root, family, &retained)?;
                 return Err(BridgeError::new(format!(
                     "{} mismatch at {}; expected {}, Lean returned {}; minimized request saved to formal/fixtures/bridge-regressions/{}/{}.json",
                     family.name(),
@@ -91,7 +94,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
                     expected,
                     observed,
                     family.name(),
-                    regression_filename(family, &minimized.id)
+                    retained_id
                 )));
             }
             normalized.push(expected);
