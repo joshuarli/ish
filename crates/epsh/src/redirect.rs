@@ -255,7 +255,7 @@ impl Shell {
                             self.err_msg(&format!("{filename}: {e}"));
                             ShellError::Io(e)
                         })?;
-                    install_redirection(file.into(), target_fd).map_err(ShellError::Io)?;
+                    install_redirection(file, target_fd).map_err(ShellError::Io)?;
                 }
                 RedirKind::DupInput(word) | RedirKind::DupOutput(word) => {
                     let fd_str = self.expand_string(word)?;
