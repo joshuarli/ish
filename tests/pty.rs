@@ -30,6 +30,8 @@ struct PtyShell {
 
 struct TempDir(PathBuf);
 
+const READY_SLEEP_SCRIPT: &str = "#!/bin/sh\nprintf 'pty-child-ready\\n'\nexec /bin/sleep 60\n";
+
 impl TempDir {
     fn new(prefix: &str) -> Self {
         let mut path = std::env::temp_dir()
@@ -189,8 +191,7 @@ impl PtyShell {
             output_offset: Cell::new(0),
         };
 
-        // Wait for the initial prompt
-        sh.startup_output = sh.wait_for_prompt(3000);
+        sh.startup_output = sh.wait_for("$ ", 3000);
         assert!(
             sh.startup_output.contains("$ "),
             "ish did not render its initial prompt within 3s: {:?}",
@@ -373,6 +374,25 @@ impl PtyShell {
         self.terminal.borrow().screen()
     }
 
+    fn wait_for_screen<F>(
+        &self,
+        description: &str,
+        timeout_ms: u64,
+        predicate: F,
+    ) -> ptytest::ScreenSnapshot
+    where
+        F: Fn(&ptytest::ScreenSnapshot) -> bool,
+    {
+        let mut terminal = self.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::from_millis(timeout_ms));
+        let screen = terminal
+            .wait_for_screen(deadline, description, predicate)
+            .expect("wait for screen state");
+        self.output_offset.set(terminal.raw_output().len());
+        self.pending_output.borrow_mut().clear();
+        screen
+    }
+
     /// Wait until output contains `marker`, up to `timeout_ms`.
     fn wait_for(&self, marker: &str, timeout_ms: u64) -> String {
         let mut accumulated = String::new();
@@ -403,9 +423,27 @@ impl PtyShell {
         panic!("timed out after {timeout_ms}ms waiting for {marker:?}; output: {accumulated:?}");
     }
 
-    /// Wait for the shell prompt (` $ `).
-    fn wait_for_prompt(&self, timeout_ms: u64) -> String {
-        self.wait_for("$ ", timeout_ms)
+    fn wait_for_prompt_after_line_advance(&self, timeout_ms: u64) -> String {
+        let mut accumulated = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u64;
+            if remaining == 0 {
+                break;
+            }
+
+            let chunk = self.read_timeout(remaining.min(200));
+            accumulated.push_str(&chunk);
+
+            if let Some(prompt_end) = prompt_end_after_last_newline(&accumulated) {
+                return self.finish_at_prompt(accumulated, prompt_end);
+            }
+        }
+
+        panic!("timed out after {timeout_ms}ms waiting for the shell prompt; output: {accumulated:?}");
     }
 
     /// Wait until Enter has been processed and the shell advanced to a new line.
@@ -413,18 +451,6 @@ impl PtyShell {
         self.wait_for("\n", timeout_ms)
     }
 
-    /// Send a command, press enter, wait for the next prompt.
-    ///
-    /// Waits for `"$ "` that appears after a newline. Typing renders use `\r`
-    /// only, so any `\n` indicates the shell processed Enter and started
-    /// execution. This prevents early returns from matching `"$ "` in typing
-    /// renders during slow commands (e.g., denv subprocess on cd).
-    /// Send a command, press enter, wait for the next prompt.
-    ///
-    /// Waits for `"$ "` that appears after a newline. Typing renders use `\r`
-    /// only, so any `\n` indicates the shell processed Enter and started
-    /// execution. This prevents early returns from matching `"$ "` in typing
-    /// renders during slow commands (e.g., denv subprocess on cd).
     fn run_command(&self, cmd: &str) -> String {
         self.type_str(cmd);
         self.enter();
@@ -442,19 +468,20 @@ impl PtyShell {
             let chunk = self.read_timeout(remaining.min(200));
             accumulated.push_str(&chunk);
 
-            if let Some(nl) = accumulated.rfind('\n')
-                && let Some(prompt_offset) = accumulated[nl + 1..].find("$ ")
-            {
-                let prompt_end = nl + 1 + prompt_offset + 2;
-                let suffix = accumulated.split_off(prompt_end);
-                self.pending_output
-                    .borrow_mut()
-                    .extend_from_slice(suffix.as_bytes());
-                return accumulated;
+            if let Some(prompt_end) = prompt_end_after_last_newline(&accumulated) {
+                return self.finish_at_prompt(accumulated, prompt_end);
             }
         }
 
         panic!("timed out waiting for the prompt after running {cmd:?}; output: {accumulated:?}");
+    }
+
+    fn finish_at_prompt(&self, mut output: String, prompt_end: usize) -> String {
+        let suffix = output.split_off(prompt_end);
+        self.pending_output
+            .borrow_mut()
+            .extend_from_slice(suffix.as_bytes());
+        output
     }
 
     fn wait_for_exit(&self, timeout_ms: u64) {
@@ -531,7 +558,21 @@ fn active_prompt_text(screen: &ptytest::ScreenSnapshot) -> String {
         .find(|&row| rows[row].contains("$ "))
         .unwrap_or_else(|| cursor_row.saturating_sub(4));
     let last = (cursor_row + 4).min(screen.row_count().saturating_sub(1));
-    rows[first..=last].join(" ")
+    let mut active = String::new();
+    for row in first..=last {
+        if row > first && screen.row_wrapped(row - 1) != Some(true) {
+            active.push(' ');
+        }
+        active.push_str(&rows[row]);
+    }
+    active
+}
+
+fn prompt_end_after_last_newline(output: &str) -> Option<usize> {
+    let prompt_line = output.rfind('\n')? + 1;
+    output[prompt_line..]
+        .find("$ ")
+        .map(|offset| prompt_line + offset + 2)
 }
 
 #[derive(Clone, Debug)]
@@ -645,10 +686,8 @@ impl Drop for PtyShell {
 #[test]
 fn prompt_appears_on_startup() {
     let sh = PtyShell::spawn();
-    // The initial wait_for_prompt in spawn() succeeded, so the prompt appeared.
-    // Verify we can get another prompt after Enter.
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     assert!(out.contains("$ "), "expected prompt, got: {out:?}");
 }
 
@@ -747,7 +786,7 @@ fn ctrl_c_cancels_input() {
     let sh = PtyShell::spawn();
     sh.type_str("some partial input");
     sh.ctrl_c();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     // After Ctrl+C, should see ^C and a new prompt
     assert!(text.contains("^C"), "expected ^C in output: {text:?}");
@@ -763,7 +802,7 @@ fn line_editing_backspace() {
     sh.type_str("echo helloo");
     sh.backspace();
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
         text.contains("hello"),
@@ -800,7 +839,7 @@ fn line_editing_ctrl_u() {
     sh.ctrl_u();
     sh.type_str("echo survived");
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
         text.contains("survived"),
@@ -832,7 +871,7 @@ fn line_editing_ctrl_w() {
     // Move to end and execute
     sh.ctrl_e();
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(text.contains("keep"), "expected 'keep' in output: {text:?}");
 }
@@ -843,7 +882,7 @@ fn line_editing_ctrl_delete() {
     sh.type_str("echo alpha beta");
     sh.ctrl_delete();
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
         text.contains("\r\nalpha\r\n"),
@@ -864,7 +903,7 @@ fn line_editing_ctrl_k_and_ctrl_y() {
     sh.type_str("yanked: ");
     sh.ctrl_y(); // pastes "hello world"
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
         text.contains("yanked: hello world"),
@@ -1202,7 +1241,7 @@ fn history_up_arrow() {
         );
     }
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
         text.contains("from_global"),
@@ -1265,7 +1304,7 @@ fn history_ctrl_r_search() {
 
     // Accept with Enter
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     // The selected command should be on the line — enter executes it
     assert!(text.contains("beta"), "expected 'beta' in output: {text:?}");
@@ -1290,7 +1329,7 @@ fn history_ctrl_r_includes_later_global_entries() {
     sh.type_str("later");
     sh.wait_for_quiescence(200);
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
         text.contains("echo later_global"),
@@ -1305,14 +1344,14 @@ fn history_ctrl_r_escape_cancels() {
     sh.wait_for("search:", 2000);
     sh.type_str("secret");
     sh.wait_for_quiescence(200);
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
-    // After escape, the original line should be restored (empty)
-    // Send enter to verify nothing executes
+    sh.wait_for_screen("history search closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("search:")
+    });
     sh.enter();
-    let out2 = sh.wait_for_prompt(2000);
+    let out2 = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out2);
-    // "secret" should NOT appear as command output — just in prompt area
     assert!(
         !text.contains("secret"),
         "escape should have cancelled search: {text:?}"
@@ -1342,8 +1381,11 @@ fn history_ctrl_r_narrow_repaint_does_not_stack_rows() {
     assert_screen_contains_once(&screen, "abc2");
     assert_screen_contains_once(&screen, "abc3");
 
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("history search closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("search:")
+    });
 }
 
 #[test]
@@ -1429,8 +1471,11 @@ fn history_search_selection_preserves_cursor_after_typing() {
         "the query buffer should contain the typed character: {:?}",
         typed_frame.snapshot
     );
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("history search closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("search:")
+    });
 }
 
 #[test]
@@ -1506,7 +1551,7 @@ fn history_accept_reanchors_prompt_before_typing() {
     );
 
     sh.ctrl_c();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_prompt_after_line_advance(2000);
 }
 
 #[test]
@@ -1538,8 +1583,11 @@ fn history_ctrl_r_near_bottom_keeps_pager_stable() {
         "expected second recent history entry in pager: {screen:?}"
     );
 
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("history search closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("search:")
+    });
 }
 
 #[test]
@@ -1567,8 +1615,11 @@ fn history_ctrl_r_scrolls_when_selection_passes_last_visible_entry() {
         "pager did not scroll down: {screen:?}"
     );
 
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("history search closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("search:")
+    });
 }
 
 #[test]
@@ -1695,8 +1746,11 @@ fn history_ctrl_r_near_bottom_query_edits_do_not_stack_headers() {
         final_frame.snapshot.visible
     );
 
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("history search closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("search:")
+    });
 }
 
 #[test]
@@ -1709,7 +1763,7 @@ fn tab_completion_files() {
     sh.tab();
     sh.wait_for_quiescence(300);
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
         text.contains("alpha.txt"),
@@ -1757,8 +1811,11 @@ fn tab_completion_first_tab_has_no_selection_second_tab_selects_first() {
         "second tab should activate selection on the first item and preview it in the prompt line: {second:?}"
     );
 
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("completion grid closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("aaa.txt")
+    });
 }
 
 #[test]
@@ -1789,8 +1846,11 @@ fn tab_completion_narrow_repaint_does_not_stack_rows() {
     assert_screen_contains_once(&screen, "aab.txt");
     assert_screen_contains_once(&screen, "aac.txt");
 
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("completion grid closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("aaa.txt")
+    });
 }
 
 #[test]
@@ -1800,7 +1860,7 @@ fn tab_completion_directory() {
     sh.tab();
     sh.wait_for_quiescence(300);
     sh.enter();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_prompt_after_line_advance(2000);
     // After cd, pwd should show mydir
     let out2 = sh.run_command("pwd");
     let text = PtyShell::strip_ansi(&out2);
@@ -1816,7 +1876,7 @@ fn tab_completion_escape_restores_typed_prefix() {
     sh.escape();
     sh.type_str("x");
     sh.enter();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_prompt_after_line_advance(2000);
     let screen = snapshot_text(&sh.screen());
     let text = normalize_screen_text(&screen);
     assert!(
@@ -1840,7 +1900,7 @@ fn tab_completion_narrowing_does_not_autoaccept() {
     sh.escape();
     sh.type_str("x");
     sh.enter();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_prompt_after_line_advance(2000);
     let screen = snapshot_text(&sh.screen());
     let text = normalize_screen_text(&screen);
     assert!(
@@ -1964,8 +2024,11 @@ fn tab_completion_with_wide_dir_name_restores_prompt_cursor() {
         second_tab.snapshot
     );
 
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("completion grid closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("Altered States/")
+    });
 }
 
 #[test]
@@ -1988,8 +2051,11 @@ fn completion_resize_rerenders_grid() {
     assert_screen_contains_once(&screen, "aab.txt");
     assert_screen_contains_once(&screen, "aac.txt");
 
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("completion grid closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("aaa.txt")
+    });
 }
 
 #[test]
@@ -2029,7 +2095,7 @@ fn normal_resize_reanchors_wrapped_prompt() {
     );
 
     sh.ctrl_c();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_prompt_after_line_advance(2000);
 }
 
 #[test]
@@ -2049,8 +2115,11 @@ fn history_resize_rerenders_pager() {
     assert_screen_contains_once(&screen, "abc2");
     assert_screen_contains_once(&screen, "abc3");
 
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("history pager closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("search:")
+    });
 }
 
 #[test]
@@ -2085,7 +2154,7 @@ fn alias_self_referencing_no_reexpand() {
     eprintln!("AFTER SECOND SPACE: {second_text:?}");
     // Cancel the line
     sh.ctrl_c();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_prompt_after_line_advance(2000);
 
     // After first space: should see expanded form
     assert!(
@@ -2126,7 +2195,7 @@ fn alias_self_referencing_from_config() {
     let third_text = PtyShell::strip_ansi(&after_third);
     eprintln!("CONFIG AFTER THIRD SPACE: {third_text:?}");
     sh.ctrl_c();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_prompt_after_line_advance(2000);
 
     assert!(
         first_text.contains("rg --hidden -S -g !.git"),
@@ -2245,7 +2314,7 @@ fn error_status_colors_prompt() {
     sh.run_command("false");
     // The next prompt should have red color (38;5;1 or 31)
     sh.enter();
-    let raw = sh.wait_for_prompt(2000);
+    let raw = sh.wait_for_prompt_after_line_advance(2000);
     // Look for red ANSI in the raw output
     assert!(
         raw.contains("\x1b[38;5;1m") || raw.contains("\x1b[31m") || raw.contains("$ "),
@@ -2443,7 +2512,7 @@ fn multiline_continuation() {
     // Type the rest
     sh.type_str("/usr/bin/tr a-z A-Z");
     sh.enter();
-    let out2 = sh.wait_for_prompt(2000);
+    let out2 = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out2);
     assert!(
         text.contains("HELLO"),
@@ -2467,7 +2536,7 @@ fn multiline_completion_on_continuation_line() {
         "expected multiline completion to expand on continuation line: {text:?}"
     );
     sh.ctrl_c();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_prompt_after_line_advance(2000);
 }
 
 #[test]
@@ -2495,8 +2564,11 @@ fn dir_picker_narrow_repaint_does_not_stack_rows() {
     assert_screen_contains_once(picker, "~/one");
     assert_screen_contains_once(picker, "~/two");
 
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("directory picker closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("dirs:")
+    });
 }
 
 #[test]
@@ -2521,7 +2593,7 @@ fn prompt_shows_cwd() {
     let sh = PtyShell::spawn();
     // The prompt should contain some representation of the cwd
     sh.enter();
-    let raw = sh.wait_for_prompt(2000);
+    let raw = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&raw);
     // Our HOME is a temp dir — prompt shortens to ~
     assert!(
@@ -2672,7 +2744,7 @@ fn history_persisted_across_commands() {
     // Now up arrow should recall it
     sh.up();
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
         text.contains("unique_cmd_12345"),
@@ -2694,7 +2766,7 @@ fn history_survives_abrupt_termination_and_restart() {
     restarted.type_str("durable_before_kill");
     restarted.wait_for_quiescence(200);
     restarted.enter();
-    let text = PtyShell::strip_ansi(&restarted.wait_for_prompt(2000));
+    let text = PtyShell::strip_ansi(&restarted.wait_for_prompt_after_line_advance(2000));
     assert!(
         text.contains("/bin/echo durable_before_kill"),
         "lost durable command: {text:?}"
@@ -2745,8 +2817,8 @@ fn history_shared_shell_processes_keep_all_commands() {
         second.enter();
         first.wait_for_line_advance(2000);
         second.wait_for_line_advance(2000);
-        first.wait_for_prompt(2000);
-        second.wait_for_prompt(2000);
+        first.wait_for_prompt_after_line_advance(2000);
+        second.wait_for_prompt_after_line_advance(2000);
     }
     first.type_str("exit");
     first.enter();
@@ -2758,7 +2830,7 @@ fn history_shared_shell_processes_keep_all_commands() {
     second.type_str("first_process_1");
     second.wait_for_quiescence(200);
     second.enter();
-    let text = PtyShell::strip_ansi(&second.wait_for_prompt(2000));
+    let text = PtyShell::strip_ansi(&second.wait_for_prompt_after_line_advance(2000));
     assert!(
         text.contains("/bin/echo first_process_1"),
         "missing other process command: {text:?}"
@@ -2888,11 +2960,14 @@ fn history_up_ignores_later_global_entries() {
     writer.add("echo later_global").unwrap();
     sh.ctrl_r();
     sh.wait_for("search:", 2000);
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("history search closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("search:")
+    });
     sh.up();
     sh.enter();
-    let text = PtyShell::strip_ansi(&sh.wait_for_prompt(2000));
+    let text = PtyShell::strip_ansi(&sh.wait_for_prompt_after_line_advance(2000));
     assert!(
         text.contains("echo startup"),
         "missing startup recall: {text:?}"
@@ -2922,13 +2997,16 @@ fn history_autosuggest_ignores_later_global_entries() {
 
     sh.ctrl_r();
     sh.wait_for("search:", 2000);
+    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_prompt(2000);
+    sh.wait_for_screen("history search closed", 2000, |screen| {
+        screen != &before_escape && !screen.contains("search:")
+    });
 
     sh.type_str("echo l");
     sh.right();
     sh.enter();
-    let out = sh.wait_for_prompt(2000);
+    let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
     assert!(
         !text.contains("later_global"),
@@ -3289,13 +3367,12 @@ fn denv_allow_without_any_env_file_fails() {
 
 #[test]
 fn ctrl_c_interrupts_running_child() {
-    let sh = PtyShell::spawn();
-    sh.type_str("sleep 60");
+    let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
+    sh.type_str("./bin/sleep");
     sh.enter();
-    sh.wait_for_line_advance(1000);
-    sh.wait_for_quiescence(200);
+    sh.wait_for("pty-child-ready", 3000);
     sh.ctrl_c();
-    sh.wait_for_prompt(3000);
+    sh.wait_for_prompt_after_line_advance(3000);
 
     let out = sh.run_command("echo alive");
     assert!(out.contains("alive"), "shell unresponsive after ^C: {out:?}");
@@ -3303,14 +3380,13 @@ fn ctrl_c_interrupts_running_child() {
 
 #[test]
 fn ctrl_d_with_stopped_job_warns_then_exits() {
-    let sh = PtyShell::spawn();
-    sh.type_str("sleep 60");
+    let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
+    sh.type_str("./bin/sleep");
     sh.enter();
-    sh.wait_for_line_advance(1000);
-    sh.wait_for_quiescence(200);
+    sh.wait_for("pty-child-ready", 3000);
     sh.ctrl_z();
     sh.wait_for("stopped:", 3000);
-    sh.wait_for_prompt(3000);
+    sh.wait_for_prompt_after_line_advance(3000);
 
     sh.ctrl_d();
     let out = sh.wait_for("suspended job", 3000);
@@ -3321,20 +3397,19 @@ fn ctrl_d_with_stopped_job_warns_then_exits() {
 
 #[test]
 fn exit_twice_with_stopped_job_warns_then_exits() {
-    let sh = PtyShell::spawn();
-    sh.type_str("sleep 60");
+    let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
+    sh.type_str("./bin/sleep");
     sh.enter();
-    sh.wait_for_line_advance(1000);
-    sh.wait_for_quiescence(200);
+    sh.wait_for("pty-child-ready", 3000);
     sh.ctrl_z();
     sh.wait_for("stopped:", 3000);
-    sh.wait_for_prompt(3000);
+    sh.wait_for_prompt_after_line_advance(3000);
 
     sh.type_str("exit");
     sh.enter();
     let out = sh.wait_for("suspended job", 3000);
     assert!(out.contains("Exit again"), "expected warning: {out:?}");
-    sh.wait_for_prompt(3000);
+    sh.wait_for_prompt_after_line_advance(3000);
     sh.type_str("exit");
     sh.enter();
     sh.wait_for_exit(3000);
@@ -3342,26 +3417,19 @@ fn exit_twice_with_stopped_job_warns_then_exits() {
 
 #[test]
 fn job_suspend_and_resume() {
-    let sh = PtyShell::spawn();
-
-    // Start a long-running foreground process.
-    sh.type_str("sleep 60");
+    let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
+    sh.type_str("./bin/sleep");
     sh.enter();
-    sh.wait_for_line_advance(1000);
-
-    // Give sleep a moment to start, then suspend it with Ctrl+Z.
-    sh.wait_for_quiescence(200);
+    sh.wait_for("pty-child-ready", 3000);
     sh.ctrl_z();
 
-    // Shell should report the stop and return a prompt.
     let out = sh.wait_for("stopped:", 3000);
     assert!(
         out.contains("stopped:") && out.contains("sleep"),
         "expected stop notification: {out:?}"
     );
-    sh.wait_for_prompt(3000);
+    sh.wait_for_prompt_after_line_advance(3000);
 
-    // Resume the job with fg.
     sh.type_str("fg");
     sh.enter();
 
@@ -3371,18 +3439,15 @@ fn job_suspend_and_resume() {
         "expected resume notification: {out:?}"
     );
 
-    // sleep is now in the foreground again — kill it so the shell returns.
     sh.wait_for_quiescence(100);
     sh.ctrl_c();
 
-    // Shell must return a prompt, confirming it regained control.
-    let out = sh.wait_for_prompt(3000);
+    let out = sh.wait_for_prompt_after_line_advance(3000);
     assert!(
         out.contains("$ "),
         "shell did not return a prompt after fg: {out:?}"
     );
 
-    // Confirm the shell is fully interactive again.
     let out = sh.run_command("echo alive");
     assert!(
         out.contains("alive"),
@@ -3400,7 +3465,6 @@ fn bracketed_paste_over_limit_rejected() {
     let sh = PtyShell::spawn();
     sh.send(b"echo ");
 
-    // Build the bracketed paste payload: \x1b[200~ CONTENT \x1b[201~
     let mut payload = Vec::with_capacity(6 + content.len() + 6);
     payload.extend_from_slice(b"\x1b[200~");
     payload.extend_from_slice(content.as_bytes());
@@ -3408,19 +3472,17 @@ fn bracketed_paste_over_limit_rejected() {
 
     sh.send(&payload);
 
-    let out = sh.wait_for_prompt(5000);
+    let out = sh.wait_for("\x07", 5000);
     let clean = PtyShell::strip_ansi(&out);
 
     assert!(
         !clean.contains("[paste exceeded 8KB limit]"),
         "a rejected paste must not insert text into the line: {clean:?}"
     );
-    // No 'x's from the paste content should appear on screen.
     assert!(
         !clean.contains("xxxxx"),
         "paste content appeared on screen — limit bypassed: {clean:?}"
     );
-    // The line typed before the paste is untouched, so completing it runs it.
     let out2 = sh.run_command("kept");
     let clean2 = PtyShell::strip_ansi(&out2);
     assert!(
@@ -3550,30 +3612,27 @@ fn sigterm_and_sighup_restore_the_terminal_and_exit_with_the_signal_status() {
 
 #[test]
 fn second_ctrl_z_is_refused_and_the_first_job_stays_resumable() {
-    let sh = PtyShell::spawn();
-    sh.type_str("sleep 60");
+    let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
+    sh.type_str("./bin/sleep");
     sh.enter();
-    sh.wait_for_line_advance(1000);
-    sh.wait_for_quiescence(200);
+    sh.wait_for("pty-child-ready", 3000);
     sh.ctrl_z();
     sh.wait_for("stopped:", 3000);
-    sh.wait_for_prompt(3000);
+    sh.wait_for_prompt_after_line_advance(3000);
 
-    // A second command that stops itself must not take (or replace) the slot.
     sh.type_str("sh -c 'kill -STOP $$; echo continued$((1+1))'");
     sh.enter();
     let out = sh.wait_for("continued2", 3000);
     assert!(out.contains("already suspended"), "{out:?}");
-    sh.wait_for_prompt(3000);
+    sh.wait_for_prompt_after_line_advance(3000);
 
-    // The original job is still the one `fg` resumes.
     sh.type_str("fg");
     sh.enter();
-    let out = sh.wait_for("resuming: sleep", 3000);
+    let out = sh.wait_for("resuming: ./bin/sleep", 3000);
     assert!(out.contains("sleep"), "{out:?}");
     sh.wait_for_quiescence(100);
     sh.ctrl_c();
-    sh.wait_for_prompt(3000);
+    sh.wait_for_prompt_after_line_advance(3000);
 }
 
 #[test]

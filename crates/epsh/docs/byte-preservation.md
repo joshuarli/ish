@@ -13,10 +13,10 @@ valid UTF-8.
 
 Some parser and expansion paths use Rust `String` internally. The codec in
 [encoding.rs](../src/encoding.rs) carries arbitrary bytes through those paths.
-It maps invalid UTF-8 bytes to private-use markers and prefixes literal marker
-characters so they remain distinct. The reverse conversion restores the
-original byte sequence, including invalid UTF-8. This encoding is private to
-the implementation and is not a display format.
+It maps invalid UTF-8 bytes to U+E080 through U+E0FF and prefixes literal
+occurrences of those markers and U+E000. The reverse conversion restores the
+original byte sequence, including invalid UTF-8 and literal marker characters.
+This encoding is private to the implementation and is not a display format.
 
 The byte-preserving paths include:
 
@@ -37,9 +37,17 @@ Use `set_var_bytes` and `get_var_bytes` for arbitrary variable values. The
 string convenience getter returns `None` for values that are not valid UTF-8.
 Converting bytes to a C string can fail when the data contains NUL.
 
+ish keeps `HOME` as raw OS bytes for path operations. For example, standalone
+`cd`, `cd ~/subdir`, and filesystem path arguments can use a `HOME` value with
+invalid UTF-8. The `z` builtin and completion for `~` paths or SSH hostnames
+need `HOME` as text. They report that `HOME` is not UTF-8 when conversion is
+unavailable.
+
 Byte-preservation coverage lives in the `raw_bytes` module of
 [integration.rs](../tests/integration.rs), the byte-oriented embedding checks
 in [embedding.rs](../tests/embedding.rs), and
-[byte_codec.rs](../tests/byte_codec.rs). Tests for invalid path bytes skip when
-the host filesystem does not accept them. Argument and environment round-trip
-checks do not depend on invalid path support.
+[byte_codec.rs](../tests/byte_codec.rs). ish also checks raw `HOME` path use and
+the text-only `z` and completion errors in [pty.rs](../../../tests/pty.rs).
+Tests for invalid path bytes skip when the host filesystem does not accept
+them. Argument and environment round-trip checks do not depend on invalid path
+support.
