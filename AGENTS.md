@@ -7,7 +7,8 @@ behavior contract.
 - `make test` runs workspace library, integration, PTY, and conformance tests.
 - `make test-epsh` runs epsh library and integration tests.
 - `make conformance` prints all retained native conformance case results.
-- `make verify` checks the Lean models, theorem axioms, and Rust differential bridge.
+- `make verify` checks Lean models, theorem axioms, the Rust bridge, and production mutations.
+- `make verify-refinement` checks the extracted Rust shift-count proof on Linux.
 - `make check` runs workspace lint, Rust tests, and semantic verification.
 - `cargo check --workspace` checks the Rust workspace.
 

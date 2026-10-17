@@ -7,6 +7,7 @@ use epsh::ast::{
 use epsh::parser::Parser;
 use epsh::shell_bytes::ShellBytes;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
@@ -217,10 +218,16 @@ fn require_policy_bytes(value: &Value) -> BridgeResult<Vec<u8>> {
 }
 
 pub(crate) fn verify_runtime_hook() -> BridgeResult<()> {
+    let redirection_attempts = Arc::new(AtomicUsize::new(0));
+    let observed_redirections = Arc::clone(&redirection_attempts);
     let mut shell = epsh::eval::Shell::builder()
         .env_clear()
         .stdout_sink(Arc::new(Mutex::new(std::io::sink())))
         .stderr_sink(Arc::new(Mutex::new(std::io::sink())))
+        .redirect_open_handler(Box::new(move |_| {
+            observed_redirections.fetch_add(1, Ordering::Relaxed);
+            Some(Err(std::io::Error::other("policy probe reached redirection")))
+        }))
         .build();
     shell.set_var("TARGET", "eval").map_err(BridgeError::new)?;
     shell
@@ -231,18 +238,26 @@ pub(crate) fn verify_runtime_hook() -> BridgeResult<()> {
             .err()
             .map(|rejection| rejection.to_string())
     }));
-    let mut parser = Parser::new("\"$TARGET\" POLICY_BRIDGE_MARKER=after");
-    let program = parser
-        .parse()
-        .map_err(|error| BridgeError::new(format!("runtime policy probe did not parse: {error}")))?;
-    if program.commands.len() != 1 {
-        return Err(BridgeError::new("runtime policy probe is not one command"));
-    }
-    let status = shell.run_program(&program);
-    if status.code() != 2
-        || shell.get_var("POLICY_BRIDGE_MARKER") != Some("before")
-    {
-        return Err(BridgeError::new("runtime policy hook did not reject eval before its effects"));
+    for source in [
+        "POLICY_PREFIX=$((POLICY_BRIDGE_MARKER=9)) \"$TARGET\" POLICY_BRIDGE_MARKER=after 8>policy-bridge-redirection-probe",
+        "POLICY_PREFIX=$((POLICY_BRIDGE_MARKER=9)) command \"$TARGET\" POLICY_BRIDGE_MARKER=after 8>policy-bridge-redirection-probe",
+    ] {
+        let program = Parser::new(source)
+            .parse()
+            .map_err(|error| BridgeError::new(format!("runtime policy probe did not parse: {error}")))?;
+        if program.commands.len() != 1 {
+            return Err(BridgeError::new("runtime policy probe is not one command"));
+        }
+        let status = shell.run_program(&program);
+        if status.code() != 2
+            || shell.get_var("POLICY_BRIDGE_MARKER") != Some("before")
+            || shell.get_var("POLICY_PREFIX").is_some()
+            || redirection_attempts.load(Ordering::Relaxed) != 0
+        {
+            return Err(BridgeError::new(
+                "runtime policy hook did not reject eval before assignments and redirections",
+            ));
+        }
     }
     Ok(())
 }

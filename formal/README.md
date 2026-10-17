@@ -1,8 +1,9 @@
 # Lean models and Rust bridge
 
-The Lean project models selected behavior from ish and epsh. Its theorems state
-properties of those models. They do not establish that the models cover the
-Rust implementations. See the [formal and Rust coverage matrix](../docs/verification/coverage.md)
+The Lean project models selected behavior from ish and epsh. Most theorems state
+properties of those models. A separate [shift-count refinement](../docs/verification/refinement.md)
+checks freshly extracted production Rust against the arithmetic model.
+See the [formal and Rust coverage matrix](../docs/verification/coverage.md)
 for the theorem links, production entry points, regression commands, and bridge
 domains.
 
@@ -29,7 +30,7 @@ cargo run --example semantic_bridge -p ish -- --family all --cases 1000
 
 The command generates 1,000 semantic requests for each of the policy,
 expansion, arithmetic, evaluation, effects, and interactive families. It also
-runs retained regression cases, protocol boundary checks, and one negative
+runs retained regression cases, protocol boundary checks, and one comparator
 control per family. A family comparison fails if either side returns
 `unsupported_domain` or `fuel_exhausted`. Separate effects boundary checks
 require those outcomes for invalid environment inputs and a zero-fuel request.
@@ -54,12 +55,23 @@ bounded `false` and `true` assignment cases.
 The [coverage matrix](../docs/verification/coverage.md) describes those limits
 for each adapter.
 
+Expansion retains its first 53 fixtures and then uses a seeded schedule covering
+315 combinations of separator bytes, delimiter boundaries, and quoting contexts.
+The [generation reference](../docs/verification/expansion-generation.md) lists the
+dimensions and limitations.
+
+`make verify` also compiles four isolated production mutations and requires the
+bridge to detect each one. The [mutation guide](../docs/verification/mutation-testing.md)
+describes the detectors and their Python requirement. Run `make verify-refinement`
+on Linux to extract and prove the production shift-count helper. Its first run
+downloads a separate development toolchain under `.work/`.
+
 The mismatch minimizer accepts only validated candidates with a strictly
 smaller serialized request key. It tracks visited candidates to avoid shrink
 cycles. Focused runner tests cover semantic versus nonsemantic outcomes,
 boundary rejection, strict decrease, and repeated shrink candidates.
 
 The Rust PUA codec and the Lean octet map are separate representations. The
-bridge tests their selected observable behavior; it does not derive a Rust
-refinement proof from the Lean theorem. Aeneas is unavailable, so no
-translation from Rust to Lean or refinement proof is claimed.
+bridge tests their selected observable behavior. The byte codec has no Rust
+refinement proof. The separate extracted proof covers shift-count validation
+and conversion only.

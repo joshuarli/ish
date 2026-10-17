@@ -74,7 +74,15 @@ Process and PTY tests also exercise operating-system behavior.
 
 The [`make verify` target](../Makefile) builds the formal project, checks
 protocol fixtures, audits theorem axioms, and runs 1,000 generated cases for
-each bridge family.
+each bridge family. It also compiles four isolated production mutants and
+requires the bridge to detect their arithmetic, splitting, policy, and
+descriptor regressions.
+
+The separate Linux [`make verify-refinement` check](verification/refinement.md)
+extracts the production shift-count helper through Charon and Aeneas. Lean proves
+that the translated helper accepts exactly counts 0 through 63 and converts them
+losslessly. The proof connects that result to both model shift branches. Its
+trust boundary includes the extractor and its separate compiler version.
 See [epsh testing](../crates/epsh/docs/testing.md) for Rust and native corpus commands.
 
 ## Shell terms

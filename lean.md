@@ -1,7 +1,28 @@
 # Execute the ish semantic foundations campaign
 
-Status: incomplete. All local acceptance checks pass. Native macOS Apple silicon
-and Linux ARM64 hosts are unavailable; remote CI was not authorized.
+Status: incomplete. Local Rust tests, Clippy, the semantic bridge, compiled
+production mutations, and the extracted shift-count proof pass. Native macOS
+Apple silicon and Linux ARM64 execution and green remote CI remain unverified.
+
+The verification-hardening changes fix both Apple FIFO call sites, PTY pointer
+types, the Python-dependent heredoc test, and the missing Lean manifest. Linux
+CI now covers native x86_64 and ARM64 musl runners. The workspace's full target
+set compiles for Apple ARM64 from Linux.
+
+`make verify` rejects four compiled production mutations. Expansion now covers
+a seeded 315-combination schedule after its first 53 fixtures. The separate
+`make verify-refinement` check freshly extracts the production shift-count helper
+and proves its correspondence to both model shift branches for every count.
+The [refinement reference](docs/verification/refinement.md) describes the trusted
+extractor and separate compiler version. Its bootstrap was checked from an empty
+tool directory. The [mutation guide](docs/verification/mutation-testing.md)
+distinguishes compiled mutants from comparator controls.
+
+The profiled history-search candidate was reverted because its timing ranges
+overlapped the baseline on all three workloads and allocations were unchanged.
+The [measurement reference](docs/verification/history-search-profile.md) records
+that rejected experiment. The resource tables below retain the earlier campaign
+comparison and do not describe this hardening pass.
 
 The owner granted implementation, local commits, the unsquashed epsh import, and
 the described CI edits on 2026-10-17. No pushes or publication were authorized.
@@ -533,9 +554,10 @@ exclusions under `shell:legacy-no`, `int:32`, `int:64`, and `int:u`. Lean 4.35
 checks six semantic families: policy, expansion,
 arithmetic, evaluation, effects, and interactive behavior. The bridge compares
 1,000 generated cases per family with production Rust entry points, detects each
-family's mutation control, and validates 52 theorem links. The model uses finite
-fuel and supplied observations for external behavior. Aeneas and Charon are
-unavailable, so no Rust refinement proof is claimed.
+family's comparator control, and validates 52 theorem links. The model uses finite
+fuel and supplied observations for external behavior. The extracted refinement
+proof covers shift-count validation and conversion. Other production arithmetic
+operations, parsing, and evaluator behavior remain outside its scope.
 
 The final-source workspace tests pass 952 tests across 27 runners, including 140
 PTY tests. All-target Clippy, the semantic bridge, epsh package and publish
@@ -606,6 +628,6 @@ are documented in the existing READMEs. The denv persistence change retains
 atomic mode-0600 temporary writes, write-all, rename, and error rollback. It
 changes no file format or crash-recovery contract.
 
-The remaining hard stops are native macOS Apple silicon and Linux ARM64 hosts,
-which are unavailable, and remote CI, which was not authorized. The campaign is
-incomplete on those platforms.
+The remaining hard stops are native macOS Apple silicon and Linux ARM64 test
+execution and green remote CI. The changes are local and have not been pushed.
+Cross-compilation checks do not close the native execution requirement.

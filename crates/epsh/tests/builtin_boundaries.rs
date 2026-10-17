@@ -1,3 +1,6 @@
+#[path = "common/unix.rs"]
+mod unix_support;
+
 use epsh::eval::Shell;
 use epsh::shell_bytes::ShellBytes;
 use std::ffi::OsString;
@@ -9,6 +12,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
+use unix_support::create_fifo;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -27,7 +31,7 @@ fn test_file_predicates_use_shell_cwd() {
     fs::create_dir(directory.path().join("directory")).unwrap();
     symlink("file", directory.path().join("link")).unwrap();
     let fifo = directory.path().join("fifo");
-    rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::from_raw_mode(0o600)).unwrap();
+    create_fifo(&fifo).unwrap();
     let socket = directory.path().join("socket");
     let _listener = UnixListener::bind(&socket).unwrap();
     symlink("/dev/null", directory.path().join("character-device")).unwrap();
@@ -131,8 +135,8 @@ fn run_epsh_with_tty_stdout(script: &str) -> Output {
             &mut master_fd,
             &mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     assert_eq!(result, 0, "{}", std::io::Error::last_os_error());

@@ -24,6 +24,8 @@
 use crate::error::ExitStatus;
 use crate::var::Variables;
 
+mod shift;
+
 pub fn eval_arith(
     expr: &str,
     vars: &mut Variables,
@@ -532,10 +534,7 @@ impl<'a> ArithParser<'a> {
     }
 
     fn shift_count(count: i64) -> Result<u32, String> {
-        if !(0..64).contains(&count) {
-            return Err("shift count out of range".into());
-        }
-        Ok(count as u32)
+        shift::count(count).ok_or_else(|| "shift count out of range".into())
     }
 
     fn precedence(tok: &ArithToken) -> Option<u8> {

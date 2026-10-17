@@ -13,7 +13,7 @@ cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static r
 RUSTYBENCH_DEFAULT := $(CURDIR)/.work/tools/bin/rustybench
 RUSTYBENCH ?= "$(RUSTYBENCH_DEFAULT)"
 
-.PHONY: build test test-epsh conformance verify check test-ci release release-dynamic verify-release verify-release-dynamic bench bench-syscalls rustybench install install-login-shell lint fix
+.PHONY: build test test-epsh conformance verify verify-mutations verify-refinement check test-ci release release-dynamic verify-release verify-release-dynamic bench bench-syscalls rustybench install install-login-shell lint fix
 
 build:
 	$(call cargo,dev) build
@@ -30,11 +30,20 @@ conformance:
 	TMPDIR="$(CURDIR)/.work/tmp" cargo test -p epsh --test conformance -- --nocapture
 
 verify:
+	@git check-ignore -q .work/ || printf '\n.work/\n' >> "$$(git rev-parse --git-path info/exclude)"
 	@mkdir -p .work/tmp
 	cd formal && TMPDIR="$(CURDIR)/.work/tmp" lake build semanticBridge protocolTests IshSemantics.Audit
 	cd formal && TMPDIR="$(CURDIR)/.work/tmp" lake exe protocolTests
 	cd formal && TMPDIR="$(CURDIR)/.work/tmp" lake env lean IshSemantics/Audit.lean
 	TMPDIR="$(CURDIR)/.work/tmp" cargo run --quiet -p ish --example semantic_bridge -- --cases 1000
+	$(MAKE) verify-mutations
+
+verify-mutations:
+	python3 -B scripts/test-semantic-mutations.py
+	python3 scripts/check-semantic-mutations.py
+
+verify-refinement:
+	python3 scripts/check-refinement.py
 
 check:
 	@mkdir -p .work/tmp

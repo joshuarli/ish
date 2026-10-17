@@ -115,19 +115,19 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
             let altered = negative_control(family, outcome)?;
             if altered == *outcome {
                 return Err(BridgeError::new(format!(
-                    "{} negative control did not mutate an observation",
+                    "{} comparator control did not alter an expected outcome",
                     family.name()
                 )));
             }
             if altered == validate_response(responses[offset].clone(), &request.id)? {
                 return Err(BridgeError::new(format!(
-                    "{} negative control was not detected",
+                    "{} comparator control was not rejected",
                     family.name()
                 )));
             }
         }
         println!(
-            "{}: {} generated, {} retained, negative control detected",
+            "{}: {} generated, {} retained, comparator control rejected",
             family.name(),
             generated_count,
             cases.len() - generated_count,

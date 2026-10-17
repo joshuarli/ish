@@ -1,8 +1,12 @@
+#[path = "common/unix.rs"]
+mod unix_support;
+
 use std::process::{Command, Stdio};
 use std::os::unix::process::CommandExt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use epsh::eval::Shell;
+use unix_support::create_fifo;
 
 fn isolated(name: &str, probe: impl FnOnce()) {
     if std::env::var("EPSH_LIFECYCLE_PROBE").as_deref() == Ok(name) {
@@ -180,7 +184,7 @@ fn cancellation_reaches_blocked_substitutions_and_pipelines() {
 fn background_relay_descriptors_move_with_user_redirections() {
     isolated("background_relay_descriptors_move_with_user_redirections", || {
         let dir = tempfile::tempdir().unwrap();
-        rustix::fs::mkfifoat(rustix::fs::CWD, dir.path().join("gate"), rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR).unwrap();
+        create_fifo(&dir.path().join("gate")).unwrap();
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut shell = Shell::builder().cwd(dir.path().to_path_buf()).stdout_sink(out.clone()).build();
         let open_descriptors = || (3..1024).filter(|fd| {

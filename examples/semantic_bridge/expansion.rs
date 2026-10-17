@@ -16,6 +16,73 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
+const LEGACY_FIXTURE_COUNT: usize = 53;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IfsKind {
+    Whitespace,
+    Colon,
+    RawByte,
+    Unicode,
+    Empty,
+    WhitespaceColon,
+    WhitespaceRawByte,
+}
+
+const IFS_KINDS: [IfsKind; 7] = [
+    IfsKind::Whitespace,
+    IfsKind::Colon,
+    IfsKind::RawByte,
+    IfsKind::Unicode,
+    IfsKind::Empty,
+    IfsKind::WhitespaceColon,
+    IfsKind::WhitespaceRawByte,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValuePattern {
+    Leading,
+    Adjacent,
+    Trailing,
+    AllBoundaries,
+    Empty,
+}
+
+const VALUE_PATTERNS: [ValuePattern; 5] = [
+    ValuePattern::Leading,
+    ValuePattern::Adjacent,
+    ValuePattern::Trailing,
+    ValuePattern::AllBoundaries,
+    ValuePattern::Empty,
+];
+
+#[derive(Clone, Copy)]
+enum SourceShape {
+    UnquotedValue,
+    QuotedValue,
+    UnquotedAffixedValue,
+    QuotedAffixedValue,
+    QuotedAffixesWithUnquotedValue,
+    UnquotedAtWithAffixes,
+    QuotedAtWithAffixes,
+    QuotedStar,
+    UnquotedStar,
+}
+
+const SOURCE_SHAPES: [SourceShape; 9] = [
+    SourceShape::UnquotedValue,
+    SourceShape::QuotedValue,
+    SourceShape::UnquotedAffixedValue,
+    SourceShape::QuotedAffixedValue,
+    SourceShape::QuotedAffixesWithUnquotedValue,
+    SourceShape::UnquotedAtWithAffixes,
+    SourceShape::QuotedAtWithAffixes,
+    SourceShape::QuotedStar,
+    SourceShape::UnquotedStar,
+];
+
+const COMBINATORIAL_PERIOD: usize = IFS_KINDS.len() * VALUE_PATTERNS.len() * SOURCE_SHAPES.len();
+
 #[derive(Default)]
 struct ObservationIds {
     substitution: usize,
@@ -25,8 +92,11 @@ struct ObservationIds {
 }
 
 pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
+    if index >= LEGACY_FIXTURE_COUNT {
+        return generate_combinatorial(index, seed);
+    }
     let mut random = Generator::new(seed ^ (index as u64).wrapping_mul(0xa0761d6478bd642f));
-    let case = index % 53;
+    let case = index % LEGACY_FIXTURE_COUNT;
     let source = match case {
         0 => "echo bridge-literal".to_string(),
         1 => "echo 'quoted *'".to_string(),
@@ -85,8 +155,6 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         51 => "echo $(echo $((x=4)))$x".to_string(),
         _ => "echo $(cd /)".to_string(),
     };
-    let program = parse_program(&source)?;
-    let words = command_words(&program)?;
     let mut state = empty_state();
     let value = match case {
         5 => vec![0xff],
@@ -171,6 +239,177 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         }
         _ => json!([]),
     };
+    generated_request(index, source, state, process_observations, globs)
+}
+
+fn generate_combinatorial(index: usize, seed: u64) -> BridgeResult<Request> {
+    let ordinal = (index - LEGACY_FIXTURE_COUNT) % COMBINATORIAL_PERIOD;
+    let mut layout = Generator::new(seed ^ 0x9e37_79b9_7f4a_7c15);
+    let ifs_kind = IFS_KINDS[(ordinal % IFS_KINDS.len()
+        + layout.below(IFS_KINDS.len() as u64) as usize)
+        % IFS_KINDS.len()];
+    let value_pattern = VALUE_PATTERNS[(ordinal / IFS_KINDS.len() % VALUE_PATTERNS.len()
+        + layout.below(VALUE_PATTERNS.len() as u64) as usize)
+        % VALUE_PATTERNS.len()];
+    let source_shape = SOURCE_SHAPES[(ordinal / (IFS_KINDS.len() * VALUE_PATTERNS.len())
+        % SOURCE_SHAPES.len()
+        + layout.below(SOURCE_SHAPES.len() as u64) as usize)
+        % SOURCE_SHAPES.len()];
+    let mut random = Generator::new(
+        seed ^ (index as u64).wrapping_mul(0xd6e8_feb8_6659_fd93) ^ 0xa076_1d64_78bd_642f,
+    );
+    let affix = random.below(4) as usize;
+    let (prefix, suffix) = [("pre", "post"), ("L", "R"), ("λ", "☃"), (":", ":")][affix];
+    let ifs = generated_ifs(ifs_kind);
+    let value = generated_value(ifs_kind, value_pattern);
+    let source = match source_shape {
+        SourceShape::UnquotedValue => "echo ${VALUE}".to_string(),
+        SourceShape::QuotedValue => "echo \"${VALUE}\"".to_string(),
+        SourceShape::UnquotedAffixedValue => format!("echo {prefix}${{VALUE}}{suffix}"),
+        SourceShape::QuotedAffixedValue => format!("echo {prefix}\"${{VALUE}}\"{suffix}"),
+        SourceShape::QuotedAffixesWithUnquotedValue => "echo 'pre'${VALUE}'post'".to_string(),
+        SourceShape::UnquotedAtWithAffixes => format!("echo {prefix}$@{suffix}"),
+        SourceShape::QuotedAtWithAffixes => format!("echo {prefix}\"$@\"{suffix}"),
+        SourceShape::QuotedStar => "echo \"$*\"".to_string(),
+        SourceShape::UnquotedStar => "echo $*".to_string(),
+    };
+    let positional = match value_pattern {
+        ValuePattern::Leading => vec![
+            generated_value(ifs_kind, ValuePattern::Adjacent),
+            Vec::new(),
+            generated_value(ifs_kind, ValuePattern::Trailing),
+        ],
+        ValuePattern::Adjacent => vec![
+            generated_value(ifs_kind, ValuePattern::Trailing),
+            Vec::new(),
+            generated_value(ifs_kind, ValuePattern::AllBoundaries),
+        ],
+        ValuePattern::Trailing => vec![
+            generated_value(ifs_kind, ValuePattern::AllBoundaries),
+            Vec::new(),
+            generated_value(ifs_kind, ValuePattern::Leading),
+        ],
+        ValuePattern::AllBoundaries => vec![
+            generated_value(ifs_kind, ValuePattern::Leading),
+            Vec::new(),
+            generated_value(ifs_kind, ValuePattern::Adjacent),
+        ],
+        ValuePattern::Empty => vec![Vec::new(), Vec::new(), Vec::new()],
+    };
+    let mut state = empty_state();
+    state["variables"] = json!([
+        ["EMPTY", []],
+        ["HOME", [47, 98, 114, 105, 100, 103, 101, 45, 104, 111, 109, 101]],
+        ["IFS", ifs],
+        ["VALUE", value],
+    ]);
+    state["positional"] = json!(positional);
+    state["last_status"] = json!(0);
+    generated_request(index, source, state, Vec::new(), json!([]))
+}
+
+fn generated_ifs(kind: IfsKind) -> Vec<u8> {
+    match kind {
+        IfsKind::Whitespace => vec![32, 9, 10],
+        IfsKind::Colon => vec![b':'],
+        IfsKind::RawByte => vec![0xff],
+        IfsKind::Unicode => "λ".as_bytes().to_vec(),
+        IfsKind::Empty => Vec::new(),
+        IfsKind::WhitespaceColon => vec![32, 9, 10, b':'],
+        IfsKind::WhitespaceRawByte => vec![32, 9, 10, 0xff],
+    }
+}
+
+fn generated_value(kind: IfsKind, pattern: ValuePattern) -> Vec<u8> {
+    if pattern == ValuePattern::Empty {
+        return Vec::new();
+    }
+    let delimiter = match kind {
+        IfsKind::Whitespace => b" ".as_slice(),
+        IfsKind::Colon | IfsKind::Empty => b":".as_slice(),
+        IfsKind::RawByte => b"\xff".as_slice(),
+        IfsKind::Unicode => "λ".as_bytes(),
+        IfsKind::WhitespaceColon => b":".as_slice(),
+        IfsKind::WhitespaceRawByte => b"\xff".as_slice(),
+    };
+    let mixed_ifs = matches!(kind, IfsKind::WhitespaceColon | IfsKind::WhitespaceRawByte);
+    let mut value = Vec::new();
+    match pattern {
+        ValuePattern::Leading => {
+            value.extend_from_slice(delimiter);
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+            value.push(b'a');
+        }
+        ValuePattern::Adjacent => {
+            value.push(b'a');
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+            value.extend_from_slice(delimiter);
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+            value.extend_from_slice(delimiter);
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+            value.push(b'b');
+        }
+        ValuePattern::Trailing => {
+            value.push(b'a');
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+            value.extend_from_slice(delimiter);
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+            value.extend_from_slice(delimiter);
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+            value.push(b'b');
+            value.extend_from_slice(delimiter);
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+        }
+        ValuePattern::AllBoundaries => {
+            value.extend_from_slice(delimiter);
+            value.push(b'a');
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+            value.extend_from_slice(delimiter);
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+            value.extend_from_slice(delimiter);
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+            value.push(b'b');
+            value.extend_from_slice(delimiter);
+            if mixed_ifs {
+                value.extend_from_slice(b" \t");
+            }
+        }
+        ValuePattern::Empty => return Vec::new(),
+    }
+    value
+}
+
+fn generated_request(
+    index: usize,
+    source: String,
+    state: Value,
+    process_observations: Vec<Value>,
+    globs: Value,
+) -> BridgeResult<Request> {
+    let program = parse_program(&source)?;
+    let words = command_words(&program)?;
     let observation_values = observation_map_from_slice(&process_observations)?;
     let process = process_values(&observation_values)?;
     let glob_observations = globs
@@ -1120,11 +1359,190 @@ fn register_effect(ids: &mut ObservationIds, id: &str) {
 mod tests {
     use super::{
         actual, command_words, generate, parse_program, PrimitiveExpandContext, ProcessValues,
+        COMBINATORIAL_PERIOD, LEGACY_FIXTURE_COUNT,
     };
     use epsh::error::ShellError;
     use serde_json::json;
+    use std::collections::HashSet;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    #[test]
+    fn combinatorial_generation_covers_ifs_boundaries_and_word_contexts() {
+        let requests: Vec<_> = (LEGACY_FIXTURE_COUNT..LEGACY_FIXTURE_COUNT + COMBINATORIAL_PERIOD)
+            .map(|index| generate(index, 0x53ad_5eed).unwrap())
+            .collect();
+        let ifs_values: HashSet<Vec<u8>> = requests
+            .iter()
+            .map(|request| {
+                request.state["variables"][2][1]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|byte| byte.as_u64().unwrap() as u8)
+                    .collect()
+            })
+            .collect();
+        let values: HashSet<Vec<u8>> = requests
+            .iter()
+            .map(|request| {
+                request.state["variables"][3][1]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|byte| byte.as_u64().unwrap() as u8)
+                    .collect()
+            })
+            .collect();
+        let sources: HashSet<String> = requests
+            .iter()
+            .map(|request| String::from_utf8(request.source.clone()).unwrap())
+            .collect();
+
+        assert!(ifs_values.contains(b" \t\n".as_slice()));
+        assert!(ifs_values.contains(b":".as_slice()));
+        assert!(ifs_values.contains(&vec![0xff]));
+        assert!(ifs_values.contains("λ".as_bytes()));
+        assert!(ifs_values.contains(&Vec::new()));
+        assert!(ifs_values.contains(b" \t\n:".as_slice()));
+        assert!(ifs_values.contains(&vec![32, 9, 10, 0xff]));
+        assert!(values.contains(b":a".as_slice()));
+        assert!(values.contains(b"a::b".as_slice()));
+        assert!(values.contains(b"a::b:".as_slice()));
+        assert!(values.contains(b":a::b:".as_slice()));
+        assert!(values.contains(&vec![0xff, b'a', 0xff, 0xff, b'b', 0xff]));
+        assert!(values.contains("λaλλbλ".as_bytes()));
+        assert!(values.contains(&Vec::new()));
+        assert!(values.contains(b"a \t: \t: \tb".as_slice()));
+        assert!(values.contains(b"a \t: \t: \tb: \t".as_slice()));
+        assert!(values.contains(&vec![b'a', b' ', b'\t', 0xff, b' ', b'\t', 0xff, b' ', b'\t', b'b']));
+        assert!(sources.contains("echo ${VALUE}"));
+        assert!(sources.contains("echo \"${VALUE}\""));
+        assert!(sources.iter().any(|source| {
+            source.contains("${VALUE}")
+                && !source.contains('"')
+                && !source.contains('\'')
+                && source != "echo ${VALUE}"
+        }));
+        assert!(sources
+            .iter()
+            .any(|source| source.contains("${VALUE}") && source.contains('\'')));
+        assert!(sources.iter().any(|source| source.contains("$@") && source.contains('"')));
+        assert!(sources.iter().any(|source| source.contains("$@") && !source.contains('"')));
+        assert!(sources.contains("echo \"$*\""));
+        assert!(sources.contains("echo $*"));
+        assert!(requests.iter().any(|request| {
+            request.state["variables"][2][1] == json!([58])
+                && request.state["variables"][3][1] == json!([97, 58, 58, 98, 58])
+        }));
+        let combinations: HashSet<(usize, usize, usize)> = requests
+            .iter()
+            .map(|request| {
+                let ifs: Vec<u8> = request.state["variables"][2][1]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|byte| byte.as_u64().unwrap() as u8)
+                    .collect();
+                let value: Vec<u8> = request.state["variables"][3][1]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|byte| byte.as_u64().unwrap() as u8)
+                    .collect();
+                let ifs_kind = match ifs.as_slice() {
+                    b" \t\n" => 0,
+                    b":" => 1,
+                    [0xff] => 2,
+                    [0xce, 0xbb] => 3,
+                    [] => 4,
+                    b" \t\n:" => 5,
+                    [32, 9, 10, 0xff] => 6,
+                    _ => panic!("unexpected generated IFS bytes"),
+                };
+                let pattern = value_pattern(ifs_kind, &value);
+                let source = std::str::from_utf8(&request.source).unwrap();
+                let shape = match source {
+                    "echo ${VALUE}" => 0,
+                    "echo \"${VALUE}\"" => 1,
+                    "echo \"$*\"" => 7,
+                    "echo $*" => 8,
+                    _ if source.contains("${VALUE}") && source.contains('\'') => 4,
+                    _ if source.contains("${VALUE}") && source.contains('"') => 3,
+                    _ if source.contains("${VALUE}") => 2,
+                    _ if source.contains("$@") && source.contains('"') => 6,
+                    _ if source.contains("$@") => 5,
+                    _ => panic!("unexpected generated source shape"),
+                };
+                (ifs_kind, pattern, shape)
+            })
+            .collect();
+        assert_eq!(combinations.len(), COMBINATORIAL_PERIOD);
+        for request in &requests {
+            super::validate_case(request).unwrap();
+        }
+
+        let first = generate(LEGACY_FIXTURE_COUNT, 1).unwrap();
+        let repeated = generate(LEGACY_FIXTURE_COUNT, 1).unwrap();
+        let other_seed = generate(LEGACY_FIXTURE_COUNT, 2).unwrap();
+        assert_eq!(first.to_json(), repeated.to_json());
+        assert_ne!(first.to_json(), other_seed.to_json());
+        assert_eq!(generate(52, 0).unwrap().source, b"echo $(cd /)");
+    }
+
+    fn value_pattern(ifs_kind: usize, value: &[u8]) -> usize {
+        if value.is_empty() {
+            return 4;
+        }
+        let delimiter: &[u8] = match ifs_kind {
+            0 => b" ",
+            1 | 4 | 5 => b":",
+            2 => b"\xff",
+            3 => "λ".as_bytes(),
+            6 => b"\xff",
+            _ => panic!("unexpected generated IFS class"),
+        };
+        let mixed_ifs = matches!(ifs_kind, 5 | 6);
+        let adjacent = adjacent_delimiters(value, delimiter, mixed_ifs);
+        let mut end = value.len();
+        if mixed_ifs {
+            while end > 0 && matches!(value[end - 1], b' ' | b'\t' | b'\n') {
+                end -= 1;
+            }
+        }
+        match (
+            value.starts_with(delimiter),
+            adjacent,
+            value[..end].ends_with(delimiter),
+        ) {
+            (true, false, false) => 0,
+            (false, true, false) => 1,
+            (false, true, true) => 2,
+            (true, true, true) => 3,
+            _ => panic!("unexpected generated value shape"),
+        }
+    }
+
+    fn adjacent_delimiters(value: &[u8], delimiter: &[u8], mixed_ifs: bool) -> bool {
+        if !mixed_ifs {
+            return value
+                .windows(delimiter.len() * 2)
+                .any(|pair| pair == [delimiter, delimiter].concat());
+        }
+        for start in 0..=value.len().saturating_sub(delimiter.len()) {
+            if !value[start..].starts_with(delimiter) {
+                continue;
+            }
+            let mut next = start + delimiter.len();
+            while next < value.len() && matches!(value[next], b' ' | b'\t' | b'\n') {
+                next += 1;
+            }
+            if value[next..].starts_with(delimiter) {
+                return true;
+            }
+        }
+        false
+    }
 
     #[test]
     fn output_and_glob_fixtures_preserve_raw_bytes_and_unicode_scalars() {

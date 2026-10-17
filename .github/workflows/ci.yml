@@ -40,11 +40,23 @@ jobs:
         run: cargo test --workspace --lib --tests
 
   linux-musl:
-    name: Lint and test (Linux musl)
-    runs-on: ubuntu-latest
+    name: Lint and test (Linux ${{ matrix.arch }} musl)
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+          - arch: ARM64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            platform: linux/arm64
     defaults:
       run:
         shell: bash -euo pipefail {0}
@@ -56,23 +68,23 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64
+          platforms: ${{ matrix.platform }}
           load: true
-          tags: ish-builder:x86_64-unknown-linux-musl
-          cache-from: type=gha,scope=ish-x86_64-unknown-linux-musl
+          tags: ish-builder:${{ matrix.target }}
+          cache-from: type=gha,scope=ish-${{ matrix.target }}
       - name: Lint and test in image
         run: |
           docker run --rm --init \
-            --platform linux/amd64 \
+            --platform "${{ matrix.platform }}" \
             -e CI \
             -v "$GITHUB_WORKSPACE:/ish" \
             -w /ish \
-            ish-builder:x86_64-unknown-linux-musl \
+            ish-builder:${{ matrix.target }} \
             sh -ec '
               rustup component add clippy
-              MUSL_TARGET=x86_64-unknown-linux-musl MUSL_BUILD_MODE=test \
+              MUSL_TARGET=${{ matrix.target }} MUSL_BUILD_MODE=test \
                 musl-cargo clippy --workspace --all-targets -- -D warnings
-              make test TARGET=x86_64-unknown-linux-musl
+              make test TARGET=${{ matrix.target }}
             '
 
   semantic:
@@ -99,3 +111,5 @@ jobs:
           key: semantic-ubuntu
       - name: Verify Lean models and Rust bridge
         run: make verify
+      - name: Verify extracted Rust shift-count refinement
+        run: make verify-refinement

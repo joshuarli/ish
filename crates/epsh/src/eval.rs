@@ -2428,7 +2428,7 @@ mod tests {
             for i in 0..20 {
                 let out: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
                 let out2 = out.clone();
-                let script = format!("python3 - << 'PYEOF'\nprint('iter {i}')\nPYEOF");
+                let script = format!("/bin/cat << 'EOF'\niter {i}\nEOF");
                 let mut shell = Shell::builder()
                     .stdout_sink(Arc::new(Mutex::new(crate::eval::tests::VecSink(out2))))
                     .stderr_sink(Arc::new(Mutex::new(std::io::sink())))
