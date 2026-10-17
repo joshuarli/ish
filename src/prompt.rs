@@ -273,7 +273,6 @@ fn resolve_gitdir_file(path: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Read HEAD into `out`. Returns true if branch found. Zero allocation.
 fn read_head_into(head_path: &Path, out: &mut String) -> bool {
     use std::io::Read;
     let mut buf = [0u8; 256];
@@ -290,16 +289,24 @@ fn read_head_into(head_path: &Path, out: &mut String) -> bool {
     } else if let Some(b) = line.strip_prefix("ref: ") {
         b
     } else {
-        // Detached HEAD — show short hash
-        &line[..line.len().min(8)]
+        let Some(abbreviation) = detached_head_abbreviation(line) else {
+            return false;
+        };
+        abbreviation
     };
     if branch.is_empty() {
         return false;
     }
-    // HEAD comes from the checkout, not the user: a control character in it
-    // would reach the terminal as an escape sequence.
     out.extend(branch.chars().map(crate::line::display_char));
     true
+}
+
+fn detached_head_abbreviation(object_id: &str) -> Option<&str> {
+    let bytes = object_id.as_bytes();
+    if !matches!(bytes.len(), 40 | 64) || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some(&object_id[..8])
 }
 
 /// Append `bytes` percent-encoded byte-wise: only URI unreserved bytes (and
@@ -379,6 +386,29 @@ mod tests {
         let mut out = String::new();
         assert!(read_head_into(&head, &mut out));
         assert!(!out.chars().any(char::is_control));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_detached_head_is_unavailable() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".work/tmp")
+            .join(format!("head-malformed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = dir.join("HEAD");
+        for (value, expected) in [
+            ("ééé€x", None),
+            ("0123456789abcdef0123456789abcdef01234567", Some("01234567")),
+            (
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                Some("01234567"),
+            ),
+        ] {
+            std::fs::write(&head, value).unwrap();
+            let mut out = String::new();
+            assert_eq!(read_head_into(&head, &mut out), expected.is_some());
+            assert_eq!(out.as_str(), expected.unwrap_or(""));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
