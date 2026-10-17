@@ -1,7 +1,7 @@
 //! Reversible compatibility encoding for arbitrary shell bytes in UTF-8 strings.
 
 const PUA_BASE: u32 = 0xE000;
-const ESCAPE: char = '\u{E000}';
+pub(crate) const ESCAPE: char = '\u{E000}';
 
 fn push_text(result: &mut String, text: &str) {
     for c in text.chars() {
@@ -52,6 +52,33 @@ pub fn str_to_bytes(s: &str) -> Vec<u8> {
         }
     }
     result
+}
+
+pub(crate) fn shell_chars(text: &str) -> impl Iterator<Item = &str> {
+    let mut chars = text.char_indices();
+    std::iter::from_fn(move || {
+        let (start, c) = chars.next()?;
+        let end = if c == ESCAPE {
+            chars.next().map_or(start + c.len_utf8(), |(i, c)| i + c.len_utf8())
+        } else {
+            start + c.len_utf8()
+        };
+        Some(&text[start..end])
+    })
+}
+
+pub(crate) fn shell_codepoints(text: &str) -> impl Iterator<Item = u32> {
+    shell_chars(text).map(|unit| {
+        let mut chars = unit.chars();
+        let c = chars.next().unwrap();
+        if c == ESCAPE {
+            chars.next().unwrap_or(ESCAPE) as u32
+        } else if (PUA_BASE + 0x80..=PUA_BASE + 0xFF).contains(&(c as u32)) {
+            0x110000 + c as u32 - PUA_BASE
+        } else {
+            c as u32
+        }
+    })
 }
 
 #[cfg(test)]

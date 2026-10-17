@@ -51,6 +51,68 @@ fn parser_text_and_byte_sources_preserve_literal_private_use_characters() {
 }
 
 #[test]
+fn public_text_values_are_utf8_and_encoded_values_decode_explicitly() {
+    let text = "\u{e000}\u{e080}\u{e0ff}";
+    assert_eq!(epsh::shell_bytes::ShellBytes::from(text).as_bytes(), text.as_bytes());
+    assert_eq!(epsh::shell_bytes::ShellBytes::from(text.to_string()).as_bytes(), text.as_bytes());
+    let mut shell = Shell::new();
+    shell.set_var("CODEC", text).unwrap();
+    shell.set_args(&["codec", text]);
+    assert_eq!(shell.get_var_bytes("CODEC").unwrap().as_bytes(), text.as_bytes());
+    let output = Arc::new(Mutex::new(Vec::new()));
+    shell.set_stdout_sink(output.clone());
+    assert_eq!(shell.run_script("printf '%s%s' \"$CODEC\" \"$1\""), 0);
+    assert_eq!(*output.lock().unwrap(), text.as_bytes().repeat(2));
+}
+
+#[test]
+fn lexer_spans_count_source_characters_without_codec_prefixes() {
+    let mut lexer = epsh::lexer::Lexer::new("\u{e000}\u{e080}\u{e0ff} next");
+    lexer.next_token().unwrap();
+    let (_, span) = lexer.next_token().unwrap();
+    assert_eq!(span.offset, 4);
+    assert_eq!(span.col, 5);
+    assert_eq!(span.line, 1);
+}
+
+#[test]
+fn private_use_units_survive_ifs_patterns_and_parameter_trimming() {
+    let pua = "\u{e000}\u{e080}\u{e0ff}";
+    let script = format!(
+        "v='{pua}'; printf '%s:%s:%s:' \"${{v#?}}\" \"${{v%?}}\" \"${{#v}}\"; IFS='\u{e080}'; v='a\u{e080}b'; printf '<%s>' $v"
+    );
+    let expected = "\u{e080}\u{e0ff}:\u{e000}\u{e080}:9:<a><b>";
+    assert_eq!(captured(script.as_bytes(), true), expected.as_bytes());
+    for scalar in ["\u{e000}", "\u{e080}", "\u{e0ff}"] {
+        assert!(epsh::glob::fnmatch("?", scalar));
+        assert!(!epsh::glob::fnmatch("??", scalar));
+        assert!(epsh::glob::fnmatch(&format!("[{scalar}]"), scalar));
+    }
+    let script = b"v='\xee\x82\x80\x80'; printf '%s:%s' \"${v#?}\" \"${v%?}\"";
+    assert_eq!(captured(script, false), b"\x80:\xee\x82\x80");
+}
+
+#[test]
+fn quoted_private_use_heredocs_and_nested_scripts_preserve_bytes() {
+    let value = "\u{e000}\u{e080}\u{e0ff}";
+    for script in [
+        format!("printf '%s' \"${{UNSET_CODEC:-\\{value}}}\""),
+        format!("eval \"printf '%s' '{value}'\""),
+        format!("trap \"printf '%s' '{value}'\" EXIT"),
+    ] {
+        let expected = if script.starts_with("printf") { format!("\\{value}") } else { value.to_string() };
+        assert_eq!(captured(script.as_bytes(), true), expected.as_bytes(), "{script}");
+    }
+    for quoted in [false, true] {
+        let delimiter = if quoted { "'EOF'" } else { "EOF" };
+        let script = format!("cat <<{delimiter}\n\\{value}\nEOF\n");
+        let output = Command::new(env!("CARGO_BIN_EXE_epsh")).arg("-c").arg(script).output().unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, format!("\\{value}\n").as_bytes());
+    }
+}
+
+#[test]
 fn cli_source_arguments_and_environment_preserve_private_use_and_invalid_bytes() {
     let value = [0xee, 0x80, 0x80, 0xee, 0x82, 0x80, 0xff];
     let name = "CODEC_\u{e080}";

@@ -122,6 +122,8 @@ enum WordCtx {
 pub struct Lexer {
     src: Vec<char>,
     pos: usize,
+    source_offset: usize,
+    encoding_prefix: bool,
     line: u32,
     col: u32,
 
@@ -145,6 +147,8 @@ impl Lexer {
         Lexer {
             src: source.chars().collect(),
             pos: 0,
+            source_offset: 0,
+            encoding_prefix: false,
             line: 1,
             col: 1,
             pushback: None,
@@ -160,7 +164,7 @@ impl Lexer {
     /// Return the current source position.
     pub fn span(&self) -> Span {
         Span {
-            offset: self.pos,
+            offset: self.source_offset,
             line: self.line,
             col: self.col,
         }
@@ -184,10 +188,8 @@ impl Lexer {
         loop {
             let ch = self.src.get(self.pos).copied()?;
             if ch == '\\' && self.src.get(self.pos + 1).copied() == Some('\n') {
-                // Consume the backslash-newline continuation
-                self.pos += 2;
-                self.line += 1;
-                self.col = 1;
+                self.advance_raw();
+                self.advance_raw();
                 continue;
             }
             return Some(ch);
@@ -198,6 +200,12 @@ impl Lexer {
     pub(crate) fn advance_raw(&mut self) -> Option<char> {
         let ch = self.src.get(self.pos).copied()?;
         self.pos += 1;
+        if ch == crate::encoding::ESCAPE && !self.encoding_prefix {
+            self.encoding_prefix = true;
+            return Some(ch);
+        }
+        self.encoding_prefix = false;
+        self.source_offset += 1;
         if ch == '\n' {
             self.line += 1;
             self.col = 1;
@@ -209,23 +217,8 @@ impl Lexer {
 
     /// Consume and return the next character, eating `\<newline>` continuations.
     fn advance(&mut self) -> Option<char> {
-        loop {
-            let ch = self.src.get(self.pos).copied()?;
-            if ch == '\\' && self.src.get(self.pos + 1).copied() == Some('\n') {
-                self.pos += 2;
-                self.line += 1;
-                self.col = 1;
-                continue;
-            }
-            self.pos += 1;
-            if ch == '\n' {
-                self.line += 1;
-                self.col = 1;
-            } else {
-                self.col += 1;
-            }
-            return Some(ch);
-        }
+        self.peek()?;
+        self.advance_raw()
     }
 
     /// Skip whitespace (spaces and tabs, NOT newlines — those are tokens).
@@ -478,7 +471,7 @@ impl Lexer {
                     match ch {
                         '"' if !in_dquote => {
                             if !literal.is_empty() {
-                                parts.push(WordPart::Literal(std::mem::take(&mut literal).into()));
+                                parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&std::mem::take(&mut literal))));
                             }
                             self.advance(); // consume opening "
                             let inner = self.read_dquote_parts(span)?;
@@ -488,7 +481,7 @@ impl Lexer {
                         '"' if in_dquote && ctx == WordCtx::Brace => {
                             // Inner double quote inside "${...}" toggles context (dash's innerdq).
                             if !literal.is_empty() {
-                                parts.push(WordPart::Literal(std::mem::take(&mut literal).into()));
+                                parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&std::mem::take(&mut literal))));
                             }
                             self.advance(); // consume opening inner "
                             let inner = self.read_brace_dquote_toggle_parts(span)?;
@@ -497,7 +490,7 @@ impl Lexer {
                         // ('"' if in_dquote && ctx == Word is caught by termination above)
                         '\'' if !in_dquote => {
                             if !literal.is_empty() {
-                                parts.push(WordPart::Literal(std::mem::take(&mut literal).into()));
+                                parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&std::mem::take(&mut literal))));
                             }
                             self.advance_raw(); // consume opening '
                             let mut content = String::new();
@@ -514,7 +507,7 @@ impl Lexer {
                                 }
                             }
                             had_quoting = true;
-                            parts.push(WordPart::SingleQuoted(content.into()));
+                            parts.push(WordPart::SingleQuoted(ShellBytes::from_str_lossless(&content)));
                         }
 
                         '\\' if in_dquote => {
@@ -555,7 +548,7 @@ impl Lexer {
 
                         '$' => {
                             if !literal.is_empty() {
-                                parts.push(WordPart::Literal(std::mem::take(&mut literal).into()));
+                                parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&std::mem::take(&mut literal))));
                             }
                             self.advance(); // consume $
                             if let Some(part) = self.read_dollar(in_dquote, span)? {
@@ -566,7 +559,7 @@ impl Lexer {
                         }
                         '`' => {
                             if !literal.is_empty() {
-                                parts.push(WordPart::Literal(std::mem::take(&mut literal).into()));
+                                parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&std::mem::take(&mut literal))));
                             }
                             self.advance(); // consume opening `
                             let part = self.read_backtick_part(span)?;
@@ -591,7 +584,7 @@ impl Lexer {
                                 user.push(c);
                                 self.advance();
                             }
-                            parts.push(WordPart::Tilde(user.into()));
+                            parts.push(WordPart::Tilde(ShellBytes::from_str_lossless(&user)));
                         }
 
                         _ => {
@@ -604,7 +597,7 @@ impl Lexer {
         }
 
         if !literal.is_empty() {
-            parts.push(WordPart::Literal(literal.into()));
+            parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&literal)));
         }
 
         Ok((coalesce_literals(parts), had_quoting))
@@ -937,7 +930,7 @@ impl Lexer {
                 Some('$') => {
                     self.advance();
                     if !literal.is_empty() {
-                        parts.push(WordPart::Literal(std::mem::take(&mut literal).into()));
+                        parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&std::mem::take(&mut literal))));
                     }
                     if let Some(part) = self.read_dollar(false, span)? {
                         parts.push(part);
@@ -953,7 +946,7 @@ impl Lexer {
                 }
                 Some('`') => {
                     if !literal.is_empty() {
-                        parts.push(WordPart::Literal(std::mem::take(&mut literal).into()));
+                        parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&std::mem::take(&mut literal))));
                     }
                     self.advance();
                     parts.push(self.read_backtick_part(span)?);
@@ -966,7 +959,7 @@ impl Lexer {
         }
 
         if !literal.is_empty() {
-            parts.push(WordPart::Literal(literal.into()));
+            parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&literal)));
         }
         Ok(parts)
     }
@@ -1534,7 +1527,7 @@ fn try_split_assignment(parts: &[WordPart]) -> Option<(String, Vec<WordPart>)> {
             let rest_of_first = &first[eq_pos + 1..];
             let mut value_parts = Vec::new();
             if !rest_of_first.is_empty() {
-                value_parts.push(WordPart::Literal(rest_of_first.to_string().into()));
+                value_parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&rest_of_first.to_string())));
             }
             for part in &parts[1..] {
                 value_parts.push(part.clone());
