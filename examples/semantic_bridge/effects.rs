@@ -17,6 +17,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -505,7 +506,7 @@ fn run_isolated(request: &Request) -> BridgeResult<Value> {
     }
     drop(stdin);
     let status = wait_bounded(&mut child)?;
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| BridgeError::new("effects worker stdout is unavailable"))?;
@@ -519,7 +520,7 @@ fn run_isolated(request: &Request) -> BridgeResult<Value> {
     }
     if !status.success() {
         let mut stderr = Vec::new();
-        if let Some(mut stream) = child.stderr.take() {
+        if let Some(stream) = child.stderr.take() {
             stream
                 .take((MAX_WORKER_OUTPUT_BYTES + 1) as u64)
                 .read_to_end(&mut stderr)
@@ -697,10 +698,17 @@ fn actual_cwd(request: &Request) -> BridgeResult<Value> {
         }
         let mut shells = shell_cwds
             .iter()
-            .map(|cwd| Shell::builder().cwd(cwd.clone()).env_clear().build())
+            .map(|cwd| {
+                Shell::builder()
+                    .cwd(cwd.clone())
+                    .env_clear()
+                    .stderr_sink(Arc::new(Mutex::new(std::io::sink())))
+                    .build()
+            })
             .collect::<Vec<_>>();
         let source = format!("cd {}", shell_quote(&selected_path));
-        let status = evaluate_source(&mut shells[selected_slot], &source)?;
+        let status = evaluate_source(&mut shells[selected_slot], &source)
+            .map_err(|error| BridgeError::new(error.to_string()))?;
         if (status.code() == 0) != success {
             return Err(BridgeError::new("epsh cd outcome disagrees with the generated cwd case"));
         }
@@ -756,7 +764,7 @@ fn actual_redirections(request: &Request) -> BridgeResult<Value> {
             Ok((*resource, path))
         })
         .collect::<BridgeResult<BTreeMap<_, _>>>()?;
-    let mut shell = Shell::builder().cwd(root.clone()).env_clear().build();
+    let mut shell = Shell::builder().cwd(root.to_path_buf()).env_clear().build();
     for (fd, resource) in &descriptors {
         let path = resource_paths
             .get(resource)
@@ -1044,14 +1052,14 @@ pub(crate) fn negative_control(outcome: &Value) -> BridgeResult<Value> {
 pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
     validate_case(request)?;
     let mut candidates = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = BTreeSet::<String>::new();
     match request.input["mode"].as_str().unwrap_or("") {
         "bytes" => {
             let bytes = require_bytes(&request.input["bytes"], "bytes input")?;
             for length in [bytes.len() / 2, 0] {
                 let mut candidate = request.clone();
                 candidate.input["bytes"] = json!(&bytes[..length]);
-                add_candidate(&mut candidates, &mut seen, request, candidate);
+                add_candidate(&mut candidates, &mut seen, request, candidate)?;
             }
         }
         "environment" => {
@@ -1059,20 +1067,20 @@ pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
             for length in [assignments.len() / 2, 0] {
                 let mut candidate = request.clone();
                 candidate.input["assignments"] = Value::Array(assignments[..length].to_vec());
-                add_candidate(&mut candidates, &mut seen, request, candidate);
+                add_candidate(&mut candidates, &mut seen, request, candidate)?;
             }
         }
         "cwd" => {
             let mut candidate = request.clone();
             candidate.input["success"] = json!(false);
-            add_candidate(&mut candidates, &mut seen, request, candidate);
+            add_candidate(&mut candidates, &mut seen, request, candidate)?;
         }
         "redirection" => {
             let operations = request.input["operations"].as_array().unwrap();
             for length in [operations.len() / 2, operations.len().saturating_sub(1), 0] {
                 let mut candidate = request.clone();
                 candidate.input["operations"] = Value::Array(operations[..length].to_vec());
-                add_candidate(&mut candidates, &mut seen, request, candidate);
+                add_candidate(&mut candidates, &mut seen, request, candidate)?;
             }
         }
         _ => return Err(BridgeError::new("effects shrink saw an unknown mode")),
@@ -1082,11 +1090,16 @@ pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
 
 fn add_candidate(
     candidates: &mut Vec<Request>,
-    seen: &mut BTreeSet<Value>,
+    seen: &mut BTreeSet<String>,
     original: &Request,
     candidate: Request,
-) {
-    if candidate.input != original.input && seen.insert(candidate.input.clone()) {
-        candidates.push(candidate);
+) -> BridgeResult<()> {
+    if candidate.input != original.input {
+        let key = serde_json::to_string(&candidate.input)
+            .map_err(|error| BridgeError::new(format!("cannot encode effects shrink candidate: {error}")))?;
+        if seen.insert(key) {
+            candidates.push(candidate);
+        }
     }
+    Ok(())
 }
