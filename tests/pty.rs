@@ -3616,3 +3616,24 @@ fn ctrl_p_dump_is_private_and_omits_typed_text() {
     assert!(text.contains("line.bytes: 16"), "{text}");
     assert!(!text.contains("secret-token-123"), "{text}");
 }
+
+#[test]
+fn native_listing_and_standalone_cd_preserve_private_use_and_raw_path_bytes() {
+    use std::ffi::OsString;
+    let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
+        for directory in [OsString::from("\u{e000}\u{e080}"), OsString::from_vec(vec![0x80])] {
+            let directory = home.join(directory);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(directory.join("codec-path-marker"), b"").unwrap();
+        }
+    });
+    for directory in ["\u{e000}\u{e080}".to_string(), "$(printf '\\200')".to_string()] {
+        let out = clean(&sh.run_command(&format!("l \"$HOME/{directory}\"")));
+        assert!(out.contains("codec-path-marker"), "{out}");
+        let out = clean(&sh.run_command(&format!("cd \"$HOME/{directory}\"")));
+        assert!(!out.contains("No such file"), "{out}");
+        let out = clean(&sh.run_command("l"));
+        assert!(out.contains("codec-path-marker"), "{out}");
+        sh.run_command("cd \"$HOME\"");
+    }
+}
