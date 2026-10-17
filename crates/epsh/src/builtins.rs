@@ -178,7 +178,7 @@ impl Shell {
             "exec" => return self.builtin_exec(args, redirs, span).map(Some),
             "command" => Some(self.builtin_command(args, span)?),
             "type" => Some(self.builtin_type(args)),
-            "wait" => Some(self.builtin_wait(args)),
+            "wait" => return self.builtin_wait(args).map(Some),
             "trap" => Some(self.builtin_trap(args)),
             "kill" => Some(self.builtin_kill(args)),
             "umask" => Some(self.builtin_umask(args)),
@@ -476,7 +476,7 @@ impl Shell {
         } else {
             &args[1..]
         };
-        test_eval(args)
+        test_eval(args, &self.cwd)
     }
 
     fn builtin_read(&mut self, args: &[String]) -> ExitStatus {
@@ -615,17 +615,36 @@ impl Shell {
         _redirs: &[Redir],
         _span: Span,
     ) -> crate::error::Result<ExitStatus> {
-        // Redirections are applied permanently by eval_simple (is_exec flag).
         if args.len() <= 1 {
             return Ok(ExitStatus::SUCCESS);
         }
 
-        // exec with command — replace process
         let args_bytes: Vec<ShellBytes> = args.iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
         let env = self.vars.env_for_command_os(&[]);
-        let _ = std::env::set_current_dir(&self.cwd);
-        let err = exec::execve_with_env(&args_bytes[0], &args_bytes, &env);
-        self.err_msg(&format!("exec: {}: {err}", args[0]));
+        #[cfg(target_os = "linux")]
+        let original_cwd = rustix::fs::open(
+            ".",
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        );
+        #[cfg(target_os = "macos")]
+        let original_cwd = std::fs::File::open(".");
+        let original_cwd = match original_cwd {
+            Ok(directory) => directory,
+            Err(err) => {
+                self.err_msg(&format!("exec: cannot save current directory: {err}"));
+                return Ok(ExitStatus::NOT_EXECUTABLE);
+            }
+        };
+        if let Err(err) = std::env::set_current_dir(&self.cwd) {
+            self.err_msg(&format!("exec: {}: {err}", args[1]));
+            return Ok(ExitStatus::NOT_EXECUTABLE);
+        }
+        let err = exec::execve_with_env(&args_bytes[1], &args_bytes[1..], &env);
+        self.err_msg(&format!("exec: {}: {err}", args[1]));
+        if let Err(restore_err) = rustix::process::fchdir(&original_cwd) {
+            self.err_msg(&format!("exec: cannot restore current directory: {restore_err}"));
+        }
         Ok(ExitStatus::NOT_EXECUTABLE)
     }
 
@@ -712,72 +731,118 @@ impl Shell {
         Err(())
     }
 
-    fn builtin_wait(&mut self, _args: &[String]) -> ExitStatus {
-        // Wait for all background children
-        loop {
-            let mut status = 0i32;
-            // SAFETY: -1 waits for any child process; standard POSIX usage.
-            let pid = sys::waitpid(-1, &mut status, 0);
-            if pid <= 0 {
-                break;
+    fn builtin_wait(&mut self, args: &[String]) -> crate::error::Result<ExitStatus> {
+        if args.len() == 1 {
+            for pid in self.child_pids.clone() {
+                if self.child_pids.contains(&pid) {
+                    self.wait_owned_child(pid)?;
+                }
+            }
+            return Ok(ExitStatus::SUCCESS);
+        }
+
+        let mut status = ExitStatus::SUCCESS;
+        for operand in &args[1..] {
+            let pid = operand.parse::<i32>().ok();
+            match pid.filter(|pid| self.child_pids.contains(pid)) {
+                Some(pid) => status = self.wait_owned_child(pid)?,
+                None => {
+                    self.err_msg(&format!("wait: {operand}: not a child"));
+                    status = ExitStatus::from(127);
+                }
             }
         }
-        ExitStatus::SUCCESS
+        Ok(status)
     }
 
     fn builtin_trap(&mut self, args: &[String]) -> ExitStatus {
         if args.len() <= 1 {
-            // Print current traps
             for (sig, action) in &self.traps {
                 self.write_out(&format!("trap -- '{}' {}\n", action, sig));
             }
             return ExitStatus::SUCCESS;
         }
-        // Skip -- if present
         let offset = if args[1] == "--" { 2 } else { 1 };
         if args.len() <= offset {
             return ExitStatus::SUCCESS;
         }
-        // POSIX: when only one operand remains (no action), it's a signal name
-        // and the trap is reset to default. e.g. `trap INT` resets SIGINT.
         if args.len() == offset + 1 {
             let sig = &args[offset];
             if sig == "-" {
-                // `trap -` with no signals: print traps (same as bare `trap`)
                 for (sig, action) in &self.traps {
                     self.write_out(&format!("trap -- '{}' {}\n", action, sig));
                 }
-            } else {
-                let normalized = sig.to_uppercase();
-                self.traps.remove(&normalized);
-                if let Some(signum) = crate::signal::name_to_signal(&normalized) {
-                    crate::signal::reset_handler(signum);
-                }
+                return ExitStatus::SUCCESS;
             }
-            return ExitStatus::SUCCESS;
+            return self.reset_named_trap(sig);
         }
         let action = &args[offset];
+        let mut status = ExitStatus::SUCCESS;
         for sig_name in &args[offset + 1..] {
             let normalized = sig_name.to_uppercase();
-            if action == "-" {
-                self.traps.remove(&normalized);
-                if let Some(signum) = crate::signal::name_to_signal(&normalized) {
-                    crate::signal::reset_handler(signum);
+            if normalized == "EXIT" {
+                if action == "-" {
+                    self.traps.remove("EXIT");
+                } else {
+                    self.traps.insert("EXIT".to_owned(), action.clone());
                 }
+                continue;
+            }
+            let Some(signum) = crate::signal::name_to_signal(&normalized) else {
+                self.err_msg(&format!("trap: {sig_name}: invalid signal specification"));
+                status = ExitStatus::FAILURE;
+                continue;
+            };
+            let Some(canonical) = crate::signal::signal_to_name(signum.as_raw()) else {
+                self.err_msg(&format!("trap: {sig_name}: invalid signal specification"));
+                status = ExitStatus::FAILURE;
+                continue;
+            };
+            let result = if action == "-" {
+                crate::signal::reset_handler(signum)
             } else if action.is_empty() {
-                // trap '' SIG — ignore the signal
-                self.traps.insert(normalized.clone(), action.clone());
-                if let Some(signum) = crate::signal::name_to_signal(&normalized) {
-                    crate::signal::ignore_signal(signum);
-                }
+                crate::signal::ignore_signal(signum)
             } else {
-                self.traps.insert(normalized.clone(), action.clone());
-                if let Some(signum) = crate::signal::name_to_signal(&normalized) {
-                    crate::signal::install_handler(signum);
-                }
+                crate::signal::install_handler(signum)
+            };
+            if let Err(err) = result {
+                self.err_msg(&format!("trap: {sig_name}: {err}"));
+                status = ExitStatus::FAILURE;
+                continue;
+            }
+            if action == "-" {
+                self.traps.remove(canonical);
+            } else {
+                self.traps.insert(canonical.to_owned(), action.clone());
             }
         }
-        ExitStatus::SUCCESS
+        status
+    }
+
+    fn reset_named_trap(&mut self, name: &str) -> ExitStatus {
+        let normalized = name.to_uppercase();
+        if normalized == "EXIT" {
+            self.traps.remove("EXIT");
+            return ExitStatus::SUCCESS;
+        }
+        let Some(signal) = crate::signal::name_to_signal(&normalized) else {
+            self.err_msg(&format!("trap: {name}: invalid signal specification"));
+            return ExitStatus::FAILURE;
+        };
+        let Some(canonical) = crate::signal::signal_to_name(signal.as_raw()) else {
+            self.err_msg(&format!("trap: {name}: invalid signal specification"));
+            return ExitStatus::FAILURE;
+        };
+        match crate::signal::reset_handler(signal) {
+            Ok(()) => {
+                self.traps.remove(canonical);
+                ExitStatus::SUCCESS
+            }
+            Err(err) => {
+                self.err_msg(&format!("trap: {name}: {err}"));
+                ExitStatus::FAILURE
+            }
+        }
     }
 
     fn builtin_kill(&self, args: &[String]) -> ExitStatus {

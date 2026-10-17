@@ -1,26 +1,13 @@
-//! Signal handling for trap execution.
-//!
-//! When a trap is set for a signal (e.g. `trap 'cleanup' INT`), we install a
-//! signal handler that sets a global atomic flag. The shell checks these flags
-//! between commands and runs the corresponding trap action.
-//!
-//! Signal numbers are rustix `Signal` values (no libc constants). Handler
-//! installation registers a raw C-style handler pointer via `sigaction`
-//! (avoiding rustix's `kernel_sigaction` trampoline, which is unsafe under
-//! static-musl linking); reset/ignore use rustix `kernel_sigaction` with the
-//! `SIG_DFL`/`SIG_IGN` kernel handlers (no trampoline involved).
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustix::process::Signal;
 
-static SIGINT_PENDING: AtomicBool = AtomicBool::new(false);
-static SIGTERM_PENDING: AtomicBool = AtomicBool::new(false);
-static SIGHUP_PENDING: AtomicBool = AtomicBool::new(false);
+const PENDING_SIGNAL_COUNT: usize = 64;
 
-/// Map a signal name (e.g. "INT", "SIGINT") to its `Signal`.
+static PENDING_SIGNALS: [AtomicBool; PENDING_SIGNAL_COUNT] =
+    [const { AtomicBool::new(false) }; PENDING_SIGNAL_COUNT];
+
 pub fn name_to_signal(name: &str) -> Option<Signal> {
-    // Strip "SIG" prefix if present
     let name = name.strip_prefix("SIG").unwrap_or(name);
     match name {
         "HUP" => Some(Signal::HUP),
@@ -50,126 +37,106 @@ pub fn name_to_signal(name: &str) -> Option<Signal> {
     }
 }
 
-/// Map a signal number to its name (without SIG prefix).
 pub fn signal_to_name(signum: i32) -> Option<&'static str> {
     let sig = Signal::from_named_raw(signum)?;
-    let name = match sig {
-        Signal::HUP => "HUP",
-        Signal::INT => "INT",
-        Signal::QUIT => "QUIT",
-        Signal::ILL => "ILL",
-        Signal::TRAP => "TRAP",
-        Signal::ABORT => "ABRT",
-        Signal::FPE => "FPE",
-        Signal::KILL => "KILL",
-        Signal::BUS => "BUS",
-        Signal::SEGV => "SEGV",
-        Signal::SYS => "SYS",
-        Signal::PIPE => "PIPE",
-        Signal::ALARM => "ALRM",
-        Signal::TERM => "TERM",
-        Signal::URG => "URG",
-        Signal::STOP => "STOP",
-        Signal::TSTP => "TSTP",
-        Signal::CONT => "CONT",
-        Signal::CHILD => "CHLD",
-        Signal::TTIN => "TTIN",
-        Signal::TTOU => "TTOU",
-        Signal::USR1 => "USR1",
-        Signal::USR2 => "USR2",
-        _ => return None,
-    };
-    Some(name)
-}
-
-/// Install a signal handler that sets the pending flag for the given signal.
-/// Call this when a trap is set for a signal.
-pub fn install_handler(sig: Signal) {
-    // SAFETY: sigaction is async-signal-safe. The handler only sets an atomic
-    // flag. We register a raw C-style handler pointer (SA_RESTART) rather than
-    // rustix's trampoline-based kernel_sigaction, which is unsafe under static
-    // musl linking.
-    unsafe {
-        #[cfg(target_os = "linux")]
-        {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = signal_handler as *const () as usize;
-            sa.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(sig.as_raw(), &sa, std::ptr::null_mut());
-        }
-        #[cfg(target_os = "macos")]
-        {
-            darwin_sigaction(sig.as_raw(), signal_handler as *const () as usize, 0x0002);
-        }
+    match sig {
+        Signal::HUP => Some("HUP"),
+        Signal::INT => Some("INT"),
+        Signal::QUIT => Some("QUIT"),
+        Signal::ILL => Some("ILL"),
+        Signal::TRAP => Some("TRAP"),
+        Signal::ABORT => Some("ABRT"),
+        Signal::FPE => Some("FPE"),
+        Signal::KILL => Some("KILL"),
+        Signal::BUS => Some("BUS"),
+        Signal::SEGV => Some("SEGV"),
+        Signal::SYS => Some("SYS"),
+        Signal::PIPE => Some("PIPE"),
+        Signal::ALARM => Some("ALRM"),
+        Signal::TERM => Some("TERM"),
+        Signal::URG => Some("URG"),
+        Signal::STOP => Some("STOP"),
+        Signal::TSTP => Some("TSTP"),
+        Signal::CONT => Some("CONT"),
+        Signal::CHILD => Some("CHLD"),
+        Signal::TTIN => Some("TTIN"),
+        Signal::TTOU => Some("TTOU"),
+        Signal::USR1 => Some("USR1"),
+        Signal::USR2 => Some("USR2"),
+        _ => None,
     }
 }
 
-/// Reset a signal to its default disposition.
-/// Call this when a trap is removed for a signal.
-pub fn reset_handler(sig: Signal) {
-    // SAFETY: kernel_sigaction with KERNEL_SIG_DFL is always safe.
-    unsafe {
-        #[cfg(target_os = "linux")]
-        {
-            let action = rustix::runtime::KernelSigaction {
-                sa_handler_kernel: rustix::runtime::KERNEL_SIG_DFL,
-                sa_flags: rustix::runtime::KernelSigactionFlags::empty(),
-                sa_restorer: None,
-                sa_mask: rustix::runtime::KernelSigSet::empty(),
-            };
-            let _ = rustix::runtime::kernel_sigaction(sig, Some(action));
-        }
-        #[cfg(target_os = "macos")]
-        {
-            darwin_sigaction(sig.as_raw(), 0, 0);
-        }
-    }
+// rustix 1.1.5 hides its runtime signal API, so disposition changes use the platform libc ABI.
+pub fn install_handler(sig: Signal) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux_sigaction(
+        sig,
+        signal_handler as *const () as usize,
+        libc::SA_RESTART,
+    );
+    #[cfg(target_os = "macos")]
+    return darwin_sigaction(sig, signal_handler as *const () as usize, 0x0002);
 }
 
-/// Set a signal to be ignored (for `trap '' SIG`).
-pub fn ignore_signal(sig: Signal) {
-    // SAFETY: kernel_sigaction with kernel_sig_ign() is always safe.
-    unsafe {
-        #[cfg(target_os = "linux")]
-        {
-            let action = rustix::runtime::KernelSigaction {
-                sa_handler_kernel: rustix::runtime::kernel_sig_ign(),
-                sa_flags: rustix::runtime::KernelSigactionFlags::empty(),
-                sa_restorer: None,
-                sa_mask: rustix::runtime::KernelSigSet::empty(),
-            };
-            let _ = rustix::runtime::kernel_sigaction(sig, Some(action));
-        }
-        #[cfg(target_os = "macos")]
-        {
-            darwin_sigaction(sig.as_raw(), 1, 0);
-        }
-    }
+pub fn reset_handler(sig: Signal) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux_sigaction(sig, libc::SIG_DFL, 0);
+    #[cfg(target_os = "macos")]
+    return darwin_sigaction(sig, 0, 0);
 }
 
-/// Check and clear all pending signal flags. Returns signal names that were pending.
+pub fn ignore_signal(sig: Signal) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux_sigaction(sig, libc::SIG_IGN, 0);
+    #[cfg(target_os = "macos")]
+    return darwin_sigaction(sig, 1, 0);
+}
+
 pub fn take_pending() -> Vec<&'static str> {
-    let mut pending = Vec::new();
-    if SIGINT_PENDING.swap(false, Ordering::Relaxed) {
-        pending.push("INT");
-    }
-    if SIGTERM_PENDING.swap(false, Ordering::Relaxed) {
-        pending.push("TERM");
-    }
-    if SIGHUP_PENDING.swap(false, Ordering::Relaxed) {
-        pending.push("HUP");
-    }
-    pending
+    PENDING_SIGNALS
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(signum, pending)| {
+            if pending.swap(false, Ordering::Relaxed) {
+                signal_to_name(signum as i32)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 extern "C" fn signal_handler(signum: i32) {
-    match signum {
-        x if x == Signal::INT.as_raw() => SIGINT_PENDING.store(true, Ordering::Relaxed),
-        x if x == Signal::TERM.as_raw() => SIGTERM_PENDING.store(true, Ordering::Relaxed),
-        x if x == Signal::HUP.as_raw() => SIGHUP_PENDING.store(true, Ordering::Relaxed),
-        _ => {}
+    if let Ok(signum) = usize::try_from(signum)
+        && let Some(pending) = PENDING_SIGNALS.get(signum)
+    {
+        pending.store(true, Ordering::Relaxed);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_sigaction(
+    signal: Signal,
+    handler: usize,
+    flags: core::ffi::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: zero initializes the libc action fields before the mask is initialized below.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler;
+    action.sa_flags = flags;
+    // SAFETY: the mask is a valid mutable libc sigset_t.
+    let empty_set = unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    if empty_set != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the signal and handler use libc's Linux ABI, and sigaction copies the initialized action.
+    let result = unsafe { libc::sigaction(signal.as_raw(), &action, std::ptr::null_mut()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -181,7 +148,11 @@ struct DarwinSigaction {
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn darwin_sigaction(signal: i32, handler: usize, flags: core::ffi::c_int) {
+fn darwin_sigaction(
+    signal: Signal,
+    handler: usize,
+    flags: core::ffi::c_int,
+) -> std::io::Result<()> {
     unsafe extern "C" {
         fn sigaction(
             signal: core::ffi::c_int,
@@ -194,5 +165,10 @@ unsafe fn darwin_sigaction(signal: i32, handler: usize, flags: core::ffi::c_int)
         sa_mask: 0,
         sa_flags: flags,
     };
-    let _ = unsafe { sigaction(signal, &action, std::ptr::null_mut()) };
+    // SAFETY: the action has the Darwin ABI layout and the API copies it before returning.
+    let result = unsafe { sigaction(signal.as_raw(), &action, std::ptr::null_mut()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
