@@ -17,6 +17,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -697,10 +698,17 @@ fn actual_cwd(request: &Request) -> BridgeResult<Value> {
         }
         let mut shells = shell_cwds
             .iter()
-            .map(|cwd| Shell::builder().cwd(cwd.clone()).env_clear().build())
+            .map(|cwd| {
+                Shell::builder()
+                    .cwd(cwd.clone())
+                    .env_clear()
+                    .stderr_sink(Arc::new(Mutex::new(std::io::sink())))
+                    .build()
+            })
             .collect::<Vec<_>>();
         let source = format!("cd {}", shell_quote(&selected_path));
-        let status = evaluate_source(&mut shells[selected_slot], &source).map_err(BridgeError::new)?;
+        let status = evaluate_source(&mut shells[selected_slot], &source)
+            .map_err(|error| BridgeError::new(error.to_string()))?;
         if (status.code() == 0) != success {
             return Err(BridgeError::new("epsh cd outcome disagrees with the generated cwd case"));
         }
