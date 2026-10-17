@@ -490,6 +490,8 @@ must remain explicit. Do not claim an external handler intercepts epsh builtins.
 
 - 2026-10-17: split E1 into disjoint arithmetic and evaluator/policy owners; preserve import ancestry with local merge commits rather than rebasing upstream history.
 - 2026-10-17: reuse locked regex-lite 0.1.9 for the 12 conformance patterns; MIT/Apache, no new transitive packages or production link dependency.
+- 2026-10-17: add the owned, read-only `Variables::bindings_bytes` semantic snapshot rather than infer writes from arithmetic syntax. This preserves existing signatures and keeps private storage, flags, and caches private while exposing dynamically created values to correspondence checks.
+- 2026-10-17: compare clean compiler builds with per-command `KACHE_DISABLED=1`, retaining the configured wrapper and Mold. Warm-cache restoration is a separate diagnostic, not evidence of compiler speed. The original baseline checkout has a verification-only empty workspace declaration because its nested location otherwise discovers the new parent workspace.
 
 - 2026-10-17: overlap G1 import and F0 foundation with G0 baselines against fixed source revisions; neither changes baseline source.
 
@@ -503,6 +505,8 @@ Append one line per material executor judgment, with the call and its reason.
 - 2026-10-17 P1 integration: native epsh library/API/embedding/integration/byte/expansion/descriptor targets and all 175 corpus classifications pass. ish library/history-import/integration pass; six PTY synchronization failures remain under investigation. Fixed baseline identity-lookup races, closed-descriptor handling, arithmetic boundaries, expanded-target policy, quote expansion, and byte-codec collisions.
 - 2026-10-17 P2 integration: all six model families and transitive axiom/coverage audit pass; integrated `make verify` compares 1,000 generated requests per family and detects all negative controls. Adversarial review found unsupported-outcome accounting and expansion adapter byte gaps; these remain open, so the comparison gate is not yet accepted. Aeneas/Charon are unavailable; no Rust refinement proof is claimed.
 - 2026-10-17 P3 integration: native test and verification commands, documentation, and authorized CI wiring landed. Remote CI, macOS Apple silicon, and Linux ARM64 remain unavailable locally. Final review, Clippy cleanup, deferred-heredoc input ownership, performance, packaging, and release checks remain in progress.
+- 2026-10-17 P1–P3 acceptance: integrated workspace suite passes, including 134 PTYs; strict `make verify` passes 1,000 supported cases per family, all controls, protocol checks, and retained regressions. Axiom/coverage audit validates 49 theorem links; workspace all-target Clippy passes. Fixed all seven adversarial-review findings and the deferred-input lifetime/collision findings. `cargo package -p epsh --locked` and publish dry-run pass; final resource/release and close checks remain.
+- 2026-10-17 P4: benchmark commands now bootstrap published rustybench 0.3.0 under `.work/tools`, preserve overrides, and handle spaced repository paths. No sibling checkout or production dependency is required. Clean-build pairs and all existing runtime/allocation workloads are being measured on Linux musl; no optional optimization has been retained.
 
 Append one line per phase end with commands, outcomes, contract changes, and remaining
 hard stops. Baseline IDs and theorem coverage belong in their tested artifacts.
