@@ -619,13 +619,7 @@ fn actual_bytes(input: &Value) -> BridgeResult<Value> {
 }
 
 fn actual_environment(request: &Request) -> BridgeResult<Value> {
-    let mut variables = Variables::new();
-    for (name, value) in decode_bindings(&request.state["exported"], "exported")? {
-        variables
-            .set_bytes(&name, ShellBytes::from_vec(value))
-            .map_err(BridgeError::new)?;
-        variables.export(&name);
-    }
+    let variables = environment_variables(request)?;
     let assignments = decode_bindings(&request.input["assignments"], "assignments")?
         .into_iter()
         .map(|(name, value)| (name, ShellBytes::from_vec(value)))
@@ -645,6 +639,22 @@ fn actual_environment(request: &Request) -> BridgeResult<Value> {
         "tag": "success",
         "value": {"environment": environment},
     }))
+}
+
+fn environment_variables(request: &Request) -> BridgeResult<Variables> {
+    let mut variables = Variables::new();
+    for (name, value) in decode_bindings(&request.state["variables"], "variables")? {
+        variables
+            .set_bytes(&name, ShellBytes::from_vec(value))
+            .map_err(BridgeError::new)?;
+    }
+    for (name, value) in decode_bindings(&request.state["exported"], "exported")? {
+        variables
+            .set_bytes(&name, ShellBytes::from_vec(value))
+            .map_err(BridgeError::new)?;
+        variables.export(&name);
+    }
+    Ok(variables)
 }
 
 fn environment_domain_error(request: &Request) -> BridgeResult<Option<&'static str>> {
@@ -1126,6 +1136,18 @@ pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_request_initializes_unexported_values_without_exporting_them() {
+        let mut request = generate(3, 0).expect("environment case");
+        request.state["variables"] = json!([["BRIDGE_PRIVATE", [255, 128, 112]]]);
+        let variables = environment_variables(&request).expect("initialized environment variables");
+        assert_eq!(
+            variables.get_bytes("BRIDGE_PRIVATE").map(ShellBytes::as_bytes),
+            Some([255, 128, 112].as_slice()),
+        );
+        assert!(variables.env_for_command_os(&[]).iter().all(|(name, _)| name != "BRIDGE_PRIVATE"));
+    }
 
     #[test]
     fn generated_effects_cases_stay_in_the_semantic_domain() {
