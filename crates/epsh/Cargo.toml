@@ -18,22 +18,6 @@ path = "src/lib.rs"
 name = "epsh"
 path = "src/main.rs"
 
-[[bin]]
-name = "show_argv"
-path = "tests/fixtures/show_argv.rs"
-
-[[bin]]
-name = "show_env"
-path = "tests/fixtures/show_env.rs"
-
-[[bin]]
-name = "emit_hex"
-path = "tests/fixtures/emit_hex.rs"
-
-[[bin]]
-name = "stat_path"
-path = "tests/fixtures/stat_path.rs"
-
 [dependencies]
 libc = "0.2"
 fxhash = "0.2"

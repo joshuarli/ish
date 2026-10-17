@@ -13,9 +13,11 @@ Install Rust and Cargo, then add epsh to a Rust project:
 
 To install the command-line runner:
 
-    cargo install epsh --bin epsh
+    cargo install epsh
 
-The crate has no dependency on ish and remains independently packageable.
+The crate has no dependency on ish and remains independently packageable. The
+default installation includes only the `epsh` runner; test fixtures are reserved
+for the crate's tests.
 Workspace contributor commands are in [Testing](docs/testing.md).
 
 ## Use as a library

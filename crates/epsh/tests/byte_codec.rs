@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 #[path = "common/raw_filename.rs"]
 mod raw_filename_support;
 
+#[path = "common/fixture.rs"]
+mod fixture_support;
+
 #[test]
 fn codec_preserves_every_private_use_scalar_and_invalid_byte() {
     for scalar in 0xe000..=0xf8ff {
@@ -125,6 +128,8 @@ fn quoted_private_use_heredocs_and_nested_scripts_preserve_bytes() {
 #[test]
 fn private_use_and_invalid_path_names_remain_distinct_during_globbing() {
     let directory = tempfile::tempdir().unwrap();
+    let show_argv = fixture_support::compile(directory.path(), "show_argv");
+    let show_argv = bytes_to_str(show_argv.as_os_str().as_bytes()).replace('\'', "'\\''");
     let private_use_names = [vec![0xee, 0x80, 0x80], vec![0xee, 0x82, 0x80]];
     for name in &private_use_names {
         std::fs::write(directory.path().join(OsString::from_vec(name.clone())), b"").unwrap();
@@ -137,7 +142,7 @@ fn private_use_and_invalid_path_names_remain_distinct_during_globbing() {
     let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
         .current_dir(directory.path())
         .arg("-c")
-        .arg(format!("'{}' ?", env!("CARGO_BIN_EXE_show_argv")))
+        .arg(format!("'{show_argv}' ?"))
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output.stderr);
@@ -312,9 +317,12 @@ fn cli_source_arguments_and_environment_preserve_private_use_and_invalid_bytes()
         .unwrap();
     assert!(output.status.success(), "{:?}", output.stderr);
     assert_eq!(output.stdout, value.repeat(3));
+    let directory = tempfile::tempdir().unwrap();
+    let show_env = fixture_support::compile(directory.path(), "show_env");
+    let show_env = bytes_to_str(show_env.as_os_str().as_bytes()).replace('\'', "'\\''");
     let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
         .arg("-c")
-        .arg(format!("'{}' '{name}'", env!("CARGO_BIN_EXE_show_env")))
+        .arg(format!("'{show_env}' '{name}'"))
         .env(name, OsString::from_vec(value.to_vec()))
         .output()
         .unwrap();

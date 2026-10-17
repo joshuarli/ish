@@ -11,6 +11,10 @@ Run its library and integration tests:
     mkdir -p .work/tmp
     TMPDIR="$PWD/.work/tmp" cargo test -p epsh --lib --tests
 
+Tests that use fixture executables compile them with `rustc` into the test's
+temporary directory. Set `RUSTC_WRAPPER` to wrap these compilations. The same
+test command works from an unpacked Cargo package archive.
+
 Run the native conformance corpus and print each case result:
 
     TMPDIR="$PWD/.work/tmp" cargo test -p epsh --test conformance -- --nocapture

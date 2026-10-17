@@ -1,6 +1,9 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "common/fixture.rs"]
+mod fixture_support;
+
 fn epsh() -> Command {
     let bin = env!("CARGO_BIN_EXE_epsh");
     Command::new(bin)
@@ -1717,20 +1720,6 @@ mod raw_bytes {
         cmd.output().expect("failed to execute epsh")
     }
 
-    fn helper_paths() -> (
-        std::path::PathBuf,
-        std::path::PathBuf,
-        std::path::PathBuf,
-        std::path::PathBuf,
-    ) {
-        (
-            std::path::PathBuf::from(env!("CARGO_BIN_EXE_show_argv")),
-            std::path::PathBuf::from(env!("CARGO_BIN_EXE_show_env")),
-            std::path::PathBuf::from(env!("CARGO_BIN_EXE_emit_hex")),
-            std::path::PathBuf::from(env!("CARGO_BIN_EXE_stat_path")),
-        )
-    }
-
     fn raw_paths_supported(dir: &Path) -> bool {
         let probe = raw_path(dir, b"probe-\x80");
         match fs::write(&probe, "x") {
@@ -1745,7 +1734,7 @@ mod raw_bytes {
     #[test]
     fn argv_bytes_round_trip_to_child() {
         let tmp = tempdir().unwrap();
-        let (show_argv, _, _, _) = helper_paths();
+        let show_argv = crate::fixture_support::compile(tmp.path(), "show_argv");
         let raw = vec![b'a', 0x80, 0xff, b'b'];
         let arg = encoding::bytes_to_str(&raw);
         let script = format!(
@@ -1761,7 +1750,7 @@ mod raw_bytes {
     #[test]
     fn exported_env_bytes_round_trip_to_child() {
         let tmp = tempdir().unwrap();
-        let (_, show_env, _, _) = helper_paths();
+        let show_env = crate::fixture_support::compile(tmp.path(), "show_env");
         let raw = vec![b'x', 0x80, 0xff, b'y'];
         let value = encoding::bytes_to_str(&raw);
         let script = format!(
@@ -1777,7 +1766,7 @@ mod raw_bytes {
     #[test]
     fn prefix_assignment_env_bytes_round_trip_to_child() {
         let tmp = tempdir().unwrap();
-        let (_, show_env, _, _) = helper_paths();
+        let show_env = crate::fixture_support::compile(tmp.path(), "show_env");
         let raw = vec![b'p', 0x80, 0xff, b'q'];
         let value = encoding::bytes_to_str(&raw);
         let script = format!(
@@ -1793,7 +1782,7 @@ mod raw_bytes {
     #[test]
     fn inherited_env_bytes_round_trip_to_child() {
         let tmp = tempdir().unwrap();
-        let (_, show_env, _, _) = helper_paths();
+        let show_env = crate::fixture_support::compile(tmp.path(), "show_env");
         let out = run_script_os(
             tmp.path(),
             &format!("{} X", shell_quote(&shell_path(&show_env))),
@@ -1809,7 +1798,7 @@ mod raw_bytes {
     #[test]
     fn variable_expansion_to_argv_preserves_invalid_utf8_bytes() {
         let tmp = tempdir().unwrap();
-        let (show_argv, _, _, _) = helper_paths();
+        let show_argv = crate::fixture_support::compile(tmp.path(), "show_argv");
         let raw = vec![b'v', 0x80, 0xff, b'w'];
         let value = encoding::bytes_to_str(&raw);
         let script = format!(
@@ -1929,7 +1918,8 @@ mod raw_bytes {
         let dir = raw_path(tmp.path(), b"path-\x80");
         fs::create_dir(&dir).unwrap();
         let tool = dir.join("tool");
-        fs::copy(env!("CARGO_BIN_EXE_show_argv"), &tool).unwrap();
+        let show_argv = crate::fixture_support::compile(tmp.path(), "show_argv");
+        fs::copy(show_argv, &tool).unwrap();
         let out = run_script_os(
             tmp.path(),
             "type tool >/dev/null && command -v tool >/dev/null && tool >/dev/null && echo path-ok",
@@ -1965,7 +1955,8 @@ mod raw_bytes {
     #[test]
     fn command_subst_preserves_invalid_utf8_bytes() {
         let tmp = tempdir().unwrap();
-        let (show_argv, _, emit, _) = helper_paths();
+        let show_argv = crate::fixture_support::compile(tmp.path(), "show_argv");
+        let emit = crate::fixture_support::compile(tmp.path(), "emit_hex");
         let script = format!(
             "{} \"$({} 61ff62)\"",
             shell_quote(&shell_path(&show_argv)),
@@ -1998,7 +1989,7 @@ mod raw_bytes {
         if !raw_paths_supported(tmp.path()) {
             return;
         }
-        let (_, _, _, stat_path) = helper_paths();
+        let stat_path = crate::fixture_support::compile(tmp.path(), "stat_path");
         let target = raw_path(tmp.path(), b"arg-path-\x80");
         fs::write(&target, "x").unwrap();
         let script = format!(

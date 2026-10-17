@@ -1,7 +1,6 @@
 Prefix: ISH
 Next: 22
 
-
 ### ISH-5 · P2 · Stopped pipelines disappear from foreground job control
 
 - **Area:** Concurrency
@@ -11,8 +10,6 @@ Next: 22
 - **Fix with:** lifecycle-concurrency, error-model
 - **Effort:** M (days)
 - **Design:** [Foreground job outcomes](docs/rfc/ISH-5-foreground-job-outcomes.md)
-
-
 
 ### ISH-8 · P2 · Forked external callbacks can deadlock on captured host locks
 
@@ -24,12 +21,6 @@ Next: 22
 - **Effort:** L (weeks)
 - **Design:** [Callback process boundary](docs/rfc/ISH-8-callback-process-boundary.md)
 
-
-
-
-
-
-
 ### ISH-15 · P2 · Safe library APIs conceal environment mutation preconditions
 
 - **Area:** Security
@@ -37,18 +28,4 @@ Next: 22
 - **Problem:** Public safe wrappers call unsafe std environment mutation without enforcing its Unix process-wide concurrency preconditions. Public denv operations also reach those mutations. Safe library callers can invoke them while another thread uses libc environment readers. The pinned standard-library safety contract explicitly names such readers, including DNS resolution. This is a source-proven missing safety boundary; a concrete undefined-behavior manifestation is unproven and was not attempted. Normal ish foreground execution and joined relay threads do not establish an observed incident.
 - **Recommendation:** Expose the required safety contract through every public mutation entry point, or remove process-environment mutation from the library interface in favor of explicit environments. Changing only the three wrappers leaves the denv boundary unresolved.
 - **Fix with:** os-boundaries, api-surface-and-module-boundaries
-- **Effort:** M (days)
-
-
-
-
-
-
-### ISH-21 · P3 · Default epsh installation exposes conformance fixture binaries
-
-- **Area:** Build
-- **Where:** `crates/epsh/Cargo.toml:17`, `crates/epsh/Cargo.toml:35`
-- **Problem:** The package declares emit_hex, show_argv, show_env, and stat_path as normal binaries. An offline debug `cargo install --path crates/epsh` into an isolated root installed all four alongside epsh. A default user installation therefore adds test utilities to the executable namespace.
-- **Recommendation:** Keep fixture executables available to integration tests without including them in the default published installation surface. The README now selects `--bin epsh` as an immediate user-facing mitigation.
-- **Fix with:** api-surface-and-module-boundaries
 - **Effort:** M (days)
