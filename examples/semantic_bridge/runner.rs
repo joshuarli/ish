@@ -1,4 +1,5 @@
 use crate::semantic_bridge::arithmetic;
+use crate::semantic_bridge::evaluation;
 use crate::semantic_bridge::expansion;
 use crate::semantic_bridge::interactive;
 use crate::semantic_bridge::policy;
@@ -322,7 +323,7 @@ fn generate(family: Family, index: usize, seed: u64) -> BridgeResult<Request> {
         Family::Interactive => Ok(interactive::generate(index, seed)),
         Family::Policy => policy::generate(index, seed),
         Family::Expansion => expansion::generate(index, seed),
-        Family::Evaluation => Err(BridgeError::new("evaluation adapter is not integrated")),
+        Family::Evaluation => evaluation::generate(index, seed),
         Family::Effects => Err(BridgeError::new("effects adapter is not integrated")),
     }
 }
@@ -333,7 +334,8 @@ fn validate_case(request: &Request) -> BridgeResult<()> {
         Family::Interactive => interactive::validate_case(request),
         Family::Policy => policy::validate_case(request),
         Family::Expansion => expansion::validate_case(request),
-        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family adapter is not integrated")),
+        Family::Evaluation => evaluation::validate_case(request),
+        Family::Effects => Err(BridgeError::new("effects adapter is not integrated")),
     }
 }
 
@@ -343,7 +345,8 @@ fn actual(request: &Request) -> BridgeResult<Value> {
         Family::Interactive => interactive::actual(request),
         Family::Policy => policy::actual(request),
         Family::Expansion => expansion::actual(request),
-        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family adapter is not integrated")),
+        Family::Evaluation => evaluation::actual(request),
+        Family::Effects => Err(BridgeError::new("selected family adapter is not integrated")),
     }
 }
 
@@ -353,7 +356,8 @@ fn negative_control(family: Family, outcome: &Value) -> BridgeResult<Value> {
         Family::Interactive => interactive::negative_control(outcome),
         Family::Policy => policy::negative_control(outcome),
         Family::Expansion => expansion::negative_control(outcome),
-        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family negative control is not integrated")),
+        Family::Evaluation => evaluation::negative_control(outcome),
+        Family::Effects => Err(BridgeError::new("selected family negative control is not integrated")),
     }
 }
 
@@ -666,7 +670,8 @@ fn shrink(family: Family, request: &Request) -> BridgeResult<Vec<Request>> {
         Family::Interactive => interactive::shrink(request),
         Family::Policy => policy::shrink(request),
         Family::Expansion => expansion::shrink(request),
-        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family shrinker is not integrated")),
+        Family::Evaluation => evaluation::shrink(request),
+        Family::Effects => Err(BridgeError::new("selected family shrinker is not integrated")),
     }
 }
 
