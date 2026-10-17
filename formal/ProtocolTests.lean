@@ -41,7 +41,9 @@ def main : IO Unit := do
     | .error reason => throw (IO.userError reason)
   let outcomes : List (Outcome Json) := [
     .success (.mkObj [("status", toJson (0 : Nat))]),
-    .semanticError (.arithmetic "division by zero"),
+    .semanticError (.arithmetic "division by zero")
+      { variables := [("rhs", [49])], lastStatus := 2 }
+      [.write 1 [114, 104, 115]],
     .unsupportedDomain "control flow", .fuelExhausted]
   let expected ← IO.FS.readFile "fixtures/protocol-outcomes.jsonl"
   let actual := String.intercalate "\n" (outcomes.map fun result =>

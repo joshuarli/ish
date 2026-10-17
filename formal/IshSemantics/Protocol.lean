@@ -174,7 +174,9 @@ def encodeError : SemanticError → Json
 
 def encodeOutcome (encode : α → Json) : Outcome α → Json
   | .success value => .mkObj [("tag", toJson "success"), ("value", encode value)]
-  | .semanticError error => .mkObj [("tag", toJson "semantic_error"), ("error", encodeError error)]
+  | .semanticError error state trace => .mkObj [
+      ("tag", toJson "semantic_error"), ("error", encodeError error),
+      ("state", encodeState state), ("trace", .arr (trace.map encodeTraceEvent).toArray)]
   | .unsupportedDomain reason => .mkObj [("tag", toJson "unsupported_domain"), ("reason", toJson reason)]
   | .fuelExhausted => .mkObj [("tag", toJson "fuel_exhausted")]
 

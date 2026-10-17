@@ -41,7 +41,7 @@ The outcome is one of these objects:
 | Tag | Other required fields |
 | --- | --- |
 | `success` | `value`: family result |
-| `semantic_error` | `error`: semantic error object |
+| `semantic_error` | `error`: semantic error object, `state`: shell state, `trace`: ordered trace events |
 | `unsupported_domain` | `reason`: string |
 | `fuel_exhausted` | None |
 
@@ -49,6 +49,8 @@ Semantic error objects use `kind` as the discriminator.
 The `syntax`, `arithmetic`, `expansion`, and `environment` kinds contain a `message` string.
 The `policy` kind contains a byte-array `target`.
 The `redirection` and `restoration` kinds contain a nonnegative `fd` and a `message` string.
+Semantic errors carry the state and trace at failure, including effects completed before the failed operation.
+No error state or trace field is optional. Invalid wire input remains a boundary error.
 Error text is diagnostic. Differential comparisons use the kind and any structured payload required by the family.
 Fuel exhaustion never denotes success or a termination proof.
 
