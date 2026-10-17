@@ -150,11 +150,11 @@ fn protect_globs(value: String, enabled: bool) -> String {
         return value;
     }
     let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if matches!(ch, '*' | '?' | '[' | ']' | '\\') {
+    for unit in crate::encoding::shell_chars(&value) {
+        if unit != "/" {
             escaped.push(crate::lexer::CTLESC);
         }
-        escaped.push(ch);
+        escaped.push_str(unit);
     }
     escaped
 }
