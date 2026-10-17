@@ -14,6 +14,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -586,6 +587,7 @@ fn save_active(pid: &str, state: &ActiveState) -> Result<(), String> {
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&temp_path)
         {
             Ok(file) => {
@@ -1329,6 +1331,7 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Mutex, MutexGuard};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1770,6 +1773,15 @@ mod tests {
         let first = refresh(false, &epsh).unwrap();
         apply_changes_to_shell(&mut epsh, &first);
         let pid = std::process::id().to_string();
+        let active_path = data.join(format!("active_{pid}"));
+        assert_eq!(
+            std::fs::metadata(active_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let original_active = load_active(&pid).unwrap();
         assert!(original_active.prev.iter().any(|previous| matches!(
             previous,
