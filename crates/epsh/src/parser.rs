@@ -89,7 +89,7 @@ impl Parser {
                     for heredoc in &pending {
                         let raw = self.lexer.read_heredoc_body(heredoc)?;
                         self.heredoc_bodies
-                            .push(make_heredoc_body(raw, heredoc.quoted));
+                            .push(make_heredoc_body(raw, heredoc.quoted)?);
                     }
                 }
             } else {
@@ -218,7 +218,7 @@ impl Parser {
             let mut bodies = Vec::new();
             for heredoc in &pending {
                 let raw = self.lexer.read_heredoc_body(heredoc)?;
-                bodies.push(make_heredoc_body(raw, heredoc.quoted));
+                bodies.push(make_heredoc_body(raw, heredoc.quoted)?);
             }
             Self::patch_heredocs(cmd, &bodies);
         }
@@ -254,7 +254,7 @@ impl Parser {
                         for heredoc in &pending {
                             let raw = self.lexer.read_heredoc_body(heredoc)?;
                             self.heredoc_bodies
-                                .push(make_heredoc_body(raw, heredoc.quoted));
+                                .push(make_heredoc_body(raw, heredoc.quoted)?);
                         }
                     }
                     self.skip_newlines()?;
@@ -1033,34 +1033,58 @@ impl Parser {
     }
 }
 
-/// Parse a raw word string into WordPart nodes.
-/// Kept for heredoc body expansion (called from redirect.rs).
+/// Parse a raw shell word while preserving the legacy empty-command recovery.
+/// Use [`try_parse_word_parts`] to receive nested syntax errors.
 pub fn parse_word_parts(raw: &str) -> Vec<WordPart> {
-    parse_word_parts_bytes(raw.as_bytes())
+    parse_word_parts_legacy(&crate::encoding::bytes_to_str(raw.as_bytes()))
 }
 
-pub(crate) fn parse_word_parts_shell(raw: &str) -> Vec<WordPart> {
-    parse_word_parts_impl(raw, false)
+pub(crate) fn parse_word_parts_shell(raw: &str) -> Result<Vec<WordPart>, ShellError> {
+    parse_word_parts_impl(raw, false, NestedCommandErrors::Propagate)
 }
 
-/// Parse a raw byte string into WordPart nodes.
+/// Parse a raw shell word and return nested syntax errors.
+pub fn try_parse_word_parts(raw: &str) -> Result<Vec<WordPart>, ShellError> {
+    parse_word_parts_shell(&crate::encoding::bytes_to_str(raw.as_bytes()))
+}
+
+/// Parse a raw byte string into word parts while preserving the legacy empty-command recovery.
+/// Use [`try_parse_word_parts_bytes`] to receive nested syntax errors.
 pub fn parse_word_parts_bytes(raw: &[u8]) -> Vec<WordPart> {
+    parse_word_parts_legacy(&crate::encoding::bytes_to_str(raw))
+}
+
+/// Parse raw shell bytes into word parts and return nested syntax errors.
+pub fn try_parse_word_parts_bytes(raw: &[u8]) -> Result<Vec<WordPart>, ShellError> {
     parse_word_parts_shell(&crate::encoding::bytes_to_str(raw))
 }
 
-/// Build a HereDocBody from a raw heredoc body string.
-fn make_heredoc_body(raw: String, quoted: bool) -> HereDocBody {
+fn parse_word_parts_legacy(raw: &str) -> Vec<WordPart> {
+    parse_word_parts_impl(raw, false, NestedCommandErrors::LegacyEmptyCommand)
+        .expect("legacy parser converts nested command errors to empty commands")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NestedCommandErrors {
+    Propagate,
+    LegacyEmptyCommand,
+}
+
+fn make_heredoc_body(raw: String, quoted: bool) -> Result<HereDocBody, ShellError> {
     if quoted {
-        HereDocBody::Literal(ShellBytes::from_str_lossless(&raw))
+        Ok(HereDocBody::Literal(ShellBytes::from_str_lossless(&raw)))
     } else {
-        HereDocBody::Parsed(parse_word_parts_heredoc(&raw))
+        Ok(HereDocBody::Parsed(parse_word_parts_heredoc(
+            &raw,
+            NestedCommandErrors::Propagate,
+        )?))
     }
 }
 
-/// Parse word parts in heredoc context: single quotes and double quotes are
-/// literal, and only \$, \`, \\, \<newline> are special backslash escapes
-/// (NOT \" — unlike regular double quotes).
-fn parse_word_parts_heredoc(raw: &str) -> Vec<WordPart> {
+fn parse_word_parts_heredoc(
+    raw: &str,
+    nested_errors: NestedCommandErrors,
+) -> Result<Vec<WordPart>, ShellError> {
     let mut parts = Vec::new();
     let chars: Vec<char> = raw.chars().collect();
     let mut i = 0;
@@ -1069,7 +1093,7 @@ fn parse_word_parts_heredoc(raw: &str) -> Vec<WordPart> {
         match chars[i] {
             '$' => {
                 i += 1;
-                if let Some(part) = parse_dollar(&chars, &mut i, true) {
+                if let Some(part) = parse_dollar(&chars, &mut i, true, nested_errors)? {
                     parts.push(part);
                 } else {
                     parts.push(WordPart::Literal("$".into()));
@@ -1088,7 +1112,7 @@ fn parse_word_parts_heredoc(raw: &str) -> Vec<WordPart> {
                 if i < chars.len() {
                     i += 1; // skip closing `
                 }
-                let cmd = parse_cmdsubst_content(&content);
+                let cmd = parse_nested_command_substitution(&content, nested_errors)?;
                 parts.push(WordPart::Backtick(Box::new(cmd)));
             }
             '\\' => {
@@ -1123,10 +1147,14 @@ fn parse_word_parts_heredoc(raw: &str) -> Vec<WordPart> {
         }
     }
 
-    coalesce_literals(parts)
+    Ok(coalesce_literals(parts))
 }
 
-fn parse_word_parts_impl(raw: &str, in_dquote: bool) -> Vec<WordPart> {
+fn parse_word_parts_impl(
+    raw: &str,
+    in_dquote: bool,
+    nested_errors: NestedCommandErrors,
+) -> Result<Vec<WordPart>, ShellError> {
     let mut parts = Vec::new();
     let chars: Vec<char> = raw.chars().collect();
     let mut i = 0;
@@ -1149,7 +1177,7 @@ fn parse_word_parts_impl(raw: &str, in_dquote: bool) -> Vec<WordPart> {
             '"' => {
                 // Double-quoted string — parse inner parts
                 i += 1; // skip opening "
-                let inner = parse_double_quoted_parts(&chars, &mut i);
+                let inner = parse_double_quoted_parts(&chars, &mut i, nested_errors)?;
                 parts.push(WordPart::DoubleQuoted(inner));
                 if i < chars.len() && chars[i] == '"' {
                     i += 1; // skip closing "
@@ -1157,7 +1185,7 @@ fn parse_word_parts_impl(raw: &str, in_dquote: bool) -> Vec<WordPart> {
             }
             '$' => {
                 i += 1;
-                if let Some(part) = parse_dollar(&chars, &mut i, in_dquote) {
+                if let Some(part) = parse_dollar(&chars, &mut i, in_dquote, nested_errors)? {
                     parts.push(part);
                 } else {
                     // Bare $
@@ -1177,7 +1205,7 @@ fn parse_word_parts_impl(raw: &str, in_dquote: bool) -> Vec<WordPart> {
                 if i < chars.len() {
                     i += 1; // skip closing `
                 }
-                let cmd = parse_cmdsubst_content(&content);
+                let cmd = parse_nested_command_substitution(&content, nested_errors)?;
                 parts.push(WordPart::Backtick(Box::new(cmd)));
             }
             '\\' => {
@@ -1231,10 +1259,14 @@ fn parse_word_parts_impl(raw: &str, in_dquote: bool) -> Vec<WordPart> {
         }
     }
 
-    coalesce_literals(parts)
+    Ok(coalesce_literals(parts))
 }
 
-fn parse_double_quoted_parts(chars: &[char], i: &mut usize) -> Vec<WordPart> {
+fn parse_double_quoted_parts(
+    chars: &[char],
+    i: &mut usize,
+    nested_errors: NestedCommandErrors,
+) -> Result<Vec<WordPart>, ShellError> {
     let mut parts = Vec::new();
     let mut literal = String::new();
 
@@ -1245,7 +1277,7 @@ fn parse_double_quoted_parts(chars: &[char], i: &mut usize) -> Vec<WordPart> {
                     parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&std::mem::take(&mut literal))));
                 }
                 *i += 1;
-                if let Some(part) = parse_dollar(chars, i, true) {
+                if let Some(part) = parse_dollar(chars, i, true, nested_errors)? {
                     parts.push(part);
                 } else {
                     literal.push('$');
@@ -1267,7 +1299,7 @@ fn parse_double_quoted_parts(chars: &[char], i: &mut usize) -> Vec<WordPart> {
                 if *i < chars.len() {
                     *i += 1;
                 }
-                let cmd = parse_cmdsubst_content(&content);
+                let cmd = parse_nested_command_substitution(&content, nested_errors)?;
                 parts.push(WordPart::Backtick(Box::new(cmd)));
             }
             '\\' => {
@@ -1297,18 +1329,23 @@ fn parse_double_quoted_parts(chars: &[char], i: &mut usize) -> Vec<WordPart> {
         parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&literal)));
     }
 
-    parts
+    Ok(parts)
 }
 
-fn parse_dollar(chars: &[char], i: &mut usize, in_dquote: bool) -> Option<WordPart> {
+fn parse_dollar(
+    chars: &[char],
+    i: &mut usize,
+    in_dquote: bool,
+    nested_errors: NestedCommandErrors,
+) -> Result<Option<WordPart>, ShellError> {
     if *i >= chars.len() {
-        return None;
+        return Ok(None);
     }
 
-    match chars[*i] {
+    Ok(Some(match chars[*i] {
         '{' => {
             *i += 1;
-            Some(parse_brace_param(chars, i, in_dquote))
+            parse_brace_param(chars, i, in_dquote, nested_errors)?
         }
         '(' => {
             *i += 1;
@@ -1339,8 +1376,8 @@ fn parse_dollar(chars: &[char], i: &mut usize, in_dquote: bool) -> Option<WordPa
                     }
                 }
                 let text: String = content.into_iter().collect();
-                let inner_parts = parse_word_parts_shell(&text);
-                Some(WordPart::Arith(inner_parts))
+                let inner_parts = parse_word_parts_impl(&text, false, nested_errors)?;
+                WordPart::Arith(inner_parts)
             } else {
                 // $( — command substitution
                 let mut content = String::new();
@@ -1379,27 +1416,27 @@ fn parse_dollar(chars: &[char], i: &mut usize, in_dquote: bool) -> Option<WordPa
                         }
                     }
                 }
-                let cmd = parse_cmdsubst_content(&content);
-                Some(WordPart::CmdSubst(Box::new(cmd)))
+                let cmd = parse_nested_command_substitution(&content, nested_errors)?;
+                WordPart::CmdSubst(Box::new(cmd))
             }
         }
         // Special parameters
         c @ ('@' | '*' | '#' | '?' | '-' | '$' | '!') => {
             *i += 1;
-            Some(WordPart::Param(ParamExpr {
+            WordPart::Param(ParamExpr {
                 name: c.to_string(),
                 op: ParamOp::Normal,
                 span: Span::default(),
-            }))
+            })
         }
         // Positional parameters $0-$9
         c @ '0'..='9' => {
             *i += 1;
-            Some(WordPart::Param(ParamExpr {
+            WordPart::Param(ParamExpr {
                 name: c.to_string(),
                 op: ParamOp::Normal,
                 span: Span::default(),
-            }))
+            })
         }
         // Variable name
         c if c == '_' || c.is_ascii_alphabetic() => {
@@ -1408,19 +1445,24 @@ fn parse_dollar(chars: &[char], i: &mut usize, in_dquote: bool) -> Option<WordPa
                 *i += 1;
             }
             let name: String = chars[start..*i].iter().collect();
-            Some(WordPart::Param(ParamExpr {
+            WordPart::Param(ParamExpr {
                 name,
                 op: ParamOp::Normal,
                 span: Span::default(),
-            }))
+            })
         }
-        _ => None,
-    }
+        _ => return Ok(None),
+    }))
 }
 
-fn parse_brace_param(chars: &[char], i: &mut usize, in_dquote: bool) -> WordPart {
+fn parse_brace_param(
+    chars: &[char],
+    i: &mut usize,
+    in_dquote: bool,
+    nested_errors: NestedCommandErrors,
+) -> Result<WordPart, ShellError> {
     if *i >= chars.len() {
-        return WordPart::Literal("${".into());
+        return Ok(WordPart::Literal("${".into()));
     }
 
     // ${#var} — length
@@ -1455,11 +1497,11 @@ fn parse_brace_param(chars: &[char], i: &mut usize, in_dquote: bool) -> WordPart
         if *i < chars.len() {
             *i += 1;
         }
-        return WordPart::Param(ParamExpr {
+        return Ok(WordPart::Param(ParamExpr {
             name,
             op: ParamOp::Length,
             span: Span::default(),
-        });
+        }));
     }
 
     // Check for operator
@@ -1467,11 +1509,11 @@ fn parse_brace_param(chars: &[char], i: &mut usize, in_dquote: bool) -> WordPart
         if *i < chars.len() {
             *i += 1;
         }
-        return WordPart::Param(ParamExpr {
+        return Ok(WordPart::Param(ParamExpr {
             name,
             op: ParamOp::Normal,
             span: Span::default(),
-        });
+        }));
     }
 
     let op_char = chars[*i];
@@ -1485,11 +1527,11 @@ fn parse_brace_param(chars: &[char], i: &mut usize, in_dquote: bool) -> WordPart
         if *i < chars.len() {
             *i += 1;
         }
-        return WordPart::Param(ParamExpr {
+        return Ok(WordPart::Param(ParamExpr {
             name: format!("{}{}", name, op_char),
             op: ParamOp::BadSubst,
             span: Span::default(),
-        });
+        }));
     }
 
     *i += 1;
@@ -1498,7 +1540,7 @@ fn parse_brace_param(chars: &[char], i: &mut usize, in_dquote: bool) -> WordPart
         ':' if *i < chars.len() => {
             let op2 = chars[*i];
             *i += 1;
-            let word = read_brace_word(chars, i, in_dquote);
+            let word = read_brace_word(chars, i, in_dquote, nested_errors)?;
             match op2 {
                 '-' => ParamOp::Default { colon: true, word },
                 '=' => ParamOp::Assign { colon: true, word },
@@ -1508,19 +1550,19 @@ fn parse_brace_param(chars: &[char], i: &mut usize, in_dquote: bool) -> WordPart
             }
         }
         '-' => {
-            let word = read_brace_word(chars, i, in_dquote);
+            let word = read_brace_word(chars, i, in_dquote, nested_errors)?;
             ParamOp::Default { colon: false, word }
         }
         '=' => {
-            let word = read_brace_word(chars, i, in_dquote);
+            let word = read_brace_word(chars, i, in_dquote, nested_errors)?;
             ParamOp::Assign { colon: false, word }
         }
         '?' => {
-            let word = read_brace_word(chars, i, in_dquote);
+            let word = read_brace_word(chars, i, in_dquote, nested_errors)?;
             ParamOp::Error { colon: false, word }
         }
         '+' => {
-            let word = read_brace_word(chars, i, in_dquote);
+            let word = read_brace_word(chars, i, in_dquote, nested_errors)?;
             ParamOp::Alternative { colon: false, word }
         }
         // Trim ops: ALWAYS use BASESYNTAX (single quotes are quoting)
@@ -1528,20 +1570,20 @@ fn parse_brace_param(chars: &[char], i: &mut usize, in_dquote: bool) -> WordPart
         '%' => {
             if *i < chars.len() && chars[*i] == '%' {
                 *i += 1;
-                let word = read_brace_word(chars, i, false);
+                let word = read_brace_word(chars, i, false, nested_errors)?;
                 ParamOp::TrimSuffixLarge(word)
             } else {
-                let word = read_brace_word(chars, i, false);
+                let word = read_brace_word(chars, i, false, nested_errors)?;
                 ParamOp::TrimSuffixSmall(word)
             }
         }
         '#' => {
             if *i < chars.len() && chars[*i] == '#' {
                 *i += 1;
-                let word = read_brace_word(chars, i, false);
+                let word = read_brace_word(chars, i, false, nested_errors)?;
                 ParamOp::TrimPrefixLarge(word)
             } else {
-                let word = read_brace_word(chars, i, false);
+                let word = read_brace_word(chars, i, false, nested_errors)?;
                 ParamOp::TrimPrefixSmall(word)
             }
         }
@@ -1557,15 +1599,20 @@ fn parse_brace_param(chars: &[char], i: &mut usize, in_dquote: bool) -> WordPart
         }
     };
 
-    WordPart::Param(ParamExpr {
+    Ok(WordPart::Param(ParamExpr {
         name,
         op,
         span: Span::default(),
-    })
+    }))
 }
 
 /// Read the word part of a ${var<op>word} expression up to the closing }.
-fn read_brace_word(chars: &[char], i: &mut usize, in_dquote: bool) -> Vec<WordPart> {
+fn read_brace_word(
+    chars: &[char],
+    i: &mut usize,
+    in_dquote: bool,
+    nested_errors: NestedCommandErrors,
+) -> Result<Vec<WordPart>, ShellError> {
     let mut raw = String::new();
     let mut depth = 1u32;
 
@@ -1614,7 +1661,7 @@ fn read_brace_word(chars: &[char], i: &mut usize, in_dquote: bool) -> Vec<WordPa
         }
     }
 
-    parse_word_parts_impl(&raw, in_dquote)
+    parse_word_parts_impl(&raw, in_dquote, nested_errors)
 }
 
 /// Coalesce adjacent Literal parts.
@@ -1634,65 +1681,41 @@ pub(crate) fn coalesce_literals(parts: Vec<WordPart>) -> Vec<WordPart> {
     result
 }
 
-/// Parse command substitution content by recursively invoking the parser.
-pub(crate) fn parse_cmdsubst_content(content: &str) -> Command {
-    match Parser::from_shell_string(content).parse() {
-        Ok(program) => {
-            if program.commands.is_empty() {
-                Command::Simple {
-                    assigns: Vec::new(),
-                    args: Vec::new(),
-                    redirs: Vec::new(),
-                    span: Span::default(),
-                }
-            } else if program.commands.len() == 1 {
-                program.commands.into_iter().next().unwrap()
-            } else {
-                let mut iter = program.commands.into_iter();
-                let mut result = iter.next().unwrap();
-                for cmd in iter {
-                    result = Command::Sequence(Box::new(result), Box::new(cmd));
-                }
-                result
-            }
+pub(crate) fn parse_cmdsubst_content(content: &str) -> Result<Command, ShellError> {
+    let program = Parser::from_shell_string(content).parse()?;
+    let command = if program.commands.is_empty() {
+        empty_command_substitution()
+    } else if program.commands.len() == 1 {
+        program.commands.into_iter().next().unwrap()
+    } else {
+        let mut iter = program.commands.into_iter();
+        let mut result = iter.next().unwrap();
+        for cmd in iter {
+            result = Command::Sequence(Box::new(result), Box::new(cmd));
         }
-        Err(_) => Command::Simple {
-            assigns: Vec::new(),
-            args: Vec::new(),
-            redirs: Vec::new(),
-            span: Span::default(),
-        },
+        result
+    };
+    Ok(command)
+}
+
+fn parse_nested_command_substitution(
+    content: &str,
+    nested_errors: NestedCommandErrors,
+) -> Result<Command, ShellError> {
+    match parse_cmdsubst_content(content) {
+        Err(_) if nested_errors == NestedCommandErrors::LegacyEmptyCommand => {
+            Ok(empty_command_substitution())
+        }
+        result => result,
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn parse_cmdsubst_content_bytes(content: &[u8]) -> Command {
-    match Parser::new_bytes(content).parse() {
-        Ok(program) => {
-            if program.commands.is_empty() {
-                Command::Simple {
-                    assigns: Vec::new(),
-                    args: Vec::new(),
-                    redirs: Vec::new(),
-                    span: Span::default(),
-                }
-            } else if program.commands.len() == 1 {
-                program.commands.into_iter().next().unwrap()
-            } else {
-                let mut iter = program.commands.into_iter();
-                let mut result = iter.next().unwrap();
-                for cmd in iter {
-                    result = Command::Sequence(Box::new(result), Box::new(cmd));
-                }
-                result
-            }
-        }
-        Err(_) => Command::Simple {
-            assigns: Vec::new(),
-            args: Vec::new(),
-            redirs: Vec::new(),
-            span: Span::default(),
-        },
+fn empty_command_substitution() -> Command {
+    Command::Simple {
+        assigns: Vec::new(),
+        args: Vec::new(),
+        redirs: Vec::new(),
+        span: Span::default(),
     }
 }
 
@@ -2013,6 +2036,21 @@ mod tests {
         let parts = parse_word_parts("$(date)");
         assert_eq!(parts.len(), 1);
         assert!(matches!(&parts[0], WordPart::CmdSubst(_)));
+    }
+
+    #[test]
+    fn word_parts_propagate_nested_syntax_errors() {
+        assert!(matches!(
+            try_parse_word_parts("$(if)"),
+            Err(ShellError::Syntax { .. })
+        ));
+    }
+
+    #[test]
+    fn word_parts_legacy_api_retains_empty_command_recovery() {
+        let parts = parse_word_parts("$(if)");
+        assert!(matches!(&parts[0], WordPart::CmdSubst(command)
+            if matches!(command.as_ref(), Command::Simple { args, .. } if args.is_empty())));
     }
 
     #[test]

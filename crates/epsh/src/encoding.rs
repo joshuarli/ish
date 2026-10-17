@@ -2,30 +2,41 @@
 
 const PUA_BASE: u32 = 0xE000;
 pub(crate) const ESCAPE: char = '\u{E000}';
+pub(crate) const GLOB_ESCAPE: u32 = 0x110100;
 
-fn push_text(result: &mut String, text: &str) {
+fn push_text(result: &mut String, text: &str, escape_glob_marker: bool) {
     for c in text.chars() {
-        if c == ESCAPE || (PUA_BASE + 0x80..=PUA_BASE + 0xFF).contains(&(c as u32)) {
+        if c == ESCAPE
+            || (escape_glob_marker && c == crate::lexer::CTLESC)
+            || (PUA_BASE + 0x80..=PUA_BASE + 0xFF).contains(&(c as u32))
+        {
             result.push(ESCAPE);
         }
         result.push(c);
     }
 }
 
+pub(crate) fn pattern_to_str(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    push_text(&mut result, text, false);
+    result
+}
+
 /// Encode raw bytes as shell text. Invalid UTF-8 bytes use U+E080–U+E0FF;
-/// literal occurrences of those characters and U+E000 receive a U+E000 prefix.
+/// literal occurrences of those characters, U+E000, and U+FFFE receive a
+/// U+E000 prefix.
 pub fn bytes_to_str(bytes: &[u8]) -> String {
     let mut result = String::with_capacity(bytes.len());
     let mut remaining = bytes;
     while !remaining.is_empty() {
         match std::str::from_utf8(remaining) {
             Ok(text) => {
-                push_text(&mut result, text);
+                push_text(&mut result, text, true);
                 break;
             }
             Err(error) => {
                 let (valid, invalid) = remaining.split_at(error.valid_up_to());
-                push_text(&mut result, std::str::from_utf8(valid).unwrap());
+                push_text(&mut result, std::str::from_utf8(valid).unwrap(), true);
                 result.push(char::from_u32(PUA_BASE + u32::from(invalid[0])).unwrap());
                 remaining = &invalid[1..];
             }
@@ -72,7 +83,10 @@ pub(crate) fn shell_codepoints(text: &str) -> impl Iterator<Item = u32> {
         let mut chars = unit.chars();
         let c = chars.next().unwrap();
         if c == ESCAPE {
-            chars.next().unwrap_or(ESCAPE) as u32
+            let literal = chars.next().unwrap_or(ESCAPE);
+            literal as u32
+        } else if c == crate::lexer::CTLESC {
+            GLOB_ESCAPE
         } else if (PUA_BASE + 0x80..=PUA_BASE + 0xFF).contains(&(c as u32)) {
             0x110000 + c as u32 - PUA_BASE
         } else {
@@ -123,5 +137,15 @@ mod tests {
         let s = "\u{E000}hello";
         let encoded = bytes_to_str(s.as_bytes());
         assert_eq!(str_to_bytes(&encoded), s.as_bytes());
+    }
+
+    #[test]
+    fn literal_glob_escape_is_distinct_from_pattern_metadata() {
+        let literal = "\u{FFFE}";
+        let encoded = bytes_to_str(literal.as_bytes());
+        assert_eq!(encoded, format!("{ESCAPE}{literal}"));
+        assert_eq!(str_to_bytes(&encoded), literal.as_bytes());
+        assert_eq!(shell_codepoints(&encoded).collect::<Vec<_>>(), vec![0xFFFE]);
+        assert_eq!(shell_codepoints(literal).collect::<Vec<_>>(), vec![GLOB_ESCAPE]);
     }
 }
