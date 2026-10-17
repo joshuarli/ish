@@ -152,25 +152,3 @@ Evaluation stops after 60 seconds.
 
 Report issues at [GitHub Issues](https://github.com/joshuarli/ish/issues). This
 repository does not specify a license.
-
-## Development
-
-ish and epsh share a Cargo workspace and lockfile. The Makefile provides these
-workspace commands:
-
-| Command | Checks |
-|---|---|
-| `make build` | Build the workspace. |
-| `make test` | Run Rust tests for the workspace. |
-| `make test-epsh` | Run epsh library and integration tests. |
-| `make conformance` | Print each retained native corpus case. |
-| `make verify` | Check Lean models, theorem axioms, and the Rust differential bridge. |
-| `make check` | Run workspace lint, Rust tests, and semantic verification. |
-
-The Lean project lives in `formal/` and pins Lean in `formal/lean-toolchain`.
-Lean proofs establish properties of the model. The Rust bridge compares model
-results with actual Rust entry points for its admitted inputs. Rust unit,
-integration, and PTY tests cover implementation behavior outside that domain.
-The bridge does not prove that the model covers every Rust behavior. See the
-[formal project guide](formal/README.md) and [coverage matrix](docs/verification/coverage.md)
-for the checked domains and limits.
