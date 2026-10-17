@@ -780,7 +780,7 @@ impl Shell {
         let mut status = ExitStatus::SUCCESS;
         for sig_name in &args[offset + 1..] {
             let normalized = sig_name.to_uppercase();
-            if normalized == "EXIT" {
+            if is_exit_signal_specifier(&normalized) {
                 if action == "-" {
                     self.traps.remove("EXIT");
                 } else {
@@ -821,7 +821,7 @@ impl Shell {
 
     fn reset_named_trap(&mut self, name: &str) -> ExitStatus {
         let normalized = name.to_uppercase();
-        if normalized == "EXIT" {
+        if is_exit_signal_specifier(&normalized) {
             self.traps.remove("EXIT");
             return ExitStatus::SUCCESS;
         }
@@ -1236,6 +1236,12 @@ impl Shell {
         self.write_out(&out);
         ExitStatus::SUCCESS
     }
+}
+
+fn is_exit_signal_specifier(specifier: &str) -> bool {
+    specifier.eq_ignore_ascii_case("EXIT")
+        || (specifier.bytes().all(|byte| byte.is_ascii_digit())
+            && specifier.parse::<i32>().ok() == Some(0))
 }
 
 /// All builtin command names recognized by the shell.

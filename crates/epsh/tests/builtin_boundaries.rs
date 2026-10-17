@@ -251,7 +251,7 @@ fn failed_exec_does_not_run_from_an_unusable_shell_cwd() {
 #[test]
 fn user_signal_traps_run_their_action() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    for signal_name in ["USR1", "SIGUSR1"] {
+    for signal_name in ["USR1", "SIGUSR1", "usr1", "sigusr1"] {
         let script = format!("trap 'echo caught' {signal_name}; kill -USR1 $$; echo after");
         let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
             .args(["-c", script.as_str()])
@@ -273,4 +273,28 @@ fn trap_reports_uncatchable_signals() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut shell = Shell::new();
     assert_eq!(shell.run_script("trap '' KILL"), 1);
+    assert_eq!(shell.run_script("trap '' 999999"), 1);
+}
+
+#[test]
+fn trap_accepts_numeric_zero_as_exit() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for specifier in ["0", "00"] {
+        let script = format!("trap 'echo exit' {specifier}; echo body");
+        let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
+            .args(["-c", script.as_str()])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"body\nexit\n");
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
+        .args(["-c", "trap 'echo wrong' EXIT; trap 00; echo body"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"body\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
 }

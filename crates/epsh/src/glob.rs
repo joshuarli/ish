@@ -51,6 +51,15 @@ fn split_components(pattern: &str) -> (bool, Vec<String>) {
     (absolute, components)
 }
 
+fn component_starts_with_dot(pattern: &str) -> bool {
+    let mut units = crate::encoding::shell_chars(pattern);
+    match units.next() {
+        Some(GLOB_ESCAPE_MARKER) | Some("\\") => units.next() == Some("."),
+        Some(".") => true,
+        _ => false,
+    }
+}
+
 /// `fs_dir`: actual filesystem directory to read from
 /// `display_dir`: path prefix for result strings (relative to original pattern)
 fn glob_recursive(
@@ -94,8 +103,7 @@ fn glob_recursive(
         let name = entry.file_name();
         let name_shell = ShellBytes::from_os_str(name.as_os_str()).to_shell_string();
 
-        // Dotfiles are only matched if the pattern starts with '.'
-        if name.as_os_str().as_bytes().starts_with(b".") && !pattern.starts_with('.') {
+        if name.as_os_str().as_bytes().starts_with(b".") && !component_starts_with_dot(pattern) {
             continue;
         }
 
