@@ -26,14 +26,6 @@ Next: 22
 
 
 
-### ISH-11 · P2 · Early execution returns leave shell status and EXIT traps stale
-
-- **Area:** Errors
-- **Where:** `crates/epsh/src/eval.rs:1135`, `crates/epsh/src/eval.rs:1153`, `crates/epsh/src/eval.rs:1157`, `crates/epsh/src/eval.rs:1161`
-- **Problem:** Exit, cancellation, timeout, stop, and parse-error paths can return a status without storing it. A library probe running an EXIT trap followed by `exit 7` returned 7 while the trap printed 0 and stored status remained 0. Cancellation and timeout returned 130 with stored 0; a parse failure returned 2 but the next `$?` expansion still printed 0.
-- **Recommendation:** Update the stored status on every terminal path, before running EXIT traps, and preserve the intended final status across trap execution.
-- **Fix with:** error-model
-- **Effort:** S (hours)
 
 ### ISH-12 · P2 · Exit operands and status constructors violate the status contract
 

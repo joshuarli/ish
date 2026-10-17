@@ -1134,7 +1134,8 @@ impl Shell {
             Ok(p) => p,
             Err(e) => {
                 self.err_msg(&format!("epsh: {e}"));
-                return 2;
+                self.exit_status = ExitStatus::MISUSE;
+                return self.exit_status.code();
             }
         };
 
@@ -1151,15 +1152,18 @@ impl Shell {
                     self.exit_status = status;
                 }
                 Err(ShellError::Exit(n)) => {
+                    self.exit_status = n;
                     self.run_exit_trap();
-                    return n;
+                    return self.exit_status;
                 }
                 Err(ShellError::Cancelled) | Err(ShellError::TimedOut) => {
+                    self.exit_status = ExitStatus::from_signal(2);
                     self.kill_children();
-                    return ExitStatus::from_signal(2); // 130 = SIGINT
+                    return self.exit_status;
                 }
                 Err(ShellError::Stopped { .. }) => {
-                    return ExitStatus::from(148);
+                    self.exit_status = ExitStatus::from(148);
+                    return self.exit_status;
                 }
                 Err(e) => {
                     self.err_msg(&format!("epsh: {e}"));
@@ -1196,14 +1200,15 @@ impl Shell {
 
     /// Run the EXIT trap if one is set.
     pub(crate) fn run_exit_trap(&mut self) {
-        // Remove the trap to prevent recursive invocation
         if let Some(action) = self.traps.remove("EXIT") {
+            let status = self.exit_status;
             let mut parser = Parser::from_shell_string(&action);
             if let Ok(program) = parser.parse() {
                 for cmd in &program.commands {
                     let _ = self.eval_command(cmd);
                 }
             }
+            self.exit_status = status;
         }
     }
 

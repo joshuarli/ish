@@ -67,6 +67,14 @@ blocked in a child wait.
 Trap names are case-insensitive and accept a `SIG` prefix. Installing a trap for
 an uncatchable signal such as KILL fails without changing the registered traps.
 
+`run_program` and `run_script` store their returned status in `exit_status()`,
+which supplies `$?` on the next call. Explicit exit stores the requested status.
+Cancellation and timeout store 130. Stopped execution stores 148. Parse and runtime
+errors store 2. EXIT traps run on normal completion, explicit exit, and runtime
+errors. They see the terminal status through `$?`. Trap commands do not replace
+the returned or stored terminal status. Parse errors, cancellation, timeout, and
+stopped execution return without running EXIT traps.
+
 ## Interactive integrations
 
 Interactive mode enables foreground terminal handoff and stopped-child
