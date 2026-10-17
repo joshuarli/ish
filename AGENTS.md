@@ -3,8 +3,12 @@ behavior contract.
 
 ## Commands
 
-- `make build` builds the shell.
-- `make test` runs the library, integration, and PTY tests.
+- `make build` builds the workspace.
+- `make test` runs workspace library, integration, PTY, and conformance tests.
+- `make test-epsh` runs epsh library and integration tests.
+- `make conformance` prints all retained native conformance case results.
+- `make verify` checks the Lean models, theorem axioms, and Rust differential bridge.
+- `make check` runs workspace lint, Rust tests, and semantic verification.
 - `cargo check --workspace` checks the Rust workspace.
 
 ## Invariants
@@ -21,6 +25,10 @@ behavior contract.
 - Prefer rustix for Unix and system calls; keep any libc exception narrow and explain it where it is used.
 - Localize unsafe code at platform boundaries and preserve descriptor ownership and error handling.
 - Update the README and relevant integration or PTY coverage when user-visible behavior changes.
+- Keep dynamic command policy checks in epsh expansion and dispatch paths; ish refuses dynamic `eval`, `source`, `.`, and out-of-line shell-state builtins with status 2 before target effects.
+- Keep arithmetic overflow behavior explicit: wrapping add, subtract, multiply, and negate; errors for zero division or remainder, signed division or remainder overflow, and invalid shift counts.
+- Keep Rust workspace tests and the native 175-case byte-preserving conformance corpus in CI on supported hosts.
+- Treat Lean theorems as claims about the model. Use the differential bridge and Rust tests for implementation correspondence and behavior.
 
 ## Topic map
 
@@ -28,3 +36,4 @@ behavior contract.
 - History search ranking and session snapshots: [History search](docs/history-search.md).
 - Completion matching, ordering, and hot-path constraints: [Completion](docs/completion.md).
 - PTY test environment and synchronization: [PTY tests](docs/ptytest.md).
+- Lean model, protocol, and Rust bridge commands: [Development](README.md#development).
