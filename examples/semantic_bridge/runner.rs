@@ -36,14 +36,21 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
     verify_protocol_boundary(&binary, &tmpdir, &root)?;
     let mut groups = Vec::new();
     for family in options.families.iter().copied() {
-        let mut cases = match options.selected_id.as_deref() {
+        let (mut cases, generated_count) = match options.selected_id.as_deref() {
             Some(id) => match load_regression_by_id(&root, family, id)? {
-                Some(request) => vec![request],
-                None => generate_cases(family, options.cases, options.seed, Some(id))?,
+                Some(request) => (vec![request], 0),
+                None => {
+                    let cases = generate_cases(family, options.cases, options.seed, Some(id))?;
+                    let count = cases.len();
+                    (cases, count)
+                }
             },
-            None => generate_cases(family, options.cases, options.seed, None)?,
+            None => {
+                let cases = generate_cases(family, options.cases, options.seed, None)?;
+                let count = cases.len();
+                (cases, count)
+            }
         };
-        let generated_count = cases.len();
         if options.selected_id.is_none() {
             cases.extend(load_regressions(&root, family)?);
         }
