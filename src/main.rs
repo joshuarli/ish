@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 mod static_word;
+mod trash;
 
 // Thread-local storage for a stopped job's info, written by the external handler
 // and consumed by the main loop. Avoids needing to thread state through epsh's
@@ -415,6 +416,36 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
             shell.last_status = 0;
         }
         "ish-dump" => shell.last_status = write_layout_dump(shell),
+        "t" | "trash" => {
+            let args = match expand_builtin_args_bytes(args, shell, name) {
+                Some(args) => args
+                    .iter()
+                    .map(epsh::shell_bytes::ShellBytes::to_os_string)
+                    .collect::<Vec<_>>(),
+                None => return false,
+            };
+            match trash::parse_args(&args) {
+                Ok(trash::Command::Help) => {
+                    println!("Usage: {name} [--yes] [--] PATH");
+                    println!("Scan PATH before permanently deleting its entries. PATH stays in place.");
+                    println!("Type 'yes' to confirm. --yes skips confirmation.");
+                    shell.last_status = 0;
+                }
+                Ok(trash::Command::Run { path, assume_yes }) => {
+                    match trash::run(path, assume_yes, store_env_os(&shell.epsh, "HOME")) {
+                        Ok(()) => shell.last_status = 0,
+                        Err(error) => {
+                            eprintln!("ish: {name}: {error}");
+                            shell.last_status = 1;
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("ish: {name}: {error}");
+                    shell.last_status = 2;
+                }
+            }
+        }
         "denv" => {
             let args = expanded_args!();
             let outcome = denv::command(&shell.denv, &args, &shell.epsh);

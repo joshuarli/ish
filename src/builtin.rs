@@ -4,10 +4,8 @@ use crate::path;
 /// Where an ish-owned builtin may run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exec {
-    /// Reads or changes shell state (aliases, jobs, history store, directory
-    /// stack, environment mirror) that a list or pipeline stage cannot reach.
-    /// It runs only when it is the whole input line; anywhere else it is
-    /// refused.
+    /// Reads or changes shell state, or performs an ish-owned operation that
+    /// must stay in the shell process. It runs only as the whole input line.
     InShell,
     /// As the whole input line it runs in the shell with shell state; inside a
     /// list or pipeline epsh's own builtin or the external-command handler
@@ -38,6 +36,8 @@ const ISH_BUILTINS: &[Builtin] = &[
     Builtin { name: "history", exec: Exec::Hybrid },
     Builtin { name: "ish-dump", exec: Exec::InShell },
     Builtin { name: "l", exec: Exec::Native },
+    Builtin { name: "t", exec: Exec::InShell },
+    Builtin { name: "trash", exec: Exec::InShell },
     Builtin { name: "type", exec: Exec::InShell },
     Builtin { name: "w", exec: Exec::InShell },
     Builtin { name: "which", exec: Exec::InShell },

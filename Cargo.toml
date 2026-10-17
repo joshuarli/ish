@@ -4,11 +4,23 @@ version = "0.0.0"
 edition = "2024"
 
 [workspace]
-members = [".", "crates/epsh"]
+members = [
+    ".",
+    "crates/epsh",
+    "crates/fdu-core",
+    "crates/fdu-delete",
+    "crates/fdu-scan",
+]
 default-members = [".", "crates/epsh"]
+
+[workspace.dependencies]
+hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }
 
 [dependencies]
 epsh = { version = "0.0.9", path = "crates/epsh" }
+fdu-core = { path = "crates/fdu-core" }
+fdu-delete = { path = "crates/fdu-delete" }
+fdu-scan = { path = "crates/fdu-scan" }
 fxhash = "0.2"
 rustix = { version = "1.1.4", features = ["event", "fs", "pipe", "process", "system", "termios", "time"] }
 libc = "0.2"

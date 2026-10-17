@@ -62,11 +62,11 @@ impl fmt::Display for Rejection {
             ),
             Rejection::ShellBuiltinOutsideLine(name) => write!(
                 f,
-                "{name} changes shell state and must be the only command on its line"
+                "{name} changes shell state or needs the ish process, so it must be the only command on its line"
             ),
             Rejection::ExpandedShellBuiltin(name) => write!(
                 f,
-                "{name} changes shell state and requires a statically named whole-line command"
+                "{name} changes shell state or needs the ish process, so it requires a statically named whole-line command"
             ),
         }
     }

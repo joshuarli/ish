@@ -102,7 +102,7 @@ its allowed whole-line form, ish refuses the command with status 2 before that
 target runs or opens its redirections. Earlier commands in the input line keep
 their effects. Commands that need shell state, including `alias`, `exit`, `fg`,
 `denv`, and `z`, must be the whole input line. `cd` and `history` can also be
-used in lists.
+used in lists. `t` and `trash` must also be the whole input line.
 
 Arithmetic follows [epsh's signed 64-bit rules](crates/epsh/README.md#arithmetic).
 
@@ -120,12 +120,22 @@ ish-specific commands include:
 | `alias [name [command...]]` | Define or list aliases |
 | `history [reset]` | List or clear saved history |
 | `z [query]` | Jump to a frequently used directory; no query goes home |
+| `t`, `trash` | Permanently delete entries below an explicit directory; `--yes` skips confirmation |
 | `w`, `which`, `type` | Locate a command or alias |
 | `l [path...]` | List files with colors and human-readable sizes |
 | `c` | Clear the screen |
 | `denv` | Trust, revoke, or reload environment files for this directory |
 | `copy-scrollback` | Copy the terminal scrollback through OSC 52 |
 | `ish-dump` | Write the current layout dump |
+
+`t PATH` and `trash PATH` scan the directory tree before deleting anything.
+They permanently delete its entries and keep `PATH` itself. The last component
+of `PATH` must name a directory, not a symlink. The command refuses
+`/`, `$HOME`, and any parent of the current directory. It removes nested
+symlinks themselves and leaves their targets alone. An incomplete scan or mount
+boundary stops deletion before it starts. By default, the command asks you to
+type `yes`. Pass `--yes` to skip the prompt. Without a terminal, `--yes` is
+required. A terminal shows scan progress and a deletion progress bar.
 
 The shell also provides epsh's environment and output builtins, including
 `set`, `export`, `unset`, `echo`, `pwd`, `true`, and `false`. Aliases can be

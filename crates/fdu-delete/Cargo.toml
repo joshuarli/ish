@@ -1,0 +1,12 @@
+[package]
+name = "fdu-delete"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Descriptor-relative deletion for fdu indexes"
+
+[dependencies]
+fdu-core = { path = "../fdu-core" }
+hashbrown = { workspace = true }
+rayon = "1.5.1"
+rustix = { version = "1.1", features = ["fs", "std", "linux_latest"] }
