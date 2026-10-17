@@ -33,6 +33,7 @@ const DOTENV_VALUE_VAR_PREFIX: &str = "__DENV_DOT_";
 /// Upper bound for one bash `.envrc` evaluation. The child holds the terminal
 /// while ish waits, so a hung `.envrc` must fail loudly instead of wedging cd.
 const ENVRC_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const ACTIVE_TEMP_NAME_ATTEMPTS: u64 = 128;
 
 static NEXT_ACTIVE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -578,7 +579,8 @@ fn save_active(pid: &str, state: &ActiveState) -> Result<(), String> {
         }
     }
     let path = dir.join(format!("active_{pid}"));
-    let (temp_path, mut file) = loop {
+    let mut reserved = None;
+    for _ in 0..ACTIVE_TEMP_NAME_ATTEMPTS {
         let id = NEXT_ACTIVE_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed);
         let temp_path = dir.join(format!(".active_{pid}.{id}.tmp"));
         match fs::OpenOptions::new()
@@ -586,11 +588,17 @@ fn save_active(pid: &str, state: &ActiveState) -> Result<(), String> {
             .create_new(true)
             .open(&temp_path)
         {
-            Ok(file) => break (temp_path, file),
+            Ok(file) => {
+                reserved = Some((temp_path, file));
+                break;
+            }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(format!("failed to create active file: {err}")),
         }
-    };
+    }
+    let (temp_path, mut file) = reserved.ok_or_else(|| {
+        "failed to create active file: temporary names are already occupied".to_string()
+    })?;
     let result = file
         .write_all(buf.as_bytes())
         .map_err(|e| format!("failed to write active file: {e}"))
@@ -1321,7 +1329,6 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Mutex, MutexGuard};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1769,20 +1776,27 @@ mod tests {
             PrevVar::Restore(key, value) if key == "DENV_SAVE_TEST" && value == "base"
         )));
 
-        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let first_temp_id = 10_000;
+        NEXT_ACTIVE_TEMP_ID.store(first_temp_id, AtomicOrdering::Relaxed);
+        for id in first_temp_id..first_temp_id + ACTIVE_TEMP_NAME_ATTEMPTS {
+            std::fs::write(data.join(format!(".active_{pid}.{id}.tmp")), b"occupied").unwrap();
+        }
         let failed_refresh = refresh(true, &epsh);
-        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
         let err = match failed_refresh {
             Ok(_) => panic!("expected active-state write to fail"),
             Err(err) => err,
         };
-        assert!(err.contains("active file"), "{err}");
+        assert!(err.contains("temporary names"), "{err}");
         assert_eq!(env::var("DENV_SAVE_TEST").unwrap(), "loaded");
         assert_eq!(
             epsh.vars().get_bytes("DENV_SAVE_TEST").unwrap().as_bytes(),
             b"loaded"
         );
-        assert!(load_active(&pid).is_some());
+        let preserved_active = load_active(&pid).unwrap();
+        assert!(preserved_active.prev.iter().any(|previous| matches!(
+            previous,
+            PrevVar::Restore(key, value) if key == "DENV_SAVE_TEST" && value == "base"
+        )));
 
         epsh.vars_mut().set("PWD", outside.to_str().unwrap()).unwrap();
         let restored = refresh(false, &epsh).unwrap();
