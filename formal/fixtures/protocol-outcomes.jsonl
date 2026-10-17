@@ -1,0 +1,4 @@
+{"id":"outcomes","outcome":{"tag":"success","value":{"status":0}},"version":1}
+{"id":"outcomes","outcome":{"error":{"kind":"arithmetic","message":"division by zero"},"state":{"cwd":[],"exported":[],"inherited":[],"last_status":2,"positional":[],"variables":[["rhs",[49]]]},"tag":"semantic_error","trace":[{"bytes":[114,104,115],"fd":1,"tag":"write"}]},"version":1}
+{"id":"outcomes","outcome":{"reason":"control flow","tag":"unsupported_domain"},"version":1}
+{"id":"outcomes","outcome":{"tag":"fuel_exhausted"},"version":1}
