@@ -41,6 +41,7 @@ fn shell_builder_methods() {
     let cancel = Arc::new(AtomicBool::new(false));
     let sink: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(Vec::<u8>::new()));
     let handler: eval::ExternalHandler = Box::new(|_args, _env| Ok(error::ExitStatus::SUCCESS));
+    let policy: eval::CommandPolicy = Box::new(|_target| None);
     let _shell = eval::Shell::builder()
         .cwd(PathBuf::from("/"))
         .errexit(true)
@@ -54,6 +55,7 @@ fn shell_builder_methods() {
         .timeout(Duration::from_secs(1))
         .env_clear()
         .external_handler(handler)
+        .command_policy(policy)
         .build();
 }
 
@@ -78,6 +80,7 @@ fn shell_public_methods() {
     shell.set_stdout_sink(Arc::new(Mutex::new(Vec::<u8>::new())));
     shell.set_stderr_sink(Arc::new(Mutex::new(Vec::<u8>::new())));
     shell.set_external_handler(Box::new(|_args, _env| Ok(error::ExitStatus::SUCCESS)));
+    shell.set_command_policy(Box::new(|_target| None));
     shell.set_redirect_open_handler(Box::new(|request: &eval::RedirectOpen<'_>| {
         let _mode: eval::RedirectOpenMode = request.mode;
         None

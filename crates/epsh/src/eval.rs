@@ -188,6 +188,10 @@ pub type ExternalHandler = Box<
         + Send,
 >;
 
+/// Callback for expanded command targets. Return `None` to allow a target or
+/// `Some(diagnostic)` to refuse it with status 2.
+pub type CommandPolicy = Box<dyn FnMut(&ShellBytes) -> Option<String> + Send>;
+
 thread_local! {
     static EXTERNAL_COMMAND_CWD: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
@@ -298,6 +302,7 @@ pub struct Shell {
     /// Optional callback that replaces eval_external for spawning processes.
     /// Lets embedders control process creation (job control, sandboxing, etc.).
     external_handler: Option<ExternalHandler>,
+    command_policy: Option<CommandPolicy>,
     /// Optional provider that opens writable redirection targets.
     pub(crate) redirect_open_handler: Option<RedirectOpenHandler>,
     /// PID of the last background command ($!).
@@ -405,6 +410,7 @@ pub struct ShellBuilder {
     timeout: Option<std::time::Duration>,
     env_clear: bool,
     external_handler: Option<ExternalHandler>,
+    command_policy: Option<CommandPolicy>,
     redirect_open_handler: Option<RedirectOpenHandler>,
 }
 
@@ -431,6 +437,7 @@ impl ShellBuilder {
             timeout: None,
             env_clear: false,
             external_handler: None,
+            command_policy: None,
             redirect_open_handler: None,
         }
     }
@@ -496,6 +503,11 @@ impl ShellBuilder {
         self.external_handler = Some(handler);
         self
     }
+    /// Set a callback that can refuse expanded command targets. Without a callback, all targets are allowed.
+    pub fn command_policy(mut self, policy: CommandPolicy) -> Self {
+        self.command_policy = Some(policy);
+        self
+    }
     /// Set a provider that opens writable redirection targets.
     pub fn redirect_open_handler(mut self, handler: RedirectOpenHandler) -> Self {
         self.redirect_open_handler = Some(handler);
@@ -542,6 +554,7 @@ impl ShellBuilder {
             child_pids: Vec::new(),
             timeout: self.timeout.map(|d| std::time::Instant::now() + d),
             external_handler: self.external_handler,
+            command_policy: self.command_policy,
             redirect_open_handler: self.redirect_open_handler,
             last_bg_pid: None,
             pending_stdin: None,
@@ -582,6 +595,7 @@ impl Shell {
             child_pids: Vec::new(),
             timeout: None,
             external_handler: None,
+            command_policy: None,
             redirect_open_handler: None,
             last_bg_pid: None,
             pending_stdin: None,
@@ -635,6 +649,43 @@ impl Shell {
     /// Trap handlers.
     pub fn traps(&self) -> &FxHashMap<String, String> {
         &self.traps
+    }
+
+    pub(crate) fn check_command_policy(
+        &mut self,
+        target: &str,
+        span: Span,
+    ) -> crate::error::Result<()> {
+        let target = ShellBytes::from_str_lossless(target);
+        if let Some(diagnostic) = self
+            .command_policy
+            .as_mut()
+            .and_then(|policy| policy(&target))
+        {
+            return Err(ShellError::Runtime {
+                msg: diagnostic,
+                span,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_command_policy_for_dispatch(
+        &mut self,
+        args: &[String],
+        span: Span,
+    ) -> crate::error::Result<()> {
+        let Some(target) = args.first() else {
+            return Ok(());
+        };
+        self.check_command_policy(target, span)?;
+        if target == "command"
+            && let crate::builtins::CommandAction::Execute(nested_args) =
+                crate::builtins::command_action(args)
+        {
+            self.check_command_policy_for_dispatch(nested_args, span)?;
+        }
+        Ok(())
     }
 
     /// Check cancellation flag and timeout deadline.
@@ -795,6 +846,11 @@ impl Shell {
     ///   assignments
     pub fn set_external_handler(&mut self, handler: ExternalHandler) {
         self.external_handler = Some(handler);
+    }
+
+    /// Replace the callback that can refuse expanded command targets.
+    pub fn set_command_policy(&mut self, policy: CommandPolicy) {
+        self.command_policy = Some(policy);
     }
 
     /// Install a provider that owns the open of writable redirections
@@ -1310,6 +1366,8 @@ impl Shell {
             }
             return Ok(self.exit_status);
         }
+
+        self.check_command_policy_for_dispatch(&expanded_args, span)?;
 
         // xtrace: print $PS4, assignments, then args (like dash's evalcommand)
         if self.opts.xtrace {
@@ -1883,20 +1941,34 @@ impl Shell {
                 && !expanded.is_empty()
                 && is_command_substitution_builtin(&expanded[0])
             {
+                if let Err(error) = self.check_command_policy_for_dispatch(&expanded, *span) {
+                    self.err_msg(&format!("epsh: {error}"));
+                    self.exit_status = ExitStatus::MISUSE;
+                    return Ok(String::new());
+                }
                 // Capture output to buffer instead of forking
                 let saved_sink = self.stdout_sink.take();
                 let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
                 self.stdout_sink = Some(buf.clone());
                 let status = self.try_builtin(&expanded[0], &expanded, &[], &[], *span);
                 self.stdout_sink = saved_sink;
-                if let Ok(Some(s)) = status {
-                    self.exit_status = s;
-                    let captured = buf.lock().unwrap();
-                    let mut output = crate::encoding::bytes_to_str(&captured);
-                    while output.ends_with('\n') {
-                        output.pop();
+                match status {
+                    Ok(Some(status)) => {
+                        self.exit_status = status;
+                        let captured = buf.lock().unwrap();
+                        let mut output = crate::encoding::bytes_to_str(&captured);
+                        while output.ends_with('\n') {
+                            output.pop();
+                        }
+                        return Ok(output);
                     }
-                    return Ok(output);
+                    Err(error @ ShellError::Runtime { .. }) => {
+                        self.err_msg(&format!("epsh: {error}"));
+                        self.exit_status = ExitStatus::MISUSE;
+                        return Ok(String::new());
+                    }
+                    Err(_) => {}
+                    Ok(None) => {}
                 }
                 // Fallback: not a builtin after all, continue to fork path
             }
@@ -1948,22 +2020,27 @@ impl Shell {
 
             let pid = sys::fork();
             if pid < 0 {
-                sys::close(fds[0]);
-                sys::close(fds[1]);
-                return Err(ShellError::Io(std::io::Error::last_os_error()));
+                let error = std::io::Error::last_os_error();
+                let _ = sys::close(fds[0]);
+                let _ = sys::close(fds[1]);
+                return Err(ShellError::Io(error));
             }
 
             if pid == 0 {
                 // Child: redirect stdout to write end of pipe
                 let _ = rustix::process::setpgid(None, None);
                 self.in_forked_child = true;
-                sys::close(fds[0]);
+                let _ = sys::close(fds[0]);
                 sys::dup2(fds[1], 1);
-                sys::close(fds[1]);
+                let _ = sys::close(fds[1]);
 
                 let status = match self.eval_command(cmd) {
                     Ok(s) => s,
                     Err(ShellError::Exit(n)) => n,
+                    Err(error @ ShellError::Runtime { .. }) => {
+                        self.err_msg(&format!("epsh: {error}"));
+                        ExitStatus::MISUSE
+                    }
                     Err(_) => ExitStatus::FAILURE,
                 };
                 self.run_exit_trap();
