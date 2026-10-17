@@ -809,10 +809,34 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
                 continue;
             }
             InputEvent::Paste(text) => {
-                // Insert the entire paste content in one shot — no per-char
-                // rendering.
                 grid_column = None;
-                line.insert_str(&text);
+                if let Mode::HistorySearch {
+                    query,
+                    matches,
+                    candidates,
+                    scratch,
+                    candidate_stack,
+                    selected,
+                    ..
+                } = &mut mode
+                {
+                    let previous = (query.text().to_string(), query.cursor());
+                    query.insert_str(&text);
+                    update_history_search(
+                        query,
+                        (&previous.0, previous.1),
+                        matches,
+                        HistoryCandidates {
+                            candidates,
+                            scratch,
+                            candidate_stack,
+                        },
+                        selected,
+                        shell,
+                    );
+                } else {
+                    line.insert_str(&text);
+                }
                 region = render_active_mode(
                     &mut tw,
                     &mode,
@@ -2140,61 +2164,76 @@ fn handle_history_search_key(
         _ => {}
     }
     if re_search {
-        let new_text = query.text();
-        let append_at_end = prev_cursor == prev_text.len()
-            && query.cursor() == new_text.len()
-            && new_text.len() > prev_text.len()
-            && new_text.starts_with(&prev_text);
-        let delete_at_end = prev_cursor == prev_text.len()
-            && query.cursor() == new_text.len()
-            && new_text.len() < prev_text.len()
-            && prev_text.starts_with(new_text);
-        if append_at_end {
-            candidate_stack.push((prev_text.len(), std::mem::take(candidates)));
+        update_history_search(
+            query,
+            (&prev_text, prev_cursor),
+            matches,
+            HistoryCandidates {
+                candidates,
+                scratch,
+                candidate_stack,
+            },
+            selected,
+            shell,
+        );
+    }
+    HistoryAction::Continue
+}
+
+fn update_history_search(
+    query: &LineBuffer,
+    (prev_text, prev_cursor): (&str, usize),
+    matches: &mut Vec<FuzzyMatch>,
+    HistoryCandidates {
+        candidates,
+        scratch,
+        candidate_stack,
+    }: HistoryCandidates<'_>,
+    selected: &mut usize,
+    shell: &Shell,
+) {
+    let new_text = query.text();
+    let append_at_end = prev_cursor == prev_text.len()
+        && query.cursor() == new_text.len()
+        && new_text.len() > prev_text.len()
+        && new_text.starts_with(prev_text);
+    let delete_at_end = prev_cursor == prev_text.len()
+        && query.cursor() == new_text.len()
+        && new_text.len() < prev_text.len()
+        && prev_text.starts_with(new_text);
+    if append_at_end {
+        candidate_stack.push((prev_text.len(), std::mem::take(candidates)));
+        shell.history.fuzzy_search_subset_into_in_dir(
+            new_text,
+            &candidate_stack.last().unwrap().1,
+            scratch,
+            matches,
+            200,
+            shell.epsh.cwd(),
+        );
+        std::mem::swap(candidates, scratch);
+    } else if delete_at_end {
+        while candidate_stack
+            .last()
+            .is_some_and(|(len, _)| *len > new_text.len())
+        {
+            if let Some((_, old_candidates)) = candidate_stack.pop() {
+                *scratch = old_candidates;
+            }
+        }
+        if let Some((len, _)) = candidate_stack.last()
+            && *len == new_text.len()
+        {
+            let (_, old_candidates) = candidate_stack.pop().unwrap();
+            *candidates = old_candidates;
             shell.history.fuzzy_search_subset_into_in_dir(
                 new_text,
-                &candidate_stack.last().unwrap().1,
+                candidates,
                 scratch,
                 matches,
                 200,
                 shell.epsh.cwd(),
             );
-            std::mem::swap(candidates, scratch);
-        } else if delete_at_end {
-            while candidate_stack
-                .last()
-                .is_some_and(|(len, _)| *len > new_text.len())
-            {
-                if let Some((_, old_candidates)) = candidate_stack.pop() {
-                    *scratch = old_candidates;
-                }
-            }
-            if let Some((len, _)) = candidate_stack.last()
-                && *len == new_text.len()
-            {
-                let (_, old_candidates) = candidate_stack.pop().unwrap();
-                *candidates = old_candidates;
-                shell.history.fuzzy_search_subset_into_in_dir(
-                    new_text,
-                    candidates,
-                    scratch,
-                    matches,
-                    200,
-                    shell.epsh.cwd(),
-                );
-            } else {
-                candidate_stack.clear();
-                shell.history.search_entry_indices_into(scratch);
-                shell.history.fuzzy_search_subset_into_in_dir(
-                    new_text,
-                    scratch,
-                    candidates,
-                    matches,
-                    200,
-                    shell.epsh.cwd(),
-                );
-                std::mem::swap(candidates, scratch);
-            }
         } else {
             candidate_stack.clear();
             shell.history.search_entry_indices_into(scratch);
@@ -2208,9 +2247,20 @@ fn handle_history_search_key(
             );
             std::mem::swap(candidates, scratch);
         }
-        *selected = 0;
+    } else {
+        candidate_stack.clear();
+        shell.history.search_entry_indices_into(scratch);
+        shell.history.fuzzy_search_subset_into_in_dir(
+            new_text,
+            scratch,
+            candidates,
+            matches,
+            200,
+            shell.epsh.cwd(),
+        );
+        std::mem::swap(candidates, scratch);
     }
-    HistoryAction::Continue
+    *selected = 0;
 }
 
 fn render_history_mode(

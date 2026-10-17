@@ -68,6 +68,7 @@ first; partial paths and SSH hosts are supported. SSH host completion reads
 results, Enter to accept, and Escape to cancel.
 
 Ctrl+R opens a case-insensitive fuzzy-search pager with matches highlighted.
+Typing or pasting edits the search query and filters the matches.
 Use Up and Down to navigate, Enter to accept, and Escape to cancel. History is
 saved in `~/.local/share/ish/history`; Ctrl+R searches saved commands across
 sessions, while Up and Down use this session's history snapshot. `history`

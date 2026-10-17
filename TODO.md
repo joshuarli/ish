@@ -24,14 +24,6 @@ Next: 22
 - **Effort:** L (weeks)
 - **Design:** [Callback process boundary](docs/rfc/ISH-8-callback-process-boundary.md)
 
-### ISH-9 · P2 · Pasting into history search selects the wrong command
-
-- **Area:** Data
-- **Where:** `src/main.rs:809`, `src/main.rs:1100`, `src/main.rs:2072`
-- **Problem:** The Paste event updates the normal input line even while HistorySearch owns the active query. A fresh-build PTY seeded with `echo alpha` and `echo beta`, then given Ctrl+R and bracketed paste of `alpha`, accepted and executed `echo beta` after two Enter presses. The pasted search never filtered the candidates.
-- **Recommendation:** Route pasted text through the active editor mode and apply the same query update and candidate filtering as typed search text.
-- **Fix with:** isolate-effects
-- **Effort:** S (hours)
 
 ### ISH-10 · P2 · Prompt identity emits unsanitized control characters
 
