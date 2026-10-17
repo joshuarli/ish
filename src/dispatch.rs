@@ -267,8 +267,6 @@ mod tests {
             "cd /tmp && ls",
             "history | grep x",
             "l | cat",
-            "rm -f x; mv a b",
-            "echo hi > out; undo",
         ] {
             assert!(matches!(plan(line), Ok(Plan::Epsh(_))), "{line:?}");
         }

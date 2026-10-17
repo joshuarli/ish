@@ -16,8 +16,6 @@ pub enum Exec {
     /// Self-contained: runs through the external-command handler wherever it
     /// appears, including pipeline stages.
     Native,
-    /// Native, and routed through the undo-recovery dispatcher.
-    Undo,
 }
 
 /// One ish-owned builtin. The handler for [`Exec::InShell`] and
@@ -40,10 +38,7 @@ const ISH_BUILTINS: &[Builtin] = &[
     Builtin { name: "history", exec: Exec::Hybrid },
     Builtin { name: "ish-dump", exec: Exec::InShell },
     Builtin { name: "l", exec: Exec::Native },
-    Builtin { name: "mv", exec: Exec::Undo },
-    Builtin { name: "rm", exec: Exec::Undo },
     Builtin { name: "type", exec: Exec::InShell },
-    Builtin { name: "undo", exec: Exec::Undo },
     Builtin { name: "w", exec: Exec::InShell },
     Builtin { name: "which", exec: Exec::InShell },
     Builtin { name: "z", exec: Exec::InShell },
@@ -52,11 +47,6 @@ const ISH_BUILTINS: &[Builtin] = &[
 /// The ish-owned builtin called `name`, if any.
 pub fn lookup(name: &str) -> Option<&'static Builtin> {
     ISH_BUILTINS.iter().find(|b| b.name == name)
-}
-
-/// True for builtins that the undo dispatcher executes (`rm`, `mv`, `undo`).
-pub fn is_undo_builtin(name: &str) -> bool {
-    lookup(name).is_some_and(|b| b.exec == Exec::Undo)
 }
 
 /// Check if a command name is a builtin in either ish or epsh.

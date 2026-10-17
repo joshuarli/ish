@@ -1962,10 +1962,6 @@ fn builtin_registry_drives_names_and_execution_classes() {
     for name in &names {
         assert!(builtin::is_builtin(name), "{name}");
     }
-    for name in ["rm", "mv", "undo"] {
-        assert!(builtin::is_undo_builtin(name), "{name}");
-    }
-    assert!(!builtin::is_undo_builtin("l"));
     assert_eq!(builtin::lookup("z").map(|b| b.exec), Some(builtin::Exec::InShell));
     assert_eq!(builtin::lookup("cd").map(|b| b.exec), Some(builtin::Exec::Hybrid));
     assert!(builtin::lookup("echo").is_none());

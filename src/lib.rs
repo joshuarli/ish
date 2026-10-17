@@ -33,4 +33,3 @@ pub mod render;
 pub mod signal;
 pub mod sys;
 pub mod term;
-pub mod undo;

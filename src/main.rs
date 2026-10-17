@@ -207,12 +207,6 @@ fn main() {
         shell_pid,
     };
 
-    // Writable redirections open through ish-undo so existing contents are
-    // preserved before truncation or writable exposure.
-    shell
-        .epsh
-        .set_redirect_open_handler(ish::undo::redirect_provider());
-
     denv::init(&mut shell.epsh);
     let changes = denv::on_startup(&shell.epsh);
     apply_denv_changes(&changes, &mut shell.epsh);
@@ -260,17 +254,13 @@ fn main() {
                 shell.session_log.push_str(&line);
                 shell.session_log.push('\n');
 
-                // One accepted input is one recovery transaction, begun
-                // before any expansion or command substitution runs.
                 let expanded = shell.aliases.expand_line(&line);
-                ish::undo::begin(&shell.epsh, &expanded);
 
                 let plan = match dispatch::plan(&expanded) {
                     Ok(plan) => plan,
                     Err(rejection) => {
                         eprintln!("ish: {rejection}");
                         shell.last_status = 2;
-                        ish::undo::end(2, false);
                         continue;
                     }
                 };
@@ -281,7 +271,6 @@ fn main() {
                         if quit {
                             break;
                         }
-                        ish::undo::end(shell.last_status, false);
                         continue;
                     }
                     dispatch::Plan::Epsh(program) => program,
@@ -311,22 +300,13 @@ fn main() {
                     sync_cwd_change(&mut shell, &prev_cwd, new_cwd);
                 }
 
-                // Detect job suspension (status 148 = 128 + SIGTSTP). A
-                // stopped job keeps its recovery transaction active.
+                // Detect job suspension (status 148 = 128 + SIGTSTP).
                 if shell.last_status == 148
                     && let Some((pgid, cmd, termios)) =
                         STOPPED_JOB.with(|cell| cell.borrow_mut().take())
                 {
                     eprintln!("ish: stopped: {} (pgid={})", cmd, pgid);
-                    let undo = ish::undo::end(148, true);
-                    shell.job = Some(Job {
-                        pgid,
-                        cmd,
-                        termios,
-                        undo,
-                    });
-                } else {
-                    ish::undo::end(shell.last_status, false);
+                    shell.job = Some(Job { pgid, cmd, termios });
                 }
 
                 shell.prompt_needs_line_start = true;
@@ -372,7 +352,6 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
     match name {
         "alias" => handle_alias(line, shell),
         "exit" => {
-            ish::undo::end(0, false);
             return handle_exit_command(line, shell);
         }
         "cd" => {
@@ -413,11 +392,7 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
             shell.last_status = outcome.status;
         }
         "fg" => {
-            let (status, work) = ish::job::resume_job(&mut shell.job);
-            shell.last_status = status;
-            if let Some(work) = work {
-                ish::undo::finish_job(work, status);
-            }
+            shell.last_status = ish::job::resume_job(&mut shell.job);
         }
         "z" => {
             let args = expanded_args!();
@@ -1797,28 +1772,6 @@ fn start_completion(
     let first_command_word = text.split_whitespace().next().unwrap_or("");
     let dirs_only = first_command_word == "cd" && word_start > 0;
 
-    // `undo` takes a subcommand as its first argument.
-    if first_command_word == "undo" && word_start > 0 && existing.is_empty() && !in_quote {
-        for sub in ish_undo::cli::SUBCOMMANDS {
-            if sub.starts_with(partial.as_str()) {
-                comp.push(sub, false, false, false);
-            }
-        }
-        if !comp.is_empty() {
-            let (cols, rows) = complete::compute_grid(&comp.entries, term_cols);
-            return CompletionState {
-                comp,
-                selected: 0,
-                cols,
-                rows,
-                scroll: 0,
-                term_cols,
-                dir_prefix: String::new(),
-                in_quote,
-            };
-        }
-    }
-
     // After ssh-like commands, offer hostnames beside local files. There is no
     // remote path completion: it would run ssh from the completion path.
     const SSH_CMDS: &[&str] = &["ssh", "scp", "rsync", "sftp", "mosh"];
@@ -2381,9 +2334,6 @@ fn abandon_job(job: Job) {
         let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::TERM);
         let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::CONT);
     }
-    if let Some(work) = job.undo {
-        ish::undo::finish_job(work, 143);
-    }
 }
 
 /// Handle the "exit" command typed at the prompt. Returns true if the shell should break.
@@ -2540,12 +2490,6 @@ fn make_external_handler(
                 _ => {}
             }
 
-            // Native builtins run after expansion, by exact command name.
-            let is_main = rustix::process::getpid().as_raw_pid() == shell_pid;
-            if let Some(result) = ish::undo::dispatch(&name, args, is_main) {
-                return result;
-            }
-            ish::undo::note_opaque();
             spawn_external(args, env_pairs, shell_pid)
         },
     )

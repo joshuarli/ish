@@ -117,9 +117,6 @@ ish-specific commands include:
 | `denv` | Trust, revoke, or reload environment files for this directory |
 | `copy-scrollback` | Copy the terminal scrollback through OSC 52 |
 | `ish-dump` | Write the current layout dump |
-| `rm` | Protected removal; supports `-f`, `-i`, `-r`/`-R`, `-v`, and `--` |
-| `mv` | Protected move; supports `-f`, `-i`, `-n`, `-v`, and `--` |
-| `undo` | Revert, reapply, inspect, and manage recorded changes |
 
 The shell also provides epsh's environment and output builtins, including
 `set`, `export`, `unset`, `echo`, `pwd`, `true`, and `false`. Aliases can be
@@ -139,44 +136,6 @@ trust. If either discovered file is untrusted, neither is loaded. `.envrc`
 files whose first line mentions `bash` run in a `bash` child; other `.envrc`
 files are evaluated by epsh. `.env` files are read as variable assignments.
 Evaluation stops after 60 seconds.
-
-### Protected file operations
-
-ish records its native `rm`, native same-filesystem `mv`, and writable
-redirections so they can be undone. Changes made inside arbitrary external
-programs are not recorded. Explicit paths such as `/bin/rm` run the external
-program without protection. If ish cannot preserve a required version, the
-native operation fails without changing the files. Cross-filesystem `mv` is
-refused.
-
-```sh
-rm -r build
-undo                   # restore the latest eligible change from this session
-undo redo              # reapply it
-undo list [-a]
-undo show [id]
-undo [id] --dry-run
-```
-
-Recovery data lives under `~/.local/share/ish/undo`. Use `undo list [-a]`
-(`-a` includes other sessions), `undo show [id]`, `undo gc`, `undo purge ID`,
-`undo doctor`, and `undo volume ...` to inspect and manage recovery records. Use
-`undo volume add DIRECTORY` to register another filesystem for its own saved
-versions. Undo and redo check for newer changes before replay and leave
-conflicts untouched. `undo show` reports saved-version limitations. Process
-interruption recovery is supported; after power loss, recent records may be
-missing.
-
-Undo settings can be set in `config.ish` or at the prompt:
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `ISH_UNDO` | `on` | `off` disables protection for native operations and redirections |
-| `ISH_UNDO_COPY_LIMIT` | `64M` | Maximum userspace copy for one saved version |
-| `ISH_UNDO_MAX_SIZE` | `8G` | Retained logical data limit |
-| `ISH_UNDO_MAX_ENTRIES` | `500` | Retained transaction limit |
-| `ISH_UNDO_MAX_DAYS` | `30` | Transaction age limit |
-| `ISH_UNDO_MIN_FREE` | `1G` | Free space reserved for copying |
 
 ## Help and license
 

@@ -20,8 +20,7 @@ The `Exec` class in [`builtin.rs`](../src/builtin.rs) defines where ish-owned
 commands run. `InShell` commands must be the whole input line. `Hybrid`
 commands such as `cd` and `history` run with shell state when alone and use the
 stateless command path inside lists. `Native` commands can run in pipeline
-stages. `Undo` commands are routed through the recovery adapter. The registry
-is the source for builtin-name lookup and completion.
+stages. The registry is the source for builtin-name lookup and completion.
 
 `epsh` supports more syntax than ish exposes. Keep the acceptance check in
 `dispatch::plan()`; do not send unsupported syntax directly to epsh. Do not
@@ -38,9 +37,6 @@ add an ish-owned parser or general configuration language.
 - Directory listing, completion, pathname expansion, and prompt Git inspection
   run in-process. External commands and command substitutions may start child
   processes. A `.envrc` that requests bash evaluation may also start one.
-- ish installs the undo redirection-open provider so existing targets can be
-  preserved before a writable descriptor is returned. See [Undo](UNDO.md) for
-  the recovery invariants.
 
 ## Subsystem ownership
 
@@ -54,10 +50,6 @@ add an ish-owned parser or general configuration language.
 | Completion and directory listing | [`src/complete.rs`](../src/complete.rs), [`src/path.rs`](../src/path.rs), [`src/ls.rs`](../src/ls.rs) |
 | History search and ranking | [`src/history.rs`](../src/history.rs), [`src/frecency.rs`](../src/frecency.rs) |
 | Config, aliases and denv | [`src/config.rs`](../src/config.rs), [`src/alias.rs`](../src/alias.rs), [`src/denv.rs`](../src/denv.rs) |
-| Undo shell adapter | [`src/undo.rs`](../src/undo.rs); storage and replay belong to [`crates/ish-undo`](../crates/ish-undo/src/lib.rs) |
-
-The undo crate receives resolved paths, configuration and I/O handles. It does
-not depend on ish's parser, history, line editor or renderer.
 
 ## Shell terms
 
