@@ -37,7 +37,7 @@ jobs:
           rustup component add clippy
           cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --lib --tests
+        run: cargo test --workspace --lib --tests
 
   linux-musl:
     name: Lint and test (Linux musl)
@@ -74,3 +74,27 @@ jobs:
                 musl-cargo clippy --workspace --all-targets -- -D warnings
               make test TARGET=x86_64-unknown-linux-musl
             '
+
+  semantic:
+    name: Lean model and Rust bridge
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: leanprover/lean-action@24581d74d674803a25a81b10b059c5c0cdd344c6 # v1
+        with:
+          auto-config: "false"
+          build: "false"
+          test: "false"
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: semantic-ubuntu
+      - name: Verify Lean models and Rust bridge
+        run: make verify
