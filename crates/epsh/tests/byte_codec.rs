@@ -2,7 +2,7 @@ use epsh::encoding::{bytes_to_str, str_to_bytes};
 use epsh::eval::Shell;
 use epsh::parser::Parser;
 use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
@@ -110,6 +110,27 @@ fn quoted_private_use_heredocs_and_nested_scripts_preserve_bytes() {
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, format!("\\{value}\n").as_bytes());
     }
+}
+
+#[test]
+fn private_use_and_invalid_path_names_remain_distinct_during_globbing() {
+    let directory = tempfile::tempdir().unwrap();
+    let names = [vec![0xee, 0x80, 0x80], vec![0xee, 0x82, 0x80], vec![0x80]];
+    for name in &names {
+        std::fs::write(directory.path().join(OsString::from_vec(name.clone())), b"").unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
+        .current_dir(directory.path())
+        .arg("-c")
+        .arg(format!("'{}' ?", env!("CARGO_BIN_EXE_show_argv")))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let mut lines: Vec<_> = output.stdout.split(|b| *b == b'\n').filter(|line| !line.is_empty()).collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec![b"80".as_slice(), b"ee8080", b"ee8280"]);
+    let path = directory.path().join("\u{e080}");
+    assert_eq!(epsh::glob::glob("\u{e080}", directory.path()), vec![bytes_to_str(path.file_name().unwrap().as_bytes())]);
 }
 
 #[test]
