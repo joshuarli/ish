@@ -172,10 +172,10 @@ pub(crate) fn validate_response(value: Value, expected_id: &str) -> BridgeResult
         _ => return Err(BridgeError::new(format!("unknown response outcome {tag:?}"))),
     }
     let mut normalized = outcome.clone();
-    if normalized["tag"] == "semantic_error" {
-        if let Some(error) = normalized["error"].as_object_mut() {
-            error.remove("message");
-        }
+    if normalized["tag"] == "semantic_error"
+        && let Some(error) = normalized["error"].as_object_mut()
+    {
+        error.remove("message");
     }
     normalize_maps(&mut normalized)?;
     Ok(normalized)
@@ -299,9 +299,7 @@ fn validate_state(value: &Value) -> BridgeResult<()> {
         ],
         "shell state",
     )?;
-    for field in ["cwd"] {
-        require_bytes(&value[field], field)?;
-    }
+    require_bytes(&value["cwd"], "cwd")?;
     let status = value["last_status"]
         .as_u64()
         .filter(|status| *status < 256)

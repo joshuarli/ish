@@ -24,6 +24,7 @@ struct Options {
 
 pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
     let options = parse_args(args)?;
+    verify_nonsemantic_outcomes_rejected()?;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let binary = root.join("formal/.lake/build/bin/semanticBridge");
     if !binary.is_file() {
@@ -38,6 +39,12 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
     })?;
     verify_rust_protocol_boundary(&root)?;
     verify_protocol_boundary(&binary, &tmpdir, &root)?;
+    if options.families.contains(&Family::Policy) {
+        policy::verify_runtime_hook()?;
+    }
+    if options.families.contains(&Family::Effects) {
+        verify_effects_boundaries(&binary, &tmpdir)?;
+    }
     let mut groups = Vec::new();
     for family in options.families.iter().copied() {
         let (mut cases, generated_count) = match options.selected_id.as_deref() {
@@ -86,7 +93,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
             let actual = actual(request)?;
             let observed = validate_response(responses[offset + index].clone(), &request.id)?;
             let expected = normalize_actual(&actual, &request.id)?;
-            if expected != observed {
+            if !semantic_outcomes_match(family, &request.id, &expected, &observed)? {
                 let minimized = minimize_mismatch(&binary, &tmpdir, family, request)?;
                 let mut retained = minimized;
                 retained.id = regression_filename(family, &retained.id);
@@ -631,17 +638,41 @@ fn minimize_mismatch(
     family: Family,
     request: &Request,
 ) -> BridgeResult<Request> {
+    minimize_mismatch_with(family, request, |reduced| {
+        let responses = run_lean(binary, tmpdir, std::slice::from_ref(reduced))?;
+        responses
+            .into_iter()
+            .next()
+            .ok_or_else(|| BridgeError::new("Lean returned no minimized response"))
+    })
+}
+
+fn minimize_mismatch_with(
+    family: Family,
+    request: &Request,
+    mut observe: impl FnMut(&Request) -> BridgeResult<Value>,
+) -> BridgeResult<Request> {
     let mut candidate = request.clone();
+    let mut visited = HashSet::new();
+    visited.insert(request_key(&candidate)?);
     loop {
         let mut changed = false;
+        let current_key = request_key(&candidate)?;
         for reduced in shrink(family, &candidate)? {
-            let responses = run_lean(binary, tmpdir, &[reduced.clone()])?;
-            let Some(response) = responses.into_iter().next() else {
-                continue;
-            };
-            if normalize_actual(&actual(&reduced)?, &reduced.id)?
-                == validate_response(response, &reduced.id)?
+            let reduced_key = request_key(&reduced)?;
+            if (reduced_key.len(), &reduced_key) >= (current_key.len(), &current_key)
+                || !visited.insert(reduced_key)
             {
+                continue;
+            }
+            validate_case(&reduced)?;
+            let response = observe(&reduced)?;
+            let expected = normalize_actual(&actual(&reduced)?, &reduced.id)?;
+            let observed = validate_response(response, &reduced.id)?;
+            if !semantic_outcome(&expected) || !semantic_outcome(&observed) {
+                continue;
+            }
+            if semantic_outcomes_match(family, &reduced.id, &expected, &observed)? {
                 continue;
             }
             candidate = reduced;
@@ -652,17 +683,102 @@ fn minimize_mismatch(
             break;
         }
     }
-    let responses = run_lean(binary, tmpdir, &[candidate.clone()])?;
-    let response = responses
-        .into_iter()
-        .next()
-        .ok_or_else(|| BridgeError::new("Lean returned no minimized response"))?;
-    if normalize_actual(&actual(&candidate)?, &candidate.id)?
-        == validate_response(response, &candidate.id)?
-    {
+    let response = observe(&candidate)?;
+    let expected = normalize_actual(&actual(&candidate)?, &candidate.id)?;
+    let observed = validate_response(response, &candidate.id)?;
+    if !semantic_outcome(&expected) || !semantic_outcome(&observed) {
+        return Err(BridgeError::new("mismatch minimizer lost the original discrepancy"));
+    }
+    if semantic_outcomes_match(family, &candidate.id, &expected, &observed)? {
         return Err(BridgeError::new("mismatch minimizer lost the original discrepancy"));
     }
     Ok(candidate)
+}
+
+fn request_key(request: &Request) -> BridgeResult<Vec<u8>> {
+    serde_json::to_vec(&request.to_json())
+        .map_err(|error| BridgeError::new(format!("cannot measure shrink candidate: {error}")))
+}
+
+fn semantic_outcome(outcome: &Value) -> bool {
+    matches!(outcome["tag"].as_str(), Some("success" | "semantic_error"))
+}
+
+fn semantic_outcomes_match(
+    family: Family,
+    id: &str,
+    expected: &Value,
+    observed: &Value,
+) -> BridgeResult<bool> {
+    for (side, outcome) in [("Rust", expected), ("Lean", observed)] {
+        match outcome["tag"].as_str() {
+            Some("success" | "semantic_error") => {}
+            Some("unsupported_domain") => {
+                return Err(BridgeError::new(format!(
+                    "{} case {} reached unsupported_domain on the {side} side",
+                    family.name(),
+                    id
+                )));
+            }
+            Some("fuel_exhausted") => {
+                return Err(BridgeError::new(format!(
+                    "{} case {} exhausted fuel on the {side} side",
+                    family.name(),
+                    id
+                )));
+            }
+            tag => {
+                return Err(BridgeError::new(format!(
+                    "{} case {} has invalid semantic outcome tag {tag:?} on the {side} side",
+                    family.name(),
+                    id
+                )));
+            }
+        }
+    }
+    Ok(expected == observed)
+}
+
+fn verify_nonsemantic_outcomes_rejected() -> BridgeResult<()> {
+    for outcome in [
+        json!({"tag": "unsupported_domain", "reason": "probe"}),
+        json!({"tag": "fuel_exhausted"}),
+    ] {
+        if semantic_outcomes_match(Family::Effects, "runner-negative-control", &outcome, &outcome).is_ok() {
+            return Err(BridgeError::new(format!(
+                "runner accepted matching {} outcomes as a semantic pass",
+                outcome["tag"]
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_effects_boundaries(binary: &Path, tmpdir: &Path) -> BridgeResult<()> {
+    let requests = effects::boundary_cases();
+    let responses = run_lean(binary, tmpdir, &requests)?;
+    if responses.len() != requests.len() {
+        return Err(BridgeError::new("Lean effects boundary response count changed"));
+    }
+    for (request, response) in requests.iter().zip(responses) {
+        let expected = normalize_actual(&actual(request)?, &request.id)?;
+        let observed = validate_response(response, &request.id)?;
+        if expected != observed
+            || !matches!(expected["tag"].as_str(), Some("unsupported_domain" | "fuel_exhausted"))
+        {
+            return Err(BridgeError::new(format!(
+                "effects boundary {} did not return its explicit rejection outcome",
+                request.id
+            )));
+        }
+        if semantic_outcomes_match(Family::Effects, &request.id, &expected, &observed).is_ok() {
+            return Err(BridgeError::new(format!(
+                "effects boundary {} was incorrectly counted as a semantic pass",
+                request.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn shrink(family: Family, request: &Request) -> BridgeResult<Vec<Request>> {
@@ -697,4 +813,87 @@ fn retain_regression(root: &Path, family: Family, request: &Request) -> BridgeRe
         .map_err(|error| BridgeError::new(format!("cannot encode regression fixture: {error}")))?;
     fs::write(&path, bytes)
         .map_err(|error| BridgeError::new(format!("cannot retain {}: {error}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn matching_nonsemantic_outcomes_are_rejected() {
+        for outcome in [
+            json!({"tag": "unsupported_domain", "reason": "probe"}),
+            json!({"tag": "fuel_exhausted"}),
+        ] {
+            assert!(semantic_outcomes_match(Family::Effects, "probe", &outcome, &outcome).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_effects_boundary_fails_semantic_comparison() {
+        let request = effects::boundary_cases().remove(0);
+        let outcome = normalize_actual(&effects::actual(&request).expect("actual boundary"), &request.id)
+            .expect("normalized boundary");
+        assert_eq!(outcome["tag"], "unsupported_domain");
+        assert!(semantic_outcomes_match(Family::Effects, &request.id, &outcome, &outcome).is_err());
+    }
+
+    #[test]
+    fn matching_semantic_outcomes_are_accepted() {
+        let success = json!({"tag": "success", "value": {"route": "epsh"}});
+        assert!(matches!(
+            semantic_outcomes_match(Family::Policy, "probe", &success, &success),
+            Ok(true)
+        ));
+        let different = json!({"tag": "success", "value": {"route": "builtin"}});
+        assert!(matches!(
+            semantic_outcomes_match(Family::Policy, "probe", &success, &different),
+            Ok(false)
+        ));
+    }
+
+    #[test]
+    fn mismatch_with_repeating_shrinks_is_minimized_and_retained() {
+        let initial = policy::generate(0, DEFAULT_SEED).expect("generated policy case");
+        let request = policy::shrink(&initial)
+            .expect("policy shrink candidates")
+            .into_iter()
+            .next()
+            .expect("policy shrink candidate");
+        assert!(
+            policy::shrink(&request)
+                .expect("repeated policy shrink candidates")
+                .iter()
+                .any(|candidate| request_key(candidate).ok() == request_key(&request).ok())
+        );
+        let minimized = minimize_mismatch_with(Family::Policy, &request, |case| {
+            let expected = normalize_actual(&policy::actual(case)?, &case.id)?;
+            let altered = policy::negative_control(&expected)?;
+            Ok(json!({"version": 1, "id": case.id, "outcome": altered}))
+        })
+        .expect("minimized mismatch");
+        let minimized_key = request_key(&minimized).expect("minimized key");
+        let request_key = request_key(&request).expect("request key");
+        assert!((minimized_key.len(), &minimized_key) < (request_key.len(), &request_key));
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            ".work/tmp/bridge-minimizer-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let mut retained = minimized.clone();
+        retained.id = regression_filename(Family::Policy, &retained.id);
+        retain_regression(&root, Family::Policy, &retained).expect("retained mismatch");
+        let path = root
+            .join("formal/fixtures/bridge-regressions/policy")
+            .join(format!("{}.json", retained.id));
+        let loaded: Value = serde_json::from_slice(&fs::read(&path).expect("retained fixture bytes"))
+            .expect("retained fixture JSON");
+        assert_eq!(loaded["source"], json!(minimized.source));
+        fs::remove_dir_all(root).expect("removed temporary regression fixture");
+    }
 }
