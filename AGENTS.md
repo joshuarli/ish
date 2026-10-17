@@ -36,4 +36,6 @@ behavior contract.
 - History search ranking and session snapshots: [History search](docs/history-search.md).
 - Completion matching, ordering, and hot-path constraints: [Completion](docs/completion.md).
 - PTY test environment and synchronization: [PTY tests](docs/ptytest.md).
-- Lean model, protocol, and Rust bridge commands: [Development](README.md#development).
+- Lean project and bridge commands: [formal guide](formal/README.md),
+  [protocol](formal/PROTOCOL.md), and
+  [verification coverage](docs/verification/coverage.md).
