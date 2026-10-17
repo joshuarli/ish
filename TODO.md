@@ -1,5 +1,5 @@
 Prefix: ISH
-Next: 22
+Next: 23
 
 ### ISH-5 · P2 · Stopped pipelines disappear from foreground job control
 
@@ -28,4 +28,13 @@ Next: 22
 - **Problem:** Public safe wrappers call unsafe std environment mutation without enforcing its Unix process-wide concurrency preconditions. Public denv operations also reach those mutations. Safe library callers can invoke them while another thread uses libc environment readers. The pinned standard-library safety contract explicitly names such readers, including DNS resolution. This is a source-proven missing safety boundary; a concrete undefined-behavior manifestation is unproven and was not attempted. Normal ish foreground execution and joined relay threads do not establish an observed incident.
 - **Recommendation:** Expose the required safety contract through every public mutation entry point, or remove process-environment mutation from the library interface in favor of explicit environments. Changing only the three wrappers leaves the denv boundary unresolved.
 - **Fix with:** os-boundaries, api-surface-and-module-boundaries
+- **Effort:** M (days)
+
+### ISH-22 · P2 · History tail recovery leaves concurrent readers on stale occurrence IDs
+
+- **Area:** Data
+- **Where:** `src/history/store.rs:294`, `src/history/store.rs:414`, `src/history.rs:128`
+- **Problem:** Final-frame recovery truncates without changing the store generation. A focused regression loaded two entries into an existing reader, corrupted the final frame, and opened a fresh reader that retained one entry. After recovery and an external append reusing occurrence ID 2, the existing reader still contained the discarded second command and could not see the new external command.
+- **Recommendation:** Publish recovery that removes previously observable occurrences as a new generation, atomically replacing the retained prefix so readers rebuild their snapshots and reset occurrence cutoffs.
+- **Fix with:** durable-state
 - **Effort:** M (days)
