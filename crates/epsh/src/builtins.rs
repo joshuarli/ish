@@ -954,7 +954,7 @@ impl Shell {
         let found = optchars.iter().position(|&c| c == opt);
         match found {
             Some(pos) => {
-                let _ = self.vars.set_shell(name, &opt.to_string());
+                let _ = self.vars.set_shell(name, opt);
                 let needs_arg = pos + 1 < optchars.len() && optchars[pos + 1] == ":";
                 if needs_arg {
                     // Option argument
@@ -989,7 +989,7 @@ impl Shell {
             None => {
                 let silent = optstring.starts_with(':');
                 if silent {
-                    let _ = self.vars.set_shell("OPTARG", &opt.to_string());
+                    let _ = self.vars.set_shell("OPTARG", opt);
                 } else {
                     self.err_msg(&format!("getopts: illegal option -- {opt}"));
                 }
