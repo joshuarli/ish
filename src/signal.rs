@@ -68,14 +68,8 @@ pub fn restore_defaults() {
 
 fn set_default(sig: rustix::process::Signal) {
     #[cfg(target_os = "linux")]
-    unsafe {
-        let action = rustix::runtime::KernelSigaction {
-            sa_handler_kernel: rustix::runtime::KERNEL_SIG_DFL,
-            sa_flags: rustix::runtime::KernelSigactionFlags::empty(),
-            sa_restorer: None,
-            sa_mask: rustix::runtime::KernelSigSet::empty(),
-        };
-        let _ = rustix::runtime::kernel_sigaction(sig, Some(action));
+    {
+        set_linux_disposition(sig, libc::SIG_DFL);
     }
 
     #[cfg(target_os = "macos")]
@@ -111,19 +105,23 @@ fn install_handler(sig: rustix::process::Signal) {
 
 fn ignore(sig: rustix::process::Signal) {
     #[cfg(target_os = "linux")]
-    unsafe {
-        let action = rustix::runtime::KernelSigaction {
-            sa_handler_kernel: rustix::runtime::kernel_sig_ign(),
-            sa_flags: rustix::runtime::KernelSigactionFlags::empty(),
-            sa_restorer: None,
-            sa_mask: rustix::runtime::KernelSigSet::empty(),
-        };
-        let _ = rustix::runtime::kernel_sigaction(sig, Some(action));
+    {
+        set_linux_disposition(sig, libc::SIG_IGN);
     }
 
     #[cfg(target_os = "macos")]
     unsafe {
         darwin_sigaction(sig.as_raw(), 1, 0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_linux_disposition(sig: rustix::process::Signal, handler: libc::sighandler_t) {
+    // SAFETY: `sig` is a valid rustix signal and callers pass libc disposition constants.
+    let previous = unsafe { libc::signal(sig.as_raw(), handler) };
+    if previous == libc::SIG_ERR {
+        let error = std::io::Error::last_os_error();
+        panic!("failed to set signal {} disposition: {error}", sig.as_raw());
     }
 }
 
