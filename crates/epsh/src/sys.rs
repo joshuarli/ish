@@ -86,21 +86,39 @@ pub fn write(fd: RawFd, buf: *const u8, len: usize) {
     let _ = rustix::io::write(unsafe { BorrowedFd::borrow_raw(fd) }, slice);
 }
 
-/// Duplicate a file descriptor. Mirrors libc `dup2`: makes `newfd` a copy of
-/// `oldfd`, closing `newfd` first if open. Returns newfd on success, -1 on error.
 pub fn dup2(oldfd: RawFd, newfd: RawFd) -> i32 {
-    // SAFETY: standard dup2. We take ownership of newfd via an OwnedFd, then
-    // leak it with `forget` after the call, matching the pattern used by
-    // `rustix::stdio::dup2_stdin` and similar rustix helpers.
-    unsafe {
-        let mut new = OwnedFd::from_raw_fd(newfd);
-        let result = rustix::io::dup2(BorrowedFd::borrow_raw(oldfd), &mut new);
-        // Prevent Drop from closing newfd regardless of success/failure.
-        std::mem::forget(new);
-        match result {
-            Ok(()) => newfd,
-            Err(_) => -1,
-        }
+    match dup2_result(oldfd, newfd) {
+        Ok(()) => newfd,
+        Err(_) => -1,
+    }
+}
+
+pub fn dup2_result(oldfd: RawFd, newfd: RawFd) -> std::io::Result<()> {
+    // SAFETY: libc dup2 accepts a closed destination and leaves descriptor ownership with the caller.
+    let result = unsafe { libc::dup2(oldfd, newfd) };
+    if result == newfd {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+pub fn duplicate_fd_above(fd: RawFd, min_fd: RawFd) -> std::io::Result<OwnedFd> {
+    // SAFETY: fcntl accepts raw shell descriptor numbers and reports EBADF when fd is closed.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, min_fd) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a newly allocated open descriptor owned by this function.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+
+pub fn descriptor_is_open(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl accepts raw shell descriptor numbers and reports EBADF when fd is closed.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
