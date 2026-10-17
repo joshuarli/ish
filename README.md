@@ -93,9 +93,20 @@ echo $((1 + 2))
 `${NAME}` is accepted alongside `$NAME`; parameter operators such as
 `${NAME:-default}` are refused. Background `&`, scripts, conditionals (`if`,
 `for`, `while`, `case`), subshells, brace groups, functions, `source`, `.`, and
-`eval` are not supported. Commands that need shell state, including `alias`,
-`exit`, `fg`, `denv`, and `z`, must be the whole input line. `cd` and `history`
-can also be used in lists.
+`eval` are not supported. ish checks the command target after expansion too.
+If expansion selects `eval`, `source`, `.`, or a shell-state builtin outside
+its allowed whole-line form, ish refuses the command with status 2 before that
+target runs or opens its redirections. Earlier commands in the input line keep
+their effects. Commands that need shell state, including `alias`, `exit`, `fg`,
+`denv`, and `z`, must be the whole input line. `cd` and `history` can also be
+used in lists.
+
+Arithmetic uses signed 64-bit values. Addition, subtraction, multiplication,
+and negation wrap. Division or remainder by zero, division or remainder of the
+minimum value by -1, and shift counts outside 0 through 63 return an arithmetic
+error. Left shift keeps the low 64 bits; right shift is arithmetic. Compound
+arithmetic assignments use the same rules. A failed operation leaves its
+assignment destination unchanged, while effects from the right-hand side stay.
 
 A bare directory name becomes an implicit `cd` only when it does not match a
 builtin, alias, or executable on `PATH`. Use `cd name` to enter a directory
@@ -141,3 +152,23 @@ Evaluation stops after 60 seconds.
 
 Report issues at [GitHub Issues](https://github.com/joshuarli/ish/issues). This
 repository does not specify a license.
+
+## Development
+
+ish and epsh share a Cargo workspace and lockfile. The Makefile provides these
+workspace commands:
+
+| Command | Checks |
+|---|---|
+| `make build` | Build the workspace. |
+| `make test` | Run Rust tests for the workspace. |
+| `make test-epsh` | Run epsh library and integration tests. |
+| `make conformance` | Print each retained native corpus case. |
+| `make verify` | Check Lean models, theorem axioms, and the Rust differential bridge. |
+| `make check` | Run workspace lint, Rust tests, and semantic verification. |
+
+The Lean project lives in `formal/` and pins Lean in `formal/lean-toolchain`.
+Lean proofs establish properties of the model. The Rust bridge compares model
+results with actual Rust entry points for its admitted inputs. Rust unit,
+integration, and PTY tests cover implementation behavior outside that domain.
+The bridge does not prove that the model covers every Rust behavior.

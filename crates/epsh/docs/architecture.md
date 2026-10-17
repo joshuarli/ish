@@ -28,6 +28,19 @@ Several evaluator rules are easy to break during changes:
 - Eligible simple builtin command substitutions and the file-only input
   redirection command substitution have in-process paths.
 
+The builder and `Shell` expose an optional `CommandPolicy`. epsh checks the
+expanded command target before builtin or function dispatch, including nested
+`command` indirection and command substitutions. The default has no policy.
+An embedder can return a diagnostic to stop dispatch with status 2. The policy
+does not undo earlier command or expansion effects.
+
+Arithmetic expressions use signed 64-bit values. Addition, subtraction,
+multiplication, and negation wrap. Division and remainder by zero or the
+minimum value by -1 fail. Shift counts outside 0 through 63 fail. Left shift
+keeps the low 64 bits and right shift is arithmetic. Compound assignments use
+the same operations. A failed arithmetic assignment keeps the old destination
+value and retains right-hand-side effects.
+
 Use shell terms consistently: a token is a lexical unit; a word is an
 unexpanded sequence of word parts; a field is an argument after expansion. A
 pipeline joins commands with a pipe. An AND-OR list joins commands with && or

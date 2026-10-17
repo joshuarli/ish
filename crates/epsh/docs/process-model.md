@@ -19,6 +19,14 @@ external_command_cwd() when it needs the shell's working directory. The
 environment includes inherited entries unless env_clear was selected, exported
 shell variables, and command-prefix assignments.
 
+An embedder can install a command policy on the builder or with
+`Shell::set_command_policy`. epsh calls it with the expanded target before
+builtin or function dispatch. The policy also sees targets reached through
+nested `command` builtins and command substitutions. Returning a diagnostic
+stops the target with status 2 before its effects and redirections. The default
+shell has no policy. A policy does not undo effects from earlier commands or
+expansion.
+
 The optional redirect-open handler owns only the opening of writable targets:
 truncating output, forced output, append output, and read/write redirections.
 It must honor the requested create, truncate, append, or read-write mode. Input
