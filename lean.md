@@ -1,7 +1,10 @@
 # Execute the ish semantic foundations campaign
 
-Status: executing. Owner granted implementation, local commits, the unsquashed
-epsh import, and the described CI edits on 2026-10-17. No pushes or publication.
+Status: incomplete. All local acceptance checks pass. Native macOS Apple silicon
+and Linux ARM64 hosts are unavailable; remote CI was not authorized.
+
+The owner granted implementation, local commits, the unsquashed epsh import, and
+the described CI edits on 2026-10-17. No pushes or publication were authorized.
 
 Build one Rust workspace containing ish and epsh, replace Perl conformance testing,
 and establish an audited Lean model connected to production Rust behavior.
@@ -525,9 +528,9 @@ Status: incomplete. All local acceptance checks pass. Native macOS Apple silicon
 and Linux ARM64 hosts are unavailable; remote CI was not authorized.
 
 The unsquashed epsh import and one-workspace conversion are integrated. The Rust
-conformance corpus retains all 175 IDs: 168 pass and seven remain explicit,
-category exclusions (`shell:legacy-no`, `shell:int32`, `shell:int64`, and
-`shell:intu`). Lean 4.35 checks six semantic families: policy, expansion,
+conformance corpus retains all 175 IDs: 168 pass, and seven are explicit
+exclusions under `shell:legacy-no`, `int:32`, `int:64`, and `int:u`. Lean 4.35
+checks six semantic families: policy, expansion,
 arithmetic, evaluation, effects, and interactive behavior. The bridge compares
 1,000 generated cases per family with production Rust entry points, detects each
 family's mutation control, and validates 52 theorem links. The model uses finite
@@ -553,8 +556,9 @@ does not weaken sandboxing or change host directories. The Rust nightly pin is
 unchanged.
 
 Resource measurements compare baseline `a3de4c4` with final source `088caa8`,
-using the same corrected, trusted-denv fixture. Clean builds used fresh targets,
-`KACHE_DISABLED`, and scoped GNU time. No cross-configuration comparison is used.
+using the same corrected, trusted-denv fixture. Both sides used
+`CARGO_BUILD_JOBS=8`. Clean builds used fresh targets, `KACHE_DISABLED`, and
+scoped GNU time. No cross-configuration comparison is used.
 
 | Measurement | Baseline min / median / max | Final min / median / max |
 | --- | --- | --- |
@@ -574,6 +578,9 @@ is 1,098,088 bytes at baseline and 1,170,120
 bytes at final source, an increase of 72,032 bytes (6.56%). The dynamic artifact
 is 1,111,296 bytes. Developer costs include the full all-target build, not an
 isolated dependency cost.
+
+Warm CPU and wall measurements are reported at 0.01-second timer precision. These
+near-floor values do not support percentage comparisons.
 
 All 14 runtime and allocation workloads pass five interleaved pairs of 31 samples
 each, below 2x; median ratios range from 0.947 to 1.092. For denv, baseline median
