@@ -519,11 +519,86 @@ Append one line per material executor judgment, with the call and its reason.
 Append one line per phase end with commands, outcomes, contract changes, and remaining
 hard stops. Baseline IDs and theorem coverage belong in their tested artifacts.
 
-## For the owner afterwards
+## Closeout report
 
-Read the final diff, README, docs/verification/coverage.md, native corpus comparison,
-and the final report. The report names import results, corpus outcomes, theorem
-families, actual Rust correspondence, assumptions, policy/arithmetic fixes,
-measurements, platform/CI checks not run, and ranked remaining findings.
-List accepted local commits in integration order for cherry-picking when work was
-isolated. Leave no decision or approval gate in that report.
+Status: incomplete. All local acceptance checks pass. Native macOS Apple silicon
+and Linux ARM64 hosts are unavailable; remote CI was not authorized.
+
+The unsquashed epsh import and one-workspace conversion are integrated. The Rust
+conformance corpus retains all 175 IDs: 168 pass and seven remain explicit,
+category exclusions (`shell:legacy-no`, `shell:int32`, `shell:int64`, and
+`shell:intu`). Lean 4.35 checks six semantic families: policy, expansion,
+arithmetic, evaluation, effects, and interactive behavior. The bridge compares
+1,000 generated cases per family with production Rust entry points, detects each
+family's mutation control, and validates 52 theorem links. The model uses finite
+fuel and supplied observations for external behavior. Aeneas and Charon are
+unavailable, so no Rust refinement proof is claimed.
+
+The final-source workspace tests pass 952 tests across 27 runners, including 140
+PTY tests. All-target Clippy, the semantic bridge, epsh package and publish
+dry-run, and a separate epsh consumer pass. After the final denv change at
+088caa8, its focused suite passes 25 tests. Static and dynamic
+`make verify-release` checks pass, including release ELF checks and 140 PTY tests
+for each artifact. The static binary is 1,170,120 bytes, 72,032 bytes (6.56%)
+above the 1,098,088-byte baseline; the dynamic binary is 1,111,296 bytes.
+Development dependencies are absent from both artifacts.
+The project pins Lean 4.35, and kernel checks used the installed 4.35 binaries via
+a scoped `PATH`. The global `~/.local/bin/lake` remains at 4.34.1. No global
+toolchain selection changed. At 353b215, hardened Lean, lean4lean (95,742
+declarations), nanoda, con-leche, con-ron, and default kernel checks pass. The
+final axiom set is `propext`, `Quot.sound`, and `Classical.choice`. Its scoped
+sandbox shim creates a private `/run` for the existing `/run/user` mount on hosts
+lacking that parent; it
+does not weaken sandboxing or change host directories. The Rust nightly pin is
+unchanged.
+
+Resource measurements compare baseline `a3de4c4` with final source `088caa8`,
+using the same corrected, trusted-denv fixture. Clean builds used fresh targets,
+`KACHE_DISABLED`, and scoped GNU time. No cross-configuration comparison is used.
+
+| Measurement | Baseline min / median / max | Final min / median / max |
+| --- | --- | --- |
+| Clean static CPU (s) | 49.71 / 52.30 / 53.94 | 52.53 / 53.06 / 55.63 |
+| Clean static wall (s) | 35.99 / 37.64 / 38.56 | 38.34 / 38.75 / 40.75 |
+| Clean static peak RSS (KiB) | 1,245,752 / 1,246,840 / 1,249,444 | 1,243,460 / 1,246,636 / 1,248,788 |
+| Developer cold CPU (s) | 45.63 / 50.18 / 58.07 | 50.07 / 53.32 / 56.41 |
+| Developer cold wall (s) | 9.19 / 10.00 / 10.82 | 9.88 / 9.90 / 10.48 |
+| Developer cold peak RSS (KiB) | 401,696 / 402,400 / 404,584 | 394,140 / 397,380 / 397,744 |
+| Developer warm CPU (s) | 0.03 / 0.03 / 0.04 | 0.03 / 0.03 / 0.04 |
+| Developer warm wall (s) | 0.03 / 0.04 / 0.04 | 0.04 / 0.04 / 0.04 |
+| Developer warm peak RSS (KiB) | 33,144 / 33,884 / 34,112 | 34,736 / 35,416 / 35,680 |
+
+All five clean-static and developer-check pairs pass the 2x ceiling. CPU and wall
+ranges overlap, while all peak RSS values remain within the ceiling. Static size
+is 1,098,088 bytes at baseline and 1,170,120
+bytes at final source, an increase of 72,032 bytes (6.56%). The dynamic artifact
+is 1,111,296 bytes. Developer costs include the full all-target build, not an
+isolated dependency cost.
+
+All 14 runtime and allocation workloads pass five interleaved pairs of 31 samples
+each, below 2x; median ratios range from 0.947 to 1.092. For denv, baseline median
+latency is 93.125 µs (85.203–98.829) and candidate latency is 101.693 µs
+(98.127–104.188). The ranges overlap, so these measurements establish no reliable
+speedup. Allocation per timed operation changes from 714 allocations and 37,538
+bytes to 711 allocations and 37,319 bytes. An initial single-transition sample
+varied widely and does not establish stable latency. No optional optimization
+gain is established.
+
+The documented contracts now include the opt-in `command_policy` hook, wrapping
+i64 arithmetic and explicit error boundaries, `Variables::bindings_bytes`,
+`Shell::set_exit_status`, and strict `try_parse_word_parts` and
+`try_parse_word_parts_bytes` helpers that preserve the legacy `Vec` helpers.
+Command policy is opt-in; epsh remains unrestricted by default. The development
+bridge enforces its byte-based JSON protocol, tagged outcomes, and explicit fuel
+and unsupported-domain results. Its dev-only `serde_json` dependency validates
+that protocol; version 1.0.154 is MIT or Apache-2.0 licensed and adds no production
+dependency. `serde_core` is its only new compiled development transitive.
+`regex-lite` reuses an existing rustybench transitive dependency for corpus
+patterns. Process, descriptor, byte handling, and interactive behavior
+are documented in the existing READMEs. The denv persistence change retains
+atomic mode-0600 temporary writes, write-all, rename, and error rollback. It
+changes no file format or crash-recovery contract.
+
+The remaining hard stops are native macOS Apple silicon and Linux ARM64 hosts,
+which are unavailable, and remote CI, which was not authorized. The campaign is
+incomplete on those platforms.
