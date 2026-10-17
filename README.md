@@ -171,4 +171,6 @@ The Lean project lives in `formal/` and pins Lean in `formal/lean-toolchain`.
 Lean proofs establish properties of the model. The Rust bridge compares model
 results with actual Rust entry points for its admitted inputs. Rust unit,
 integration, and PTY tests cover implementation behavior outside that domain.
-The bridge does not prove that the model covers every Rust behavior.
+The bridge does not prove that the model covers every Rust behavior. See the
+[formal project guide](formal/README.md) and [coverage matrix](docs/verification/coverage.md)
+for the checked domains and limits.
