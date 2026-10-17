@@ -104,12 +104,7 @@ their effects. Commands that need shell state, including `alias`, `exit`, `fg`,
 `denv`, and `z`, must be the whole input line. `cd` and `history` can also be
 used in lists.
 
-Arithmetic uses signed 64-bit values. Addition, subtraction, multiplication,
-and negation wrap. Division or remainder by zero, division or remainder of the
-minimum value by -1, and shift counts outside 0 through 63 return an arithmetic
-error. Left shift keeps the low 64 bits; right shift is arithmetic. Compound
-arithmetic assignments use the same rules. A failed operation leaves its
-assignment destination unchanged, while effects from the right-hand side stay.
+Arithmetic follows [epsh's signed 64-bit rules](crates/epsh/README.md#arithmetic).
 
 A bare directory name becomes an implicit `cd` only when it does not match a
 builtin, alias, or executable on `PATH`. Use `cd name` to enter a directory

@@ -111,6 +111,8 @@ applied to file descriptors. The environment includes inherited entries unless
 env_clear was selected, exported shell variables, and command-prefix
 assignments.
 
+## Arithmetic
+
 Arithmetic uses signed 64-bit values. Addition, subtraction, multiplication,
 and negation wrap. Division or remainder by zero, division or remainder of the
 minimum value by -1, and shift counts outside 0 through 63 return an arithmetic

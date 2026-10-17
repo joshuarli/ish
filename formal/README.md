@@ -38,40 +38,14 @@ The coverage matrix records each adapter's domain. A detected semantic
 mismatch is reduced and saved under
 `formal/fixtures/bridge-regressions/`.
 
-The bridge calls production Rust entry points for each family. Its generated
-domains are bounded. Expansion supplies controlled filesystem entries,
-evaluation supplies command observations, and effects checks selected raw-byte,
-environment, cwd, and redirection operations subject to host OS preconditions.
-The expansion adapter requires command substitutions to leave parent variables
-and cwd unchanged. Its model retains the substitution status but discards child
-binding deltas; arithmetic effects can update parent bindings. Returned errors
-abort expansion, while a nonzero command status remains a successful substitution
-result. The bridge compares projected
-`arithmetic` and `expansion` error categories; it does not claim exact Rust error
-variant correspondence. Typed cancellation propagation has a direct Rust test.
-The evaluation adapter checks that a bare assignment returns status 0 when no
-command substitution runs and the final substitution status otherwise, using
-bounded `false` and `true` assignment cases.
-The [coverage matrix](../docs/verification/coverage.md) describes those limits
-for each adapter.
-
-Expansion retains its first 53 fixtures and then uses a seeded schedule covering
-315 combinations of separator bytes, delimiter boundaries, and quoting contexts.
-The [generation reference](../docs/verification/expansion-generation.md) lists the
-dimensions and limitations.
-
 `make verify` also compiles four isolated production mutations and requires the
 bridge to detect each one. The [mutation guide](../docs/verification/mutation-testing.md)
 describes the detectors and their Python requirement. Run `make verify-refinement`
 on Linux to extract and prove the production shift-count helper. Its first run
 downloads a separate development toolchain under `.work/`.
 
-The mismatch minimizer accepts only validated candidates with a strictly
-smaller serialized request key. It tracks visited candidates to avoid shrink
-cycles. Focused runner tests cover semantic versus nonsemantic outcomes,
-boundary rejection, strict decrease, and repeated shrink candidates.
-
-The Rust PUA codec and the Lean octet map are separate representations. The
-bridge tests their selected observable behavior. The byte codec has no Rust
-refinement proof. The separate extracted proof covers shift-count validation
-and conversion only.
+See the [coverage matrix](../docs/verification/coverage.md) for bridge domains
+and correspondence limits, [expansion generation](../docs/verification/expansion-generation.md)
+for generated inputs, [mutation testing](../docs/verification/mutation-testing.md)
+for production controls, and [shift refinement](../docs/verification/refinement.md)
+for the extracted proof and its trust boundary.

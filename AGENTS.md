@@ -44,3 +44,7 @@ behavior contract.
 - Lean project and bridge commands: [formal guide](formal/README.md),
   [protocol](formal/PROTOCOL.md), and
   [verification coverage](docs/verification/coverage.md).
+- Verification details: [expansion generation](docs/verification/expansion-generation.md),
+  [mutations](docs/verification/mutation-testing.md),
+  [shift refinement](docs/verification/refinement.md), and
+  [history-search measurements](docs/verification/history-search-profile.md).
