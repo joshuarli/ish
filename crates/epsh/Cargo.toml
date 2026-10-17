@@ -42,15 +42,3 @@ rustix = { version = "1.1.4", features = ["event", "fs", "pipe", "process", "run
 [dev-dependencies]
 tempfile = "3"
 
-[profile.dev]
-opt-level = 2
-debug = "line-tables-only"
-split-debuginfo = "unpacked"
-incremental = false
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
