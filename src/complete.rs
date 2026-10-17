@@ -455,7 +455,10 @@ fn finish_candidates(comp: &mut Completions, before: usize, prefix: &str, prefix
             }
         }
     }
-    comp.sort_by_mtime();
+    let names = comp.names.as_bytes();
+    comp.entries[before..].sort_unstable_by(|a, b| {
+        b.mtime.cmp(&a.mtime).then_with(|| cmp_icase_arena(names, a, b))
+    });
 }
 
 /// Complete entries in `dir` matching `prefix`.
@@ -983,6 +986,33 @@ mod tests {
             names.iter().any(|n| n.starts_with("main")),
             "expected main.rs in {names:?}"
         );
+    }
+
+    #[test]
+    fn partial_path_groups_preserve_each_files_directory() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".work/tmp")
+            .join(format!("partial-groups-{}", std::process::id()));
+        for (directory, files) in [("alphaA", [("itemA", 100), ("itemC", 300)]),
+                                   ("alphaB", [("itemB", 200), ("itemD", 400)])] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+            for (name, seconds) in files {
+                let file = std::fs::File::create(root.join(directory).join(name)).unwrap();
+                file.set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                )).unwrap();
+            }
+        }
+        let (comp, groups) = complete_partial_path(root.join("al/item").to_str().unwrap(), false);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(comp.len(), 4);
+        for (directory, start, count) in groups {
+            for index in start..start + count {
+                let target = std::path::Path::new(&directory).join(comp.name(index));
+                assert!(target.is_file(), "completion points to {}", target.display());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
