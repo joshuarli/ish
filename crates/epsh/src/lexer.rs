@@ -1514,26 +1514,19 @@ fn single_literal_text(parts: &[WordPart]) -> Option<&str> {
     None
 }
 
-/// Try to split a word's parts into an assignment (name=value).
-/// Returns Some((name, value_parts)) if the first Literal starts with `name=`.
 fn try_split_assignment(parts: &[WordPart]) -> Option<(String, Vec<WordPart>)> {
     if let Some(WordPart::Literal(first)) = parts.first()
-        && let Some(first) = first.as_utf8_str()
-        && let Some(eq_pos) = first.find('=')
+        && let Some(eq_pos) = first.as_bytes().iter().position(|byte| *byte == b'=')
+        && let Ok(name) = std::str::from_utf8(&first.as_bytes()[..eq_pos])
+        && !name.is_empty() && is_name(name)
     {
-        let name = &first[..eq_pos];
-        if !name.is_empty() && is_name(name) {
-            let name = name.to_string();
-            let rest_of_first = &first[eq_pos + 1..];
-            let mut value_parts = Vec::new();
-            if !rest_of_first.is_empty() {
-                value_parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&rest_of_first.to_string())));
-            }
-            for part in &parts[1..] {
-                value_parts.push(part.clone());
-            }
-            return Some((name, value_parts));
+        let mut value_parts = Vec::new();
+        let value = &first.as_bytes()[eq_pos + 1..];
+        if !value.is_empty() {
+            value_parts.push(WordPart::Literal(ShellBytes::from_vec(value.to_vec())));
         }
+        value_parts.extend_from_slice(&parts[1..]);
+        return Some((name.to_string(), value_parts));
     }
     None
 }

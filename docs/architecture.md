@@ -11,7 +11,7 @@ ish's user-facing syntax smaller than epsh's parser and runtime.
    rejects constructs outside the supported subset. The accepted syntax is
    listed in the [README](../README.md).
 3. A whole-line shell builtin is dispatched in ish. Other accepted programs are
-   evaluated by epsh with ish's external-command handler.
+   evaluated by epsh with ish's command policy and external-command handler.
 4. The handler runs ish-owned builtins where needed and starts external
    commands with process-group and terminal control. ish synchronizes the
    resulting status and working directory.
@@ -25,6 +25,12 @@ stages. The registry is the source for builtin-name lookup and completion.
 `epsh` supports more syntax than ish exposes. Keep the acceptance check in
 `dispatch::plan()`; do not send unsupported syntax directly to epsh. Do not
 add an ish-owned parser or general configuration language.
+
+The epsh command policy checks expanded targets before builtin or function
+dispatch. ish uses it to refuse dynamically selected `eval`, `source`, `.`, and
+shell-state builtins outside their whole-line route. These refusals return
+status 2 before the target runs or opens its redirections. The policy does not
+undo effects from earlier commands or expansion.
 
 ## State and process boundaries
 
@@ -50,6 +56,26 @@ add an ish-owned parser or general configuration language.
 | Completion and directory listing | [`src/complete.rs`](../src/complete.rs), [`src/path.rs`](../src/path.rs), [`src/ls.rs`](../src/ls.rs) |
 | History search and ranking | [`src/history.rs`](../src/history.rs), [`src/frecency.rs`](../src/frecency.rs) |
 | Config, aliases and denv | [`src/config.rs`](../src/config.rs), [`src/alias.rs`](../src/alias.rs), [`src/denv.rs`](../src/denv.rs) |
+
+## Semantic verification
+
+The Lean project in [`formal/`](../formal/) models arithmetic, expansion,
+syntax policy, evaluation, effects, and interactive behavior. Its theorems
+establish properties of those definitions. They do not prove that Rust
+implements every modeled rule.
+
+The development bridge parses inputs with epsh and runs admitted cases through
+Rust entry points and Lean models. It compares their outcomes for six families:
+policy, expansion, arithmetic, evaluation, effects, and interactive behavior.
+Each family has an explicit input domain. Unsupported inputs and exhausted fuel
+do not count as successes. Rust unit, integration, and PTY tests separately
+check implementation behavior, including cases outside the bridge domains.
+Process and PTY tests also exercise operating-system behavior.
+
+The [`make verify` target](../Makefile) builds the formal project, checks
+protocol fixtures, audits theorem axioms, and runs 1,000 generated cases for
+each bridge family.
+See [epsh testing](../crates/epsh/docs/testing.md) for Rust and native corpus commands.
 
 ## Shell terms
 

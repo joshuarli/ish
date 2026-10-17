@@ -66,6 +66,14 @@ fn public_text_values_are_utf8_and_encoded_values_decode_explicitly() {
 }
 
 #[test]
+fn unquoted_assignment_values_preserve_unicode_and_invalid_bytes() {
+    let source = b"v=\xee\x80\x80\xee\x82\x80; printf '%s' \"$v\"";
+    assert_eq!(captured(source, true), b"\xee\x80\x80\xee\x82\x80");
+    let source = b"v=\x80\xee\x82\x80\xff; printf '%s' \"$v\"";
+    assert_eq!(captured(source, false), b"\x80\xee\x82\x80\xff");
+}
+
+#[test]
 fn lexer_spans_count_source_characters_without_codec_prefixes() {
     let mut lexer = epsh::lexer::Lexer::new("\u{e000}\u{e080}\u{e0ff} next");
     lexer.next_token().unwrap();
@@ -131,6 +139,62 @@ fn private_use_and_invalid_path_names_remain_distinct_during_globbing() {
     assert_eq!(lines, vec![b"80".as_slice(), b"ee8080", b"ee8280"]);
     let path = directory.path().join("\u{e080}");
     assert_eq!(epsh::glob::glob("\u{e080}", directory.path()), vec![bytes_to_str(path.file_name().unwrap().as_bytes())]);
+}
+
+#[test]
+fn glob_order_uses_filename_bytes_instead_of_codec_prefixes() {
+    let directory = tempfile::tempdir().unwrap();
+    for name in ["\u{e001}", "\u{e080}"] {
+        std::fs::write(directory.path().join(name), b"").unwrap();
+    }
+    let names: Vec<_> = epsh::glob::glob("*", directory.path()).iter().map(|name| str_to_bytes(name)).collect();
+    assert_eq!(names, vec!["\u{e001}".as_bytes(), "\u{e080}".as_bytes()]);
+}
+
+#[test]
+fn builtin_byte_consumers_preserve_unicode_units_and_raw_data() {
+    let pua = "\u{e080}";
+    let source = format!("printf '%c|%2s|%.1s|' '{pua}' '{pua}' '{pua}'; getopts '{pua}:' option '-{pua}{pua}'; printf '%s:%s' \"$option\" \"$OPTARG\"");
+    let mut expected = format!("{pua}| {pua}|").into_bytes();
+    expected.extend_from_slice(&[0xee, b'|']);
+    expected.extend_from_slice(format!("{pua}:{pua}").as_bytes());
+    assert_eq!(captured(source.as_bytes(), true), expected);
+
+    let mut source = format!("IFS='{pua}'; read -r first second <<'EOF'\na{pua}").into_bytes();
+    source.extend_from_slice(&[0x80, 0xee, 0x80, 0x80]);
+    source.extend_from_slice(b"\nEOF\nprintf '%s:%s' \"$first\" \"$second\"");
+    let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
+        .arg("-c").arg(OsString::from_vec(source)).output().unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"a:\x80\xee\x80\x80");
+    assert_eq!(captured(b"printf '\\0200'", true), b"\x80");
+}
+
+#[test]
+fn bad_interpreter_lookup_and_diagnostics_preserve_os_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let bin = directory.path().join(OsString::from_vec(b"bin\xee\x82\x80\x80".to_vec()));
+    std::fs::create_dir(&bin).unwrap();
+    let name = OsString::from_vec(b"cmd\xee\x82\x80\xff".to_vec());
+    let interpreter = b"/absent-codec-interpreter/\xee\x82\x80\x80";
+    let mut source = b"#!".to_vec();
+    source.extend_from_slice(interpreter);
+    source.push(b'\n');
+    let path = bin.join(&name);
+    std::fs::write(&path, source).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let diagnostic = epsh::eval::bad_interpreter_message_os(&name, libc::ENOENT, directory.path(), bin.as_os_str()).unwrap();
+    let mut prefix = name.as_bytes().to_vec();
+    prefix.extend_from_slice(b": ");
+    prefix.extend_from_slice(interpreter);
+    prefix.extend_from_slice(b": bad interpreter: ");
+    assert!(diagnostic.as_bytes().starts_with(&prefix));
+    let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
+        .current_dir(directory.path()).env("PATH", &bin)
+        .arg("-c").arg(name).output().unwrap();
+    assert_eq!(output.status.code(), Some(126));
+    assert!(output.stderr.starts_with(&prefix), "{:?}", output.stderr);
 }
 
 #[test]
