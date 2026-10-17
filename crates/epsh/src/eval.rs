@@ -1138,8 +1138,7 @@ impl Shell {
                     // EV_EXIT optimization. Prevents pipe fd leaks.
                     let saved = self.setup_redirections(redirs)?;
                     let result = self.eval_command(body);
-                    self.restore_redirections(saved);
-                    result
+                    self.finish_redirections(result, saved)
                 } else {
                     self.eval_in_subshell(body, redirs)
                 }
@@ -1152,8 +1151,7 @@ impl Shell {
             } => {
                 let saved = self.setup_redirections(redirs)?;
                 let result = self.eval_command(body);
-                self.restore_redirections(saved);
-                result
+                self.finish_redirections(result, saved)
             }
 
             Command::If {
@@ -1421,16 +1419,10 @@ impl Shell {
         };
 
         if is_exec {
-            // exec redirections are permanent — close saved copies instead of restoring
-            for s in saved_fds {
-                if let Some(copy) = s.saved_copy {
-                    let _ = sys::close(copy);
-                }
-            }
+            self.finish_saved_redirections(result, saved_fds)
         } else {
-            self.restore_redirections(saved_fds);
+            self.finish_redirections(result, saved_fds)
         }
-        result
     }
 
     /// Run an external command through the embedder's handler.
@@ -1507,8 +1499,7 @@ impl Shell {
             Err(e) => Err(e),
         };
 
-        // Restore state
-        self.restore_redirections(saved_fds);
+        let result = self.finish_redirections(result, saved_fds);
         self.vars.pop_scope();
         self.vars.positional = saved_positional;
 
@@ -1569,8 +1560,8 @@ impl Shell {
             let env = self.vars.env_for_command_os(&assign_bytes);
             let _ = std::env::set_current_dir(&self.cwd);
             let err = crate::builtins::exec::execve_with_env(&args_bytes[0], &args_bytes, &env);
-            self.restore_redirections(saved);
-            return self.handle_exec_error(&err, &args[0]);
+            let result = self.handle_exec_error(&err, &args[0]);
+            return self.finish_redirections(result, saved);
         }
 
         let mut cmd = std::process::Command::new(args_bytes[0].to_os_string());
@@ -1645,8 +1636,7 @@ impl Shell {
                             for h in handles {
                                 let _ = h.join();
                             }
-                            self.restore_redirections(saved);
-                            return Err(e);
+                            return self.finish_redirections(Err(e), saved);
                         }
                     }
                 } else {
@@ -1667,8 +1657,7 @@ impl Shell {
             Err(e) => self.handle_exec_error(&e, &args[0]),
         };
 
-        self.restore_redirections(saved);
-        result
+        self.finish_redirections(result, saved)
     }
 
     /// Execute a pipeline.
@@ -2204,9 +2193,11 @@ mod tests {
         let mut shell = Shell::builder().env_clear().build();
         shell.set_var("EPSH_PIPELINE_ENV", "works").unwrap();
         shell.vars_mut().export("EPSH_PIPELINE_ENV");
+        shell.set_var("PATH", "/bin:/usr/bin").unwrap();
+        shell.vars_mut().export("PATH");
 
         let status = shell.run_script(&format!(
-            "/usr/bin/env | /bin/grep EPSH_PIPELINE_ENV > {output_path}"
+            "/usr/bin/env | grep EPSH_PIPELINE_ENV > {output_path}"
         ));
         assert_eq!(status, 0);
         assert_eq!(

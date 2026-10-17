@@ -170,6 +170,10 @@ impl Variables {
 
     /// Set a variable from shell text. Returns Err if readonly.
     pub fn set(&mut self, name: &str, value: &str) -> Result<(), String> {
+        self.set_bytes(name, ShellBytes::from(value))
+    }
+
+    pub(crate) fn set_shell(&mut self, name: &str, value: &str) -> Result<(), String> {
         self.set_bytes(name, ShellBytes::from_str_lossless(value))
     }
 
