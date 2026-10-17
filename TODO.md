@@ -41,14 +41,6 @@ Next: 22
 
 
 
-### ISH-18 · P3 · Public empty pipeline AST panics during evaluation
-
-- **Area:** Types
-- **Where:** `crates/epsh/src/ast.rs:24`, `crates/epsh/src/eval.rs:1849`, `crates/epsh/src/eval.rs:1855`
-- **Problem:** The public Pipeline variant accepts an empty Vec, but evaluation subtracts one from its length. A library probe constructing this public AST caught a debug panic. The parser does not create empty pipelines, so this affects embedders constructing ASTs rather than normal parsed ish input.
-- **Recommendation:** Reject empty pipelines at the public evaluation boundary or represent pipeline stages with a nonempty type, with an explicit public API decision if the AST changes.
-- **Fix with:** make-invalid-states-unrepresentable, api-surface-and-module-boundaries
-- **Effort:** S (hours)
 
 ### ISH-19 · P3 · Tab-separated cd history loses its original directory target
 

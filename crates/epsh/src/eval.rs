@@ -1266,6 +1266,14 @@ impl Shell {
 
     /// Evaluate a command node, returning its exit status.
     pub fn eval_command(&mut self, cmd: &Command) -> crate::error::Result<ExitStatus> {
+        if let Command::Pipeline { commands, span, .. } = cmd
+            && commands.is_empty()
+        {
+            return Err(ShellError::Runtime {
+                msg: "empty pipeline".into(),
+                span: *span,
+            });
+        }
         self.check_cancel()?;
         if self.opts.noexec {
             return Ok(ExitStatus::SUCCESS);

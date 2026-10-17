@@ -120,6 +120,10 @@ For interactive integrations, eval_command can return
 ShellError::Stopped { pid, pgid }. run_program converts a stopped command to
 exit status 148; see [process handling](docs/process-model.md).
 
+If an embedder constructs a Pipeline with no commands, eval_command returns
+ShellError::Runtime with the pipeline's source span. run_program reports the
+error and returns status 2.
+
 ## Command-line runner
 
 Run a command string, script file, or input from standard input:
