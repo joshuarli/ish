@@ -16,8 +16,7 @@ fn main() {
                     eprintln!("epsh: -c requires an argument");
                     std::process::exit(2);
                 }
-                let script = epsh::shell_bytes::ShellBytes::from_os_str(args[i + 1].as_os_str())
-                    .to_shell_string();
+                let script = epsh::shell_bytes::ShellBytes::from_os_str(args[i + 1].as_os_str());
                 // Remaining args become $0, $1, ...
                 if i + 2 < args.len() {
                     let shell_args: Vec<_> = args[i + 2..]
@@ -26,7 +25,7 @@ fn main() {
                         .collect();
                     shell.set_args_bytes(&shell_args);
                 }
-                let status = shell.run_script(&script);
+                let status = run_bytes(&mut shell, script.as_bytes());
                 std::process::exit(status);
             } else if arg == "-s" {
                 // Read from stdin
@@ -75,7 +74,7 @@ fn main() {
                     .collect();
                 shell.set_args_bytes(&shell_args);
                 let content = match std::fs::read(filename) {
-                    Ok(bytes) => epsh::encoding::bytes_to_str(&bytes),
+                    Ok(bytes) => bytes,
                     Err(e) => {
                         let filename =
                             epsh::shell_bytes::ShellBytes::from_os_str(filename.as_os_str())
@@ -84,7 +83,7 @@ fn main() {
                         std::process::exit(127);
                     }
                 };
-                let status = shell.run_script(&content);
+                let status = run_bytes(&mut shell, &content);
                 std::process::exit(status);
             }
         }
@@ -116,13 +115,21 @@ fn main() {
         std::process::exit(0);
     }
 
-    // Read from stdin (pipe) — preserve non-UTF-8 bytes via PUA encoding
     let mut bytes = Vec::new();
     if let Err(e) = std::io::stdin().read_to_end(&mut bytes) {
         eprintln!("epsh: {e}");
         std::process::exit(1);
     }
-    let input = epsh::encoding::bytes_to_str(&bytes);
-    let status = shell.run_script(&input);
+    let status = run_bytes(&mut shell, &bytes);
     std::process::exit(status);
+}
+
+fn run_bytes(shell: &mut epsh::eval::Shell, source: &[u8]) -> i32 {
+    match epsh::parser::Parser::new_bytes(source).parse() {
+        Ok(program) => shell.run_program(&program).code(),
+        Err(error) => {
+            eprintln!("epsh: {error}");
+            2
+        }
+    }
 }

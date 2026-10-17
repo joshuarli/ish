@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::shell_bytes::ShellBytes;
 use crate::error::{ShellError, Span};
 use crate::lexer::{Lexer, PendingHereDoc, Token, parts_have_quoting, parts_to_text};
 
@@ -26,6 +27,13 @@ impl Parser {
     pub fn new(source: &str) -> Self {
         Parser {
             lexer: Lexer::new(source),
+            heredoc_bodies: Vec::new(),
+        }
+    }
+
+    pub(crate) fn from_shell_string(source: &str) -> Self {
+        Parser {
+            lexer: Lexer::from_shell_string(source),
             heredoc_bodies: Vec::new(),
         }
     }
@@ -492,7 +500,7 @@ impl Parser {
                     self.next()?;
                     let text = reserved_word_text(&tok);
                     args.push(Word {
-                        parts: vec![WordPart::Literal(text.to_string().into())],
+                        parts: vec![WordPart::Literal(ShellBytes::from(text))],
                         span: tok_span,
                     });
                 }
@@ -551,7 +559,7 @@ impl Parser {
                 let delimiter = parts_to_text(&delim_parts);
 
                 self.lexer.pending_heredocs.push(PendingHereDoc {
-                    delimiter: delimiter.into(),
+                    delimiter: ShellBytes::from_str_lossless(&delimiter),
                     strip_tabs,
                     quoted,
                 });
@@ -588,7 +596,7 @@ impl Parser {
                             });
                         }
                         Word {
-                            parts: vec![WordPart::Literal(text.to_string().into())],
+                            parts: vec![WordPart::Literal(ShellBytes::from(text))],
                             span: word_span,
                         }
                     }
@@ -946,7 +954,7 @@ impl Parser {
                         });
                     }
                     Word {
-                        parts: vec![WordPart::Literal(text.to_string().into())],
+                        parts: vec![WordPart::Literal(ShellBytes::from(text))],
                         span: tok_span,
                     }
                 }
@@ -1028,18 +1036,22 @@ impl Parser {
 /// Parse a raw word string into WordPart nodes.
 /// Kept for heredoc body expansion (called from redirect.rs).
 pub fn parse_word_parts(raw: &str) -> Vec<WordPart> {
+    parse_word_parts_bytes(raw.as_bytes())
+}
+
+pub(crate) fn parse_word_parts_shell(raw: &str) -> Vec<WordPart> {
     parse_word_parts_impl(raw, false)
 }
 
 /// Parse a raw byte string into WordPart nodes.
 pub fn parse_word_parts_bytes(raw: &[u8]) -> Vec<WordPart> {
-    parse_word_parts(&crate::encoding::bytes_to_str(raw))
+    parse_word_parts_shell(&crate::encoding::bytes_to_str(raw))
 }
 
 /// Build a HereDocBody from a raw heredoc body string.
 fn make_heredoc_body(raw: String, quoted: bool) -> HereDocBody {
     if quoted {
-        HereDocBody::Literal(raw.into())
+        HereDocBody::Literal(ShellBytes::from_str_lossless(&raw))
     } else {
         HereDocBody::Parsed(parse_word_parts_heredoc(&raw))
     }
@@ -1087,12 +1099,13 @@ fn parse_word_parts_heredoc(raw: &str) -> Vec<WordPart> {
                         i += 1;
                     } else if matches!(chars[i], '$' | '`' | '\\') {
                         // Heredoc: only \$, \`, \\ are special (NOT \")
-                        parts.push(WordPart::Literal(chars[i].to_string().into()));
+                        parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&chars[i].to_string())));
                         i += 1;
                     } else {
-                        // Other \X — preserve the backslash
-                        parts.push(WordPart::Literal(format!("\\{}", chars[i]).into()));
-                        i += 1;
+                        let start = i;
+                        i += if chars[i] == crate::encoding::ESCAPE && i + 1 < chars.len() { 2 } else { 1 };
+                        let literal: String = chars[start..i].iter().collect();
+                        parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&format!("\\{literal}"))));
                     }
                 }
             }
@@ -1104,7 +1117,7 @@ fn parse_word_parts_heredoc(raw: &str) -> Vec<WordPart> {
                 }
                 let text: String = chars[start..i].iter().collect();
                 if !text.is_empty() {
-                    parts.push(WordPart::Literal(text.into()));
+                    parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&text)));
                 }
             }
         }
@@ -1128,7 +1141,7 @@ fn parse_word_parts_impl(raw: &str, in_dquote: bool) -> Vec<WordPart> {
                     i += 1;
                 }
                 let content: String = chars[start..i].iter().collect();
-                parts.push(WordPart::SingleQuoted(content.into()));
+                parts.push(WordPart::SingleQuoted(ShellBytes::from_str_lossless(&content)));
                 if i < chars.len() {
                     i += 1; // skip closing '
                 }
@@ -1175,12 +1188,13 @@ fn parse_word_parts_impl(raw: &str, in_dquote: bool) -> Vec<WordPart> {
                         i += 1;
                     } else if matches!(chars[i], '$' | '`' | '"' | '\\') {
                         // \$, \`, \", \\ are special
-                        parts.push(WordPart::Literal(chars[i].to_string().into()));
+                        parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&chars[i].to_string())));
                         i += 1;
                     } else {
-                        // Other \X — preserve the backslash
-                        parts.push(WordPart::Literal(format!("\\{}", chars[i]).into()));
-                        i += 1;
+                        let start = i;
+                        i += if chars[i] == crate::encoding::ESCAPE && i + 1 < chars.len() { 2 } else { 1 };
+                        let literal: String = chars[start..i].iter().collect();
+                        parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&format!("\\{literal}"))));
                     }
                 }
             }
@@ -1196,7 +1210,7 @@ fn parse_word_parts_impl(raw: &str, in_dquote: bool) -> Vec<WordPart> {
                     i += 1;
                 }
                 let user: String = chars[start..i].iter().collect();
-                parts.push(WordPart::Tilde(user.into()));
+                parts.push(WordPart::Tilde(ShellBytes::from_str_lossless(&user)));
             }
             _ => {
                 // Accumulate literal text
@@ -1211,7 +1225,7 @@ fn parse_word_parts_impl(raw: &str, in_dquote: bool) -> Vec<WordPart> {
                 }
                 let text: String = chars[start..i].iter().collect();
                 if !text.is_empty() {
-                    parts.push(WordPart::Literal(text.into()));
+                    parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&text)));
                 }
             }
         }
@@ -1228,7 +1242,7 @@ fn parse_double_quoted_parts(chars: &[char], i: &mut usize) -> Vec<WordPart> {
         match chars[*i] {
             '$' => {
                 if !literal.is_empty() {
-                    parts.push(WordPart::Literal(std::mem::take(&mut literal).into()));
+                    parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&std::mem::take(&mut literal))));
                 }
                 *i += 1;
                 if let Some(part) = parse_dollar(chars, i, true) {
@@ -1239,7 +1253,7 @@ fn parse_double_quoted_parts(chars: &[char], i: &mut usize) -> Vec<WordPart> {
             }
             '`' => {
                 if !literal.is_empty() {
-                    parts.push(WordPart::Literal(std::mem::take(&mut literal).into()));
+                    parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&std::mem::take(&mut literal))));
                 }
                 *i += 1;
                 let start = *i;
@@ -1280,7 +1294,7 @@ fn parse_double_quoted_parts(chars: &[char], i: &mut usize) -> Vec<WordPart> {
     }
 
     if !literal.is_empty() {
-        parts.push(WordPart::Literal(literal.into()));
+        parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&literal)));
     }
 
     parts
@@ -1325,7 +1339,7 @@ fn parse_dollar(chars: &[char], i: &mut usize, in_dquote: bool) -> Option<WordPa
                     }
                 }
                 let text: String = content.into_iter().collect();
-                let inner_parts = parse_word_parts(&text);
+                let inner_parts = parse_word_parts_shell(&text);
                 Some(WordPart::Arith(inner_parts))
             } else {
                 // $( — command substitution
@@ -1612,7 +1626,7 @@ pub(crate) fn coalesce_literals(parts: Vec<WordPart>) -> Vec<WordPart> {
         {
             let mut bytes = prev.as_bytes().to_vec();
             bytes.extend_from_slice(s.as_bytes());
-            *prev = crate::shell_bytes::ShellBytes::from_vec(bytes);
+            *prev = ShellBytes::from_vec(bytes);
             continue;
         }
         result.push(part);
@@ -1622,7 +1636,7 @@ pub(crate) fn coalesce_literals(parts: Vec<WordPart>) -> Vec<WordPart> {
 
 /// Parse command substitution content by recursively invoking the parser.
 pub(crate) fn parse_cmdsubst_content(content: &str) -> Command {
-    match Parser::new(content).parse() {
+    match Parser::from_shell_string(content).parse() {
         Ok(program) => {
             if program.commands.is_empty() {
                 Command::Simple {
