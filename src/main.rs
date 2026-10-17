@@ -50,6 +50,7 @@ struct Shell {
     session_log: String,
     layout_dump: String,
     epsh: epsh::eval::Shell,
+    denv: denv::Session,
     shell_pid: i32,
 }
 
@@ -189,6 +190,7 @@ fn main() {
     let home_display = store_env_display(&epsh, "HOME");
     let home_os = store_env_os(&epsh, "HOME");
 
+    let denv = denv::init(&mut epsh);
     let mut shell = Shell {
         aliases,
         last_status: 0,
@@ -213,11 +215,11 @@ fn main() {
         session_log: String::new(),
         layout_dump: String::new(),
         epsh,
+        denv,
         shell_pid,
     };
 
-    denv::init(&mut shell.epsh);
-    let changes = denv::on_startup(&shell.epsh);
+    let changes = denv::on_startup(&shell.denv, &shell.epsh);
     apply_denv_changes(&changes, &mut shell.epsh);
     sync_shell_store_derived(&mut shell);
     shell
@@ -415,7 +417,7 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
         "ish-dump" => shell.last_status = write_layout_dump(shell),
         "denv" => {
             let args = expanded_args!();
-            let outcome = denv::command(&args, &shell.epsh);
+            let outcome = denv::command(&shell.denv, &args, &shell.epsh);
             apply_denv_changes(&outcome.changes, &mut shell.epsh);
             sync_shell_store_derived(shell);
             shell.last_status = outcome.status;
@@ -2275,7 +2277,7 @@ fn sync_cwd_change(shell: &mut Shell, old_cwd: &Path, new_cwd: std::path::PathBu
     shell.epsh.set_cwd(new_cwd);
     push_dir_stack(&mut shell.dir_stack);
     shell.prompt.invalidate_git();
-    let changes = denv::on_cd(&shell.epsh);
+    let changes = denv::on_cd(&shell.denv, &shell.epsh);
     apply_denv_changes(&changes, &mut shell.epsh);
     sync_shell_store_derived(shell);
 }

@@ -149,6 +149,10 @@ files whose first line mentions `bash` run in a `bash` child; other `.envrc`
 files are evaluated by epsh. `.env` files are read as variable assignments.
 Evaluation stops after 60 seconds.
 
+`denv` fixes its trust and restoration storage directory when the shell starts,
+using `DENV_DATA_DIR` or `$HOME/.local/share/denv`. Project changes to `HOME` or
+`DENV_DATA_DIR` do not move that storage. Leaving a project restores its variables.
+
 ## Help and license
 
 Report issues at [GitHub Issues](https://github.com/joshuarli/ish/issues). This

@@ -437,14 +437,14 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
         .cwd(first.clone())
         .interactive(true)
         .build();
-    ish::denv::init(&mut epsh);
+    let denv = ish::denv::init(&mut epsh);
     std::env::set_current_dir(&first).unwrap();
     sync_bench_pwd(&mut epsh, &first);
     if with_denv {
         for (dir, expected) in [(&first, "first"), (&second, "second")] {
             std::env::set_current_dir(dir).unwrap();
             sync_bench_pwd(&mut epsh, dir);
-            let outcome = ish::denv::command(&["allow".to_owned()], &epsh);
+            let outcome = ish::denv::command(&denv, &["allow".to_owned()], &epsh);
             assert_eq!(outcome.status, 0);
             apply_bench_denv_changes(&outcome.changes, &mut epsh);
             assert_bench_denv_store_value(&epsh, expected);
@@ -454,7 +454,7 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
         for dir in [&first, &second] {
             std::env::set_current_dir(dir).unwrap();
             sync_bench_pwd(&mut epsh, dir);
-            let changes = ish::denv::on_cd(&epsh);
+            let changes = ish::denv::on_cd(&denv, &epsh);
             apply_bench_denv_changes(&changes, &mut epsh);
         }
     }
@@ -473,7 +473,7 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
         use_first = !use_first;
         std::env::set_current_dir(dir).unwrap();
         sync_bench_pwd(&mut epsh, dir);
-        let changes = ish::denv::on_cd(&epsh);
+        let changes = ish::denv::on_cd(&denv, &epsh);
         if with_denv {
             assert_bench_denv_change(&changes, expected);
             apply_bench_denv_changes(&changes, &mut epsh);

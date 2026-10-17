@@ -12,14 +12,6 @@ Next: 22
 - **Effort:** M (days)
 - **Design:** [Foreground job outcomes](docs/rfc/ISH-5-foreground-job-outcomes.md)
 
-### ISH-6 · P2 · Project environment changes can strand denv restoration state
-
-- **Area:** Data
-- **Where:** `src/denv.rs:230`, `src/denv.rs:304`, `src/denv.rs:411`
-- **Problem:** denv recomputes its storage directory from mutable process environment. A trusted project can change HOME or DENV_DATA_DIR after active state was saved under the old directory. A public-API probe entered a project setting HOME and a scoped marker, then left it: the marker remained set because the next refresh looked for active state in the new location.
-- **Recommendation:** Keep the active-state storage location stable for the shell session, independent of project environment changes, and restore through that same location.
-- **Fix with:** durable-state, single-source-of-truth
-- **Effort:** S (hours)
 
 ### ISH-7 · P2 · History salvage leaves concurrent readers on stale occurrence IDs
 
