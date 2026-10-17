@@ -1,0 +1,4 @@
+{"id":"outcomes","outcome":{"tag":"success","value":{"status":0}},"version":1}
+{"id":"outcomes","outcome":{"error":{"kind":"arithmetic","message":"division by zero"},"tag":"semantic_error"},"version":1}
+{"id":"outcomes","outcome":{"reason":"control flow","tag":"unsupported_domain"},"version":1}
+{"id":"outcomes","outcome":{"tag":"fuel_exhausted"},"version":1}
