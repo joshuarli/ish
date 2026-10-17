@@ -1,16 +1,21 @@
-use crate::semantic_bridge::protocol::{Family, Request, empty_state};
+use crate::semantic_bridge::protocol::{Family, Request, empty_state, exact_object};
 use crate::semantic_bridge::random::Generator;
 use crate::semantic_bridge::{BridgeError, BridgeResult};
 use epsh::ast::{
     Assignment, CaseArm, Command, HereDocBody, ParamOp, Program, Redir, RedirKind, Word, WordPart,
 };
 use epsh::parser::Parser;
+use epsh::shell_bytes::ShellBytes;
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 
 pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
+    if index % 4 == 1 {
+        return dynamic_case(index, dynamic_target((index / 4) % 10));
+    }
     let mut random = Generator::new(seed ^ (index as u64).wrapping_mul(0xa0761d6478bd642f));
     let word = format!("item{}", random.below(100_000));
-    let source = match index % 16 {
+    let source = match (index / 4) % 16 {
         0 => format!("echo {word}"),
         1 => "l -l".into(),
         2 => "cd /tmp".into(),
@@ -42,6 +47,34 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
     })
 }
 
+fn dynamic_target(index: usize) -> Vec<u8> {
+    match index {
+        0 => b"eval".to_vec(),
+        1 => b"source".to_vec(),
+        2 => b".".to_vec(),
+        3 => b"z".to_vec(),
+        4 => b"exit".to_vec(),
+        5 => b"cd".to_vec(),
+        6 => b"history".to_vec(),
+        7 => b"l".to_vec(),
+        8 => vec![0xff],
+        _ => "\u{e080}".as_bytes().to_vec(),
+    }
+}
+
+fn dynamic_case(index: usize, target: Vec<u8>) -> BridgeResult<Request> {
+    let mut state = empty_state();
+    state["variables"] = json!([["TARGET", target]]);
+    Ok(Request {
+        id: format!("policy-{index:05}"),
+        family: Family::Policy,
+        source: b"\"$TARGET\"".to_vec(),
+        state,
+        fuel: 256,
+        input: json!({"mode": "dynamic", "target": target}),
+    })
+}
+
 fn parse_program(source: &str) -> BridgeResult<Program> {
     Parser::new(source)
         .parse()
@@ -49,6 +82,14 @@ fn parse_program(source: &str) -> BridgeResult<Program> {
 }
 
 pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
+    if request.input["mode"] == "dynamic" {
+        let target = require_policy_bytes(&request.input["target"])?;
+        let allowed = ish::dispatch::check_expanded_command(&ShellBytes::from_vec(target)).is_ok();
+        return Ok(json!({
+            "tag": "success",
+            "value": {"allowed": allowed, "status": if allowed { 0 } else { 2 }},
+        }));
+    }
     let source = std::str::from_utf8(&request.source)
         .map_err(|_| BridgeError::new("policy source is not UTF-8"))?;
     let result = ish::dispatch::plan(source);
@@ -98,6 +139,11 @@ pub(crate) fn negative_control(outcome: &Value) -> BridgeResult<Value> {
     if altered["tag"] != "success" {
         return Err(BridgeError::new("policy negative control needs success"));
     }
+    if let Some(allowed) = altered["value"]["allowed"].as_bool() {
+        altered["value"]["allowed"] = json!(!allowed);
+        altered["value"]["status"] = json!(if allowed { 2 } else { 0 });
+        return Ok(altered);
+    }
     altered["value"]["route"] = match altered["value"]["route"].as_str() {
         Some("epsh") => json!("builtin"),
         Some("builtin") => json!("epsh"),
@@ -108,6 +154,17 @@ pub(crate) fn negative_control(outcome: &Value) -> BridgeResult<Value> {
 }
 
 pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
+    if request.input["mode"] == "dynamic" {
+        return [b"eval".to_vec(), b"cd".to_vec(), vec![0xff]]
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| {
+                let mut candidate = dynamic_case(index, target)?;
+                candidate.id = request.id.clone();
+                Ok(candidate)
+            })
+            .collect();
+    }
     ["echo x", "z x", "cd /tmp", "echo $(z x)"]
         .into_iter()
         .map(|source| {
@@ -121,12 +178,72 @@ pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
 }
 
 pub(crate) fn validate_case(request: &Request) -> BridgeResult<()> {
+    if request.input["mode"] == "dynamic" {
+        exact_object(&request.input, &["mode", "target"], "dynamic policy input")?;
+        let target = require_policy_bytes(&request.input["target"])?;
+        if request.state["variables"] != json!([["TARGET", target]]) {
+            return Err(BridgeError::new("dynamic policy target differs from its source variable"));
+        }
+        if request.source != b"\"$TARGET\"" {
+            return Err(BridgeError::new("dynamic policy source is not the generated target word"));
+        }
+        let source = std::str::from_utf8(&request.source)
+            .map_err(|_| BridgeError::new("dynamic policy source is not UTF-8"))?;
+        let program = parse_program(source)?;
+        let [Command::Simple { assigns, args, redirs, .. }] = program.commands.as_slice() else {
+            return Err(BridgeError::new("dynamic policy source is not a simple command"));
+        };
+        if !assigns.is_empty() || !redirs.is_empty() || args.len() != 1
+            || !matches!(args[0].parts.as_slice(), [epsh::ast::WordPart::DoubleQuoted(parts)]
+                if matches!(parts.as_slice(), [epsh::ast::WordPart::Param(parameter)]
+                    if parameter.name == "TARGET" && matches!(parameter.op, ParamOp::Normal)))
+        {
+            return Err(BridgeError::new("dynamic policy source does not expand TARGET as the command"));
+        }
+        return Ok(());
+    }
+    exact_object(&request.input, &["mode", "ast"], "static policy input")?;
     if request.source.len() > 256 {
         return Err(BridgeError::new("generated policy source exceeds 256 bytes"));
     }
     let source = std::str::from_utf8(&request.source)
         .map_err(|_| BridgeError::new("policy source is not UTF-8"))?;
     let _ = parse_program(source)?;
+    Ok(())
+}
+
+fn require_policy_bytes(value: &Value) -> BridgeResult<Vec<u8>> {
+    crate::semantic_bridge::protocol::require_bytes(value, "dynamic policy target")
+}
+
+pub(crate) fn verify_runtime_hook() -> BridgeResult<()> {
+    let mut shell = epsh::eval::Shell::builder()
+        .env_clear()
+        .stdout_sink(Arc::new(Mutex::new(std::io::sink())))
+        .stderr_sink(Arc::new(Mutex::new(std::io::sink())))
+        .build();
+    shell.set_var("TARGET", "eval").map_err(BridgeError::new)?;
+    shell
+        .set_var("POLICY_BRIDGE_MARKER", "before")
+        .map_err(BridgeError::new)?;
+    shell.set_command_policy(Box::new(|target| {
+        ish::dispatch::check_expanded_command(target)
+            .err()
+            .map(|rejection| rejection.to_string())
+    }));
+    let mut parser = Parser::new("\"$TARGET\" POLICY_BRIDGE_MARKER=after");
+    let program = parser
+        .parse()
+        .map_err(|error| BridgeError::new(format!("runtime policy probe did not parse: {error}")))?;
+    if program.commands.len() != 1 {
+        return Err(BridgeError::new("runtime policy probe is not one command"));
+    }
+    let status = shell.run_program(&program);
+    if status.code() != 2
+        || shell.get_var("POLICY_BRIDGE_MARKER") != Some("before")
+    {
+        return Err(BridgeError::new("runtime policy hook did not reject eval before its effects"));
+    }
     Ok(())
 }
 

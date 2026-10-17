@@ -60,19 +60,19 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
             ],
         ),
         5 => environment_case(
-            Vec::new(),
-            Vec::new(),
-            vec![(b"BAD=NAME".to_vec(), b"value".to_vec())],
+            vec![("BASE", vec![0xef, 0x80, 0x80])],
+            vec![("BASE", b"assigned".to_vec()), ("NEW", b"value".to_vec())],
+            vec![(b"BASE".to_vec(), b"inherited".to_vec()), (b"RAW".to_vec(), vec![0x80, 0xff])],
         ),
         6 => environment_case(
-            Vec::new(),
-            Vec::new(),
-            vec![(b"BAD_VALUE".to_vec(), vec![b'a', 0, b'b'])],
+            vec![("FIRST", b"exported".to_vec()), ("SECOND", b"two".to_vec())],
+            vec![("FIRST", b"prefix".to_vec())],
+            vec![(b"FIRST".to_vec(), b"inherited".to_vec()), (b"UNTOUCHED".to_vec(), b"kept".to_vec())],
         ),
         7 => environment_case(
-            vec![("BAD-NAME", b"value".to_vec())],
+            vec![("RAW_VALUE", vec![0x80, 0xff])],
             Vec::new(),
-            Vec::new(),
+            vec![(b"RAW_VALUE".to_vec(), b"inherited".to_vec())],
         ),
         8 => cwd_case(true, (index % 3) as u64),
         9 => cwd_case(false, (index % 3) as u64),
@@ -87,9 +87,11 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
                 (empty_state(), json!({"mode": "bytes", "bytes": bytes}))
             }
             1 => {
+                let raw_name = vec![0xff, b'A' + random.below(26) as u8];
+                let raw_value = vec![random.next() as u8 | 1];
                 let raw = vec![
                     (b"BASE".to_vec(), b"inherited".to_vec()),
-                    (vec![0xff, random.next() as u8], vec![random.next() as u8]),
+                    (raw_name, raw_value),
                 ];
                 let assignments = if random.below(2) == 0 {
                     vec![("BASE", b"assigned".to_vec())]
@@ -114,6 +116,41 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         fuel: 128,
         input,
     })
+}
+
+pub(crate) fn boundary_cases() -> Vec<Request> {
+    let invalid_inherited_name = environment_case(
+        Vec::new(),
+        Vec::new(),
+        vec![(b"BAD=NAME".to_vec(), b"value".to_vec())],
+    );
+    let invalid_inherited_value = environment_case(
+        Vec::new(),
+        Vec::new(),
+        vec![(b"BAD_VALUE".to_vec(), vec![b'a', 0, b'b'])],
+    );
+    let invalid_exported_name = environment_case(
+        vec![("BAD-NAME", b"value".to_vec())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (fuel_state, fuel_input) = redirection_case(false, 0);
+    [
+        ("effects-domain-inherited-name", invalid_inherited_name, 128),
+        ("effects-domain-inherited-value", invalid_inherited_value, 128),
+        ("effects-domain-exported-name", invalid_exported_name, 128),
+        ("effects-fuel-boundary", (fuel_state, fuel_input), 0),
+    ]
+    .into_iter()
+    .map(|(id, (state, input), fuel)| Request {
+        id: id.to_string(),
+        family: Family::Effects,
+        source: Vec::new(),
+        state,
+        fuel,
+        input,
+    })
+    .collect()
 }
 
 fn environment_case(
@@ -395,9 +432,7 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
     {
         return Ok(json!({"tag": "fuel_exhausted"}));
     }
-    if mode == "environment" {
-        run_isolated(request)
-    } else if mode == "redirection" {
+    if matches!(mode, "environment" | "redirection") {
         run_isolated(request)
     } else {
         actual_in_process(request)
@@ -1086,6 +1121,26 @@ pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
         _ => return Err(BridgeError::new("effects shrink saw an unknown mode")),
     }
     Ok(candidates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_effects_cases_stay_in_the_semantic_domain() {
+        for index in 0..1000 {
+            let request = generate(index, 0x5e6d_616e_7469_6373).expect("generated effects case");
+            validate_case(&request).expect("valid effects case");
+            assert_ne!(request.fuel, 0);
+            if request.input["mode"] == "environment" {
+                assert_eq!(
+                    environment_domain_error(&request).expect("environment domain check"),
+                    None
+                );
+            }
+        }
+    }
 }
 
 fn add_candidate(
