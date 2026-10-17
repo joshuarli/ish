@@ -488,11 +488,18 @@ must remain explicit. Do not claim an external handler intercepts epsh builtins.
 
 ## Decision log
 
+- 2026-10-17: split E1 into disjoint arithmetic and evaluator/policy owners; preserve import ancestry with local merge commits rather than rebasing upstream history.
+- 2026-10-17: reuse locked regex-lite 0.1.9 for the 12 conformance patterns; MIT/Apache, no new transitive packages or production link dependency.
+
 - 2026-10-17: overlap G1 import and F0 foundation with G0 baselines against fixed source revisions; neither changes baseline source.
 
 Append one line per material executor judgment, with the call and its reason.
 
 ## Campaign log
+
+- 2026-10-17 G0: ish library 139 passed; integration process SIGSEGV narrowed to concurrent libc identity lookup in directory listing. epsh library 146 passed/1 hardcoded grep-path failure; API 16 passed; embedding 43 passed; integration 223 passed/3 failures (closed-FD EBADF panic and two invalid-UTF8 test decodes). Legacy corpus 168 passed/7 visible category exclusions, all 175 IDs classified.
+- 2026-10-17 G1: imported unsquashed epsh history in 148639e (upstream 6b47acb is ancestor), workspace 707b307. Integrated dispatch7/API16 checks pass. Single root lock/toolchain; sibling clean.
+- 2026-10-17 F0: strict v1 byte/state/trace protocol and vocabulary integrated; Lean protocol goldens pass. Semantic errors retain failure state/trace for differential effect checks.
 
 Append one line per phase end with commands, outcomes, contract changes, and remaining
 hard stops. Baseline IDs and theorem coverage belong in their tested artifacts.
