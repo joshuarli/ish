@@ -3773,7 +3773,10 @@ fn ctrl_p_dump_is_private_and_omits_typed_text() {
     let sh = PtyShell::spawn();
     sh.type_str("secret-token-123");
     sh.send(b"\x10");
-    sh.wait_for_quiescence(200);
+    sh.ctrl_c();
+    let output = PtyShell::strip_ansi(&sh.wait_for_prompt_after_line_advance(2000));
+    assert!(output.contains("^C"), "expected Ctrl+C after Ctrl+P: {output:?}");
+    assert!(output.contains("$ "), "expected prompt after Ctrl+C: {output:?}");
     let dir = sh.home_path().join(".cache/ish");
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&dir), 0o700);
