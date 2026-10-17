@@ -685,21 +685,21 @@ impl Shell {
         Ok((spawn_relay(stream, sink), index))
     }
 
-    fn relay_fork_outputs(&mut self, pid: i32, outputs: Vec<ForkOutput>) -> crate::error::Result<()> {
+    fn relay_fork_outputs(&mut self, pid: i32, outputs: Vec<ForkOutput>, children: &[i32]) -> crate::error::Result<()> {
         let streams = outputs.into_iter().map(|output| {
             drop(output.write);
             (output.read, output.sink)
         }).collect();
-        self.relay_streams(pid, streams)
+        self.relay_streams(pid, streams, children)
     }
 
-    fn relay_streams(&mut self, pid: i32, streams: Vec<(OwnedFd, OutputSink)>) -> crate::error::Result<()> {
+    fn relay_streams(&mut self, pid: i32, streams: Vec<(OwnedFd, OutputSink)>, children: &[i32]) -> crate::error::Result<()> {
         self.child_relays.insert(pid, ChildRelays { handles: Vec::new(), descriptors: Vec::new() });
         for (stream, sink) in streams {
             let (handle, index) = match self.start_relay(stream, sink) {
                 Ok(relay) => relay,
                 Err(error) => {
-                    self.kill_children();
+                    self.kill_owned_children(children);
                     return Err(error.into());
                 }
             };
@@ -1029,8 +1029,12 @@ impl Shell {
 
     fn kill_children(&mut self) {
         let children = std::mem::take(&mut self.child_pids);
+        self.kill_owned_children(&children);
+    }
+
+    fn kill_owned_children(&mut self, children: &[i32]) {
         let mut owned_children = Vec::new();
-        for pid in children {
+        for &pid in children {
             let observation = loop {
                 match rustix::process::waitid(rustix::process::WaitId::Pid(rustix::process::Pid::from_raw(pid).unwrap()), rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT | rustix::process::WaitIdOptions::NOHANG) {
                     Err(rustix::io::Errno::INTR) => continue,
@@ -1038,17 +1042,23 @@ impl Shell {
                 }
             };
             if observation.is_ok() {
-                self.terminate_group(self.child_group(pid));
+                let pgid = self.child_group(pid);
+                if pgid == rustix::process::getpgrp().as_raw_pid() {
+                    let _ = rustix::process::kill_process(rustix::process::Pid::from_raw(pid).unwrap(), rustix::process::Signal::KILL);
+                } else {
+                    self.terminate_group(pgid);
+                }
                 owned_children.push(pid);
             } else {
                 self.discard_child_relays(pid);
+                self.forget_child(pid);
             }
         }
         for pid in owned_children {
             let _ = self.finish_child_relays(pid);
             while let Err(rustix::io::Errno::INTR) = rustix::process::waitpid(rustix::process::Pid::from_raw(pid), rustix::process::WaitOptions::empty()) {}
+            self.forget_child(pid);
         }
-        self.child_groups.clear();
     }
 
     /// Build the xtrace prefix string ($PS4, default "+ ").
@@ -1840,7 +1850,7 @@ impl Shell {
                     drop(output.write);
                     streams.push((output.read, output.sink));
                 }
-                self.relay_streams(child_id, streams)?;
+                self.relay_streams(child_id, streams, &[child_id])?;
                 drop(child);
                 self.wait_owned_child(child_id)
             }
@@ -1870,7 +1880,7 @@ impl Shell {
                 Err(error) => {
                     drop(pipes);
                     drop(outputs);
-                    self.kill_children();
+                    self.kill_owned_children(&children);
                     return Err(error);
                 }
             };
@@ -1878,7 +1888,7 @@ impl Shell {
                 let error = std::io::Error::last_os_error();
                 drop(pipes);
                 drop(outputs);
-                self.kill_children();
+                self.kill_owned_children(&children);
                 return Err(ShellError::Io(error));
             }
             if pid == 0 {
@@ -1907,7 +1917,7 @@ impl Shell {
             children.push(pid);
         }
         drop(pipes);
-        self.relay_fork_outputs(*children.last().unwrap(), outputs)?;
+        self.relay_fork_outputs(*children.last().unwrap(), outputs, &children)?;
 
         // Interactive mode: give the pipeline the terminal
         if self.opts.interactive && pgid > 0 {
@@ -2015,7 +2025,7 @@ impl Shell {
         }
         let pgid = if parent_group == 0 { pid } else { parent_group };
         self.track_child(pid, pgid);
-        self.relay_fork_outputs(pid, outputs)?;
+        self.relay_fork_outputs(pid, outputs, &[pid])?;
         self.wait_child(pid)
     }
 
@@ -2052,7 +2062,7 @@ impl Shell {
         }
         let pgid = if parent_group == 0 { pid } else { parent_group };
         self.track_child(pid, pgid);
-        self.relay_fork_outputs(pid, outputs)?;
+        self.relay_fork_outputs(pid, outputs, &[pid])?;
         self.last_bg_pid = Some(pid as u32);
         Ok(ExitStatus::SUCCESS)
     }
@@ -2088,7 +2098,7 @@ impl Shell {
         drop(write_end);
         let pgid = if parent_group == 0 { pid } else { parent_group };
         self.track_child(pid, pgid);
-        self.relay_fork_outputs(pid, outputs)?;
+        self.relay_fork_outputs(pid, outputs, &[pid])?;
 
         let mut raw_output = Vec::new();
         let mut buffer = [0u8; 8192];

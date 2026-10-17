@@ -43,9 +43,11 @@ that execution model.
 
 Before an evaluator fork, epsh locks and flushes Rust stdout, then releases the
 copied guard in both processes. This prevents inherited stdout locks and parent
-buffer duplication. A flush error aborts setup. The current pipeline error path
-terminates all tracked children; its cleanup scope is tracked in
-[ISH-13](../../../TODO.md#ish-13--p2--pipeline-setup-errors-terminate-unrelated-background-children).
+buffer duplication. A flush error aborts setup. Pipeline setup errors terminate
+and reap only children started by that pipeline. Earlier background children
+remain waitable and keep their output relays. Cleanup terminates a dedicated
+pipeline process group, or individual pipeline children when they share the
+evaluator's process group.
 
 Embedding callbacks can execute in forked evaluator children. A captured host
 mutex held by another thread at fork can remain locked in the child after the

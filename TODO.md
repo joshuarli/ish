@@ -28,14 +28,6 @@ Next: 22
 
 
 
-### ISH-13 · P2 · Pipeline setup errors terminate unrelated background children
-
-- **Area:** Concurrency
-- **Where:** `crates/epsh/src/eval.rs:1030`, `crates/epsh/src/eval.rs:1868`
-- **Problem:** The pipeline pre-fork stdout-flush error path calls kill_children, which drains all children owned by the Shell, including jobs started before this pipeline. In a fresh-source library probe with stdout on /dev/full, an unbuffered control preserved an earlier background command and its output file. Buffering parent output made pipeline setup fail with ENOSPC and killed that unrelated command before it wrote the file.
-- **Recommendation:** Scope pipeline setup cleanup to children created by that pipeline. Reserve whole-shell child termination for whole-shell cancellation or shutdown.
-- **Fix with:** lifecycle-concurrency
-- **Effort:** S (hours)
 
 ### ISH-14 · P2 · Denv trust filenames reject ordinary long project paths
 
