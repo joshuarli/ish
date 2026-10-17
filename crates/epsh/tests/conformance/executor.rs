@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use rustix::process::{kill_process_group, Pid, Signal};
+use rustix::process::{kill_process_group, waitid, Pid, Signal, WaitId, WaitIdOptions};
 
 use super::fixture::CaseScratch;
 use super::parser::{Case, ExpectedExit};
@@ -183,15 +183,15 @@ fn wait_for_process(
     stdout_reader: JoinHandle<()>,
     stderr_reader: JoinHandle<()>,
 ) -> Result<ProcessOutput, String> {
-    let mut status = None;
+    let mut child_exited = false;
     let mut stdout = None;
     let mut stderr = None;
     let mut failure = None;
     loop {
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(value) => status = value,
-                Err(error) => failure = Some(format!("cannot wait for test program: {error}")),
+        if !child_exited {
+            match child_has_exited(process_group) {
+                Ok(value) => child_exited = value,
+                Err(error) => failure = Some(error),
             }
         }
         while let Ok(message) = receiver.try_recv() {
@@ -200,7 +200,7 @@ fn wait_for_process(
         if failure.is_some() {
             break;
         }
-        if status.is_some() && stdout.is_some() && stderr.is_some() {
+        if child_exited && stdout.is_some() && stderr.is_some() {
             break;
         }
         let now = Instant::now();
@@ -222,7 +222,7 @@ fn wait_for_process(
     }
 
     if let Some(reason) = failure {
-        let cleanup = stop_child(child, process_group);
+        let cleanup = kill_process_group_and_reap(child, process_group);
         let joined = join_readers(stdout_reader, stderr_reader);
         let mut details = vec![reason];
         if let Err(error) = cleanup {
@@ -246,15 +246,34 @@ fn wait_for_process(
         });
     }
 
-    if let Err(error) = join_readers(stdout_reader, stderr_reader) {
-        return Err(error);
+    if let Err(cleanup) = kill_process_group_and_reap(child, process_group) {
+        return match join_readers(stdout_reader, stderr_reader) {
+            Ok(()) => Err(cleanup),
+            Err(readers) => Err(format!("{cleanup}; {readers}")),
+        };
     }
+    join_readers(stdout_reader, stderr_reader)?;
+    let status = child
+        .try_wait()
+        .map_err(|error| format!("cannot wait for test program: {error}"))?
+        .ok_or_else(|| "test process was not reaped after cleanup".to_owned())?;
     Ok(ProcessOutput {
-        status,
+        status: Some(status),
         stdout: stdout.unwrap_or_default(),
         stderr: stderr.unwrap_or_default(),
         failure: None,
     })
+}
+
+fn child_has_exited(process: Pid) -> Result<bool, String> {
+    match waitid(
+        WaitId::Pid(process),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    ) {
+        Ok(status) => Ok(status.is_some()),
+        Err(error) if error == rustix::io::Errno::INTR => Ok(false),
+        Err(error) => Err(format!("cannot wait for test program: {error}")),
+    }
 }
 
 fn record_message(
@@ -308,7 +327,7 @@ fn stop_after_error(
     stderr_reader: Option<JoinHandle<()>>,
     primary: String,
 ) -> Result<ProcessOutput, String> {
-    let cleanup = stop_child(child, process_group);
+    let cleanup = kill_process_group_and_reap(child, process_group);
     let readers = match (stdout_reader, stderr_reader) {
         (Some(stdout), Some(stderr)) => join_readers(stdout, stderr),
         (Some(stdout), None) => stdout.join().map_err(|_| "stdout reader panicked".to_owned()),
@@ -333,7 +352,7 @@ fn combine_errors(
     errors.join("; ")
 }
 
-fn stop_child(child: &mut Child, process_group: Pid) -> Result<(), String> {
+fn kill_process_group_and_reap(child: &mut Child, process_group: Pid) -> Result<(), String> {
     let signal = match kill_process_group(process_group, Signal::KILL) {
         Ok(()) => Ok(()),
         Err(error) if error == rustix::io::Errno::SRCH => Ok(()),
@@ -409,15 +428,22 @@ fn display_status(status: &ExitStatus) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::fs;
     use std::process::Command;
-    use std::time::Duration;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use rustix::process::{kill_process, Pid, Signal};
+    #[cfg(not(target_os = "linux"))]
+    use rustix::process::{getpgid, test_kill_process};
 
     use super::run_process;
 
     #[test]
     fn timeout_kills_the_process_group_and_reaps_the_child() {
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 30 & echo descendant=$!; wait"]);
+        command.args(["-c", "sleep 30 & printf 'leader=%s descendant=%s\\n' \"$$\" \"$!\"; wait"]);
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         use std::os::unix::process::CommandExt;
@@ -425,9 +451,26 @@ mod tests {
         let output = run_process(&mut command, Duration::from_millis(200)).unwrap();
         assert!(output.failure.as_deref().unwrap().contains("time limit"));
         assert!(output.status.is_some());
-        let descendant = output.stdout.strip_prefix(b"descendant=").unwrap();
-        let descendant = std::str::from_utf8(descendant.strip_suffix(b"\n").unwrap()).unwrap();
-        assert!(descendant.parse::<u32>().is_ok());
+        let (group, descendant) = process_ids(&output.stdout);
+        assert_process_inactive(group, descendant);
+    }
+
+    #[test]
+    fn normal_exit_kills_descendants_in_the_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "sleep 30 </dev/null >/dev/null 2>&1 & printf 'leader=%s descendant=%s\\n' \"$$\" \"$!\"",
+        ]);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        let output = run_process(&mut command, Duration::from_secs(1)).unwrap();
+        assert!(output.failure.is_none());
+        assert_eq!(output.status.unwrap().code(), Some(0));
+        let (group, descendant) = process_ids(&output.stdout);
+        assert_process_inactive(group, descendant);
     }
 
     #[test]
@@ -436,8 +479,74 @@ mod tests {
         command.args(["-c", "exec 1>&- 2>&-; sleep 0.1"]);
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
         let output = run_process(&mut command, Duration::from_secs(1)).unwrap();
         assert!(output.failure.is_none());
         assert_eq!(output.status.unwrap().code(), Some(0));
+    }
+
+    fn process_ids(output: &[u8]) -> (Pid, Pid) {
+        let output = std::str::from_utf8(output).unwrap();
+        let line = output.strip_suffix('\n').unwrap();
+        let (group, descendant) = line.split_once(" descendant=").unwrap();
+        let group = group.strip_prefix("leader=").unwrap().parse::<i32>().unwrap();
+        let descendant = descendant.parse::<i32>().unwrap();
+        (Pid::from_raw(group).unwrap(), Pid::from_raw(descendant).unwrap())
+    }
+
+    fn assert_process_inactive(group: Pid, descendant: Pid) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match process_active_in_group(group, descendant) {
+                Ok(false) => return,
+                Ok(true) => {}
+                Err(error) => {
+                    let _ = kill_process(descendant, Signal::KILL);
+                    panic!("cannot inspect descendant {descendant}: {error}");
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = kill_process(descendant, Signal::KILL);
+                panic!("descendant {descendant} stayed active in process group {group}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_active_in_group(group: Pid, descendant: Pid) -> Result<bool, String> {
+        let stat = match fs::read_to_string(format!("/proc/{}/stat", descendant.as_raw_pid())) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("cannot inspect descendant {descendant}: {error}")),
+        };
+        let fields = stat
+            .rsplit_once(')')
+            .ok_or_else(|| "malformed process stat".to_owned())?
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let state = fields.first().ok_or_else(|| "missing process state".to_owned())?;
+        let process_group = fields
+            .get(2)
+            .ok_or_else(|| "missing process group".to_owned())?
+            .parse::<i32>()
+            .map_err(|error| format!("invalid process group: {error}"))?;
+        Ok(process_group == group.as_raw_pid() && !matches!(*state, "Z" | "X"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_active_in_group(group: Pid, descendant: Pid) -> Result<bool, String> {
+        match getpgid(Some(descendant)) {
+            Ok(actual_group) if actual_group == group => match test_kill_process(descendant) {
+                Ok(()) => Ok(true),
+                Err(error) if error == rustix::io::Errno::SRCH => Ok(false),
+                Err(error) => Err(format!("cannot inspect descendant {descendant}: {error}")),
+            },
+            Ok(_) => Ok(false),
+            Err(error) if error == rustix::io::Errno::SRCH => Ok(false),
+            Err(error) => Err(format!("cannot inspect descendant {descendant}: {error}")),
+        }
     }
 }
