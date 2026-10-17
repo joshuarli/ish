@@ -4,6 +4,7 @@ epsh keeps a working directory on each Shell instance. The cd builtin updates
 that shell state without changing the embedder's process working directory.
 Default external commands run in the shell directory. An external handler can
 query the directory for its current call with external_command_cwd().
+Relative file predicates in `test` also use the shell directory.
 
 ## External commands
 
@@ -45,8 +46,14 @@ while waiting for children. On cancellation or timeout it terminates tracked
 child process groups. A custom external handler owns the lifecycle of the
 processes it starts.
 
+The `wait` builtin waits only for children started by its Shell. A PID operand
+selects that child's exit status. Command substitutions isolate variable and
+directory changes; a nonzero command status still produces substitution output.
+
 Signal traps run between commands. They are not dispatched while the shell is
 blocked in a child wait.
+Trap names are case-insensitive and accept a `SIG` prefix. Installing a trap for
+an uncatchable signal such as KILL fails without changing the registered traps.
 
 ## Interactive integrations
 
