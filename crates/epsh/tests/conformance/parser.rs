@@ -4,6 +4,8 @@ use std::path::{Component, Path};
 
 use super::pattern::OutputAssertion;
 
+type EnvironmentChange = (Vec<u8>, Option<Vec<u8>>);
+
 #[derive(Debug)]
 pub struct Case {
     pub name: String,
@@ -12,7 +14,7 @@ pub struct Case {
     pub arguments: Vec<Vec<u8>>,
     pub script: Option<Vec<u8>>,
     pub stdin: Option<Vec<u8>>,
-    pub environment: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    pub environment: Vec<EnvironmentChange>,
     pub files: Vec<FileSetup>,
     pub time_limit_secs: u64,
     pub expected_exit: ExpectedExit,
@@ -278,7 +280,7 @@ fn decode_delimited(value: Option<Vec<u8>>, field: &str, line: usize) -> Result<
         .collect())
 }
 
-fn decode_environment(value: Option<Vec<u8>>, line: usize) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, String> {
+fn decode_environment(value: Option<Vec<u8>>, line: usize) -> Result<Vec<EnvironmentChange>, String> {
     decode_delimited(value, "env-setup", line)?
         .into_iter()
         .map(|entry| {

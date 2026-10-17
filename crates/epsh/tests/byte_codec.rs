@@ -31,8 +31,7 @@ fn captured(source: &[u8], text_entry: bool) -> Vec<u8> {
         shell.run_program(&Parser::new_bytes(source).parse().unwrap()).code()
     };
     assert_eq!(status, 0);
-    let result = output.lock().unwrap().clone();
-    result
+    output.lock().unwrap().clone()
 }
 
 #[test]
