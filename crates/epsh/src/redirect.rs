@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io::Write;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use crate::ast::*;
 use crate::error::ShellError;
@@ -79,6 +79,16 @@ fn restoration_error(errors: Vec<std::io::Error>) -> ShellError {
         kind,
         RedirectionRestoreFailure(errors),
     ))
+}
+
+fn install_redirection(file: OwnedFd, target_fd: RawFd) -> std::io::Result<()> {
+    if file.as_raw_fd() == target_fd {
+        rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty())?;
+        let _ = file.into_raw_fd();
+        Ok(())
+    } else {
+        sys::dup2_result(file.as_raw_fd(), target_fd)
+    }
 }
 
 pub(crate) struct SavedFd {
@@ -203,11 +213,7 @@ impl Shell {
                         self.err_msg(&format!("{filename}: {e}"));
                         ShellError::Io(e)
                     })?;
-                    if file.as_raw_fd() == target_fd {
-                        let _ = file.into_raw_fd();
-                    } else {
-                        sys::dup2_result(file.as_raw_fd(), target_fd).map_err(ShellError::Io)?;
-                    }
+                    install_redirection(file.into(), target_fd).map_err(ShellError::Io)?;
                 }
                 RedirKind::Output(word)
                 | RedirKind::Clobber(word)
@@ -227,11 +233,7 @@ impl Shell {
                             self.err_msg(&format!("{filename}: {e}"));
                             ShellError::Io(e)
                         })?;
-                    if file.as_raw_fd() == target_fd {
-                        let _ = file.into_raw_fd();
-                    } else {
-                        sys::dup2_result(file.as_raw_fd(), target_fd).map_err(ShellError::Io)?;
-                    }
+                    install_redirection(file.into(), target_fd).map_err(ShellError::Io)?;
                 }
                 RedirKind::DupInput(word) | RedirKind::DupOutput(word) => {
                     let fd_str = self.expand_string(word)?;
@@ -279,12 +281,7 @@ impl Shell {
                         }
                         self.pending_stdin = Some(read_end.into_raw_fd());
                     } else {
-                        if read_end.as_raw_fd() == target_fd {
-                            let _ = read_end.into_raw_fd();
-                        } else {
-                            sys::dup2_result(read_end.as_raw_fd(), target_fd)
-                                .map_err(ShellError::Io)?;
-                        }
+                        install_redirection(read_end.into(), target_fd).map_err(ShellError::Io)?;
                     }
                 }
             }

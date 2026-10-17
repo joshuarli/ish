@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::process::Command;
+use std::os::unix::process::CommandExt;
 
 const CHILD_TARGET: &str = "EPSH_RESTORE_FAILURE_TARGET";
 const CHILD_PRIMARY: &str = "EPSH_RESTORE_PRIMARY_TARGET";
@@ -145,4 +146,45 @@ fn primary_redirection_error_keeps_restore_context_in_child() {
             child_failure(&format!("unexpected redirection result: {result:?}\n"))
         }
     }
+}
+
+fn descriptor_three_command(script: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_epsh"));
+    command.arg("-c").arg(script);
+    // SAFETY: the child has completed stdio setup; closing descriptor 3 makes the redirection allocate it.
+    unsafe {
+        command.pre_exec(|| {
+            libc::close(3);
+            Ok(())
+        });
+    }
+    command
+}
+
+#[test]
+fn external_output_inherits_a_newly_opened_target_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("output");
+    let script = format!("/bin/sh -c 'printf inherited >&3' 3>{}", quote(target.to_str().unwrap()));
+    let output = descriptor_three_command(&script).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read(target).unwrap(), b"inherited");
+}
+
+#[test]
+fn external_input_inherits_a_newly_opened_target_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("input");
+    std::fs::write(&target, b"inherited").unwrap();
+    let script = format!("/bin/sh -c 'cat <&3' 3<{}", quote(target.to_str().unwrap()));
+    let output = descriptor_three_command(&script).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"inherited");
+}
+
+#[test]
+fn external_heredoc_inherits_a_newly_opened_target_descriptor() {
+    let output = descriptor_three_command("/bin/sh -c 'cat <&3' 3<<EOF\ninherited\nEOF\n").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"inherited\n");
 }
