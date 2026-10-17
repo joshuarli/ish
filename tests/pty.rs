@@ -746,10 +746,10 @@ fn pwd_builtin() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("pwd");
     let text = PtyShell::strip_ansi(&out);
-    // HOME is our temp dir, and we cd'd there
+    let expected = sh.home_path().display().to_string();
     assert!(
-        text.contains("/tmp/ish_pty_test_"),
-        "expected temp dir in pwd output: {text:?}"
+        text.lines().any(|line| line.trim() == expected),
+        "expected {expected:?} in pwd output: {text:?}"
     );
 }
 
@@ -1213,9 +1213,10 @@ fn tilde_expansion() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("echo ~");
     let text = PtyShell::strip_ansi(&out);
+    let expected = sh.home_path().display().to_string();
     assert!(
-        text.contains("/tmp/ish_pty_test_"),
-        "expected home dir expansion: {text:?}"
+        text.lines().any(|line| line.trim() == expected),
+        "expected home directory {expected:?}: {text:?}"
     );
 }
 
@@ -2373,19 +2374,19 @@ fn expanded_targets_obey_ish_execution_policy() {
     let dot_script = home.join("dot-target.sh");
     std::fs::write(
         &source_script,
-        format!("/bin/touch {}\n", source_marker.display()),
+        format!("/usr/bin/touch {}\n", source_marker.display()),
     )
     .unwrap();
     std::fs::write(
         &dot_script,
-        format!("/bin/touch {}\n", dot_marker.display()),
+        format!("/usr/bin/touch {}\n", dot_marker.display()),
     )
     .unwrap();
 
     let refused = [
         (
             format!(
-                "set TARGET eval; $TARGET /bin/touch {}",
+                "set TARGET eval; $TARGET /usr/bin/touch {}",
                 eval_marker.display()
             ),
             &eval_marker,
@@ -2400,7 +2401,7 @@ fn expanded_targets_obey_ish_execution_policy() {
         ),
         (
             format!(
-                "set TARGET eval; command $TARGET /bin/touch {}",
+                "set TARGET eval; command $TARGET /usr/bin/touch {}",
                 command_marker.display()
             ),
             &command_marker,
@@ -2420,7 +2421,7 @@ fn expanded_targets_obey_ish_execution_policy() {
     let redirection_target = home.join("redirection-target-marker");
     let redirection_file = home.join("redirection-file");
     sh.run_command(&format!(
-        "set TARGET eval; $TARGET /bin/touch {} > {}",
+        "set TARGET eval; $TARGET /usr/bin/touch {} > {}",
         redirection_target.display(),
         redirection_file.display()
     ));
@@ -2433,7 +2434,7 @@ fn expanded_targets_obey_ish_execution_policy() {
     );
 
     sh.run_command(&format!(
-        "set TARGET eval; echo $(echo $(command $TARGET /bin/touch {}))",
+        "set TARGET eval; echo $(echo $(command $TARGET /usr/bin/touch {}))",
         nested_marker.display()
     ));
     assert!(
@@ -2450,7 +2451,7 @@ fn expanded_targets_obey_ish_execution_policy() {
 
     let ordinary_marker = home.join("ordinary-command-marker");
     sh.run_command(&format!(
-        "set TARGET /bin/touch; $TARGET {}",
+        "set TARGET touch; $TARGET {}",
         ordinary_marker.display()
     ));
     assert!(ordinary_marker.exists(), "dynamic external command did not run");

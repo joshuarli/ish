@@ -8,7 +8,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use rustix::process::{kill_process_group, waitid, Pid, Signal, WaitId, WaitIdOptions};
+use rustix::process::{
+    kill_process_group, test_kill_process_group, waitid, Pid, Signal, WaitId, WaitIdOptions,
+};
 
 use super::fixture::CaseScratch;
 use super::parser::{Case, ExpectedExit};
@@ -223,7 +225,12 @@ fn wait_for_process(
 
     if let Some(reason) = failure {
         let cleanup = kill_process_group_and_reap(child, process_group);
-        let joined = join_readers(stdout_reader, stderr_reader);
+        let joined = if cleanup.is_ok() || (stdout.is_some() && stderr.is_some()) {
+            join_readers(stdout_reader, stderr_reader)
+        } else {
+            drop((stdout_reader, stderr_reader));
+            Err("output readers not joined after process group cleanup failed".to_owned())
+        };
         let mut details = vec![reason];
         if let Err(error) = cleanup {
             details.push(error);
@@ -328,11 +335,16 @@ fn stop_after_error(
     primary: String,
 ) -> Result<ProcessOutput, String> {
     let cleanup = kill_process_group_and_reap(child, process_group);
-    let readers = match (stdout_reader, stderr_reader) {
-        (Some(stdout), Some(stderr)) => join_readers(stdout, stderr),
-        (Some(stdout), None) => stdout.join().map_err(|_| "stdout reader panicked".to_owned()),
-        (None, Some(stderr)) => stderr.join().map_err(|_| "stderr reader panicked".to_owned()),
-        (None, None) => Ok(()),
+    let readers = if cleanup.is_ok() {
+        match (stdout_reader, stderr_reader) {
+            (Some(stdout), Some(stderr)) => join_readers(stdout, stderr),
+            (Some(stdout), None) => stdout.join().map_err(|_| "stdout reader panicked".to_owned()),
+            (None, Some(stderr)) => stderr.join().map_err(|_| "stderr reader panicked".to_owned()),
+            (None, None) => Ok(()),
+        }
+    } else {
+        drop((stdout_reader, stderr_reader));
+        Err("output readers not joined after process group cleanup failed".to_owned())
     };
     Err(combine_errors(&primary, cleanup, readers))
 }
@@ -354,8 +366,10 @@ fn combine_errors(
 
 fn kill_process_group_and_reap(child: &mut Child, process_group: Pid) -> Result<(), String> {
     let signal = match kill_process_group(process_group, Signal::KILL) {
-        Ok(()) => Ok(()),
-        Err(error) if error == rustix::io::Errno::SRCH => Ok(()),
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(error) if error == rustix::io::Errno::PERM => {
+            return reap_child_after_group_denial(child, process_group, error)
+        }
         Err(error) => Err(format!("cannot kill test process group: {error}")),
     };
     let wait = child.wait()
@@ -366,6 +380,32 @@ fn kill_process_group_and_reap(child: &mut Child, process_group: Pid) -> Result<
         (Err(signal), Ok(())) => Err(signal),
         (Ok(()), Err(wait)) => Err(wait),
         (Err(signal), Err(wait)) => Err(format!("{signal}; {wait}")),
+    }
+}
+
+fn reap_child_after_group_denial(
+    child: &mut Child,
+    process_group: Pid,
+    denial: rustix::io::Errno,
+) -> Result<(), String> {
+    let child_exited = child_has_exited(process_group)
+        .map_err(|error| format!("cannot kill test process group: {denial}; {error}"))?;
+    if !child_exited {
+        return Err(format!("cannot kill test process group: {denial}"));
+    }
+    child
+        .wait()
+        .map_err(|error| {
+            format!("cannot kill test process group: {denial}; cannot reap test process: {error}")
+        })?;
+    match test_kill_process_group(process_group) {
+        Err(rustix::io::Errno::SRCH) => Ok(()),
+        Ok(()) => Err(format!(
+            "cannot kill test process group: {denial}; group remains after reaping test process"
+        )),
+        Err(error) => Err(format!(
+            "cannot kill test process group: {denial}; cannot verify group removal: {error}"
+        )),
     }
 }
 
@@ -431,14 +471,82 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::fs;
     use std::process::Command;
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use rustix::process::{kill_process, Pid, Signal};
+    use rustix::process::{kill_process, kill_process_group, Pid, Signal};
     #[cfg(not(target_os = "linux"))]
     use rustix::process::{getpgid, test_kill_process};
 
-    use super::run_process;
+    use super::{
+        child_has_exited, kill_process_group_and_reap, reap_child_after_group_denial, run_process,
+    };
+
+    #[test]
+    fn group_permission_error_does_not_wait_for_live_child() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_group = i32::try_from(child.id())
+            .ok()
+            .and_then(Pid::from_raw)
+            .unwrap();
+        let watchdog_group = process_group;
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let watchdog = thread::spawn(move || {
+            match finished_receiver.recv_timeout(Duration::from_secs(2)) {
+                Ok(()) => (false, Ok(())),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    (true, kill_process_group(watchdog_group, Signal::KILL))
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => (false, Ok(())),
+            }
+        });
+        let result = reap_child_after_group_denial(
+            &mut child,
+            process_group,
+            rustix::io::Errno::PERM,
+        );
+        let _ = finished_sender.send(());
+        let (timed_out, watchdog_result) = watchdog.join().unwrap();
+        let cleanup = kill_process_group_and_reap(&mut child, process_group);
+        assert!(cleanup.is_ok(), "{cleanup:?}");
+        assert!(!timed_out, "permission handling waited for the live child");
+        assert!(watchdog_result.is_ok(), "{watchdog_result:?}");
+        assert!(result.unwrap_err().contains("Operation not permitted"));
+    }
+
+    #[test]
+    fn reaping_exited_group_preserves_child_status() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 23"]);
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_group = i32::try_from(child.id())
+            .ok()
+            .and_then(Pid::from_raw)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !child_has_exited(process_group).unwrap() {
+            assert!(Instant::now() < deadline, "child did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        reap_child_after_group_denial(&mut child, process_group, rustix::io::Errno::PERM)
+            .unwrap();
+        let status = child.try_wait().unwrap().expect("child status was not retained");
+        assert_eq!(status.code(), Some(23));
+    }
 
     #[test]
     fn timeout_kills_the_process_group_and_reaps_the_child() {

@@ -37,12 +37,32 @@ fn literal_control_escape_in_glob_pattern_matches_filename_bytes() {
     let directory = tempdir().unwrap();
     let marker = '\u{fffe}';
     let names = [format!("a{marker}b"), format!("a{marker}c")];
+    fs::write(directory.path().join("a*"), b"").unwrap();
+    let pattern = format!("a{marker}*");
+    let (status, output) = capture(
+        &format!("printf '<%s>' {pattern}"),
+        directory.path().to_path_buf(),
+    );
+    assert_eq!(status, 0);
+    assert_eq!(output, format!("<{pattern}>").into_bytes());
+
+    let mut created_names = Vec::new();
     for name in &names {
-        fs::write(directory.path().join(name), b"").unwrap();
+        let path = directory.path().join(name);
+        match fs::write(&path, b"") {
+            Ok(()) => created_names.push(path),
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                for path in created_names {
+                    fs::remove_file(path).unwrap();
+                }
+                return;
+            }
+            Err(error) => panic!("create glob fixture {name:?}: {error}"),
+        }
     }
 
     let (status, output) = capture(
-        &format!("printf '<%s>' a{marker}*"),
+        &format!("printf '<%s>' {pattern}"),
         directory.path().to_path_buf(),
     );
 

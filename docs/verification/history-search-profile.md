@@ -32,3 +32,15 @@ GNU time records the shell's peak resident memory in KiB:
 | Initial verification revision | 11,944 | 12,256 | 12,504 |
 
 The ranges overlap, and the retained changes pass the 2× memory ceiling.
+
+After the descriptor correction in `b120b0f`, the same static release checks
+pass at 1,228,536 bytes. Five new interleaved PTY pairs give these peak memory
+results:
+
+| Source | Minimum | Median | Maximum |
+| --- | ---: | ---: | ---: |
+| Baseline | 12,028 | 12,168 | 12,472 |
+| Descriptor correction | 11,924 | 12,096 | 12,328 |
+
+This revision also passes the 2× memory ceiling. These size and memory checks
+establish no latency improvement.
