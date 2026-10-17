@@ -5,6 +5,7 @@ use crate::semantic_bridge::policy;
 use crate::semantic_bridge::protocol::{Family, Request, validate_response};
 use crate::semantic_bridge::{BridgeError, BridgeResult};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
     fs::create_dir_all(&tmpdir).map_err(|error| {
         BridgeError::new(format!("cannot create {}: {error}", tmpdir.display()))
     })?;
+    verify_rust_protocol_boundary(&root)?;
     verify_protocol_boundary(&binary, &tmpdir, &root)?;
     let mut groups = Vec::new();
     for family in options.families.iter().copied() {
@@ -63,6 +65,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
         .iter()
         .flat_map(|(_, cases, _)| cases.iter().cloned())
         .collect();
+    validate_unique_ids(&requests)?;
     let responses = run_lean(&binary, &tmpdir, &requests)?;
     if responses.len() != requests.len() {
         return Err(BridgeError::new(format!(
@@ -500,6 +503,78 @@ fn validate_boundary_error(response: &Value, tag: &str, id: Option<&str>) -> Bri
         "unsupported_version" if response["error"]["version"] == 2 => {}
         "duplicate_id" if response["error"]["id"].as_str() == id => {}
         _ => return Err(BridgeError::new(format!("boundary {tag:?} payload is invalid"))),
+    }
+    Ok(())
+}
+
+fn verify_rust_protocol_boundary(root: &Path) -> BridgeResult<()> {
+    let invalid = fs::read_to_string(root.join("formal/fixtures/protocol-invalid.jsonl"))
+        .map_err(|error| BridgeError::new(format!("cannot read protocol rejection goldens: {error}")))?;
+    let valid = fs::read_to_string(root.join("formal/fixtures/protocol-v1.jsonl"))
+        .map_err(|error| BridgeError::new(format!("cannot read protocol acceptance goldens: {error}")))?;
+    let invalid_lines: Vec<&str> = invalid.lines().collect();
+    if invalid_lines.len() != 12 {
+        return Err(BridgeError::new("protocol-invalid fixture count changed"));
+    }
+    for (index, line) in invalid_lines.iter().enumerate() {
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(_) if index != 0 => continue,
+            Err(error) => {
+                return Err(BridgeError::new(format!(
+                    "unsupported-version golden is malformed: {error}"
+                )));
+            }
+        };
+        if index == 0 && value["version"] != 2 {
+            return Err(BridgeError::new("unsupported-version golden changed"));
+        }
+        if index != 0 && value["version"] != 1 {
+            return Err(BridgeError::new(format!(
+                "malformed protocol golden {} has the wrong version",
+                index + 1
+            )));
+        }
+        if Request::from_json(value).is_ok() {
+            return Err(BridgeError::new(format!(
+                "Rust accepted invalid protocol golden {}",
+                index + 1
+            )));
+        }
+    }
+    let valid_lines: Vec<&str> = valid.lines().collect();
+    if valid_lines.len() != Family::ALL.len() {
+        return Err(BridgeError::new("protocol-v1 fixture count changed"));
+    }
+    let mut requests = Vec::with_capacity(valid_lines.len());
+    for (line, expected_family) in valid_lines.iter().zip(Family::ALL) {
+        let value: Value = serde_json::from_str(line)
+            .map_err(|error| BridgeError::new(format!("protocol-v1 fixture is malformed: {error}")))?;
+        let request = Request::from_json(value)?;
+        if request.family != expected_family {
+            return Err(BridgeError::new("protocol-v1 family order changed"));
+        }
+        requests.push(request);
+    }
+    validate_unique_ids(&requests)?;
+    let mut duplicate_requests = requests;
+    let duplicate = duplicate_requests[0].clone();
+    duplicate_requests.push(duplicate);
+    if validate_unique_ids(&duplicate_requests).is_ok() {
+        return Err(BridgeError::new("Rust accepted a duplicate protocol ID"));
+    }
+    Ok(())
+}
+
+fn validate_unique_ids(requests: &[Request]) -> BridgeResult<()> {
+    let mut ids = HashSet::new();
+    for request in requests {
+        if !ids.insert(request.id.as_str()) {
+            return Err(BridgeError::new(format!(
+                "duplicate request ID {:?}",
+                request.id
+            )));
+        }
     }
     Ok(())
 }
