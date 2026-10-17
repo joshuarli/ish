@@ -70,6 +70,12 @@ def wordForwardEnd (text : List Char) (cursor : Nat) : Nat :=
   let word := (suffix.drop whitespace.length).takeWhile notRustWhitespace
   cursor + whitespace.length + word.length
 
+def wordMoveForwardEnd (text : List Char) (cursor : Nat) : Nat :=
+  let suffix := text.drop cursor
+  let word := suffix.takeWhile notRustWhitespace
+  let whitespace := (suffix.drop word.length).takeWhile rustWhitespace
+  cursor + word.length + whitespace.length
+
 def cursorAtOrBeforeByte : List Char → Nat → Nat
   | [], _ => 0
   | value :: rest, byteCursor =>
@@ -122,7 +128,7 @@ def step (state : InteractiveState) (operation : InteractiveOp) : InteractiveSta
   | .moveHome => stateWith state.text 0 state.killRing
   | .moveEnd => stateWith state.text state.text.length state.killRing
   | .moveWordLeft => stateWith state.text (wordBackStart state.text cursor) state.killRing
-  | .moveWordRight => stateWith state.text (wordForwardEnd state.text cursor) state.killRing
+  | .moveWordRight => stateWith state.text (wordMoveForwardEnd state.text cursor) state.killRing
   | .killToStart =>
       if cursor = 0 then
         stateWith state.text cursor state.killRing
@@ -467,6 +473,14 @@ example : byteCursor (runOperations (fromString "éx" 2) [.insertString "雪🙂
 example : textString (runOperations (fromString "aé" 3) [.deleteBack]) = "a" := by decide
 
 example : textString (runOperations (fromString "aé" 1) [.deleteForward]) = "a" := by decide
+
+example :
+    let moved := step (fromString "café λ" 4) .moveWordRight
+    textBytes moved = [99, 97, 102, 195, 169, 32, 206, 187] ∧ byteCursor moved = 6 := by decide
+
+example :
+    let killed := step (fromString "café λ" 4) .killWordForward
+    textString killed = "caf λ" ∧ killed.killRing = "é".toList ∧ byteCursor killed = 3 := by decide
 
 example : rustWhitespace ' ' = true := by decide
 
