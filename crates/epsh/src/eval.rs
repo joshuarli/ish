@@ -656,12 +656,11 @@ impl Shell {
         target: &str,
         span: Span,
     ) -> crate::error::Result<()> {
+        let Some(policy) = self.command_policy.as_mut() else {
+            return Ok(());
+        };
         let target = ShellBytes::from_str_lossless(target);
-        if let Some(diagnostic) = self
-            .command_policy
-            .as_mut()
-            .and_then(|policy| policy(&target))
-        {
+        if let Some(diagnostic) = policy(&target) {
             return Err(ShellError::Runtime {
                 msg: diagnostic,
                 span,
@@ -675,17 +674,21 @@ impl Shell {
         args: &[String],
         span: Span,
     ) -> crate::error::Result<()> {
-        let Some(target) = args.first() else {
-            return Ok(());
-        };
-        self.check_command_policy(target, span)?;
-        if target == "command"
-            && let crate::builtins::CommandAction::Execute(nested_args) =
-                crate::builtins::command_action(args)
-        {
-            self.check_command_policy_for_dispatch(nested_args, span)?;
+        let mut args = args;
+        loop {
+            let Some(target) = args.first() else {
+                return Ok(());
+            };
+            self.check_command_policy(target, span)?;
+            if target != "command" {
+                return Ok(());
+            }
+            match crate::builtins::command_action(args) {
+                crate::builtins::CommandAction::Execute(nested_args) => args = nested_args,
+                crate::builtins::CommandAction::Empty
+                | crate::builtins::CommandAction::Describe { .. } => return Ok(()),
+            }
         }
-        Ok(())
     }
 
     /// Check cancellation flag and timeout deadline.
