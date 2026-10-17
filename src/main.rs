@@ -132,6 +132,12 @@ fn print_help() {
     println!("  -h, --help     Show this help message");
 }
 
+fn ish_command_policy(target: &epsh::shell_bytes::ShellBytes) -> Option<String> {
+    dispatch::check_expanded_command(target)
+        .err()
+        .map(|rejection| rejection.to_string())
+}
+
 fn main() {
     let cli = parse_args();
 
@@ -211,6 +217,9 @@ fn main() {
     let changes = denv::on_startup(&shell.epsh);
     apply_denv_changes(&changes, &mut shell.epsh);
     sync_shell_store_derived(&mut shell);
+    shell
+        .epsh
+        .set_command_policy(Box::new(ish_command_policy));
 
     // Main loop
     let mut exit_code = 0;
