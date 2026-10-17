@@ -133,19 +133,9 @@ fn print_help() {
 }
 
 fn ish_command_policy(target: &epsh::shell_bytes::ShellBytes) -> Option<String> {
-    let name = target.as_utf8_str()?;
-    if matches!(name, "eval" | "source" | ".") {
-        return Some(format!("`{name}` is not supported"));
-    }
-
-    builtin::lookup(name)
-        .filter(|spec| spec.exec == builtin::Exec::InShell)
-        .map(|spec| {
-            format!(
-                "{} changes shell state and requires a statically named whole-line command",
-                spec.name
-            )
-        })
+    dispatch::check_expanded_command(target)
+        .err()
+        .map(|rejection| rejection.to_string())
 }
 
 fn main() {
