@@ -16,7 +16,8 @@ use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 mod sha256;
@@ -32,6 +33,8 @@ const DOTENV_VALUE_VAR_PREFIX: &str = "__DENV_DOT_";
 /// Upper bound for one bash `.envrc` evaluation. The child holds the terminal
 /// while ish waits, so a hung `.envrc` must fail loudly instead of wedging cd.
 const ENVRC_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+static NEXT_ACTIVE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 const BASH_STDLIB: &str = include_str!("denv_stdlib.sh");
 
@@ -153,25 +156,51 @@ fn current_dir_from_store(epsh: &epsh::eval::Shell) -> PathBuf {
 
 fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
     let store_env_pairs = epsh.vars().env_for_command_os(&[]);
-    // denv's bookkeeping and embedded epsh evaluator use process-global
-    // environment APIs, so keep that environment as a temporary mirror.
     restore_process_env(&store_env_pairs);
+    let result = refresh_inner(force, epsh);
+    if result.is_err() {
+        restore_process_env(&store_env_pairs);
+    }
+    result
+}
+
+fn refresh_inner(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
     let cwd = current_dir_from_store(epsh);
     let pid = std::process::id().to_string();
 
-    // Fast path: skip the parent-directory walk entirely. Go straight to the
-    // cached dir and stat only files that previously existed.
-    if !force && state_var_fast_path_ok(&cwd) {
-        return Ok(Vec::new());
-    }
-
     let found = find_env_files(&cwd);
 
+    let envrc_file = found
+        .as_ref()
+        .and_then(|found| found.envrc.as_ref())
+        .map(|(path, _)| read_trusted_candidate(path))
+        .transpose()?;
+    let dotenv_file = found
+        .as_ref()
+        .and_then(|found| found.dotenv.as_ref())
+        .map(|(path, _)| read_trusted_candidate(path))
+        .transpose()?;
+    let files_allowed = [&envrc_file, &dotenv_file]
+        .into_iter()
+        .flatten()
+        .all(is_allowed);
+    let dotenv_entries = if files_allowed {
+        match &dotenv_file {
+            Some(file) => load_dotenv_entries(&file.bytes)?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let active = load_active(&pid);
+
     if !force && let Some(ref found) = found {
-        if state_var_matches(found) {
+        if files_allowed && state_var_matches(found) {
             return Ok(Vec::new());
         }
-        if let Some(active) = load_active(&pid)
+        if files_allowed
+            && let Some(active) = &active
             && active.envrc_mtime == found.envrc.as_ref().map(|(_, m)| *m).unwrap_or(0)
             && active.dotenv_mtime == found.dotenv.as_ref().map(|(_, m)| *m).unwrap_or(0)
             && paths_match(&active.dir, &found.dir)
@@ -180,21 +209,17 @@ fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, Stri
         }
     }
 
-    let active = load_active(&pid);
     let mut changes = Vec::new();
 
     if let Some(ref state) = active {
         apply_restore(&state.prev, &mut changes);
-        clear_active(&pid);
     }
 
-    // Active denv state has now been restored in the process mirror. Capture
-    // that post-restore baseline for the explicit child environment so reload
-    // does not reintroduce values that should have been removed first.
     let env_pairs = capture_process_env();
 
     let Some(found) = found else {
         clear_runtime_state(&mut changes);
+        clear_active(&pid)?;
         if let Some(ref state) = active {
             print_restore_summary(&state.prev);
         }
@@ -204,21 +229,6 @@ fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, Stri
     let envrc_mtime = found.envrc.as_ref().map(|(_, m)| *m).unwrap_or(0);
     let dotenv_mtime = found.dotenv.as_ref().map(|(_, m)| *m).unwrap_or(0);
 
-    // Each file is read once; the trust check and the evaluation below both use
-    // these bytes, so a file swapped after the check cannot run untrusted.
-    let envrc_file = found
-        .envrc
-        .as_ref()
-        .map(|(path, _)| read_trusted_candidate(path))
-        .transpose()?;
-    let dotenv_file = found
-        .dotenv
-        .as_ref()
-        .map(|(path, _)| read_trusted_candidate(path))
-        .transpose()?;
-
-    // `.env` is as powerful as `.envrc` (it can set PATH or LD_*), so it needs
-    // the same trust.
     if let Some(blocked) = [&envrc_file, &dotenv_file]
         .into_iter()
         .flatten()
@@ -236,16 +246,13 @@ fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, Stri
         );
         set_change(&mut changes, "__DENV_DIRTY", "1".to_string());
         unset_change(&mut changes, "__DENV_STATE");
+        clear_active(&pid)?;
         if let Some(ref state) = active {
             print_restore_summary(&state.prev);
         }
         return Ok(changes);
     }
 
-    let dotenv_entries = match &dotenv_file {
-        Some(file) => load_dotenv_entries(&file.bytes)?,
-        None => Vec::new(),
-    };
     if found.envrc.is_some() {
         eprintln!("denv: loading .envrc");
     }
@@ -267,6 +274,7 @@ fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, Stri
                 );
                 set_change(&mut changes, "__DENV_DIRTY", "1".to_string());
                 unset_change(&mut changes, "__DENV_STATE");
+                clear_active(&pid)?;
                 return Ok(changes);
             }
         }
@@ -275,8 +283,17 @@ fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, Stri
     };
 
     let prev = capture_prev(&diff);
-    apply_diff(&diff, &mut changes);
     let dir = canonicalize_fallback(&found.dir);
+    save_active(
+        &pid,
+        &ActiveState {
+            dir: dir.clone(),
+            envrc_mtime,
+            dotenv_mtime,
+            prev,
+        },
+    )?;
+    apply_diff(&diff, &mut changes);
     set_change(
         &mut changes,
         "__DENV_DIR",
@@ -294,15 +311,6 @@ fn refresh(force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, Stri
             .map(|(key, _)| ('+', key.as_str()))
             .chain(diff.unset.iter().map(|key| ('-', key.as_str()))),
     );
-    save_active(
-        &pid,
-        &ActiveState {
-            dir,
-            envrc_mtime,
-            dotenv_mtime,
-            prev,
-        },
-    )?;
     Ok(changes)
 }
 
@@ -340,7 +348,9 @@ fn find_env_files(start: &Path) -> Option<EnvFiles> {
 }
 
 fn stat_file_with_probe(dir: &Path, name: &str, probe: &mut PathBuf) -> Option<(PathBuf, u64)> {
-    set_probe_path(probe, dir, name);
+    probe.clear();
+    probe.push(dir);
+    probe.push(name);
     let mtime = stat_regular_file_mtime(probe)?;
     Some((probe.clone(), mtime))
 }
@@ -361,43 +371,6 @@ fn parse_denv_state(s: &str) -> Option<(u64, u64, &str)> {
     let (envrc_str, rest) = s.split_once(' ')?;
     let (dotenv_str, dir) = rest.split_once(' ')?;
     Some((envrc_str.parse().ok()?, dotenv_str.parse().ok()?, dir))
-}
-
-fn state_var_fast_path_ok(cwd: &Path) -> bool {
-    let Some(state) = env::var_os("__DENV_STATE") else {
-        return false;
-    };
-    let state = state.to_string_lossy();
-    let Some((envrc_mtime, dotenv_mtime, dir)) = parse_denv_state(&state) else {
-        return false;
-    };
-    let cached = Path::new(dir);
-    if !cwd.starts_with(cached) {
-        return false;
-    }
-
-    let mut probe = PathBuf::new();
-    let envrc_ok = envrc_mtime == 0
-        || stat_file_mtime_with_probe(cached, ".envrc", &mut probe)
-            .is_some_and(|mtime| mtime == envrc_mtime);
-    if !envrc_ok {
-        return false;
-    }
-
-    dotenv_mtime == 0
-        || stat_file_mtime_with_probe(cached, ".env", &mut probe)
-            .is_some_and(|mtime| mtime == dotenv_mtime)
-}
-
-fn stat_file_mtime_with_probe(dir: &Path, name: &str, probe: &mut PathBuf) -> Option<u64> {
-    set_probe_path(probe, dir, name);
-    stat_regular_file_mtime(probe)
-}
-
-fn set_probe_path(probe: &mut PathBuf, dir: &Path, name: &str) {
-    probe.clear();
-    probe.push(dir);
-    probe.push(name);
 }
 
 fn state_var_matches(found: &EnvFiles) -> bool {
@@ -604,13 +577,49 @@ fn save_active(pid: &str, state: &ActiveState) -> Result<(), String> {
             }
         }
     }
-    fs::write(dir.join(format!("active_{pid}")), buf)
+    let path = dir.join(format!("active_{pid}"));
+    let (temp_path, mut file) = loop {
+        let id = NEXT_ACTIVE_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        let temp_path = dir.join(format!(".active_{pid}.{id}.tmp"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => break (temp_path, file),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("failed to create active file: {err}")),
+        }
+    };
+    let result = file
+        .write_all(buf.as_bytes())
         .map_err(|e| format!("failed to write active file: {e}"))
+        .and_then(|()| {
+            file.sync_all()
+                .map_err(|e| format!("failed to sync active file: {e}"))
+        })
+        .and_then(|()| {
+            fs::rename(&temp_path, &path)
+                .map_err(|e| format!("failed to replace active file: {e}"))
+        });
+    if let Err(err) = result {
+        return match fs::remove_file(&temp_path) {
+            Ok(()) => Err(err),
+            Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(err),
+            Err(cleanup) => Err(format!(
+                "{err}; failed to remove temporary active file: {cleanup}"
+            )),
+        };
+    }
+    Ok(())
 }
 
-fn clear_active(pid: &str) {
-    if let Ok(path) = active_path(pid) {
-        let _ = fs::remove_file(path);
+fn clear_active(pid: &str) -> Result<(), String> {
+    let path = active_path(pid)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to remove active file: {err}")),
     }
 }
 
@@ -866,7 +875,9 @@ fn eval_env(
             env_pairs,
             ENVRC_EVAL_TIMEOUT,
         ),
-        EnvRcInterpreter::Epsh => eval_env_epsh(dir, source, dotenv_entries, env_pairs),
+        EnvRcInterpreter::Epsh => {
+            eval_env_epsh(dir, source, dotenv_entries, env_pairs, ENVRC_EVAL_TIMEOUT)
+        }
     }
 }
 
@@ -902,6 +913,10 @@ fn eval_env_bash(
         .map_err(|e| format!("set before pipe close-on-exec: {e}"))?;
     rustix::io::fcntl_setfd(&after_src, rustix::io::FdFlags::CLOEXEC)
         .map_err(|e| format!("set after pipe close-on-exec: {e}"))?;
+    rustix::fs::fcntl_setfl(&before_r, rustix::fs::OFlags::NONBLOCK)
+        .map_err(|e| format!("set before pipe nonblocking: {e}"))?;
+    rustix::fs::fcntl_setfl(&after_r, rustix::fs::OFlags::NONBLOCK)
+        .map_err(|e| format!("set after pipe nonblocking: {e}"))?;
 
     let mut script = String::with_capacity(BASH_STDLIB.len() + 256);
     script.push_str(BASH_STDLIB);
@@ -922,20 +937,11 @@ fn eval_env_bash(
         .as_fd()
         .try_clone_to_owned()
         .map_err(|e| format!("dup stderr: {e}"))?;
-    let before_read = std::thread::spawn(move || -> io::Result<Vec<u8>> {
-        let mut data = Vec::new();
-        let mut file = fs::File::from(before_r);
-        file.read_to_end(&mut data)?;
-        Ok(data)
-    });
-    let after_read = std::thread::spawn(move || -> io::Result<Vec<u8>> {
-        let mut data = Vec::new();
-        let mut file = fs::File::from(after_r);
-        file.read_to_end(&mut data)?;
-        Ok(data)
-    });
+    let mut before_read = fs::File::from(before_r);
+    let mut after_read = fs::File::from(after_r);
 
     let mut cmd = Command::new("bash");
+    cmd.process_group(0);
     cmd.env_clear();
     for (key, value) in env_pairs {
         cmd.env(key, value);
@@ -979,32 +985,111 @@ fn eval_env_bash(
     drop(after_w);
 
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                // Reader threads are left detached: a grandchild may still hold
-                // the pipe write ends open.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    ".envrc evaluation timed out after {}s",
-                    timeout.as_secs_f32()
+    let bash_pid = rustix::process::Pid::from_child(&child);
+    let process_group = bash_pid;
+    let mut leader_exited = false;
+    let mut before_open = true;
+    let mut after_open = true;
+    let mut before_data = Vec::new();
+    let mut after_data = Vec::new();
+    while !leader_exited || before_open || after_open {
+        if Instant::now() >= deadline {
+            let cleanup = stop_bash_group(&mut child, process_group, leader_exited);
+            let message = format!(
+                ".envrc evaluation timed out after {}s",
+                timeout.as_secs_f32()
+            );
+            return Err(append_cleanup_error(message, cleanup));
+        }
+
+        if !leader_exited {
+            match rustix::process::waitid(
+                rustix::process::WaitId::Pid(bash_pid),
+                rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOHANG
+                    | rustix::process::WaitIdOptions::NOWAIT,
+            ) {
+                Ok(Some(_)) => leader_exited = true,
+                Ok(None) => {}
+                Err(err) if err == rustix::io::Errno::INTR => continue,
+                Err(err) => {
+                    let cleanup = stop_bash_group(&mut child, process_group, false);
+                    return Err(append_cleanup_error(format!("wait for bash: {err}"), cleanup));
+                }
+            }
+        }
+
+        let mut readers = Vec::with_capacity(2);
+        if before_open {
+            readers.push(rustix::event::PollFd::from_borrowed_fd(
+                before_read.as_fd(),
+                rustix::event::PollFlags::IN,
+            ));
+        }
+        if after_open {
+            readers.push(rustix::event::PollFd::from_borrowed_fd(
+                after_read.as_fd(),
+                rustix::event::PollFlags::IN,
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let poll_for = remaining.min(Duration::from_millis(10));
+        let poll_timeout = rustix::event::Timespec {
+            tv_sec: poll_for.as_secs() as i64,
+            tv_nsec: poll_for.subsec_nanos() as i64,
+        };
+        match rustix::event::poll(&mut readers, Some(&poll_timeout)) {
+            Err(err) if err == rustix::io::Errno::INTR => continue,
+            Err(err) => {
+                let cleanup = stop_bash_group(&mut child, process_group, leader_exited);
+                return Err(append_cleanup_error(
+                    format!("poll env snapshot pipes: {err}"),
+                    cleanup,
                 ));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => return Err(format!("wait for bash: {e}")),
+            Ok(_) => {}
         }
-    };
 
-    let before_data = before_read
-        .join()
-        .map_err(|_| "read before env thread panicked".to_string())?
-        .map_err(|e| format!("read before env: {e}"))?;
-    let after_data = after_read
-        .join()
-        .map_err(|_| "read after env thread panicked".to_string())?
-        .map_err(|e| format!("read after env: {e}"))?;
+        let ready = rustix::event::PollFlags::IN
+            | rustix::event::PollFlags::HUP
+            | rustix::event::PollFlags::ERR;
+        let mut reader_index = 0;
+        let mut ready_to_drain = Vec::with_capacity(2);
+        if before_open {
+            ready_to_drain.push(readers[reader_index].revents().intersects(ready));
+            reader_index += 1;
+        }
+        if after_open {
+            ready_to_drain.push(readers[reader_index].revents().intersects(ready));
+        }
+        drop(readers);
+        let mut ready_index = 0;
+        if before_open {
+            if ready_to_drain[ready_index] {
+                match drain_env_pipe(&mut before_read, &mut before_data, "before") {
+                    Ok(open) => before_open = open,
+                    Err(err) => {
+                        let cleanup = stop_bash_group(&mut child, process_group, leader_exited);
+                        return Err(append_cleanup_error(err, cleanup));
+                    }
+                }
+            }
+            ready_index += 1;
+        }
+        if after_open && ready_to_drain[ready_index] {
+            match drain_env_pipe(&mut after_read, &mut after_data, "after") {
+                Ok(open) => after_open = open,
+                Err(err) => {
+                    let cleanup = stop_bash_group(&mut child, process_group, leader_exited);
+                    return Err(append_cleanup_error(err, cleanup));
+                }
+            }
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("reap bash: {err}"))?;
 
     if !status.success() {
         return Err(".envrc evaluation failed".to_string());
@@ -1015,21 +1100,82 @@ fn eval_env_bash(
     Ok(diff_sorted_env(&before, &after))
 }
 
+fn drain_env_pipe(file: &mut fs::File, data: &mut Vec<u8>, label: &str) -> Result<bool, String> {
+    let mut buffer = [0; 8192];
+    match file.read(&mut buffer) {
+        Ok(0) => Ok(false),
+        Ok(count) => {
+            data.extend_from_slice(&buffer[..count]);
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(true),
+        Err(err) => Err(format!("read {label} env: {err}")),
+    }
+}
+
+fn stop_bash_group(
+    child: &mut Child,
+    process_group: rustix::process::Pid,
+    leader_exited: bool,
+) -> Result<(), String> {
+    let group_result = match rustix::process::kill_process_group(
+        process_group,
+        rustix::process::Signal::KILL,
+    ) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(err) => Err(format!("kill .envrc process group: {err}")),
+    };
+    let kill_result = if leader_exited {
+        Ok(())
+    } else {
+        match child.kill() {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("kill bash: {err}")),
+        }
+    };
+    let reap_result = child
+        .wait()
+        .map(|_| ())
+        .map_err(|err| format!("reap bash: {err}"));
+    let wait_result = match (kill_result, reap_result) {
+        (Ok(()), result) | (result, Ok(())) => result,
+        (Err(kill), Err(reap)) => Err(format!("{kill}; {reap}")),
+    };
+    match (group_result, wait_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(group), Ok(())) | (Ok(()), Err(group)) => Err(group),
+        (Err(group), Err(wait)) => Err(format!("{group}; {wait}")),
+    }
+}
+
+fn append_cleanup_error(primary: String, cleanup: Result<(), String>) -> String {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => format!("{primary}; cleanup failed: {cleanup}"),
+    }
+}
+
 fn eval_env_epsh(
     dir: &Path,
     source: &[u8],
     dotenv_entries: &[(String, String)],
     env_pairs: &[(OsString, OsString)],
+    timeout: Duration,
 ) -> Result<EnvDiff, String> {
     let source = std::str::from_utf8(source).map_err(|e| format!(".envrc is not UTF-8: {e}"))?;
     let process_before = capture_process_env();
     restore_process_env(env_pairs);
     let before_process = env_pairs.to_vec();
     let sink = std::sync::Arc::new(std::sync::Mutex::new(SharedStderr));
+    let deadline = Instant::now() + timeout;
     let mut shell = epsh::eval::Shell::builder()
         .cwd(dir.to_path_buf())
         .stdout_sink(sink.clone())
         .stderr_sink(sink)
+        .timeout(timeout)
         .build();
 
     let mut script = String::with_capacity(BASH_STDLIB.len() + 256);
@@ -1039,7 +1185,6 @@ fn eval_env_epsh(
     script.push('\n');
 
     let status = shell.run_script(&script);
-    // Applied through the variable store, never as script text.
     let mut dotenv_failed = None;
     if status == 0 {
         let vars = shell.vars_mut();
@@ -1058,6 +1203,12 @@ fn eval_env_epsh(
     }
 
     if status != 0 {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                ".envrc evaluation timed out after {}s",
+                timeout.as_secs_f32()
+            ));
+        }
         return Err(".envrc evaluation failed".to_string());
     }
 
@@ -1170,9 +1321,50 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static PROCESS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
     struct TempDir(PathBuf);
+
+    struct ProcessEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        snapshot: Vec<(OsString, OsString)>,
+    }
+
+    impl ProcessEnvGuard {
+        fn new() -> Self {
+            let lock = PROCESS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self {
+                _lock: lock,
+                snapshot: capture_process_env(),
+            }
+        }
+    }
+
+    impl Drop for ProcessEnvGuard {
+        fn drop(&mut self) {
+            restore_process_env(&self.snapshot);
+        }
+    }
+
+    fn apply_changes_to_shell(epsh: &mut epsh::eval::Shell, changes: &[EnvChange]) {
+        for change in changes {
+            match change {
+                EnvChange::Set(key, value) => {
+                    epsh.vars_mut().set(key, value).unwrap();
+                    epsh.vars_mut().export(key);
+                }
+                EnvChange::Unset(key) => {
+                    epsh.vars_mut().unset(key).unwrap();
+                }
+            }
+        }
+    }
 
     impl TempDir {
         fn new(prefix: &str) -> Self {
@@ -1180,8 +1372,9 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path =
-                std::env::temp_dir().join(format!("{prefix}_{}_{}", std::process::id(), unique));
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".work/tmp");
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join(format!("{prefix}_{}_{}", std::process::id(), unique));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }
@@ -1281,6 +1474,7 @@ mod tests {
 
     #[test]
     fn eval_env_uses_epsh_for_non_bash_envrc() {
+        let _process_env = ProcessEnvGuard::new();
         let tmp = TempDir::new("ish_denv_epsh_eval");
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1298,6 +1492,7 @@ mod tests {
 
     #[test]
     fn eval_env_bash_uses_explicit_store_environment() {
+        let _process_env = ProcessEnvGuard::new();
         let tmp = TempDir::new("ish_denv_bash_env");
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1314,6 +1509,7 @@ mod tests {
 
     #[test]
     fn eval_env_epsh_restores_process_env_after_failure() {
+        let _process_env = ProcessEnvGuard::new();
         let tmp = TempDir::new("ish_denv_epsh_restore");
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1322,7 +1518,7 @@ mod tests {
         crate::shell_unsetenv("DENV_TMP_SHOULD_ROLLBACK");
         let epsh = epsh::eval::Shell::new();
         let env_pairs = epsh.vars().env_for_command_os(&[]);
-        let err = match eval_env_epsh(&project, source, &[], &env_pairs) {
+        let err = match eval_env_epsh(&project, source, &[], &env_pairs, Duration::from_secs(30)) {
             Ok(_) => panic!("expected epsh envrc evaluation to fail"),
             Err(err) => err,
         };
@@ -1331,7 +1527,29 @@ mod tests {
     }
 
     #[test]
+    fn epsh_envrc_evaluation_times_out() {
+        let _process_env = ProcessEnvGuard::new();
+        let tmp = TempDir::new("ish_denv_epsh_timeout");
+        let epsh = epsh::eval::Shell::new();
+        let env_pairs = epsh.vars().env_for_command_os(&[]);
+        let start = Instant::now();
+        let err = match eval_env_epsh(
+            tmp.path(),
+            b"#!/bin/sh\nsleep 30\n",
+            &[],
+            &env_pairs,
+            Duration::from_millis(100),
+        ) {
+            Ok(_) => panic!("expected timeout"),
+            Err(err) => err,
+        };
+        assert!(err.contains("timed out"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
     fn restore_process_env_preserves_non_utf8_entries() {
+        let _process_env = ProcessEnvGuard::new();
         let key = OsString::from_vec(vec![b'D', b'E', b'N', b'V', b'_', 0xf0, 0x80, b'K']);
         let value = OsString::from_vec(vec![b'v', b'a', b'l', 0xff]);
         let extra = "DENV_TMP_SHOULD_BE_REMOVED";
@@ -1363,7 +1581,8 @@ mod tests {
     }
 
     #[test]
-    fn state_var_fast_path_ok_uses_cached_dir() {
+    fn state_var_matches_uses_cached_dir() {
+        let _process_env = ProcessEnvGuard::new();
         let tmp = TempDir::new("ish_denv_fast_path");
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1372,21 +1591,206 @@ mod tests {
         let mtime = stat_regular_file_mtime(&envrc).unwrap();
         let state = format!("{mtime} 0 {}", project.display());
 
-        // SAFETY: tests run in a single process; this test sets and restores
-        // only the env vars it uses.
         unsafe {
             std::env::set_var("__DENV_STATE", &state);
         }
-        assert!(state_var_fast_path_ok(&project));
+        assert!(state_var_matches(&find_env_files(&project).unwrap()));
 
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(&envrc, "export OK=2\n").unwrap();
-        assert!(!state_var_fast_path_ok(&project));
+        std::fs::File::options()
+            .write(true)
+            .open(&envrc)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(mtime + 2))
+            .unwrap();
+        assert!(!state_var_matches(&find_env_files(&project).unwrap()));
+    }
 
-        // SAFETY: see comment above.
-        unsafe {
-            std::env::remove_var("__DENV_STATE");
+    #[test]
+    fn cached_ancestor_does_not_skip_child_or_same_mtime_content_changes() {
+        let _process_env = ProcessEnvGuard::new();
+        let tmp = TempDir::new("ish_denv_fast_path_stale");
+        let data = tmp.path().join("data");
+        let project = tmp.path().join("project");
+        let child = project.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let parent_env = project.join(".env");
+        let child_env = child.join(".env");
+        std::fs::write(&parent_env, "DENV_CACHE_TEST=parent\n").unwrap();
+        std::fs::write(&child_env, "DENV_CACHE_TEST=child\n").unwrap();
+        let parent_mtime = stat_regular_file_mtime(&parent_env).unwrap();
+        let state = format!("0 {parent_mtime} {}", project.display());
+        let allow = data.join("allow");
+        allow_file_in(&allow, &read_trusted_candidate(&parent_env).unwrap()).unwrap();
+        allow_file_in(&allow, &read_trusted_candidate(&child_env).unwrap()).unwrap();
+
+        let mut epsh = epsh::eval::Shell::builder().env_clear().build();
+        for (key, value) in [
+            ("DENV_DATA_DIR", data.to_str().unwrap()),
+            ("PWD", child.to_str().unwrap()),
+            ("DENV_CACHE_TEST", "parent"),
+            ("__DENV_STATE", &state),
+        ] {
+            epsh.vars_mut().set(key, value).unwrap();
+            epsh.vars_mut().export(key);
         }
+        unsafe {
+            std::env::set_var("DENV_DATA_DIR", &data);
+        }
+        let pid = std::process::id().to_string();
+        save_active(
+            &pid,
+            &ActiveState {
+                dir: canonicalize_fallback(&project),
+                envrc_mtime: 0,
+                dotenv_mtime: parent_mtime,
+                prev: vec![PrevVar::Unset("DENV_CACHE_TEST".to_string())],
+            },
+        )
+        .unwrap();
+
+        let child_changes = refresh(false, &epsh).unwrap();
+        assert!(child_changes.iter().any(|change| matches!(
+            change,
+            EnvChange::Set(key, value) if key == "DENV_CACHE_TEST" && value == "child"
+        )));
+        apply_changes_to_shell(&mut epsh, &child_changes);
+
+        let old_mtime = std::fs::metadata(&child_env).unwrap().modified().unwrap();
+        std::fs::write(&child_env, "DENV_CACHE_TEST=changed\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&child_env)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+        let changed = refresh(false, &epsh).unwrap();
+        assert!(changed.iter().any(|change| matches!(
+            change,
+            EnvChange::Unset(key) if key == "DENV_CACHE_TEST"
+        )));
+    }
+
+    #[test]
+    fn malformed_dotenv_keeps_active_restore_for_the_next_directory() {
+        let _process_env = ProcessEnvGuard::new();
+        let tmp = TempDir::new("ish_denv_malformed_restore");
+        let data = tmp.path().join("data");
+        let project = tmp.path().join("project");
+        let bad = tmp.path().join("bad");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        std::fs::write(project.join(".env"), "DENV_RESTORE_TEST=leaked\n").unwrap();
+        let malformed = bad.join(".env");
+        std::fs::write(&malformed, b"DENV_RESTORE_TEST=\xff\n").unwrap();
+        let allow = data.join("allow");
+        allow_file_in(&allow, &read_trusted_candidate(&project.join(".env")).unwrap()).unwrap();
+        allow_file_in(&allow, &read_trusted_candidate(&malformed).unwrap()).unwrap();
+
+        let mut epsh = epsh::eval::Shell::builder().env_clear().build();
+        for (key, value) in [
+            ("DENV_DATA_DIR", data.to_str().unwrap()),
+            ("PWD", bad.to_str().unwrap()),
+            ("DENV_RESTORE_TEST", "leaked"),
+        ] {
+            epsh.vars_mut().set(key, value).unwrap();
+            epsh.vars_mut().export(key);
+        }
+        unsafe {
+            std::env::set_var("DENV_DATA_DIR", &data);
+        }
+        let pid = std::process::id().to_string();
+        save_active(
+            &pid,
+            &ActiveState {
+                dir: canonicalize_fallback(&project),
+                envrc_mtime: 0,
+                dotenv_mtime: stat_regular_file_mtime(&project.join(".env")).unwrap(),
+                prev: vec![PrevVar::Unset("DENV_RESTORE_TEST".to_string())],
+            },
+        )
+        .unwrap();
+
+        let err = match refresh(false, &epsh) {
+            Ok(_) => panic!("expected malformed dotenv to fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("utf-8"), "{err}");
+        assert!(load_active(&pid).is_some());
+
+        epsh.vars_mut().set("PWD", outside.to_str().unwrap()).unwrap();
+        let changes = refresh(false, &epsh).unwrap();
+        assert!(changes.iter().any(|change| matches!(
+            change,
+            EnvChange::Unset(key) if key == "DENV_RESTORE_TEST"
+        )));
+        assert!(load_active(&pid).is_none());
+    }
+
+    #[test]
+    fn active_save_failure_preserves_shell_and_restore_state() {
+        let _process_env = ProcessEnvGuard::new();
+        let tmp = TempDir::new("ish_denv_active_save_failure");
+        let data = tmp.path().join("data");
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let dotenv = project.join(".env");
+        std::fs::write(&dotenv, "DENV_SAVE_TEST=loaded\n").unwrap();
+        allow_file_in(
+            &data.join("allow"),
+            &read_trusted_candidate(&dotenv).unwrap(),
+        )
+        .unwrap();
+
+        let mut epsh = epsh::eval::Shell::builder().env_clear().build();
+        for (key, value) in [
+            ("DENV_DATA_DIR", data.to_str().unwrap()),
+            ("PWD", project.to_str().unwrap()),
+            ("DENV_SAVE_TEST", "base"),
+        ] {
+            epsh.vars_mut().set(key, value).unwrap();
+            epsh.vars_mut().export(key);
+        }
+        unsafe {
+            std::env::set_var("DENV_DATA_DIR", &data);
+        }
+
+        let first = refresh(false, &epsh).unwrap();
+        apply_changes_to_shell(&mut epsh, &first);
+        let pid = std::process::id().to_string();
+        let original_active = load_active(&pid).unwrap();
+        assert!(original_active.prev.iter().any(|previous| matches!(
+            previous,
+            PrevVar::Restore(key, value) if key == "DENV_SAVE_TEST" && value == "base"
+        )));
+
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let failed_refresh = refresh(true, &epsh);
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = match failed_refresh {
+            Ok(_) => panic!("expected active-state write to fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("active file"), "{err}");
+        assert_eq!(env::var("DENV_SAVE_TEST").unwrap(), "loaded");
+        assert_eq!(
+            epsh.vars().get_bytes("DENV_SAVE_TEST").unwrap().as_bytes(),
+            b"loaded"
+        );
+        assert!(load_active(&pid).is_some());
+
+        epsh.vars_mut().set("PWD", outside.to_str().unwrap()).unwrap();
+        let restored = refresh(false, &epsh).unwrap();
+        assert!(restored.iter().any(|change| matches!(
+            change,
+            EnvChange::Set(key, value) if key == "DENV_SAVE_TEST" && value == "base"
+        )));
+        assert!(load_active(&pid).is_none());
     }
 
     #[test]
@@ -1420,13 +1824,21 @@ mod tests {
 
     #[test]
     fn dotenv_values_reach_epsh_as_data_not_script() {
+        let _process_env = ProcessEnvGuard::new();
         let tmp = TempDir::new("ish_denv_dotenv_epsh");
         let marker = tmp.path().join("marker");
         let value = format!("it's $(touch {}) `x`", marker.display());
         let entries = vec![("DENV_DOTENV_VALUE".to_string(), value.clone())];
         let epsh = epsh::eval::Shell::new();
         let env_pairs = epsh.vars().env_for_command_os(&[]);
-        let diff = eval_env_epsh(tmp.path(), b"#!/bin/sh\n:\n", &entries, &env_pairs).unwrap();
+        let diff = eval_env_epsh(
+            tmp.path(),
+            b"#!/bin/sh\n:\n",
+            &entries,
+            &env_pairs,
+            Duration::from_secs(30),
+        )
+        .unwrap();
         assert!(diff.set.contains(&("DENV_DOTENV_VALUE".to_string(), value)));
         assert!(!marker.exists());
     }
@@ -1449,6 +1861,34 @@ mod tests {
         };
         assert!(err.contains("timed out"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn bash_envrc_timeout_covers_descendants_holding_snapshot_pipes() {
+        let tmp = TempDir::new("ish_denv_descendant_timeout");
+        let marker = tmp.path().join("descendant_completed");
+        let epsh = epsh::eval::Shell::new();
+        let env_pairs = epsh.vars().env_for_command_os(&[]);
+        let start = Instant::now();
+        let result = eval_env_bash(
+            tmp.path(),
+            format!(
+                "#!/usr/bin/env bash\n(sleep 0.3; printf done > '{}') &\n",
+                marker.display()
+            )
+            .as_bytes(),
+            &[],
+            &env_pairs,
+            Duration::from_millis(50),
+        );
+        let err = match result {
+            Ok(_) => panic!("expected descendant timeout"),
+            Err(err) => err,
+        };
+        assert!(err.contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!marker.exists());
     }
 
     #[test]
