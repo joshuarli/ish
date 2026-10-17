@@ -1,3 +1,4 @@
+import Lean.Elab.Tactic.Omega
 import IshSemantics.Protocol
 
 namespace IshSemantics.Interactive

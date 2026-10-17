@@ -1,3 +1,4 @@
+import Lean.Data.Json
 import IshSemantics.Types
 
 namespace IshSemantics.Protocol

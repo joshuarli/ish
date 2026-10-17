@@ -1,5 +1,3 @@
-import Lean
-
 namespace IshSemantics
 
 abbrev Bytes := List UInt8

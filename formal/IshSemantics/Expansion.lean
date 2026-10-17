@@ -1,3 +1,4 @@
+import Lean.Elab.Tactic.Omega
 import IshSemantics.Protocol
 import IshSemantics.Evaluation
 namespace IshSemantics.Expansion
