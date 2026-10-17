@@ -66,6 +66,14 @@ fn public_text_values_are_utf8_and_encoded_values_decode_explicitly() {
 }
 
 #[test]
+fn unquoted_assignment_values_preserve_unicode_and_invalid_bytes() {
+    let source = b"v=\xee\x80\x80\xee\x82\x80; printf '%s' \"$v\"";
+    assert_eq!(captured(source, true), b"\xee\x80\x80\xee\x82\x80");
+    let source = b"v=\x80\xee\x82\x80\xff; printf '%s' \"$v\"";
+    assert_eq!(captured(source, false), b"\x80\xee\x82\x80\xff");
+}
+
+#[test]
 fn lexer_spans_count_source_characters_without_codec_prefixes() {
     let mut lexer = epsh::lexer::Lexer::new("\u{e000}\u{e080}\u{e0ff} next");
     lexer.next_token().unwrap();
@@ -131,6 +139,16 @@ fn private_use_and_invalid_path_names_remain_distinct_during_globbing() {
     assert_eq!(lines, vec![b"80".as_slice(), b"ee8080", b"ee8280"]);
     let path = directory.path().join("\u{e080}");
     assert_eq!(epsh::glob::glob("\u{e080}", directory.path()), vec![bytes_to_str(path.file_name().unwrap().as_bytes())]);
+}
+
+#[test]
+fn glob_order_uses_filename_bytes_instead_of_codec_prefixes() {
+    let directory = tempfile::tempdir().unwrap();
+    for name in ["\u{e001}", "\u{e080}"] {
+        std::fs::write(directory.path().join(name), b"").unwrap();
+    }
+    let names: Vec<_> = epsh::glob::glob("*", directory.path()).iter().map(|name| str_to_bytes(name)).collect();
+    assert_eq!(names, vec!["\u{e001}".as_bytes(), "\u{e080}".as_bytes()]);
 }
 
 #[test]

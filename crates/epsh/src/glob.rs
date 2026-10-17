@@ -267,7 +267,7 @@ fn path_to_string(path: &Path) -> String {
 }
 
 fn sort_results(mut results: Vec<String>) -> Vec<String> {
-    results.sort();
+    results.sort_by_cached_key(|result| crate::encoding::str_to_bytes(result));
     results
 }
 
