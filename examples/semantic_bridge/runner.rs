@@ -1,4 +1,5 @@
 use crate::semantic_bridge::arithmetic;
+use crate::semantic_bridge::expansion;
 use crate::semantic_bridge::interactive;
 use crate::semantic_bridge::policy;
 use crate::semantic_bridge::protocol::{Family, Request, validate_response};
@@ -67,9 +68,11 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
                 let minimized = minimize_mismatch(&binary, &tmpdir, family, request)?;
                 retain_regression(&root, family, &minimized)?;
                 return Err(BridgeError::new(format!(
-                    "{} mismatch at {}; minimized request saved to formal/fixtures/bridge-regressions/{}/{}.json",
+                    "{} mismatch at {}; expected {}, Lean returned {}; minimized request saved to formal/fixtures/bridge-regressions/{}/{}.json",
                     family.name(),
                     request.id,
+                    expected,
+                    observed,
                     family.name(),
                     minimized.id
                 )));
@@ -235,7 +238,7 @@ fn generate(family: Family, index: usize, seed: u64) -> BridgeResult<Request> {
         Family::Arithmetic => Ok(arithmetic::generate(index, seed)),
         Family::Interactive => Ok(interactive::generate(index, seed)),
         Family::Policy => policy::generate(index, seed),
-        Family::Expansion => Err(BridgeError::new("expansion adapter is not integrated")),
+        Family::Expansion => expansion::generate(index, seed),
         Family::Evaluation => Err(BridgeError::new("evaluation adapter is not integrated")),
         Family::Effects => Err(BridgeError::new("effects adapter is not integrated")),
     }
@@ -246,9 +249,8 @@ fn validate_case(request: &Request) -> BridgeResult<()> {
         Family::Arithmetic => arithmetic::validate_case(request),
         Family::Interactive => interactive::validate_case(request),
         Family::Policy => policy::validate_case(request),
-        Family::Expansion | Family::Evaluation | Family::Effects => {
-            Err(BridgeError::new("selected family adapter is not integrated"))
-        }
+        Family::Expansion => expansion::validate_case(request),
+        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family adapter is not integrated")),
     }
 }
 
@@ -257,9 +259,8 @@ fn actual(request: &Request) -> BridgeResult<Value> {
         Family::Arithmetic => arithmetic::actual(request),
         Family::Interactive => interactive::actual(request),
         Family::Policy => policy::actual(request),
-        Family::Expansion | Family::Evaluation | Family::Effects => {
-            Err(BridgeError::new("selected family adapter is not integrated"))
-        }
+        Family::Expansion => expansion::actual(request),
+        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family adapter is not integrated")),
     }
 }
 
@@ -268,9 +269,8 @@ fn negative_control(family: Family, outcome: &Value) -> BridgeResult<Value> {
         Family::Arithmetic => arithmetic::negative_control(outcome),
         Family::Interactive => interactive::negative_control(outcome),
         Family::Policy => policy::negative_control(outcome),
-        Family::Expansion | Family::Evaluation | Family::Effects => {
-            Err(BridgeError::new("selected family negative control is not integrated"))
-        }
+        Family::Expansion => expansion::negative_control(outcome),
+        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family negative control is not integrated")),
     }
 }
 
@@ -471,9 +471,8 @@ fn shrink(family: Family, request: &Request) -> BridgeResult<Vec<Request>> {
         Family::Arithmetic => arithmetic::shrink(request),
         Family::Interactive => interactive::shrink(request),
         Family::Policy => policy::shrink(request),
-        Family::Expansion | Family::Evaluation | Family::Effects => {
-            Err(BridgeError::new("selected family shrinker is not integrated"))
-        }
+        Family::Expansion => expansion::shrink(request),
+        Family::Evaluation | Family::Effects => Err(BridgeError::new("selected family shrinker is not integrated")),
     }
 }
 
