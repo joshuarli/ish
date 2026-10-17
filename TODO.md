@@ -13,14 +13,6 @@ Next: 22
 - **Design:** [Foreground job outcomes](docs/rfc/ISH-5-foreground-job-outcomes.md)
 
 
-### ISH-7 · P2 · History salvage leaves concurrent readers on stale occurrence IDs
-
-- **Area:** Data
-- **Where:** `src/history/store.rs:216`, `src/history/store.rs:298`, `src/history/store.rs:310`, `src/history.rs:128`
-- **Problem:** Salvage truncates a damaged suffix without changing the store generation. Existing readers retain discarded entries and their last-ID cutoff even after resetting their byte cursor. A public-API probe with three entries corrupted the second frame: a fresh reader saw one retained entry while an existing reader still saw three; subsequent appends reused IDs and a new external occurrence remained invisible to that reader.
-- **Recommendation:** Publish the retained prefix as a new generation during salvage so every reader replaces its snapshot and resets its occurrence cutoff.
-- **Fix with:** durable-state
-- **Effort:** M (days)
 
 ### ISH-8 · P2 · Forked external callbacks can deadlock on captured host locks
 

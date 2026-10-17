@@ -206,6 +206,9 @@ impl Store {
                 None => return Err(error),
             },
         };
+        let generation = read_header(&mut file)?
+            .checked_add(1)
+            .ok_or_else(|| invalid("generation exhausted"))?;
         let moved_to = corrupt_path(&self.path);
         let mut destination = open_file(
             &moved_to,
@@ -214,8 +217,11 @@ impl Store {
         file.seek(SeekFrom::Start(kept))?;
         io::copy(&mut file, &mut destination)?;
         destination.sync_all()?;
-        file.set_len(kept)?;
-        file.sync_all()?;
+        publish(&self.path, generation, |writer| {
+            file.seek(SeekFrom::Start(HEADER_SIZE))?;
+            io::copy(&mut file.take(kept - HEADER_SIZE), writer)?;
+            Ok(())
+        })?;
         self.cursor = Cursor::default();
         Ok(Salvage { kept, moved_to })
     }
@@ -532,6 +538,19 @@ impl Drop for TemporaryFile {
 }
 
 fn replace(path: &Path, generation: i64, occurrences: &[Occurrence]) -> io::Result<()> {
+    publish(path, generation, |writer| {
+        for occurrence in occurrences {
+            writer.write_all(&encode(occurrence)?)?;
+        }
+        Ok(())
+    })
+}
+
+fn publish(
+    path: &Path,
+    generation: i64,
+    write_records: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+) -> io::Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let (temporary, file) = loop {
         let temporary = suffixed_path(
@@ -554,9 +573,7 @@ fn replace(path: &Path, generation: i64, occurrences: &[Occurrence]) -> io::Resu
     let mut writer = BufWriter::with_capacity(64 * 1024, file);
     writer.write_all(HEADER)?;
     writer.write_all(&generation.to_le_bytes())?;
-    for occurrence in occurrences {
-        writer.write_all(&encode(occurrence)?)?;
-    }
+    write_records(&mut writer)?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
     fs::rename(&temporary.0, path)?;

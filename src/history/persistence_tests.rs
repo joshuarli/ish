@@ -485,6 +485,55 @@ fn damage_before_the_last_frame_is_salvaged_loudly() {
 }
 
 #[test]
+fn salvage_invalidates_existing_readers_and_reused_occurrence_cutoffs() {
+    for keep_first in [false, true] {
+        let fixture = Fixture::new();
+        let mut writer = History::load_from(fixture.path()).unwrap();
+        writer.add_in_dir("first", None).unwrap();
+        let path = store::storage_path(&fixture.path());
+        let first_end = fs::read(&path).unwrap().len();
+        writer.add_in_dir("second", None).unwrap();
+        writer.add_in_dir("third", None).unwrap();
+        let mut syncing = History::load_from(fixture.path()).unwrap();
+        let mut appending = History::load_from(fixture.path()).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        let retained_end = if keep_first { first_end } else { 16 };
+        bytes[retained_end + 12] ^= 0x80;
+        fs::write(&path, bytes).unwrap();
+
+        let mut recovered = History::load_from(fixture.path()).unwrap();
+        let retained_count = usize::from(keep_first);
+        assert_eq!(recovered.len(), retained_count);
+        syncing.sync().unwrap();
+        assert_eq!(syncing.len(), retained_count);
+        assert_eq!(syncing.prefix_search("second", 0), None);
+        assert_eq!(syncing.prefix_search("third", 0), None);
+        assert_eq!(syncing.session_get(0), None);
+        if keep_first {
+            assert_eq!(syncing.get(0), "first");
+            assert_eq!(syncing.frequency(0), 1);
+        }
+
+        appending.add_in_dir("mine", None).unwrap();
+        assert_eq!(appending.len(), retained_count + 1);
+        assert_eq!(appending.session_get(0), Some("mine"));
+        assert_eq!(appending.session_get(1), None);
+        syncing.sync().unwrap();
+        assert_eq!(syncing.prefix_search("mine", 0), Some("mine"));
+
+        recovered.add_in_dir("external", None).unwrap();
+        syncing.sync().unwrap();
+        assert_eq!(syncing.prefix_search("external", 0), Some("external"));
+        assert_eq!(syncing.len(), retained_count + 2);
+        syncing.sync().unwrap();
+        for idx in 0..syncing.len() {
+            assert_eq!(syncing.frequency(idx), 1);
+        }
+        assert_eq!(fixture.occurrences(), retained_count + 2);
+    }
+}
+
+#[test]
 fn reset_works_on_a_log_with_damaged_records_or_header() {
     let fixture = Fixture::new();
     let (path, mut bytes, first_end) = two_frame_log(&fixture);
