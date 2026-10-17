@@ -454,12 +454,20 @@ impl InputReader {
         let mut params = Vec::new();
         let mut current = 0u32;
         let mut has_digit = false;
+        let mut invalid = false;
 
         loop {
             let b = self.read_byte_timeout(50)?;
             match b {
                 b'0'..=b'9' => {
-                    current = current * 10 + (b - b'0') as u32;
+                    if let Some(value) = current
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add((b - b'0') as u32))
+                    {
+                        current = value;
+                    } else {
+                        invalid = true;
+                    }
                     has_digit = true;
                 }
                 b';' => {
@@ -470,6 +478,9 @@ impl InputReader {
                 0x40..=0x7e => {
                     if has_digit {
                         params.push(current);
+                    }
+                    if invalid {
+                        return None;
                     }
                     return self.csi_to_key(b, &params);
                 }
@@ -620,6 +631,16 @@ mod tests {
         assert_eq!(key.key, Key::Delete);
         assert!(key.mods.ctrl);
         assert!(!key.mods.alt);
+    }
+
+    #[test]
+    fn oversized_csi_parameter_is_discarded_through_its_final_byte() {
+        let (stdin_read, stdin_write) = rustix::pipe::pipe().unwrap();
+        rustix::io::write(&stdin_write, b"\x1b[4294967296Ax").unwrap();
+        let mut reader = InputReader::with_fds(stdin_read.as_raw_fd(), -1);
+
+        assert!(reader.decode_key().is_none());
+        assert_eq!(reader.decode_key().unwrap().key, Key::Char('x'));
     }
 
     #[test]

@@ -40,14 +40,6 @@ Next: 22
 - **Effort:** M (days)
 
 
-### ISH-17 · P3 · Oversized terminal parameters overflow the input decoder
-
-- **Area:** Errors
-- **Where:** `src/input.rs:453`, `src/input.rs:462`
-- **Problem:** The CSI decoder accumulates decimal parameters with unchecked u32 multiplication and addition. A fresh debug-build PTY fed an oversized decimal CSI parameter panicked. Release arithmetic can wrap instead; that release outcome is inferred from the arithmetic and build profile, not separately reproduced.
-- **Recommendation:** Use checked accumulation and consume or reject the complete malformed sequence without panicking or interpreting a wrapped parameter.
-- **Fix with:** error-model
-- **Effort:** S (hours)
 
 ### ISH-18 · P3 · Public empty pipeline AST panics during evaluation
 
