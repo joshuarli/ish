@@ -39,14 +39,6 @@ Next: 22
 - **Fix with:** os-boundaries, api-surface-and-module-boundaries
 - **Effort:** M (days)
 
-### ISH-16 · P3 · Newlines in project paths break denv restoration records
-
-- **Area:** Data
-- **Where:** `src/denv.rs:536`, `src/denv.rs:563`
-- **Problem:** Active state stores the project path as an unescaped first line. A newline in a valid Unix directory name shifts the remaining fields and load_active silently treats the record as absent. A public-API probe entered and left a trusted project whose name contained a newline; its scoped environment marker remained set.
-- **Recommendation:** Encode paths losslessly in a versioned active-state format and distinguish malformed state from absent state before applying or restoring project values.
-- **Fix with:** durable-state, os-boundaries, error-model
-- **Effort:** S (hours)
 
 ### ISH-17 · P3 · Oversized terminal parameters overflow the input decoder
 

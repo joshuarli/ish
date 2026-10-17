@@ -35,6 +35,7 @@ const DOTENV_VALUE_VAR_PREFIX: &str = "__DENV_DOT_";
 /// while ish waits, so a hung `.envrc` must fail loudly instead of wedging cd.
 const ENVRC_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
 const ACTIVE_TEMP_NAME_ATTEMPTS: u64 = 128;
+const ACTIVE_FORMAT_HEADER: &str = "DENV-ACTIVE 1";
 const BEFORE_SNAPSHOT_FD: RawFd = 3;
 const AFTER_SNAPSHOT_FD: RawFd = 4;
 const SNAPSHOT_SOURCE_FD_MIN: RawFd = AFTER_SNAPSHOT_FD + 1;
@@ -172,16 +173,24 @@ fn current_dir_from_store(epsh: &epsh::eval::Shell) -> PathBuf {
 }
 
 fn refresh(session: &Session, force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
+    let data_dir = session.data_dir()?;
+    let pid = std::process::id().to_string();
+    let active = load_active(data_dir, &pid)?;
     let store_env_pairs = epsh.vars().env_for_command_os(&[]);
     restore_process_env(&store_env_pairs);
-    let result = refresh_inner(session.data_dir()?, force, epsh);
+    let result = refresh_inner(data_dir, force, epsh, active);
     if result.is_err() {
         restore_process_env(&store_env_pairs);
     }
     result
 }
 
-fn refresh_inner(data_dir: &Path, force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
+fn refresh_inner(
+    data_dir: &Path,
+    force: bool,
+    epsh: &epsh::eval::Shell,
+    active: Option<ActiveState>,
+) -> Result<Vec<EnvChange>, String> {
     let cwd = current_dir_from_store(epsh);
     let pid = std::process::id().to_string();
     let allow_dir = data_dir.join("allow");
@@ -210,8 +219,6 @@ fn refresh_inner(data_dir: &Path, force: bool, epsh: &epsh::eval::Shell) -> Resu
     } else {
         Vec::new()
     };
-
-    let active = load_active(data_dir, &pid);
 
     if !force && let Some(ref found) = found {
         if files_allowed && state_var_matches(found) {
@@ -553,50 +560,173 @@ fn unescape_newlines(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn load_active(data_dir: &Path, pid: &str) -> Option<ActiveState> {
-    let content = fs::read_to_string(active_path(data_dir, pid)).ok()?;
+fn load_active(data_dir: &Path, pid: &str) -> Result<Option<ActiveState>, String> {
+    let path = active_path(data_dir, pid);
+    let content = match fs::read(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("failed to read active file {}: {err}", path.display())),
+    };
+    let content = std::str::from_utf8(&content)
+        .map_err(|err| format!("invalid active file {}: {err}", path.display()))?;
+    parse_active(content)
+        .map(Some)
+        .map_err(|err| format!("invalid active file {}: {err}", path.display()))
+}
+
+fn parse_active(content: &str) -> Result<ActiveState, String> {
+    if content.starts_with("DENV-ACTIVE ") {
+        let mut lines = content.split_terminator('\n');
+        let header = lines.next().ok_or("missing active format header")?;
+        if header != ACTIVE_FORMAT_HEADER {
+            return Err(format!("unsupported active format {header:?}"));
+        }
+        let path_hex = lines.next().ok_or("missing active project path")?;
+        let dir_bytes = decode_hex(path_hex)?;
+        if dir_bytes.is_empty() || dir_bytes.contains(&0) {
+            return Err("invalid active project path".to_string());
+        }
+        let dir = PathBuf::from(std::ffi::OsStr::from_bytes(&dir_bytes));
+        validate_active_dir(&dir)?;
+        let mtimes = lines.next().ok_or("missing active timestamps")?;
+        let (envrc_mtime, dotenv_mtime) = parse_active_mtimes(mtimes)?;
+        let prev = parse_active_vars(lines, true)?;
+        return Ok(ActiveState { dir, envrc_mtime, dotenv_mtime, prev });
+    }
+
+    parse_legacy_active(content)
+}
+
+fn parse_legacy_active(content: &str) -> Result<ActiveState, String> {
     let mut lines = content.lines();
-    let dir = PathBuf::from(lines.next()?);
-    let mtimes = lines.next()?;
-    let (envrc_mtime, dotenv_mtime) = mtimes.split_once(' ')?;
-    let envrc_mtime = envrc_mtime.parse().ok()?;
-    let dotenv_mtime = dotenv_mtime.parse().ok()?;
+    let dir = PathBuf::from(lines.next().ok_or("missing legacy project path")?);
+    validate_active_dir(&dir)?;
+    let mtimes = lines.next().ok_or("missing legacy timestamps")?;
+    let (envrc_mtime, dotenv_mtime) = parse_active_mtimes(mtimes)?;
+    let prev = parse_active_vars(lines, false)?;
+    Ok(ActiveState { dir, envrc_mtime, dotenv_mtime, prev })
+}
+
+fn validate_active_dir(dir: &Path) -> Result<(), String> {
+    if !dir.is_absolute() || dir.as_os_str().as_bytes().contains(&0) {
+        return Err("invalid active project path".to_string());
+    }
+    Ok(())
+}
+
+fn parse_active_mtimes(mtimes: &str) -> Result<(u64, u64), String> {
+    let (envrc_mtime, dotenv_mtime) = mtimes
+        .split_once(' ')
+        .ok_or("invalid active timestamps")?;
+    if envrc_mtime.is_empty() || dotenv_mtime.is_empty() || dotenv_mtime.contains(' ') {
+        return Err("invalid active timestamps".to_string());
+    }
+    let envrc_mtime = envrc_mtime.parse().map_err(|_| "invalid envrc timestamp")?;
+    let dotenv_mtime = dotenv_mtime.parse().map_err(|_| "invalid dotenv timestamp")?;
+    Ok((envrc_mtime, dotenv_mtime))
+}
+
+fn parse_active_vars<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    encoded_keys: bool,
+) -> Result<Vec<PrevVar>, String> {
     let mut prev = Vec::new();
     for line in lines {
         if let Some(eq) = line.find('=') {
+            let key = if encoded_keys {
+                unescape_newlines(&line[..eq]).into_owned()
+            } else {
+                line[..eq].to_string()
+            };
+            validate_active_variable(&key)?;
+            let value = unescape_newlines(&line[eq + 1..]).into_owned();
+            if value.contains('\0') {
+                return Err("invalid active variable value".to_string());
+            }
             prev.push(PrevVar::Restore(
-                line[..eq].to_string(),
-                unescape_newlines(&line[eq + 1..]).into_owned(),
+                key,
+                value,
             ));
         } else if !line.is_empty() {
-            prev.push(PrevVar::Unset(line.to_string()));
+            let key = if encoded_keys {
+                unescape_newlines(line).into_owned()
+            } else {
+                line.to_string()
+            };
+            validate_active_variable(&key)?;
+            prev.push(PrevVar::Unset(key));
+        } else {
+            return Err("empty active variable record".to_string());
         }
     }
-    Some(ActiveState {
-        dir,
-        envrc_mtime,
-        dotenv_mtime,
-        prev,
-    })
+    Ok(prev)
+}
+
+fn validate_active_variable(key: &str) -> Result<(), String> {
+    if key.is_empty() || key.bytes().any(|byte| byte == b'=' || byte == 0) {
+        return Err("invalid active variable name".to_string());
+    }
+    Ok(())
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err("invalid project path encoding".to_string());
+    }
+    pairs
+        .iter()
+        .map(|pair| {
+            let high = hex_digit(pair[0]).ok_or("invalid project path encoding")?;
+            let low = hex_digit(pair[1]).ok_or("invalid project path encoding")?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn save_active(dir: &Path, pid: &str, state: &ActiveState) -> Result<(), String> {
+    validate_active_dir(&state.dir).map_err(|err| format!("failed to write active file: {err}"))?;
+    for previous in &state.prev {
+        match previous {
+            PrevVar::Restore(key, value) => {
+                validate_active_variable(key)
+                    .map_err(|err| format!("failed to write active file: {err}"))?;
+                if value.contains('\0') {
+                    return Err("failed to write active file: invalid active variable value".to_string());
+                }
+            }
+            PrevVar::Unset(key) => validate_active_variable(key)
+                .map_err(|err| format!("failed to write active file: {err}"))?,
+        }
+    }
     fs::create_dir_all(dir).map_err(|e| format!("failed to create data dir: {e}"))?;
     let mut buf = String::new();
-    buf.push_str(&state.dir.to_string_lossy());
+    buf.push_str(ACTIVE_FORMAT_HEADER);
+    buf.push('\n');
+    for byte in state.dir.as_os_str().as_bytes() {
+        write!(buf, "{byte:02x}").unwrap();
+    }
     buf.push('\n');
     write!(buf, "{} {}", state.envrc_mtime, state.dotenv_mtime).unwrap();
     buf.push('\n');
     for prev in &state.prev {
         match prev {
             PrevVar::Restore(key, value) => {
-                buf.push_str(key);
+                buf.push_str(&escape_newlines(key));
                 buf.push('=');
                 buf.push_str(&escape_newlines(value));
                 buf.push('\n');
             }
             PrevVar::Unset(key) => {
-                buf.push_str(key);
+                buf.push_str(&escape_newlines(key));
                 buf.push('\n');
             }
         }
@@ -1495,6 +1625,134 @@ mod tests {
     }
 
     #[test]
+    fn active_state_restores_variables_for_newline_project_path() {
+        let _process_env = ProcessEnvGuard::new();
+        let tmp = TempDir::new("ish_denv_newline_project");
+        let data = tmp.path().join("data");
+        let project = tmp.path().join("project\nbreak");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut epsh = epsh::eval::Shell::builder().env_clear().build();
+        for (key, value) in [
+            ("DENV_DATA_DIR", data.to_str().unwrap()),
+            ("PWD", outside.to_str().unwrap()),
+            ("DENV_NEWLINE_RESTORE", "project"),
+        ] {
+            epsh.vars_mut().set(key, value).unwrap();
+            epsh.vars_mut().export(key);
+        }
+        unsafe {
+            std::env::set_var("DENV_DATA_DIR", &data);
+        }
+        let session = init(&mut epsh);
+        save_active(
+            &data,
+            &std::process::id().to_string(),
+            &ActiveState {
+                dir: project,
+                envrc_mtime: 1,
+                dotenv_mtime: 2,
+                prev: vec![PrevVar::Restore("DENV_NEWLINE_RESTORE".into(), "original".into())],
+            },
+        )
+        .unwrap();
+
+        let changes = refresh(&session, false, &epsh).unwrap();
+
+        assert!(changes.iter().any(|change| matches!(
+            change,
+            EnvChange::Set(key, value) if key == "DENV_NEWLINE_RESTORE" && value == "original"
+        )));
+        assert_eq!(env::var("DENV_NEWLINE_RESTORE").unwrap(), "original");
+    }
+
+    #[test]
+    fn active_state_roundtrip_preserves_non_utf8_project_path() {
+        let tmp = TempDir::new("ish_denv_non_utf8_project");
+        let data = tmp.path().join("data");
+        let path = PathBuf::from(OsString::from_vec(b"/project/\xff".to_vec()));
+        let state = ActiveState {
+            dir: path.clone(),
+            envrc_mtime: 3,
+            dotenv_mtime: 4,
+            prev: vec![PrevVar::Unset("DENV_TEST".into())],
+        };
+
+        save_active(&data, "test", &state).unwrap();
+        let saved = std::fs::read_to_string(active_path(&data, "test")).unwrap();
+        assert!(saved.starts_with("DENV-ACTIVE 1\n"));
+
+        let restored = load_active(&data, "test").unwrap().unwrap();
+        assert_eq!(restored.dir.as_os_str().as_bytes(), path.as_os_str().as_bytes());
+        assert_eq!(restored.envrc_mtime, 3);
+        assert_eq!(restored.dotenv_mtime, 4);
+    }
+
+    #[test]
+    fn active_state_reads_legacy_records_and_rejects_malformed_or_unknown_formats() {
+        let tmp = TempDir::new("ish_denv_legacy_active");
+        std::fs::write(
+            active_path(tmp.path(), "legacy"),
+            "/project\n1 2\nA=value\\nnext\nB\n",
+        )
+        .unwrap();
+        let legacy = load_active(tmp.path(), "legacy").unwrap().unwrap();
+        assert!(matches!(
+            legacy,
+            ActiveState { dir, envrc_mtime: 1, dotenv_mtime: 2, prev }
+                if dir == Path::new("/project")
+                    && matches!(prev.as_slice(), [PrevVar::Restore(key, value), PrevVar::Unset(unset)]
+                        if key == "A" && value == "value\nnext" && unset == "B")
+        ));
+        let unknown = match parse_active("DENV-ACTIVE 2\n00\n1 2\n") {
+            Ok(_) => panic!("expected unknown active format to fail"),
+            Err(err) => err,
+        };
+        assert!(unknown.contains("unsupported"));
+        assert!(parse_active("DENV-ACTIVE 1\n0g\n1 2\n").is_err());
+        assert!(parse_active("DENV-ACTIVE 1\n2f\n1 2\n=bad\n").is_err());
+        assert!(parse_active("DENV-ACTIVE 1\n72656c6174697665\n1 2\n").is_err());
+        assert!(parse_active("DENV-ACTIVE 1\n2f00\n1 2\n").is_err());
+        assert!(parse_active("DENV-ACTIVE 1\n2f\n1 2\nA=bad\0value\n").is_err());
+        assert!(load_active(tmp.path(), "missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_active_state_fails_before_process_environment_changes() {
+        let _process_env = ProcessEnvGuard::new();
+        let tmp = TempDir::new("ish_denv_malformed_active");
+        let data = tmp.path().join("data");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let mut epsh = epsh::eval::Shell::builder().env_clear().build();
+        for (key, value) in [
+            ("DENV_DATA_DIR", data.to_str().unwrap()),
+            ("PWD", cwd.to_str().unwrap()),
+            ("DENV_PROCESS_ENV_SENTINEL", "shell-value"),
+        ] {
+            epsh.vars_mut().set(key, value).unwrap();
+            epsh.vars_mut().export(key);
+        }
+        unsafe {
+            std::env::set_var("DENV_DATA_DIR", &data);
+            std::env::set_var("DENV_PROCESS_ENV_SENTINEL", "process-value");
+        }
+        let pid = std::process::id().to_string();
+        std::fs::write(active_path(&data, &pid), b"DENV-ACTIVE 99\n").unwrap();
+        let session = init(&mut epsh);
+
+        let err = match refresh(&session, false, &epsh) {
+            Ok(_) => panic!("expected malformed active format to fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("unsupported active format"), "{err}");
+        assert_eq!(env::var("DENV_PROCESS_ENV_SENTINEL").unwrap(), "process-value");
+    }
+
+    #[test]
     fn parse_denv_state_supports_spaces_in_dir() {
         let parsed = parse_denv_state("1 2 /tmp/path with spaces").unwrap();
         assert_eq!(parsed.0, 1);
@@ -1845,7 +2103,7 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.contains("utf-8"), "{err}");
-        assert!(load_active(&data, &pid).is_some());
+        assert!(load_active(&data, &pid).unwrap().is_some());
 
         epsh.vars_mut().set("PWD", outside.to_str().unwrap()).unwrap();
         let changes = refresh(&session, false, &epsh).unwrap();
@@ -1853,7 +2111,7 @@ mod tests {
             change,
             EnvChange::Unset(key) if key == "DENV_RESTORE_TEST"
         )));
-        assert!(load_active(&data, &pid).is_none());
+        assert!(load_active(&data, &pid).unwrap().is_none());
     }
 
     #[test]
@@ -1899,7 +2157,7 @@ mod tests {
                 & 0o777,
             0o600
         );
-        let original_active = load_active(&data, &pid).unwrap();
+        let original_active = load_active(&data, &pid).unwrap().unwrap();
         assert!(original_active.prev.iter().any(|previous| matches!(
             previous,
             PrevVar::Restore(key, value) if key == "DENV_SAVE_TEST" && value == "base"
@@ -1921,7 +2179,7 @@ mod tests {
             epsh.vars().get_bytes("DENV_SAVE_TEST").unwrap().as_bytes(),
             b"loaded"
         );
-        let preserved_active = load_active(&data, &pid).unwrap();
+        let preserved_active = load_active(&data, &pid).unwrap().unwrap();
         assert!(preserved_active.prev.iter().any(|previous| matches!(
             previous,
             PrevVar::Restore(key, value) if key == "DENV_SAVE_TEST" && value == "base"
@@ -1933,7 +2191,7 @@ mod tests {
             change,
             EnvChange::Set(key, value) if key == "DENV_SAVE_TEST" && value == "base"
         )));
-        assert!(load_active(&data, &pid).is_none());
+        assert!(load_active(&data, &pid).unwrap().is_none());
     }
 
     #[test]
