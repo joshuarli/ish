@@ -258,6 +258,16 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
             let and = join_source(&[first, second], b" && ");
             (join_source(&[and, third], b" || "), observations, Options { errexit: false, pipefail: true })
         }
+        13 => (
+            b"plain=$(false)".to_vec(),
+            Vec::new(),
+            Options { errexit: false, pipefail: false },
+        ),
+        14 => (
+            b"plain=$(false)$(true)".to_vec(),
+            Vec::new(),
+            Options { errexit: false, pipefail: false },
+        ),
         _ => {
             let mut observations = Vec::new();
             let source = random_source(&mut random, 4, &mut observations);
@@ -342,7 +352,13 @@ fn initial_state(index: usize) -> Value {
         "inherited": [],
         "cwd": [47],
         "positional": [b"positional".to_vec(), vec![b'p', 0xff]],
-        "last_status": if index == 1 { 9 } else if index.is_multiple_of(6) { 11 } else { 0 },
+        "last_status": if index == 1 || (13..=14).contains(&index) {
+            9
+        } else if index.is_multiple_of(6) {
+            11
+        } else {
+            0
+        },
     })
 }
 
@@ -722,15 +738,20 @@ fn command_json(command: &Command) -> BridgeResult<Value> {
             if assigns.is_empty() && args.is_empty() {
                 return Err(BridgeError::new("evaluation source has an empty simple command"));
             }
+            let mut assignment_status = None;
             let assignments = assigns
                 .iter()
                 .map(|assignment| {
                     if !is_shell_name(&assignment.name) {
                         return Err(BridgeError::new("evaluation assignment name is invalid"));
                     }
+                    let (value, status) = assignment_word(&assignment.value)?;
+                    if status.is_some() {
+                        assignment_status = status;
+                    }
                     Ok(json!([
                         assignment.name,
-                        literal_assignment_word(&assignment.value)?
+                        value
                     ]))
                 })
                 .collect::<BridgeResult<Vec<_>>>()?;
@@ -747,6 +768,11 @@ fn command_json(command: &Command) -> BridgeResult<Value> {
                 .iter()
                 .map(literal_word)
                 .collect::<BridgeResult<Vec<_>>>()?;
+            if !argv.is_empty() && assignment_status.is_some() {
+                return Err(BridgeError::new(
+                    "evaluation command has a substitution in a prefix assignment",
+                ));
+            }
             let observation = if argv.is_empty() {
                 0
             } else {
@@ -757,6 +783,7 @@ fn command_json(command: &Command) -> BridgeResult<Value> {
                 "assignments": assignments,
                 "argv": argv,
                 "observation": observation,
+                "assignment_status": assignment_status,
             }))
         }
         Command::Sequence(left, right) => Ok(json!({
@@ -802,15 +829,74 @@ fn literal_word(word: &Word) -> BridgeResult<Vec<u8>> {
     Ok(ShellBytes::from_str_lossless(&value).into_vec())
 }
 
-fn literal_assignment_word(word: &Word) -> BridgeResult<Vec<u8>> {
+fn assignment_word(word: &Word) -> BridgeResult<(Vec<u8>, Option<u8>)> {
     let mut value = String::new();
-    append_literal_parts(&word.parts, &mut value, false, false)?;
+    let mut status = None;
+    append_assignment_parts(&word.parts, &mut value, &mut status)?;
     if value.contains('\u{FFFE}') {
         return Err(BridgeError::new(
             "evaluation assignment contains an escaped literal",
         ));
     }
-    Ok(ShellBytes::from_str_lossless(&value).into_vec())
+    Ok((ShellBytes::from_str_lossless(&value).into_vec(), status))
+}
+
+fn append_assignment_parts(
+    parts: &[WordPart],
+    output: &mut String,
+    status: &mut Option<u8>,
+) -> BridgeResult<()> {
+    for part in parts {
+        match part {
+            WordPart::Literal(bytes) | WordPart::SingleQuoted(bytes) => {
+                let text = bytes.to_shell_string();
+                if text.contains('\u{FFFE}') {
+                    return Err(BridgeError::new(
+                        "evaluation source contains a reserved escape marker",
+                    ));
+                }
+                output.push_str(&text);
+            }
+            WordPart::DoubleQuoted(parts) => {
+                append_assignment_parts(parts, output, status)?;
+            }
+            WordPart::CmdSubst(command) => {
+                *status = Some(command_substitution_status(command)?);
+            }
+            _ => {
+                return Err(BridgeError::new(
+                    "evaluation source contains an unsupported assignment expansion",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn command_substitution_status(command: &Command) -> BridgeResult<u8> {
+    let Command::Simple {
+        assigns,
+        args,
+        redirs,
+        ..
+    } = command
+    else {
+        return Err(BridgeError::new(
+            "evaluation assignment substitution is outside the admitted command set",
+        ));
+    };
+    if !assigns.is_empty() || !redirs.is_empty() || args.len() != 1 {
+        return Err(BridgeError::new(
+            "evaluation assignment substitution is outside the admitted command set",
+        ));
+    }
+    match literal_word(&args[0])?.as_slice() {
+        b"false" => Ok(1),
+        b"true" => Ok(0),
+        _ => Err(BridgeError::new(
+            "evaluation assignment substitution is outside the admitted command set",
+        )),
+    }
 }
 
 fn append_literal_parts(

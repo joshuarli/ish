@@ -28,7 +28,7 @@ Each expression uses one of these exact shapes:
 
 | `tag` | Other required fields |
 | --- | --- |
-| `simple` | `assignments`: name-byte pairs, `argv`: byte arrays, `observation`: array index |
+| `simple` | `assignments`: name-byte pairs, `argv`: byte arrays, `observation`: array index, `assignment_status`: `null` or an integer from 0 through 255 |
 | `sequence` | `left`, `right`: expressions |
 | `and` | `left`, `right`: expressions |
 | `or` | `left`, `right`: expressions |
@@ -36,8 +36,13 @@ Each expression uses one of these exact shapes:
 | `subshell` | `body`: expression |
 | `pipeline` | `commands`: expression array, `bang`: Boolean |
 
-An empty `argv` applies assignments to the current state and preserves the previous
-status, matching epsh's literal assignment path. The evaluator ignores its observation index.
+An empty `argv` applies assignments to the current state. If no command substitution
+ran while expanding the assignment values, the command returns status 0. Otherwise
+it returns the status from the last completed substitution. The evaluator ignores
+its observation index. `assignment_status` is `null` when no substitution ran and
+otherwise contains that last substitution status. The bridge admits assignment
+substitutions only when their command is exactly `false` or `true`; all other
+assignment expansions are outside its source domain.
 A nonempty `argv` selects the indexed observation and emits an invocation event.
 Nonempty stdout and stderr emit writes to descriptors 1 and 2, in that order.
 Prefix assignments affect the invocation environment and leave shell variables unchanged.
@@ -53,11 +58,15 @@ program through `Shell::run_program`. The driver must reject a supplied expressi
 that disagrees with the parsed program. Directly interpreting this JSON in Rust
 would not establish correspondence with the production evaluator.
 
-The admitted source domain contains literal assignments and literal argument bytes,
-with no redirections, expansions, builtins, functions, traps, or asynchronous commands.
+The admitted source domain contains literal argument bytes and literal assignment
+values, with a narrow exception for `false` and `true` command substitutions in
+bare assignment values. It has no redirections, other expansions, direct builtins,
+functions, traps, or asynchronous commands.
 Literal and quoted word parts concatenate into one argument.
 An empty quoted argument remains an argument.
-The driver must reject unquoted splitting, globbing, tilde expansion, and substitutions.
+The driver must reject unquoted splitting, globbing, tilde expansion, argument
+substitutions, and assignment substitutions outside the admitted `false` and `true`
+commands.
 The external callback supplies the declared observation and records the actual
 invocation environment, working directory, and output effects.
 Observation indices identify syntactic leaves. Skipped leaves consume no observations.
@@ -103,15 +112,16 @@ callbacks from the same pipeline into stage order, preserving order between
 sequential commands and separate pipelines.
 
 The admitted leaf oracle returns statuses and bytes without callback errors.
-Expansion, redirection, process creation, cancellation, and callback failures require
-other models or explicit unsupported outcomes. A modeled semantic error retains its
-error, state, and trace. `prepend` also retains all earlier trace events on an error.
+Other expansion, redirection, process creation, cancellation, and callback failures
+require other models or explicit unsupported outcomes. A modeled semantic error
+retains its error, state, and trace. `prepend` also retains all earlier trace events on an error.
 The error-composition theorem does not establish that every production failure is modeled.
 
 ## Checked properties
 
 `Evaluation.lean` proves general skipping, composition, status selection, tested-context,
-assignment-scope, and state-isolation properties. `Tests.lean` checks concrete boundaries.
+assignment-scope, and state-isolation properties, including bare-assignment status
+selection. `Tests.lean` checks concrete boundaries.
 `Audit.lean` prints the dependencies of every named theorem.
 The audit permits only Lean's standard axioms: `propext`, `Quot.sound`, and `Classical.choice`.
 No theorem uses `sorry`, `admit`, custom axioms, mathlib, or `native_decide`.

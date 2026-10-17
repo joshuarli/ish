@@ -36,6 +36,16 @@ The bridge calls production Rust entry points for each family. Its generated
 domains are bounded. Expansion supplies controlled filesystem entries,
 evaluation supplies command observations, and effects checks selected raw-byte,
 environment, cwd, and redirection operations subject to host OS preconditions.
+The expansion adapter requires command substitutions to leave parent variables
+and cwd unchanged. Its model retains the substitution status but discards child
+binding deltas; arithmetic effects can update parent bindings. Returned errors
+abort expansion, while a nonzero command status remains a successful substitution
+result. The bridge compares projected
+`arithmetic` and `expansion` error categories; it does not claim exact Rust error
+variant correspondence. Typed cancellation propagation has a direct Rust test.
+The evaluation adapter checks that a bare assignment returns status 0 when no
+command substitution runs and the final substitution status otherwise, using
+bounded `false` and `true` assignment cases.
 The [coverage matrix](../docs/verification/coverage.md) describes those limits
 for each adapter.
 

@@ -3,7 +3,7 @@ import IshSemantics.Evaluation
 namespace IshSemantics.Evaluation.Tests
 
 def bytes (value : String) : Bytes := value.toUTF8.toList
-def leaf (index : Nat) : Expr := .simple [] [bytes "oracle", bytes (toString index)] index
+def leaf (index : Nat) : Expr := .simple [] [bytes "oracle", bytes (toString index)] index none
 def observations : List LeafObservation := [
   { status := 7, stdout := bytes "failed", stderr := [] },
   { status := 0, stdout := bytes "ok", stderr := [] },
@@ -44,17 +44,21 @@ example : status (eval observations { opts with pipefail := true } 8 false
 example : status (eval observations strict 8 false
     (.sequence (.pipeline [leaf 1, leaf 1] true) (leaf 2)) {}) = some 3 := by rfl
 example : status (eval observations opts 8 false
-    (.simple [("x", bytes "value")] [] 999) { lastStatus := 9 }) = some 9 := by rfl
+    (.simple [("x", bytes "value")] [] 999 none) { lastStatus := 9 }) = some 0 := by rfl
+example : status (eval observations opts 8 false
+    (.simple [("x", bytes "value")] [] 999 (some 1)) { lastStatus := 9 }) = some 1 := by rfl
+example : status (eval observations opts 8 false
+    (.simple [("x", bytes "value")] [] 999 (some 0)) { lastStatus := 9 }) = some 0 := by rfl
 example : variables (eval observations opts 8 false
-    (.simple [("x", bytes "value")] [] 999) {}) = [("x", bytes "value")] := by rfl
+    (.simple [("x", bytes "value")] [] 999 none) {}) = [("x", bytes "value")] := by rfl
 example : variables (eval observations opts 8 false
-    (.simple [("x", bytes "temporary")] [bytes "oracle"] 1)
+    (.simple [("x", bytes "temporary")] [bytes "oracle"] 1 none)
     { variables := [("x", bytes "original")] }) = [("x", bytes "original")] := by rfl
 example : variables (eval observations opts 8 false
-    (.subshell (.simple [("x", bytes "child")] [] 0))
+    (.subshell (.simple [("x", bytes "child")] [] 0 none))
     { variables := [("x", bytes "parent")] }) = [("x", bytes "parent")] := by rfl
 example : variables (eval observations opts 8 false
-    (.pipeline [.simple [("x", bytes "child")] [] 0, leaf 1] false)
+    (.pipeline [.simple [("x", bytes "child")] [] 0 none, leaf 1] false)
     { variables := [("x", bytes "parent")] }) = [("x", bytes "parent")] := by rfl
 example : environment
     { inherited := [(bytes "x", bytes "inherited")], exported := [("x", bytes "exported")] }
@@ -74,6 +78,10 @@ example : match decodeObservation (.mkObj [
     | .error _ => true | .ok _ => false = true := by rfl
 example : match decodeExpr 2 (.mkObj [
     ("tag", Lean.toJson "not"), ("body", .null), ("unknown", .null)]) with
+    | .error _ => true | .ok _ => false = true := by rfl
+example : match decodeExpr 2 (.mkObj [
+    ("tag", Lean.toJson "simple"), ("assignments", .arr #[]), ("argv", .arr #[]),
+    ("observation", Lean.toJson (0 : Nat)), ("assignment_status", Lean.toJson (256 : Nat))]) with
     | .error _ => true | .ok _ => false = true := by rfl
 
 end IshSemantics.Evaluation.Tests

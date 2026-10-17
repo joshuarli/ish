@@ -65,6 +65,13 @@ run_cmd do
   check "substitution status survives word boundary"
     (expand statusInput {} [[.substitution "sub0" false], [.parameter "?" true none]])
     (.success ⟨[[49]], { lastStatus := 1 }, []⟩)
+  let isolatedInput : Input := { emptyInput with
+    observations := [("sub0", [115])]
+    effects := [("sub0", { status := some 0, bindings := [("X", [99])] })] }
+  check "substitution binding delta stays isolated"
+    (expandWord isolatedInput { variables := [("X", [112])], lastStatus := 9 }
+      [.substitution "sub0" true, .parameter "X" true none])
+    (.success ⟨[[115, 112]], { variables := [("X", [112])], lastStatus := 0 }, []⟩)
   let variableInput : Input := { emptyInput with
     observations := [("arith0", [51])]
     effects := [("arith0", { bindings := [("X", [57])] })] }
@@ -79,12 +86,14 @@ run_cmd do
     (expandWord failInput { lastStatus := 11 } [.arithmetic "arith0" true, .arithmetic "arith1" true])
     (.semanticError (.arithmetic "division by zero")
       { variables := [("Y", [55]), ("X", [57])], lastStatus := 11 } [])
+  let childFailure : Effect := { status := some 1, bindings := [("X", [99])], error := some (.expansion "read failure") }
   let failedSub : Input := { emptyInput with
     observations := [("sub0", [120])]
-    effects := [("sub0", { status := some 1, error := some (.expansion "read failure") })] }
-  check "production swallows substitution error but retains status"
-    (expandWord failedSub {} [.substitution "sub0" true])
-    (.success ⟨[[]], { lastStatus := 1 }, []⟩)
+    effects := [("sub0", childFailure)] }
+  check "substitution error aborts and keeps parent bindings isolated"
+    (expandWord failedSub { variables := [("X", [112])], lastStatus := 9 }
+      [.substitution "sub0" true])
+    (.semanticError (.expansion "read failure") { variables := [("X", [112])], lastStatus := 1 } [])
   let ifsInput : Input := { emptyInput with
     observations := [("arith0", [49])]
     effects := [("arith0", { bindings := [("IFS", [49])] })] }
@@ -117,6 +126,10 @@ run_cmd do
     (schemaFailure (.mkObj [("id", .str "x"), ("bytes", .arr #[]),
       ("bindings", .arr #[.arr #[.str "@", .arr #[]]])]))
     (some "invalid oracle binding name")
+  check "substitution oracle cannot change parent bindings"
+    (schemaFailure (.mkObj [("id", .str "sub0"), ("bytes", .arr #[]),
+      ("bindings", .arr #[.arr #[.str "X", .arr #[toJson (99 : Nat)]]])]))
+    (some "command substitution cannot change parent bindings")
   check "oracle error schema rejects unknown kind"
     (schemaFailure (.mkObj [("id", .str "x"), ("bytes", .arr #[]),
       ("error", .mkObj [("kind", .str "syntax"), ("message", .str "x")])]))

@@ -5,6 +5,7 @@ open Lean
 
 inductive Expr where
   | simple (assignments : Bindings) (argv : List Bytes) (observation : Nat)
+      (assignmentStatus : Option UInt8)
   | sequence (left right : Expr)
   | and (left right : Expr)
   | or (left right : Expr)
@@ -70,10 +71,11 @@ def eval (observations : List LeafObservation) (opts : Options) :
   | 0, _, _, _ => .fuelExhausted
   | fuel + 1, tested, expr, state =>
     match expr with
-    | .simple bindings argv index =>
+    | .simple bindings argv index assignmentStatus =>
       if argv.isEmpty then
+        let status := assignmentStatus.getD 0
         .success (finish opts tested true
-          { state := assign state bindings, status := state.lastStatus })
+          { state := { assign state bindings with lastStatus := status }, status })
       else match observations[index]? with
         | none => .unsupportedDomain "missing leaf observation"
         | some observation =>
@@ -164,10 +166,18 @@ def decodeExpr : Nat → Json → Except String Expr
     let tag ← (← value.getObjVal? "tag").getStr?
     match tag with
     | "simple" =>
-      Protocol.exactObject ["tag", "assignments", "argv", "observation"] value
-      return .simple (← Protocol.decodeBindings (← value.getObjVal? "assignments"))
-        (← (← (← value.getObjVal? "argv").getArr?).toList.mapM Protocol.decodeBytes)
-        (← (← value.getObjVal? "observation").getNat?)
+      Protocol.exactObject ["tag", "assignments", "argv", "observation", "assignment_status"] value
+      let assignments ← Protocol.decodeBindings (← value.getObjVal? "assignments")
+      let argv ← (← (← value.getObjVal? "argv").getArr?).toList.mapM Protocol.decodeBytes
+      let observation ← (← value.getObjVal? "observation").getNat?
+      let assignmentStatus ← do
+        match (← value.getObjVal? "assignment_status") with
+        | .null => pure none
+        | status => do
+          let status ← status.getNat?
+          unless status < 256 do throw "assignment status outside 0..255"
+          pure (some status.toUInt8)
+      return .simple assignments argv observation assignmentStatus
     | "sequence" | "and" | "or" =>
       Protocol.exactObject ["tag", "left", "right"] value
       let left ← decodeExpr fuel (← value.getObjVal? "left")
@@ -283,11 +293,12 @@ theorem environment_last_assignment_wins (environment name first second) :
       setEnvironment environment name second := by
   simp [setEnvironment, List.filter_filter]
 
-theorem assignment_persists (observations opts fuel tested bindings index state) :
-    eval observations opts (fuel + 1) tested (.simple bindings [] index) state =
+theorem bare_assignment_selects_final_substitution_status
+    (observations opts fuel tested bindings index assignmentStatus state) :
+    eval observations opts (fuel + 1) tested (.simple bindings [] index assignmentStatus) state =
       .success (finish opts tested true {
-        state := assign state bindings
-        status := state.lastStatus }) := by
+        state := { assign state bindings with lastStatus := assignmentStatus.getD 0 }
+        status := assignmentStatus.getD 0 }) := by
   simp [eval]
 
 theorem pipeline_snoc (pipefail statuses status) :
@@ -332,10 +343,11 @@ theorem subshell_restores_state (observations opts fuel tested body state result
         state := { state with lastStatus := result.execution.status } }) := by
   simp [eval, evaluated]
 
-theorem invocation_preserves_scope (observations opts fuel tested bindings argv index state observation)
+theorem invocation_preserves_scope
+    (observations opts fuel tested bindings argv index assignmentStatus state observation)
     (nonempty : argv.isEmpty = false)
     (observed : observations[index]? = some observation) :
-    eval observations opts (fuel + 1) tested (.simple bindings argv index) state =
+    eval observations opts (fuel + 1) tested (.simple bindings argv index assignmentStatus) state =
       .success (finish opts tested true {
         state := { state with lastStatus := observation.status }
         status := observation.status

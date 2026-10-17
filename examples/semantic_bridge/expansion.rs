@@ -26,7 +26,7 @@ struct ObservationIds {
 
 pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
     let mut random = Generator::new(seed ^ (index as u64).wrapping_mul(0xa0761d6478bd642f));
-    let case = index % 50;
+    let case = index % 53;
     let source = match case {
         0 => "echo bridge-literal".to_string(),
         1 => "echo 'quoted *'".to_string(),
@@ -80,7 +80,10 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         46 => "echo ${bad!}".to_string(),
         47 => "echo \"$(( $EXPR ))\"".to_string(),
         48 => "echo \"$((1 + $(( $EXPR ))))\"".to_string(),
-        _ => "echo \"$((1/0))$((2))\"".to_string(),
+        49 => "echo \"$((1/0))$((2))\"".to_string(),
+        50 => "echo 'literal:\u{fffe}'".to_string(),
+        51 => "echo $(echo $((x=4)))$x".to_string(),
+        _ => "echo $(cd /)".to_string(),
     };
     let program = parse_program(&source)?;
     let words = command_words(&program)?;
@@ -104,7 +107,7 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         json!(["IFS", ifs]),
         json!(["VALUE", value]),
     ];
-    if matches!(case, 43..=45) {
+    if matches!(case, 43..=45 | 51) {
         variables.push(json!(["x", [49]]));
     }
     if matches!(case, 47 | 48) {
@@ -322,7 +325,12 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
         let mut context = PrimitiveExpandContext::new(&mut shell, &process);
         let mut fields = Vec::new();
         for word in &words {
-            match epsh::expand::expand_word_to_fields(word, &mut context) {
+            let cwd = context.shell.cwd().to_path_buf();
+            let expansion = epsh::expand::expand_word_to_fields(word, &mut context);
+            if context.shell.cwd() != cwd {
+                return Err(BridgeError::new("word expansion changed the caller cwd"));
+            }
+            match expansion {
                 Ok(expanded) => fields.extend(
                     expanded
                         .into_iter()
@@ -517,6 +525,7 @@ fn validate_observation(value: &Value) -> BridgeResult<()> {
     if value["id"].as_str().is_none() {
         return Err(BridgeError::new("expansion observation ID is not text"));
     }
+    let id = value["id"].as_str().unwrap_or_default();
     require_bytes(&value["bytes"], "expansion observation bytes")?;
     if let Some(status) = object.get("status") {
         status
@@ -540,6 +549,11 @@ fn validate_observation(value: &Value) -> BridgeResult<()> {
             }
             require_bytes(&binding[1], "expansion observation binding value")?;
         }
+        if id.starts_with("sub") && !bindings.is_empty() {
+            return Err(BridgeError::new(
+                "command substitution observation changes parent bindings",
+            ));
+        }
     }
     if let Some(error) = object.get("error") {
         exact_object(error, &["kind", "message"], "expansion observation error")?;
@@ -548,10 +562,7 @@ fn validate_observation(value: &Value) -> BridgeResult<()> {
         {
             return Err(BridgeError::new("expansion observation error is malformed"));
         }
-        let id = value["id"].as_str().unwrap_or_default();
-        if (id.starts_with("arith") && error["kind"] != "arithmetic")
-            || (id.starts_with("sub") && error["kind"] != "expansion")
-        {
+        if id.starts_with("arith") && error["kind"] != "arithmetic" {
             return Err(BridgeError::new("expansion observation error kind does not match its ID"));
         }
     }
@@ -676,19 +687,32 @@ fn observe_word_effects(
             WordPart::CmdSubst(command) | WordPart::Backtick(command) => {
                 let id = format!("sub{}", ids.substitution);
                 ids.substitution += 1;
+                let cwd = shell.cwd().to_path_buf();
                 let before = shell.vars().bindings_bytes();
-                let bytes = shell
-                    .command_subst(command)
-                    .map(|value| ShellBytes::from_str_lossless(&value).into_vec())
-                    .unwrap_or_default();
+                let (bytes, error) = match shell.command_subst(command) {
+                    Ok(value) => (ShellBytes::from_str_lossless(&value).into_vec(), None),
+                    Err(error) => (Vec::new(), Some(expansion_error_value(error)?)),
+                };
+                if shell.cwd() != cwd {
+                    return Err(BridgeError::new("command substitution changed the caller cwd"));
+                }
                 let after = shell.vars().bindings_bytes();
                 let bindings = changed_bindings(&before, &after);
-                result.push(json!({
+                if !bindings.is_empty() {
+                    return Err(BridgeError::new(
+                        "command substitution changed parent bindings",
+                    ));
+                }
+                let mut observation = json!({
                     "id": id,
                     "bytes": bytes,
                     "status": shell.exit_status().code().clamp(0, 255),
                     "bindings": bindings,
-                }));
+                });
+                if let Some(error) = error {
+                    observation["error"] = error;
+                }
+                result.push(observation);
             }
             WordPart::Arith(_) => {
                 let id = format!("arith{}", ids.arithmetic);
@@ -796,20 +820,42 @@ fn resulting_state(
 }
 
 fn semantic_error_outcome(error: ShellError, state: Value) -> BridgeResult<Value> {
-    let ShellError::Runtime { msg, .. } = error else {
-        return Err(BridgeError::new(format!("production expansion failed outside semantic domain: {error}")));
-    };
-    let kind = if msg.starts_with("arithmetic error:") {
-        "arithmetic"
-    } else {
-        "expansion"
-    };
+    let kind = expansion_error_kind(&error).ok_or_else(|| {
+        BridgeError::new(format!("production expansion error is outside semantic domain: {error}"))
+    })?;
+    let message = expansion_error_message(error)?;
     Ok(json!({
         "tag": "semantic_error",
-        "error": {"kind": kind, "message": msg},
+        "error": {"kind": kind, "message": message},
         "state": state,
         "trace": [],
     }))
+}
+
+fn expansion_error_value(error: ShellError) -> BridgeResult<Value> {
+    let kind = expansion_error_kind(&error).ok_or_else(|| {
+        BridgeError::new(format!("command substitution error is outside semantic domain: {error}"))
+    })?;
+    let message = expansion_error_message(error)?;
+    Ok(json!({"kind": kind, "message": message}))
+}
+
+fn expansion_error_kind(error: &ShellError) -> Option<&'static str> {
+    match error {
+        ShellError::Runtime { msg, .. } if msg.starts_with("arithmetic error:") => Some("arithmetic"),
+        ShellError::Runtime { .. } | ShellError::CommandNotFound(_) => Some("expansion"),
+        _ => None,
+    }
+}
+
+fn expansion_error_message(error: ShellError) -> BridgeResult<String> {
+    match error {
+        ShellError::Runtime { msg, .. } => Ok(msg),
+        ShellError::CommandNotFound(name) => Ok(format!("{name}: not found")),
+        error => Err(BridgeError::new(format!(
+            "production expansion failed outside semantic domain: {error}"
+        ))),
+    }
 }
 
 fn set_variable(shell: &mut epsh::eval::Shell, binding: &Value) -> BridgeResult<()> {
@@ -997,6 +1043,7 @@ fn validate_substitution(command: &Command, depth: usize) -> BridgeResult<()> {
     }
     match static_word(&args[0]).as_deref() {
         Some(b"false") if args.len() == 1 => Ok(()),
+        Some(b"cd") if args.len() == 2 && static_word(&args[1]).as_deref() == Some(b"/") => Ok(()),
         Some(b"echo") => {
             for word in &args[1..] {
                 validate_word_effects(word, depth + 1)?;
@@ -1071,17 +1118,27 @@ fn register_effect(ids: &mut ObservationIds, id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{actual, generate};
+    use super::{
+        actual, command_words, generate, parse_program, PrimitiveExpandContext, ProcessValues,
+    };
+    use epsh::error::ShellError;
     use serde_json::json;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     #[test]
-    fn output_and_glob_fixtures_preserve_invalid_and_pua_bytes() {
+    fn output_and_glob_fixtures_preserve_raw_bytes_and_unicode_scalars() {
         let invalid = actual(&generate(5, 0).unwrap()).unwrap();
         let literal_pua = actual(&generate(6, 0).unwrap()).unwrap();
+        let literal_noncharacter = actual(&generate(50, 0).unwrap()).unwrap();
         let glob = actual(&generate(11, 0).unwrap()).unwrap();
 
         assert_eq!(invalid["value"]["fields"], json!([[255]]));
         assert_eq!(literal_pua["value"]["fields"], json!([[238, 130, 128]]));
+        assert_eq!(
+            literal_noncharacter["value"]["fields"],
+            json!(["literal:\u{fffe}".as_bytes()])
+        );
         assert_eq!(
             glob["value"]["fields"],
             json!([
@@ -1090,6 +1147,49 @@ mod tests {
                 [98, 114, 105, 100, 103, 101, 45, 255, 46, 116, 120, 116],
             ])
         );
+    }
+
+    #[test]
+    fn command_substitution_isolates_nested_assignments() {
+        let request = generate(51, 0).unwrap();
+        let outcome = actual(&request).unwrap();
+
+        assert_eq!(request.input["observations"], json!([
+            {"id": "sub0", "bytes": [52], "status": 0, "bindings": []}
+        ]));
+        assert_eq!(outcome["value"]["fields"], json!([[52, 49]]));
+        assert_eq!(
+            outcome["value"]["state"]["variables"].as_array().unwrap().last(),
+            Some(&json!(["x", [49]]))
+        );
+    }
+
+    #[test]
+    fn command_substitution_isolates_cwd_changes() {
+        let request = generate(52, 0).unwrap();
+        let outcome = actual(&request).unwrap();
+
+        assert_eq!(request.input["observations"], json!([
+            {"id": "sub0", "bytes": [], "status": 0, "bindings": []}
+        ]));
+        assert_eq!(outcome["value"]["fields"], json!([]));
+        assert_eq!(outcome["value"]["state"]["cwd"], request.state["cwd"]);
+        assert_eq!(outcome["value"]["state"]["variables"], request.state["variables"]);
+    }
+
+    #[test]
+    fn command_substitution_errors_escape_word_expansion() {
+        let program = parse_program("echo $(echo interrupted)").unwrap();
+        let words = command_words(&program).unwrap();
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let mut shell = epsh::eval::Shell::new();
+        shell.set_cancel_flag(cancellation);
+        let process = ProcessValues::default();
+        let mut context = PrimitiveExpandContext::new(&mut shell, &process);
+
+        let error = epsh::expand::expand_word_to_fields(&words[0], &mut context).unwrap_err();
+
+        assert!(matches!(error, ShellError::Cancelled));
     }
 
     #[test]
