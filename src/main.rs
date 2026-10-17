@@ -1362,15 +1362,19 @@ fn resolve_cd_for_history(line: &str) -> String {
     use epsh::lexer::{Lexer, Token};
 
     let trimmed = line.trim();
-    let (prefix, rest) = if let Some(rest) = trimmed.strip_prefix("cd ") {
-        ("cd ", rest.trim_start())
-    } else if let Some(rest) = trimmed.strip_prefix("z ") {
-        ("z ", rest.trim_start())
-    } else {
+    let mut lexer = Lexer::new(trimmed);
+    lexer.recognize_reserved = false;
+    let Ok((Token::Word(command_parts, _), _)) = lexer.next_token() else {
         return line.to_string();
     };
-    let mut lexer = Lexer::new(rest);
-    lexer.recognize_reserved = false;
+    let Some(command) = static_word::static_word(&command_parts) else {
+        return line.to_string();
+    };
+    let prefix = match command.as_str() {
+        "cd" => "cd ",
+        "z" => "z ",
+        _ => return line.to_string(),
+    };
     let Ok((Token::Word(parts, _), _)) = lexer.next_token() else {
         return line.to_string();
     };
@@ -1383,8 +1387,11 @@ fn resolve_cd_for_history(line: &str) -> String {
     let Ok((_, next_span)) = lexer.next_token() else {
         return line.to_string();
     };
-    let suffix_start = rest.char_indices().nth(next_span.offset).map_or(rest.len(), |(i, _)| i);
-    let suffix = &rest[suffix_start..];
+    let suffix_start = trimmed
+        .char_indices()
+        .nth(next_span.offset)
+        .map_or(trimmed.len(), |(index, _)| index);
+    let suffix = &trimmed[suffix_start..];
     let Ok(cwd) = std::env::current_dir() else {
         return line.to_string();
     };
@@ -2892,3 +2899,7 @@ fn base64_encode(input: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+#[path = "main_history_tests.rs"]
+mod history_tests;

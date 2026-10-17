@@ -42,14 +42,6 @@ Next: 22
 
 
 
-### ISH-19 · P3 · Tab-separated cd history loses its original directory target
-
-- **Area:** Data
-- **Where:** `src/main.rs:1335`, `src/frecency.rs:48`
-- **Problem:** History target resolution recognizes only literal `cd ` and `z ` prefixes, although parsing accepts tabs. A fresh-build PTY successfully ran a pasted `cd` followed by a tab and `child` from directory A. After moving to B, `z child` failed because history retained the relative target and resolved it under B instead of the existing A/child.
-- **Recommendation:** Resolve directory-change history using the accepted lexical command boundary and arguments, including tabs, before recording the absolute target.
-- **Fix with:** none
-- **Effort:** S (hours)
 
 ### ISH-20 · P3 · Prompt retains a no-repository result after repository creation
 
