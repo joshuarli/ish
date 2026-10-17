@@ -2,10 +2,7 @@ use crate::ast::{ParamExpr, ParamOp, WordPart};
 use crate::error::{ShellError, Span};
 use crate::shell_bytes::ShellBytes;
 
-/// Escape marker for backslash-escaped characters in unquoted context.
-/// Stored in Literal text so that fnmatch/glob can see escapes inside
-/// brackets (e.g. `[\!ab]`). Quote removal strips CTLESC for non-pattern
-/// contexts. Uses a Unicode noncharacter that won't appear in normal text.
+/// Pattern escape marker in shell pattern strings.
 pub const CTLESC: char = '\u{FFFE}';
 
 /// Token types produced by the lexer.
@@ -535,11 +532,18 @@ impl Lexer {
                                     // Inside ${...}, \} always escapes }
                                     literal.push(escaped);
                                 } else if ctx == WordCtx::Word {
-                                    // Mark escaped chars with CTLESC so fnmatch/glob
-                                    // can see escapes inside brackets (e.g. [\!ab]).
-                                    // Quote removal strips CTLESC for non-pattern contexts.
-                                    literal.push(CTLESC);
-                                    literal.push(escaped);
+                                    if !literal.is_empty() {
+                                        parts.push(WordPart::Literal(ShellBytes::from_str_lossless(&std::mem::take(&mut literal))));
+                                    }
+                                    let mut escaped_text = escaped.to_string();
+                                    if escaped == crate::encoding::ESCAPE
+                                        && let Some(literal_char) = self.advance()
+                                    {
+                                        escaped_text.push(literal_char);
+                                    }
+                                    parts.push(WordPart::DoubleQuoted(vec![WordPart::Literal(
+                                        ShellBytes::from_str_lossless(&escaped_text),
+                                    )]));
                                 } else {
                                     literal.push(escaped);
                                 }
@@ -967,8 +971,10 @@ impl Lexer {
     /// Read `$(...)` command substitution after `$(` has been consumed.
     /// Collects raw text, then recursively parses it.
     fn read_cmd_subst(&mut self, span: Span) -> std::result::Result<WordPart, ShellError> {
+        let content_span = self.span();
         let content = self.read_cmd_subst_raw(span)?;
-        let cmd = parse_cmdsubst_content(&content);
+        let cmd = parse_cmdsubst_content(&content)
+            .map_err(|error| rebase_nested_parse_error(error, content_span))?;
         Ok(WordPart::CmdSubst(Box::new(cmd)))
     }
 
@@ -1051,6 +1057,7 @@ impl Lexer {
 
     /// Read `$((expr))` arithmetic expansion after `$((` has been consumed.
     fn read_arith_expansion(&mut self, span: Span) -> std::result::Result<WordPart, ShellError> {
+        let content_span = self.span();
         let mut content = String::new();
         let mut depth = 1u32;
         loop {
@@ -1063,7 +1070,8 @@ impl Lexer {
                 }
                 Some(')') if self.peek() == Some(')') && depth == 1 => {
                     self.advance();
-                    let inner_parts = crate::parser::parse_word_parts_shell(&content);
+                    let inner_parts = crate::parser::parse_word_parts_shell(&content)
+                        .map_err(|error| rebase_nested_parse_error(error, content_span))?;
                     return Ok(WordPart::Arith(inner_parts));
                 }
                 Some(')') => {
@@ -1085,6 +1093,7 @@ impl Lexer {
 
     /// Read backtick command substitution after opening `` ` `` consumed.
     fn read_backtick_part(&mut self, span: Span) -> std::result::Result<WordPart, ShellError> {
+        let content_span = self.span();
         let mut content = String::new();
         loop {
             match self.advance() {
@@ -1095,7 +1104,8 @@ impl Lexer {
                     });
                 }
                 Some('`') => {
-                    let cmd = parse_cmdsubst_content(&content);
+                    let cmd = parse_cmdsubst_content(&content)
+                        .map_err(|error| rebase_nested_parse_error(error, content_span))?;
                     return Ok(WordPart::Backtick(Box::new(cmd)));
                 }
                 Some('\\') => {
@@ -1533,25 +1543,33 @@ fn try_split_assignment(parts: &[WordPart]) -> Option<(String, Vec<WordPart>)> {
 
 use crate::parser::{coalesce_literals, parse_cmdsubst_content};
 
+fn rebase_nested_parse_error(error: ShellError, base: Span) -> ShellError {
+    match error {
+        ShellError::Syntax { msg, mut span } => {
+            span.offset += base.offset;
+            if span.line == 0 {
+                span.line = base.line;
+                span.col = base.col;
+            } else {
+                span.line += base.line - 1;
+                if span.line == base.line {
+                    span.col += base.col - 1;
+                }
+            }
+            ShellError::Syntax { msg, span }
+        }
+        error => error,
+    }
+}
+
 /// Extract the plain text from word parts (for heredoc delimiter, func name, for-var, etc.).
-/// Only extracts from Literal and SingleQuoted parts. Strips CTLESC markers.
+/// Only extracts from Literal and SingleQuoted parts.
 pub fn parts_to_text(parts: &[WordPart]) -> String {
     let mut s = String::new();
     for part in parts {
         match part {
             WordPart::Literal(t) => {
-                // Strip CTLESC markers — they're escape metadata, not content
-                let text = t.to_shell_string();
-                let mut chars = text.chars();
-                while let Some(c) = chars.next() {
-                    if c == CTLESC {
-                        if let Some(next) = chars.next() {
-                            s.push(next);
-                        }
-                    } else {
-                        s.push(c);
-                    }
-                }
+                s.push_str(&t.to_shell_string());
             }
             WordPart::SingleQuoted(t) => s.push_str(&t.to_shell_string()),
             WordPart::DoubleQuoted(inner) => {

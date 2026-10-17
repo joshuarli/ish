@@ -144,4 +144,13 @@ mod tests {
         let bytes = ShellBytes::from("hello");
         assert_eq!(bytes.as_utf8_str(), Some("hello"));
     }
+
+    #[test]
+    fn shell_roundtrip_glob_escape_character() {
+        let bytes = ShellBytes::from_vec("\u{FFFE}".as_bytes().to_vec());
+        assert_eq!(
+            ShellBytes::from_str_lossless(&bytes.to_shell_string()),
+            bytes
+        );
+    }
 }
