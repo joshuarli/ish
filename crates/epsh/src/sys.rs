@@ -1,13 +1,9 @@
-//! Thin wrappers around syscalls, backed by rustix where possible.
-//!
-//! `fork` and `execve` have no rustix equivalent and remain thin libc wrappers.
-//! Everything else is routed through rustix (`process`, `io`, `pipe`, `termios`,
-//! `fs`, `runtime` features).
+//! Unix process and descriptor operations backed by rustix, with libc at fork,
+//! exec, child exit, and raw descriptor boundaries that must accept closed descriptors.
 
 use std::ffi::c_void;
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
-// `fork` and `execve` have no rustix equivalent — keep libc wrappers.
 pub use libc::{execve, fork};
 
 use rustix::fs::Mode;
@@ -16,38 +12,30 @@ use rustix::process::{Pid, WaitOptions};
 /// Create a close-on-exec pipe, writing the (read, write) fds into `fds`
 /// (length >= 2). Returns 0 on success, -1 on error. Mirrors libc `pipe(int[2])`.
 pub fn pipe(fds: *mut i32) -> i32 {
-    #[cfg(target_vendor = "apple")]
-    let result = rustix::pipe::pipe();
-    #[cfg(not(target_vendor = "apple"))]
-    let result = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC);
-
-    match result {
+    match pipe_owned() {
         Ok((r, w)) => {
-            // SAFETY: caller guarantees `fds` points to a writable [i32; 2].
-            let read_fd = r.into_raw_fd();
-            let write_fd = w.into_raw_fd();
-            #[cfg(target_vendor = "apple")]
-            if rustix::io::fcntl_setfd(
-                unsafe { BorrowedFd::borrow_raw(read_fd) },
-                rustix::io::FdFlags::CLOEXEC,
-            )
-            .and(rustix::io::fcntl_setfd(
-                unsafe { BorrowedFd::borrow_raw(write_fd) },
-                rustix::io::FdFlags::CLOEXEC,
-            ))
-            .is_err()
-            {
-                let _ = close(read_fd);
-                let _ = close(write_fd);
-                return -1;
-            }
+            // SAFETY: caller guarantees fds points to a writable two-element descriptor array.
             unsafe {
-                *fds = read_fd;
-                *fds.add(1) = write_fd;
+                *fds = r.into_raw_fd();
+                *fds.add(1) = w.into_raw_fd();
             }
             0
         }
         Err(_) => -1,
+    }
+}
+
+pub fn pipe_owned() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let (read, write) = rustix::pipe::pipe()?;
+        rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;
+        rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC)?;
+        Ok((read, write))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(Into::into)
     }
 }
 
