@@ -7,7 +7,7 @@ use epsh::expand::ShellExpand;
 use epsh::parser::Parser;
 use epsh::shell_bytes::ShellBytes;
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -21,14 +21,12 @@ struct ObservationIds {
     substitution: usize,
     arithmetic: usize,
     all: std::collections::HashSet<String>,
-    effects: std::collections::HashSet<String>,
     process: std::collections::HashSet<String>,
-    effect_order: Vec<String>,
 }
 
 pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
     let mut random = Generator::new(seed ^ (index as u64).wrapping_mul(0xa0761d6478bd642f));
-    let case = index % 47;
+    let case = index % 50;
     let source = match case {
         0 => "echo bridge-literal".to_string(),
         1 => "echo 'quoted *'".to_string(),
@@ -79,7 +77,10 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         43 => "echo \"$((x=4))$((1/0))\"".to_string(),
         44 => "echo \"$((x=4))$x\"".to_string(),
         45 => "echo \"$((x=3))$((x+2))$x\"".to_string(),
-        _ => "echo ${bad!}".to_string(),
+        46 => "echo ${bad!}".to_string(),
+        47 => "echo \"$(( $EXPR ))\"".to_string(),
+        48 => "echo \"$((1 + $(( $EXPR ))))\"".to_string(),
+        _ => "echo \"$((1/0))$((2))\"".to_string(),
     };
     let program = parse_program(&source)?;
     let words = command_words(&program)?;
@@ -105,6 +106,10 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
     ];
     if matches!(case, 43..=45) {
         variables.push(json!(["x", [49]]));
+    }
+    if matches!(case, 47 | 48) {
+        let value: &[u8] = if case == 47 { b"fresh=4" } else { b"nested=4" };
+        variables.push(json!(["EXPR", value]));
     }
     state["variables"] = Value::Array(variables);
     state["last_status"] = json!(if case == 20 { 37 } else { 0 });
@@ -288,28 +293,23 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
             "reason": format!("missing process parameter observation: {id}"),
         }));
     }
-    for id in &ids.effects {
-        if !observations.contains_key(id.as_str()) {
-            let kind = if id.starts_with("sub") { "substitution" } else { "arithmetic" };
-            return Ok(json!({
-                "tag": "unsupported_domain",
-                "reason": format!("missing {kind} oracle: {id}"),
-            }));
-        }
-    }
     let process = process_values(&observations)?;
-    let expected_effects = ids
-        .effect_order
-        .iter()
-        .map(|id| {
-            observations
-                .get(id.as_str())
-                .map(|value| (*value).clone())
-                .ok_or_else(|| BridgeError::new(format!("missing effect observation {id:?}")))
-        })
-        .collect::<BridgeResult<Vec<_>>>()?;
     let outcome = with_glob_directory(globs, |cwd| {
         let actual_observations = observe_effects(&words, &request.state, &process, cwd)?;
+        let mut expected_effects = Vec::with_capacity(actual_observations.len());
+        for actual_observation in &actual_observations {
+            let id = actual_observation["id"]
+                .as_str()
+                .ok_or_else(|| BridgeError::new("production effect observation ID is not text"))?;
+            let Some(expected) = observations.get(id) else {
+                let kind = if id.starts_with("sub") { "substitution" } else { "arithmetic" };
+                return Ok(json!({
+                    "tag": "unsupported_domain",
+                    "reason": format!("missing {kind} oracle: {id}"),
+                }));
+            };
+            expected_effects.push((*expected).clone());
+        }
         let initial_status = request.state["last_status"]
             .as_u64()
             .filter(|status| *status < 256)
@@ -318,6 +318,7 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
             return Err(BridgeError::new("expansion effect observations differ from production execution"));
         }
         let mut shell = build_shell(&request.state, cwd, &process)?;
+        let initial_bindings = shell.vars().bindings_bytes();
         let mut context = PrimitiveExpandContext::new(&mut shell, &process);
         let mut fields = Vec::new();
         for word in &words {
@@ -328,12 +329,12 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
                         .map(|field| ShellBytes::from_str_lossless(&field).into_vec()),
                 ),
                 Err(error) => {
-                    let state = resulting_state(request, &words, context.shell)?;
+                    let state = resulting_state(request, &initial_bindings, context.shell)?;
                     return semantic_error_outcome(error, state);
                 }
             }
         }
-        let state = resulting_state(request, &words, context.shell)?;
+        let state = resulting_state(request, &initial_bindings, context.shell)?;
         Ok(json!({
             "tag": "success",
             "value": {"fields": fields, "state": state, "trace": []},
@@ -675,13 +676,13 @@ fn observe_word_effects(
             WordPart::CmdSubst(command) | WordPart::Backtick(command) => {
                 let id = format!("sub{}", ids.substitution);
                 ids.substitution += 1;
-                let names = assignment_names_command(command);
-                let before = variable_snapshot(shell, &names);
+                let before = shell.vars().bindings_bytes();
                 let bytes = shell
                     .command_subst(command)
                     .map(|value| ShellBytes::from_str_lossless(&value).into_vec())
                     .unwrap_or_default();
-                let bindings = changed_bindings(shell, &names, &before);
+                let after = shell.vars().bindings_bytes();
+                let bindings = changed_bindings(&before, &after);
                 result.push(json!({
                     "id": id,
                     "bytes": bytes,
@@ -692,8 +693,7 @@ fn observe_word_effects(
             WordPart::Arith(_) => {
                 let id = format!("arith{}", ids.arithmetic);
                 ids.arithmetic += 1;
-                let names = assignment_names_word(word);
-                let before = variable_snapshot(shell, &names);
+                let before = shell.vars().bindings_bytes();
                 let arithmetic_word = Word { parts: vec![part.clone()], span: Default::default() };
                 let mut context = PrimitiveExpandContext::new(shell, process);
                 match epsh::expand::expand_word_to_fields(&arithmetic_word, &mut context) {
@@ -701,10 +701,11 @@ fn observe_word_effects(
                         if fields.len() != 1 {
                             return Err(BridgeError::new("arithmetic observation did not produce one field"));
                         }
+                        let after = context.shell.vars().bindings_bytes();
                         result.push(json!({
                             "id": id,
                             "bytes": ShellBytes::from_str_lossless(&fields[0]).into_vec(),
-                            "bindings": changed_bindings(context.shell, &names, &before),
+                            "bindings": changed_bindings(&before, &after),
                         }));
                     }
                     Err(error) => {
@@ -712,10 +713,11 @@ fn observe_word_effects(
                             ShellError::Runtime { msg, .. } => msg.clone(),
                             _ => error.to_string(),
                         };
+                        let after = context.shell.vars().bindings_bytes();
                         result.push(json!({
                             "id": id,
                             "bytes": [],
-                            "bindings": changed_bindings(context.shell, &names, &before),
+                            "bindings": changed_bindings(&before, &after),
                             "error": {"kind": "arithmetic", "message": message},
                         }));
                         return Ok(());
@@ -737,142 +739,45 @@ fn observe_word_effects(
     Ok(())
 }
 
-fn assignment_names_command(command: &Command) -> BTreeSet<String> {
-    match command {
-        Command::Simple { args, .. } => args.iter().flat_map(assignment_names_word).collect(),
-        _ => BTreeSet::new(),
-    }
-}
-
-fn assignment_names_word(word: &Word) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    for part in &word.parts {
-        match part {
-            WordPart::Arith(parts) => collect_assignment_names_parts(parts, &mut names),
-            WordPart::DoubleQuoted(parts) => {
-                let inner = Word { parts: parts.clone(), span: Default::default() };
-                names.extend(assignment_names_word(&inner));
-            }
-            WordPart::CmdSubst(command) | WordPart::Backtick(command) => {
-                names.extend(assignment_names_command(command));
-            }
-            _ => {}
-        }
-    }
-    names
-}
-
-fn collect_assignment_names_parts(parts: &[WordPart], names: &mut BTreeSet<String>) {
-    let mut source = Vec::new();
-    for part in parts {
-        match part {
-            WordPart::Literal(bytes) | WordPart::SingleQuoted(bytes) => source.extend_from_slice(bytes.as_bytes()),
-            WordPart::DoubleQuoted(inner) => collect_assignment_source(inner, &mut source),
-            _ => {}
-        }
-    }
-    let bytes = &source;
-    let mut index = 0;
-    while index < bytes.len() {
-        if !matches!(bytes[index], b'A'..=b'Z' | b'a'..=b'z' | b'_') {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        index += 1;
-        while index < bytes.len() && matches!(bytes[index], b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_') {
-            index += 1;
-        }
-        let mut operator = index;
-        while operator < bytes.len() && bytes[operator].is_ascii_whitespace() {
-            operator += 1;
-        }
-        let assignment = if bytes.get(operator) == Some(&b'=') {
-            bytes.get(operator + 1) != Some(&b'=')
-        } else if matches!(bytes.get(operator).copied(), Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'<' | b'>')) {
-            let mut end = operator + 1;
-            if bytes.get(end) == Some(&bytes[operator]) {
-                end += 1;
-            }
-            while end < bytes.len() && bytes[end].is_ascii_whitespace() {
-                end += 1;
-            }
-            bytes.get(end) == Some(&b'=')
-        } else {
-            false
-        };
-        if assignment && let Ok(name) = std::str::from_utf8(&bytes[start..index]) {
-            names.insert(name.to_string());
-        }
-    }
-}
-
-fn collect_assignment_source(parts: &[WordPart], source: &mut Vec<u8>) {
-    for part in parts {
-        match part {
-            WordPart::Literal(bytes) | WordPart::SingleQuoted(bytes) => source.extend_from_slice(bytes.as_bytes()),
-            _ => {}
-        }
-    }
-}
-
-fn variable_snapshot(
-    shell: &epsh::eval::Shell,
-    names: &BTreeSet<String>,
-) -> HashMap<String, Option<Vec<u8>>> {
-    names
-        .iter()
-        .map(|name| {
-            (
-                name.clone(),
-                shell.vars().get_bytes(name).map(|value| value.as_bytes().to_vec()),
-            )
-        })
-        .collect()
-}
-
 fn changed_bindings(
-    shell: &epsh::eval::Shell,
-    names: &BTreeSet<String>,
-    before: &HashMap<String, Option<Vec<u8>>>,
+    before: &[(String, ShellBytes)],
+    after: &[(String, ShellBytes)],
 ) -> Vec<Value> {
-    names
+    after
         .iter()
-        .filter_map(|name| {
-            let current = shell
-                .vars()
-                .get_bytes(name)
-                .map(|value| value.as_bytes().to_vec());
-            if before.get(name) != Some(&current) {
-                current.map(|value| json!([name, value]))
-            } else {
-                None
-            }
+        .filter_map(|(name, value)| {
+            let previous = before
+                .iter()
+                .find(|(previous_name, _)| previous_name == name)
+                .map(|(_, previous_value)| previous_value);
+            (previous != Some(value)).then(|| json!([name, value.as_bytes()]))
         })
         .collect()
 }
 
 fn resulting_state(
     request: &Request,
-    words: &[Word],
+    initial_bindings: &[(String, ShellBytes)],
     shell: &epsh::eval::Shell,
 ) -> BridgeResult<Value> {
     let mut state = request.state.clone();
-    let writes: BTreeSet<String> = words.iter().flat_map(assignment_names_word).collect();
+    let current_bindings = shell.vars().bindings_bytes();
+    let changes: Vec<_> = changed_bindings(initial_bindings, &current_bindings);
     let variables = state["variables"]
         .as_array_mut()
         .ok_or_else(|| BridgeError::new("expansion variables are not an array"))?;
-    for name in &writes {
-        let Some(value) = shell.vars().get_bytes(name) else {
-            continue;
-        };
+    for change in &changes {
+        let name = change[0]
+            .as_str()
+            .ok_or_else(|| BridgeError::new("expansion changed variable name is not text"))?;
+        let value = require_bytes(&change[1], "expansion changed variable value")?;
         if let Some(binding) = variables
             .iter_mut()
             .find(|binding| binding[0].as_str() == Some(name))
         {
-            binding[1] = json!(value.as_bytes());
+            binding[1] = json!(value);
         } else {
-            variables.push(json!([name, value.as_bytes()]));
+            variables.push(json!([name, value]));
         }
     }
     let exported = state["exported"]
@@ -882,8 +787,8 @@ fn resulting_state(
         let name = binding[0]
             .as_str()
             .ok_or_else(|| BridgeError::new("expansion exported name is not text"))?;
-        if let Some(value) = shell.vars().get_bytes(name) {
-            binding[1] = json!(value.as_bytes());
+        if let Some(change) = changes.iter().find(|change| change[0].as_str() == Some(name)) {
+            binding[1] = change[1].clone();
         }
     }
     state["last_status"] = json!(shell.exit_status().code().clamp(0, 255));
@@ -1162,8 +1067,6 @@ fn parts_json(parts: &[WordPart], quoted: bool, ids: &mut ObservationIds) -> Bri
 
 fn register_effect(ids: &mut ObservationIds, id: &str) {
     ids.all.insert(id.to_string());
-    ids.effects.insert(id.to_string());
-    ids.effect_order.push(id.to_string());
 }
 
 #[cfg(test)]
@@ -1232,5 +1135,24 @@ mod tests {
             ["VALUE", [97, 108, 112, 104, 97, 32, 98, 101, 116, 97]],
             ["x", [52]],
         ]));
+    }
+
+    #[test]
+    fn arithmetic_variable_expansion_retains_dynamic_assignment() {
+        let simple = actual(&generate(47, 0).unwrap()).unwrap();
+        let nested = actual(&generate(48, 0).unwrap()).unwrap();
+        let unreachable = generate(49, 0).unwrap();
+        assert_eq!(
+            unreachable.input["observations"],
+            json!([{"id": "arith0", "bytes": [], "bindings": [], "error": {"kind": "arithmetic", "message": "arithmetic error: division by zero"}}])
+        );
+        let failed = actual(&unreachable).unwrap();
+
+        assert_eq!(simple["value"]["fields"], json!([[52]]));
+        assert_eq!(simple["value"]["state"]["variables"].as_array().unwrap().iter().find(|binding| binding[0] == "fresh"), Some(&json!(["fresh", [52]])));
+        assert_eq!(nested["value"]["fields"], json!([[53]]));
+        assert_eq!(nested["value"]["state"]["variables"].as_array().unwrap().iter().find(|binding| binding[0] == "nested"), Some(&json!(["nested", [52]])));
+        assert_eq!(failed["tag"], "semantic_error");
+        assert_eq!(failed["error"]["kind"], "arithmetic");
     }
 }
