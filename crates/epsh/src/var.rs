@@ -158,6 +158,17 @@ impl Variables {
         self.vars.get(name).and_then(|v| v.value.as_ref())
     }
 
+    /// Snapshot defined variable names and raw values in lexical name order.
+    pub fn bindings_bytes(&self) -> Vec<(String, ShellBytes)> {
+        let mut bindings: Vec<_> = self
+            .vars
+            .iter()
+            .filter_map(|(name, var)| var.value.as_ref().map(|value| (name.clone(), value.clone())))
+            .collect();
+        bindings.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        bindings
+    }
+
     /// Get a variable's value as UTF-8, if valid. Returns None if unset or not UTF-8.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.get_bytes(name).and_then(ShellBytes::as_utf8_str)
@@ -400,6 +411,42 @@ mod tests {
         let mut vars = Variables::new();
         vars.set("FOO", "bar").unwrap();
         assert_eq!(vars.get("FOO"), Some("bar"));
+    }
+
+    #[test]
+    fn bindings_bytes_snapshots_defined_values_and_scope_restoration() {
+        let mut vars = Variables::new_clean();
+        vars.set("EMPTY", "").unwrap();
+        vars.set_bytes("EXPORTED_VALUE", ShellBytes::from_vec(vec![b'e', 0xff])).unwrap();
+        vars.export("EXPORTED_VALUE");
+        vars.export("EXPORTED_PLACEHOLDER");
+        vars.set_bytes("RAW", ShellBytes::from_vec(vec![b'r', 0xfe])).unwrap();
+        vars.set("SAVED", "outer").unwrap();
+
+        let outer = vars.bindings_bytes();
+        assert_eq!(
+            outer.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            ["EMPTY", "EXPORTED_VALUE", "IFS", "RAW", "SAVED"]
+        );
+        assert_eq!(outer.iter().find(|(name, _)| name == "EMPTY").unwrap().1.as_bytes(), b"");
+        assert_eq!(outer.iter().find(|(name, _)| name == "RAW").unwrap().1.as_bytes(), [b'r', 0xfe]);
+        assert_eq!(outer.iter().find(|(name, _)| name == "EXPORTED_VALUE").unwrap().1.as_bytes(), [b'e', 0xff]);
+
+        vars.push_scope();
+        vars.make_local("SAVED");
+        vars.set("SAVED", "inner").unwrap();
+        vars.make_local("LOCAL");
+        vars.set("LOCAL", "scoped").unwrap();
+        let scoped = vars.bindings_bytes();
+        vars.set("RAW", "changed").unwrap();
+        assert_eq!(scoped.iter().find(|(name, _)| name == "RAW").unwrap().1.as_bytes(), [b'r', 0xfe]);
+        assert_eq!(scoped.iter().find(|(name, _)| name == "SAVED").unwrap().1.as_bytes(), b"inner");
+        assert!(!scoped.iter().any(|(name, _)| name == "EXPORTED_PLACEHOLDER"));
+
+        vars.pop_scope();
+        let restored = vars.bindings_bytes();
+        assert_eq!(restored.iter().find(|(name, _)| name == "SAVED").unwrap().1.as_bytes(), b"outer");
+        assert!(!restored.iter().any(|(name, _)| name == "LOCAL"));
     }
 
     #[test]
