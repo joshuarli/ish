@@ -469,8 +469,8 @@ pub(crate) fn validate_case(request: &Request) -> BridgeResult<()> {
     if source_tree_depth(tree) > 8 {
         return Err(BridgeError::new("generated arithmetic tree exceeds depth 8"));
     }
-    if request.source.len() > 256 {
-        return Err(BridgeError::new("generated arithmetic source exceeds 256 bytes"));
+    if request.source.len() > 2048 {
+        return Err(BridgeError::new("generated arithmetic source exceeds 2048 bytes"));
     }
     Ok(())
 }

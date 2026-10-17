@@ -364,11 +364,14 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
             return handle_exit_command(line, shell);
         }
         "cd" => {
-            let args = expanded_args!();
+            let args = match expand_builtin_args_bytes(args, shell, name) {
+                Some(args) => args,
+                None => return false,
+            };
             if args.len() > 1 {
                 eprintln!("ish: cd: too many arguments");
                 shell.last_status = 1;
-            } else if args.first().map(String::as_str) == Some("-") {
+            } else if args.first().map(|arg| arg.as_bytes()) == Some(b"-".as_slice()) {
                 if let Some(prev) = store_env_os(&shell.epsh, "OLDPWD").filter(|s| !s.is_empty()) {
                     eprintln!("{}", Path::new(&prev).display());
                     shell.last_status = change_directory_path(Path::new(&prev), shell);
@@ -377,8 +380,19 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                     shell.last_status = 1;
                 }
             } else {
-                let target = args.first().cloned().unwrap_or_else(|| shell.home.clone());
-                shell.last_status = change_directory(&target, shell);
+                let home = store_env_os(&shell.epsh, "HOME").unwrap_or_else(|| shell.home.clone().into());
+                let target = match args.first().map(|arg| arg.as_bytes()) {
+                    None | Some(b"") | Some(b"~") => std::path::PathBuf::from(home),
+                    Some(bytes) => {
+                        if let Some(relative) = bytes.strip_prefix(b"~/") {
+                            use std::os::unix::ffi::OsStrExt;
+                            Path::new(&home).join(std::ffi::OsStr::from_bytes(relative))
+                        } else {
+                            args[0].to_path_buf()
+                        }
+                    }
+                };
+                shell.last_status = change_directory_path(&target, shell);
             }
         }
         "history" => {
@@ -2260,10 +2274,30 @@ fn expand_builtin_args(
     shell: &mut Shell,
     name: &str,
 ) -> Option<Vec<String>> {
+    let fields = expand_builtin_args_bytes(words, shell, name)?;
+    let mut args = Vec::with_capacity(fields.len());
+    for field in fields {
+        match String::from_utf8(field.into_vec()) {
+            Ok(field) => args.push(field),
+            Err(error) => {
+                eprintln!("ish: {name}: argument is not UTF-8: {error}");
+                shell.last_status = 1;
+                return None;
+            }
+        }
+    }
+    Some(args)
+}
+
+fn expand_builtin_args_bytes(
+    words: &[epsh::ast::Word],
+    shell: &mut Shell,
+    name: &str,
+) -> Option<Vec<epsh::shell_bytes::ShellBytes>> {
     let mut args = Vec::new();
     for word in words {
         match epsh::expand::expand_word_to_fields(word, &mut shell.epsh) {
-            Ok(fields) => args.extend(fields),
+            Ok(fields) => args.extend(fields.iter().map(|field| epsh::shell_bytes::ShellBytes::from_str_lossless(field))),
             Err(e) => {
                 eprintln!("ish: {name}: expansion error: {e}");
                 shell.last_status = 1;
@@ -2444,10 +2478,10 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
 fn env_pair_value(
     env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)],
     name: &str,
-) -> Option<String> {
+) -> Option<OsString> {
     env_pairs
         .iter()
-        .find_map(|(k, v)| (k.as_bytes() == name.as_bytes()).then(|| v.to_shell_string()))
+        .find_map(|(k, v)| (k.as_bytes() == name.as_bytes()).then(|| v.to_os_string()))
 }
 
 /// Build the external handler for epsh. Handles ish-specific builtins
@@ -2464,8 +2498,7 @@ fn make_external_handler(
             // ish interactive builtins
             match name.as_str() {
                 "l" => {
-                    let l_args: Vec<String> =
-                        args[1..].iter().map(|arg| arg.to_shell_string()).collect();
+                    let l_args: Vec<_> = args[1..].iter().map(|arg| arg.to_path_buf()).collect();
                     let status = builtin::list_directory(&l_args);
                     return Ok(epsh::error::ExitStatus::from(status));
                 }
@@ -2630,9 +2663,12 @@ fn spawn_external(
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let path_env = env_pair_value(env_pairs, "PATH")
                     .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
-                if let Some(msg) = epsh::eval::bad_interpreter_message(&name, code, &cwd, &path_env)
-                {
-                    eprintln!("{msg}");
+                if let Some(msg) = epsh::eval::bad_interpreter_message_os(&args[0].to_os_string(), code, &cwd, &path_env) {
+                    use std::io::Write;
+                    use std::os::unix::ffi::OsStrExt;
+                    let mut stderr = std::io::stderr().lock();
+                    stderr.write_all(msg.as_bytes())?;
+                    stderr.write_all(b"\n")?;
                     return Ok(epsh::error::ExitStatus::NOT_EXECUTABLE);
                 }
             }

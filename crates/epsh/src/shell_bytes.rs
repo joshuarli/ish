@@ -37,6 +37,8 @@ impl ShellBytes {
         self.0.len()
     }
 
+    /// Decode the compatibility representation returned by `to_shell_string`.
+    /// Use `From<&str>` or `From<String>` for ordinary UTF-8 text.
     pub fn from_str_lossless(s: &str) -> Self {
         Self(crate::encoding::str_to_bytes(s))
     }
@@ -84,13 +86,13 @@ impl std::fmt::Debug for ShellBytes {
 
 impl From<&str> for ShellBytes {
     fn from(value: &str) -> Self {
-        Self::from_str_lossless(value)
+        Self(value.as_bytes().to_vec())
     }
 }
 
 impl From<String> for ShellBytes {
     fn from(value: String) -> Self {
-        Self::from_str_lossless(&value)
+        Self(value.into_bytes())
     }
 }
 

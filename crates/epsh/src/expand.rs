@@ -53,7 +53,7 @@ pub fn expand_word_to_fields(
     let cwd = sh.cwd();
     for field in split {
         if !sh.noglob() && glob::has_glob_chars(&field) {
-            let matches = glob::glob(&field, cwd);
+            let matches = glob::glob_shell(&field, cwd);
             if matches.is_empty() {
                 result.push(remove_glob_escapes(&field));
             } else {
@@ -225,12 +225,7 @@ fn expand_word_parts_inner(
                 }
                 else if param.name == "*" && matches!(param.op, ParamOp::Normal) && quoted_context
                 {
-                    let sep = sh
-                        .vars()
-                        .ifs()
-                        .chars()
-                        .next()
-                        .map_or(String::new(), |c| c.to_string());
+                    let sep = crate::encoding::shell_chars(&sh.vars().ifs()).next().unwrap_or_default().to_string();
                     let value = sh.vars().positional_join_shell(&sep);
                     result.push(ExpandedWord {
                         value,
@@ -306,12 +301,7 @@ fn expand_param_to_fragments(
 
     // $* and $@ join with first char of IFS when used as a scalar
     let raw_value = if name == "*" || name == "@" {
-        let sep = sh
-            .vars()
-            .ifs()
-            .chars()
-            .next()
-            .map_or(String::new(), |c| c.to_string());
+        let sep = crate::encoding::shell_chars(&sh.vars().ifs()).next().unwrap_or_default().to_string();
         Some(sh.vars().positional_join_shell(&sep))
     } else if is_special_param(name) {
         let exit_status = sh.exit_status();
@@ -362,7 +352,7 @@ fn expand_param_to_fragments(
         ParamOp::Length => {
             let value = raw_value
                 .as_ref()
-                .map(|v| v.len().to_string())
+                .map(|v| crate::encoding::str_to_bytes(v).len().to_string())
                 .unwrap_or_else(|| "0".to_string());
             Ok(vec![ExpandedWord {
                 value,
@@ -377,19 +367,22 @@ fn expand_param_to_fragments(
                 raw_value.is_none()
             };
             if is_unset {
-                let frags = expand_word_parts_inner(
+                if matches!(param.op, ParamOp::Assign { .. }) {
+                    let value = remove_glob_escapes(&expand_param_word(word, sh)?);
+                    let _ = sh.vars_mut().set_shell(name, &value);
+                    return Ok(vec![ExpandedWord {
+                        value,
+                        split_fields: !quoted_context,
+                        word_break: false,
+                    }]);
+                }
+                expand_word_parts_inner(
                     word,
                     sh,
                     quoted_context,
                     true,
                     escape_quoted_globs,
-                )?;
-                if matches!(param.op, ParamOp::Assign { .. }) {
-                    let val: String = frags.iter().map(|f| f.value.clone()).collect();
-                    let val = if escape_quoted_globs { remove_glob_escapes(&val) } else { val };
-                    let _ = sh.vars_mut().set(name, &val);
-                }
-                Ok(frags)
+                )
             } else {
                 let value = raw_value.unwrap_or_default();
                 Ok(vec![ExpandedWord {
@@ -463,12 +456,7 @@ fn expand_param(param: &ParamExpr, sh: &mut dyn ShellExpand) -> crate::error::Re
     // Get the raw value
     // $* joins with first char of IFS (or nothing if IFS="")
     let raw_value = if name == "*" || name == "@" {
-        let sep = sh
-            .vars()
-            .ifs()
-            .chars()
-            .next()
-            .map_or(String::new(), |c| c.to_string());
+        let sep = crate::encoding::shell_chars(&sh.vars().ifs()).next().unwrap_or_default().to_string();
         Some(sh.vars().positional_join_shell(&sep))
     } else if is_special_param(name) {
         let exit_status = sh.exit_status();
@@ -509,7 +497,7 @@ fn expand_param(param: &ParamExpr, sh: &mut dyn ShellExpand) -> crate::error::Re
         ParamOp::Normal => Ok(raw_value.unwrap_or_default()),
         ParamOp::Length => Ok(raw_value
             .as_ref()
-            .map(|v| v.len().to_string())
+            .map(|v| crate::encoding::str_to_bytes(v).len().to_string())
             .unwrap_or_else(|| "0".to_string())),
         ParamOp::Default { colon, word } => {
             let is_unset = if *colon {
@@ -531,7 +519,7 @@ fn expand_param(param: &ParamExpr, sh: &mut dyn ShellExpand) -> crate::error::Re
             };
             if is_unset {
                 let default = expand_param_word(word, sh)?;
-                let _ = sh.vars_mut().set(name, &default);
+                let _ = sh.vars_mut().set_shell(name, &default);
                 Ok(default)
             } else {
                 Ok(raw_value.unwrap_or_default())
@@ -629,8 +617,8 @@ fn field_split(fragments: &[ExpandedWord], ifs: &str) -> Vec<String> {
     let mut current = String::new();
     let mut have_field = false;
 
-    let ifs_ws: Vec<char> = ifs.chars().filter(|c| c.is_whitespace()).collect();
-    let ifs_nws: Vec<char> = ifs.chars().filter(|c| !c.is_whitespace()).collect();
+    let ifs_ws: Vec<&str> = crate::encoding::shell_chars(ifs).filter(|c| c.chars().all(char::is_whitespace)).collect();
+    let ifs_nws: Vec<&str> = crate::encoding::shell_chars(ifs).filter(|c| !c.chars().all(char::is_whitespace)).collect();
 
     for frag in fragments {
         // word_break starts a new field (used for "$@" expansion)
@@ -647,7 +635,7 @@ fn field_split(fragments: &[ExpandedWord], ifs: &str) -> Vec<String> {
         }
 
         // Split this fragment on IFS
-        let chars: Vec<char> = frag.value.chars().collect();
+        let chars: Vec<&str> = crate::encoding::shell_chars(&frag.value).collect();
         let mut i = 0;
 
         while i < chars.len() {
@@ -684,7 +672,7 @@ fn field_split(fragments: &[ExpandedWord], ifs: &str) -> Vec<String> {
                     i += 1;
                 }
             } else {
-                current.push(ch);
+                current.push_str(ch);
                 have_field = true;
                 i += 1;
             }
@@ -721,21 +709,21 @@ pub fn remove_glob_escapes(s: &str) -> String {
 }
 
 fn trim_suffix(value: &str, pattern: &str, greedy: bool) -> String {
-    let chars: Vec<char> = value.chars().collect();
+    let chars: Vec<&str> = crate::encoding::shell_chars(value).collect();
     if greedy {
         // Largest suffix: try from the beginning
         for i in 0..chars.len() {
-            let suffix: String = chars[i..].iter().collect();
-            if glob::fnmatch(pattern, &suffix) {
-                return chars[..i].iter().collect();
+            let suffix: String = chars[i..].iter().copied().collect();
+            if glob::fnmatch_shell(pattern, &suffix) {
+                return chars[..i].iter().copied().collect();
             }
         }
     } else {
         // Smallest suffix: try from the end
         for i in (0..chars.len()).rev() {
-            let suffix: String = chars[i..].iter().collect();
-            if glob::fnmatch(pattern, &suffix) {
-                return chars[..i].iter().collect();
+            let suffix: String = chars[i..].iter().copied().collect();
+            if glob::fnmatch_shell(pattern, &suffix) {
+                return chars[..i].iter().copied().collect();
             }
         }
     }
@@ -744,21 +732,21 @@ fn trim_suffix(value: &str, pattern: &str, greedy: bool) -> String {
 
 /// Remove smallest/largest prefix matching pattern.
 fn trim_prefix(value: &str, pattern: &str, greedy: bool) -> String {
-    let chars: Vec<char> = value.chars().collect();
+    let chars: Vec<&str> = crate::encoding::shell_chars(value).collect();
     if greedy {
         // Largest prefix: try from the end
         for i in (1..=chars.len()).rev() {
-            let prefix: String = chars[..i].iter().collect();
-            if glob::fnmatch(pattern, &prefix) {
-                return chars[i..].iter().collect();
+            let prefix: String = chars[..i].iter().copied().collect();
+            if glob::fnmatch_shell(pattern, &prefix) {
+                return chars[i..].iter().copied().collect();
             }
         }
     } else {
         // Smallest prefix: try from the beginning
         for i in 1..=chars.len() {
-            let prefix: String = chars[..i].iter().collect();
-            if glob::fnmatch(pattern, &prefix) {
-                return chars[i..].iter().collect();
+            let prefix: String = chars[..i].iter().copied().collect();
+            if glob::fnmatch_shell(pattern, &prefix) {
+                return chars[i..].iter().copied().collect();
             }
         }
     }

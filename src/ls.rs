@@ -5,11 +5,12 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 /// Native directory listing, equivalent to `ls -plAhG`.
 /// Writes output to stdout directly. Returns 0 on success, 1 on error.
-pub fn list_dir(path: &str) -> i32 {
+pub fn list_dir(path: impl AsRef<std::path::Path>) -> i32 {
+    let path = path.as_ref();
     let entries = match read_entries(path) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("ish: l: {path}: {e}");
+            eprintln!("ish: l: {}: {e}", path.display());
             return 1;
         }
     };
@@ -65,7 +66,8 @@ struct Entry {
     color_start: String,
 }
 
-fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
+fn read_entries(path: impl AsRef<std::path::Path>) -> Result<Vec<Entry>, std::io::Error> {
+    let path = path.as_ref();
     let top_meta = std::fs::symlink_metadata(path)?;
     let top_is_dir = if top_meta.file_type().is_symlink() {
         std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
@@ -73,11 +75,11 @@ fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
         top_meta.is_dir()
     };
     if !top_is_dir {
-        let p = std::path::Path::new(path);
+        let p = path;
         let name = p
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string());
+            .unwrap_or_else(|| path.display().to_string());
         return Ok(vec![build_entry(&name, p, &top_meta)?]);
     }
 

@@ -1,4 +1,7 @@
 mod arithmetic;
+mod evaluation;
+mod effects;
+mod expansion;
 mod interactive;
 mod policy;
 mod protocol;
@@ -28,5 +31,12 @@ impl fmt::Display for BridgeError {
 impl Error for BridgeError {}
 
 pub(crate) fn run_from_args(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
+    let args: Vec<String> = args.into_iter().collect();
+    if args.first().is_some_and(|argument| argument == "--effects-worker") {
+        if args.len() != 1 {
+            return Err(BridgeError::new("effects worker does not accept arguments"));
+        }
+        return effects::subprocess_worker();
+    }
     runner::run(args)
 }

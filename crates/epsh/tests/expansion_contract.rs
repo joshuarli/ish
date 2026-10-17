@@ -35,7 +35,7 @@ fn quote_masks_survive_mixed_globbing_and_field_splitting() {
     assert_eq!(fields("\"$X\"", &mut shell), ["*"]);
     assert_eq!(fields("'*'$Y", &mut shell), ["*left", "right"]);
     assert_eq!(fields("${UNSET:-'*'}", &mut shell), ["*"]);
-    assert_eq!(fields("${ASSIGNED:='*'}", &mut shell), ["*"]);
+    assert_eq!(fields("${ASSIGNED:='*'}", &mut shell), ["*one", "*two", "other"]);
     assert_eq!(shell.get_var("ASSIGNED"), Some("*"));
 }
 
@@ -89,4 +89,18 @@ fn quoted_literal_directory_component_allows_following_glob() {
     let mut shell = Shell::builder().cwd(dir.path().to_path_buf()).build();
     assert_eq!(fields("'*dir'/* '?dir'/* '[dir]'/* '\\dir'/*", &mut shell),
         ["*dir/file", "?dir/file", "[dir]/file", "\\dir/file"]);
+}
+
+#[test]
+fn assignment_rhs_joins_positional_values_before_outer_field_splitting() {
+    let mut shell = Shell::new();
+    shell.set_args(&["ish", "one", "two three", "four"]);
+    shell.set_var("IFS", "").unwrap();
+    assert_eq!(fields("${EMPTY_IFS=$*}", &mut shell), ["onetwo threefour"]);
+    assert_eq!(shell.get_var("EMPTY_IFS"), Some("onetwo threefour"));
+    shell.set_var("IFS", ":").unwrap();
+    assert_eq!(fields("${COLON_IFS=$*}", &mut shell), ["one", "two three", "four"]);
+    assert_eq!(shell.get_var("COLON_IFS"), Some("one:two three:four"));
+    assert_eq!(fields("\"${QUOTED=$*}\"", &mut shell), ["one:two three:four"]);
+    assert_eq!(shell.get_var("QUOTED"), Some("one:two three:four"));
 }

@@ -1,5 +1,6 @@
+use std::fmt;
 use std::io::Write;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use crate::ast::*;
 use crate::error::ShellError;
@@ -8,34 +9,163 @@ use crate::shell_bytes::ShellBytes;
 
 use crate::sys;
 
-/// Saved file descriptor for restoration after redirections.
+#[derive(Debug)]
+struct RedirectionRestoreFailure(Vec<std::io::Error>);
+
+impl fmt::Display for RedirectionRestoreFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("failed to restore redirections: ")?;
+        for (index, error) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RedirectionRestoreFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.first().map(|error| error as _)
+    }
+}
+
+#[derive(Debug)]
+struct RedirectionCleanupFailure {
+    primary: ShellError,
+    cleanup: ShellError,
+}
+
+impl fmt::Display for RedirectionCleanupFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}; cleanup failed: {}",
+            self.primary, self.cleanup
+        )
+    }
+}
+
+impl std::error::Error for RedirectionCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
+fn combine_cleanup<T>(
+    primary: crate::error::Result<T>,
+    cleanup: crate::error::Result<()>,
+) -> crate::error::Result<T> {
+    match (primary, cleanup) {
+        (primary, Ok(())) => primary,
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => {
+            let kind = match &primary {
+                ShellError::Io(error) => error.kind(),
+                _ => std::io::ErrorKind::Other,
+            };
+            Err(ShellError::Io(std::io::Error::new(
+                kind,
+                RedirectionCleanupFailure { primary, cleanup },
+            )))
+        }
+    }
+}
+
+fn restoration_error(errors: Vec<std::io::Error>) -> ShellError {
+    let kind = errors[0].kind();
+    ShellError::Io(std::io::Error::new(
+        kind,
+        RedirectionRestoreFailure(errors),
+    ))
+}
+
+fn install_redirection(file: OwnedFd, target_fd: RawFd) -> std::io::Result<()> {
+    if file.as_raw_fd() == target_fd {
+        rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty())?;
+        let _ = file.into_raw_fd();
+        Ok(())
+    } else {
+        sys::dup2_result(file.as_raw_fd(), target_fd)
+    }
+}
+
 pub(crate) struct SavedFd {
     pub(crate) target_fd: RawFd,
-    pub(crate) saved_copy: Option<RawFd>,
-    /// The target was not open before the redirection, so restoration closes it.
+    pub(crate) backup_slot: Option<usize>,
     pub(crate) was_closed: bool,
 }
 
 impl Shell {
-    /// Apply redirections left to right. Returns saved FD state for
-    /// restoration. When a later redirection fails, the descriptors changed by
-    /// earlier ones are restored before the error is returned.
     pub(crate) fn setup_redirections(
         &mut self,
         redirs: &[Redir],
     ) -> crate::error::Result<Vec<SavedFd>> {
+        let saved_fd_min = redirs
+            .iter()
+            .map(|redir| redir.fd)
+            .max()
+            .unwrap_or(9)
+            .max(9)
+            .checked_add(1)
+            .ok_or_else(|| {
+                ShellError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "redirection descriptor leaves no room for saved descriptors",
+                ))
+            })?;
         let mut saved = Vec::new();
-        match self.apply_redirections(redirs, &mut saved) {
+        match self.apply_redirections(redirs, &mut saved, saved_fd_min) {
             Ok(()) => Ok(saved),
-            Err(e) => {
-                self.restore_redirections(saved);
-                Err(e)
+            Err(error) => {
+                let cleanup = self.restore_redirections(saved);
+                self.combine_redirection_cleanup(Err(error), cleanup)
             }
         }
     }
 
-    /// Open a writable redirection target, letting an installed provider own
-    /// the open. The default open matches `File::create`, append, and `<>`.
+    fn move_backup_for_target(
+        &mut self,
+        target_fd: RawFd,
+        saved_fd_min: RawFd,
+    ) -> crate::error::Result<()> {
+        let Some(index) = self.redirection_backups.iter().position(|backup| {
+            backup.as_ref().is_some_and(|fd| fd.as_raw_fd() == target_fd)
+        }) else {
+            return Ok(());
+        };
+        let moved = sys::duplicate_fd_above(target_fd, saved_fd_min)?;
+        let old = self.redirection_backups[index].replace(moved).unwrap();
+        sys::close(old.into_raw_fd())?;
+        Ok(())
+    }
+
+    fn combine_redirection_cleanup<T>(
+        &self,
+        primary: crate::error::Result<T>,
+        cleanup: crate::error::Result<()>,
+    ) -> crate::error::Result<T> {
+        if matches!(&primary, Err(
+            ShellError::Exit(_) | ShellError::Return(_) | ShellError::Break(_)
+            | ShellError::Continue(_) | ShellError::Cancelled | ShellError::TimedOut
+            | ShellError::Stopped { .. }
+        )) {
+            if let Err(error) = cleanup {
+                self.err_msg(&format!("epsh: {error}"));
+            }
+            primary
+        } else {
+            combine_cleanup(primary, cleanup)
+        }
+    }
+
+    fn trim_redirection_backups(&mut self) {
+        while self.redirection_backups.last().is_some_and(Option::is_none) {
+            self.redirection_backups.pop();
+        }
+    }
+
     fn open_writable_redirection(
         &mut self,
         path: &std::path::Path,
@@ -65,9 +195,11 @@ impl Shell {
         &mut self,
         redirs: &[Redir],
         saved: &mut Vec<SavedFd>,
+        saved_fd_min: RawFd,
     ) -> crate::error::Result<()> {
         for redir in redirs {
             let target_fd = redir.fd;
+            self.move_backup_for_target(target_fd, saved_fd_min)?;
             let preserve_fd = !(target_fd == 0
                 && matches!(
                     redir.kind,
@@ -76,17 +208,20 @@ impl Shell {
                 && (self.stdout_sink.is_some() || self.stderr_sink.is_some()));
 
             if preserve_fd {
-                // SAFETY: target_fd is only borrowed for the duplicate; an
-                // unopened descriptor reports EBADF.
-                let target = unsafe { std::os::fd::BorrowedFd::borrow_raw(target_fd) };
-                let (saved_copy, was_closed) = match rustix::io::fcntl_dupfd_cloexec(target, 10) {
-                    Ok(copy) => (Some(std::os::fd::IntoRawFd::into_raw_fd(copy)), false),
-                    Err(e) => (None, e == rustix::io::Errno::BADF),
+                let (backup_slot, was_closed) = match sys::duplicate_fd_above(target_fd, saved_fd_min)
+                {
+                    Ok(copy) => {
+                        let index = self.redirection_backups.len();
+                        self.redirection_backups.push(Some(copy));
+                        (Some(index), false)
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::EBADF) => (None, true),
+                    Err(error) => return Err(ShellError::Io(error)),
                 };
 
                 saved.push(SavedFd {
                     target_fd,
-                    saved_copy,
+                    backup_slot,
                     was_closed,
                 });
             }
@@ -100,11 +235,7 @@ impl Shell {
                         self.err_msg(&format!("{filename}: {e}"));
                         ShellError::Io(e)
                     })?;
-                    if file.as_raw_fd() == target_fd {
-                        let _ = file.into_raw_fd();
-                    } else {
-                        sys::dup2(file.as_raw_fd(), target_fd);
-                    }
+                    install_redirection(file.into(), target_fd).map_err(ShellError::Io)?;
                 }
                 RedirKind::Output(word)
                 | RedirKind::Clobber(word)
@@ -124,19 +255,19 @@ impl Shell {
                             self.err_msg(&format!("{filename}: {e}"));
                             ShellError::Io(e)
                         })?;
-                    if file.as_raw_fd() == target_fd {
-                        let _ = file.into_raw_fd();
-                    } else {
-                        sys::dup2(file.as_raw_fd(), target_fd);
-                    }
+                    install_redirection(file.into(), target_fd).map_err(ShellError::Io)?;
                 }
                 RedirKind::DupInput(word) | RedirKind::DupOutput(word) => {
                     let fd_str = self.expand_string(word)?;
                     if fd_str == "-" {
                         sys::close(target_fd)?;
                     } else if let Ok(source_fd) = fd_str.parse::<i32>() {
-                        // SAFETY: source_fd is user-specified (may fail at OS level); target_fd is from redirect syntax.
-                        sys::dup2(source_fd, target_fd);
+                        if self.redirection_backups.iter().any(|backup| {
+                            backup.as_ref().is_some_and(|fd| fd.as_raw_fd() == source_fd)
+                        }) {
+                            return Err(ShellError::Io(std::io::Error::from_raw_os_error(libc::EBADF)));
+                        }
+                        sys::dup2_result(source_fd, target_fd).map_err(ShellError::Io)?;
                     } else {
                         return Err(ShellError::Runtime {
                             msg: format!("{fd_str}: bad file descriptor"),
@@ -145,12 +276,9 @@ impl Shell {
                     }
                 }
                 RedirKind::HereDoc(body) | RedirKind::HereDocStrip(body) => {
-                    let mut fds = [0i32; 2];
-                    // SAFETY: fds is a valid 2-element array for pipe() to write into.
-                    sys::pipe(fds.as_mut_ptr());
-                    // SAFETY: fds[1] is a valid fd just returned by pipe().
-                    let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
-                    let read_fd = fds[0];
+                    let (read_end, write_end) = sys::pipe_owned()?;
+                    let read_end = std::fs::File::from(read_end);
+                    let write_end = std::fs::File::from(write_end);
 
                     let expanded = match body {
                         HereDocBody::Literal(s) => s.clone(),
@@ -164,28 +292,18 @@ impl Shell {
                             )
                         }
                     };
-                    let _ = (&write_end).write_all(expanded.as_bytes());
+                    (&write_end).write_all(expanded.as_bytes())?;
                     drop(write_end);
 
-                    // When sinks are active the shell is embedded in a multi-threaded
-                    // process. Calling dup2(read_fd, 0) in the parent would replace the
-                    // process-wide fd 0 and race with other threads reading stdin (e.g.
-                    // nerv's keyboard input loop). Instead, stash the read fd and let
-                    // eval_external pass it via cmd.stdin() after fork — only the child
-                    // inherits it. For builtins/functions that need stdin, the dup2 path
-                    // is still used since they run in-process on this thread.
                     if target_fd == 0 && (self.stdout_sink.is_some() || self.stderr_sink.is_some())
                     {
                         if let Some(old) = self.pending_stdin.take() {
                             // SAFETY: old is a valid fd we own.
-                            let _ = sys::close(old);
+                            sys::close(old)?;
                         }
-                        self.pending_stdin = Some(read_fd);
-                        // No SavedFd entry needed: we never touched fd 0.
+                        self.pending_stdin = Some(read_end.into_raw_fd());
                     } else {
-                        // SAFETY: read_fd is valid from pipe(); target_fd is the redirect target.
-                        sys::dup2(read_fd, target_fd);
-                        let _ = sys::close(read_fd);
+                        install_redirection(read_end.into(), target_fd).map_err(ShellError::Io)?;
                     }
                 }
             }
@@ -194,24 +312,65 @@ impl Shell {
         Ok(())
     }
 
-    /// Restore file descriptors after redirections.
-    pub(crate) fn restore_redirections(&self, saved: Vec<SavedFd>) {
+    pub(crate) fn restore_redirections(&mut self, saved: Vec<SavedFd>) -> crate::error::Result<()> {
+        let mut errors = Vec::new();
         for s in saved.into_iter().rev() {
-            if let Some(copy) = s.saved_copy {
-                // SAFETY: copy is a valid fd from fcntl_dupfd_cloexec; target_fd is the original fd being restored.
-                sys::dup2(copy, s.target_fd);
-                let _ = sys::close(copy);
-            } else if s.was_closed
-                // SAFETY: only queried; a redirection that failed before its
-                // dup2 left the descriptor closed, and closing it again would
-                // report EBADF.
-                && rustix::io::fcntl_getfd(unsafe {
-                    std::os::fd::BorrowedFd::borrow_raw(s.target_fd)
-                })
-                .is_ok()
-            {
-                let _ = sys::close(s.target_fd);
+            if let Some(index) = s.backup_slot {
+                let copy = self.redirection_backups[index].take().unwrap().into_raw_fd();
+                if let Err(error) = sys::dup2_result(copy, s.target_fd) {
+                    errors.push(error);
+                }
+                if let Err(error) = sys::close(copy) {
+                    errors.push(error);
+                }
+            } else if s.was_closed {
+                match sys::descriptor_is_open(s.target_fd) {
+                    Ok(()) => {
+                        if let Err(error) = sys::close(s.target_fd) {
+                            errors.push(error);
+                        }
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::EBADF) => {}
+                    Err(error) => errors.push(error),
+                }
             }
         }
+        self.trim_redirection_backups();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(restoration_error(errors))
+        }
+    }
+
+    pub(crate) fn finish_redirections<T>(
+        &mut self,
+        primary: crate::error::Result<T>,
+        saved: Vec<SavedFd>,
+    ) -> crate::error::Result<T> {
+        let cleanup = self.restore_redirections(saved);
+        self.combine_redirection_cleanup(primary, cleanup)
+    }
+
+    pub(crate) fn finish_saved_redirections<T>(
+        &mut self,
+        primary: crate::error::Result<T>,
+        saved: Vec<SavedFd>,
+    ) -> crate::error::Result<T> {
+        let errors: Vec<_> = saved
+            .into_iter()
+            .filter_map(|state| state.backup_slot)
+            .filter_map(|index| {
+                let fd = self.redirection_backups[index].take().unwrap().into_raw_fd();
+                sys::close(fd).err()
+            })
+            .collect();
+        self.trim_redirection_backups();
+        let cleanup = if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(restoration_error(errors))
+        };
+        self.combine_redirection_cleanup(primary, cleanup)
     }
 }
