@@ -367,19 +367,22 @@ fn expand_param_to_fragments(
                 raw_value.is_none()
             };
             if is_unset {
-                let frags = expand_word_parts_inner(
+                if matches!(param.op, ParamOp::Assign { .. }) {
+                    let value = remove_glob_escapes(&expand_param_word(word, sh)?);
+                    let _ = sh.vars_mut().set_shell(name, &value);
+                    return Ok(vec![ExpandedWord {
+                        value,
+                        split_fields: !quoted_context,
+                        word_break: false,
+                    }]);
+                }
+                expand_word_parts_inner(
                     word,
                     sh,
                     quoted_context,
                     true,
                     escape_quoted_globs,
-                )?;
-                if matches!(param.op, ParamOp::Assign { .. }) {
-                    let val: String = frags.iter().map(|f| f.value.clone()).collect();
-                    let val = if escape_quoted_globs { remove_glob_escapes(&val) } else { val };
-                    let _ = sh.vars_mut().set_shell(name, &val);
-                }
-                Ok(frags)
+                )
             } else {
                 let value = raw_value.unwrap_or_default();
                 Ok(vec![ExpandedWord {

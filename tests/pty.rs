@@ -3636,4 +3636,31 @@ fn native_listing_and_standalone_cd_preserve_private_use_and_raw_path_bytes() {
         assert!(out.contains("codec-path-marker"), "{out}");
         sh.run_command("cd \"$HOME\"");
     }
+    sh.run_command("HOME=\"$HOME/$(printf '\\0200')\"");
+    sh.run_command("cd");
+    let out = clean(&sh.run_command("l"));
+    assert!(out.contains("codec-path-marker"), "{out}");
+    sh.send(b"\x10");
+    sh.wait_for_quiescence(200);
+    let dump_dir = sh.home_path().join(OsString::from_vec(vec![0x80])).join(".cache/ish");
+    assert!(std::fs::read_dir(dump_dir).unwrap().any(|entry| {
+        entry.unwrap().file_name().to_string_lossy().starts_with("dump-")
+    }));
+    let out = clean(&sh.run_command("z"));
+    assert!(out.contains("ish: z: HOME is not UTF-8"), "{out}");
+    sh.type_str("cd ~/");
+    sh.tab();
+    let out = clean(&sh.read_timeout(300));
+    assert!(out.contains("ish: completion: HOME is not UTF-8"), "{out}");
+    sh.ctrl_c();
+}
+
+#[test]
+fn prompt_identity_displays_unicode_and_replaces_only_invalid_display_bytes() {
+    let sh = PtyShell::spawn();
+    let out = clean(&sh.run_command("USER='\u{e080}'"));
+    assert!(out.contains("\u{e080}@"), "{out}");
+    assert!(!out.contains('\u{e000}'), "{out}");
+    let out = clean(&sh.run_command("USER=$(printf '\\0200')"));
+    assert!(out.contains("\u{fffd}@"), "{out}");
 }
