@@ -104,7 +104,7 @@ pub fn locate_command(
 }
 
 /// List directories using ish's native directory listing.
-pub fn list_directory(args: &[String]) -> i32 {
+pub fn list_directory(args: &[impl AsRef<std::path::Path>]) -> i32 {
     if args.is_empty() {
         ls::list_dir(".")
     } else {
@@ -115,7 +115,7 @@ pub fn list_directory(args: &[String]) -> i32 {
                 if i > 0 {
                     println!();
                 }
-                println!("{arg}:");
+                println!("{}:", arg.as_ref().display());
             }
             let s = ls::list_dir(arg);
             if s != 0 {
