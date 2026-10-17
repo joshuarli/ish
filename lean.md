@@ -1,6 +1,7 @@
 # Execute the ish semantic foundations campaign
 
-Status: ready for an explicit execution grant. This document does not start work.
+Status: executing. Owner granted implementation, local commits, the unsquashed
+epsh import, and the described CI edits on 2026-10-17. No pushes or publication.
 
 Build one Rust workspace containing ish and epsh, replace Perl conformance testing,
 and establish an audited Lean model connected to production Rust behavior.
@@ -434,13 +435,10 @@ complete. Do not wait for owner approval to finish a report.
 
 ## Execution boundary
 
-The current request authorizes preflight edits to lean.md and checks only. It does
-not authorize implementation, local commits, history import, CI edits, or a release.
-
-A subsequent launch must explicitly authorize repository implementation, local
-Conventional Commits, the unsquashed local epsh import, and the described CI edits.
-Without those grants, park the affected items and finish disjoint authorized work.
-No plan text supplies missing permission. Local build/test/package dry-runs and
+The owner authorized execution on 2026-10-17, including repository implementation,
+local Conventional Commits, the unsquashed local epsh import, and the described CI
+edits. The owner requested Luna high for import scaffolding. No plan text supplies
+permission beyond that grant. Local build/test/package dry-runs and
 isolated experiments are reversible. Retain these exclusions even after launch:
 
 - No pushes, remote workflow dispatch, tags, actual package publication, system/user installations,
@@ -489,6 +487,8 @@ exec redirections are permanent. Cancellation and custom-handler child ownership
 must remain explicit. Do not claim an external handler intercepts epsh builtins.
 
 ## Decision log
+
+- 2026-10-17: overlap G1 import and F0 foundation with G0 baselines against fixed source revisions; neither changes baseline source.
 
 Append one line per material executor judgment, with the call and its reason.
 
