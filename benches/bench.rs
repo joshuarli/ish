@@ -3,6 +3,7 @@
 //! Tracks wall time and allocations for user-visible and interactive hot paths.
 //! Run: `cargo bench --bench bench`.
 
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -82,6 +83,45 @@ impl BenchDir {
 impl Drop for BenchDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct DenvBenchmarkState {
+    cwd: PathBuf,
+    env: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl DenvBenchmarkState {
+    fn capture() -> Self {
+        let keys = [
+            "DENV_DATA_DIR",
+            "PWD",
+            "ISH_BENCH_DIR",
+            "__DENV_PID",
+            "__DENV_SHELL",
+            "__DENV_DIR",
+            "__DENV_DIRTY",
+            "__DENV_STATE",
+        ];
+        Self {
+            cwd: std::env::current_dir().unwrap(),
+            env: keys
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        }
+    }
+}
+
+impl Drop for DenvBenchmarkState {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.cwd).unwrap();
+        for (key, value) in &self.env {
+            match value {
+                Some(value) => ish::shell_setenv_os(key, value),
+                None => ish::shell_unsetenv(key),
+            }
+        }
     }
 }
 
@@ -379,17 +419,19 @@ fn startup_warm(bencher: Bencher) {
 
 fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
     let fixture = BenchDir::new(if with_denv { "cd-denv" } else { "cd" });
+    let _process_state = DenvBenchmarkState::capture();
     let first = fixture.path().join("first");
     let second = fixture.path().join("second");
+    let data_dir = fixture.path().join("denv-data");
     fs::create_dir_all(&first).unwrap();
     fs::create_dir_all(&second).unwrap();
+    fs::create_dir_all(&data_dir).unwrap();
+    ish::shell_setenv_os("DENV_DATA_DIR", &data_dir);
     if with_denv {
         fs::write(first.join(".env"), b"ISH_BENCH_DIR=first\n").unwrap();
         fs::write(second.join(".env"), b"ISH_BENCH_DIR=second\n").unwrap();
     }
 
-    let original_dir = std::env::current_dir().unwrap();
-    let original_pwd = std::env::var_os("PWD");
     let _stderr = SuppressStderr::new();
     let mut epsh = epsh::eval::Shell::builder()
         .cwd(first.clone())
@@ -398,30 +440,85 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
     ish::denv::init(&mut epsh);
     std::env::set_current_dir(&first).unwrap();
     sync_bench_pwd(&mut epsh, &first);
-    let _ = ish::denv::on_cd(&epsh);
-    std::env::set_current_dir(&second).unwrap();
-    sync_bench_pwd(&mut epsh, &second);
-    let _ = ish::denv::on_cd(&epsh);
+    if with_denv {
+        for (dir, expected) in [(&first, "first"), (&second, "second")] {
+            std::env::set_current_dir(dir).unwrap();
+            sync_bench_pwd(&mut epsh, dir);
+            let outcome = ish::denv::command(&["allow".to_owned()], &epsh);
+            assert_eq!(outcome.status, 0);
+            apply_bench_denv_changes(&outcome.changes, &mut epsh);
+            assert_bench_denv_store_value(&epsh, expected);
+            assert_bench_process_denv_value(expected);
+        }
+    } else {
+        for dir in [&first, &second] {
+            std::env::set_current_dir(dir).unwrap();
+            sync_bench_pwd(&mut epsh, dir);
+            let changes = ish::denv::on_cd(&epsh);
+            apply_bench_denv_changes(&changes, &mut epsh);
+        }
+    }
 
     let mut prompt = prompt::Prompt::new();
     let mut out = String::with_capacity(128);
-    let mut use_first = false;
+    let mut use_first = true;
+    let mut expected_process_value = "second";
+    let mut observed = false;
     bench_with_syscall_trace(bencher, || {
-        let dir = if use_first { &first } else { &second };
+        let (dir, expected) = if use_first {
+            (&first, "first")
+        } else {
+            (&second, "second")
+        };
         use_first = !use_first;
         std::env::set_current_dir(dir).unwrap();
         sync_bench_pwd(&mut epsh, dir);
         let changes = ish::denv::on_cd(&epsh);
+        if with_denv {
+            assert_bench_denv_change(&changes, expected);
+            apply_bench_denv_changes(&changes, &mut epsh);
+            assert_bench_denv_store_value(&epsh, expected);
+            expected_process_value = expected;
+        }
+        observed = true;
         prompt.invalidate_git();
         prompt.render_into(&mut out, 0, dir.to_str().unwrap(), !changes.is_empty());
         black_box((&changes, &out));
     });
-
-    std::env::set_current_dir(original_dir).unwrap();
-    match original_pwd {
-        Some(pwd) => ish::shell_setenv_os("PWD", pwd),
-        None => ish::shell_unsetenv("PWD"),
+    assert!(observed);
+    if with_denv {
+        assert_bench_process_denv_value(expected_process_value);
     }
+}
+
+fn apply_bench_denv_changes(changes: &[ish::denv::EnvChange], epsh: &mut epsh::eval::Shell) {
+    for change in changes {
+        match change {
+            ish::denv::EnvChange::Set(key, value) => {
+                epsh.vars_mut().set(key, value).unwrap();
+                epsh.vars_mut().export(key);
+            }
+            ish::denv::EnvChange::Unset(key) => {
+                epsh.vars_mut().unset(key).unwrap();
+            }
+        }
+    }
+}
+
+fn assert_bench_denv_store_value(epsh: &epsh::eval::Shell, expected: &str) {
+    assert_eq!(epsh.vars().get("ISH_BENCH_DIR"), Some(expected));
+}
+
+fn assert_bench_denv_change(changes: &[ish::denv::EnvChange], expected: &str) {
+    assert!(changes.iter().any(|change| matches!(
+        change,
+        ish::denv::EnvChange::Set(key, value)
+            if key == "ISH_BENCH_DIR" && value == expected
+    )));
+}
+
+fn assert_bench_process_denv_value(expected: &str) {
+    assert_eq!(std::env::var("ISH_BENCH_DIR").unwrap(), expected);
 }
 
 // Mirror what change_directory does before denv::on_cd: PWD must agree in both
