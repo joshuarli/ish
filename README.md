@@ -44,6 +44,7 @@ alias .. "cd .."
 
 The prompt shows the user, host, shortened working directory, Git branch, and
 last command status. A red `*` marks a dirty denv environment.
+Control characters in the user, host, directory, and branch appear as `�`.
 
 | Key | Action |
 |---|---|

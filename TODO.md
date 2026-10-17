@@ -25,14 +25,6 @@ Next: 22
 - **Design:** [Callback process boundary](docs/rfc/ISH-8-callback-process-boundary.md)
 
 
-### ISH-10 · P2 · Prompt identity emits unsanitized control characters
-
-- **Area:** Security
-- **Where:** `src/main.rs:672`, `src/prompt.rs:35`, `src/prompt.rs:84`
-- **Problem:** USER is inserted into the prompt identity and rendered directly, while directory and branch display paths sanitize control characters. A fresh-build PTY with a newline in USER emitted that newline and split the prompt. Other terminal control characters follow the same unsanitized output path.
-- **Recommendation:** Apply the existing display-character sanitization to identity text before rendering it, including any host component.
-- **Fix with:** os-boundaries
-- **Effort:** S (hours)
 
 ### ISH-11 · P2 · Early execution returns leave shell status and EXIT traps stale
 

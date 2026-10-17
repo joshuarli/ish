@@ -35,7 +35,7 @@ impl Prompt {
     pub fn with_identity(user: &str, home: &str) -> Self {
         Self {
             user: user.to_string(),
-            user_host: format!("{user}@{} ", hostname()),
+            user_host: prompt_identity(user, &hostname()),
             home: home.to_string(),
             git: GitCache::Unknown,
             pwd_last: String::new(),
@@ -49,7 +49,7 @@ impl Prompt {
         if self.user != user {
             self.user.clear();
             self.user.push_str(user);
-            self.user_host = format!("{user}@{} ", hostname());
+            self.user_host = prompt_identity(user, &hostname());
         }
         if self.home != home {
             self.home.clear();
@@ -324,6 +324,15 @@ pub fn push_percent_encoded(out: &mut String, bytes: &[u8], keep_slash: bool) {
     }
 }
 
+fn prompt_identity(user: &str, host: &str) -> String {
+    user.chars()
+        .chain(['@'])
+        .chain(host.chars())
+        .chain([' '])
+        .map(crate::line::display_char)
+        .collect()
+}
+
 fn hostname() -> String {
     rustix::system::uname()
         .nodename()
@@ -337,6 +346,14 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_replaces_host_controls() {
+        assert_eq!(
+            prompt_identity("Zoë", "h\n\r\t\x1b]52;c;x\x07\x7f\u{0085}"),
+            "Zoë@h����]52;c;x��� "
+        );
+    }
 
     #[test]
     fn pwd_shortens_middle() {
