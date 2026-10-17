@@ -1,6 +1,7 @@
 import IshSemantics.Arithmetic
 import IshSemantics.Effects
 import IshSemantics.Evaluation
+import IshSemantics.Expansion
 import IshSemantics.Interactive
 import IshSemantics.Policy
 import IshSemantics.Protocol
@@ -10,7 +11,7 @@ open Lean IshSemantics IshSemantics.Protocol
 def dispatch (request : Request) : Outcome Json :=
   match request.family with
   | .policy => IshSemantics.Policy.run request
-  | .expansion => .unsupportedDomain "expansion adapter is not integrated"
+  | .expansion => IshSemantics.Expansion.evalRequest request
   | .arithmetic => IshSemantics.Arithmetic.evalRequest request
   | .interactive => IshSemantics.Interactive.evalRequest request
   | .evaluation => IshSemantics.Evaluation.evalRequest request

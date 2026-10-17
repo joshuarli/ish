@@ -1,4 +1,5 @@
 mod arithmetic;
+mod expansion;
 mod interactive;
 mod policy;
 mod protocol;
