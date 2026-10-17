@@ -18,9 +18,10 @@ Run cases with one corpus category:
     EPSH_CONFORMANCE_CATEGORY=shell:legacy-no TMPDIR="$PWD/.work/tmp" cargo test -p epsh --test conformance legacy_conformance -- --exact --nocapture
 
 The native runner executes all 175 retained IDs without Perl. It keeps case
-data as bytes, creates an isolated working directory under `TMPDIR`, and reports
-host-category exclusions. A `need-pass: no` case still runs; a mismatch is
-reported as an ignored failure. `info-pre` prints informational output and does
+data as bytes and creates isolated working directories under the repository's
+`.work/tmp`, independently of ambient `TMPDIR`. Standalone packages use their
+own `.work/tmp`. The runner reports host-category exclusions. A `need-pass: no`
+case still runs; a mismatch is reported as an ignored failure. `info-pre` prints informational output and does
 not skip a case. The corpus and its license notice are in
 [check-epsh.t](../check-epsh.t) and [tests/conformance/NOTICE](../tests/conformance/NOTICE).
 
