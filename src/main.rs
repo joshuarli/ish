@@ -45,7 +45,8 @@ struct Shell {
     path_cache: path::PathCache,
     exit_warned: bool,
     signal_fd: RawFd,
-    home: String,
+    home: Option<String>,
+    home_display: String,
     session_log: String,
     layout_dump: String,
     epsh: epsh::eval::Shell,
@@ -132,6 +133,12 @@ fn print_help() {
     println!("  -h, --help     Show this help message");
 }
 
+fn ish_command_policy(target: &epsh::shell_bytes::ShellBytes) -> Option<String> {
+    dispatch::check_expanded_command(target)
+        .err()
+        .map(|rejection| rejection.to_string())
+}
+
 fn main() {
     let cli = parse_args();
 
@@ -177,8 +184,9 @@ fn main() {
             initial_home.as_deref(),
         );
     }
-    let user = store_env_string(&epsh, "USER");
-    let home = store_env_string(&epsh, "HOME");
+    let user = store_env_display(&epsh, "USER");
+    let home = store_home_text(&epsh);
+    let home_display = store_env_display(&epsh, "HOME");
     let home_os = store_env_os(&epsh, "HOME");
 
     let mut shell = Shell {
@@ -191,7 +199,7 @@ fn main() {
             eprintln!("ish: cannot open history: {error}");
             std::process::exit(1);
         }),
-        prompt: prompt::Prompt::with_identity(&user, &home),
+        prompt: prompt::Prompt::with_identity(&user, &home_display),
         prompt_buf: String::with_capacity(128),
         completion_buffer: complete::Completions::with_capacity(2048, 64),
         history_match_buffer: Vec::with_capacity(200),
@@ -200,7 +208,8 @@ fn main() {
         path_cache: path::PathCache::new(),
         exit_warned: false,
         signal_fd,
-        home: home.clone(),
+        home,
+        home_display,
         session_log: String::new(),
         layout_dump: String::new(),
         epsh,
@@ -211,6 +220,9 @@ fn main() {
     let changes = denv::on_startup(&shell.epsh);
     apply_denv_changes(&changes, &mut shell.epsh);
     sync_shell_store_derived(&mut shell);
+    shell
+        .epsh
+        .set_command_policy(Box::new(ish_command_policy));
 
     // Main loop
     let mut exit_code = 0;
@@ -231,7 +243,7 @@ fn main() {
                 let line = maybe_rewrite_cd(
                     &line,
                     &shell.aliases,
-                    &shell.home,
+                    store_env_os(&shell.epsh, "HOME").as_deref().unwrap_or(std::ffi::OsStr::new("")),
                     store_path_env(&shell.epsh),
                 );
 
@@ -355,11 +367,14 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
             return handle_exit_command(line, shell);
         }
         "cd" => {
-            let args = expanded_args!();
+            let args = match expand_builtin_args_bytes(args, shell, name) {
+                Some(args) => args,
+                None => return false,
+            };
             if args.len() > 1 {
                 eprintln!("ish: cd: too many arguments");
                 shell.last_status = 1;
-            } else if args.first().map(String::as_str) == Some("-") {
+            } else if args.first().map(|arg| arg.as_bytes()) == Some(b"-".as_slice()) {
                 if let Some(prev) = store_env_os(&shell.epsh, "OLDPWD").filter(|s| !s.is_empty()) {
                     eprintln!("{}", Path::new(&prev).display());
                     shell.last_status = change_directory_path(Path::new(&prev), shell);
@@ -368,8 +383,19 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                     shell.last_status = 1;
                 }
             } else {
-                let target = args.first().cloned().unwrap_or_else(|| shell.home.clone());
-                shell.last_status = change_directory(&target, shell);
+                let home = store_env_os(&shell.epsh, "HOME").unwrap_or_default();
+                let target = match args.first().map(|arg| arg.as_bytes()) {
+                    None | Some(b"") | Some(b"~") => std::path::PathBuf::from(home),
+                    Some(bytes) => {
+                        if let Some(relative) = bytes.strip_prefix(b"~/") {
+                            use std::os::unix::ffi::OsStrExt;
+                            Path::new(&home).join(std::ffi::OsStr::from_bytes(relative))
+                        } else {
+                            args[0].to_path_buf()
+                        }
+                    }
+                };
+                shell.last_status = change_directory_path(&target, shell);
             }
         }
         "history" => {
@@ -396,7 +422,12 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
         }
         "z" => {
             let args = expanded_args!();
-            shell.last_status = frecency::builtin_z(&args, &shell.history, &shell.home);
+            let Some(home) = shell.home.as_deref() else {
+                eprintln!("ish: z: HOME is not UTF-8");
+                shell.last_status = 1;
+                return false;
+            };
+            shell.last_status = frecency::builtin_z(&args, &shell.history, home);
             if shell.last_status == 0 {
                 // z already did chdir — run post-cd hooks
                 let old_cwd = shell.epsh.cwd().to_path_buf();
@@ -558,11 +589,9 @@ fn mode_name(mode: &Mode) -> &'static str {
 fn write_layout_dump_to_file(shell: &Shell) -> Result<String, String> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
-    if shell.home.is_empty() {
-        return Err("ish-dump: HOME is not set".to_string());
-    }
-
-    let dir = Path::new(&shell.home).join(".cache/ish");
+    let home = store_env_os(&shell.epsh, "HOME").filter(|home| !home.is_empty())
+        .ok_or_else(|| "ish-dump: HOME is not set".to_string())?;
+    let dir = Path::new(&home).join(".cache/ish");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -637,8 +666,10 @@ fn store_env_os(epsh: &epsh::eval::Shell, name: &str) -> Option<OsString> {
         .map(|value| value.to_os_string())
 }
 
-fn store_env_string(epsh: &epsh::eval::Shell, name: &str) -> String {
-    epsh.vars().get_shell(name).unwrap_or_default()
+fn store_env_display(epsh: &epsh::eval::Shell, name: &str) -> String {
+    epsh.vars().get_bytes(name)
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// `$PATH` as raw bytes from epsh's variable store — the single source of
@@ -650,10 +681,18 @@ fn store_path_env(epsh: &epsh::eval::Shell) -> &[u8] {
     epsh.vars().get_bytes("PATH").map_or(&[], |v| v.as_bytes())
 }
 
+fn store_home_text(epsh: &epsh::eval::Shell) -> Option<String> {
+    match epsh.vars().get_bytes("HOME") {
+        Some(value) => value.as_utf8_str().map(str::to_owned),
+        None => Some(String::new()),
+    }
+}
+
 fn sync_shell_store_derived(shell: &mut Shell) {
-    shell.home = store_env_string(&shell.epsh, "HOME");
-    let user = store_env_string(&shell.epsh, "USER");
-    shell.prompt.set_identity(&user, &shell.home);
+    shell.home = store_home_text(&shell.epsh);
+    let user = store_env_display(&shell.epsh, "USER");
+    shell.home_display = store_env_display(&shell.epsh, "HOME");
+    shell.prompt.set_identity(&user, &shell.home_display);
 }
 
 fn read_line(shell: &mut Shell) -> ReadResult {
@@ -924,7 +963,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 let mut cs = start_completion(
                                     &base_line,
                                     shell.cols,
-                                    &shell.home,
+                                    shell.home.as_deref(),
                                     &shell.aliases,
                                     &shell.epsh,
                                     comp,
@@ -985,7 +1024,7 @@ fn read_line(shell: &mut Shell) -> ReadResult {
                                 let mut cs = start_completion(
                                     base_line,
                                     shell.cols,
-                                    &shell.home,
+                                    shell.home.as_deref(),
                                     &shell.aliases,
                                     &shell.epsh,
                                     comp,
@@ -1708,7 +1747,7 @@ fn needs_quoting(s: &str) -> bool {
 fn start_completion(
     line: &LineBuffer,
     term_cols: u16,
-    home: &str,
+    home: Option<&str>,
     aliases: &AliasMap,
     epsh: &epsh::eval::Shell,
     mut comp: complete::Completions,
@@ -1732,6 +1771,28 @@ fn start_completion(
         (inner.strip_suffix('\'').unwrap_or(inner).into(), true)
     } else {
         (raw_word.into(), false)
+    };
+
+    let first_command_word = text.split_whitespace().next().unwrap_or("");
+    const SSH_CMDS: &[&str] = &["ssh", "scp", "rsync", "sftp", "mosh"];
+    let needs_home = partial.starts_with('~')
+        || (word_start > 0 && SSH_CMDS.contains(&first_command_word) && !partial.contains([':', '/']));
+    let home = match home {
+        Some(home) => home,
+        None if needs_home => {
+            eprintln!("ish: completion: HOME is not UTF-8");
+            return CompletionState {
+                comp,
+                selected: 0,
+                cols: 1,
+                rows: 0,
+                scroll: 0,
+                term_cols,
+                dir_prefix: String::new(),
+                in_quote,
+            };
+        }
+        None => "",
     };
 
     // Command position: first word or after |, &&, ;
@@ -1769,12 +1830,10 @@ fn start_completion(
     }
 
     // Detect if first word is cd → complete only directories
-    let first_command_word = text.split_whitespace().next().unwrap_or("");
     let dirs_only = first_command_word == "cd" && word_start > 0;
 
     // After ssh-like commands, offer hostnames beside local files. There is no
     // remote path completion: it would run ssh from the completion path.
-    const SSH_CMDS: &[&str] = &["ssh", "scp", "rsync", "sftp", "mosh"];
     if word_start > 0 && SSH_CMDS.contains(&first_command_word) && !partial.contains([':', '/']) {
         complete::complete_hostnames(&partial, home, &mut comp);
         complete::complete_path_into(&partial, false, &mut comp);
@@ -2251,10 +2310,30 @@ fn expand_builtin_args(
     shell: &mut Shell,
     name: &str,
 ) -> Option<Vec<String>> {
+    let fields = expand_builtin_args_bytes(words, shell, name)?;
+    let mut args = Vec::with_capacity(fields.len());
+    for field in fields {
+        match String::from_utf8(field.into_vec()) {
+            Ok(field) => args.push(field),
+            Err(error) => {
+                eprintln!("ish: {name}: argument is not UTF-8: {error}");
+                shell.last_status = 1;
+                return None;
+            }
+        }
+    }
+    Some(args)
+}
+
+fn expand_builtin_args_bytes(
+    words: &[epsh::ast::Word],
+    shell: &mut Shell,
+    name: &str,
+) -> Option<Vec<epsh::shell_bytes::ShellBytes>> {
     let mut args = Vec::new();
     for word in words {
         match epsh::expand::expand_word_to_fields(word, &mut shell.epsh) {
-            Ok(fields) => args.extend(fields),
+            Ok(fields) => args.extend(fields.iter().map(|field| epsh::shell_bytes::ShellBytes::from_str_lossless(field))),
             Err(e) => {
                 eprintln!("ish: {name}: expansion error: {e}");
                 shell.last_status = 1;
@@ -2268,16 +2347,15 @@ fn expand_builtin_args(
 /// Change directory and run all post-cd hooks (OLDPWD, epsh sync, dir stack, denv, prompt).
 /// Returns 0 on success, 1 on failure.
 fn change_directory(target: &str, shell: &mut Shell) -> i32 {
-    // Resolve ~ prefix
+    let home = store_env_os(&shell.epsh, "HOME").unwrap_or_default();
     let resolved = if target == "~" || target.is_empty() {
-        shell.home.clone()
+        std::path::PathBuf::from(home)
     } else if let Some(rest) = target.strip_prefix("~/") {
-        format!("{}/{rest}", shell.home)
+        Path::new(&home).join(rest)
     } else {
-        target.to_string()
+        std::path::PathBuf::from(target)
     };
-
-    change_directory_path(Path::new(&resolved), shell)
+    change_directory_path(&resolved, shell)
 }
 
 fn change_directory_path(target: &Path, shell: &mut Shell) -> i32 {
@@ -2317,7 +2395,7 @@ fn render_dir_picker_mode(
             tw,
             entries,
             *selected,
-            &shell.home,
+            &shell.home_display,
             shell.rows,
             shell.cols,
             prev,
@@ -2435,10 +2513,10 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
 fn env_pair_value(
     env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)],
     name: &str,
-) -> Option<String> {
+) -> Option<OsString> {
     env_pairs
         .iter()
-        .find_map(|(k, v)| (k.as_bytes() == name.as_bytes()).then(|| v.to_shell_string()))
+        .find_map(|(k, v)| (k.as_bytes() == name.as_bytes()).then(|| v.to_os_string()))
 }
 
 /// Build the external handler for epsh. Handles ish-specific builtins
@@ -2455,8 +2533,7 @@ fn make_external_handler(
             // ish interactive builtins
             match name.as_str() {
                 "l" => {
-                    let l_args: Vec<String> =
-                        args[1..].iter().map(|arg| arg.to_shell_string()).collect();
+                    let l_args: Vec<_> = args[1..].iter().map(|arg| arg.to_path_buf()).collect();
                     let status = builtin::list_directory(&l_args);
                     return Ok(epsh::error::ExitStatus::from(status));
                 }
@@ -2621,9 +2698,12 @@ fn spawn_external(
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let path_env = env_pair_value(env_pairs, "PATH")
                     .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
-                if let Some(msg) = epsh::eval::bad_interpreter_message(&name, code, &cwd, &path_env)
-                {
-                    eprintln!("{msg}");
+                if let Some(msg) = epsh::eval::bad_interpreter_message_os(&args[0].to_os_string(), code, &cwd, &path_env) {
+                    use std::io::Write;
+                    use std::os::unix::ffi::OsStrExt;
+                    let mut stderr = std::io::stderr().lock();
+                    stderr.write_all(msg.as_bytes())?;
+                    stderr.write_all(b"\n")?;
                     return Ok(epsh::error::ExitStatus::NOT_EXECUTABLE);
                 }
             }
@@ -2690,7 +2770,7 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
     }
 }
 
-fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &str, path_env: &[u8]) -> String {
+fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &std::ffi::OsStr, path_env: &[u8]) -> String {
     let trimmed = line.trim();
     let words = match lex_simple_command_words(trimmed) {
         Some(words) => words,
@@ -2700,7 +2780,10 @@ fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &str, path_env: &[u8])
         Some(word) => word,
         None => return line.to_string(),
     };
-    let first_text = epsh::lexer::parts_to_text(&first.parts);
+    let first_bytes = epsh::shell_bytes::ShellBytes::from_str_lossless(&epsh::lexer::parts_to_text(&first.parts));
+    let Some(first_text) = first_bytes.as_utf8_str() else {
+        return line.to_string();
+    };
     let first_quoted = epsh::lexer::parts_have_quoting(&first.parts);
 
     if !first_quoted && first_text == "cd" {
@@ -2721,10 +2804,12 @@ fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &str, path_env: &[u8])
         return line.to_string();
     }
 
-    let expanded = first_text
-        .strip_prefix('~')
-        .map(|rest| format!("{home}{rest}"));
-    let path = std::path::Path::new(expanded.as_deref().unwrap_or(&first_text));
+    let expanded = first_text.strip_prefix('~').map(|rest| {
+        let mut path = home.to_os_string();
+        path.push(rest);
+        std::path::PathBuf::from(path)
+    });
+    let path = expanded.as_deref().unwrap_or_else(|| Path::new(first_text));
     if path.is_dir()
         && !is_executable(path)
         && (first_text.contains('/') || path::scan_path(&first_text, path_env).is_none())

@@ -4,11 +4,11 @@ version = "0.0.9"
 edition = "2024"
 description = "embeddable posix shell"
 license = "MIT"
-repository = "https://github.com/joshuarli/epsh"
+repository = "https://github.com/joshuarli/ish"
 readme = "README.md"
 keywords = ["shell", "posix", "embedded", "scripting"]
 categories = ["command-line-utilities", "os::unix-apis"]
-exclude = ["check.t", "check.pl", "check-epsh.t", "filter-tests.pl", "tests/stress/", "rust-toolchain.toml"]
+exclude = ["tests/stress/"]
 
 [lib]
 name = "epsh"

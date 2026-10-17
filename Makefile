@@ -12,13 +12,34 @@ cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static r
 
 RUSTYBENCH ?= cargo run --quiet --manifest-path ../rustybench/Cargo.toml --
 
-.PHONY: build test test-ci release release-dynamic verify-release verify-release-dynamic bench bench-syscalls install install-login-shell lint fix
+.PHONY: build test test-epsh conformance verify check test-ci release release-dynamic verify-release verify-release-dynamic bench bench-syscalls install install-login-shell lint fix
 
 build:
 	$(call cargo,dev) build
 
 test:
 	$(call cargo,test) test --quiet
+
+test-epsh:
+	@mkdir -p .work/tmp
+	TMPDIR="$(CURDIR)/.work/tmp" cargo test -p epsh --lib --tests
+
+conformance:
+	@mkdir -p .work/tmp
+	TMPDIR="$(CURDIR)/.work/tmp" cargo test -p epsh --test conformance -- --nocapture
+
+verify:
+	@mkdir -p .work/tmp
+	cd formal && TMPDIR="$(CURDIR)/.work/tmp" lake build semanticBridge protocolTests IshSemantics.Audit
+	cd formal && TMPDIR="$(CURDIR)/.work/tmp" lake exe protocolTests
+	cd formal && TMPDIR="$(CURDIR)/.work/tmp" lake env lean IshSemantics/Audit.lean
+	TMPDIR="$(CURDIR)/.work/tmp" cargo run --quiet -p ish --example semantic_bridge -- --cases 1000
+
+check:
+	@mkdir -p .work/tmp
+	TMPDIR="$(CURDIR)/.work/tmp" cargo clippy --workspace --all-targets -- -D warnings
+	TMPDIR="$(CURDIR)/.work/tmp" cargo test --workspace --lib --tests
+	$(MAKE) verify
 
 test-ci:
 	@test -x "target/$(TARGET)/release/$(NAME)"

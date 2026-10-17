@@ -1,12 +1,16 @@
+use std::ffi::CStr;
+use std::io;
+use std::mem::MaybeUninit;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 /// Native directory listing, equivalent to `ls -plAhG`.
 /// Writes output to stdout directly. Returns 0 on success, 1 on error.
-pub fn list_dir(path: &str) -> i32 {
+pub fn list_dir(path: impl AsRef<std::path::Path>) -> i32 {
+    let path = path.as_ref();
     let entries = match read_entries(path) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("ish: l: {path}: {e}");
+            eprintln!("ish: l: {}: {e}", path.display());
             return 1;
         }
     };
@@ -15,7 +19,6 @@ pub fn list_dir(path: &str) -> i32 {
         return 0;
     }
 
-    // Compute column widths for alignment
     let max_nlink = entries.iter().map(|e| e.nlink_str.len()).max().unwrap_or(0);
     let max_owner = entries.iter().map(|e| e.owner.len()).max().unwrap_or(0);
     let max_group = entries.iter().map(|e| e.group.len()).max().unwrap_or(0);
@@ -23,7 +26,6 @@ pub fn list_dir(path: &str) -> i32 {
 
     let mut out = String::new();
     for e in &entries {
-        // mode nlink owner group size date — no color
         out.push_str(&format!(
             "{} {:>nw$} {:<ow$}  {:<gw$}  {:>sw$} {} ",
             e.mode_str,
@@ -37,7 +39,6 @@ pub fn list_dir(path: &str) -> i32 {
             gw = max_group,
             sw = max_size,
         ));
-        // Color only wraps the name
         out.push_str(&e.color_start);
         out.push_str(&e.display_name);
         if !e.color_start.is_empty() {
@@ -65,8 +66,8 @@ struct Entry {
     color_start: String,
 }
 
-fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
-    // If path is a file (or symlink to file), list just that entry.
+fn read_entries(path: impl AsRef<std::path::Path>) -> Result<Vec<Entry>, std::io::Error> {
+    let path = path.as_ref();
     let top_meta = std::fs::symlink_metadata(path)?;
     let top_is_dir = if top_meta.file_type().is_symlink() {
         std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
@@ -74,12 +75,12 @@ fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
         top_meta.is_dir()
     };
     if !top_is_dir {
-        let p = std::path::Path::new(path);
+        let p = path;
         let name = p
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string());
-        return Ok(vec![build_entry(&name, p, &top_meta)]);
+            .unwrap_or_else(|| path.display().to_string());
+        return Ok(vec![build_entry(&name, p, &top_meta)?]);
     }
 
     let mut entries = Vec::new();
@@ -87,7 +88,6 @@ fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
         let dir_entry = dir_entry?;
         let name = dir_entry.file_name().to_string_lossy().into_owned();
 
-        // Skip . and .. (-A behavior)
         if name == "." || name == ".." {
             continue;
         }
@@ -97,10 +97,9 @@ fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
             Ok(m) => m,
             Err(_) => continue,
         };
-        entries.push(build_entry(&name, &full_path, &lmeta));
+        entries.push(build_entry(&name, &full_path, &lmeta)?);
     }
 
-    // Sort case-insensitively
     entries.sort_by(|a, b| {
         a.display_name
             .to_lowercase()
@@ -110,7 +109,11 @@ fn read_entries(path: &str) -> Result<Vec<Entry>, std::io::Error> {
     Ok(entries)
 }
 
-fn build_entry(name: &str, full_path: &std::path::Path, lmeta: &std::fs::Metadata) -> Entry {
+fn build_entry(
+    name: &str,
+    full_path: &std::path::Path,
+    lmeta: &std::fs::Metadata,
+) -> io::Result<Entry> {
     let mode = lmeta.mode();
     let file_type = lmeta.file_type();
     let is_link = file_type.is_symlink();
@@ -139,18 +142,18 @@ fn build_entry(name: &str, full_path: &std::path::Path, lmeta: &std::fs::Metadat
     };
 
     let color_start = if is_link {
-        "\x1b[36m".to_string() // cyan
+        "\x1b[36m".to_string()
     } else if is_dir {
-        "\x1b[34m".to_string() // blue
+        "\x1b[34m".to_string()
     } else if mode & 0o4000 != 0 {
-        "\x1b[31m".to_string() // red for setuid
+        "\x1b[31m".to_string()
     } else if is_exec {
-        "\x1b[32m".to_string() // green
+        "\x1b[32m".to_string()
     } else {
         String::new()
     };
 
-    Entry {
+    Ok(Entry {
         mode_str: format_mode(
             mode,
             if is_link {
@@ -170,18 +173,16 @@ fn build_entry(name: &str, full_path: &std::path::Path, lmeta: &std::fs::Metadat
             },
         ),
         nlink_str: lmeta.nlink().to_string(),
-        owner: username(lmeta.uid()),
-        group: groupname(lmeta.gid()),
+        owner: username(lmeta.uid())?,
+        group: groupname(lmeta.gid())?,
         size_str: human_size(lmeta.size()),
         date_str: format_time(lmeta.mtime()),
         display_name,
         link_target,
         color_start,
-    }
+    })
 }
 
-/// Replace control characters (newlines, tabs, etc.) in filenames with
-/// Unicode replacement char to prevent terminal injection and output corruption.
 fn sanitize_name(name: &str) -> String {
     if name.bytes().all(|b| b >= b' ' && b != 0x7f) {
         return name.to_string();
@@ -196,7 +197,6 @@ fn format_mode(mode: u32, file_type: char) -> String {
 
     s.push(file_type);
 
-    // (read, write, exec, setbit, set_char, SET_CHAR)
     const PERMS: [(u32, u32, u32, u32, char, char); 3] = [
         (0o400, 0o200, 0o100, 0o4000, 's', 'S'),
         (0o040, 0o020, 0o010, 0o2000, 's', 'S'),
@@ -230,13 +230,12 @@ fn human_size(size: u64) -> String {
 }
 
 fn format_time(mtime: i64) -> String {
-    // rustix has no localtime_r wrapper; retain libc for thread-safe local
-    // timezone conversion in this non-hot-path display helper.
-    // SAFETY: time(NULL) returns seconds since epoch, cannot fail meaningfully.
+    // libc exposes the thread-safe localtime_r conversion that rustix lacks.
+    // SAFETY: POSIX permits a null argument to request the current time.
     let now = unsafe { libc::time(std::ptr::null_mut()) };
-    // SAFETY: zeroed tm is valid for localtime_r. localtime_r is thread-safe
-    // (unlike localtime) and writes into our stack-allocated tm struct.
+    // SAFETY: zero is valid for each integer and nullable pointer field in libc::tm.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `mtime` is readable and `tm` is writable for the duration of the call.
     unsafe {
         libc::localtime_r(&mtime, &mut tm);
     }
@@ -257,33 +256,165 @@ fn format_time(mtime: i64) -> String {
     }
 }
 
-fn username(uid: u32) -> String {
-    // rustix does not expose passwd database lookups.
-    // SAFETY: getpwuid returns a pointer to a static struct (or NULL).
-    // We immediately copy pw_name into an owned String. Single-threaded
-    // shell so no concurrent getpwuid calls can invalidate the pointer.
-    unsafe {
-        let pw = libc::getpwuid(uid);
-        if pw.is_null() {
-            return uid.to_string();
+const INITIAL_NSS_BUFFER_SIZE: usize = 1024;
+
+// rustix does not expose reentrant NSS account lookups.
+struct NssBuffer {
+    stack: [libc::c_char; INITIAL_NSS_BUFFER_SIZE],
+    heap: Vec<libc::c_char>,
+    len: usize,
+}
+
+impl NssBuffer {
+    fn new() -> Self {
+        Self {
+            stack: [0; INITIAL_NSS_BUFFER_SIZE],
+            heap: Vec::new(),
+            len: INITIAL_NSS_BUFFER_SIZE,
         }
-        std::ffi::CStr::from_ptr((*pw).pw_name)
-            .to_string_lossy()
-            .into_owned()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut libc::c_char {
+        if self.heap.is_empty() {
+            self.stack.as_mut_ptr()
+        } else {
+            self.heap.as_mut_ptr()
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn grow(&mut self) -> io::Result<()> {
+        let new_len = self.len.checked_mul(2).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "NSS record exceeds addressable memory",
+            )
+        })?;
+        let additional = if self.heap.is_empty() {
+            new_len
+        } else {
+            new_len - self.heap.len()
+        };
+        self.heap
+            .try_reserve_exact(additional)
+            .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+        self.heap.resize(new_len, 0);
+        self.len = new_len;
+        Ok(())
     }
 }
 
-fn groupname(gid: u32) -> String {
-    // rustix does not expose group database lookups.
-    // SAFETY: getgrgid returns a pointer to a static struct (or NULL).
-    // We immediately copy gr_name into an owned String. Single-threaded.
-    unsafe {
-        let gr = libc::getgrgid(gid);
-        if gr.is_null() {
-            return gid.to_string();
+fn nss_name(name: *const libc::c_char, database: &str) -> io::Result<String> {
+    if name.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{database} record has no name"),
+        ));
+    }
+    // SAFETY: reentrant NSS calls return NUL-terminated names in the live lookup buffer.
+    Ok(unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn lookup_nss_name<Id, Record>(
+    id: Id,
+    database: &str,
+    lookup: unsafe extern "C" fn(
+        Id,
+        *mut Record,
+        *mut libc::c_char,
+        usize,
+        *mut *mut Record,
+    ) -> libc::c_int,
+    get_name: impl FnOnce(&Record) -> *mut libc::c_char,
+) -> io::Result<String>
+where
+    Id: Copy + ToString,
+{
+    let mut buffer = NssBuffer::new();
+    let mut record = MaybeUninit::<Record>::uninit();
+    loop {
+        let mut result = std::ptr::null_mut::<Record>();
+        let buffer_len = buffer.len();
+        let buffer_ptr = buffer.as_mut_ptr();
+        // SAFETY: NSS writes through these valid output pointers and returns strings in `buffer`.
+        let status = unsafe { lookup(id, record.as_mut_ptr(), buffer_ptr, buffer_len, &mut result) };
+        if status == libc::ERANGE {
+            buffer.grow()?;
+            continue;
         }
-        std::ffi::CStr::from_ptr((*gr).gr_name)
-            .to_string_lossy()
-            .into_owned()
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        if result.is_null() {
+            return Ok(id.to_string());
+        }
+        // SAFETY: a successful non-null NSS result means libc initialized the record.
+        let record = unsafe { record.assume_init() };
+        return nss_name(get_name(&record), database);
+    }
+}
+
+fn username(uid: u32) -> io::Result<String> {
+    lookup_nss_name(uid, "passwd", libc::getpwuid_r, |record: &libc::passwd| {
+        record.pw_name
+    })
+}
+
+fn groupname(gid: u32) -> io::Result<String> {
+    lookup_nss_name(gid, "group", libc::getgrgid_r, |record: &libc::group| {
+        record.gr_name
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_entries;
+
+    #[test]
+    fn entry_names_replace_terminal_controls() {
+        assert_eq!(super::sanitize_name("plain name"), "plain name");
+        assert_eq!(
+            super::sanitize_name("line\nbreak\t\u{0085}"),
+            "line�break��"
+        );
+    }
+
+    #[test]
+    fn concurrent_reads_keep_owner_and_group_names() {
+        const WORKERS: usize = 8;
+        const READS_PER_WORKER: usize = 256;
+
+        let path = std::env::current_exe()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let expected = read_entries(&path).unwrap().remove(0);
+
+        std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(WORKERS);
+            for _ in 0..WORKERS {
+                let path = &path;
+                let owner = &expected.owner;
+                let group = &expected.group;
+                workers.push(scope.spawn(move || {
+                    for _ in 0..READS_PER_WORKER {
+                        let entries = read_entries(path).unwrap();
+                        assert_eq!(entries.len(), 1);
+                        assert_eq!(entries[0].owner, *owner);
+                        assert_eq!(entries[0].group, *group);
+                    }
+                }));
+            }
+
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
     }
 }

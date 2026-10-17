@@ -13,6 +13,7 @@
 use crate::builtin::{self, Exec};
 use epsh::ast::{Command, HereDocBody, Program, RedirKind, Word, WordPart};
 use epsh::parser::Parser;
+use epsh::shell_bytes::ShellBytes;
 use std::fmt;
 
 /// How an accepted input line will run.
@@ -38,6 +39,7 @@ pub enum Rejection {
     Source(String),
     ParameterOperator,
     ShellBuiltinOutsideLine(&'static str),
+    ExpandedShellBuiltin(&'static str),
 }
 
 impl fmt::Display for Rejection {
@@ -62,8 +64,33 @@ impl fmt::Display for Rejection {
                 f,
                 "{name} changes shell state and must be the only command on its line"
             ),
+            Rejection::ExpandedShellBuiltin(name) => write!(
+                f,
+                "{name} changes shell state and requires a statically named whole-line command"
+            ),
         }
     }
+}
+
+/// Refuse an expanded command name that ish cannot route safely.
+///
+/// `eval`, `source`, `.`, and InShell builtins are rejected. Other names,
+/// including non-UTF-8 names, are allowed.
+pub fn check_expanded_command(target: &ShellBytes) -> Result<(), Rejection> {
+    let Some(name) = target.as_utf8_str() else {
+        return Ok(());
+    };
+    if matches!(name, "eval" | "source" | ".") {
+        return Err(Rejection::Source(name.to_owned()));
+    }
+
+    if let Some(spec) = builtin::lookup(name)
+        && spec.exec == Exec::InShell
+    {
+        return Err(Rejection::ExpandedShellBuiltin(spec.name));
+    }
+
+    Ok(())
 }
 
 /// Parse `line` and decide how it runs, or refuse it.
@@ -212,6 +239,12 @@ fn static_text(word: &Word) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expanded_command_policy_allows_non_utf8_names() {
+        let command = ShellBytes::from_vec(vec![b'c', 0xff]);
+        assert_eq!(check_expanded_command(&command), Ok(()));
+    }
 
     fn builtin_name(line: &str) -> Option<&'static str> {
         match plan(line) {

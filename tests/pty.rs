@@ -11,6 +11,7 @@ use ptytest::{
     CommandSpec, ExitStatus, ProtocolProfile, PtyTest, Scenario, Size, TerminalBaseline, TestEnv,
 };
 use std::cell::{Cell, RefCell};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -27,17 +28,19 @@ struct PtyShell {
     output_offset: Cell<usize>,
 }
 
-/// Minimal RAII temp dir.
 struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(prefix: &str) -> Self {
-        let template = format!("/tmp/{prefix}_XXXXXX\0");
-        let mut buf = template.into_bytes();
-        let ptr = unsafe { libc::mkdtemp(buf.as_mut_ptr() as *mut libc::c_char) };
+        let mut path = std::env::temp_dir()
+            .join(format!("{prefix}_XXXXXX"))
+            .into_os_string()
+            .into_vec();
+        path.push(0);
+        let ptr = unsafe { libc::mkdtemp(path.as_mut_ptr() as *mut libc::c_char) };
         assert!(!ptr.is_null(), "mkdtemp failed");
-        buf.pop(); // remove NUL
-        let path = PathBuf::from(String::from_utf8(buf).unwrap());
+        path.pop();
+        let path = PathBuf::from(std::ffi::OsString::from_vec(path));
         Self(std::fs::canonicalize(&path).unwrap_or(path))
     }
 
@@ -2289,6 +2292,123 @@ fn source_is_refused() {
 }
 
 #[test]
+fn expanded_targets_obey_ish_execution_policy() {
+    let sh = PtyShell::spawn();
+    let home = sh.home_path();
+    let eval_marker = home.join("eval-marker");
+    let source_marker = home.join("source-marker");
+    let dot_marker = home.join("dot-marker");
+    let command_marker = home.join("command-marker");
+    let nested_marker = home.join("nested-marker");
+    let source_script = home.join("source-target.sh");
+    let dot_script = home.join("dot-target.sh");
+    std::fs::write(
+        &source_script,
+        format!("/bin/touch {}\n", source_marker.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        &dot_script,
+        format!("/bin/touch {}\n", dot_marker.display()),
+    )
+    .unwrap();
+
+    let refused = [
+        (
+            format!(
+                "set TARGET eval; $TARGET /bin/touch {}",
+                eval_marker.display()
+            ),
+            &eval_marker,
+        ),
+        (
+            format!("set TARGET source; $TARGET {}", source_script.display()),
+            &source_marker,
+        ),
+        (
+            format!("set TARGET .; $TARGET {}", dot_script.display()),
+            &dot_marker,
+        ),
+        (
+            format!(
+                "set TARGET eval; command $TARGET /bin/touch {}",
+                command_marker.display()
+            ),
+            &command_marker,
+        ),
+    ];
+
+    for (line, marker) in refused {
+        sh.run_command(&line);
+        assert!(!marker.exists(), "forbidden target changed {}", marker.display());
+        let status = PtyShell::strip_ansi(&sh.run_command("echo policy-status-$?"));
+        assert!(
+            status.lines().any(|line| line.trim() == "policy-status-2"),
+            "expected dynamic target status 2 after {line:?}, got {status:?}"
+        );
+    }
+
+    let redirection_target = home.join("redirection-target-marker");
+    let redirection_file = home.join("redirection-file");
+    sh.run_command(&format!(
+        "set TARGET eval; $TARGET /bin/touch {} > {}",
+        redirection_target.display(),
+        redirection_file.display()
+    ));
+    assert!(!redirection_target.exists(), "forbidden eval target ran");
+    assert!(!redirection_file.exists(), "forbidden eval redirection opened");
+    let status = PtyShell::strip_ansi(&sh.run_command("echo policy-status-$?"));
+    assert!(
+        status.lines().any(|line| line.trim() == "policy-status-2"),
+        "expected redirection refusal status 2, got {status:?}"
+    );
+
+    sh.run_command(&format!(
+        "set TARGET eval; echo $(echo $(command $TARGET /bin/touch {}))",
+        nested_marker.display()
+    ));
+    assert!(
+        !nested_marker.exists(),
+        "nested command substitution ran a forbidden target"
+    );
+
+    sh.run_command("set TARGET exit; $TARGET 23");
+    let status = PtyShell::strip_ansi(&sh.run_command("echo policy-status-$?"));
+    assert!(
+        status.lines().any(|line| line.trim() == "policy-status-2"),
+        "expected InShell builtin target status 2, got {status:?}"
+    );
+
+    let ordinary_marker = home.join("ordinary-command-marker");
+    sh.run_command(&format!(
+        "set TARGET /bin/touch; $TARGET {}",
+        ordinary_marker.display()
+    ));
+    assert!(ordinary_marker.exists(), "dynamic external command did not run");
+
+    let subdir = home.join("policy-subdir");
+    std::fs::create_dir(&subdir).unwrap();
+    sh.run_command("set TARGET cd");
+    let output = PtyShell::strip_ansi(&sh.run_command("$TARGET policy-subdir && pwd"));
+    let expected_cwd = subdir.to_string_lossy().into_owned();
+    assert!(
+        output.lines().any(|line| line.trim() == expected_cwd),
+        "dynamic Hybrid builtin did not run in a list: {output:?}"
+    );
+
+    std::fs::write(home.join("native-list-sentinel"), b"").unwrap();
+    sh.run_command("set TARGET l");
+    let output = PtyShell::strip_ansi(&sh.run_command(&format!(
+        "$TARGET {} | /bin/cat",
+        home.display()
+    )));
+    assert!(
+        output.contains("native-list-sentinel"),
+        "dynamic Native builtin did not run in a pipeline: {output:?}"
+    );
+}
+
+#[test]
 fn ctrl_l_clears_screen() {
     let sh = PtyShell::spawn();
     let mut out = sh.run_command("echo before_clear");
@@ -3495,4 +3615,52 @@ fn ctrl_p_dump_is_private_and_omits_typed_text() {
     let text = std::fs::read_to_string(&dumps[0]).unwrap();
     assert!(text.contains("line.bytes: 16"), "{text}");
     assert!(!text.contains("secret-token-123"), "{text}");
+}
+
+#[test]
+fn native_listing_and_standalone_cd_preserve_private_use_and_raw_path_bytes() {
+    use std::ffi::OsString;
+    let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
+        for directory in [OsString::from("\u{e000}\u{e080}"), OsString::from_vec(vec![0x80])] {
+            let directory = home.join(directory);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(directory.join("codec-path-marker"), b"").unwrap();
+        }
+    });
+    for directory in ["\u{e000}\u{e080}".to_string(), "$(printf '\\0200')".to_string()] {
+        let out = clean(&sh.run_command(&format!("l \"$HOME/{directory}\"")));
+        assert!(out.contains("codec-path-marker"), "{out}");
+        let out = clean(&sh.run_command(&format!("cd \"$HOME/{directory}\"")));
+        assert!(!out.contains("No such file"), "{out}");
+        let out = clean(&sh.run_command("l"));
+        assert!(out.contains("codec-path-marker"), "{out}");
+        sh.run_command("cd \"$HOME\"");
+    }
+    sh.run_command("HOME=\"$HOME/$(printf '\\0200')\"");
+    sh.run_command("cd");
+    let out = clean(&sh.run_command("l"));
+    assert!(out.contains("codec-path-marker"), "{out}");
+    sh.send(b"\x10");
+    sh.wait_for_quiescence(200);
+    let dump_dir = sh.home_path().join(OsString::from_vec(vec![0x80])).join(".cache/ish");
+    assert!(std::fs::read_dir(dump_dir).unwrap().any(|entry| {
+        entry.unwrap().file_name().to_string_lossy().starts_with("dump-")
+    }));
+    let out = clean(&sh.run_command("z"));
+    assert!(out.contains("ish: z: HOME is not UTF-8"), "{out}");
+    sh.type_str("cd ~/");
+    sh.tab();
+    let out = clean(&sh.read_timeout(300));
+    assert!(out.contains("ish: completion: HOME is not UTF-8"), "{out}");
+    sh.ctrl_c();
+}
+
+#[test]
+fn prompt_identity_displays_unicode_and_replaces_only_invalid_display_bytes() {
+    let sh = PtyShell::spawn();
+    let out = clean(&sh.run_command("USER='\u{e080}'"));
+    assert!(out.contains("\u{e080}@"), "{out}");
+    assert!(!out.contains('\u{e000}'), "{out}");
+    let out = clean(&sh.run_command("USER=$(printf '\\0200')"));
+    assert!(out.contains("\u{fffd}@"), "{out}");
 }

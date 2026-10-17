@@ -9,6 +9,10 @@ use crate::shell_bytes::ShellBytes;
 /// Returns sorted matches, or empty vec if no matches.
 /// `cwd` is the working directory for resolving relative patterns.
 pub fn glob(pattern: &str, cwd: &Path) -> Vec<String> {
+    glob_shell(&crate::encoding::bytes_to_str(pattern.as_bytes()), cwd)
+}
+
+pub(crate) fn glob_shell(pattern: &str, cwd: &Path) -> Vec<String> {
     let pattern = ShellBytes::from_str_lossless(pattern);
     if pattern.is_empty() {
         return Vec::new();
@@ -63,8 +67,9 @@ fn glob_recursive(
     let remaining = &components[1..];
 
     if !has_glob_chars(&pattern_shell) {
-        let fs_candidate = fs_dir.join(pattern.to_os_string());
-        let display_candidate = display_dir.join(pattern.to_os_string());
+        let literal = literal_component(&pattern_shell).to_os_string();
+        let fs_candidate = fs_dir.join(&literal);
+        let display_candidate = display_dir.join(&literal);
         if remaining.is_empty() {
             if fs_candidate.symlink_metadata().is_ok() {
                 results.push(path_to_string(&display_candidate));
@@ -94,7 +99,7 @@ fn glob_recursive(
             continue;
         }
 
-        if fnmatch(&pattern_shell, &name_shell) {
+        if fnmatch_shell(&pattern_shell, &name_shell) {
             let fs_full = fs_dir.join(&name);
             let display_full = display_dir.join(&name);
             if remaining.is_empty() {
@@ -104,6 +109,19 @@ fn glob_recursive(
             }
         }
     }
+}
+
+fn literal_component(pattern: &str) -> ShellBytes {
+    let mut literal = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if is_escape(ch as u32) {
+            literal.push(chars.next().unwrap_or(ch));
+        } else {
+            literal.push(ch);
+        }
+    }
+    ShellBytes::from_str_lossless(&literal)
 }
 
 /// Check if a string contains glob metacharacters.
@@ -125,19 +143,26 @@ pub fn has_glob_chars(s: &str) -> bool {
 /// POSIX fnmatch-style pattern matching.
 /// Supports: * (any string), ? (any char), [...] (char class), \ (escape)
 pub fn fnmatch(pattern: &str, string: &str) -> bool {
-    let pat: Vec<char> = pattern.chars().collect();
-    let s: Vec<char> = string.chars().collect();
+    fnmatch_shell(
+        &crate::encoding::bytes_to_str(pattern.as_bytes()),
+        &crate::encoding::bytes_to_str(string.as_bytes()),
+    )
+}
+
+pub(crate) fn fnmatch_shell(pattern: &str, string: &str) -> bool {
+    let pat: Vec<u32> = crate::encoding::shell_codepoints(pattern).collect();
+    let s: Vec<u32> = crate::encoding::shell_codepoints(string).collect();
     fnmatch_inner(&pat, 0, &s, 0)
 }
 
 /// Check if a pattern char is an escape marker (CTLESC or backslash).
-fn is_escape(c: char) -> bool {
-    c == '\\' || c == crate::lexer::CTLESC
+fn is_escape(c: u32) -> bool {
+    c == '\\' as u32 || c == crate::lexer::CTLESC as u32
 }
 
 /// Read one char from pattern, handling escape markers (CTLESC and \).
 /// Returns the literal char and advances pi.
-fn read_bracket_char(pat: &[char], pi: &mut usize) -> char {
+fn read_bracket_char(pat: &[u32], pi: &mut usize) -> u32 {
     if is_escape(pat[*pi]) && *pi + 1 < pat.len() {
         *pi += 1;
         let c = pat[*pi];
@@ -150,18 +175,18 @@ fn read_bracket_char(pat: &[char], pi: &mut usize) -> char {
     }
 }
 
-fn fnmatch_inner(pat: &[char], mut pi: usize, s: &[char], mut si: usize) -> bool {
+fn fnmatch_inner(pat: &[u32], mut pi: usize, s: &[u32], mut si: usize) -> bool {
     while pi < pat.len() {
         match pat[pi] {
-            '?' => {
+            c if c == '?' as u32 => {
                 if si >= s.len() {
                     return false;
                 }
                 pi += 1;
                 si += 1;
             }
-            '*' => {
-                while pi < pat.len() && pat[pi] == '*' {
+            c if c == '*' as u32 => {
+                while pi < pat.len() && pat[pi] == '*' as u32 {
                     pi += 1;
                 }
                 if pi >= pat.len() {
@@ -174,12 +199,12 @@ fn fnmatch_inner(pat: &[char], mut pi: usize, s: &[char], mut si: usize) -> bool
                 }
                 return false;
             }
-            '[' => {
+            c if c == '[' as u32 => {
                 if si >= s.len() {
                     return false;
                 }
                 pi += 1;
-                let negate = pi < pat.len() && pat[pi] == '!';
+                let negate = pi < pat.len() && pat[pi] == '!' as u32;
                 if negate {
                     pi += 1;
                 }
@@ -187,12 +212,12 @@ fn fnmatch_inner(pat: &[char], mut pi: usize, s: &[char], mut si: usize) -> bool
                 let mut matched = false;
                 let bracket_start = pi;
                 while pi < pat.len() {
-                    if pat[pi] == ']' && pi != bracket_start {
+                    if pat[pi] == ']' as u32 && pi != bracket_start {
                         break;
                     }
 
                     let c1 = read_bracket_char(pat, &mut pi);
-                    if pi + 1 < pat.len() && pat[pi] == '-' && pat[pi + 1] != ']' {
+                    if pi + 1 < pat.len() && pat[pi] == '-' as u32 && pat[pi + 1] != ']' as u32 {
                         pi += 1;
                         let c2 = read_bracket_char(pat, &mut pi);
                         if s[si] >= c1 && s[si] <= c2 {
@@ -242,7 +267,7 @@ fn path_to_string(path: &Path) -> String {
 }
 
 fn sort_results(mut results: Vec<String>) -> Vec<String> {
-    results.sort();
+    results.sort_by_cached_key(|result| crate::encoding::str_to_bytes(result));
     results
 }
 

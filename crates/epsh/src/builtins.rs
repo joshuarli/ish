@@ -8,6 +8,46 @@ use crate::test_cmd::test_eval;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
+pub(crate) enum CommandAction<'a> {
+    Empty,
+    Describe { verbose: bool, names: &'a [String] },
+    Execute(&'a [String]),
+}
+
+pub(crate) fn command_action(args: &[String]) -> CommandAction<'_> {
+    let mut mode = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-v" => {
+                mode = Some(false);
+                index += 1;
+            }
+            "-V" => {
+                mode = Some(true);
+                index += 1;
+            }
+            "-p" => index += 1,
+            "--" => {
+                index += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    if index >= args.len() {
+        return CommandAction::Empty;
+    }
+    if let Some(verbose) = mode {
+        CommandAction::Describe {
+            verbose,
+            names: &args[index..],
+        }
+    } else {
+        CommandAction::Execute(&args[index..])
+    }
+}
+
 fn kill_with_rustix(pid: i32, signum: i32) -> Result<(), rustix::io::Errno> {
     if signum == 0 {
         return match pid {
@@ -230,7 +270,7 @@ impl Shell {
             if let Some(eq) = arg.find('=') {
                 let name = &arg[..eq];
                 let value = &arg[eq + 1..];
-                if let Err(e) = self.vars.set(name, value) {
+                if let Err(e) = self.vars.set_shell(name, value) {
                     self.err_msg(&format!("export: {e}"));
                     return ExitStatus::FAILURE;
                 }
@@ -247,7 +287,7 @@ impl Shell {
             if let Some(eq) = arg.find('=') {
                 let name = &arg[..eq];
                 let value = &arg[eq + 1..];
-                if let Err(e) = self.vars.set(name, value) {
+                if let Err(e) = self.vars.set_shell(name, value) {
                     self.err_msg(&format!("readonly: {e}"));
                     return ExitStatus::FAILURE;
                 }
@@ -302,7 +342,7 @@ impl Shell {
             if arg == "--" {
                 i += 1;
                 // Remaining args become positional parameters
-                self.vars.positional = args[i..].iter().cloned().map(Into::into).collect();
+                self.vars.positional = args[i..].iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
                 return ExitStatus::SUCCESS;
             } else if arg == "-" {
                 // POSIX: bare "set -" turns off -x and -v
@@ -347,7 +387,7 @@ impl Shell {
                 // value. Explicit positional assignment stays behind `--`.
                 let name = arg.clone();
                 let value = args[i + 1..].join(" ");
-                if let Err(e) = self.vars.set(&name, &value) {
+                if let Err(e) = self.vars.set_shell(&name, &value) {
                     self.err_msg(&format!("set: {e}"));
                     return ExitStatus::FAILURE;
                 }
@@ -355,7 +395,7 @@ impl Shell {
                 return ExitStatus::SUCCESS;
             } else {
                 // Positional parameters
-                self.vars.positional = args[i..].iter().cloned().map(Into::into).collect();
+                self.vars.positional = args[i..].iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
                 return ExitStatus::SUCCESS;
             }
         }
@@ -378,7 +418,7 @@ impl Shell {
     /// Parse and execute a script inline (propagates control flow).
     /// Used by eval and dot builtins.
     fn run_inline(&mut self, source: &str) -> crate::error::Result<ExitStatus> {
-        let mut parser = Parser::new(source);
+        let mut parser = Parser::from_shell_string(source);
         let program = match parser.parse() {
             Ok(p) => p,
             Err(e) => {
@@ -457,7 +497,7 @@ impl Shell {
         };
 
         // Read a line char-by-char from fd 0 (works with redirections)
-        let mut line = String::new();
+        let mut line = Vec::new();
         let mut buf = [0u8; 1];
         let mut hit_eof = true; // assume EOF until we see a newline
         let mut continued = false;
@@ -481,25 +521,25 @@ impl Shell {
                 // SAFETY: fd 0 (stdin) is valid; buf is a live 1-byte array.
                 let n2 = sys::read(0, buf.as_mut_ptr().cast(), 1);
                 if n2 <= 0 {
-                    line.push('\\');
+                    line.push(b'\\');
                     break;
                 }
                 if buf[0] == b'\n' {
                     continued = true;
                     continue;
                 }
-                line.push(buf[0] as char);
+                line.push(buf[0]);
                 continued = false;
                 continue;
             }
             continued = false;
-            line.push(ch);
+            line.push(buf[0]);
         }
 
         if hit_eof && line.is_empty() {
             // Pure EOF with no data: set variables to empty
             for name in &var_names {
-                if let Err(e) = self.vars.set(name, "") {
+                if let Err(e) = self.vars.set_shell(name, "") {
                     self.err_msg(&format!("read: {e}"));
                     return ExitStatus::FAILURE;
                 }
@@ -507,43 +547,45 @@ impl Shell {
             return ExitStatus::FAILURE;
         }
 
-        // Split on IFS and assign to variables
-        let ifs = self.vars.ifs().to_string();
+        let line = crate::encoding::bytes_to_str(&line);
+        let ifs = self.vars.ifs();
+        let delimiters: Vec<&str> = crate::encoding::shell_chars(&ifs).collect();
         if var_names.len() == 1 {
             // Single variable gets the whole line (with leading/trailing IFS stripped)
-            let trimmed = line.trim_matches(|c: char| ifs.contains(c));
-            if let Err(e) = self.vars.set(var_names[0], trimmed) {
+            let units: Vec<&str> = crate::encoding::shell_chars(&line).collect();
+            let start = units.iter().position(|unit| !delimiters.contains(unit)).unwrap_or(units.len());
+            let end = units.iter().rposition(|unit| !delimiters.contains(unit)).map_or(start, |index| index + 1);
+            let trimmed: String = units[start..end].iter().copied().collect();
+            if let Err(e) = self.vars.set_shell(var_names[0], &trimmed) {
                 self.err_msg(&format!("read: {e}"));
                 return ExitStatus::FAILURE;
             }
         } else {
             // Multiple variables: split on IFS, last gets remainder
             let mut fields = Vec::new();
-            let chars: Vec<char> = line.chars().collect();
+            let chars: Vec<&str> = crate::encoding::shell_chars(&line).collect();
             let mut pos = 0;
 
             // Skip leading IFS whitespace
-            while pos < chars.len() && ifs.contains(chars[pos]) && chars[pos].is_whitespace() {
+            while pos < chars.len() && delimiters.contains(&chars[pos]) && chars[pos].chars().all(char::is_whitespace) {
                 pos += 1;
             }
 
             for vi in 0..var_names.len() {
                 if vi == var_names.len() - 1 {
                     // Last variable gets the rest
-                    let rest: String = chars[pos..].iter().collect();
-                    // Trim trailing IFS whitespace
-                    let trimmed =
-                        rest.trim_end_matches(|c: char| ifs.contains(c) && c.is_whitespace());
-                    fields.push(trimmed.to_string());
+                    let end = chars[pos..].iter().rposition(|unit| !delimiters.contains(unit) || !unit.chars().all(char::is_whitespace))
+                        .map_or(pos, |index| pos + index + 1);
+                    fields.push(chars[pos..end].iter().copied().collect::<String>());
                 } else {
                     // Accumulate until next IFS char
                     let start = pos;
-                    while pos < chars.len() && !ifs.contains(chars[pos]) {
+                    while pos < chars.len() && !delimiters.contains(&chars[pos]) {
                         pos += 1;
                     }
-                    fields.push(chars[start..pos].iter().collect());
+                    fields.push(chars[start..pos].iter().copied().collect::<String>());
                     // Skip IFS delimiters
-                    while pos < chars.len() && ifs.contains(chars[pos]) {
+                    while pos < chars.len() && delimiters.contains(&chars[pos]) {
                         pos += 1;
                     }
                 }
@@ -551,7 +593,7 @@ impl Shell {
 
             for (vi, name) in var_names.iter().enumerate() {
                 let value = fields.get(vi).map(|s| s.as_str()).unwrap_or("");
-                if let Err(e) = self.vars.set(name, value) {
+                if let Err(e) = self.vars.set_shell(name, value) {
                     self.err_msg(&format!("read: {e}"));
                     return ExitStatus::FAILURE;
                 }
@@ -571,7 +613,7 @@ impl Shell {
                 let name = &arg[..eq];
                 let value = &arg[eq + 1..];
                 self.vars.make_local(name);
-                let _ = self.vars.set(name, value);
+                let _ = self.vars.set_shell(name, value);
             } else {
                 self.vars.make_local(arg);
             }
@@ -591,7 +633,7 @@ impl Shell {
         }
 
         // exec with command — replace process
-        let args_bytes: Vec<ShellBytes> = args.iter().cloned().map(Into::into).collect();
+        let args_bytes: Vec<ShellBytes> = args.iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
         let env = self.vars.env_for_command_os(&[]);
         let _ = std::env::set_current_dir(&self.cwd);
         let err = exec::execve_with_env(&args_bytes[0], &args_bytes, &env);
@@ -600,54 +642,23 @@ impl Shell {
     }
 
     fn builtin_command(&mut self, args: &[String], span: Span) -> crate::error::Result<ExitStatus> {
-        if args.len() <= 1 {
-            return Ok(ExitStatus::SUCCESS);
-        }
-        let mut mode = None; // None = execute, Some('v') = -v, Some('V') = -V
-        let mut i = 1;
-        while i < args.len() {
-            match args[i].as_str() {
-                "-v" => {
-                    mode = Some('v');
-                    i += 1;
-                }
-                "-V" => {
-                    mode = Some('V');
-                    i += 1;
-                }
-                "-p" => {
-                    i += 1;
-                } // -p: use default PATH (ignored for now)
-                "--" => {
-                    i += 1;
-                    break;
-                }
-                _ => break,
-            }
-        }
-        if i >= args.len() {
-            return Ok(ExitStatus::SUCCESS);
-        }
-
-        if let Some(m) = mode {
-            // Describe commands instead of executing them
-            let mut status = ExitStatus::SUCCESS;
-            for name in &args[i..] {
-                if m == 'V' {
-                    // -V: verbose, like `type`
-                    if self.functions.contains_key(name.as_str()) {
-                        self.write_out(&format!("{name} is a function\n"));
-                    } else if is_builtin(name) {
-                        self.write_out(&format!("{name} is a shell builtin\n"));
-                    } else if let Ok(path) = self.which(name) {
-                        self.write_out(&format!("{name} is {path}\n"));
-                    } else {
-                        self.err_msg(&format!("{name}: not found"));
-                        status = ExitStatus::FAILURE;
-                    }
-                } else {
-                    // -v: terse — print path, or name for builtins/functions
-                    if self.functions.contains_key(name.as_str()) || is_builtin(name) {
+        match command_action(args) {
+            CommandAction::Empty => Ok(ExitStatus::SUCCESS),
+            CommandAction::Describe { verbose, names } => {
+                let mut status = ExitStatus::SUCCESS;
+                for name in names {
+                    if verbose {
+                        if self.functions.contains_key(name.as_str()) {
+                            self.write_out(&format!("{name} is a function\n"));
+                        } else if is_builtin(name) {
+                            self.write_out(&format!("{name} is a shell builtin\n"));
+                        } else if let Ok(path) = self.which(name) {
+                            self.write_out(&format!("{name} is {path}\n"));
+                        } else {
+                            self.err_msg(&format!("{name}: not found"));
+                            status = ExitStatus::FAILURE;
+                        }
+                    } else if self.functions.contains_key(name.as_str()) || is_builtin(name) {
                         self.write_out(&format!("{name}\n"));
                     } else if let Ok(path) = self.which(name) {
                         self.write_out(&format!("{path}\n"));
@@ -655,20 +666,18 @@ impl Shell {
                         status = ExitStatus::FAILURE;
                     }
                 }
+                Ok(status)
             }
-            return Ok(status);
-        }
-
-        let new_args: Vec<String> = args[i..].to_vec();
-
-        // `command` bypasses functions but NOT builtins. External commands use
-        // the embedder's handler when one is installed, like ordinary lookup.
-        if let Some(status) = self.try_builtin(&new_args[0], &new_args, &[], &[], span)? {
-            Ok(status)
-        } else if self.has_external_handler() {
-            self.call_external_handler(&new_args, &[])
-        } else {
-            self.eval_external(&new_args, &[], &[], span)
+            CommandAction::Execute(new_args) => {
+                self.check_command_policy_for_dispatch(new_args, span)?;
+                if let Some(status) = self.try_builtin(&new_args[0], new_args, &[], &[], span)? {
+                    Ok(status)
+                } else if self.has_external_handler() {
+                    self.call_external_handler(new_args, &[])
+                } else {
+                    self.eval_external(new_args, &[], &[], span)
+                }
+            }
         }
     }
 
@@ -912,18 +921,18 @@ impl Shell {
             .unwrap_or(1);
 
         if optind < 1 || optind > argv.len() {
-            let _ = self.vars.set(name, "?");
+            let _ = self.vars.set_shell(name, "?");
             return ExitStatus::FAILURE;
         }
 
         let arg = &argv[optind - 1];
         if !arg.starts_with('-') || arg == "-" || arg == "--" {
-            let _ = self.vars.set(name, "?");
+            let _ = self.vars.set_shell(name, "?");
             return ExitStatus::FAILURE;
         }
 
-        let optchars: Vec<char> = optstring.chars().collect();
-        let arg_chars: Vec<char> = arg.chars().collect();
+        let optchars: Vec<&str> = crate::encoding::shell_chars(optstring).collect();
+        let arg_chars: Vec<&str> = crate::encoding::shell_chars(arg).collect();
 
         // Track position within the current arg (for grouped short opts)
         let optpos: usize = self
@@ -934,8 +943,8 @@ impl Shell {
 
         if optpos >= arg_chars.len() {
             // Move to next arg
-            let _ = self.vars.set("OPTIND", &(optind + 1).to_string());
-            let _ = self.vars.set("_OPTPOS", "1");
+            let _ = self.vars.set_shell("OPTIND", &(optind + 1).to_string());
+            let _ = self.vars.set_shell("_OPTPOS", "1");
             return self.builtin_getopts(args);
         }
 
@@ -945,34 +954,34 @@ impl Shell {
         let found = optchars.iter().position(|&c| c == opt);
         match found {
             Some(pos) => {
-                let _ = self.vars.set(name, &opt.to_string());
-                let needs_arg = pos + 1 < optchars.len() && optchars[pos + 1] == ':';
+                let _ = self.vars.set_shell(name, &opt.to_string());
+                let needs_arg = pos + 1 < optchars.len() && optchars[pos + 1] == ":";
                 if needs_arg {
                     // Option argument
                     if optpos + 1 < arg_chars.len() {
                         // Argument is rest of current word
-                        let optarg: String = arg_chars[optpos + 1..].iter().collect();
-                        let _ = self.vars.set("OPTARG", &optarg);
-                        let _ = self.vars.set("OPTIND", &(optind + 1).to_string());
-                        let _ = self.vars.set("_OPTPOS", "1");
+                        let optarg: String = arg_chars[optpos + 1..].iter().copied().collect();
+                        let _ = self.vars.set_shell("OPTARG", &optarg);
+                        let _ = self.vars.set_shell("OPTIND", &(optind + 1).to_string());
+                        let _ = self.vars.set_shell("_OPTPOS", "1");
                     } else if optind < argv.len() {
                         // Argument is next word
-                        let _ = self.vars.set("OPTARG", &argv[optind]);
-                        let _ = self.vars.set("OPTIND", &(optind + 2).to_string());
-                        let _ = self.vars.set("_OPTPOS", "1");
+                        let _ = self.vars.set_shell("OPTARG", &argv[optind]);
+                        let _ = self.vars.set_shell("OPTIND", &(optind + 2).to_string());
+                        let _ = self.vars.set_shell("_OPTPOS", "1");
                     } else {
                         self.err_msg(&format!("getopts: option requires argument -- {opt}"));
-                        let _ = self.vars.set(name, "?");
-                        let _ = self.vars.set("OPTIND", &(optind + 1).to_string());
+                        let _ = self.vars.set_shell(name, "?");
+                        let _ = self.vars.set_shell("OPTIND", &(optind + 1).to_string());
                         return ExitStatus::SUCCESS;
                     }
                 } else {
                     let _ = self.vars.unset("OPTARG");
                     if optpos + 1 >= arg_chars.len() {
-                        let _ = self.vars.set("OPTIND", &(optind + 1).to_string());
-                        let _ = self.vars.set("_OPTPOS", "1");
+                        let _ = self.vars.set_shell("OPTIND", &(optind + 1).to_string());
+                        let _ = self.vars.set_shell("_OPTPOS", "1");
                     } else {
-                        let _ = self.vars.set("_OPTPOS", &(optpos + 1).to_string());
+                        let _ = self.vars.set_shell("_OPTPOS", &(optpos + 1).to_string());
                     }
                 }
                 ExitStatus::SUCCESS
@@ -980,16 +989,16 @@ impl Shell {
             None => {
                 let silent = optstring.starts_with(':');
                 if silent {
-                    let _ = self.vars.set("OPTARG", &opt.to_string());
+                    let _ = self.vars.set_shell("OPTARG", &opt.to_string());
                 } else {
                     self.err_msg(&format!("getopts: illegal option -- {opt}"));
                 }
-                let _ = self.vars.set(name, "?");
+                let _ = self.vars.set_shell(name, "?");
                 if optpos + 1 >= arg_chars.len() {
-                    let _ = self.vars.set("OPTIND", &(optind + 1).to_string());
-                    let _ = self.vars.set("_OPTPOS", "1");
+                    let _ = self.vars.set_shell("OPTIND", &(optind + 1).to_string());
+                    let _ = self.vars.set_shell("_OPTPOS", "1");
                 } else {
-                    let _ = self.vars.set("_OPTPOS", &(optpos + 1).to_string());
+                    let _ = self.vars.set_shell("_OPTPOS", &(optpos + 1).to_string());
                 }
                 ExitStatus::SUCCESS
             }
@@ -1038,7 +1047,7 @@ impl Shell {
                                 }
                                 let oct: String = fmt_chars[start..i].iter().collect();
                                 let n = u8::from_str_radix(&oct, 8).unwrap_or(0);
-                                out.push(n as char);
+                                out.push_str(&crate::encoding::bytes_to_str(&[n]));
                                 continue;
                             }
                             c => {
@@ -1089,15 +1098,19 @@ impl Shell {
                         's' => {
                             let val = args.get(arg_idx).map(|s| s.as_str()).unwrap_or("");
                             arg_idx += 1;
-                            let val = if let Some(p) = precision {
-                                &val[..val.len().min(p)]
+                            let val = if let Some(precision) = precision {
+                                let bytes = crate::encoding::str_to_bytes(val);
+                                crate::encoding::bytes_to_str(&bytes[..bytes.len().min(precision)])
                             } else {
-                                val
+                                val.to_string()
                             };
+                            let padding = width.saturating_sub(crate::encoding::shell_chars(&val).count());
+                            if !left_align {
+                                out.extend(std::iter::repeat_n(' ', padding));
+                            }
+                            out.push_str(&val);
                             if left_align {
-                                let _ = write!(out, "{val:<width$}");
-                            } else {
-                                let _ = write!(out, "{val:>width$}");
+                                out.extend(std::iter::repeat_n(' ', padding));
                             }
                         }
                         'd' | 'i' => {
@@ -1139,13 +1152,10 @@ impl Shell {
                             let _ = write!(out, "{val:X}");
                         }
                         'c' => {
-                            let val = args
-                                .get(arg_idx)
-                                .and_then(|s| s.chars().next())
-                                .unwrap_or('\0');
+                            let val = args.get(arg_idx).and_then(|s| crate::encoding::shell_chars(s).next());
                             arg_idx += 1;
-                            if val != '\0' {
-                                out.push(val);
+                            if let Some(val) = val.filter(|value| *value != "\0") {
+                                out.push_str(val);
                             }
                         }
                         '%' => out.push('%'),

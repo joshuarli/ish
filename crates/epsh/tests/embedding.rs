@@ -732,3 +732,156 @@ mod variables {
         assert_eq!(shell.exit_status(), ExitStatus::SUCCESS);
     }
 }
+
+mod command_policy {
+    use super::*;
+    use epsh::eval;
+    use epsh::shell_bytes::ShellBytes;
+
+    fn deny_shell_code(target: &ShellBytes) -> Option<String> {
+        match target.as_bytes() {
+            b"eval" | b"source" | b"." => {
+                Some(format!("{} is disabled by command policy", target.to_string_lossy()))
+            }
+            _ => None,
+        }
+    }
+
+    fn policy() -> eval::CommandPolicy {
+        Box::new(deny_shell_code)
+    }
+
+    fn quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    #[test]
+    fn default_shell_remains_unrestricted() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_script("eval 'DEFAULT_POLICY_RAN=yes'"), 0);
+        assert_eq!(shell.get_var("DEFAULT_POLICY_RAN"), Some("yes"));
+    }
+
+    #[test]
+    fn policy_refuses_shell_code_before_redirections_and_source_effects() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.epsh");
+        fs::write(&source, "SOURCE_POLICY_RAN=yes\n").unwrap();
+
+        let cases = [
+            ("eval", "eval 'EVAL_POLICY_RAN=yes'".to_owned()),
+            (
+                "source",
+                format!("source {}", quote(source.to_str().unwrap())),
+            ),
+            (".", format!(". {}", quote(source.to_str().unwrap()))),
+        ];
+
+        for (target, command) in cases {
+            let redirected = dir.path().join(format!("{target}.out"));
+            let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let mut shell = Shell::builder()
+                .cwd(dir.path().to_path_buf())
+                .stderr_sink(stderr.clone())
+                .command_policy(policy())
+                .build();
+            let script = format!("{command} > {}", quote(redirected.to_str().unwrap()));
+
+            assert_eq!(shell.run_script(&script), 2, "target: {target}");
+            assert!(!redirected.exists(), "redirection for {target} was opened");
+            assert_eq!(shell.get_var("EVAL_POLICY_RAN"), None);
+            assert_eq!(shell.get_var("SOURCE_POLICY_RAN"), None);
+            let diagnostic = String::from_utf8(stderr.lock().unwrap().clone()).unwrap();
+            assert!(diagnostic.contains(target), "diagnostic: {diagnostic}");
+        }
+    }
+
+    #[test]
+    fn dynamic_allowed_targets_and_command_indirection_obey_policy() {
+        let dir = tempdir().unwrap();
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .cwd(dir.path().to_path_buf())
+            .stdout_sink(stdout.clone())
+            .stderr_sink(stderr)
+            .command_policy(policy())
+            .build();
+        shell.set_var("cmd", "echo").unwrap();
+        assert_eq!(shell.run_script("$cmd allowed"), 0);
+        assert_eq!(String::from_utf8(stdout.lock().unwrap().clone()).unwrap(), "allowed\n");
+
+        for (name, script) in [
+            (
+                "command.out",
+                "command eval 'INDIRECT_POLICY_RAN=yes'",
+            ),
+            (
+                "nested.out",
+                "command command eval 'NESTED_POLICY_RAN=yes'",
+            ),
+            (
+                "dynamic.out",
+                "cmd=eval; command $cmd 'DYNAMIC_POLICY_RAN=yes'",
+            ),
+        ] {
+            let redirected = dir.path().join(name);
+            let script = format!("{script} > {}", quote(redirected.to_str().unwrap()));
+            assert_eq!(shell.run_script(&script), 2, "script: {script}");
+            assert!(!redirected.exists(), "redirection {name} was opened");
+        }
+        assert_eq!(shell.get_var("INDIRECT_POLICY_RAN"), None);
+        assert_eq!(shell.get_var("NESTED_POLICY_RAN"), None);
+        assert_eq!(shell.get_var("DYNAMIC_POLICY_RAN"), None);
+    }
+
+    #[test]
+    fn policy_reaches_command_substitution_fast_and_fork_paths() {
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .stderr_sink(stderr.clone())
+            .command_policy(policy())
+            .build();
+
+        assert_eq!(shell.run_script("$(command eval 'FAST_POLICY_RAN=yes')"), 2);
+        assert_eq!(shell.get_var("FAST_POLICY_RAN"), None);
+        assert_eq!(shell.run_script("$(eval 'FORK_POLICY_RAN=yes')"), 2);
+        assert_eq!(shell.get_var("FORK_POLICY_RAN"), None);
+        assert_eq!(shell.run_script("$(source absent-policy-source)"), 2);
+        assert!(String::from_utf8(stderr.lock().unwrap().clone())
+            .unwrap()
+            .contains("disabled by command policy"));
+    }
+
+    #[test]
+    fn shell_policy_setter_replaces_builder_policy() {
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .stderr_sink(stderr)
+            .command_policy(policy())
+            .build();
+        shell.set_command_policy(Box::new(|target| {
+            (target.as_bytes() == b"echo").then(|| "echo denied".to_owned())
+        }));
+        assert_eq!(shell.run_script("echo no"), 2);
+        assert_eq!(shell.run_script("true"), 0);
+    }
+
+    #[test]
+    fn policy_receives_expanded_target_bytes() {
+        let observed = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let policy_observed = observed.clone();
+        let mut shell = Shell::builder()
+            .stderr_sink(stderr)
+            .command_policy(Box::new(move |target| {
+                *policy_observed.lock().unwrap() = target.as_bytes().to_vec();
+                Some("target denied".to_owned())
+            }))
+            .build();
+        let program = Parser::new_bytes(b"'command-\x80'").parse().unwrap();
+
+        assert_eq!(shell.run_program(&program).code(), 2);
+        assert_eq!(*observed.lock().unwrap(), b"command-\x80");
+    }
+}

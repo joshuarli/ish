@@ -16,6 +16,7 @@ libc = "0.2"
 [dev-dependencies]
 rustybench = "0.3"
 laputa-ptytest = "0.2"
+serde_json = "1"
 
 [[bench]]
 name = "bench"

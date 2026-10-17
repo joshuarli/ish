@@ -15,6 +15,14 @@ To install the command-line runner:
 
     cargo install epsh
 
+The `epsh` crate has no dependency on ish and remains independently packageable.
+From the ish repository, select it with `-p epsh` because both crates share a
+workspace and lockfile:
+
+    cargo build -p epsh
+    cargo test -p epsh --lib --tests
+    cargo package -p epsh
+
 ## Use as a library
 
 This example captures output as bytes, so it also works when command output is
@@ -76,12 +84,26 @@ valid UTF-8. See [byte preservation](docs/byte-preservation.md).
 | external_handler(...) | Delegate external command execution to the embedder. |
 | redirect_open_handler(...) | Let the embedder open writable redirection targets. |
 | interactive(bool) | Enable foreground terminal handoff and stopped-process detection for pipelines. |
+| command_policy(...) | Refuse expanded command targets before builtin or function dispatch. |
+
+Command policy is opt-in and disabled by default. The callback receives the
+expanded target as `ShellBytes`. Returning a diagnostic refuses the target with
+status 2. The policy also checks nested `command` indirection and command
+substitutions. Rejection happens before the target runs or opens redirections.
+The policy does not undo earlier commands or expansion effects.
 
 When an external handler is installed, epsh passes expanded arguments and the
 complete child environment as byte pairs. Redirections have already been
 applied to file descriptors. The environment includes inherited entries unless
 env_clear was selected, exported shell variables, and command-prefix
 assignments.
+
+Arithmetic uses signed 64-bit values. Addition, subtraction, multiplication,
+and negation wrap. Division or remainder by zero, division or remainder of the
+minimum value by -1, and shift counts outside 0 through 63 return an arithmetic
+error. Left shift keeps the low 64 bits; right shift is arithmetic. Compound
+arithmetic assignments use the same rules. A failed operation leaves its
+assignment destination unchanged, while effects from the right-hand side stay.
 
 For interactive integrations, eval_command can return
 ShellError::Stopped { pid, pgid }. run_program converts a stopped command to

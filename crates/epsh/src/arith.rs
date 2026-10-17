@@ -306,8 +306,6 @@ struct ArithParser<'a> {
     vars: &'a mut Variables,
     exit_status: ExitStatus,
     shell_pid: u32,
-    /// When true, parse expressions but don't execute side effects (assignments).
-    /// Used for short-circuit evaluation of ternary and logical operators.
     noeval: bool,
 }
 
@@ -359,114 +357,69 @@ impl<'a> ArithParser<'a> {
     }
 
     fn parse_assignment(&mut self) -> Result<i64, String> {
-        // Check for var = expr, var += expr, etc.
         if let Some(ArithToken::Var(name)) = self.peek().cloned() {
             let saved_pos = self.pos;
             self.pos += 1;
 
             if let Some(op) = self.peek().cloned() {
-                match op {
+                match op.clone() {
                     ArithToken::Assign => {
                         self.pos += 1;
                         let val = self.parse_assignment()?;
                         self.set_var(&name, val);
                         return Ok(val);
                     }
-                    ArithToken::AddAssign => {
+                    ArithToken::AddAssign
+                    | ArithToken::SubAssign
+                    | ArithToken::MulAssign
+                    | ArithToken::DivAssign
+                    | ArithToken::ModAssign
+                    | ArithToken::ShlAssign
+                    | ArithToken::ShrAssign
+                    | ArithToken::AndAssign
+                    | ArithToken::OrAssign
+                    | ArithToken::XorAssign => {
                         self.pos += 1;
                         let right = self.parse_assignment()?;
-                        let val = self.get_var(&name) + right;
-                        self.set_var(&name, val);
-                        return Ok(val);
-                    }
-                    ArithToken::SubAssign => {
-                        self.pos += 1;
-                        let right = self.parse_assignment()?;
-                        let val = self.get_var(&name) - right;
-                        self.set_var(&name, val);
-                        return Ok(val);
-                    }
-                    ArithToken::MulAssign => {
-                        self.pos += 1;
-                        let right = self.parse_assignment()?;
-                        let val = self.get_var(&name) * right;
-                        self.set_var(&name, val);
-                        return Ok(val);
-                    }
-                    ArithToken::DivAssign => {
-                        self.pos += 1;
-                        let right = self.parse_assignment()?;
-                        if right == 0 {
-                            return Err("division by zero".into());
-                        }
-                        let val = self.get_var(&name) / right;
-                        self.set_var(&name, val);
-                        return Ok(val);
-                    }
-                    ArithToken::ModAssign => {
-                        self.pos += 1;
-                        let right = self.parse_assignment()?;
-                        if right == 0 {
-                            return Err("division by zero".into());
-                        }
-                        let val = self.get_var(&name) % right;
-                        self.set_var(&name, val);
-                        return Ok(val);
-                    }
-                    ArithToken::ShlAssign => {
-                        self.pos += 1;
-                        let right = self.parse_assignment()?;
-                        let val = self.get_var(&name) << right;
-                        self.set_var(&name, val);
-                        return Ok(val);
-                    }
-                    ArithToken::ShrAssign => {
-                        self.pos += 1;
-                        let right = self.parse_assignment()?;
-                        let val = self.get_var(&name) >> right;
-                        self.set_var(&name, val);
-                        return Ok(val);
-                    }
-                    ArithToken::AndAssign => {
-                        self.pos += 1;
-                        let right = self.parse_assignment()?;
-                        let val = self.get_var(&name) & right;
-                        self.set_var(&name, val);
-                        return Ok(val);
-                    }
-                    ArithToken::OrAssign => {
-                        self.pos += 1;
-                        let right = self.parse_assignment()?;
-                        let val = self.get_var(&name) | right;
-                        self.set_var(&name, val);
-                        return Ok(val);
-                    }
-                    ArithToken::XorAssign => {
-                        self.pos += 1;
-                        let right = self.parse_assignment()?;
-                        let val = self.get_var(&name) ^ right;
+                        let left = self.get_var(&name);
+                        let binary_op = Self::assignment_binary_op(op);
+                        let val = self.apply_binop(&binary_op, left, right)?;
                         self.set_var(&name, val);
                         return Ok(val);
                     }
                     _ => {}
                 }
             }
-            // Not an assignment — backtrack
             self.pos = saved_pos;
         }
         self.parse_ternary()
+    }
+
+    fn assignment_binary_op(op: ArithToken) -> ArithToken {
+        match op {
+            ArithToken::AddAssign => ArithToken::Plus,
+            ArithToken::SubAssign => ArithToken::Minus,
+            ArithToken::MulAssign => ArithToken::Star,
+            ArithToken::DivAssign => ArithToken::Slash,
+            ArithToken::ModAssign => ArithToken::Percent,
+            ArithToken::ShlAssign => ArithToken::Shl,
+            ArithToken::ShrAssign => ArithToken::Shr,
+            ArithToken::AndAssign => ArithToken::BitAnd,
+            ArithToken::OrAssign => ArithToken::BitOr,
+            ArithToken::XorAssign => ArithToken::BitXor,
+            _ => unreachable!(),
+        }
     }
 
     fn parse_ternary(&mut self) -> Result<i64, String> {
         let cond = self.parse_or()?;
         if self.peek() == Some(&ArithToken::Question) {
             self.pos += 1;
-            // Short-circuit: only evaluate the taken branch (dash: noeval | !a / noeval | !!a)
             let saved = self.noeval;
-            self.noeval = saved || cond == 0; // noeval then-branch if cond is false
+            self.noeval = saved || cond == 0;
             let then_val = self.parse_expr()?;
             self.expect(&ArithToken::Colon)?;
-            self.noeval = saved || cond != 0; // noeval else-branch if cond is true
+            self.noeval = saved || cond != 0;
             let else_val = self.parse_expr()?;
             self.noeval = saved;
             Ok(if cond != 0 { then_val } else { else_val })
@@ -479,7 +432,6 @@ impl<'a> ArithParser<'a> {
         let mut left = self.parse_and()?;
         while self.peek() == Some(&ArithToken::Or) {
             self.pos += 1;
-            // Short-circuit: if left is true, don't evaluate right side effects
             let saved = self.noeval;
             self.noeval = saved || left != 0;
             let right = self.parse_and()?;
@@ -493,7 +445,6 @@ impl<'a> ArithParser<'a> {
         let mut left = self.parse_binop(1)?;
         while self.peek() == Some(&ArithToken::And) {
             self.pos += 1;
-            // Short-circuit: if left is false, don't evaluate right side effects
             let saved = self.noeval;
             self.noeval = saved || left == 0;
             let right = self.parse_binop(1)?;
@@ -503,10 +454,11 @@ impl<'a> ArithParser<'a> {
         Ok(left)
     }
 
-    /// Apply a binary operator token to two operands. Returns None if the
-    /// token is not a binary operator at this precedence level.
-    fn apply_binop(tok: &ArithToken, left: i64, right: i64) -> Result<Option<i64>, String> {
-        Ok(Some(match tok {
+    fn apply_binop(&self, tok: &ArithToken, left: i64, right: i64) -> Result<i64, String> {
+        if self.noeval {
+            return Ok(0);
+        }
+        Ok(match tok {
             ArithToken::BitOr => left | right,
             ArithToken::BitXor => left ^ right,
             ArithToken::BitAnd => left & right,
@@ -552,14 +504,17 @@ impl<'a> ArithParser<'a> {
                     0
                 }
             }
-            ArithToken::Shl => left << right,
-            ArithToken::Shr => left >> right,
-            ArithToken::Plus => left + right,
-            ArithToken::Minus => left - right,
-            ArithToken::Star => left * right,
+            ArithToken::Shl => left.wrapping_shl(Self::shift_count(right)?),
+            ArithToken::Shr => left >> Self::shift_count(right)?,
+            ArithToken::Plus => left.wrapping_add(right),
+            ArithToken::Minus => left.wrapping_sub(right),
+            ArithToken::Star => left.wrapping_mul(right),
             ArithToken::Slash => {
                 if right == 0 {
                     return Err("division by zero".into());
+                }
+                if left == i64::MIN && right == -1 {
+                    return Err("division overflow".into());
                 }
                 left / right
             }
@@ -567,13 +522,22 @@ impl<'a> ArithParser<'a> {
                 if right == 0 {
                     return Err("division by zero".into());
                 }
+                if left == i64::MIN && right == -1 {
+                    return Err("division overflow".into());
+                }
                 left % right
             }
-            _ => return Ok(None),
-        }))
+            _ => unreachable!(),
+        })
     }
 
-    /// Precedence level for binary operators (higher = tighter binding).
+    fn shift_count(count: i64) -> Result<u32, String> {
+        if !(0..64).contains(&count) {
+            return Err("shift count out of range".into());
+        }
+        Ok(count as u32)
+    }
+
     fn precedence(tok: &ArithToken) -> Option<u8> {
         Some(match tok {
             ArithToken::BitOr => 1,
@@ -588,7 +552,6 @@ impl<'a> ArithParser<'a> {
         })
     }
 
-    /// Parse binary operators using precedence climbing.
     fn parse_binop(&mut self, min_prec: u8) -> Result<i64, String> {
         let mut left = self.parse_unary()?;
         while let Some(tok) = self.peek().cloned()
@@ -597,7 +560,7 @@ impl<'a> ArithParser<'a> {
         {
             self.pos += 1;
             let right = self.parse_binop(prec + 1)?;
-            left = Self::apply_binop(&tok, left, right)?.unwrap();
+            left = self.apply_binop(&tok, left, right)?;
         }
         Ok(left)
     }
@@ -610,7 +573,7 @@ impl<'a> ArithParser<'a> {
             }
             Some(&ArithToken::Minus) => {
                 self.pos += 1;
-                Ok(-self.parse_unary()?)
+                Ok(self.parse_unary()?.wrapping_neg())
             }
             Some(&ArithToken::Not) => {
                 self.pos += 1;
@@ -747,6 +710,90 @@ mod tests {
         let mut vars = Variables::new();
         assert!(eval_arith("1 / 0", &mut vars, ExitStatus::SUCCESS, 1).is_err());
         assert!(eval_arith("1 % 0", &mut vars, ExitStatus::SUCCESS, 1).is_err());
+    }
+
+    #[test]
+    fn wrapping_i64_arithmetic() {
+        let mut vars = Variables::new();
+        vars.set_int("min", i64::MIN).unwrap();
+        vars.set_int("max", i64::MAX).unwrap();
+        assert_eq!(eval_with_vars("max + 1", &mut vars), i64::MIN);
+        assert_eq!(eval_with_vars("min - 1", &mut vars), i64::MAX);
+        assert_eq!(eval_with_vars("max * 2", &mut vars), -2);
+        assert_eq!(eval_with_vars("-min", &mut vars), i64::MIN);
+    }
+
+    #[test]
+    fn division_remainder_and_shift_errors() {
+        let mut vars = Variables::new();
+        vars.set_int("min", i64::MIN).unwrap();
+        for expr in [
+            "min / -1",
+            "min % -1",
+            "1 << -1",
+            "1 << 64",
+            "1 >> -1",
+            "1 >> 64",
+        ] {
+            assert!(
+                eval_arith(expr, &mut vars, ExitStatus::SUCCESS, 1).is_err(),
+                "{expr}"
+            );
+        }
+        assert_eq!(eval("1 << 0"), 1);
+        assert_eq!(eval("1 << 63"), i64::MIN);
+        assert_eq!(eval("-4 >> 1"), -2);
+    }
+
+    #[test]
+    fn compound_arithmetic_wraps_and_errors_without_assignment() {
+        let mut vars = Variables::new();
+        vars.set_int("x", i64::MAX).unwrap();
+        assert_eq!(eval_with_vars("x += 1", &mut vars), i64::MIN);
+        assert_eq!(vars.get_int("x"), Some(i64::MIN));
+        assert_eq!(eval_with_vars("x -= 1", &mut vars), i64::MAX);
+        assert_eq!(eval_with_vars("x *= 2", &mut vars), -2);
+        vars.set_int("x", 8).unwrap();
+        assert_eq!(eval_with_vars("x /= 2", &mut vars), 4);
+        assert_eq!(eval_with_vars("x %= 3", &mut vars), 1);
+        vars.set_int("x", 1).unwrap();
+        assert_eq!(eval_with_vars("x <<= 63", &mut vars), i64::MIN);
+        assert_eq!(eval_with_vars("x >>= 63", &mut vars), -1);
+
+        vars.set_int("x", i64::MIN).unwrap();
+
+        for expr in [
+            "x /= 0",
+            "x /= -1",
+            "x %= 0",
+            "x %= -1",
+            "x <<= 64",
+            "x >>= -1",
+        ] {
+            assert!(
+                eval_arith(expr, &mut vars, ExitStatus::SUCCESS, 1).is_err(),
+                "{expr}"
+            );
+            assert_eq!(vars.get_int("x"), Some(i64::MIN), "{expr}");
+        }
+    }
+
+    #[test]
+    fn lazy_operators_skip_errors_and_assignments_but_parse_skipped_syntax() {
+        assert_eq!(eval("1 || (1 / 0)"), 1);
+        assert_eq!(eval("0 && (1 / 0)"), 0);
+        assert_eq!(eval("1 ? 7 : (1 / 0)"), 7);
+        assert_eq!(eval("0 ? (1 / 0) : 7"), 7);
+
+        let mut vars = Variables::new();
+        vars.set_int("x", 4).unwrap();
+        assert_eq!(eval_with_vars("1 || (x = 9)", &mut vars), 1);
+        assert_eq!(vars.get_int("x"), Some(4));
+        assert_eq!(eval_with_vars("0 && (x = 9)", &mut vars), 0);
+        assert_eq!(vars.get_int("x"), Some(4));
+        assert_eq!(eval_with_vars("1 ? (x = 7) : (x = 8)", &mut vars), 7);
+        assert_eq!(vars.get_int("x"), Some(7));
+        assert!(eval_arith("1 || (1 + )", &mut vars, ExitStatus::SUCCESS, 1).is_err());
     }
 
     #[test]

@@ -44,27 +44,22 @@ pub fn expand_word_to_fields(
     word: &Word,
     sh: &mut dyn ShellExpand,
 ) -> crate::error::Result<Vec<String>> {
-    // Step 1: Expand to intermediate fragments with split_fields metadata
-    let fragments = expand_word_parts(&word.parts, sh, false)?;
+    let fragments = expand_word_parts_inner(&word.parts, sh, false, false, true)?;
 
-    // Step 2: Field splitting on fragments marked split_fields=true
     let ifs = sh.vars().ifs();
     let split = field_split(&fragments, &ifs);
 
-    // Step 3: Pathname expansion (globbing) on results
     let mut result = Vec::new();
     let cwd = sh.cwd();
     for field in split {
         if !sh.noglob() && glob::has_glob_chars(&field) {
-            let matches = glob::glob(&field, cwd);
+            let matches = glob::glob_shell(&field, cwd);
             if matches.is_empty() {
-                // No matches: keep the pattern literal, with quote removal
                 result.push(remove_glob_escapes(&field));
             } else {
                 result.extend(matches);
             }
         } else {
-            // Quote removal: strip backslash-escapes of glob chars
             result.push(remove_glob_escapes(&field));
         }
     }
@@ -98,8 +93,7 @@ pub fn expand_pattern(
                 }
             }
             WordPart::DoubleQuoted(inner) => {
-                // Double-quoted — expand inner parts but escape glob chars
-                let inner_expanded = expand_word_parts_inner(inner, sh, true, false)?;
+                let inner_expanded = expand_word_parts_inner(inner, sh, true, false, false)?;
                 let text: String = inner_expanded.into_iter().map(|f| f.value).collect();
                 for c in text.chars() {
                     if matches!(c, '*' | '?' | '[' | ']' | '\\') {
@@ -119,8 +113,7 @@ pub fn expand_pattern(
                 }
             }
             _ => {
-                // Other parts (CmdSubst, Arith, etc.) — expand and escape
-                let frags = expand_word_parts_inner(std::slice::from_ref(part), sh, true, false)?;
+                let frags = expand_word_parts_inner(std::slice::from_ref(part), sh, true, false, false)?;
                 let text: String = frags.into_iter().map(|f| f.value).collect();
                 for c in text.chars() {
                     if matches!(c, '*' | '?' | '[' | ']' | '\\') {
@@ -144,15 +137,26 @@ pub fn expand_word_to_string(
     Ok(fragments.into_iter().map(|f| f.value).collect())
 }
 
-/// Expand a list of WordParts into ExpandedWord fragments.
-/// `in_param_word`: true when expanding inside ${var+word} etc. — literals should
-/// be marked for field splitting since they're part of an expansion result.
 fn expand_word_parts(
     parts: &[WordPart],
     sh: &mut dyn ShellExpand,
     quoted_context: bool,
 ) -> crate::error::Result<Vec<ExpandedWord>> {
-    expand_word_parts_inner(parts, sh, quoted_context, false)
+    expand_word_parts_inner(parts, sh, quoted_context, false, false)
+}
+
+fn protect_globs(value: String, enabled: bool) -> String {
+    if !enabled {
+        return value;
+    }
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '*' | '?' | '[' | ']' | '\\') || ch == crate::lexer::CTLESC {
+            escaped.push(crate::lexer::CTLESC);
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn expand_word_parts_inner(
@@ -160,6 +164,7 @@ fn expand_word_parts_inner(
     sh: &mut dyn ShellExpand,
     quoted_context: bool,
     in_param_word: bool,
+    escape_quoted_globs: bool,
 ) -> crate::error::Result<Vec<ExpandedWord>> {
     let mut result = Vec::new();
 
@@ -168,92 +173,46 @@ fn expand_word_parts_inner(
             WordPart::Literal(s) => {
                 result.push(ExpandedWord {
                     value: s.to_shell_string(),
-                    // Literals from ${...} words are subject to field splitting
                     split_fields: in_param_word && !quoted_context,
                     word_break: false,
                 });
             }
             WordPart::SingleQuoted(s) => {
                 result.push(ExpandedWord {
-                    value: s.to_shell_string(),
+                    value: protect_globs(s.to_shell_string(), escape_quoted_globs),
                     split_fields: false,
                     word_break: false,
                 });
             }
             WordPart::DoubleQuoted(inner) => {
-                // Check if inner contains a bare $@ — needs special multi-field expansion
-                let has_at = inner.iter().any(|p| matches!(p, WordPart::Param(pe) if pe.name == "@" && matches!(pe.op, ParamOp::Normal)));
-
-                if has_at && inner.len() == 1 {
-                    // "$@" — expand to separate fields
-                    // First element merges with any preceding content in this word
-                    let positional = sh.vars().positional_shell_strings();
-                    for (i, arg) in positional.iter().enumerate() {
-                        result.push(ExpandedWord {
-                            value: arg.clone(),
-                            split_fields: false,
-                            word_break: i > 0,
-                        });
-                    }
-                } else if has_at {
-                    // Mixed case: "prefix$@suffix" — expand $@ into multiple fields
-                    // with prefix on first and suffix on last
-                    let mut prefix = String::new();
-                    let mut suffix_parts: Vec<WordPart> = Vec::new();
-                    let mut found_at = false;
-                    for p in inner {
-                        if !found_at {
-                            if matches!(p, WordPart::Param(pe) if pe.name == "@" && matches!(pe.op, ParamOp::Normal))
-                            {
-                                found_at = true;
-                            } else {
-                                let expanded =
-                                    expand_word_parts(std::slice::from_ref(p), sh, true)?;
-                                for f in expanded {
-                                    prefix.push_str(&f.value);
-                                }
-                            }
-                        } else {
-                            suffix_parts.push(p.clone());
-                        }
-                    }
-                    let suffix_frags = expand_word_parts(&suffix_parts, sh, true)?;
-                    let suffix: String = suffix_frags.into_iter().map(|f| f.value).collect();
-
-                    if sh.vars().positional.is_empty() {
-                        // "$@" with no positional params produces nothing (not even empty string)
-                    } else {
-                        let positional = sh.vars().positional_shell_strings();
-                        let pos_len = positional.len();
-                        for (i, arg) in positional.iter().enumerate() {
-                            let mut val = String::new();
-                            if i == 0 {
-                                val.push_str(&prefix);
-                            }
-                            val.push_str(arg);
-                            if i == pos_len - 1 {
-                                val.push_str(&suffix);
-                            }
-                            result.push(ExpandedWord {
-                                value: val,
-                                split_fields: false,
-                                word_break: i > 0,
-                            });
-                        }
-                    }
-                } else {
-                    // No $@ — normal double-quote handling
-                    let expanded = expand_word_parts(inner, sh, true)?;
-                    let value: String = expanded.into_iter().map(|f| f.value).collect();
+                if inner.is_empty() {
                     result.push(ExpandedWord {
-                        value,
+                        value: String::new(),
                         split_fields: false,
                         word_break: false,
                     });
                 }
+                for part in inner {
+                    if matches!(part, WordPart::Param(param) if param.name == "@" && matches!(param.op, ParamOp::Normal)) {
+                        for (index, arg) in sh.vars().positional_shell_strings().into_iter().enumerate() {
+                            result.push(ExpandedWord {
+                                value: protect_globs(arg, escape_quoted_globs),
+                                split_fields: false,
+                                word_break: index > 0,
+                            });
+                        }
+                    } else {
+                        let expanded = expand_word_parts(std::slice::from_ref(part), sh, true)?;
+                        let value: String = expanded.into_iter().map(|fragment| fragment.value).collect();
+                        result.push(ExpandedWord {
+                            value: protect_globs(value, escape_quoted_globs),
+                            split_fields: false,
+                            word_break: false,
+                        });
+                    }
+                }
             }
             WordPart::Param(param) => {
-                // $@ unquoted: expand to separate fields
                 if param.name == "@" && matches!(param.op, ParamOp::Normal) && !quoted_context {
                     let positional = sh.vars().positional_shell_strings();
                     for (i, arg) in positional.iter().enumerate() {
@@ -264,15 +223,9 @@ fn expand_word_parts_inner(
                         });
                     }
                 }
-                // $* in quoted context: join with first char of IFS
                 else if param.name == "*" && matches!(param.op, ParamOp::Normal) && quoted_context
                 {
-                    let sep = sh
-                        .vars()
-                        .ifs()
-                        .chars()
-                        .next()
-                        .map_or(String::new(), |c| c.to_string());
+                    let sep = crate::encoding::shell_chars(&sh.vars().ifs()).next().unwrap_or_default().to_string();
                     let value = sh.vars().positional_join_shell(&sep);
                     result.push(ExpandedWord {
                         value,
@@ -280,8 +233,6 @@ fn expand_word_parts_inner(
                         word_break: false,
                     });
                 }
-                // $* unquoted: each positional param is a separate field
-                // (same as $@ when unquoted — POSIX specifies both produce separate fields)
                 else if param.name == "*"
                     && matches!(param.op, ParamOp::Normal)
                     && !quoted_context
@@ -290,19 +241,19 @@ fn expand_word_parts_inner(
                     for arg in &positional {
                         result.push(ExpandedWord {
                             value: arg.clone(),
-                            split_fields: true, // subject to further IFS splitting
+                            split_fields: true,
                             word_break: true,
                         });
                     }
                 } else {
-                    let frags = expand_param_to_fragments(param, sh, quoted_context)?;
+                    let frags = expand_param_to_fragments(param, sh, quoted_context, escape_quoted_globs)?;
                     result.extend(frags);
                 }
             }
             WordPart::Tilde(user) => {
                 let expanded = expand_tilde(user, sh);
                 result.push(ExpandedWord {
-                    value: expanded,
+                    value: protect_globs(expanded, escape_quoted_globs),
                     split_fields: false,
                     word_break: false,
                 });
@@ -316,12 +267,10 @@ fn expand_word_parts_inner(
                 });
             }
             WordPart::Arith(inner) => {
-                // First expand any variables in the arithmetic expression
                 let text: String = expand_word_parts(inner, sh, true)?
                     .into_iter()
                     .map(|f| f.value)
                     .collect();
-                // Then evaluate the arithmetic
                 let exit_status = sh.exit_status();
                 let shell_pid = sh.pid();
                 let value = arith::eval_arith(&text, sh.vars_mut(), exit_status, shell_pid)
@@ -342,22 +291,17 @@ fn expand_word_parts_inner(
     Ok(result)
 }
 
-/// Expand a parameter expression to fragments, preserving quoting info.
 fn expand_param_to_fragments(
     param: &ParamExpr,
     sh: &mut dyn ShellExpand,
     quoted_context: bool,
+    escape_quoted_globs: bool,
 ) -> crate::error::Result<Vec<ExpandedWord>> {
     let name = &param.name;
 
     // $* and $@ join with first char of IFS when used as a scalar
     let raw_value = if name == "*" || name == "@" {
-        let sep = sh
-            .vars()
-            .ifs()
-            .chars()
-            .next()
-            .map_or(String::new(), |c| c.to_string());
+        let sep = crate::encoding::shell_chars(&sh.vars().ifs()).next().unwrap_or_default().to_string();
         Some(sh.vars().positional_join_shell(&sep))
     } else if is_special_param(name) {
         let exit_status = sh.exit_status();
@@ -408,7 +352,7 @@ fn expand_param_to_fragments(
         ParamOp::Length => {
             let value = raw_value
                 .as_ref()
-                .map(|v| v.len().to_string())
+                .map(|v| crate::encoding::str_to_bytes(v).len().to_string())
                 .unwrap_or_else(|| "0".to_string());
             Ok(vec![ExpandedWord {
                 value,
@@ -423,23 +367,22 @@ fn expand_param_to_fragments(
                 raw_value.is_none()
             };
             if is_unset {
-                let frags = expand_word_parts_inner(
-                    word,
-                    sh,
-                    quoted_context,
-                    true, // in_param_word: literals subject to field splitting
-                )?;
                 if matches!(param.op, ParamOp::Assign { .. }) {
-                    let val: String = frags.iter().map(|f| f.value.clone()).collect();
-                    let _ = sh.vars_mut().set(name, &val);
-                    // Return the assigned value as a single fragment for further splitting
+                    let value = remove_glob_escapes(&expand_param_word(word, sh)?);
+                    let _ = sh.vars_mut().set_shell(name, &value);
                     return Ok(vec![ExpandedWord {
-                        value: val,
+                        value,
                         split_fields: !quoted_context,
                         word_break: false,
                     }]);
                 }
-                Ok(frags)
+                expand_word_parts_inner(
+                    word,
+                    sh,
+                    quoted_context,
+                    true,
+                    escape_quoted_globs,
+                )
             } else {
                 let value = raw_value.unwrap_or_default();
                 Ok(vec![ExpandedWord {
@@ -488,7 +431,8 @@ fn expand_param_to_fragments(
                     word,
                     sh,
                     quoted_context,
-                    true, // in_param_word
+                    true,
+                    escape_quoted_globs,
                 )?;
                 Ok(frags)
             }
@@ -512,12 +456,7 @@ fn expand_param(param: &ParamExpr, sh: &mut dyn ShellExpand) -> crate::error::Re
     // Get the raw value
     // $* joins with first char of IFS (or nothing if IFS="")
     let raw_value = if name == "*" || name == "@" {
-        let sep = sh
-            .vars()
-            .ifs()
-            .chars()
-            .next()
-            .map_or(String::new(), |c| c.to_string());
+        let sep = crate::encoding::shell_chars(&sh.vars().ifs()).next().unwrap_or_default().to_string();
         Some(sh.vars().positional_join_shell(&sep))
     } else if is_special_param(name) {
         let exit_status = sh.exit_status();
@@ -558,7 +497,7 @@ fn expand_param(param: &ParamExpr, sh: &mut dyn ShellExpand) -> crate::error::Re
         ParamOp::Normal => Ok(raw_value.unwrap_or_default()),
         ParamOp::Length => Ok(raw_value
             .as_ref()
-            .map(|v| v.len().to_string())
+            .map(|v| crate::encoding::str_to_bytes(v).len().to_string())
             .unwrap_or_else(|| "0".to_string())),
         ParamOp::Default { colon, word } => {
             let is_unset = if *colon {
@@ -580,7 +519,7 @@ fn expand_param(param: &ParamExpr, sh: &mut dyn ShellExpand) -> crate::error::Re
             };
             if is_unset {
                 let default = expand_param_word(word, sh)?;
-                let _ = sh.vars_mut().set(name, &default);
+                let _ = sh.vars_mut().set_shell(name, &default);
                 Ok(default)
             } else {
                 Ok(raw_value.unwrap_or_default())
@@ -678,8 +617,8 @@ fn field_split(fragments: &[ExpandedWord], ifs: &str) -> Vec<String> {
     let mut current = String::new();
     let mut have_field = false;
 
-    let ifs_ws: Vec<char> = ifs.chars().filter(|c| c.is_whitespace()).collect();
-    let ifs_nws: Vec<char> = ifs.chars().filter(|c| !c.is_whitespace()).collect();
+    let ifs_ws: Vec<&str> = crate::encoding::shell_chars(ifs).filter(|c| c.chars().all(char::is_whitespace)).collect();
+    let ifs_nws: Vec<&str> = crate::encoding::shell_chars(ifs).filter(|c| !c.chars().all(char::is_whitespace)).collect();
 
     for frag in fragments {
         // word_break starts a new field (used for "$@" expansion)
@@ -696,7 +635,7 @@ fn field_split(fragments: &[ExpandedWord], ifs: &str) -> Vec<String> {
         }
 
         // Split this fragment on IFS
-        let chars: Vec<char> = frag.value.chars().collect();
+        let chars: Vec<&str> = crate::encoding::shell_chars(&frag.value).collect();
         let mut i = 0;
 
         while i < chars.len() {
@@ -733,7 +672,7 @@ fn field_split(fragments: &[ExpandedWord], ifs: &str) -> Vec<String> {
                     i += 1;
                 }
             } else {
-                current.push(ch);
+                current.push_str(ch);
                 have_field = true;
                 i += 1;
             }
@@ -770,21 +709,21 @@ pub fn remove_glob_escapes(s: &str) -> String {
 }
 
 fn trim_suffix(value: &str, pattern: &str, greedy: bool) -> String {
-    let chars: Vec<char> = value.chars().collect();
+    let chars: Vec<&str> = crate::encoding::shell_chars(value).collect();
     if greedy {
         // Largest suffix: try from the beginning
         for i in 0..chars.len() {
-            let suffix: String = chars[i..].iter().collect();
-            if glob::fnmatch(pattern, &suffix) {
-                return chars[..i].iter().collect();
+            let suffix: String = chars[i..].iter().copied().collect();
+            if glob::fnmatch_shell(pattern, &suffix) {
+                return chars[..i].iter().copied().collect();
             }
         }
     } else {
         // Smallest suffix: try from the end
         for i in (0..chars.len()).rev() {
-            let suffix: String = chars[i..].iter().collect();
-            if glob::fnmatch(pattern, &suffix) {
-                return chars[..i].iter().collect();
+            let suffix: String = chars[i..].iter().copied().collect();
+            if glob::fnmatch_shell(pattern, &suffix) {
+                return chars[..i].iter().copied().collect();
             }
         }
     }
@@ -793,21 +732,21 @@ fn trim_suffix(value: &str, pattern: &str, greedy: bool) -> String {
 
 /// Remove smallest/largest prefix matching pattern.
 fn trim_prefix(value: &str, pattern: &str, greedy: bool) -> String {
-    let chars: Vec<char> = value.chars().collect();
+    let chars: Vec<&str> = crate::encoding::shell_chars(value).collect();
     if greedy {
         // Largest prefix: try from the end
         for i in (1..=chars.len()).rev() {
-            let prefix: String = chars[..i].iter().collect();
-            if glob::fnmatch(pattern, &prefix) {
-                return chars[i..].iter().collect();
+            let prefix: String = chars[..i].iter().copied().collect();
+            if glob::fnmatch_shell(pattern, &prefix) {
+                return chars[i..].iter().copied().collect();
             }
         }
     } else {
         // Smallest prefix: try from the beginning
         for i in 1..=chars.len() {
-            let prefix: String = chars[..i].iter().collect();
-            if glob::fnmatch(pattern, &prefix) {
-                return chars[i..].iter().collect();
+            let prefix: String = chars[..i].iter().copied().collect();
+            if glob::fnmatch_shell(pattern, &prefix) {
+                return chars[i..].iter().copied().collect();
             }
         }
     }

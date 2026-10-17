@@ -24,13 +24,6 @@ inductive SemanticError where
   | environment (message : String)
   deriving Repr, BEq, Inhabited
 
-inductive Outcome (α : Type) where
-  | success (value : α)
-  | semanticError (error : SemanticError)
-  | unsupportedDomain (reason : String)
-  | fuelExhausted
-  deriving Repr, BEq, Inhabited
-
 inductive OpenMode where
   | input | output | append | readWrite | clobber
   deriving Repr, BEq, Inhabited
@@ -46,6 +39,13 @@ inductive TraceEvent where
   deriving Repr, BEq, Inhabited
 
 abbrev Trace := List TraceEvent
+
+inductive Outcome (α : Type) where
+  | success (value : α)
+  | semanticError (error : SemanticError) (state : ShellState) (trace : Trace)
+  | unsupportedDomain (reason : String)
+  | fuelExhausted
+  deriving Repr, BEq, Inhabited
 
 structure Execution where
   state : ShellState

@@ -1,5 +1,7 @@
 use fxhash::FxHashMap;
 use std::io::{Read, Write};
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +31,7 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// The interpreter path from a script's `#!` line, or None if the first line
 /// is not a shebang (or the file cannot be read). Mirrors bash's `getinterp`.
-fn read_shebang_interpreter(path: &Path) -> Option<String> {
+fn read_shebang_interpreter(path: &Path) -> Option<OsString> {
     let mut buf = [0u8; 128];
     let mut file = std::fs::File::open(path).ok()?;
     let n = file.read(&mut buf).ok()?;
@@ -47,7 +49,7 @@ fn read_shebang_interpreter(path: &Path) -> Option<String> {
     if start >= i {
         return None;
     }
-    Some(String::from_utf8_lossy(&buf[start..i]).into_owned())
+    Some(OsString::from_vec(buf[start..i].to_vec()))
 }
 
 /// The platform's strerror text for an errno, e.g. "Not a directory".
@@ -64,20 +66,20 @@ fn os_error_string(code: i32) -> String {
 /// The file exec would attempt for `cmd_name`: slash paths resolve against
 /// `cwd`; slashless names search `path_env` like `execve_with_env`. Returns
 /// None for a slashless name found in no PATH directory.
-fn resolve_exec_path(cmd_name: &str, cwd: &Path, path_env: &str) -> Option<PathBuf> {
+fn resolve_exec_path(cmd_name: &OsStr, cwd: &Path, path_env: &OsStr) -> Option<PathBuf> {
     let name_path = PathBuf::from(cmd_name);
-    if cmd_name.contains('/') {
+    if cmd_name.as_bytes().contains(&b'/') {
         return Some(if name_path.is_absolute() {
             name_path
         } else {
             cwd.join(name_path)
         });
     }
-    for directory in path_env.split(':') {
+    for directory in path_env.as_bytes().split(|byte| *byte == b':') {
         let dir = if directory.is_empty() {
             PathBuf::from(".")
         } else {
-            PathBuf::from(directory)
+            PathBuf::from(OsStr::from_bytes(directory))
         };
         let full = if dir.is_absolute() {
             dir.join(cmd_name)
@@ -105,7 +107,18 @@ pub fn bad_interpreter_message(
     cwd: &Path,
     path_env: &str,
 ) -> Option<String> {
-    // E2BIG/ENOMEM are resource errors, not interpreter problems.
+    bad_interpreter_message_os(OsStr::new(cmd_name), code, cwd, OsStr::new(path_env))
+        .map(|message| message.to_string_lossy().into_owned())
+}
+
+/// Return a bad-interpreter diagnostic with command and interpreter bytes intact.
+/// `cmd_name` and `path_env` are the raw OS arguments used for execution.
+pub fn bad_interpreter_message_os(
+    cmd_name: &OsStr,
+    code: i32,
+    cwd: &Path,
+    path_env: &OsStr,
+) -> Option<OsString> {
     if matches!(code, libc::E2BIG | libc::ENOMEM) {
         return None;
     }
@@ -114,10 +127,12 @@ pub fn bad_interpreter_message(
         return None;
     }
     let interp = read_shebang_interpreter(&path)?;
-    Some(format!(
-        "{cmd_name}: {interp}: bad interpreter: {}",
-        os_error_string(code)
-    ))
+    let mut message = cmd_name.as_bytes().to_vec();
+    message.extend_from_slice(b": ");
+    message.extend_from_slice(interp.as_bytes());
+    message.extend_from_slice(b": bad interpreter: ");
+    message.extend_from_slice(os_error_string(code).as_bytes());
+    Some(OsString::from_vec(message))
 }
 
 fn apply_dot_navigation(cwd: &Path, path: &Path) -> PathBuf {
@@ -187,6 +202,10 @@ pub type ExternalHandler = Box<
     dyn FnMut(&[ShellBytes], &[(ShellBytes, ShellBytes)]) -> crate::error::Result<ExitStatus>
         + Send,
 >;
+
+/// Callback for expanded command targets. Return `None` to allow a target or
+/// `Some(diagnostic)` to refuse it with status 2.
+pub type CommandPolicy = Box<dyn FnMut(&ShellBytes) -> Option<String> + Send>;
 
 thread_local! {
     static EXTERNAL_COMMAND_CWD: std::cell::RefCell<Option<PathBuf>> =
@@ -298,6 +317,7 @@ pub struct Shell {
     /// Optional callback that replaces eval_external for spawning processes.
     /// Lets embedders control process creation (job control, sandboxing, etc.).
     external_handler: Option<ExternalHandler>,
+    command_policy: Option<CommandPolicy>,
     /// Optional provider that opens writable redirection targets.
     pub(crate) redirect_open_handler: Option<RedirectOpenHandler>,
     /// PID of the last background command ($!).
@@ -306,6 +326,7 @@ pub struct Shell {
     /// when a heredoc targets fd 0 in sink mode (avoids process-wide dup2 on fd 0
     /// which would race with other threads reading stdin, e.g. nerv's input loop).
     pub(crate) pending_stdin: Option<RawFd>,
+    pub(crate) redirection_backups: Vec<Option<std::os::fd::OwnedFd>>,
 }
 
 /// Shell option flags (`set -e`, `set -u`, etc.).
@@ -405,6 +426,7 @@ pub struct ShellBuilder {
     timeout: Option<std::time::Duration>,
     env_clear: bool,
     external_handler: Option<ExternalHandler>,
+    command_policy: Option<CommandPolicy>,
     redirect_open_handler: Option<RedirectOpenHandler>,
 }
 
@@ -431,6 +453,7 @@ impl ShellBuilder {
             timeout: None,
             env_clear: false,
             external_handler: None,
+            command_policy: None,
             redirect_open_handler: None,
         }
     }
@@ -496,6 +519,11 @@ impl ShellBuilder {
         self.external_handler = Some(handler);
         self
     }
+    /// Set a callback that can refuse expanded command targets. Without a callback, all targets are allowed.
+    pub fn command_policy(mut self, policy: CommandPolicy) -> Self {
+        self.command_policy = Some(policy);
+        self
+    }
     /// Set a provider that opens writable redirection targets.
     pub fn redirect_open_handler(mut self, handler: RedirectOpenHandler) -> Self {
         self.redirect_open_handler = Some(handler);
@@ -542,9 +570,11 @@ impl ShellBuilder {
             child_pids: Vec::new(),
             timeout: self.timeout.map(|d| std::time::Instant::now() + d),
             external_handler: self.external_handler,
+            command_policy: self.command_policy,
             redirect_open_handler: self.redirect_open_handler,
             last_bg_pid: None,
             pending_stdin: None,
+            redirection_backups: Vec::new(),
         }
     }
 }
@@ -582,9 +612,11 @@ impl Shell {
             child_pids: Vec::new(),
             timeout: None,
             external_handler: None,
+            command_policy: None,
             redirect_open_handler: None,
             last_bg_pid: None,
             pending_stdin: None,
+            redirection_backups: Vec::new(),
         }
     }
 
@@ -635,6 +667,46 @@ impl Shell {
     /// Trap handlers.
     pub fn traps(&self) -> &FxHashMap<String, String> {
         &self.traps
+    }
+
+    pub(crate) fn check_command_policy(
+        &mut self,
+        target: &str,
+        span: Span,
+    ) -> crate::error::Result<()> {
+        let Some(policy) = self.command_policy.as_mut() else {
+            return Ok(());
+        };
+        let target = ShellBytes::from_str_lossless(target);
+        if let Some(diagnostic) = policy(&target) {
+            return Err(ShellError::Runtime {
+                msg: diagnostic,
+                span,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_command_policy_for_dispatch(
+        &mut self,
+        args: &[String],
+        span: Span,
+    ) -> crate::error::Result<()> {
+        let mut args = args;
+        loop {
+            let Some(target) = args.first() else {
+                return Ok(());
+            };
+            self.check_command_policy(target, span)?;
+            if target != "command" {
+                return Ok(());
+            }
+            match crate::builtins::command_action(args) {
+                crate::builtins::CommandAction::Execute(nested_args) => args = nested_args,
+                crate::builtins::CommandAction::Empty
+                | crate::builtins::CommandAction::Describe { .. } => return Ok(()),
+            }
+        }
     }
 
     /// Check cancellation flag and timeout deadline.
@@ -797,6 +869,11 @@ impl Shell {
         self.external_handler = Some(handler);
     }
 
+    /// Replace the callback that can refuse expanded command targets.
+    pub fn set_command_policy(&mut self, policy: CommandPolicy) {
+        self.command_policy = Some(policy);
+    }
+
     /// Install a provider that owns the open of writable redirections
     /// (`>`, `>|`, `>>`, `<>`). See [`RedirectOpenHandler`].
     pub fn set_redirect_open_handler(&mut self, handler: RedirectOpenHandler) {
@@ -837,7 +914,7 @@ impl Shell {
     /// Resolve a path against the shell's working directory.
     /// Absolute paths are returned as-is; relative paths are joined with `self.cwd`.
     pub fn resolve_path(&self, p: &str) -> PathBuf {
-        self.resolve_path_bytes(&ShellBytes::from_str_lossless(p))
+        self.resolve_path_bytes(&ShellBytes::from(p))
     }
 
     /// Resolve a path against the shell's working directory from raw shell bytes.
@@ -910,7 +987,7 @@ impl Shell {
                     continue;
                 }
                 let action = action.clone();
-                let mut parser = Parser::new(&action);
+                let mut parser = Parser::from_shell_string(&action);
                 if let Ok(program) = parser.parse() {
                     for cmd in &program.commands {
                         let _ = self.eval_command(cmd);
@@ -924,7 +1001,7 @@ impl Shell {
     pub(crate) fn run_exit_trap(&mut self) {
         // Remove the trap to prevent recursive invocation
         if let Some(action) = self.traps.remove("EXIT") {
-            let mut parser = Parser::new(&action);
+            let mut parser = Parser::from_shell_string(&action);
             if let Ok(program) = parser.parse() {
                 for cmd in &program.commands {
                     let _ = self.eval_command(cmd);
@@ -1079,8 +1156,7 @@ impl Shell {
                     // EV_EXIT optimization. Prevents pipe fd leaks.
                     let saved = self.setup_redirections(redirs)?;
                     let result = self.eval_command(body);
-                    self.restore_redirections(saved);
-                    result
+                    self.finish_redirections(result, saved)
                 } else {
                     self.eval_in_subshell(body, redirs)
                 }
@@ -1093,8 +1169,7 @@ impl Shell {
             } => {
                 let saved = self.setup_redirections(redirs)?;
                 let result = self.eval_command(body);
-                self.restore_redirections(saved);
-                result
+                self.finish_redirections(result, saved)
             }
 
             Command::If {
@@ -1205,7 +1280,7 @@ impl Shell {
                 let mut last_status = ExitStatus::SUCCESS;
                 for value in &word_list {
                     self.check_cancel()?;
-                    if let Err(e) = self.vars.set(var, value) {
+                    if let Err(e) = self.vars.set_shell(var, value) {
                         self.err_msg(&e);
                         return Ok(ExitStatus::FAILURE);
                     }
@@ -1237,7 +1312,7 @@ impl Shell {
                 for arm in arms {
                     for pattern in &arm.patterns {
                         let pat = self.expand_pattern(pattern)?;
-                        if glob::fnmatch(&pat, &expanded) {
+                        if glob::fnmatch_shell(&pat, &expanded) {
                             if let Some(ref body) = arm.body {
                                 return self.eval_command(body);
                             } else {
@@ -1305,11 +1380,13 @@ impl Shell {
             for assign in assigns {
                 let value = self.expand_string(&assign.value)?;
                 self.vars
-                    .set(&assign.name, &value)
+                    .set_shell(&assign.name, &value)
                     .map_err(|msg| ShellError::Runtime { msg, span })?;
             }
             return Ok(self.exit_status);
         }
+
+        self.check_command_policy_for_dispatch(&expanded_args, span)?;
 
         // xtrace: print $PS4, assignments, then args (like dash's evalcommand)
         if self.opts.xtrace {
@@ -1360,17 +1437,10 @@ impl Shell {
         };
 
         if is_exec {
-            // exec redirections are permanent — close saved copies instead of restoring
-            for s in saved_fds {
-                if let Some(copy) = s.saved_copy {
-                    // SAFETY: copy is a valid fd from fcntl_dupfd_cloexec.
-                    sys::close(copy);
-                }
-            }
+            self.finish_saved_redirections(result, saved_fds)
         } else {
-            self.restore_redirections(saved_fds);
+            self.finish_redirections(result, saved_fds)
         }
-        result
     }
 
     /// Run an external command through the embedder's handler.
@@ -1401,7 +1471,7 @@ impl Shell {
                 )
             })
             .collect();
-        let args_bytes: Vec<ShellBytes> = args.iter().cloned().map(Into::into).collect();
+        let args_bytes: Vec<ShellBytes> = args.iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
         let handler = self
             .external_handler
             .as_mut()
@@ -1424,7 +1494,7 @@ impl Shell {
         // Save and set positional parameters (take avoids clone)
         let saved_positional = std::mem::replace(
             &mut self.vars.positional,
-            args[1..].iter().cloned().map(Into::into).collect(),
+            args[1..].iter().map(|s| ShellBytes::from_str_lossless(s)).collect(),
         );
 
         // Push scope for local variables
@@ -1434,7 +1504,7 @@ impl Shell {
         for assign in assigns {
             let value = self.expand_string(&assign.value)?;
             self.vars.make_local(&assign.name);
-            let _ = self.vars.set(&assign.name, &value);
+            let _ = self.vars.set_shell(&assign.name, &value);
         }
 
         // Setup redirections
@@ -1447,8 +1517,7 @@ impl Shell {
             Err(e) => Err(e),
         };
 
-        // Restore state
-        self.restore_redirections(saved_fds);
+        let result = self.finish_redirections(result, saved_fds);
         self.vars.pop_scope();
         self.vars.positional = saved_positional;
 
@@ -1464,12 +1533,12 @@ impl Shell {
         // An executable script whose interpreter is broken surfaces as a bare
         // ENOTDIR/ENOENT/EACCES; report it bash-style instead of a raw errno.
         if let Some(code) = e.raw_os_error() {
-            let path_env = self
-                .vars
-                .get("PATH")
-                .unwrap_or("/usr/local/bin:/usr/bin:/bin");
-            if let Some(msg) = bad_interpreter_message(cmd_name, code, &self.cwd, path_env) {
-                self.err_msg(&msg);
+            let path_env = self.vars.get_bytes("PATH")
+                .map(|value| value.to_os_string())
+                .unwrap_or_else(|| OsString::from("/usr/local/bin:/usr/bin:/bin"));
+            let cmd_name = ShellBytes::from_str_lossless(cmd_name).to_os_string();
+            if let Some(msg) = bad_interpreter_message_os(&cmd_name, code, &self.cwd, &path_env) {
+                self.err_msg(&crate::encoding::bytes_to_str(msg.as_bytes()));
                 return Ok(ExitStatus::NOT_EXECUTABLE);
             }
         }
@@ -1494,7 +1563,7 @@ impl Shell {
     ) -> crate::error::Result<ExitStatus> {
         self.check_cancel()?;
         let saved = self.setup_redirections(redirs)?;
-        let args_bytes: Vec<ShellBytes> = args.iter().cloned().map(Into::into).collect();
+        let args_bytes: Vec<ShellBytes> = args.iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
         let mut assign_bytes = Vec::new();
         for assign in assigns {
             let value = self.expand_string(&assign.value)?;
@@ -1509,8 +1578,8 @@ impl Shell {
             let env = self.vars.env_for_command_os(&assign_bytes);
             let _ = std::env::set_current_dir(&self.cwd);
             let err = crate::builtins::exec::execve_with_env(&args_bytes[0], &args_bytes, &env);
-            self.restore_redirections(saved);
-            return self.handle_exec_error(&err, &args[0]);
+            let result = self.handle_exec_error(&err, &args[0]);
+            return self.finish_redirections(result, saved);
         }
 
         let mut cmd = std::process::Command::new(args_bytes[0].to_os_string());
@@ -1585,8 +1654,7 @@ impl Shell {
                             for h in handles {
                                 let _ = h.join();
                             }
-                            self.restore_redirections(saved);
-                            return Err(e);
+                            return self.finish_redirections(Err(e), saved);
                         }
                     }
                 } else {
@@ -1607,8 +1675,7 @@ impl Shell {
             Err(e) => self.handle_exec_error(&e, &args[0]),
         };
 
-        self.restore_redirections(saved);
-        result
+        self.finish_redirections(result, saved)
     }
 
     /// Execute a pipeline.
@@ -1638,10 +1705,9 @@ impl Shell {
             unsafe {
                 let pid = sys::fork();
                 if pid < 0 {
-                    // Fork failed — clean up pipes and kill already-forked children
                     for &(r, w) in &pipes {
-                        sys::close(r);
-                        sys::close(w);
+                        let _ = sys::close(r);
+                        let _ = sys::close(w);
                     }
                     self.kill_children();
                     return Err(ShellError::Io(std::io::Error::last_os_error()));
@@ -1668,10 +1734,9 @@ impl Shell {
                     if i < commands.len() - 1 {
                         sys::dup2(pipes[i].1, 1);
                     }
-                    // Close all pipe fds
                     for &(read_fd, write_fd) in &pipes {
-                        sys::close(read_fd);
-                        sys::close(write_fd);
+                        let _ = sys::close(read_fd);
+                        let _ = sys::close(write_fd);
                     }
 
                     // Mark this as exit context — eval_external can exec
@@ -1700,9 +1765,8 @@ impl Shell {
 
         // Parent: close all pipe fds
         for &(read_fd, write_fd) in &pipes {
-            // SAFETY: fds are valid from pipe() and not yet closed in parent.
-            sys::close(read_fd);
-            sys::close(write_fd);
+            let _ = sys::close(read_fd);
+            let _ = sys::close(write_fd);
         }
 
         // Interactive mode: give the pipeline the terminal
@@ -1883,20 +1947,34 @@ impl Shell {
                 && !expanded.is_empty()
                 && is_command_substitution_builtin(&expanded[0])
             {
+                if let Err(error) = self.check_command_policy_for_dispatch(&expanded, *span) {
+                    self.err_msg(&format!("epsh: {error}"));
+                    self.exit_status = ExitStatus::MISUSE;
+                    return Ok(String::new());
+                }
                 // Capture output to buffer instead of forking
                 let saved_sink = self.stdout_sink.take();
                 let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
                 self.stdout_sink = Some(buf.clone());
                 let status = self.try_builtin(&expanded[0], &expanded, &[], &[], *span);
                 self.stdout_sink = saved_sink;
-                if let Ok(Some(s)) = status {
-                    self.exit_status = s;
-                    let captured = buf.lock().unwrap();
-                    let mut output = crate::encoding::bytes_to_str(&captured);
-                    while output.ends_with('\n') {
-                        output.pop();
+                match status {
+                    Ok(Some(status)) => {
+                        self.exit_status = status;
+                        let captured = buf.lock().unwrap();
+                        let mut output = crate::encoding::bytes_to_str(&captured);
+                        while output.ends_with('\n') {
+                            output.pop();
+                        }
+                        return Ok(output);
                     }
-                    return Ok(output);
+                    Err(error @ ShellError::Runtime { .. }) => {
+                        self.err_msg(&format!("epsh: {error}"));
+                        self.exit_status = ExitStatus::MISUSE;
+                        return Ok(String::new());
+                    }
+                    Err(_) => {}
+                    Ok(None) => {}
                 }
                 // Fallback: not a builtin after all, continue to fork path
             }
@@ -1948,22 +2026,27 @@ impl Shell {
 
             let pid = sys::fork();
             if pid < 0 {
-                sys::close(fds[0]);
-                sys::close(fds[1]);
-                return Err(ShellError::Io(std::io::Error::last_os_error()));
+                let error = std::io::Error::last_os_error();
+                let _ = sys::close(fds[0]);
+                let _ = sys::close(fds[1]);
+                return Err(ShellError::Io(error));
             }
 
             if pid == 0 {
                 // Child: redirect stdout to write end of pipe
                 let _ = rustix::process::setpgid(None, None);
                 self.in_forked_child = true;
-                sys::close(fds[0]);
+                let _ = sys::close(fds[0]);
                 sys::dup2(fds[1], 1);
-                sys::close(fds[1]);
+                let _ = sys::close(fds[1]);
 
                 let status = match self.eval_command(cmd) {
                     Ok(s) => s,
                     Err(ShellError::Exit(n)) => n,
+                    Err(error @ ShellError::Runtime { .. }) => {
+                        self.err_msg(&format!("epsh: {error}"));
+                        ExitStatus::MISUSE
+                    }
                     Err(_) => ExitStatus::FAILURE,
                 };
                 self.run_exit_trap();
@@ -1971,7 +2054,7 @@ impl Shell {
             }
 
             // Parent: read from read end
-            sys::close(fds[1]);
+            let _ = sys::close(fds[1]);
             self.child_pids.push(pid);
 
             let mut raw_output = Vec::new();
@@ -2117,7 +2200,6 @@ mod tests {
     #[test]
     fn run_pipeline_external() {
         let mut shell = Shell::new();
-        // Simple pipeline test using external commands
         let status = shell.run_script("echo hello | cat");
         assert_eq!(status, 0);
     }
@@ -2129,9 +2211,11 @@ mod tests {
         let mut shell = Shell::builder().env_clear().build();
         shell.set_var("EPSH_PIPELINE_ENV", "works").unwrap();
         shell.vars_mut().export("EPSH_PIPELINE_ENV");
+        shell.set_var("PATH", "/bin:/usr/bin").unwrap();
+        shell.vars_mut().export("PATH");
 
         let status = shell.run_script(&format!(
-            "/usr/bin/env | /usr/bin/grep EPSH_PIPELINE_ENV > {output_path}"
+            "/usr/bin/env | grep EPSH_PIPELINE_ENV > {output_path}"
         ));
         assert_eq!(status, 0);
         assert_eq!(
