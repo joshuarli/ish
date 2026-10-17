@@ -374,6 +374,15 @@ mod tests {
     use super::read_entries;
 
     #[test]
+    fn entry_names_replace_terminal_controls() {
+        assert_eq!(super::sanitize_name("plain name"), "plain name");
+        assert_eq!(
+            super::sanitize_name("line\nbreak\t\u{0085}"),
+            "line�break��"
+        );
+    }
+
+    #[test]
     fn concurrent_reads_keep_owner_and_group_names() {
         const WORKERS: usize = 8;
         const READS_PER_WORKER: usize = 256;
