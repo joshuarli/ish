@@ -4,6 +4,7 @@ import IshSemantics.Effects.Tests
 import IshSemantics.Evaluation
 import IshSemantics.Evaluation.Tests
 import IshSemantics.Expansion
+import IshSemantics.ExpansionTests
 import IshSemantics.Interactive
 import IshSemantics.Policy
 import IshSemantics.Protocol
