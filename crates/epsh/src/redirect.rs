@@ -1,10 +1,11 @@
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::io::Write;
 use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use crate::ast::*;
 use crate::error::ShellError;
-use crate::eval::{RedirectOpen, RedirectOpenMode, Shell};
+use crate::eval::{OutputSink, RedirectOpen, RedirectOpenMode, Shell};
 use crate::shell_bytes::ShellBytes;
 
 use crate::sys;
@@ -95,6 +96,8 @@ pub(crate) struct SavedFd {
     pub(crate) target_fd: RawFd,
     pub(crate) backup_slot: Option<usize>,
     pub(crate) was_closed: bool,
+    sink: Option<OutputSink>,
+    flags: Option<rustix::io::FdFlags>,
 }
 
 #[derive(Default)]
@@ -110,13 +113,13 @@ impl Shell {
             self.redirection_fds[index]
                 .as_ref()
                 .expect("pending stdin slot is occupied")
-                .as_raw_fd()
+                .lock().unwrap().as_ref().unwrap().as_raw_fd()
         })
     }
 
     fn hold_pending_stdin(&mut self, fd: OwnedFd) -> usize {
         let index = self.redirection_fds.len();
-        self.redirection_fds.push(Some(fd));
+        self.redirection_fds.push(Some(Arc::new(Mutex::new(Some(fd)))));
         index
     }
 
@@ -161,14 +164,15 @@ impl Shell {
         target_fd: RawFd,
         saved_fd_min: RawFd,
     ) -> crate::error::Result<()> {
-        let Some(index) = self.redirection_fds.iter().position(|backup| {
-            backup.as_ref().is_some_and(|fd| fd.as_raw_fd() == target_fd)
-        }) else {
-            return Ok(());
-        };
-        let moved = sys::duplicate_fd_above(target_fd, saved_fd_min)?;
-        let old = self.redirection_fds[index].replace(moved).unwrap();
-        sys::close(old.into_raw_fd())?;
+        for descriptor in self.redirection_fds.iter().flatten() {
+            let mut held = descriptor.lock().unwrap();
+            let Some(current) = held.as_ref() else { continue; };
+            if current.as_raw_fd() != target_fd { continue; }
+            let moved = sys::duplicate_fd_above(target_fd, saved_fd_min)?;
+            let old = std::mem::replace(held.as_mut().unwrap(), moved);
+            sys::close(old.into_raw_fd())?;
+            break;
+        }
         Ok(())
     }
 
@@ -191,7 +195,7 @@ impl Shell {
         }
     }
 
-    fn trim_redirection_fds(&mut self) {
+    pub(crate) fn trim_redirection_fds(&mut self) {
         while self.redirection_fds.last().is_some_and(Option::is_none) {
             self.redirection_fds.pop();
         }
@@ -253,7 +257,7 @@ impl Shell {
                 {
                     Ok(copy) => {
                         let index = self.redirection_fds.len();
-                        self.redirection_fds.push(Some(copy));
+                        self.redirection_fds.push(Some(Arc::new(Mutex::new(Some(copy)))));
                         (Some(index), false)
                     }
                     Err(error) if error.raw_os_error() == Some(libc::EBADF) => (None, true),
@@ -264,6 +268,8 @@ impl Shell {
                     target_fd,
                     backup_slot,
                     was_closed,
+                    sink: self.output_sink(target_fd),
+                    flags: if was_closed { None } else { Some(sys::descriptor_flags(target_fd)?) },
                 });
             }
 
@@ -277,6 +283,7 @@ impl Shell {
                         ShellError::Io(e)
                     })?;
                     install_redirection(file.into(), target_fd).map_err(ShellError::Io)?;
+                    self.set_output_sink(target_fd, None);
                 }
                 RedirKind::Output(word)
                 | RedirKind::Clobber(word)
@@ -297,18 +304,22 @@ impl Shell {
                             ShellError::Io(e)
                         })?;
                     install_redirection(file, target_fd).map_err(ShellError::Io)?;
+                    self.set_output_sink(target_fd, None);
                 }
                 RedirKind::DupInput(word) | RedirKind::DupOutput(word) => {
                     let fd_str = self.expand_string(word)?;
                     if fd_str == "-" {
                         sys::close(target_fd)?;
+                        self.set_output_sink(target_fd, None);
                     } else if let Ok(source_fd) = fd_str.parse::<i32>() {
                         if self.redirection_fds.iter().any(|backup| {
-                            backup.as_ref().is_some_and(|fd| fd.as_raw_fd() == source_fd)
+                            backup.as_ref().is_some_and(|fd| fd.lock().unwrap().as_ref().is_some_and(|fd| fd.as_raw_fd() == source_fd))
                         }) {
                             return Err(ShellError::Io(std::io::Error::from_raw_os_error(libc::EBADF)));
                         }
+                        let sink = self.output_sink(source_fd);
                         sys::dup2_result(source_fd, target_fd).map_err(ShellError::Io)?;
+                        self.set_output_sink(target_fd, sink);
                     } else {
                         return Err(ShellError::Runtime {
                             msg: format!("{fd_str}: bad file descriptor"),
@@ -317,9 +328,6 @@ impl Shell {
                     }
                 }
                 RedirKind::HereDoc(body) | RedirKind::HereDocStrip(body) => {
-                    let (read_end, write_end) = sys::pipe_owned()?;
-                    let write_end = std::fs::File::from(write_end);
-
                     let expanded = match body {
                         HereDocBody::Literal(s) => s.clone(),
                         HereDocBody::Parsed(parts) => {
@@ -332,8 +340,10 @@ impl Shell {
                             )
                         }
                     };
-                    (&write_end).write_all(expanded.as_bytes())?;
-                    drop(write_end);
+                    let mut file = sys::heredoc_file()?;
+                    file.write_all(expanded.as_bytes())?;
+                    std::io::Seek::rewind(&mut file)?;
+                    let read_end = OwnedFd::from(file);
 
                     if target_fd == 0 && (self.stdout_sink.is_some() || self.stderr_sink.is_some())
                     {
@@ -341,6 +351,7 @@ impl Shell {
                     } else {
                         install_redirection(read_end, target_fd).map_err(ShellError::Io)?;
                     }
+                    self.set_output_sink(target_fd, None);
                 }
             }
         }
@@ -359,10 +370,18 @@ impl Shell {
         } = saved;
         let mut errors = Vec::new();
         for s in fds.into_iter().rev() {
+            self.set_output_sink(s.target_fd, s.sink);
             if let Some(index) = s.backup_slot {
-                let copy = self.redirection_fds[index].take().unwrap().into_raw_fd();
-                if let Err(error) = sys::dup2_result(copy, s.target_fd) {
-                    errors.push(error);
+                let copy = Arc::try_unwrap(self.redirection_fds[index].take().unwrap()).unwrap().into_inner().unwrap().unwrap().into_raw_fd();
+                match sys::dup2_result(copy, s.target_fd) {
+                    Ok(()) => {
+                        if let Some(flags) = s.flags {
+                            // SAFETY: dup2 just installed an open descriptor at the saved target.
+                            let target = unsafe { std::os::fd::BorrowedFd::borrow_raw(s.target_fd) };
+                            if let Err(error) = rustix::io::fcntl_setfd(target, flags) { errors.push(error.into()); }
+                        }
+                    }
+                    Err(error) => errors.push(error),
                 }
                 if let Err(error) = sys::close(copy) {
                     errors.push(error);
@@ -419,7 +438,7 @@ impl Shell {
             .into_iter()
             .filter_map(|state| state.backup_slot)
             .filter_map(|index| {
-                let fd = self.redirection_fds[index].take().unwrap().into_raw_fd();
+                let fd = Arc::try_unwrap(self.redirection_fds[index].take().unwrap()).unwrap().into_inner().unwrap().unwrap().into_raw_fd();
                 sys::close(fd).err()
             })
             .collect();

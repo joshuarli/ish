@@ -52,7 +52,7 @@ pub fn expand_word_to_fields(
     let mut result = Vec::new();
     let cwd = sh.cwd();
     for field in split {
-        if !sh.noglob() && glob::has_glob_chars(&field) {
+        if !sh.noglob() && glob::has_glob_chars_shell(&field) {
             let matches = glob::glob_shell(&field, cwd);
             if matches.is_empty() {
                 result.push(remove_glob_escapes(&field));
@@ -86,7 +86,7 @@ pub fn expand_pattern(
             WordPart::SingleQuoted(s) => {
                 // Single-quoted — escape glob chars for fnmatch
                 for c in s.to_shell_string().chars() {
-                    if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                    if matches!(c, '*' | '?' | '[' | ']' | '\\' | '!') {
                         result.push(CTLESC);
                     }
                     result.push(c);
@@ -96,7 +96,7 @@ pub fn expand_pattern(
                 let inner_expanded = expand_word_parts_inner(inner, sh, true, false, false)?;
                 let text: String = inner_expanded.into_iter().map(|f| f.value).collect();
                 for c in text.chars() {
-                    if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                    if matches!(c, '*' | '?' | '[' | ']' | '\\' | '!') {
                         result.push(CTLESC);
                     }
                     result.push(c);
@@ -106,7 +106,7 @@ pub fn expand_pattern(
                 // Parameter expansion in pattern — value is literal (escape globs)
                 let value = expand_param(param, sh)?;
                 for c in value.chars() {
-                    if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                    if matches!(c, '*' | '?' | '[' | ']' | '\\' | '!') {
                         result.push(CTLESC);
                     }
                     result.push(c);
@@ -116,7 +116,7 @@ pub fn expand_pattern(
                 let frags = expand_word_parts_inner(std::slice::from_ref(part), sh, true, false, false)?;
                 let text: String = frags.into_iter().map(|f| f.value).collect();
                 for c in text.chars() {
-                    if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                    if matches!(c, '*' | '?' | '[' | ']' | '\\' | '!') {
                         result.push(CTLESC);
                     }
                     result.push(c);
@@ -150,11 +150,11 @@ fn protect_globs(value: String, enabled: bool) -> String {
         return value;
     }
     let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if matches!(ch, '*' | '?' | '[' | ']' | '\\') || ch == crate::lexer::CTLESC {
+    for unit in crate::encoding::shell_chars(&value) {
+        if unit != "/" {
             escaped.push(crate::lexer::CTLESC);
         }
-        escaped.push(ch);
+        escaped.push_str(unit);
     }
     escaped
 }
@@ -259,7 +259,7 @@ fn expand_word_parts_inner(
                 });
             }
             WordPart::CmdSubst(cmd) | WordPart::Backtick(cmd) => {
-                let value = sh.command_subst(cmd).unwrap_or_default();
+                let value = sh.command_subst(cmd)?;
                 result.push(ExpandedWord {
                     value,
                     split_fields: !quoted_context,
@@ -686,24 +686,20 @@ fn field_split(fragments: &[ExpandedWord], ifs: &str) -> Vec<String> {
     fields
 }
 
-/// Remove smallest/largest suffix matching pattern.
-/// Remove backslash escapes before glob metacharacters.
-/// These were preserved by the lexer for fnmatch/glob, but need stripping
-/// for normal word expansion (POSIX quote removal).
+/// Remove internal pattern-escape markers from a shell-encoded expansion value.
 pub fn remove_glob_escapes(s: &str) -> String {
-    use crate::lexer::CTLESC;
     let mut result = String::with_capacity(s.len());
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == CTLESC && i + 1 < chars.len() {
-            // Strip CTLESC, keep the escaped char
-            i += 1;
-            result.push(chars[i]);
+    let mut units = crate::encoding::shell_chars(s).peekable();
+    while let Some(unit) = units.next() {
+        if unit == "\u{FFFE}" {
+            if let Some(next) = units.next() {
+                result.push_str(next);
+            } else {
+                result.push_str(unit);
+            }
         } else {
-            result.push(chars[i]);
+            result.push_str(unit);
         }
-        i += 1;
     }
     result
 }

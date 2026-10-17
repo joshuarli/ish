@@ -60,6 +60,8 @@ the program to Shell::run_program:
 Shell::run_script returns an integer exit code. Shell::run_program returns an
 ExitStatus. By default, output goes to the process file descriptors. The sinks
 capture builtin output and output relayed by epsh's default child executor.
+Embedders that execute commands themselves can call
+`Shell::set_exit_status(ExitStatus)` to set the next `$?` expansion.
 
 Shell values preserve arbitrary bytes; operations at OS and C-string
 boundaries may reject NUL. Use set_var_bytes and get_var_bytes when Rust code
@@ -70,6 +72,10 @@ valid UTF-8. See [byte preservation](docs/byte-preservation.md).
 names and raw values, sorted by name. It includes local and exported values,
 omits unset placeholders, and does not expose variable flags or storage. Later
 mutations to the variable store do not change the returned snapshot.
+
+Use `parser::try_parse_word_parts` or `try_parse_word_parts_bytes` to receive
+nested syntax errors. The existing `Vec`-returning word helpers retain their
+legacy empty-command recovery; shell execution uses the strict parser.
 
 ## Builder options
 

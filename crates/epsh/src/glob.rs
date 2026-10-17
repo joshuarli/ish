@@ -5,20 +5,21 @@ use std::os::unix::ffi::OsStrExt;
 
 use crate::shell_bytes::ShellBytes;
 
+const GLOB_ESCAPE_MARKER: &str = "\u{FFFE}";
+
 /// Expand a glob pattern into matching filenames.
 /// Returns sorted matches, or empty vec if no matches.
 /// `cwd` is the working directory for resolving relative patterns.
 pub fn glob(pattern: &str, cwd: &Path) -> Vec<String> {
-    glob_shell(&crate::encoding::bytes_to_str(pattern.as_bytes()), cwd)
+    glob_shell(&crate::encoding::pattern_to_str(pattern), cwd)
 }
 
 pub(crate) fn glob_shell(pattern: &str, cwd: &Path) -> Vec<String> {
-    let pattern = ShellBytes::from_str_lossless(pattern);
     if pattern.is_empty() {
         return Vec::new();
     }
 
-    let (absolute, components) = split_components(pattern.as_bytes());
+    let (absolute, components) = split_components(pattern);
     if absolute && components.is_empty() {
         return vec!["/".into()];
     }
@@ -40,14 +41,23 @@ pub(crate) fn glob_shell(pattern: &str, cwd: &Path) -> Vec<String> {
     sort_results(results)
 }
 
-fn split_components(pattern: &[u8]) -> (bool, Vec<ShellBytes>) {
-    let absolute = pattern.starts_with(b"/");
+fn split_components(pattern: &str) -> (bool, Vec<String>) {
+    let absolute = pattern.starts_with('/');
     let components = pattern
-        .split(|b| *b == b'/')
-        .filter(|c| !c.is_empty())
-        .map(|c| ShellBytes::from_vec(c.to_vec()))
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .map(str::to_owned)
         .collect();
     (absolute, components)
+}
+
+fn component_starts_with_dot(pattern: &str) -> bool {
+    let mut units = crate::encoding::shell_chars(pattern);
+    match units.next() {
+        Some(GLOB_ESCAPE_MARKER) | Some("\\") => units.next() == Some("."),
+        Some(".") => true,
+        _ => false,
+    }
 }
 
 /// `fs_dir`: actual filesystem directory to read from
@@ -55,7 +65,7 @@ fn split_components(pattern: &[u8]) -> (bool, Vec<ShellBytes>) {
 fn glob_recursive(
     fs_dir: &Path,
     display_dir: &Path,
-    components: &[ShellBytes],
+    components: &[String],
     results: &mut Vec<String>,
 ) {
     if components.is_empty() {
@@ -63,11 +73,10 @@ fn glob_recursive(
     }
 
     let pattern = &components[0];
-    let pattern_shell = pattern.to_shell_string();
     let remaining = &components[1..];
 
-    if !has_glob_chars(&pattern_shell) {
-        let literal = literal_component(&pattern_shell).to_os_string();
+    if !has_glob_chars_shell(pattern) {
+        let literal = ShellBytes::from_str_lossless(&literal_component(pattern)).to_os_string();
         let fs_candidate = fs_dir.join(&literal);
         let display_candidate = display_dir.join(&literal);
         if remaining.is_empty() {
@@ -94,12 +103,11 @@ fn glob_recursive(
         let name = entry.file_name();
         let name_shell = ShellBytes::from_os_str(name.as_os_str()).to_shell_string();
 
-        // Dotfiles are only matched if the pattern starts with '.'
-        if name.as_os_str().as_bytes().starts_with(b".") && !pattern.as_bytes().starts_with(b".") {
+        if name.as_os_str().as_bytes().starts_with(b".") && !component_starts_with_dot(pattern) {
             continue;
         }
 
-        if fnmatch_shell(&pattern_shell, &name_shell) {
+        if fnmatch_shell(pattern, &name_shell) {
             let fs_full = fs_dir.join(&name);
             let display_full = display_dir.join(&name);
             if remaining.is_empty() {
@@ -111,28 +119,40 @@ fn glob_recursive(
     }
 }
 
-fn literal_component(pattern: &str) -> ShellBytes {
+fn literal_component(pattern: &str) -> String {
     let mut literal = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars();
-    while let Some(ch) = chars.next() {
-        if is_escape(ch as u32) {
-            literal.push(chars.next().unwrap_or(ch));
+    let mut units = crate::encoding::shell_chars(pattern).peekable();
+    while let Some(unit) = units.next() {
+        if unit == GLOB_ESCAPE_MARKER || unit == "\\" {
+            if let Some(next) = units.next() {
+                literal.push_str(next);
+            } else {
+                literal.push_str(unit);
+            }
         } else {
-            literal.push(ch);
+            literal.push_str(unit);
         }
     }
-    ShellBytes::from_str_lossless(&literal)
+    literal
 }
 
 /// Check if a string contains glob metacharacters.
 /// CTLESC- and backslash-preceded chars are escaped (not glob-active).
 pub fn has_glob_chars(s: &str) -> bool {
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
+    has_glob_chars_shell(&crate::encoding::bytes_to_str(s.as_bytes()))
+}
+
+pub(crate) fn has_glob_chars_shell(s: &str) -> bool {
+    let mut units = crate::encoding::shell_chars(s);
+    while let Some(unit) = units.next() {
+        if unit.starts_with(crate::encoding::ESCAPE) {
+            continue;
+        }
+        let c = unit.chars().next().unwrap();
         match c {
             '*' | '?' | '[' => return true,
-            c if c == crate::lexer::CTLESC || c == '\\' => {
-                chars.next(); // skip escaped char
+            c if unit == GLOB_ESCAPE_MARKER || c == '\\' => {
+                units.next();
             }
             _ => {}
         }
@@ -144,7 +164,7 @@ pub fn has_glob_chars(s: &str) -> bool {
 /// Supports: * (any string), ? (any char), [...] (char class), \ (escape)
 pub fn fnmatch(pattern: &str, string: &str) -> bool {
     fnmatch_shell(
-        &crate::encoding::bytes_to_str(pattern.as_bytes()),
+        &crate::encoding::pattern_to_str(pattern),
         &crate::encoding::bytes_to_str(string.as_bytes()),
     )
 }
@@ -157,7 +177,7 @@ pub(crate) fn fnmatch_shell(pattern: &str, string: &str) -> bool {
 
 /// Check if a pattern char is an escape marker (CTLESC or backslash).
 fn is_escape(c: u32) -> bool {
-    c == '\\' as u32 || c == crate::lexer::CTLESC as u32
+    c == '\\' as u32 || c == crate::encoding::GLOB_ESCAPE
 }
 
 /// Read one char from pattern, handling escape markers (CTLESC and \).

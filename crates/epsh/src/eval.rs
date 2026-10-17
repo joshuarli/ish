@@ -1,9 +1,10 @@
 use fxhash::FxHashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::RawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -150,36 +151,51 @@ fn apply_dot_navigation(cwd: &Path, path: &Path) -> PathBuf {
     result
 }
 
-/// Builtins safe to run in-process for command substitution.
-/// Either pure (no shell state modification) or delegates to pure commands.
-/// `command` is included because it dispatches to builtins/externals which
-/// work correctly with the output sink capture mechanism.
-/// Spawn a thread that relays data from a readable stream to a sink.
-fn spawn_relay(
-    stream: impl std::io::Read + Send + 'static,
-    sink: Arc<Mutex<dyn Write + Send>>,
-) -> std::thread::JoinHandle<()> {
+fn spawn_relay(stream: HeldDescriptor, sink: OutputSink) -> std::thread::JoinHandle<std::io::Result<()>> {
     std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        let mut reader = std::io::BufReader::new(stream);
+        let _reader_owner = RelayReader(stream.clone());
+        let mut buffer = [0u8; 8192];
         loop {
-            match std::io::Read::read(&mut reader, &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if let Ok(mut w) = sink.lock() {
-                        let _ = w.write_all(&buf[..n]);
-                    }
+            let reader = stream.lock().unwrap();
+            let Some(descriptor) = reader.as_ref() else { return Ok(()); };
+            match rustix::io::read(descriptor, &mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(length) => {
+                    drop(reader);
+                    sink.lock().map_err(|_| std::io::Error::other("output sink is poisoned"))?.write_all(&buffer[..length])?;
                 }
+                Err(rustix::io::Errno::INTR) => {}
+                Err(rustix::io::Errno::AGAIN) => {
+                    drop(reader);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(error.into()),
             }
         }
     })
 }
 
-fn is_command_substitution_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "echo" | "printf" | "true" | "false" | ":" | "pwd" | "type" | "test" | "[" | "command"
-    )
+pub(crate) type OutputSink = Arc<Mutex<dyn Write + Send>>;
+type HeldDescriptor = Arc<Mutex<Option<OwnedFd>>>;
+
+struct RelayReader(HeldDescriptor);
+
+impl Drop for RelayReader {
+    fn drop(&mut self) {
+        drop(self.0.lock().unwrap().take());
+    }
+}
+
+struct ChildRelays {
+    handles: Vec<std::thread::JoinHandle<std::io::Result<()>>>,
+    descriptors: Vec<usize>,
+}
+
+struct ForkOutput {
+    target: RawFd,
+    read: OwnedFd,
+    write: OwnedFd,
+    sink: OutputSink,
 }
 use crate::error::{ExitStatus, ShellError, Span};
 use crate::expand;
@@ -299,8 +315,6 @@ pub struct Shell {
     /// True when evaluating a condition (if test, while cond, && / || operands).
     /// Suppresses set -e (errexit). Mirrors dash's EV_TESTED flag.
     pub(crate) tested: bool,
-    /// True when executing inside a forked child (pipeline stage, command subst).
-    /// Subshells skip the extra fork to avoid pipe fd leaks.
     pub(crate) in_forked_child: bool,
     /// True when the current eval context will exit after the command completes.
     /// Allows eval_external to exec directly instead of fork+exec (dash's EV_EXIT).
@@ -311,8 +325,11 @@ pub struct Shell {
     pub(crate) stdout_sink: Option<Arc<Mutex<dyn Write + Send>>>,
     /// Optional stderr sink. When set, error output goes here instead of fd 2.
     pub(crate) stderr_sink: Option<Arc<Mutex<dyn Write + Send>>>,
+    pub(crate) descriptor_sinks: FxHashMap<RawFd, OutputSink>,
     /// PIDs of currently running child processes (for cancellation cleanup).
     pub(crate) child_pids: Vec<i32>,
+    child_groups: FxHashMap<i32, i32>,
+    child_relays: FxHashMap<i32, ChildRelays>,
     /// Optional execution deadline. When exceeded, shell aborts with TimedOut.
     timeout: Option<std::time::Instant>,
     /// Optional callback that replaces eval_external for spawning processes.
@@ -323,8 +340,9 @@ pub struct Shell {
     pub(crate) redirect_open_handler: Option<RedirectOpenHandler>,
     /// PID of the last background command ($!).
     last_bg_pid: Option<u32>,
+    substitution_count: u64,
     pub(crate) pending_stdin: Option<usize>,
-    pub(crate) redirection_fds: Vec<Option<OwnedFd>>,
+    pub(crate) redirection_fds: Vec<Option<HeldDescriptor>>,
 }
 
 /// Shell option flags (`set -e`, `set -u`, etc.).
@@ -566,11 +584,15 @@ impl ShellBuilder {
             stdout_sink: self.stdout_sink,
             stderr_sink: self.stderr_sink,
             child_pids: Vec::new(),
+            descriptor_sinks: FxHashMap::default(),
+            child_groups: FxHashMap::default(),
+            child_relays: FxHashMap::default(),
             timeout: self.timeout.map(|d| std::time::Instant::now() + d),
             external_handler: self.external_handler,
             command_policy: self.command_policy,
             redirect_open_handler: self.redirect_open_handler,
             last_bg_pid: None,
+            substitution_count: 0,
             pending_stdin: None,
             redirection_fds: Vec::new(),
         }
@@ -583,7 +605,183 @@ impl Default for Shell {
     }
 }
 
+impl Drop for Shell {
+    fn drop(&mut self) {
+        self.kill_children();
+        let orphaned_relays: Vec<_> = self.child_relays.keys().copied().collect();
+        for pid in orphaned_relays { self.discard_child_relays(pid); }
+    }
+}
+
 impl Shell {
+    pub(crate) fn output_sink(&self, fd: RawFd) -> Option<OutputSink> {
+        match fd {
+            1 => self.stdout_sink.clone(),
+            2 => self.stderr_sink.clone(),
+            _ => self.descriptor_sinks.get(&fd).cloned(),
+        }
+    }
+
+    pub(crate) fn set_output_sink(&mut self, fd: RawFd, sink: Option<OutputSink>) {
+        match fd {
+            1 => self.stdout_sink = sink,
+            2 => self.stderr_sink = sink,
+            _ => match sink {
+                Some(sink) => { self.descriptor_sinks.insert(fd, sink); }
+                None => { self.descriptor_sinks.remove(&fd); }
+            },
+        }
+    }
+
+    fn fork_outputs(&self, capture_stdout: bool) -> crate::error::Result<Vec<ForkOutput>> {
+        let mut outputs = Vec::new();
+        let mut targets: Vec<_> = self.descriptor_sinks.keys().copied().collect();
+        targets.extend([1, 2]);
+        for target in targets {
+            if target == 1 && !capture_stdout { continue; }
+            if let Some(sink) = self.output_sink(target) {
+                let (read, write) = sys::pipe_owned()?;
+                outputs.push(ForkOutput { target, read, write, sink });
+            }
+        }
+        Ok(outputs)
+    }
+
+    fn enter_forked_child(&mut self, outputs: &[ForkOutput], pgid: i32) -> std::io::Result<()> {
+        rustix::process::setpgid(None, rustix::process::Pid::from_raw(pgid))?;
+        self.in_forked_child = true;
+        self.child_pids.clear();
+        self.child_groups.clear();
+        let inherited_readers: Vec<_> = self.child_relays.values().flat_map(|relays| relays.descriptors.iter().copied()).collect();
+        for index in inherited_readers {
+            if let Some(descriptor) = self.redirection_fds[index].take() {
+                drop(descriptor.lock().unwrap().take());
+            }
+        }
+        self.child_relays.clear();
+        if let Some(fd) = self.pending_stdin_fd() {
+            sys::dup2_result(fd, 0)?;
+            self.pending_stdin = None;
+        }
+        self.stdout_sink = None;
+        self.stderr_sink = None;
+        self.descriptor_sinks.clear();
+        for output in outputs {
+            sys::dup2_result(output.write.as_raw_fd(), output.target)?;
+        }
+        for output in outputs {
+            sys::close(output.read.as_raw_fd())?;
+            sys::close(output.write.as_raw_fd())?;
+        }
+        Ok(())
+    }
+
+    fn start_relay(&mut self, stream: OwnedFd, sink: OutputSink) -> std::io::Result<(std::thread::JoinHandle<std::io::Result<()>>, usize)> {
+        let flags = rustix::fs::fcntl_getfl(&stream)?;
+        rustix::fs::fcntl_setfl(&stream, flags | rustix::fs::OFlags::NONBLOCK)?;
+        let stream = Arc::new(Mutex::new(Some(stream)));
+        let index = self.redirection_fds.len();
+        self.redirection_fds.push(Some(stream.clone()));
+        Ok((spawn_relay(stream, sink), index))
+    }
+
+    fn relay_fork_outputs(&mut self, pid: i32, outputs: Vec<ForkOutput>) -> crate::error::Result<()> {
+        let streams = outputs.into_iter().map(|output| {
+            drop(output.write);
+            (output.read, output.sink)
+        }).collect();
+        self.relay_streams(pid, streams)
+    }
+
+    fn relay_streams(&mut self, pid: i32, streams: Vec<(OwnedFd, OutputSink)>) -> crate::error::Result<()> {
+        self.child_relays.insert(pid, ChildRelays { handles: Vec::new(), descriptors: Vec::new() });
+        for (stream, sink) in streams {
+            let (handle, index) = match self.start_relay(stream, sink) {
+                Ok(relay) => relay,
+                Err(error) => {
+                    self.kill_children();
+                    return Err(error.into());
+                }
+            };
+            let relays = self.child_relays.get_mut(&pid).unwrap();
+            relays.handles.push(handle);
+            relays.descriptors.push(index);
+        }
+        Ok(())
+    }
+
+    fn fork_evaluator(&self) -> i32 {
+        let guards: Vec<_> = self.redirection_fds.iter().flatten().map(|descriptor| descriptor.lock().unwrap()).collect();
+        // SAFETY: descriptor readers are paused across fork; both processes release their copied guards before evaluating.
+        let pid = unsafe { sys::fork() };
+        drop(guards);
+        pid
+    }
+
+    fn track_child(&mut self, pid: i32, pgid: i32) {
+        let _ = rustix::process::setpgid(rustix::process::Pid::from_raw(pid), rustix::process::Pid::from_raw(pgid));
+        self.child_pids.push(pid);
+        self.child_groups.insert(pid, pgid);
+    }
+
+    fn child_group(&self, pid: i32) -> i32 {
+        self.child_groups.get(&pid).copied().unwrap_or(pid)
+    }
+
+    fn terminate_group(&self, pgid: i32) {
+        if let Some(group) = rustix::process::Pid::from_raw(pgid) {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+    }
+
+    fn forget_child(&mut self, pid: i32) {
+        self.child_pids.retain(|&child| child != pid);
+        self.child_groups.remove(&pid);
+    }
+
+    fn finish_child_relays(&mut self, pid: i32) -> crate::error::Result<()> {
+        let Some(relays) = self.child_relays.remove(&pid) else { return Ok(()); };
+        let mut interruption = None;
+        while relays.handles.iter().any(|handle| !handle.is_finished()) {
+            if interruption.is_none() && let Err(error) = self.check_cancel() {
+                self.terminate_group(self.child_group(pid));
+                interruption = Some(error);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut failure = None;
+        for handle in relays.handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failure = Some(ShellError::Io(error)),
+                Err(_) => failure = Some(ShellError::Io(std::io::Error::other("output relay panicked"))),
+            }
+        }
+        for index in relays.descriptors { self.redirection_fds[index].take(); }
+        self.trim_redirection_fds();
+        interruption.or(failure).map_or(Ok(()), Err)
+    }
+
+    fn discard_child_relays(&mut self, pid: i32) {
+        if let Some(relays) = self.child_relays.remove(&pid) {
+            for &index in &relays.descriptors {
+                if let Some(descriptor) = &self.redirection_fds[index] {
+                    drop(descriptor.lock().unwrap().take());
+                }
+            }
+            for handle in relays.handles { let _ = handle.join(); }
+            for index in relays.descriptors { self.redirection_fds[index].take(); }
+            self.trim_redirection_fds();
+        }
+    }
+
+    pub(crate) fn wait_owned_child(&mut self, pid: i32) -> crate::error::Result<ExitStatus> {
+        if !self.child_pids.contains(&pid) {
+            return Err(ShellError::Io(std::io::Error::from_raw_os_error(libc::ECHILD)));
+        }
+        self.wait_child_pgid(pid, self.child_group(pid))
+    }
+
     /// Create a [`ShellBuilder`] for configuring a new shell instance.
     pub fn builder() -> ShellBuilder {
         ShellBuilder::new()
@@ -608,11 +806,15 @@ impl Shell {
             stdout_sink: None,
             stderr_sink: None,
             child_pids: Vec::new(),
+            descriptor_sinks: FxHashMap::default(),
+            child_groups: FxHashMap::default(),
+            child_relays: FxHashMap::default(),
             timeout: None,
             external_handler: None,
             command_policy: None,
             redirect_open_handler: None,
             last_bg_pid: None,
+            substitution_count: 0,
             pending_stdin: None,
             redirection_fds: Vec::new(),
         }
@@ -772,86 +974,77 @@ impl Shell {
         }
     }
 
-    /// Wait for a child process, polling the cancel flag.
-    /// On cancellation, kills the child's process group and returns Cancelled.
-    /// In interactive mode, uses WUNTRACED to detect stopped processes.
-    /// `pgid` is the process group (for Stopped reporting); 0 means use pid.
     fn wait_child(&mut self, pid: i32) -> crate::error::Result<ExitStatus> {
-        self.wait_child_pgid(pid, pid)
+        self.wait_owned_child(pid)
     }
 
     fn wait_child_pgid(&mut self, pid: i32, pgid: i32) -> crate::error::Result<ExitStatus> {
-        let wuntraced = if self.opts.interactive { 1 } else { 0 };
-
-        // If no cancel flag or timeout, just block
-        if self.cancel.is_none() && self.timeout.is_none() {
-            let mut status = 0i32;
-            // SAFETY: pid is a valid child PID obtained from fork().
-            sys::waitpid(pid, &mut status, wuntraced);
-            if sys::wifstopped(status) {
-                // Don't remove from child_pids — process is still alive
-                return Err(ShellError::Stopped { pid, pgid });
-            }
-            self.child_pids.retain(|&p| p != pid);
-            return Ok(ExitStatus::from_wait(status));
-        }
-
-        // Spawn a thread to do blocking waitpid; check cancel while waiting.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut status = 0i32;
-            // SAFETY: pid is a valid child PID obtained from fork().
-            sys::waitpid(pid, &mut status, wuntraced);
-            let _ = tx.send(status);
-        });
+        let mut options = rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT;
+        if self.opts.interactive { options |= rustix::process::WaitIdOptions::STOPPED; }
+        if self.cancel.is_some() || self.timeout.is_some() { options |= rustix::process::WaitIdOptions::NOHANG; }
+        let child = rustix::process::Pid::from_raw(pid).unwrap();
+        let mut interruption = None;
         loop {
-            // Check for result with a short timeout to allow cancel checks
-            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(status) => {
-                    if sys::wifstopped(status) {
-                        return Err(ShellError::Stopped { pid, pgid });
+            match rustix::process::waitid(rustix::process::WaitId::Pid(child), options) {
+                Ok(Some(status)) if status.stopped() => {
+                    match rustix::process::waitid(rustix::process::WaitId::Pid(child), rustix::process::WaitIdOptions::STOPPED | rustix::process::WaitIdOptions::NOHANG) {
+                        Ok(Some(_)) => return Err(ShellError::Stopped { pid, pgid }),
+                        Ok(None) | Err(rustix::io::Errno::INTR) => continue,
+                        Err(error) => return Err(ShellError::Io(error.into())),
                     }
-                    self.child_pids.retain(|&p| p != pid);
-                    return Ok(ExitStatus::from_wait(status));
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    self.child_pids.retain(|&p| p != pid);
-                    return Ok(ExitStatus::FAILURE);
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => {
+                    self.discard_child_relays(pid);
+                    self.forget_child(pid);
+                    return Err(ShellError::Io(error.into()));
                 }
             }
-            if let Err(e) = self.check_cancel() {
-                // Cancel or timeout — kill and reap
-                // SAFETY: pid is a valid child PID; negated for process group kill. SIGKILL is always valid.
-                let _ = rustix::process::kill_process_group(
-                    rustix::process::Pid::from_raw(pid).unwrap(),
-                    rustix::process::Signal::KILL,
-                );
-                // The thread will complete waitpid and send the status; just drain it
-                let _ = rx.recv();
-                self.child_pids.retain(|&p| p != pid);
-                return Err(e);
+            if interruption.is_none() && let Err(error) = self.check_cancel() {
+                self.terminate_group(pgid);
+                interruption = Some(error);
             }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        let relays = self.finish_child_relays(pid);
+        let waited = loop {
+            match rustix::process::waitpid(Some(child), rustix::process::WaitOptions::empty()) {
+                Err(rustix::io::Errno::INTR) => continue,
+                result => break result,
+            }
+        };
+        self.forget_child(pid);
+        if let Some(error) = interruption { return Err(error); }
+        relays?;
+        self.check_cancel()?;
+        let (_, status) = waited.map_err(std::io::Error::from)?.ok_or_else(|| ShellError::Io(std::io::Error::other("child exited without a wait status")))?;
+        Ok(ExitStatus::from_wait(status.as_raw()))
     }
 
-    /// Kill all tracked child processes (process groups).
     fn kill_children(&mut self) {
-        for &pid in &self.child_pids {
-            // Kill the process group (negative PID)
-            // SAFETY: pid is a valid child PID from fork(); negated for process group kill.
-            let _ = rustix::process::kill_process_group(
-                rustix::process::Pid::from_raw(pid).unwrap(),
-                rustix::process::Signal::KILL,
-            );
+        let children = std::mem::take(&mut self.child_pids);
+        let mut owned_children = Vec::new();
+        for pid in children {
+            let observation = loop {
+                match rustix::process::waitid(rustix::process::WaitId::Pid(rustix::process::Pid::from_raw(pid).unwrap()), rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT | rustix::process::WaitIdOptions::NOHANG) {
+                    Err(rustix::io::Errno::INTR) => continue,
+                    result => break result,
+                }
+            };
+            if observation.is_ok() {
+                self.terminate_group(self.child_group(pid));
+                owned_children.push(pid);
+            } else {
+                self.discard_child_relays(pid);
+            }
         }
-        // Reap them
-        for &pid in &self.child_pids {
-            let mut status = 0i32;
-            // SAFETY: pid is a valid child PID; reaping after kill.
-            sys::waitpid(pid, &mut status, 0);
+        for pid in owned_children {
+            let _ = self.finish_child_relays(pid);
+            while let Err(rustix::io::Errno::INTR) = rustix::process::waitpid(rustix::process::Pid::from_raw(pid), rustix::process::WaitOptions::empty()) {}
         }
-        self.child_pids.clear();
+        self.child_groups.clear();
     }
 
     /// Build the xtrace prefix string ($PS4, default "+ ").
@@ -1153,16 +1346,7 @@ impl Shell {
                 redirs,
                 span: _,
             } => {
-                if self.in_forked_child {
-                    // Already in a forked child (pipeline stage, command subst) —
-                    // execute directly without double-forking. Mirrors dash's
-                    // EV_EXIT optimization. Prevents pipe fd leaks.
-                    let saved = self.setup_redirections(redirs)?;
-                    let result = self.eval_command(body);
-                    self.finish_redirections(result, saved)
-                } else {
-                    self.eval_in_subshell(body, redirs)
-                }
+                self.eval_in_subshell(body, redirs)
             }
 
             Command::BraceGroup {
@@ -1355,38 +1539,34 @@ impl Shell {
         redirs: &[Redir],
         span: Span,
     ) -> crate::error::Result<ExitStatus> {
+        let substitutions_before = self.substitution_count;
         // Expand arguments
         let mut expanded_args: Vec<String> = Vec::new();
         for arg in args {
             expanded_args.extend(self.expand_fields(arg)?);
         }
 
-        // No command name: just apply assignments to the shell environment.
-        // Return current exit_status (may have been set by command substitutions
-        // during argument expansion — e.g., `$(false)` with empty result).
         if expanded_args.is_empty() {
-            // xtrace for bare assignments
-            if self.opts.xtrace && !assigns.is_empty() {
+            let saved = self.setup_redirections(redirs)?;
+            let result = (|| {
                 let mut trace = self.xtrace_prefix();
                 for assign in assigns {
                     let value = self.expand_string(&assign.value)?;
-                    if !trace.ends_with(' ') {
-                        trace.push(' ');
+                    if self.opts.xtrace {
+                        if !trace.ends_with(' ') { trace.push(' '); }
+                        trace.push_str(&assign.name);
+                        trace.push('=');
+                        trace.push_str(&value);
                     }
-                    trace.push_str(&assign.name);
-                    trace.push('=');
-                    trace.push_str(&value);
+                    self.vars.set_shell(&assign.name, &value).map_err(|msg| ShellError::Runtime { msg, span })?;
                 }
-                trace.push('\n');
-                self.write_err(&trace);
-            }
-            for assign in assigns {
-                let value = self.expand_string(&assign.value)?;
-                self.vars
-                    .set_shell(&assign.name, &value)
-                    .map_err(|msg| ShellError::Runtime { msg, span })?;
-            }
-            return Ok(self.exit_status);
+                if self.opts.xtrace && !assigns.is_empty() {
+                    trace.push('\n');
+                    self.write_err(&trace);
+                }
+                Ok(if self.substitution_count == substitutions_before { ExitStatus::SUCCESS } else { self.exit_status })
+            })();
+            return self.finish_redirections(result, saved);
         }
 
         self.check_command_policy_for_dispatch(&expanded_args, span)?;
@@ -1417,7 +1597,14 @@ impl Shell {
         let cmd_name = &expanded_args[0];
 
         // exec is special: its redirections are permanent (no save/restore)
-        let is_exec = cmd_name == "exec";
+        let mut dispatch_args = expanded_args.as_slice();
+        while dispatch_args.first().is_some_and(|name| name == "command") {
+            match crate::builtins::command_action(dispatch_args) {
+                crate::builtins::CommandAction::Execute(args) => dispatch_args = args,
+                _ => break,
+            }
+        }
+        let is_exec = dispatch_args.first().is_some_and(|name| name == "exec");
 
         // Setup redirections before executing (applies to builtins, functions, externals)
         let saved_fds = self.setup_redirections(redirs)?;
@@ -1579,7 +1766,9 @@ impl Shell {
             // Avoid mutating the process environment after fork: another thread
             // may hold Rust's environment lock when the child is created.
             let env = self.vars.env_for_command_os(&assign_bytes);
-            let _ = std::env::set_current_dir(&self.cwd);
+            if let Err(error) = std::env::set_current_dir(&self.cwd) {
+                return self.finish_redirections(Err(error.into()), saved);
+            }
             let err = crate::builtins::exec::execve_with_env(&args_bytes[0], &args_bytes, &env);
             let result = self.handle_exec_error(&err, &args[0]);
             return self.finish_redirections(result, saved);
@@ -1588,8 +1777,7 @@ impl Shell {
         let mut cmd = std::process::Command::new(args_bytes[0].to_os_string());
         cmd.args(args_bytes.iter().skip(1).map(ShellBytes::to_os_string));
         cmd.current_dir(&self.cwd);
-        // NOTE: no pre_exec here — allows Rust to use posix_spawn (1.4x faster).
-        // Process group isolation is done from parent after spawn via setpgid.
+        if !self.in_forked_child { cmd.process_group(0); }
 
         // Set environment: exported vars + temporary assignments
         cmd.env_clear();
@@ -1614,71 +1802,43 @@ impl Shell {
             cmd.stdin(child_stdin);
         }
 
+        let mut extra_outputs = Vec::new();
+        for (&target, sink) in &self.descriptor_sinks {
+            let (read, write) = sys::pipe_owned()?;
+            extra_outputs.push(ForkOutput { target, read, write, sink: sink.clone() });
+        }
+        if !extra_outputs.is_empty() {
+            let targets: Vec<_> = extra_outputs.iter().map(|output| (output.write.as_raw_fd(), output.target)).collect();
+            // SAFETY: the callback only duplicates already-open descriptors with dup2; all endpoints live until spawn returns.
+            unsafe {
+                cmd.pre_exec(move || {
+                    for &(source, target) in &targets { sys::dup2_result(source, target)?; }
+                    Ok(())
+                });
+            }
+        }
+
         let result = match cmd.spawn() {
             Ok(mut child) => {
                 let child_id = child.id() as i32;
-                // Isolate in own process group from parent (allows posix_spawn path)
-                // SAFETY: child_id is a valid PID just returned by spawn().
-                let _ = rustix::process::setpgid(
-                    rustix::process::Pid::from_raw(child_id),
-                    rustix::process::Pid::from_raw(child_id),
-                );
-                self.child_pids.push(child_id);
-
-                // Spawn relay threads for sinks, keeping handles to join later
-                let mut handles = Vec::new();
+                let pgid = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { child_id };
+                self.track_child(child_id, pgid);
+                let mut streams = Vec::new();
                 if let Some(stdout) = child.stdout.take() {
-                    handles.push(spawn_relay(stdout, self.stdout_sink.clone().unwrap()));
+                    streams.push((OwnedFd::from(stdout), self.stdout_sink.clone().unwrap()));
                 }
                 if let Some(stderr) = child.stderr.take() {
-                    handles.push(spawn_relay(stderr, self.stderr_sink.clone().unwrap()));
+                    streams.push((OwnedFd::from(stderr), self.stderr_sink.clone().unwrap()));
                 }
-
-                // Cancel-aware wait: spawn thread for blocking wait, check cancel in loop
-                let wait_result = if self.cancel.is_some() || self.timeout.is_some() {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let _ = tx.send(child.wait());
-                    });
-                    loop {
-                        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                            Ok(result) => break result,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                break Err(std::io::Error::other("wait thread panicked"));
-                            }
-                        }
-                        if let Err(e) = self.check_cancel() {
-                            // Kill via PID since child was moved to the thread
-                            // SAFETY: child_id is a valid PID from the spawned process.
-                            let _ = rustix::process::kill_process(
-                                rustix::process::Pid::from_raw(child_id).unwrap(),
-                                rustix::process::Signal::KILL,
-                            );
-                            let _ = rx.recv(); // wait for the thread to finish
-                            self.child_pids.retain(|&p| p != child_id);
-                            for h in handles {
-                                let _ = h.join();
-                            }
-                            return self.finish_redirections(Err(e), saved);
-                        }
-                    }
-                } else {
-                    child.wait()
-                };
-                self.child_pids.retain(|&p| p != child_id);
-
-                // Join relay threads to ensure all output is flushed
-                for h in handles {
-                    let _ = h.join();
+                for output in extra_outputs {
+                    drop(output.write);
+                    streams.push((output.read, output.sink));
                 }
-
-                match wait_result {
-                    Ok(status) => Ok(ExitStatus::from(status.code().unwrap_or(128))),
-                    Err(e) => Err(ShellError::Io(e)),
-                }
+                self.relay_streams(child_id, streams)?;
+                drop(child);
+                self.wait_owned_child(child_id)
             }
-            Err(e) => self.handle_exec_error(&e, &args[0]),
+            Err(error) => self.handle_exec_error(&error, &args[0]),
         };
 
         self.finish_redirections(result, saved)
@@ -1690,90 +1850,50 @@ impl Shell {
             return self.eval_command(&commands[0]);
         }
 
-        // Create pipes between stages
-        let mut pipes: Vec<(RawFd, RawFd)> = Vec::new();
+        let mut pipes = Vec::new();
         for _ in 0..commands.len() - 1 {
-            let mut fds = [0i32; 2];
-            // SAFETY: fds is a valid 2-element array for pipe() to write into.
-            if sys::pipe(fds.as_mut_ptr()) != 0 {
-                return Err(ShellError::Io(std::io::Error::last_os_error()));
-            }
-            pipes.push((fds[0], fds[1]));
+            pipes.push(sys::pipe_owned()?);
         }
-
+        let outputs = self.fork_outputs(true)?;
         let mut children = Vec::new();
-        let mut pgid: i32 = 0; // first child's PID becomes the pipeline's PGID
-
+        let mut pgid = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
         for (i, cmd) in commands.iter().enumerate() {
-            // SAFETY: Standard POSIX fork/dup2/close/setpgid pattern. Pipe fds are
-            // valid from pipe() above. Child sets up its stdin/stdout from pipe fds
-            // then closes all pipe fds before executing.
-            unsafe {
-                let pid = sys::fork();
-                if pid < 0 {
-                    for &(r, w) in &pipes {
-                        let _ = sys::close(r);
-                        let _ = sys::close(w);
-                    }
-                    self.kill_children();
-                    return Err(ShellError::Io(std::io::Error::last_os_error()));
-                }
-
-                if pid == 0 {
-                    // Child: join pipeline process group
-                    // First child creates the group (pgid==0 → setpgid(0,0))
-                    // Subsequent children join it
-                    let _ = rustix::process::setpgid(
-                        None,
-                        if pgid == 0 {
-                            None
-                        } else {
-                            rustix::process::Pid::from_raw(pgid)
-                        },
-                    );
-                    self.in_forked_child = true;
-                    // Connect stdin from previous pipe
-                    if i > 0 {
-                        sys::dup2(pipes[i - 1].0, 0);
-                    }
-                    // Connect stdout to next pipe
-                    if i < commands.len() - 1 {
-                        sys::dup2(pipes[i].1, 1);
-                    }
-                    for &(read_fd, write_fd) in &pipes {
-                        let _ = sys::close(read_fd);
-                        let _ = sys::close(write_fd);
-                    }
-
-                    // Mark this as exit context — eval_external can exec
-                    // directly instead of fork+exec (dash's EV_EXIT).
-                    self.ev_exit = true;
-                    let status = match self.eval_command(cmd) {
-                        Ok(s) => s,
-                        Err(ShellError::Exit(n)) => n,
-                        Err(_) => ExitStatus::FAILURE,
-                    };
-                    sys::exit_child(status);
-                }
-
-                // Parent: also call setpgid to avoid race with child
-                if pgid == 0 {
-                    pgid = pid; // first child's PID is the group leader
-                }
-                let _ = rustix::process::setpgid(
-                    rustix::process::Pid::from_raw(pid),
-                    rustix::process::Pid::from_raw(pgid),
-                );
-                children.push(pid);
-                self.child_pids.push(pid);
+            // SAFETY: every descriptor has an owner in the parent; the child installs its endpoints and exits without unwinding.
+            let pid = self.fork_evaluator();
+            if pid < 0 {
+                let error = std::io::Error::last_os_error();
+                drop(pipes);
+                drop(outputs);
+                self.kill_children();
+                return Err(ShellError::Io(error));
             }
+            if pid == 0 {
+                if self.enter_forked_child(&outputs, pgid).is_err() {
+                    sys::exit_child(ExitStatus::FAILURE);
+                }
+                if i > 0 && sys::dup2_result(pipes[i - 1].0.as_raw_fd(), 0).is_err() {
+                    sys::exit_child(ExitStatus::FAILURE);
+                }
+                if i < commands.len() - 1 && sys::dup2_result(pipes[i].1.as_raw_fd(), 1).is_err() {
+                    sys::exit_child(ExitStatus::FAILURE);
+                }
+                drop(pipes);
+                self.ev_exit = true;
+                let status = match self.eval_command(cmd) {
+                    Ok(status) | Err(ShellError::Exit(status)) => status,
+                    Err(error) => {
+                        self.err_msg(&format!("epsh: {error}"));
+                        ExitStatus::FAILURE
+                    }
+                };
+                sys::exit_child(status);
+            }
+            if pgid == 0 { pgid = pid; }
+            self.track_child(pid, pgid);
+            children.push(pid);
         }
-
-        // Parent: close all pipe fds
-        for &(read_fd, write_fd) in &pipes {
-            let _ = sys::close(read_fd);
-            let _ = sys::close(write_fd);
-        }
+        drop(pipes);
+        self.relay_fork_outputs(*children.last().unwrap(), outputs)?;
 
         // Interactive mode: give the pipeline the terminal
         if self.opts.interactive && pgid > 0 {
@@ -1847,237 +1967,144 @@ impl Shell {
         }
     }
 
-    /// Execute a command in a subshell (fork).
     fn eval_in_subshell(
         &mut self,
         body: &Command,
         redirs: &[Redir],
     ) -> crate::error::Result<ExitStatus> {
-        // SAFETY: Standard POSIX fork pattern. Child isolates into its own
-        // process group, executes the body, then _exit()s. Parent waits.
-        unsafe {
-            let pid = sys::fork();
-            if pid < 0 {
-                return Err(ShellError::Io(std::io::Error::last_os_error()));
+        let outputs = self.fork_outputs(true)?;
+        let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
+        // SAFETY: the child has independent evaluator state and exits without unwinding into its caller.
+        let pid = self.fork_evaluator();
+        if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
+        if pid == 0 {
+            if self.enter_forked_child(&outputs, parent_group).is_err() {
+                sys::exit_child(ExitStatus::FAILURE);
             }
-
-            if pid == 0 {
-                // Child — isolate in own process group
-                let _ = rustix::process::setpgid(None, None);
-                let parent_exit_trap = self
-                    .traps
-                    .remove("EXIT")
-                    .or_else(|| self.traps.remove("exit"));
-                drop(parent_exit_trap); // parent EXIT trap doesn't run in subshell
-                self.in_forked_child = true;
-
-                let _saved = match self.setup_redirections(redirs) {
-                    Ok(s) => s,
-                    Err(_) => sys::exit_child(ExitStatus::FAILURE),
-                };
-                let status = match self.eval_command(body) {
-                    Ok(s) => s,
-                    Err(ShellError::Exit(n)) => n,
-                    Err(_) => ExitStatus::FAILURE,
-                };
-                // Run subshell's own EXIT trap if it set one
-                self.run_exit_trap();
-                sys::exit_child(status);
-            }
-
-            // Parent
-            self.child_pids.push(pid);
-            self.wait_child(pid)
+            self.traps.remove("EXIT");
+            let _saved = match self.setup_redirections(redirs) {
+                Ok(saved) => saved,
+                Err(error) => {
+                    self.err_msg(&format!("epsh: {error}"));
+                    sys::exit_child(ExitStatus::FAILURE);
+                }
+            };
+            let status = match self.eval_command(body) {
+                Ok(status) | Err(ShellError::Exit(status)) => status,
+                Err(error) => {
+                    self.err_msg(&format!("epsh: {error}"));
+                    ExitStatus::FAILURE
+                }
+            };
+            self.run_exit_trap();
+            sys::exit_child(status);
         }
+        let pgid = if parent_group == 0 { pid } else { parent_group };
+        self.track_child(pid, pgid);
+        self.relay_fork_outputs(pid, outputs)?;
+        self.wait_child(pid)
     }
 
-    /// Execute a command in the background.
     fn eval_background(
         &mut self,
         cmd: &Command,
         redirs: &[Redir],
     ) -> crate::error::Result<ExitStatus> {
-        // SAFETY: Standard POSIX fork pattern. Child isolates into its own
-        // process group and runs the command. Parent does not wait (background).
-        unsafe {
-            let pid = sys::fork();
-            if pid < 0 {
-                return Err(ShellError::Io(std::io::Error::last_os_error()));
+        let outputs = self.fork_outputs(true)?;
+        let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
+        // SAFETY: the parent retains the child PID and its output relays; the child exits without unwinding.
+        let pid = self.fork_evaluator();
+        if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
+        if pid == 0 {
+            if self.enter_forked_child(&outputs, parent_group).is_err() {
+                sys::exit_child(ExitStatus::FAILURE);
             }
-
-            if pid == 0 {
-                let _ = rustix::process::setpgid(None, None);
-                let _saved = match self.setup_redirections(redirs) {
-                    Ok(s) => s,
-                    Err(_) => sys::exit_child(ExitStatus::FAILURE),
-                };
-                let status = match self.eval_command(cmd) {
-                    Ok(s) => s,
-                    Err(ShellError::Exit(n)) => n,
-                    Err(_) => ExitStatus::FAILURE,
-                };
-                sys::exit_child(status);
-            }
-
-            self.child_pids.push(pid);
-            self.last_bg_pid = Some(pid as u32);
-            // Don't wait — background process
-            Ok(ExitStatus::SUCCESS)
-        }
-    }
-
-    /// Execute a command substitution and return its output.
-    pub fn command_subst(&mut self, cmd: &Command) -> crate::error::Result<String> {
-        // In-process command substitution for safe builtins: capture output without forking.
-        // Pure builtins (echo, printf, true, false, :, pwd, type, test/[) don't
-        // modify shell state, so running them in-process is safe and avoids the
-        // fork+pipe+waitpid overhead entirely.
-        if let Command::Simple {
-            assigns,
-            args,
-            redirs,
-            span,
-        } = cmd
-            && assigns.is_empty()
-            && redirs.is_empty()
-            && !args.is_empty()
-        {
-            let mut expanded = Vec::new();
-            let expand_ok = (|| -> crate::error::Result<()> {
-                for a in args {
-                    expanded.extend(self.expand_fields(a)?);
-                }
-                Ok(())
-            })();
-            if expand_ok.is_ok()
-                && !expanded.is_empty()
-                && is_command_substitution_builtin(&expanded[0])
-            {
-                if let Err(error) = self.check_command_policy_for_dispatch(&expanded, *span) {
+            self.traps.remove("EXIT");
+            let _saved = match self.setup_redirections(redirs) {
+                Ok(saved) => saved,
+                Err(error) => {
                     self.err_msg(&format!("epsh: {error}"));
-                    self.exit_status = ExitStatus::MISUSE;
-                    return Ok(String::new());
+                    sys::exit_child(ExitStatus::FAILURE);
                 }
-                // Capture output to buffer instead of forking
-                let saved_sink = self.stdout_sink.take();
-                let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-                self.stdout_sink = Some(buf.clone());
-                let status = self.try_builtin(&expanded[0], &expanded, &[], &[], *span);
-                self.stdout_sink = saved_sink;
-                match status {
-                    Ok(Some(status)) => {
-                        self.exit_status = status;
-                        let captured = buf.lock().unwrap();
-                        let mut output = crate::encoding::bytes_to_str(&captured);
-                        while output.ends_with('\n') {
-                            output.pop();
-                        }
-                        return Ok(output);
-                    }
-                    Err(error @ ShellError::Runtime { .. }) => {
-                        self.err_msg(&format!("epsh: {error}"));
-                        self.exit_status = ExitStatus::MISUSE;
-                        return Ok(String::new());
-                    }
-                    Err(_) => {}
-                    Ok(None) => {}
+            };
+            let status = match self.eval_command(cmd) {
+                Ok(status) | Err(ShellError::Exit(status)) => status,
+                Err(error) => {
+                    self.err_msg(&format!("epsh: {error}"));
+                    ExitStatus::FAILURE
                 }
-                // Fallback: not a builtin after all, continue to fork path
-            }
+            };
+            sys::exit_child(status);
         }
-
-        // $(<file) optimization: read file directly without forking
-        if let Command::Simple {
-            assigns,
-            args,
-            redirs,
-            ..
-        } = cmd
-            && assigns.is_empty()
-            && args.is_empty()
-            && redirs.len() == 1
-            && let RedirKind::Input(ref word) = redirs[0].kind
-        {
-            let filename = self.expand_string(word)?;
-            let filepath = self.resolve_path_bytes(&ShellBytes::from_str_lossless(&filename));
-            match std::fs::read(&filepath) {
-                Ok(bytes) => {
-                    let mut content = crate::encoding::bytes_to_str(&bytes);
-                    // Remove trailing newlines (like command substitution)
-                    while content.ends_with('\n') {
-                        content.pop();
-                    }
-                    self.exit_status = ExitStatus::SUCCESS;
-                    return Ok(content);
-                }
-                Err(e) => {
-                    self.err_msg(&format!("epsh: {filename}: {e}"));
-                    self.exit_status = ExitStatus::FAILURE;
-                    return Err(ShellError::Runtime {
-                        msg: format!("{filename}: {e}"),
-                        span: redirs[0].span,
-                    });
-                }
-            }
-        }
-
-        let mut fds = [0i32; 2];
-        // SAFETY: Standard POSIX pipe+fork pattern for command substitution.
-        // Child redirects stdout to write end of pipe, parent reads from read end.
-        // All fds are valid from pipe(). from_raw_fd takes ownership of fds[0].
-        unsafe {
-            if sys::pipe(fds.as_mut_ptr()) != 0 {
-                return Err(ShellError::Io(std::io::Error::last_os_error()));
-            }
-
-            let pid = sys::fork();
-            if pid < 0 {
-                let error = std::io::Error::last_os_error();
-                let _ = sys::close(fds[0]);
-                let _ = sys::close(fds[1]);
-                return Err(ShellError::Io(error));
-            }
-
-            if pid == 0 {
-                // Child: redirect stdout to write end of pipe
-                let _ = rustix::process::setpgid(None, None);
-                self.in_forked_child = true;
-                let _ = sys::close(fds[0]);
-                sys::dup2(fds[1], 1);
-                let _ = sys::close(fds[1]);
-
-                let status = match self.eval_command(cmd) {
-                    Ok(s) => s,
-                    Err(ShellError::Exit(n)) => n,
-                    Err(error @ ShellError::Runtime { .. }) => {
-                        self.err_msg(&format!("epsh: {error}"));
-                        ExitStatus::MISUSE
-                    }
-                    Err(_) => ExitStatus::FAILURE,
-                };
-                self.run_exit_trap();
-                sys::exit_child(status);
-            }
-
-            // Parent: read from read end
-            let _ = sys::close(fds[1]);
-            self.child_pids.push(pid);
-
-            let mut raw_output = Vec::new();
-            let mut read_file = std::fs::File::from_raw_fd(fds[0]);
-            let _ = read_file.read_to_end(&mut raw_output);
-            let mut output = crate::encoding::bytes_to_str(&raw_output);
-
-            self.exit_status = self.wait_child(pid)?;
-
-            // Remove trailing newlines (POSIX requirement)
-            while output.ends_with('\n') {
-                output.pop();
-            }
-
-            Ok(output)
-        }
+        let pgid = if parent_group == 0 { pid } else { parent_group };
+        self.track_child(pid, pgid);
+        self.relay_fork_outputs(pid, outputs)?;
+        self.last_bg_pid = Some(pid as u32);
+        Ok(ExitStatus::SUCCESS)
     }
+
+    /// Execute a command substitution and return its encoded output.
+    pub fn command_subst(&mut self, cmd: &Command) -> crate::error::Result<String> {
+        let outputs = self.fork_outputs(false)?;
+        let (read_end, write_end) = sys::pipe_owned()?;
+        let flags = rustix::fs::fcntl_getfl(&read_end).map_err(std::io::Error::from)?;
+        rustix::fs::fcntl_setfl(&read_end, flags | rustix::fs::OFlags::NONBLOCK).map_err(std::io::Error::from)?;
+        let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
+        // SAFETY: the child has its own evaluator state and exits without unwinding into the embedder.
+        let pid = self.fork_evaluator();
+        if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
+        if pid == 0 {
+            if self.enter_forked_child(&outputs, parent_group).is_err()
+                || sys::dup2_result(write_end.as_raw_fd(), 1).is_err() {
+                sys::exit_child(ExitStatus::FAILURE);
+            }
+            drop(read_end);
+            drop(write_end);
+            self.traps.remove("EXIT");
+            let status = match self.eval_command(cmd) {
+                Ok(status) | Err(ShellError::Exit(status)) => status,
+                Err(error) => {
+                    self.err_msg(&format!("epsh: {error}"));
+                    ExitStatus::MISUSE
+                }
+            };
+            self.run_exit_trap();
+            sys::exit_child(status);
+        }
+        drop(write_end);
+        let pgid = if parent_group == 0 { pid } else { parent_group };
+        self.track_child(pid, pgid);
+        self.relay_fork_outputs(pid, outputs)?;
+
+        let mut raw_output = Vec::new();
+        let mut buffer = [0u8; 8192];
+        let read_result = loop {
+            if let Err(error) = self.check_cancel() { break Err(error); }
+            match rustix::io::read(&read_end, &mut buffer) {
+                Ok(0) => break Ok(()),
+                Ok(length) => raw_output.extend_from_slice(&buffer[..length]),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(rustix::io::Errno::AGAIN) => {
+                    let mut events = [rustix::event::PollFd::new(&read_end, rustix::event::PollFlags::IN)];
+                    let timeout = rustix::event::Timespec { tv_sec: 0, tv_nsec: 5_000_000 };
+                    match rustix::event::poll(&mut events, Some(&timeout)) {
+                        Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                        Err(error) => break Err(ShellError::Io(error.into())),
+                    }
+                }
+                Err(error) => break Err(ShellError::Io(error.into())),
+            }
+        };
+        if read_result.is_err() { self.terminate_group(pgid); }
+        let waited = self.wait_child(pid);
+        read_result?;
+        self.exit_status = waited?;
+        self.substitution_count = self.substitution_count.wrapping_add(1);
+        let mut output = crate::encoding::bytes_to_str(&raw_output);
+        while output.ends_with('\n') { output.pop(); }
+        Ok(output)
+    }
+
 }
 
 #[cfg(test)]

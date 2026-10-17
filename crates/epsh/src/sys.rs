@@ -2,40 +2,51 @@
 //! exec, child exit, and raw descriptor boundaries that must accept closed descriptors.
 
 use std::ffi::c_void;
-use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 pub use libc::{execve, fork};
 
 use rustix::fs::Mode;
-use rustix::process::{Pid, WaitOptions};
-
-/// Create a close-on-exec pipe, writing the (read, write) fds into `fds`
-/// (length >= 2). Returns 0 on success, -1 on error. Mirrors libc `pipe(int[2])`.
-pub fn pipe(fds: *mut i32) -> i32 {
-    match pipe_owned() {
-        Ok((r, w)) => {
-            // SAFETY: caller guarantees fds points to a writable two-element descriptor array.
-            unsafe {
-                *fds = r.into_raw_fd();
-                *fds.add(1) = w.into_raw_fd();
-            }
-            0
-        }
-        Err(_) => -1,
-    }
-}
 
 pub fn pipe_owned() -> std::io::Result<(OwnedFd, OwnedFd)> {
     #[cfg(target_vendor = "apple")]
-    {
+    let (read, write) = {
         let (read, write) = rustix::pipe::pipe()?;
         rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;
         rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC)?;
-        Ok((read, write))
-    }
+        (read, write)
+    };
     #[cfg(not(target_vendor = "apple"))]
+    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    let read = if read.as_raw_fd() < 3 { duplicate_fd_above(read.as_raw_fd(), 3)? } else { read };
+    let write = if write.as_raw_fd() < 3 { duplicate_fd_above(write.as_raw_fd(), 3)? } else { write };
+    Ok((read, write))
+}
+
+pub fn heredoc_file() -> std::io::Result<std::fs::File> {
+    #[cfg(target_os = "linux")]
     {
-        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(Into::into)
+        rustix::fs::memfd_create("epsh-heredoc", rustix::fs::MemfdFlags::CLOEXEC)
+            .map(std::fs::File::from).map_err(Into::into)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir();
+        for _ in 0..128 {
+            let path = directory.join(format!("epsh-heredoc-{}-{}", std::process::id(), NEXT_FILE.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path) {
+                Ok(file) => {
+                    std::fs::remove_file(path)?;
+                    return Ok(file);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "cannot allocate heredoc storage"))
     }
 }
 
@@ -74,13 +85,6 @@ pub fn write(fd: RawFd, buf: *const u8, len: usize) {
     let _ = rustix::io::write(unsafe { BorrowedFd::borrow_raw(fd) }, slice);
 }
 
-pub fn dup2(oldfd: RawFd, newfd: RawFd) -> i32 {
-    match dup2_result(oldfd, newfd) {
-        Ok(()) => newfd,
-        Err(_) => -1,
-    }
-}
-
 pub fn dup2_result(oldfd: RawFd, newfd: RawFd) -> std::io::Result<()> {
     // SAFETY: libc dup2 accepts a closed destination and leaves descriptor ownership with the caller.
     let result = unsafe { libc::dup2(oldfd, newfd) };
@@ -102,33 +106,16 @@ pub fn duplicate_fd_above(fd: RawFd, min_fd: RawFd) -> std::io::Result<OwnedFd> 
 }
 
 pub fn descriptor_is_open(fd: RawFd) -> std::io::Result<()> {
-    // SAFETY: fcntl accepts raw shell descriptor numbers and reports EBADF when fd is closed.
-    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    descriptor_flags(fd).map(|_| ())
 }
 
-/// Wait for a child process. Mirrors libc `waitpid`: returns the pid (or -1 on
-/// error), and writes the raw status word into `status`. `options` is 0 or
-/// `WUNTRACED` (nonzero).
-pub fn waitpid(pid: i32, status: &mut i32, options: i32) -> i32 {
-    // libc `waitpid(-1, ...)` = wait for any child.
-    let pid_opt = if pid < 0 { None } else { Pid::from_raw(pid) };
-    let opts = if options != 0 {
-        WaitOptions::UNTRACED
+pub fn descriptor_flags(fd: RawFd) -> std::io::Result<rustix::io::FdFlags> {
+    // SAFETY: fcntl accepts raw shell descriptor numbers and reports EBADF when fd is closed.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        Err(std::io::Error::last_os_error())
     } else {
-        WaitOptions::empty()
-    };
-    match rustix::process::waitpid(pid_opt, opts) {
-        // No status available (e.g. WNOHANG semantics) — report 0 like libc.
-        Ok(None) => 0,
-        Ok(Some((p, st))) => {
-            *status = st.as_raw();
-            p.as_raw_pid()
-        }
-        Err(_) => -1,
+        Ok(rustix::io::FdFlags::from_bits_retain(flags as _))
     }
 }
 
@@ -145,11 +132,6 @@ pub fn wexitstatus(status: i32) -> i32 {
 /// Extract the terminating signal from `status` (valid only if not exited).
 pub fn wtermsig(status: i32) -> i32 {
     status & 0x7f
-}
-
-/// True if `status` indicates the process was stopped (WIFSTOPPED / WUNTRACED).
-pub fn wifstopped(status: i32) -> bool {
-    (status & 0xff) == 0x7f
 }
 
 /// Return the real user ID of the calling process.
@@ -185,15 +167,9 @@ mod tests {
 
     #[test]
     fn pipe_fds_are_close_on_exec() {
-        let mut fds = [-1; 2];
-        assert_eq!(pipe(fds.as_mut_ptr()), 0);
-
-        let read_flags = rustix::io::fcntl_getfd(unsafe { BorrowedFd::borrow_raw(fds[0]) })
-            .expect("read end flags");
-        let write_flags = rustix::io::fcntl_getfd(unsafe { BorrowedFd::borrow_raw(fds[1]) })
-            .expect("write end flags");
-        let _ = close(fds[0]);
-        let _ = close(fds[1]);
+        let (read, write) = pipe_owned().unwrap();
+        let read_flags = rustix::io::fcntl_getfd(&read).expect("read end flags");
+        let write_flags = rustix::io::fcntl_getfd(&write).expect("write end flags");
 
         assert!(read_flags.contains(rustix::io::FdFlags::CLOEXEC));
         assert!(write_flags.contains(rustix::io::FdFlags::CLOEXEC));

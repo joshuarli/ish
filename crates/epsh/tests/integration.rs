@@ -752,6 +752,7 @@ mod glob_files {
         ] {
             fs::write(dir.path().join(name), "").unwrap();
         }
+        fs::write(dir.path().join(".abc"), "").unwrap();
 
         // [ab-]* — dash at end is literal
         let (stdout, _, _) = run_in(dir.path(), "echo [ab-]*");
@@ -764,6 +765,21 @@ mod glob_files {
         // [!ab]* — negated
         let (stdout, _, _) = run_in(dir.path(), "echo [!ab]*");
         assert_eq!(stdout, "!bc +bc ,bc -bc 0bc 1bc ^bc cbc\n");
+
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/abc"), "").unwrap();
+
+        let (stdout, _, _) = run_in(dir.path(), "echo [\\!ab]*");
+        assert_eq!(stdout, "!bc abc bbc\n");
+
+        let (stdout, _, _) = run_in(dir.path(), "echo [a\\-c]*");
+        assert_eq!(stdout, "-bc abc cbc\n");
+
+        let (stdout, _, _) = run_in(dir.path(), "echo [\\^ab]*");
+        assert_eq!(stdout, "^bc abc bbc\n");
+
+        let (stdout, _, _) = run_in(dir.path(), "echo \".\"[a]*; echo \"sub/\"[a]*");
+        assert_eq!(stdout, ".abc\nsub/abc\n");
 
         // [^ab]* — ^ is NOT negation in POSIX, it's literal
         let (stdout, _, _) = run_in(dir.path(), "echo [^ab]*");

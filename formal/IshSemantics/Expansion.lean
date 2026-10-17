@@ -46,9 +46,10 @@ structure Effect where
 /-- Words describe parameters, quoting, byte-preserving UTF-8 or invalid-byte IFS,
 positionals, tilde, and effect observations independently of production parsing.
 Substitution bytes are captured stdout before newline removal; arithmetic bytes
-are the decimal result. Optional deltas retain status and variable writes even on
-failure. Pathname observations give ordered matches for bytes and their quote mask.
-The trace projection omits child I/O; it makes no claim about external effect order. -/
+are the decimal result. Substitution effects update status but not parent bindings;
+arithmetic effects may update bindings, including on failure. Pathname observations
+give ordered matches for bytes and their quote mask. The trace projection omits
+child I/O; it makes no claim about external effect order. -/
 structure Input where
   words : List (List Part)
   observations : Bindings
@@ -237,7 +238,8 @@ def partActions (input : Input) (state : ShellState) (part : Part) :
   | .substitution id quoted =>
     let some bytes := lookup input.observations id
       | throw (.missingOracle s!"missing substitution oracle: {id}")
-    return valueActions quoted (if (effectFor input id).error.isSome then [] else stripNewlines bytes)
+    if let some error := (effectFor input id).error then throw (.semantic error)
+    return valueActions quoted (stripNewlines bytes)
   | .arithmetic id quoted =>
     let some bytes := lookup input.observations id
       | throw (.missingOracle s!"missing arithmetic oracle: {id}")
@@ -272,7 +274,8 @@ structure Result where
   deriving Repr, BEq
 
 def partEffect (input : Input) : Part → Effect
-  | .substitution id _ | .arithmetic id _ => effectFor input id
+  | .substitution id _ => { effectFor input id with bindings := [] }
+  | .arithmetic id _ => effectFor input id
   | _ => {}
 
 def stagePart (input : Input) (staged : Staged) (part : Part) : Outcome Staged :=
@@ -393,6 +396,9 @@ def decodeInput (value : Json) : Except String Input := do
     return (id, bytes, { status, bindings, error : Effect })
   let observations := entries.map (fun (id, bytes, _) => (id, bytes))
   let effects := entries.map (fun (id, _, effect) => (id, effect))
+  for (id, _, effect) in entries do
+    if id.startsWith "sub" && !effect.bindings.isEmpty then
+      throw "command substitution cannot change parent bindings"
   unless (observations.map Prod.fst).eraseDups.length == observations.length do
     throw "duplicate observation id"
   let globs ← (← (← value.getObjVal? "globs").getArr?).toList.mapM fun glob => do
@@ -755,14 +761,19 @@ theorem arithmetic_error_retains_updates (input : Input) (staged : Staged)
   simp only [stagePart, partEffect, partActions, observed, delta, failed]
   rfl
 
-theorem substitution_error_becomes_empty (input : Input) (staged : Staged)
+theorem substitution_error_propagates (input : Input) (staged : Staged)
     (id : String) (quoted : Bool) (bytes : Bytes) (effect : Effect) (error : SemanticError)
     (observed : lookup input.observations id = some bytes)
     (delta : effectFor input id = effect) (failed : effect.error = some error) :
     stagePart input staged (.substitution id quoted) =
-      .success ⟨applyEffect staged.state effect, staged.actions ++ valueActions quoted []⟩ := by
+      .semanticError error (applyEffect staged.state { effect with bindings := [] }) [] := by
   simp only [stagePart, partEffect, partActions, observed, delta, failed]
   rfl
+
+theorem substitution_isolates_bindings (input : Input) (state : ShellState)
+    (id : String) (quoted : Bool) :
+    (applyEffect state (partEffect input (.substitution id quoted))).variables = state.variables := by
+  simp [partEffect, applyEffect, Evaluation.assign]
 
 theorem binding_delta_last_write_wins (state : ShellState) (name : String) (first last : Bytes) :
     resolve (applyEffect state { bindings := [(name, first), (name, last)] }) name = some last := by
