@@ -735,7 +735,6 @@ mod variables {
 
 mod command_policy {
     use super::*;
-    use epsh::encoding;
     use epsh::eval;
     use epsh::shell_bytes::ShellBytes;
 
@@ -880,9 +879,9 @@ mod command_policy {
                 Some("target denied".to_owned())
             }))
             .build();
-        let target = encoding::bytes_to_str(b"command-\x80");
+        let program = Parser::new_bytes(b"'command-\x80'").parse().unwrap();
 
-        assert_eq!(shell.run_script(&quote(&target)), 2);
+        assert_eq!(shell.run_program(&program).code(), 2);
         assert_eq!(*observed.lock().unwrap(), b"command-\x80");
     }
 }

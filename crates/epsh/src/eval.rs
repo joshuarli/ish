@@ -1,5 +1,7 @@
 use fxhash::FxHashMap;
 use std::io::{Read, Write};
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +31,7 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// The interpreter path from a script's `#!` line, or None if the first line
 /// is not a shebang (or the file cannot be read). Mirrors bash's `getinterp`.
-fn read_shebang_interpreter(path: &Path) -> Option<String> {
+fn read_shebang_interpreter(path: &Path) -> Option<OsString> {
     let mut buf = [0u8; 128];
     let mut file = std::fs::File::open(path).ok()?;
     let n = file.read(&mut buf).ok()?;
@@ -47,7 +49,7 @@ fn read_shebang_interpreter(path: &Path) -> Option<String> {
     if start >= i {
         return None;
     }
-    Some(String::from_utf8_lossy(&buf[start..i]).into_owned())
+    Some(OsString::from_vec(buf[start..i].to_vec()))
 }
 
 /// The platform's strerror text for an errno, e.g. "Not a directory".
@@ -64,20 +66,20 @@ fn os_error_string(code: i32) -> String {
 /// The file exec would attempt for `cmd_name`: slash paths resolve against
 /// `cwd`; slashless names search `path_env` like `execve_with_env`. Returns
 /// None for a slashless name found in no PATH directory.
-fn resolve_exec_path(cmd_name: &str, cwd: &Path, path_env: &str) -> Option<PathBuf> {
+fn resolve_exec_path(cmd_name: &OsStr, cwd: &Path, path_env: &OsStr) -> Option<PathBuf> {
     let name_path = PathBuf::from(cmd_name);
-    if cmd_name.contains('/') {
+    if cmd_name.as_bytes().contains(&b'/') {
         return Some(if name_path.is_absolute() {
             name_path
         } else {
             cwd.join(name_path)
         });
     }
-    for directory in path_env.split(':') {
+    for directory in path_env.as_bytes().split(|byte| *byte == b':') {
         let dir = if directory.is_empty() {
             PathBuf::from(".")
         } else {
-            PathBuf::from(directory)
+            PathBuf::from(OsStr::from_bytes(directory))
         };
         let full = if dir.is_absolute() {
             dir.join(cmd_name)
@@ -105,7 +107,18 @@ pub fn bad_interpreter_message(
     cwd: &Path,
     path_env: &str,
 ) -> Option<String> {
-    // E2BIG/ENOMEM are resource errors, not interpreter problems.
+    bad_interpreter_message_os(OsStr::new(cmd_name), code, cwd, OsStr::new(path_env))
+        .map(|message| message.to_string_lossy().into_owned())
+}
+
+/// Return a bad-interpreter diagnostic with command and interpreter bytes intact.
+/// `cmd_name` and `path_env` are the raw OS arguments used for execution.
+pub fn bad_interpreter_message_os(
+    cmd_name: &OsStr,
+    code: i32,
+    cwd: &Path,
+    path_env: &OsStr,
+) -> Option<OsString> {
     if matches!(code, libc::E2BIG | libc::ENOMEM) {
         return None;
     }
@@ -114,10 +127,12 @@ pub fn bad_interpreter_message(
         return None;
     }
     let interp = read_shebang_interpreter(&path)?;
-    Some(format!(
-        "{cmd_name}: {interp}: bad interpreter: {}",
-        os_error_string(code)
-    ))
+    let mut message = cmd_name.as_bytes().to_vec();
+    message.extend_from_slice(b": ");
+    message.extend_from_slice(interp.as_bytes());
+    message.extend_from_slice(b": bad interpreter: ");
+    message.extend_from_slice(os_error_string(code).as_bytes());
+    Some(OsString::from_vec(message))
 }
 
 fn apply_dot_navigation(cwd: &Path, path: &Path) -> PathBuf {
@@ -896,7 +911,7 @@ impl Shell {
     /// Resolve a path against the shell's working directory.
     /// Absolute paths are returned as-is; relative paths are joined with `self.cwd`.
     pub fn resolve_path(&self, p: &str) -> PathBuf {
-        self.resolve_path_bytes(&ShellBytes::from_str_lossless(p))
+        self.resolve_path_bytes(&ShellBytes::from(p))
     }
 
     /// Resolve a path against the shell's working directory from raw shell bytes.
@@ -969,7 +984,7 @@ impl Shell {
                     continue;
                 }
                 let action = action.clone();
-                let mut parser = Parser::new(&action);
+                let mut parser = Parser::from_shell_string(&action);
                 if let Ok(program) = parser.parse() {
                     for cmd in &program.commands {
                         let _ = self.eval_command(cmd);
@@ -983,7 +998,7 @@ impl Shell {
     pub(crate) fn run_exit_trap(&mut self) {
         // Remove the trap to prevent recursive invocation
         if let Some(action) = self.traps.remove("EXIT") {
-            let mut parser = Parser::new(&action);
+            let mut parser = Parser::from_shell_string(&action);
             if let Ok(program) = parser.parse() {
                 for cmd in &program.commands {
                     let _ = self.eval_command(cmd);
@@ -1262,7 +1277,7 @@ impl Shell {
                 let mut last_status = ExitStatus::SUCCESS;
                 for value in &word_list {
                     self.check_cancel()?;
-                    if let Err(e) = self.vars.set(var, value) {
+                    if let Err(e) = self.vars.set_shell(var, value) {
                         self.err_msg(&e);
                         return Ok(ExitStatus::FAILURE);
                     }
@@ -1294,7 +1309,7 @@ impl Shell {
                 for arm in arms {
                     for pattern in &arm.patterns {
                         let pat = self.expand_pattern(pattern)?;
-                        if glob::fnmatch(&pat, &expanded) {
+                        if glob::fnmatch_shell(&pat, &expanded) {
                             if let Some(ref body) = arm.body {
                                 return self.eval_command(body);
                             } else {
@@ -1362,7 +1377,7 @@ impl Shell {
             for assign in assigns {
                 let value = self.expand_string(&assign.value)?;
                 self.vars
-                    .set(&assign.name, &value)
+                    .set_shell(&assign.name, &value)
                     .map_err(|msg| ShellError::Runtime { msg, span })?;
             }
             return Ok(self.exit_status);
@@ -1453,7 +1468,7 @@ impl Shell {
                 )
             })
             .collect();
-        let args_bytes: Vec<ShellBytes> = args.iter().cloned().map(Into::into).collect();
+        let args_bytes: Vec<ShellBytes> = args.iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
         let handler = self
             .external_handler
             .as_mut()
@@ -1476,7 +1491,7 @@ impl Shell {
         // Save and set positional parameters (take avoids clone)
         let saved_positional = std::mem::replace(
             &mut self.vars.positional,
-            args[1..].iter().cloned().map(Into::into).collect(),
+            args[1..].iter().map(|s| ShellBytes::from_str_lossless(s)).collect(),
         );
 
         // Push scope for local variables
@@ -1486,7 +1501,7 @@ impl Shell {
         for assign in assigns {
             let value = self.expand_string(&assign.value)?;
             self.vars.make_local(&assign.name);
-            let _ = self.vars.set(&assign.name, &value);
+            let _ = self.vars.set_shell(&assign.name, &value);
         }
 
         // Setup redirections
@@ -1515,12 +1530,12 @@ impl Shell {
         // An executable script whose interpreter is broken surfaces as a bare
         // ENOTDIR/ENOENT/EACCES; report it bash-style instead of a raw errno.
         if let Some(code) = e.raw_os_error() {
-            let path_env = self
-                .vars
-                .get("PATH")
-                .unwrap_or("/usr/local/bin:/usr/bin:/bin");
-            if let Some(msg) = bad_interpreter_message(cmd_name, code, &self.cwd, path_env) {
-                self.err_msg(&msg);
+            let path_env = self.vars.get_bytes("PATH")
+                .map(|value| value.to_os_string())
+                .unwrap_or_else(|| OsString::from("/usr/local/bin:/usr/bin:/bin"));
+            let cmd_name = ShellBytes::from_str_lossless(cmd_name).to_os_string();
+            if let Some(msg) = bad_interpreter_message_os(&cmd_name, code, &self.cwd, &path_env) {
+                self.err_msg(&crate::encoding::bytes_to_str(msg.as_bytes()));
                 return Ok(ExitStatus::NOT_EXECUTABLE);
             }
         }
@@ -1545,7 +1560,7 @@ impl Shell {
     ) -> crate::error::Result<ExitStatus> {
         self.check_cancel()?;
         let saved = self.setup_redirections(redirs)?;
-        let args_bytes: Vec<ShellBytes> = args.iter().cloned().map(Into::into).collect();
+        let args_bytes: Vec<ShellBytes> = args.iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
         let mut assign_bytes = Vec::new();
         for assign in assigns {
             let value = self.expand_string(&assign.value)?;
