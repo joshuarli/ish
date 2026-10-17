@@ -94,6 +94,8 @@ Without commit authority, preserve uncommitted work and report its path.
 
 - 2026-10-17: Lean is already set up. Use the installed toolchain. Preflight verified
   Lean 4.34.1 and Lake. Create the repository project, but do not reinstall Lean.
+- 2026-10-17: upgrade this project to the installed Lean 4.35.0 and run
+  `lake check --paranoid` over all model families. Keep the Rust nightly pin.
 - 2026-10-17: Arithmetic uses wrapping i64 addition, subtraction, multiplication,
   and negation. Division by zero and signed division overflow return arithmetic
   errors. Shift counts outside 0–63 return arithmetic errors. Apply the same rules
@@ -129,7 +131,8 @@ Without commit authority, preserve uncommitted work and report its path.
 - Preserve the raw corpus during migration. Parse bytes, not lossy UTF-8. Support
   all observed directives, including `need-pass` and `info-pre`. Remove the Perl
   runner only after old and new outcome parity on the same binary.
-- Pin `formal/lean-toolchain` to `leanprover/lean4:v4.34.1`. Use Lean's standard
+- Pin `formal/lean-toolchain` to `leanprover/lean4:v4.35.0`, as authorized by the
+  owner's toolchain update. Use Lean's standard
   library. Mathlib and new translation toolchains are outside the default grant.
   Investigate Aeneas using already installed tools for at most one working day.
   Keep a working refinement pilot only if compatible with the existing pins and

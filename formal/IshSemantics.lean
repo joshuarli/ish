@@ -1,3 +1,10 @@
 import IshSemantics.Types
 import IshSemantics.Syntax
 import IshSemantics.Protocol
+import IshSemantics.Policy
+import IshSemantics.Expansion
+import IshSemantics.ExpansionTests
+import IshSemantics.Arithmetic
+import IshSemantics.Evaluation.Tests
+import IshSemantics.Effects.Tests
+import IshSemantics.Interactive

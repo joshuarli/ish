@@ -8,6 +8,11 @@ domains.
 
 ## Check the models
 
+The project pins Lean 4.35.0. Run `lake check --paranoid` from `formal/` to
+recheck the default library with all bundled kernels. The library imports every
+model family and its proof fixtures; the axiom and coverage audit remains a
+separate check. Kernel checking requires Linux namespaces and bubblewrap.
+
 Run `lake build semanticBridge protocolTests` from `formal/` to build the models
 and executables. Run `lake env lean IshSemantics/Audit.lean` from `formal/` to
 check theorem axioms and verify that the coverage matrix links to audited
