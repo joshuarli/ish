@@ -1,7 +1,7 @@
 use fxhash::FxHashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
@@ -323,8 +323,8 @@ pub struct Shell {
     pub(crate) redirect_open_handler: Option<RedirectOpenHandler>,
     /// PID of the last background command ($!).
     last_bg_pid: Option<u32>,
-    pub(crate) pending_stdin: Option<OwnedFd>,
-    pub(crate) redirection_backups: Vec<Option<std::os::fd::OwnedFd>>,
+    pub(crate) pending_stdin: Option<usize>,
+    pub(crate) redirection_fds: Vec<Option<OwnedFd>>,
 }
 
 /// Shell option flags (`set -e`, `set -u`, etc.).
@@ -572,7 +572,7 @@ impl ShellBuilder {
             redirect_open_handler: self.redirect_open_handler,
             last_bg_pid: None,
             pending_stdin: None,
-            redirection_backups: Vec::new(),
+            redirection_fds: Vec::new(),
         }
     }
 }
@@ -614,7 +614,7 @@ impl Shell {
             redirect_open_handler: None,
             last_bg_pid: None,
             pending_stdin: None,
-            redirection_backups: Vec::new(),
+            redirection_fds: Vec::new(),
         }
     }
 
@@ -1599,8 +1599,8 @@ impl Shell {
         if self.stderr_sink.is_some() {
             cmd.stderr(std::process::Stdio::piped());
         }
-        if let Some(fd) = self.pending_stdin.as_ref() {
-            let child_stdin = match sys::duplicate_fd_above(fd.as_raw_fd(), 3) {
+        if let Some(fd) = self.pending_stdin_fd() {
+            let child_stdin = match sys::duplicate_fd_above(fd, 3) {
                 Ok(fd) => std::fs::File::from(fd),
                 Err(error) => {
                     return self.finish_redirections(Err(ShellError::Io(error)), saved);

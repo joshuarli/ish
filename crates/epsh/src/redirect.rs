@@ -100,11 +100,35 @@ pub(crate) struct SavedFd {
 #[derive(Default)]
 pub(crate) struct SavedRedirections {
     fds: Vec<SavedFd>,
-    previous_pending_stdin: Option<OwnedFd>,
+    previous_pending_stdin: Option<usize>,
     pending_stdin_changed: bool,
 }
 
 impl Shell {
+    pub(crate) fn pending_stdin_fd(&self) -> Option<RawFd> {
+        self.pending_stdin.map(|index| {
+            self.redirection_fds[index]
+                .as_ref()
+                .expect("pending stdin slot is occupied")
+                .as_raw_fd()
+        })
+    }
+
+    fn hold_pending_stdin(&mut self, fd: OwnedFd) -> usize {
+        let index = self.redirection_fds.len();
+        self.redirection_fds.push(Some(fd));
+        index
+    }
+
+    fn release_pending_stdin(&mut self, index: usize) {
+        drop(
+            self.redirection_fds[index]
+                .take()
+                .expect("pending stdin slot is occupied"),
+        );
+        self.trim_redirection_fds();
+    }
+
     pub(crate) fn setup_redirections(
         &mut self,
         redirs: &[Redir],
@@ -132,18 +156,18 @@ impl Shell {
         }
     }
 
-    fn move_backup_for_target(
+    fn move_held_fd_for_target(
         &mut self,
         target_fd: RawFd,
         saved_fd_min: RawFd,
     ) -> crate::error::Result<()> {
-        let Some(index) = self.redirection_backups.iter().position(|backup| {
+        let Some(index) = self.redirection_fds.iter().position(|backup| {
             backup.as_ref().is_some_and(|fd| fd.as_raw_fd() == target_fd)
         }) else {
             return Ok(());
         };
         let moved = sys::duplicate_fd_above(target_fd, saved_fd_min)?;
-        let old = self.redirection_backups[index].replace(moved).unwrap();
+        let old = self.redirection_fds[index].replace(moved).unwrap();
         sys::close(old.into_raw_fd())?;
         Ok(())
     }
@@ -167,9 +191,9 @@ impl Shell {
         }
     }
 
-    fn trim_redirection_backups(&mut self) {
-        while self.redirection_backups.last().is_some_and(Option::is_none) {
-            self.redirection_backups.pop();
+    fn trim_redirection_fds(&mut self) {
+        while self.redirection_fds.last().is_some_and(Option::is_none) {
+            self.redirection_fds.pop();
         }
     }
 
@@ -206,10 +230,12 @@ impl Shell {
     ) -> crate::error::Result<()> {
         for redir in redirs {
             let target_fd = redir.fd;
-            self.move_backup_for_target(target_fd, saved_fd_min)?;
+            self.move_held_fd_for_target(target_fd, saved_fd_min)?;
             if target_fd == 0 {
                 if saved.pending_stdin_changed {
-                    self.pending_stdin = None;
+                    if let Some(index) = self.pending_stdin.take() {
+                        self.release_pending_stdin(index);
+                    }
                 } else {
                     saved.previous_pending_stdin = self.pending_stdin.take();
                     saved.pending_stdin_changed = true;
@@ -226,8 +252,8 @@ impl Shell {
                 let (backup_slot, was_closed) = match sys::duplicate_fd_above(target_fd, saved_fd_min)
                 {
                     Ok(copy) => {
-                        let index = self.redirection_backups.len();
-                        self.redirection_backups.push(Some(copy));
+                        let index = self.redirection_fds.len();
+                        self.redirection_fds.push(Some(copy));
                         (Some(index), false)
                     }
                     Err(error) if error.raw_os_error() == Some(libc::EBADF) => (None, true),
@@ -277,7 +303,7 @@ impl Shell {
                     if fd_str == "-" {
                         sys::close(target_fd)?;
                     } else if let Ok(source_fd) = fd_str.parse::<i32>() {
-                        if self.redirection_backups.iter().any(|backup| {
+                        if self.redirection_fds.iter().any(|backup| {
                             backup.as_ref().is_some_and(|fd| fd.as_raw_fd() == source_fd)
                         }) {
                             return Err(ShellError::Io(std::io::Error::from_raw_os_error(libc::EBADF)));
@@ -311,7 +337,7 @@ impl Shell {
 
                     if target_fd == 0 && (self.stdout_sink.is_some() || self.stderr_sink.is_some())
                     {
-                        self.pending_stdin = Some(read_end);
+                        self.pending_stdin = Some(self.hold_pending_stdin(read_end));
                     } else {
                         install_redirection(read_end, target_fd).map_err(ShellError::Io)?;
                     }
@@ -334,7 +360,7 @@ impl Shell {
         let mut errors = Vec::new();
         for s in fds.into_iter().rev() {
             if let Some(index) = s.backup_slot {
-                let copy = self.redirection_backups[index].take().unwrap().into_raw_fd();
+                let copy = self.redirection_fds[index].take().unwrap().into_raw_fd();
                 if let Err(error) = sys::dup2_result(copy, s.target_fd) {
                     errors.push(error);
                 }
@@ -354,9 +380,12 @@ impl Shell {
             }
         }
         if pending_stdin_changed {
+            if let Some(index) = self.pending_stdin.take() {
+                self.release_pending_stdin(index);
+            }
             self.pending_stdin = previous_pending_stdin;
         }
-        self.trim_redirection_backups();
+        self.trim_redirection_fds();
         if errors.is_empty() {
             Ok(())
         } else {
@@ -383,16 +412,18 @@ impl Shell {
             previous_pending_stdin,
             ..
         } = saved;
-        drop(previous_pending_stdin);
+        if let Some(index) = previous_pending_stdin {
+            self.release_pending_stdin(index);
+        }
         let errors: Vec<_> = fds
             .into_iter()
             .filter_map(|state| state.backup_slot)
             .filter_map(|index| {
-                let fd = self.redirection_backups[index].take().unwrap().into_raw_fd();
+                let fd = self.redirection_fds[index].take().unwrap().into_raw_fd();
                 sys::close(fd).err()
             })
             .collect();
-        self.trim_redirection_backups();
+        self.trim_redirection_fds();
         let cleanup = if errors.is_empty() {
             Ok(())
         } else {

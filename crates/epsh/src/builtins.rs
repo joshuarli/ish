@@ -5,7 +5,6 @@ use crate::parser::Parser;
 use crate::shell_bytes::ShellBytes;
 use crate::sys;
 use crate::test_cmd::test_eval;
-use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
@@ -496,11 +495,7 @@ impl Shell {
             vec!["REPLY"]
         };
 
-        let stdin_fd = self
-            .pending_stdin
-            .as_ref()
-            .map(AsRawFd::as_raw_fd)
-            .unwrap_or(0);
+        let stdin_fd = self.pending_stdin_fd().unwrap_or(0);
         let mut line = Vec::new();
         let mut buf = [0u8; 1];
         let mut hit_eof = true;
