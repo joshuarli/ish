@@ -13,15 +13,10 @@ Install Rust and Cargo, then add epsh to a Rust project:
 
 To install the command-line runner:
 
-    cargo install epsh
+    cargo install epsh --bin epsh
 
-The `epsh` crate has no dependency on ish and remains independently packageable.
-From the ish repository, select it with `-p epsh` because both crates share a
-workspace and lockfile:
-
-    cargo build -p epsh
-    cargo test -p epsh --lib --tests
-    cargo package -p epsh
+The crate has no dependency on ish and remains independently packageable.
+Workspace contributor commands are in [Testing](docs/testing.md).
 
 ## Use as a library
 
@@ -142,6 +137,6 @@ builtins, here-strings, extended globs, arrays, typeset, or select. Traps run
 between commands, not while the shell is blocked waiting for a child. The
 ~user form of tilde expansion remains literal; a leading ~ expands from HOME.
 
-For help, see the [project repository](https://github.com/joshuarli/epsh) or
-report an issue in its [issue tracker](https://github.com/joshuarli/epsh/issues).
+For help, see the [project repository](https://github.com/joshuarli/ish) or
+report an issue in its [issue tracker](https://github.com/joshuarli/ish/issues).
 epsh is distributed under the [MIT license](LICENSE).

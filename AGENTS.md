@@ -33,6 +33,10 @@ behavior contract.
 
 ## Topic map
 
+- Open defects: [TODO](TODO.md). Pending designs: [foreground job
+  outcomes](docs/rfc/ISH-5-foreground-job-outcomes.md) and [callback process
+  boundaries](docs/rfc/ISH-8-callback-process-boundary.md).
+
 - Execution flow, epsh integration, command routing, process boundaries, and module ownership: [Architecture](docs/architecture.md).
 - History search ranking and session snapshots: [History search](docs/history-search.md).
 - Completion matching, ordering, and hot-path constraints: [Completion](docs/completion.md).

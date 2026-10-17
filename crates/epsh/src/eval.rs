@@ -1159,9 +1159,6 @@ impl Shell {
                     return ExitStatus::from_signal(2); // 130 = SIGINT
                 }
                 Err(ShellError::Stopped { .. }) => {
-                    // A foreground process was stopped (SIGTSTP). Return 148
-                    // (128 + SIGTSTP) so the embedder can detect and save the job.
-                    // Do not print anything — the embedder handles the UI.
                     return ExitStatus::from(148);
                 }
                 Err(e) => {

@@ -41,6 +41,18 @@ builtins and expansion, rather than immediately calling exec. Replacing this
 with a raw fork primitive that requires raw operations until exec would change
 that execution model.
 
+Before an evaluator fork, epsh locks and flushes Rust stdout, then releases the
+copied guard in both processes. This prevents inherited stdout locks and parent
+buffer duplication. A flush error aborts setup. The current pipeline error path
+terminates all tracked children; its cleanup scope is tracked in
+[ISH-13](../../../TODO.md#ish-13--p2--pipeline-setup-errors-terminate-unrelated-background-children).
+
+Embedding callbacks can execute in forked evaluator children. A captured host
+mutex held by another thread at fork can remain locked in the child after the
+parent unlocks it. The stdout guard does not protect arbitrary callback state.
+The pending boundary decision is tracked in
+[ISH-8](../../../docs/rfc/ISH-8-callback-process-boundary.md).
+
 The default executor checks cancellation and deadlines between commands and
 while waiting for children. On cancellation or timeout it terminates tracked
 child process groups. A custom external handler owns the lifecycle of the

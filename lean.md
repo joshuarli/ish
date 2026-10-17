@@ -541,10 +541,15 @@ Append one line per material executor judgment, with the call and its reason.
 Append one line per phase end with commands, outcomes, contract changes, and remaining
 hard stops. Baseline IDs and theorem coverage belong in their tested artifacts.
 
-## Closeout report
+## Historical closeout report
 
-Status: incomplete. All local acceptance checks pass. Native macOS Apple silicon
-and Linux ARM64 hosts are unavailable; remote CI was not authorized.
+This report predates the native CI fixes. Its host-availability status is
+superseded by the [successful four-platform CI run](https://github.com/joshuarli/ish/actions/runs/39066552118).
+See the [current verification guide](formal/README.md) for commands and proof
+boundaries. Measurements below describe the recorded revisions.
+
+Original status: incomplete. All local acceptance checks pass. Native macOS Apple
+silicon and Linux ARM64 hosts are unavailable; remote CI was not authorized.
 
 The unsquashed epsh import and one-workspace conversion are integrated. The Rust
 conformance corpus retains all 175 IDs: 168 pass, and seven are explicit

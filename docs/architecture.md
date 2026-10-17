@@ -44,23 +44,12 @@ undo effects from earlier commands or expansion.
   run in-process. External commands and command substitutions may start child
   processes. A `.envrc` that requests bash evaluation may also start one.
 
-Before an evaluator fork, epsh locks and flushes Rust stdout, then releases the
-copied guard in both processes. This prevents inherited stdout locks and parent
-buffer duplication. Flush errors abort the fork and clean up earlier pipeline
-children.
+Evaluator fork, wait, callback, and cancellation behavior belongs to the
+[epsh process model](../crates/epsh/docs/process-model.md).
 
-## Subsystem ownership
-
-| Area | Owner |
-|---|---|
-| Event loop, shell state, mode and key dispatch | [`src/main.rs`](../src/main.rs) |
-| Input decoding and editable text | [`src/input.rs`](../src/input.rs), [`src/line.rs`](../src/line.rs) |
-| Prompt, rendering and terminal mode | [`src/prompt.rs`](../src/prompt.rs), [`src/render.rs`](../src/render.rs), [`src/term.rs`](../src/term.rs) |
-| Parsing gate and command routing | [`src/dispatch.rs`](../src/dispatch.rs), [`src/builtin.rs`](../src/builtin.rs) |
-| Foreground job control and system calls | [`src/job.rs`](../src/job.rs), [`src/sys.rs`](../src/sys.rs), [`src/signal.rs`](../src/signal.rs) |
-| Completion and directory listing | [`src/complete.rs`](../src/complete.rs), [`src/path.rs`](../src/path.rs), [`src/ls.rs`](../src/ls.rs) |
-| History search and ranking | [`src/history.rs`](../src/history.rs), [`src/frecency.rs`](../src/frecency.rs) |
-| Config, aliases and denv | [`src/config.rs`](../src/config.rs), [`src/alias.rs`](../src/alias.rs), [`src/denv.rs`](../src/denv.rs) |
+Module entry points are [src/lib.rs](../src/lib.rs) and the interactive event
+loop in [src/main.rs](../src/main.rs). Parser and evaluator internals belong to
+[epsh's architecture](../crates/epsh/docs/architecture.md).
 
 ## Semantic verification
 
@@ -90,21 +79,4 @@ losslessly. The proof connects that result to both model shift branches. Its
 trust boundary includes the extractor and its separate compiler version.
 See [epsh testing](../crates/epsh/docs/testing.md) for Rust and native corpus commands.
 
-## Shell terms
-
-Use these terms consistently:
-
-- An **input line** is raw text from the line editor.
-- A **token** is a lexical unit, including operators such as `|`, `&&` and `>`.
-- A **shell word** is unexpanded syntax; an epsh `Word` contains its word parts.
-- A **field** is an argument produced by expansion for `argv`.
-- A **simple command** has assignments, a command name, arguments and
-  redirections.
-- A **pipeline** joins commands with `|` or `|&`.
-- An **AND-OR list** joins commands with `&&` or `||`; a **sequential list**
-  joins commands with `;` or a newline. Use *list* for the general case.
-- A **redirection** routes a file descriptor, as in `>file` or `2>file`.
-- **Parameter expansion** handles `$HOME`; **pathname expansion** (globbing)
-  handles patterns such as `*.rs`.
-- A **builtin** is implemented by the shell; an **external command** runs in a
-  child process. A **job** is the foreground process group and terminal state.
+Shell terminology follows [epsh's architecture](../crates/epsh/docs/architecture.md).
