@@ -3627,7 +3627,7 @@ fn native_listing_and_standalone_cd_preserve_private_use_and_raw_path_bytes() {
             std::fs::write(directory.join("codec-path-marker"), b"").unwrap();
         }
     });
-    for directory in ["\u{e000}\u{e080}".to_string(), "$(printf '\\200')".to_string()] {
+    for directory in ["\u{e000}\u{e080}".to_string(), "$(printf '\\0200')".to_string()] {
         let out = clean(&sh.run_command(&format!("l \"$HOME/{directory}\"")));
         assert!(out.contains("codec-path-marker"), "{out}");
         let out = clean(&sh.run_command(&format!("cd \"$HOME/{directory}\"")));

@@ -2478,10 +2478,10 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
 fn env_pair_value(
     env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)],
     name: &str,
-) -> Option<String> {
+) -> Option<OsString> {
     env_pairs
         .iter()
-        .find_map(|(k, v)| (k.as_bytes() == name.as_bytes()).then(|| v.to_shell_string()))
+        .find_map(|(k, v)| (k.as_bytes() == name.as_bytes()).then(|| v.to_os_string()))
 }
 
 /// Build the external handler for epsh. Handles ish-specific builtins
@@ -2663,9 +2663,12 @@ fn spawn_external(
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let path_env = env_pair_value(env_pairs, "PATH")
                     .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
-                if let Some(msg) = epsh::eval::bad_interpreter_message(&name, code, &cwd, &path_env)
-                {
-                    eprintln!("{msg}");
+                if let Some(msg) = epsh::eval::bad_interpreter_message_os(&args[0].to_os_string(), code, &cwd, &path_env) {
+                    use std::io::Write;
+                    use std::os::unix::ffi::OsStrExt;
+                    let mut stderr = std::io::stderr().lock();
+                    stderr.write_all(msg.as_bytes())?;
+                    stderr.write_all(b"\n")?;
                     return Ok(epsh::error::ExitStatus::NOT_EXECUTABLE);
                 }
             }
