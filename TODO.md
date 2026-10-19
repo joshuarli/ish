@@ -38,3 +38,12 @@ Next: 23
 - **Recommendation:** Publish recovery that removes previously observable occurrences as a new generation, atomically replacing the retained prefix so readers rebuild their snapshots and reset occurrence cutoffs.
 - **Fix with:** durable-state
 - **Effort:** M (days)
+
+### ISH-23 · P3 · Add a builtin to copy the last command's output
+
+- **Area:** Architecture
+- **Where:** `src/main.rs:256`, `src/main.rs:302`, `src/main.rs:2664`, `src/builtin.rs:26`, `README.md:128`
+- **Problem:** `copy-scrollback` copies terminal history, but ish cannot copy only the previous command's output: foreground children inherit the terminal and write around ish, while `TermWriter` contains only ish's UI bytes. Capturing output therefore needs an execution-path change, not just another builtin.
+- **Recommendation:** Add the standalone `?` builtin and retain the most recent interactive command's output in a reusable, bounded in-memory byte buffer while relaying it live to the terminal. Do not use temporary files or helper subprocesses. Preserve interactive child behavior while choosing the relay mechanism; a pipe can change `isatty` and child buffering, so evaluate a PTY relay if that matters. Reuse the existing OSC 52 clipboard path. Specify whether capture includes stderr and how pipelines and explicit redirections affect the captured bytes; bound retained memory for large or unbounded output.
+- **Fix with:** lifecycle-concurrency, os-boundaries
+- **Effort:** M (days)
