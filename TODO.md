@@ -1,5 +1,5 @@
 Prefix: ISH
-Next: 45
+Next: 53
 
 ### ISH-26 · P2 · A trusted `.envrc` runs unhashed files through `source_env`, `source_up` and `dotenv`
 
@@ -68,3 +68,75 @@ Next: 45
 - **Fix with:** none
 - **Effort:** S (hours)
 
+
+### ISH-45 · P3 · macOS-only edits from the backlog run were never compiled
+
+- **Area:** Tests
+- **Where:** `crates/ish-fs/tests/native_macos.rs`, `crates/ish-fs/src/engine/mod.rs` (`replace_by_exchange`), `crates/fdu-scan/src/macos.rs`, `src/signal.rs` (`errno_slot`), `crates/ish-fs/src/platform/mod.rs` (`rename_exchange`)
+- **Problem:** ISH-29, ISH-31, ISH-33 and ISH-38 changed macOS code paths on a Linux host. `native_macos.rs` now panics instead of skipping, `rename_exchange` relies on rustix mapping `RenameFlags::EXCHANGE` to `RENAME_SWAP`, `fdu-scan/src/macos.rs` lost its one-shot scanner, and the signal handler uses `libc::__error`. None of it was compiled or run.
+- **Recommendation:** On a macOS host run workspace check, strict clippy, `make test`, and `cargo test -p ish-fs --test native_macos -- --include-ignored` as uid 0, and fix what fails.
+- **Fix with:** none
+- **Effort:** S (hours)
+
+### ISH-46 · P3 · Remaining early-return skips and unrun fixtures in ish-fs and fdu-delete
+
+- **Area:** Tests
+- **Where:** `crates/ish-fs/src/engine/tests.rs:60,725,739,753`, `crates/ish-fs/src/engine/repair_tests.rs:258,263`, `crates/ish-fs/tests/native_boundaries.rs` (foreign-owner cases), `benches/fs/native-fixtures.sh`, `crates/fdu-delete/src/posix/quarantine.rs`
+- **Problem:** The sparse, reflink, `copy_file_range` and immutable-flag lib tests still return early and report a pass when the filesystem lacks the capability. After ISH-29 nothing runs the two foreign-owner cases automatically: the script's single-ID user namespace cannot assign uid 65534. `crates/fdu-delete` has no `#[test]` functions, so the ISH-41 ticket's claim of three tests guarding `t`'s destructive path does not match the tree; adding it to `default-members` only builds it.
+- **Recommendation:** Mark the capability-dependent lib tests `#[ignore = "reason"]` and run them from the fixture script, run the foreign-owner cases from a multi-ID namespace or document the manual root run as required evidence, and write tests for `fdu-delete`'s quarantine path or remove the claim.
+- **Fix with:** test-audit
+- **Effort:** M (days)
+
+### ISH-47 · P3 · denv and history leave unreclaimed or unobserved state after abnormal exit
+
+- **Area:** Data
+- **Where:** `src/denv.rs` (active record directory), `src/history/store.rs` (`read_snapshot` recovery)
+- **Problem:** After ISH-27, an `active_<pid>-<token>` record and its `.tmp` files from a shell killed by SIGKILL or a crash are never reused and never deleted, so they accumulate in the denv data directory; old `active_<pid>` files are orphaned the same way. After ISH-22, a reader that observed a frame later zeroed out or truncated externally within one generation is still not invalidated, the same class of fault with a different trigger. Neither was reproduced end to end.
+- **Recommendation:** Prune records whose pid is gone at startup, and publish every recovery that removes an observable occurrence as a new generation, covering the zero-fill and short-tail cases.
+- **Fix with:** durable-state
+- **Effort:** M (days)
+
+### ISH-48 · P3 · `main.rs` still holds the editor and `Shell`, and the keystroke path has no unit seam
+
+- **Area:** Architecture
+- **Where:** `src/main.rs`, `docs/architecture.md`
+- **Problem:** ISH-34 moved the external handler, diagnostics, `cd` rewriting and mode state out and split `read_line_with_reader` per event and mode, but `main.rs` is still about 2500 lines. The editor functions, key handlers and `Shell` live in the binary, so the per-mode handlers cannot be unit-tested; `write_layout_dump_file` also reports every `open` error except retry exhaustion as "could not choose a unique dump filename".
+- **Recommendation:** Decide where `Shell` lives, move the editor and key handlers behind it into the library, and add unit tests for the per-mode handlers. Report the real `open` error from the dump writer.
+- **Fix with:** api-surface-and-module-boundaries
+- **Effort:** L (weeks)
+
+### ISH-49 · P4 · Per-key history search allocation in `search_limited` is unmeasured, and no benchmark reaches the key handler
+
+- **Area:** Performance
+- **Where:** `src/history.rs` (`search_limited`), `benches/bench.rs`
+- **Problem:** `search_limited` allocates a `Vec<RankKey>` sized to the limit on every search, which is likely a larger per-key allocation than the two removed by ISH-43. The existing history benchmarks call the search directly and cannot show a change in the key handler, so ISH-43 was closed on code reading, not measurement.
+- **Recommendation:** Add a benchmark or counting-allocator test that drives the key handler, then reuse the rank buffer if it shows up.
+- **Fix with:** make-it-fast
+- **Effort:** S (hours)
+
+### ISH-50 · P4 · Small dead and stale leftovers: `RootAnchor::modified_time`, the legacy prompt label, an empty `~user` branch
+
+- **Area:** Dead code
+- **Where:** `crates/fdu-scan/src/lib.rs` (`RootAnchor::modified_time`), `src/prompt.rs` (`render_with_state`), `src/frecency.rs` (`directory_scores`), `src/history/persistence_tests.rs` (`let _ = first_end;`)
+- **Problem:** `RootAnchor::modified_time` has no caller. `Prompt::render_with_state` is still labelled legacy though the tests and the real path use it. `directory_scores` skips `~user` targets with an empty `else if` arm. `reset_works_on_a_log_with_damaged_records_or_header` carries a dead `let _ = first_end;`.
+- **Recommendation:** Delete the unused method and the dead statement, drop the stale label, and fold the `~user` skip into the target filter.
+- **Fix with:** dead-code-archaeology
+- **Effort:** S (hours)
+
+### ISH-51 · P3 · A 0555 directory carrying a `user.*` xattr may fail the same way ISH-30 did for files
+
+- **Area:** Data
+- **Where:** `crates/ish-fs/src/engine/transfer.rs:379`, `crates/ish-fs/src/engine/transfer.rs:493`, `crates/ish-fs/src/platform/linux.rs`
+- **Problem:** ISH-30 reordered `apply_fd_metadata` so xattrs and the ACL precede the final `fchmod`. Directories go through the same `apply_metadata` at the two call sites, but no test combines a read-only directory with a `user.*` xattr and the check was not run (`setfattr` is absent on this host).
+- **Recommendation:** Add one test with a 0555 directory carrying a `user.*` xattr and fix the directory path if it fails.
+- **Fix with:** os-boundaries
+- **Effort:** S (hours)
+
+### ISH-52 · P4 · Two SAFETY claims in `denv.rs` say ish is single-threaded without proof
+
+- **Area:** Security
+- **Where:** `src/denv.rs` (`env::set_var` and `env::remove_var` call sites)
+- **Problem:** The comments claim a single-threaded process, but `foreground.rs` spawns worker threads. This overlaps ISH-15 and was left unverified by the comment cleanup.
+- **Recommendation:** Resolve with ISH-15: state the real precondition at the call sites or remove the process-environment mutation.
+- **Fix with:** os-boundaries
+- **Effort:** S (hours)
