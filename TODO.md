@@ -1,5 +1,5 @@
 Prefix: ISH
-Next: 57
+Next: 59
 
 ### ISH-26 · P2 · A trusted `.envrc` runs unhashed files through `source_env`, `source_up` and `dotenv`
 
@@ -96,3 +96,21 @@ Next: 57
 - **Fix with:** os-boundaries
 - **Effort:** S (hours)
 
+
+### ISH-57 · P4 · Several `prompt_git_*` integration tests never check that a branch was detected
+
+- **Area:** Tests
+- **Where:** `tests/integration.rs` (`prompt_git_branch_detects_repo` and the other `prompt_git_*` tests)
+- **Problem:** The tests assert only that the rendered prompt ends with ` $ `, so they pass whether or not a branch is found; one comment says it only verifies the code path runs. ISH-28 added precise unit tests in `src/prompt.rs`, but the integration layer still guards nothing.
+- **Recommendation:** Assert the branch text in each repository fixture, or delete the tests that duplicate the unit tests.
+- **Fix with:** test-audit
+- **Effort:** S (hours)
+
+### ISH-58 · P4 · `fdu-delete` recovery still has uncovered branches and a stray whitespace line
+
+- **Area:** Tests
+- **Where:** `crates/fdu-delete/src/posix/quarantine.rs`, `crates/fdu-delete/tests/quarantine.rs`, `crates/fdu-delete/src/lib.rs:292-293`
+- **Problem:** ISH-54 left two recovery cases untested: an intent whose parent-name count exceeds the remaining bytes, and a non-numeric capture id. The mount-changed branches need a second mount, and `lib.rs` has a whitespace-only line between the macOS and Linux `MountIdentity` definitions.
+- **Recommendation:** Add the two malformed-record cases to the hand-written workspace tests, and decide whether the mount branches get a native fixture under `benches/fs/native-fixtures.sh`.
+- **Fix with:** test-audit
+- **Effort:** S (hours)
