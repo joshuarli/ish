@@ -228,10 +228,12 @@ Evaluation stops after 60 seconds.
 using `DENV_DATA_DIR` or `$HOME/.local/share/denv`. Project changes to `HOME` or
 `DENV_DATA_DIR` do not move that storage. Leaving a project restores its variables.
 Each shell keeps its restoration record in that directory under a name made of
-its pid and a random token, exported as `__DENV_PID`, and removes the record
+its pid, on Linux its pid namespace, and a random token, exported as `__DENV_PID`, and removes the record
 when it exits. A shell killed without cleanup leaves its record behind; no later
 shell reads it, and each new shell removes records whose pid is no longer
-running. A record whose pid has been reused by a running process stays.
+running in the new shell's pid namespace. A record whose pid has been reused by
+a running process stays, and so does a record written from another pid
+namespace, such as another container sharing the directory.
 If the shell's active restoration record is malformed or
 uses an unsupported version, `denv` reports an error and leaves the process
 environment unchanged. `denv reload`, `denv allow`, and `denv deny` then

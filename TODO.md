@@ -96,11 +96,3 @@ Next: 57
 - **Fix with:** os-boundaries
 - **Effort:** S (hours)
 
-### ISH-56 · P4 · Startup record cleanup in denv treats a pid from another pid namespace as dead
-
-- **Area:** Data
-- **Where:** `src/denv.rs` (`remove_dead_shell_records`, `shell_is_alive`)
-- **Problem:** Records are kept when `kill(pid, 0)` succeeds or fails with `EPERM` and removed on `ESRCH`. Two shells in different pid namespaces (containers or `unshare`) sharing one `DENV_DATA_DIR` see each other's pids as dead, so a new shell deletes a live shell's record and that shell cannot restore its saved variables. Not reproduced.
-- **Recommendation:** Record the pid-namespace identity (`/proc/self/ns/pid` inode on Linux) in the record name or contents and skip removal for foreign namespaces, or document the limit in the README.
-- **Fix with:** durable-state
-- **Effort:** S (hours)

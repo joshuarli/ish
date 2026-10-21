@@ -77,7 +77,20 @@ impl ActiveLoadError {
     }
 }
 
-fn new_record_id() -> Result<String, String> {
+#[cfg(target_os = "linux")]
+fn current_pid_namespace() -> Result<Option<u64>, String> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata("/proc/self/ns/pid")
+        .map(|meta| Some(meta.ino()))
+        .map_err(|err| format!("cannot read /proc/self/ns/pid: {err}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_pid_namespace() -> Result<Option<u64>, String> {
+    Ok(None)
+}
+
+fn new_record_id(pid_namespace: Option<u64>) -> Result<String, String> {
     let mut token = [0u8; 16];
     loop {
         match rustix::rand::getrandom(&mut token, rustix::rand::GetRandomFlags::empty()) {
@@ -91,6 +104,9 @@ fn new_record_id() -> Result<String, String> {
     }
     let mut id = std::process::id().to_string();
     id.push('-');
+    if let Some(namespace) = pid_namespace {
+        write!(id, "{namespace}-").expect("writing to a String cannot fail");
+    }
     for byte in token {
         write!(id, "{byte:02x}").expect("writing to a String cannot fail");
     }
@@ -127,7 +143,11 @@ enum EnvRcInterpreter {
 
 pub fn init(epsh: &mut epsh::eval::Shell) -> Session {
     let data_dir = data_dir(epsh);
-    let record_id = new_record_id().map_err(|err| format!("cannot name the active record: {err}"));
+    let pid_namespace = current_pid_namespace();
+    let record_id = pid_namespace
+        .clone()
+        .and_then(new_record_id)
+        .map_err(|err| format!("cannot name the active record: {err}"));
     let vars = epsh.vars_mut();
     if let Ok(record_id) = &record_id {
         let _ = vars.set("__DENV_PID", record_id);
@@ -136,7 +156,8 @@ pub fn init(epsh: &mut epsh::eval::Shell) -> Session {
     let _ = vars.set("__DENV_SHELL", "bash");
     vars.export("__DENV_SHELL");
     if let Ok(data_dir) = &data_dir
-        && let Err(err) = remove_dead_shell_records(data_dir)
+        && let Ok(pid_namespace) = &pid_namespace
+        && let Err(err) = remove_dead_shell_records(data_dir, *pid_namespace)
     {
         eprintln!("denv: {err}");
     }
@@ -837,7 +858,12 @@ fn clear_active(data_dir: &Path, record_id: &str) -> Result<(), String> {
     }
 }
 
-fn record_owner(name: &str) -> Option<rustix::process::Pid> {
+struct RecordOwner {
+    pid: rustix::process::Pid,
+    pid_namespace: Option<u64>,
+}
+
+fn record_owner(name: &str) -> Option<RecordOwner> {
     let (rest, temporary) = match name.strip_prefix(".active_") {
         Some(rest) => (rest.strip_suffix(".tmp")?, true),
         None => (name.strip_prefix("active_")?, false),
@@ -853,7 +879,13 @@ fn record_owner(name: &str) -> Option<rustix::process::Pid> {
     if !suffix_ok {
         return None;
     }
-    rustix::process::Pid::from_raw(pid.parse().ok()?)
+    let pid = rustix::process::Pid::from_raw(pid.parse().ok()?)?;
+    let pid_namespace = suffix.strip_prefix('-').and_then(|rest| {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let (namespace, after) = rest.split_at(digits);
+        after.starts_with('-').then(|| namespace.parse().ok()).flatten()
+    });
+    Some(RecordOwner { pid, pid_namespace })
 }
 
 fn shell_is_alive(pid: rustix::process::Pid) -> bool {
@@ -863,7 +895,10 @@ fn shell_is_alive(pid: rustix::process::Pid) -> bool {
     )
 }
 
-fn remove_dead_shell_records(data_dir: &Path) -> Result<(), String> {
+fn remove_dead_shell_records(
+    data_dir: &Path,
+    own_pid_namespace: Option<u64>,
+) -> Result<(), String> {
     let entries = match fs::read_dir(data_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -874,7 +909,11 @@ fn remove_dead_shell_records(data_dir: &Path) -> Result<(), String> {
         let Some(owner) = entry.file_name().to_str().and_then(record_owner) else {
             continue;
         };
-        if shell_is_alive(owner) {
+        let foreign = matches!(
+            (owner.pid_namespace, own_pid_namespace),
+            (Some(theirs), Some(ours)) if theirs != ours
+        );
+        if foreign || shell_is_alive(owner.pid) {
             continue;
         }
         match fs::remove_file(entry.path()) {
@@ -1987,6 +2026,45 @@ mod tests {
         std::fs::write(&own, "x").unwrap();
         drop(session);
         assert!(!own.exists());
+    }
+
+    #[test]
+    fn cleanup_keeps_records_of_other_pid_namespaces() {
+        let tmp = TempDir::new("ish_denv_foreign_namespace");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let dead = i32::MAX - 1;
+        let token = "00112233445566778899aabbccddeeff";
+        let foreign = [
+            format!("active_{dead}-4026531836-{token}"),
+            format!(".active_{dead}-4026531836-{token}.3.tmp"),
+        ];
+        let own = [
+            format!("active_{dead}-4026532000-{token}"),
+            format!("active_{dead}-{token}"),
+        ];
+        for name in foreign.iter().chain(&own) {
+            std::fs::write(data.join(name), "x").unwrap();
+        }
+
+        remove_dead_shell_records(&data, Some(4026532000)).unwrap();
+
+        for name in &foreign {
+            assert!(data.join(name).exists(), "{name} should be kept");
+        }
+        for name in &own {
+            assert!(!data.join(name).exists(), "{name} should be removed");
+        }
+    }
+
+    #[test]
+    fn record_ids_carry_the_pid_namespace_and_parse_back() {
+        let id = new_record_id(Some(4026531836)).unwrap();
+        let owner = record_owner(&format!("active_{id}")).unwrap();
+        assert_eq!(owner.pid.as_raw_nonzero().get() as u32, std::process::id());
+        assert_eq!(owner.pid_namespace, Some(4026531836));
+        let id = new_record_id(None).unwrap();
+        assert_eq!(record_owner(&format!("active_{id}")).unwrap().pid_namespace, None);
     }
 
     #[test]
