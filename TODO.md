@@ -21,15 +21,6 @@ Next: 45
 - **Effort:** M (days)
 - **Design:** [Builtin allowlist](docs/rfc/ISH-24-builtin-allowlist.md)
 
-### ISH-27 · P2 · denv's per-pid active file outlives the shell, so a reused pid restores another session's values
-
-- **Area:** Data
-- **Where:** `src/denv.rs:99`, `src/denv.rs:177-178`, `src/denv.rs:247`, `src/denv.rs:448-449`, `src/denv.rs:563-575`, `src/denv.rs:775-782`
-- **Problem:** The record is named `active_<pid>` in the persistent denv data directory and is removed only when the shell leaves a project directory; no exit path calls `clear_active`. Exiting inside a project, the normal case, leaves it behind. A later ish with the same pid, likely after a reboot resets pids, loads it at startup and applies its saved `prev` values in a directory with no `.envrc`, which can overwrite `PATH`. A malformed file makes `refresh` return an error before doing anything, and `allow`, `deny`, `reload` and `on_cd` all call `refresh`, so denv stops working until the user deletes the file by hand.
-- **Recommendation:** Key the record by pid plus a per-start random token carried in `__DENV_PID`, and remove it on every exit path. Let `denv reload` discard and report an unparseable record.
-- **Fix with:** durable-state
-- **Effort:** M (days)
-
 ### ISH-28 · P2 · Prompt Git inspection blocks on repo-controlled paths and misses the cache for worktrees
 
 - **Area:** Security

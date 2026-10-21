@@ -3615,6 +3615,46 @@ fn denv_unloads_on_leave() {
     );
 }
 
+fn denv_active_records(sh: &PtyShell) -> Vec<String> {
+    let dir = sh.home_path().join(".local/share/denv");
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("active_"))
+        .collect()
+}
+
+#[test]
+fn denv_exit_command_inside_project_removes_active_record() {
+    let sh = spawn_with_allowed_envrc(
+        &[("project/.envrc", "export DENV_TEST_VAR='active'\n")],
+        "project/.envrc",
+    );
+    sh.run_command("cd project");
+    assert_eq!(denv_active_records(&sh).len(), 1);
+
+    sh.type_str("exit");
+    sh.enter();
+    sh.wait_for_exit(3000);
+
+    assert!(denv_active_records(&sh).is_empty());
+}
+
+#[test]
+fn denv_ctrl_d_inside_project_removes_active_record() {
+    let sh = spawn_with_allowed_envrc(
+        &[("project/.envrc", "export DENV_TEST_VAR='active'\n")],
+        "project/.envrc",
+    );
+    sh.run_command("cd project");
+    assert_eq!(denv_active_records(&sh).len(), 1);
+
+    sh.ctrl_d();
+    sh.wait_for_exit(10_000);
+
+    assert!(denv_active_records(&sh).is_empty());
+}
+
 #[test]
 fn denv_allow_applies_env() {
     let sh = PtyShell::spawn_with_opts(

@@ -226,8 +226,13 @@ Evaluation stops after 60 seconds.
 `denv` fixes its trust and restoration storage directory when the shell starts,
 using `DENV_DATA_DIR` or `$HOME/.local/share/denv`. Project changes to `HOME` or
 `DENV_DATA_DIR` do not move that storage. Leaving a project restores its variables.
-If an active restoration record is malformed or uses an unsupported version,
-`denv` reports an error and leaves the process environment unchanged.
+Each shell keeps its restoration record in that directory under a name made of
+its pid and a random token, exported as `__DENV_PID`, and removes the record
+when it exits. A shell killed without cleanup leaves its record behind, and no
+later shell reads it. If the shell's active restoration record is malformed or
+uses an unsupported version, `denv` reports an error and leaves the process
+environment unchanged. `denv reload`, `denv allow`, and `denv deny` then
+discard the record and report that the variables it saved cannot be restored.
 
 ## Help and license
 

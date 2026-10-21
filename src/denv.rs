@@ -57,12 +57,57 @@ pub struct CommandOutcome {
 
 pub struct Session {
     data_dir: Result<PathBuf, String>,
+    record_id: Result<String, String>,
 }
 
 impl Session {
     fn data_dir(&self) -> Result<&Path, String> {
         self.data_dir.as_deref().map_err(Clone::clone)
     }
+
+    fn record_id(&self) -> Result<&str, String> {
+        self.record_id.as_deref().map_err(Clone::clone)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        on_exit(self);
+    }
+}
+
+#[derive(Debug)]
+enum ActiveLoadError {
+    Unreadable(String),
+    Malformed(String),
+}
+
+impl ActiveLoadError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Unreadable(message) | Self::Malformed(message) => message,
+        }
+    }
+}
+
+fn new_record_id() -> Result<String, String> {
+    let mut token = [0u8; 16];
+    loop {
+        match rustix::rand::getrandom(&mut token, rustix::rand::GetRandomFlags::empty()) {
+            Ok(filled) if filled == token.len() => break,
+            Ok(filled) => {
+                return Err(format!("getrandom returned {filled} of {} bytes", token.len()));
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(format!("getrandom failed: {err}")),
+        }
+    }
+    let mut id = std::process::id().to_string();
+    id.push('-');
+    for byte in token {
+        write!(id, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(id)
 }
 
 struct EnvFiles {
@@ -96,13 +141,24 @@ enum EnvRcInterpreter {
 /// Initialize ish's native denv state vars in epsh's variable store.
 pub fn init(epsh: &mut epsh::eval::Shell) -> Session {
     let data_dir = data_dir(epsh);
-    let pid = std::process::id().to_string();
+    let record_id = new_record_id().map_err(|err| format!("cannot name the active record: {err}"));
     let vars = epsh.vars_mut();
-    let _ = vars.set("__DENV_PID", &pid);
-    vars.export("__DENV_PID");
+    if let Ok(record_id) = &record_id {
+        let _ = vars.set("__DENV_PID", record_id);
+        vars.export("__DENV_PID");
+    }
     let _ = vars.set("__DENV_SHELL", "bash");
     vars.export("__DENV_SHELL");
-    Session { data_dir }
+    Session { data_dir, record_id }
+}
+
+pub fn on_exit(session: &Session) {
+    let (Ok(data_dir), Ok(record_id)) = (session.data_dir(), session.record_id()) else {
+        return;
+    };
+    if let Err(err) = clear_active(data_dir, record_id) {
+        eprintln!("denv: {err}");
+    }
 }
 
 /// Called once at shell startup.
@@ -174,11 +230,21 @@ fn current_dir_from_store(epsh: &epsh::eval::Shell) -> PathBuf {
 
 fn refresh(session: &Session, force: bool, epsh: &epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
     let data_dir = session.data_dir()?;
-    let pid = std::process::id().to_string();
-    let active = load_active(data_dir, &pid)?;
+    let record_id = session.record_id()?;
+    let active = match load_active(data_dir, record_id) {
+        Ok(active) => active,
+        Err(ActiveLoadError::Malformed(message)) if force => {
+            clear_active(data_dir, record_id)?;
+            eprintln!(
+                "denv: discarded unreadable active record ({message}); variables it saved cannot be restored"
+            );
+            None
+        }
+        Err(err) => return Err(err.into_message()),
+    };
     let store_env_pairs = epsh.vars().env_for_command_os(&[]);
     restore_process_env(&store_env_pairs);
-    let result = refresh_inner(data_dir, force, epsh, active);
+    let result = refresh_inner(data_dir, record_id, force, epsh, active);
     if result.is_err() {
         restore_process_env(&store_env_pairs);
     }
@@ -187,12 +253,12 @@ fn refresh(session: &Session, force: bool, epsh: &epsh::eval::Shell) -> Result<V
 
 fn refresh_inner(
     data_dir: &Path,
+    record_id: &str,
     force: bool,
     epsh: &epsh::eval::Shell,
     active: Option<ActiveState>,
 ) -> Result<Vec<EnvChange>, String> {
     let cwd = current_dir_from_store(epsh);
-    let pid = std::process::id().to_string();
     let allow_dir = data_dir.join("allow");
 
     let found = find_env_files(&cwd);
@@ -244,7 +310,7 @@ fn refresh_inner(
 
     let Some(found) = found else {
         clear_runtime_state(&mut changes);
-        clear_active(data_dir, &pid)?;
+        clear_active(data_dir, record_id)?;
         if let Some(ref state) = active {
             print_restore_summary(&state.prev);
         }
@@ -271,7 +337,7 @@ fn refresh_inner(
         );
         set_change(&mut changes, "__DENV_DIRTY", "1".to_string());
         unset_change(&mut changes, "__DENV_STATE");
-        clear_active(data_dir, &pid)?;
+        clear_active(data_dir, record_id)?;
         if let Some(ref state) = active {
             print_restore_summary(&state.prev);
         }
@@ -299,7 +365,7 @@ fn refresh_inner(
                 );
                 set_change(&mut changes, "__DENV_DIRTY", "1".to_string());
                 unset_change(&mut changes, "__DENV_STATE");
-                clear_active(data_dir, &pid)?;
+                clear_active(data_dir, record_id)?;
                 return Ok(changes);
             }
         }
@@ -311,7 +377,7 @@ fn refresh_inner(
     let dir = canonicalize_fallback(&found.dir);
     save_active(
         data_dir,
-        &pid,
+        record_id,
         &ActiveState {
             dir: dir.clone(),
             envrc_mtime,
@@ -445,8 +511,8 @@ fn data_dir(epsh: &epsh::eval::Shell) -> Result<PathBuf, String> {
     Ok(current_dir_from_store(epsh).join(dir))
 }
 
-fn active_path(data_dir: &Path, pid: &str) -> PathBuf {
-    data_dir.join(format!("active_{pid}"))
+fn active_path(data_dir: &Path, record_id: &str) -> PathBuf {
+    data_dir.join(format!("active_{record_id}"))
 }
 
 fn stat_regular_file_mtime(path: &Path) -> Option<u64> {
@@ -560,18 +626,22 @@ fn unescape_newlines(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn load_active(data_dir: &Path, pid: &str) -> Result<Option<ActiveState>, String> {
-    let path = active_path(data_dir, pid);
+fn load_active(data_dir: &Path, record_id: &str) -> Result<Option<ActiveState>, ActiveLoadError> {
+    let path = active_path(data_dir, record_id);
     let content = match fs::read(&path) {
         Ok(content) => content,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("failed to read active file {}: {err}", path.display())),
+        Err(err) => {
+            return Err(ActiveLoadError::Unreadable(format!(
+                "failed to read active file {}: {err}",
+                path.display()
+            )));
+        }
     };
-    let content = std::str::from_utf8(&content)
-        .map_err(|err| format!("invalid active file {}: {err}", path.display()))?;
-    parse_active(content)
-        .map(Some)
-        .map_err(|err| format!("invalid active file {}: {err}", path.display()))
+    let malformed =
+        |err: &dyn std::fmt::Display| ActiveLoadError::Malformed(format!("invalid active file {}: {err}", path.display()));
+    let content = std::str::from_utf8(&content).map_err(|err| malformed(&err))?;
+    parse_active(content).map(Some).map_err(|err| malformed(&err))
 }
 
 fn parse_active(content: &str) -> Result<ActiveState, String> {
@@ -692,7 +762,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-fn save_active(dir: &Path, pid: &str, state: &ActiveState) -> Result<(), String> {
+fn save_active(dir: &Path, record_id: &str, state: &ActiveState) -> Result<(), String> {
     validate_active_dir(&state.dir).map_err(|err| format!("failed to write active file: {err}"))?;
     for previous in &state.prev {
         match previous {
@@ -731,11 +801,11 @@ fn save_active(dir: &Path, pid: &str, state: &ActiveState) -> Result<(), String>
             }
         }
     }
-    let path = active_path(dir, pid);
+    let path = active_path(dir, record_id);
     let mut reserved = None;
     for _ in 0..ACTIVE_TEMP_NAME_ATTEMPTS {
         let id = NEXT_ACTIVE_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed);
-        let temp_path = dir.join(format!(".active_{pid}.{id}.tmp"));
+        let temp_path = dir.join(format!(".active_{record_id}.{id}.tmp"));
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -772,8 +842,8 @@ fn save_active(dir: &Path, pid: &str, state: &ActiveState) -> Result<(), String>
     Ok(())
 }
 
-fn clear_active(data_dir: &Path, pid: &str) -> Result<(), String> {
-    let path = active_path(data_dir, pid);
+fn clear_active(data_dir: &Path, record_id: &str) -> Result<(), String> {
+    let path = active_path(data_dir, record_id);
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1648,7 +1718,7 @@ mod tests {
         let session = init(&mut epsh);
         save_active(
             &data,
-            &std::process::id().to_string(),
+            session.record_id().unwrap(),
             &ActiveState {
                 dir: project,
                 envrc_mtime: 1,
@@ -1739,9 +1809,12 @@ mod tests {
             std::env::set_var("DENV_DATA_DIR", &data);
             std::env::set_var("DENV_PROCESS_ENV_SENTINEL", "process-value");
         }
-        let pid = std::process::id().to_string();
-        std::fs::write(active_path(&data, &pid), b"DENV-ACTIVE 99\n").unwrap();
         let session = init(&mut epsh);
+        std::fs::write(
+            active_path(&data, session.record_id().unwrap()),
+            b"DENV-ACTIVE 99\n",
+        )
+        .unwrap();
 
         let err = match refresh(&session, false, &epsh) {
             Ok(_) => panic!("expected malformed active format to fail"),
@@ -1750,6 +1823,112 @@ mod tests {
 
         assert!(err.contains("unsupported active format"), "{err}");
         assert_eq!(env::var("DENV_PROCESS_ENV_SENTINEL").unwrap(), "process-value");
+    }
+
+    fn active_record_names(data: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(data) else {
+            return Vec::new();
+        };
+        entries
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("active_"))
+            .collect()
+    }
+
+    fn denv_test_shell(data: &Path, cwd: &Path, vars: &[(&str, &str)]) -> epsh::eval::Shell {
+        let mut epsh = epsh::eval::Shell::builder().env_clear().build();
+        let data_dir = data.to_str().unwrap();
+        let cwd = cwd.to_str().unwrap();
+        for (key, value) in [("DENV_DATA_DIR", data_dir), ("PWD", cwd)]
+            .into_iter()
+            .chain(vars.iter().copied())
+        {
+            epsh.vars_mut().set(key, value).unwrap();
+            epsh.vars_mut().export(key);
+        }
+        restore_process_env(&epsh.vars().env_for_command_os(&[]));
+        epsh
+    }
+
+    #[test]
+    fn stale_record_from_earlier_shell_with_same_pid_is_not_applied() {
+        let _process_env = ProcessEnvGuard::new();
+        let tmp = TempDir::new("ish_denv_stale_record");
+        let data = tmp.path().join("data");
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut epsh = denv_test_shell(&data, &outside, &[("DENV_STALE_TEST", "current")]);
+
+        let earlier = init(&mut epsh);
+        let earlier_id = epsh.vars().get("__DENV_PID").unwrap().to_string();
+        save_active(
+            &data,
+            &earlier_id,
+            &ActiveState {
+                dir: canonicalize_fallback(&project),
+                envrc_mtime: 1,
+                dotenv_mtime: 2,
+                prev: vec![PrevVar::Restore("DENV_STALE_TEST".into(), "stale".into())],
+            },
+        )
+        .unwrap();
+        std::mem::forget(earlier);
+
+        let later = init(&mut epsh);
+        let changes = refresh(&later, false, &epsh).unwrap();
+
+        assert!(!changes.iter().any(|change| matches!(
+            change,
+            EnvChange::Set(key, _) | EnvChange::Unset(key) if key == "DENV_STALE_TEST"
+        )));
+        assert_eq!(env::var("DENV_STALE_TEST").unwrap(), "current");
+    }
+
+    #[test]
+    fn unparseable_record_does_not_wedge_denv_and_reload_discards_it() {
+        let _process_env = ProcessEnvGuard::new();
+        let tmp = TempDir::new("ish_denv_wedged_record");
+        let data = tmp.path().join("data");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut epsh = denv_test_shell(&data, &outside, &[]);
+        let session = init(&mut epsh);
+        let id = epsh.vars().get("__DENV_PID").unwrap().to_string();
+        let record = active_path(&data, &id);
+        std::fs::write(&record, b"DENV-ACTIVE 99\n").unwrap();
+
+        assert!(refresh(&session, false, &epsh).is_err());
+        assert!(record.exists());
+
+        let outcome = command(&session, &["reload".to_string()], &epsh);
+
+        assert_eq!(outcome.status, 0);
+        assert!(!record.exists());
+        assert!(refresh(&session, false, &epsh).is_ok());
+    }
+
+    #[test]
+    fn dropping_the_session_removes_its_active_record() {
+        let _process_env = ProcessEnvGuard::new();
+        let tmp = TempDir::new("ish_denv_exit_record");
+        let data = tmp.path().join("data");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let dotenv = project.join(".env");
+        std::fs::write(&dotenv, "DENV_EXIT_TEST=loaded\n").unwrap();
+        allow_file_in(&data.join("allow"), &read_trusted_candidate(&dotenv).unwrap()).unwrap();
+        let mut epsh = denv_test_shell(&data, &project, &[]);
+        let session = init(&mut epsh);
+
+        refresh(&session, false, &epsh).unwrap();
+        assert_eq!(active_record_names(&data).len(), 1);
+
+        drop(session);
+
+        assert!(active_record_names(&data).is_empty());
     }
 
     #[test]
@@ -1930,7 +2109,7 @@ mod tests {
         apply_changes_to_shell(&mut epsh, &outcome.changes);
         assert_eq!(epsh.vars().get("DENV_SESSION_MARKER"), Some("project"));
         assert_eq!(epsh.vars().get(key), changed.to_str());
-        let active = data.join(format!("active_{}", std::process::id()));
+        let active = active_path(&data, session.record_id().unwrap());
         assert!(active.exists());
 
         let reload = command(&session, &["reload".to_string()], &epsh);
@@ -1957,7 +2136,7 @@ mod tests {
             assert_eq!(epsh.vars().get(key), data.to_str());
         }
         assert!(!active.exists());
-        assert!(!changed.join(format!("active_{}", std::process::id())).exists());
+        assert!(active_record_names(&changed).is_empty());
     }
 
     #[test]
@@ -2017,10 +2196,10 @@ mod tests {
         unsafe {
             std::env::set_var("DENV_DATA_DIR", &data);
         }
-        let pid = std::process::id().to_string();
+        let session = init(&mut epsh);
         save_active(
             &data,
-            &pid,
+            session.record_id().unwrap(),
             &ActiveState {
                 dir: canonicalize_fallback(&project),
                 envrc_mtime: 0,
@@ -2030,7 +2209,6 @@ mod tests {
         )
         .unwrap();
 
-        let session = init(&mut epsh);
         let child_changes = refresh(&session, false, &epsh).unwrap();
         assert!(child_changes.iter().any(|change| matches!(
             change,
@@ -2084,7 +2262,8 @@ mod tests {
         unsafe {
             std::env::set_var("DENV_DATA_DIR", &data);
         }
-        let pid = std::process::id().to_string();
+        let session = init(&mut epsh);
+        let pid = session.record_id().unwrap().to_string();
         save_active(
             &data,
             &pid,
@@ -2097,7 +2276,6 @@ mod tests {
         )
         .unwrap();
 
-        let session = init(&mut epsh);
         let err = match refresh(&session, false, &epsh) {
             Ok(_) => panic!("expected malformed dotenv to fail"),
             Err(err) => err,
@@ -2147,8 +2325,8 @@ mod tests {
         let session = init(&mut epsh);
         let first = refresh(&session, false, &epsh).unwrap();
         apply_changes_to_shell(&mut epsh, &first);
-        let pid = std::process::id().to_string();
-        let active_path = data.join(format!("active_{pid}"));
+        let pid = session.record_id().unwrap().to_string();
+        let active_path = active_path(&data, &pid);
         assert_eq!(
             std::fs::metadata(active_path)
                 .unwrap()

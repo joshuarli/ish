@@ -2633,6 +2633,7 @@ fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    denv::on_exit(&shell.denv);
     std::process::exit(code);
 }
 
