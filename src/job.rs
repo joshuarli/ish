@@ -3,6 +3,8 @@ pub struct Job {
     pub cmd: String,
     /// Saved terminal attributes — restored on fg resume.
     pub termios: crate::term::Termios,
+    /// The relay for the job's output; the job still writes to its terminal.
+    pub capture: Option<crate::capture::Session>,
 }
 
 /// Give a stopped process group the foreground, restore the terminal settings
@@ -18,8 +20,9 @@ pub fn continue_in_foreground(pgid: rustix::process::Pid, termios: &crate::term:
 }
 
 /// Resume a suspended job in the foreground.
-/// Returns exit status (148 if stopped again).
-pub fn resume_job(job: &mut Option<Job>) -> i32 {
+/// Returns exit status (148 if stopped again). A finished job's output
+/// becomes `last_output`.
+pub fn resume_job(job: &mut Option<Job>, last_output: &mut crate::capture::OutputBuffer) -> i32 {
     let j = match job.take() {
         Some(j) => j,
         None => {
@@ -43,20 +46,25 @@ pub fn resume_job(job: &mut Option<Job>) -> i32 {
     // Reclaim the terminal
     let _ = rustix::termios::tcsetpgrp(stdin, rustix::process::getpgrp());
 
-    match result {
+    let status = match result {
         Ok(Some((_, status))) if status.stopped() => {
             let new_termios = rustix::termios::tcgetattr(stdin).ok();
             *job = Some(Job {
                 pgid: j.pgid,
                 cmd: j.cmd,
                 termios: new_termios.unwrap_or(j.termios),
+                capture: j.capture,
             });
-            148
+            return 148;
         }
         Ok(Some((_, status))) if status.exited() => status.exit_status().unwrap_or(1),
         Ok(Some((_, status))) if status.signaled() => {
             128 + status.terminating_signal().unwrap_or(0)
         }
         _ => 1,
+    };
+    if let Some(capture) = j.capture {
+        capture.finish_into(last_output);
     }
+    status
 }

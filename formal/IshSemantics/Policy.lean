@@ -11,7 +11,7 @@ inductive Exec where
   deriving Repr, BEq, DecidableEq
 
 def classify (name : Bytes) : Option Exec :=
-  if ["alias", "copy-scrollback", "denv", "exit", "fg", "ish-dump", "t", "trash", "type", "w", "which", "z"].any
+  if ["?", "alias", "copy-scrollback", "denv", "exit", "fg", "ish-dump", "t", "trash", "type", "w", "which", "z"].any
       (fun text => text.toUTF8.toList == name) then some .inShell
   else if ["cd", "history"].any (fun text => text.toUTF8.toList == name) then some .hybrid
   else if ["cp", "mv"].any (fun text => text.toUTF8.toList == name) then some .foreground

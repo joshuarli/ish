@@ -27,6 +27,7 @@ pub struct Builtin {
 }
 
 const ISH_BUILTINS: &[Builtin] = &[
+    Builtin { name: "?", exec: Exec::InShell },
     Builtin { name: "alias", exec: Exec::InShell },
     Builtin { name: "cd", exec: Exec::Hybrid },
     Builtin { name: "copy-scrollback", exec: Exec::InShell },
@@ -50,6 +51,13 @@ const ISH_BUILTINS: &[Builtin] = &[
 /// The ish-owned builtin called `name`, if any.
 pub fn lookup(name: &str) -> Option<&'static Builtin> {
     ISH_BUILTINS.iter().find(|b| b.name == name)
+}
+
+/// Whether running the whole-line builtin `name` replaces the captured output
+/// of the previous command. `?` reads it, `fg` continues the suspended job's
+/// capture, and `exit` leaves the shell.
+pub fn replaces_last_output(name: &str) -> bool {
+    !matches!(name, "?" | "fg" | "exit")
 }
 
 /// Check if a command name is a builtin in either ish or epsh.

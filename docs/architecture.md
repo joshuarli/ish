@@ -49,6 +49,32 @@ the current process. Argument substitutions finish before the handler runs.
 See [epsh's process model](../crates/epsh/docs/process-model.md) for the API and
 its limits.
 
+## Output capture
+
+[`capture.rs`](../src/capture.rs) saves the last command's terminal output for
+`?`. Around every accepted line except `?`, `fg`, and `exit`, `Capture::begin`
+replaces the shell's own fds 1 and 2 with the slave side of a new
+pseudo-terminal. Replacing fds in the shell process covers builtins, epsh
+pipeline stages, and external children without touching the spawn path.
+Redirections inherit the substitution, so only bytes that would have reached the
+terminal are saved. fd 2 is replaced only when it names the same terminal as fd 1.
+
+The slave is raw, with the terminal's size, so the real terminal still applies
+line-discipline output processing once. Stdin and the controlling terminal are
+unchanged, which keeps process groups, job control, and input as they were.
+A relay thread reads the master, writes each chunk to a duplicate of the real
+terminal, and appends it to a bounded `OutputBuffer`. It polls every 200 ms for
+window size changes, applies them to the master, and sends `SIGWINCH` to the
+terminal's foreground group when that group is not ish. The relay uses raw fds
+only, so epsh forks never need a lock it holds.
+
+`Capture::end` flushes Rust's stdout and restores fds 1 and 2; the caller then
+finishes the `Session`, which stops the relay, drains the master, and returns
+the buffer. A command that stops keeps its `Session` in the `Job`, because the
+job still holds the slave. `fg` finishes it when the job ends. The buffer moves
+into the relay thread and back, so its allocation is reused across commands
+without sharing.
+
 ## Filesystem operation boundaries
 
 `src/fs_command.rs` parses ish's command options and adapts typed requests to

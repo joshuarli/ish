@@ -5,7 +5,7 @@ use ish::input::{InputEvent, InputReader, Key, KeyEvent};
 use ish::job::Job;
 use ish::line::LineBuffer;
 use ish::term::TermWriter;
-use ish::{builtin, complete, config, denv, dispatch, frecency, history, path, prompt, render, signal, term};
+use ish::{builtin, capture, complete, config, denv, dispatch, frecency, history, path, prompt, render, signal, term};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -51,6 +51,7 @@ struct Shell {
     home: Option<String>,
     home_display: String,
     session_log: String,
+    last_output: capture::OutputBuffer,
     layout_dump: String,
     epsh: epsh::eval::Shell,
     denv: denv::Session,
@@ -234,6 +235,7 @@ fn main() {
         home,
         home_display,
         session_log: String::new(),
+        last_output: capture::OutputBuffer::default(),
         layout_dump: String::new(),
         epsh,
         denv,
@@ -312,7 +314,18 @@ fn main() {
 
                 let program = match plan {
                     dispatch::Plan::Builtin { name, args } => {
-                        let quit = run_shell_builtin(name, &args, &expanded, &mut shell);
+                        let quit = if builtin::replaces_last_output(name) {
+                            let buffer = std::mem::take(&mut shell.last_output);
+                            let (quit, session) = capture_output(buffer, || {
+                                run_shell_builtin(name, &args, &expanded, &mut shell)
+                            });
+                            if let Some(session) = session {
+                                session.finish_into(&mut shell.last_output);
+                            }
+                            quit
+                        } else {
+                            run_shell_builtin(name, &args, &expanded, &mut shell)
+                        };
                         if quit {
                             break;
                         }
@@ -335,7 +348,10 @@ fn main() {
                 shell.epsh.set_external_handler(handler);
                 JOB_SLOT_TAKEN.with(|taken| taken.set(shell.job.is_some()));
 
-                shell.last_status = shell.epsh.run_program(&program).code();
+                let buffer = std::mem::take(&mut shell.last_output);
+                let (status, mut session) =
+                    capture_output(buffer, || shell.epsh.run_program(&program).code());
+                shell.last_status = status;
                 sync_shell_store_derived(&mut shell);
 
                 // Detect cwd change from epsh (compound commands with cd, pushd, etc.)
@@ -351,7 +367,10 @@ fn main() {
                         STOPPED_JOB.with(|cell| cell.borrow_mut().take())
                 {
                     eprintln!("ish: stopped: {} (pgid={})", cmd, pgid);
-                    shell.job = Some(Job { pgid, cmd, termios });
+                    shell.job = Some(Job { pgid, cmd, termios, capture: session.take() });
+                }
+                if let Some(session) = session {
+                    session.finish_into(&mut shell.last_output);
                 }
 
                 shell.prompt_needs_line_start = true;
@@ -376,6 +395,56 @@ fn main() {
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
+}
+
+/// Run `run` with the shell's terminal output captured. The session is `None`
+/// when capture is unavailable, which is reported unless stdout is not a
+/// terminal. Otherwise the caller stores the output with
+/// `Session::finish_into`, or hands the session to a suspended job.
+fn capture_output<T>(
+    mut buffer: capture::OutputBuffer,
+    run: impl FnOnce() -> T,
+) -> (T, Option<capture::Session>) {
+    buffer.clear();
+    match capture::Capture::begin(buffer) {
+        Ok(Some(capture)) => {
+            let result = run();
+            (result, Some(capture.end()))
+        }
+        Ok(None) => (run(), None),
+        Err(error) => {
+            eprintln!("ish: output capture unavailable: {error}");
+            (run(), None)
+        }
+    }
+}
+
+fn write_clipboard(bytes: &[u8]) {
+    use std::io::Write;
+    let encoded = base64_encode(bytes);
+    let osc = format!("\x1b]52;c;{encoded}\x07");
+    let _ = std::io::stdout().write_all(osc.as_bytes());
+    let _ = std::io::stdout().flush();
+}
+
+fn copy_last_output(args: &[epsh::ast::Word], output: &capture::OutputBuffer) -> i32 {
+    if !args.is_empty() {
+        eprintln!("ish: ?: takes no arguments");
+        return 2;
+    }
+    let text = output.plain_text();
+    if text.is_empty() {
+        eprintln!("ish: ?: the last command wrote no text to the terminal");
+        return 1;
+    }
+    if output.is_truncated() {
+        eprintln!(
+            "ish: ?: output exceeded {} KiB; copied only its end",
+            capture::OUTPUT_LIMIT / 1024
+        );
+    }
+    write_clipboard(&text);
+    0
 }
 
 /// Run a shell-owned builtin that is the whole input line. Returns true when
@@ -435,13 +504,10 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
             handle_history(line, shell);
         }
         "copy-scrollback" => {
-            use std::io::Write;
-            let encoded = base64_encode(shell.session_log.as_bytes());
-            let osc = format!("\x1b]52;c;{encoded}\x07");
-            let _ = std::io::stdout().write_all(osc.as_bytes());
-            let _ = std::io::stdout().flush();
+            write_clipboard(shell.session_log.as_bytes());
             shell.last_status = 0;
         }
+        "?" => shell.last_status = copy_last_output(args, &shell.last_output),
         "ish-dump" => shell.last_status = write_layout_dump(shell),
         "t" | "trash" => {
             let args = match expand_builtin_args_bytes(args, shell, name) {
@@ -481,7 +547,7 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
             shell.last_status = outcome.status;
         }
         "fg" => {
-            shell.last_status = ish::job::resume_job(&mut shell.job);
+            shell.last_status = ish::job::resume_job(&mut shell.job, &mut shell.last_output);
         }
         "z" => {
             let args = expanded_args!();

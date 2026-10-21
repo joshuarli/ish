@@ -14,6 +14,7 @@ pub fn shell_unsetenv(key: &str) {
 
 pub mod alias;
 pub mod builtin;
+pub mod capture;
 pub mod complete;
 pub mod config;
 pub mod denv;

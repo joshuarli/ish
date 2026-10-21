@@ -138,6 +138,7 @@ ish-specific commands include:
 | `c` | Clear the screen |
 | `denv` | Trust, revoke, or reload environment files for this directory |
 | `copy-scrollback` | Copy the terminal scrollback through OSC 52 |
+| `?` | Copy the previous command's output through OSC 52 |
 | `ish-dump` | Write the current layout dump |
 
 `command -v` and `command -V` identify registered ish commands as builtins even
@@ -172,6 +173,38 @@ utilities.
 The shell also provides epsh's environment and output builtins, including
 `set`, `export`, `unset`, `echo`, `pwd`, `true`, and `false`. Aliases can be
 defined at the prompt or in config and expand as you type.
+
+### Copying command output
+
+`?` must be the whole line. It copies the text the previous command wrote to the
+terminal through OSC 52, so the terminal must allow clipboard writes. Every other
+accepted line replaces the saved output, including shell builtins such as `cd`.
+`?` does not, and `fg` continues the suspended job's output. A line ish refuses
+before running leaves the saved output alone.
+
+- Standard output and standard error are saved together in the order they were
+  written. Every stage of a pipeline and every command in a list contributes
+  what reaches the terminal.
+- A redirection or pipe that takes a stream away from the terminal also takes
+  it out of the saved output. `echo x > file` saves nothing.
+- Terminal control sequences such as colors and cursor movement are removed from
+  the copy, and `\r\n` becomes `\n`. Output from full-screen programs is not
+  useful to copy.
+- ish keeps the last 1 MiB. Larger output copies only its end, starting after
+  the first newline in what remains, and `?` says so.
+- With nothing to copy, `?` prints a message and returns 1.
+
+While a command runs, its stdout and stderr are a pseudo-terminal that ish
+relays to your terminal, so programs still see terminals there. The relay
+follows window resizes within about 200 ms. A command that reads its size on
+the first `SIGWINCH` can see the old size, so the relay sends it a second
+`SIGWINCH` once the size is updated.
+That pseudo-terminal is not the command's controlling terminal: input, Ctrl+C,
+and Ctrl+Z still go through your terminal. Output the command writes to
+`/dev/tty` directly is not saved. A background process that outlives its command
+loses its output once ish stops relaying, because its writes then fail. If the
+pseudo-terminal cannot be created, ish reports it and runs the command without
+saving its output.
 
 ### Job control
 
