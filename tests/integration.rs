@@ -1000,19 +1000,6 @@ fn prompt_default_impl() {
     assert_eq!(rendered, 4);
 }
 
-#[test]
-fn prompt_git_branch_in_git_repo() {
-    // We're running from within a git repo (ish itself)
-    let mut p = prompt::Prompt::new();
-    let cwd = std::env::current_dir().unwrap();
-    let mut rendered = String::new();
-    p.render_into(&mut rendered, 0, cwd.to_str().unwrap(), false);
-    // Should detect git branch — the rendered prompt should contain a branch name
-    // We can't predict the exact branch name, but it should be there
-    // At minimum, the prompt should not crash
-    assert!(rendered.ends_with(" $ "));
-}
-
 // ---------------------------------------------------------------------------
 // Builtin: is_builtin and the registry
 // ---------------------------------------------------------------------------
@@ -1824,88 +1811,72 @@ fn ls_list_dir_sorts_case_insensitive() {
 // Prompt: git branch with temp repo
 // ---------------------------------------------------------------------------
 
+fn render_prompt_in(p: &mut prompt::Prompt, dir: &std::path::Path) -> String {
+    let mut rendered = String::new();
+    p.render_into(&mut rendered, 0, dir.to_str().unwrap(), false);
+    rendered
+}
+
+fn init_git_dir(repo: &std::path::Path, head: &str) {
+    let git_dir = repo.join(".git");
+    std::fs::create_dir_all(&git_dir).unwrap();
+    std::fs::write(git_dir.join("HEAD"), head).unwrap();
+}
+
 #[test]
 fn prompt_git_branch_detects_repo() {
     let dir = tempdir_with_files(&[]);
-    let git_dir = dir.join(".git");
-    std::fs::create_dir(&git_dir).unwrap();
-    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/test-branch\n").unwrap();
+    init_git_dir(&dir, "ref: refs/heads/test-branch\n");
 
-    // Render sets PWD, but other tests may race. Just verify the code path runs.
-    let mut p = prompt::Prompt::new();
-    let mut rendered = String::new();
-    p.render_into(&mut rendered, 0, dir.to_str().unwrap(), false);
-    // If PWD wasn't clobbered, we see the branch. Either way, no crash.
-    assert!(rendered.ends_with(" $ "));
+    let rendered = render_prompt_in(&mut prompt::Prompt::new(), &dir);
+    assert!(rendered.ends_with(" test-branch $ "), "{rendered:?}");
 }
 
 #[test]
 fn prompt_git_branch_detached_head() {
     let dir = tempdir_with_files(&[]);
-    let git_dir = dir.join(".git");
-    std::fs::create_dir(&git_dir).unwrap();
-    std::fs::write(git_dir.join("HEAD"), "abc12345deadbeef\n").unwrap();
+    init_git_dir(&dir, "abc12345deadbeefabc12345deadbeefabc12345\n");
 
-    let mut p = prompt::Prompt::new();
-    let mut rendered = String::new();
-    p.render_into(&mut rendered, 0, dir.to_str().unwrap(), false);
-    assert!(rendered.ends_with(" $ "));
+    let rendered = render_prompt_in(&mut prompt::Prompt::new(), &dir);
+    assert!(rendered.ends_with(" abc12345 $ "), "{rendered:?}");
 }
 
 #[test]
-fn prompt_git_branch_no_repo() {
+fn prompt_git_branch_not_shown_outside_repo() {
     let dir = tempdir_with_files(&[]);
+    let repo = dir.join("repo");
+    let outside = dir.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    init_git_dir(&repo, "ref: refs/heads/inside-only\n");
+
     let mut p = prompt::Prompt::new();
-    let mut rendered = String::new();
-    p.render_into(&mut rendered, 0, dir.to_str().unwrap(), false);
+    assert!(render_prompt_in(&mut p, &repo).ends_with(" inside-only $ "));
+    let rendered = render_prompt_in(&mut p, &outside);
+    assert!(!rendered.contains("inside-only"), "{rendered:?}");
     assert!(rendered.ends_with(" $ "));
-}
-
-#[test]
-fn prompt_git_cache_no_repo_reuse() {
-    let dir = tempdir_with_files(&[]);
-    let subdir = dir.join("sub");
-    std::fs::create_dir(&subdir).unwrap();
-
-    let mut p = prompt::Prompt::new();
-
-    // First render in dir with no repo — caches NoRepo
-    let mut r = String::new();
-    p.render_into(&mut r, 0, dir.to_str().unwrap(), false);
-
-    // Render in subdir — exercises the NoRepo cache path
-    p.render_into(&mut r, 0, subdir.to_str().unwrap(), false);
-    assert!(r.ends_with(" $ "));
 }
 
 #[test]
 fn prompt_git_invalidate_clears_cache() {
     let dir = tempdir_with_files(&[]);
-    let git_dir = dir.join(".git");
-    std::fs::create_dir(&git_dir).unwrap();
-    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    let inner = dir.join("inner");
+    init_git_dir(&dir, "ref: refs/heads/outer\n");
+    init_git_dir(&inner, "ref: refs/heads/inner\n");
 
     let mut p = prompt::Prompt::new();
-    let mut r = String::new();
-    p.render_into(&mut r, 0, dir.to_str().unwrap(), false);
-
-    // Invalidate and re-render — exercises the Unknown→Repo path again
+    assert!(render_prompt_in(&mut p, &dir).ends_with(" outer $ "));
+    assert!(render_prompt_in(&mut p, &inner).ends_with(" outer $ "));
     p.invalidate_git();
-    p.render_into(&mut r, 0, dir.to_str().unwrap(), false);
-    assert!(r.ends_with(" $ "));
+    assert!(render_prompt_in(&mut p, &inner).ends_with(" inner $ "));
 }
 
 #[test]
 fn prompt_git_bare_ref() {
     let dir = tempdir_with_files(&[]);
-    let git_dir = dir.join(".git");
-    std::fs::create_dir(&git_dir).unwrap();
-    std::fs::write(git_dir.join("HEAD"), "ref: refs/remotes/origin/main\n").unwrap();
+    init_git_dir(&dir, "ref: refs/remotes/origin/main\n");
 
-    let mut p = prompt::Prompt::new();
-    let mut rendered = String::new();
-    p.render_into(&mut rendered, 0, dir.to_str().unwrap(), false);
-    assert!(rendered.ends_with(" $ "));
+    let rendered = render_prompt_in(&mut prompt::Prompt::new(), &dir);
+    assert!(rendered.ends_with(" refs/remotes/origin/main $ "), "{rendered:?}");
 }
 
 #[test]
@@ -1915,7 +1886,6 @@ fn prompt_git_worktree_gitdir_file() {
     std::fs::create_dir(&real_git).unwrap();
     std::fs::write(real_git.join("HEAD"), "ref: refs/heads/worktree\n").unwrap();
 
-    // Create a .git file (not directory) pointing to the real git dir
     let worktree = dir.join("worktree");
     std::fs::create_dir(&worktree).unwrap();
     std::fs::write(
@@ -1924,10 +1894,8 @@ fn prompt_git_worktree_gitdir_file() {
     )
     .unwrap();
 
-    let mut p = prompt::Prompt::new();
-    let mut rendered = String::new();
-    p.render_into(&mut rendered, 0, worktree.to_str().unwrap(), false);
-    assert!(rendered.ends_with(" $ "));
+    let rendered = render_prompt_in(&mut prompt::Prompt::new(), &worktree);
+    assert!(rendered.ends_with(" worktree $ "), "{rendered:?}");
 }
 
 // ---------------------------------------------------------------------------

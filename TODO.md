@@ -97,15 +97,6 @@ Next: 59
 - **Effort:** S (hours)
 
 
-### ISH-57 · P4 · Several `prompt_git_*` integration tests never check that a branch was detected
-
-- **Area:** Tests
-- **Where:** `tests/integration.rs` (`prompt_git_branch_detects_repo` and the other `prompt_git_*` tests)
-- **Problem:** The tests assert only that the rendered prompt ends with ` $ `, so they pass whether or not a branch is found; one comment says it only verifies the code path runs. ISH-28 added precise unit tests in `src/prompt.rs`, but the integration layer still guards nothing.
-- **Recommendation:** Assert the branch text in each repository fixture, or delete the tests that duplicate the unit tests.
-- **Fix with:** test-audit
-- **Effort:** S (hours)
-
 ### ISH-58 · P4 · `fdu-delete` recovery still has uncovered branches and a stray whitespace line
 
 - **Area:** Tests
