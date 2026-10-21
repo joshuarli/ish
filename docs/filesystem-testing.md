@@ -50,21 +50,34 @@ in a private namespace, then unmounts before cleanup. It never mounts over user
 data. For manual fixtures, follow ownership and path checks in
 [native_boundaries.rs](../crates/ish-fs/tests/native_boundaries.rs).
 
+Every `native_boundaries` case that needs a fixture is `#[ignore]`, so
+`cargo test -p ish-fs --test native_boundaries` and `make test` report those
+cases as ignored rather than passed. The script runs the EXDEV move, nested
+mount, and bind-alias cases with `-- --ignored` and the `ISH_FS_TEST_*`
+variables set. An ignored case run without its variables, or on a fixture that
+does not satisfy it, panics. The `native_macos` case that needs uid 0 is ignored
+the same way; the other macOS cases fail instead of returning early on a
+filesystem without APFS clones or resource forks.
+
+The foreign-owner cases need uid 0 with CAP_CHOWN. The script's single-ID user
+namespace cannot assign uid 65534, so it does not run them; see the
+foreign-owner row below.
+
 The recorded x86_64 Alpine musl run on Linux 7.2.9 exercised ext4-to-tmpfs EXDEV,
 nested mount refusal and explicit traversal, mountpoint EBUSY retirement, and
-eight mixed rename/transfer hardlink combinations. Foreign-owner setup skipped
-because its single-ID namespace cannot assign uid 65534. A passing process
-with capability skips does not establish those guarantees.
+eight mixed rename/transfer hardlink combinations. Foreign-owner setup was not
+exercised there. A run that reports ignored cases does not establish those
+guarantees.
 
 ## Required native evidence still missing
 
 | Required run | Setup and acceptance condition |
 | --- | --- |
 | Successful Linux reflink | Use a FICLONE-capable owned filesystem. Run the native Linux target above and `cargo test -p ish-fs --lib public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks -- --nocapture`. Require actual Clone selection and preservation assertions, without a clone skip. The recorded ext4 host returns EOPNOTSUPP. |
-| Foreign-owner success and safe refusal | As effective uid 0 with CAP_CHOWN, set `ISH_FS_TEST_CROSS_ROOT` to an owned writable distinct-device directory and run `cargo test -p ish-fs --test native_boundaries native_boundary_foreign -- --nocapture`. Both the success and privilege-dropped denial cases must execute. The denial case checks unchanged source bytes/identity and no publication. |
+| Foreign-owner success and safe refusal | As effective uid 0 with CAP_CHOWN, set `ISH_FS_TEST_CROSS_ROOT` to an owned writable distinct-device directory and run `cargo test -p ish-fs --test native_boundaries native_boundary_foreign -- --ignored --nocapture`. Both the success and privilege-dropped denial cases must execute. The denial case checks unchanged source bytes/identity and no publication. |
 | Deferred immutable metadata | Run `cargo test -p ish-fs --lib repair_deferred_metadata_validates_successful_output -- --nocapture` where disposable immutable flags are permitted. EPERM skips on the recorded host. |
 | Native ARM64 musl | On ARM64 Linux musl, run workspace check, strict all-target Clippy, workspace library/integration tests, `make test`, and the mount fixture script. Cross-build and QEMU execution are not native hardware evidence. |
-| Native macOS | Run workspace check, strict all-target Clippy, workspace tests, `make test`, and `cargo test -p ish-fs --test native_macos -- --nocapture`. Require clone, ACL/access, foreign-owner, immutable-flag, cancellation, sparse, and resource-fork cases to execute with appropriate privileges. Large resource forks above 4 GiB particularly need native identity-gate validation; unsupported identity must fail safely. |
+| Native macOS | Run workspace check, strict all-target Clippy, workspace tests, `make test`, and `cargo test -p ish-fs --test native_macos -- --include-ignored --nocapture` as uid 0 (the foreign-owner staging case is ignored otherwise). Require clone, ACL/access, foreign-owner, immutable-flag, cancellation, sparse, and resource-fork cases to execute with appropriate privileges. Large resource forks above 4 GiB particularly need native identity-gate validation; unsupported identity must fail safely. |
 | Native comparisons | Follow the [benchmark harness](../benches/fs/README.md) on clone-capable Linux and macOS. Record selected methods and preservation/durability differences for GNU cp and Apple cp/cp -c. |
 
 The repair run passed native x86_64 musl workspace checks, strict Clippy, Rust

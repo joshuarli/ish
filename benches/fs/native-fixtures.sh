@@ -83,19 +83,7 @@ bind_mounted=1
 
 failures=0
 if ISH_FS_TEST_CROSS_ROOT="$cross_root" \
-    cargo test --locked -p ish-fs --test native_boundaries native_boundary_real_exdev_move_preserves_and_syncs -- --exact --nocapture; then
-    :
-else
-    failures=1
-fi
-if ISH_FS_TEST_CROSS_ROOT="$cross_root" \
-    cargo test --locked -p ish-fs --test native_boundaries native_boundary_foreign_readable_file_survives_real_exdev_move -- --exact --nocapture; then
-    :
-else
-    failures=1
-fi
-if ISH_FS_TEST_CROSS_ROOT="$cross_root" \
-    cargo test --locked -p ish-fs --test native_boundaries native_boundary_foreign_owner_denial_retains_real_exdev_source -- --exact --nocapture; then
+    cargo test --locked -p ish-fs --test native_boundaries native_boundary_real_exdev_move_preserves_and_syncs -- --ignored --exact --nocapture; then
     :
 else
     failures=1
@@ -104,14 +92,14 @@ if ISH_FS_TEST_CROSS_ROOT="$cross_root" \
 ISH_FS_TEST_NESTED_SOURCE="$source_root" \
 ISH_FS_TEST_NESTED_MOUNT="$tmpfs_mount" \
 ISH_FS_TEST_NESTED_BIND="$bind_mount" \
-    cargo test --locked -p ish-fs --test native_boundaries native_boundary_nested_mount_requires_opt_in -- --exact --nocapture; then
+    cargo test --locked -p ish-fs --test native_boundaries native_boundary_nested_mount_requires_opt_in -- --ignored --exact --nocapture; then
     :
 else
     failures=1
 fi
 if ISH_FS_TEST_ALIAS_ORIGIN="$bind_source" \
 ISH_FS_TEST_ALIAS_BIND="$bind_mount" \
-    cargo test --locked -p ish-fs --test native_boundaries native_boundary_bind_exdev_then_same_mount_alias_preserves_topology -- --exact --nocapture; then
+    cargo test --locked -p ish-fs --test native_boundaries native_boundary_bind_exdev_then_same_mount_alias_preserves_topology -- --ignored --exact --nocapture; then
     :
 else
     failures=1

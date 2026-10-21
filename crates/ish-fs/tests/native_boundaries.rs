@@ -48,11 +48,11 @@ fn local(purpose: &str) -> OwnedDirectory {
     fs::create_dir_all(&scratch).expect("create workspace scratch");
     OwnedDirectory::create(&scratch, purpose)
 }
-fn cross_root(source_device: u64) -> Option<PathBuf> {
-    let Some(value) = env::var_os("ISH_FS_TEST_CROSS_ROOT") else {
-        eprintln!("SKIP: set ISH_FS_TEST_CROSS_ROOT to an existing distinct-device directory under this repo's .work");
-        return None;
-    };
+fn required_env(name: &str) -> std::ffi::OsString {
+    env::var_os(name).unwrap_or_else(|| panic!("{name} must be set to a disposable fixture under this repo's .work; see docs/filesystem-testing.md"))
+}
+fn cross_root(source_device: u64) -> PathBuf {
+    let value = required_env("ISH_FS_TEST_CROSS_ROOT");
     let work = workspace().join(".work");
     fs::create_dir_all(work.join("tmp")).expect("create workspace scratch");
     let work = fs::canonicalize(work).expect("canonicalize workspace .work");
@@ -60,11 +60,8 @@ fn cross_root(source_device: u64) -> Option<PathBuf> {
     assert!(root.starts_with(work), "ISH_FS_TEST_CROSS_ROOT must resolve under this repo's .work");
     assert!(fs::metadata(&root).expect("stat cross-device root").is_dir());
     let device = fs::metadata(&root).expect("stat cross-device root").dev();
-    if device == source_device {
-        eprintln!("SKIP: ISH_FS_TEST_CROSS_ROOT is on device {device}, same as workspace .work/tmp");
-        return None;
-    }
-    Some(root)
+    assert_ne!(device, source_device, "ISH_FS_TEST_CROSS_ROOT is on device {device}, same as workspace .work/tmp");
+    root
 }
 fn run(request: &Request) -> (ish_fs::Outcome, Vec<Event>) {
     let events = Mutex::new(Vec::new());
@@ -84,10 +81,11 @@ fn set_modified_time(path: &Path) {
 }
 
 #[test]
+#[ignore = "needs a distinct-device directory in ISH_FS_TEST_CROSS_ROOT; run benches/fs/native-fixtures.sh"]
 fn native_boundary_real_exdev_move_preserves_and_syncs() {
     let fixture = local("exdev-source");
     let source_device = fs::metadata(fixture.path()).expect("stat source fixture").dev();
-    let Some(cross) = cross_root(source_device) else { return };
+    let cross = cross_root(source_device);
     let destination_parent = OwnedDirectory::create(&cross, "exdev-destination");
     let source = fixture.path().join("source");
     let source_file = source.join("payload");
@@ -148,25 +146,17 @@ fn native_boundary_real_exdev_move_preserves_and_syncs() {
 }
 
 #[test]
+#[ignore = "needs uid 0 with CAP_CHOWN and a distinct-device ISH_FS_TEST_CROSS_ROOT; see docs/filesystem-testing.md"]
 fn native_boundary_foreign_readable_file_survives_real_exdev_move() {
     let foreign_uid = 65_534;
-    if rustix::process::geteuid().as_raw() == foreign_uid {
-        eprintln!("SKIP: uid 65534 is the effective uid and cannot represent a foreign-owner fixture");
-        return;
-    }
+    assert_ne!(rustix::process::geteuid().as_raw(), foreign_uid, "uid 65534 is the effective uid and cannot represent a foreign-owner fixture");
     let fixture = local("foreign-source");
     let source_device = fs::metadata(fixture.path()).expect("stat source fixture").dev();
-    let Some(cross) = cross_root(source_device) else { return };
+    let cross = cross_root(source_device);
     let destination_parent = OwnedDirectory::create(&cross, "foreign-destination");
     let source = fixture.path().join("source");
     fs::write(&source, b"foreign readable payload").expect("write source payload");
-    if let Err(error) = rfs::chownat(rfs::CWD, &source, Some(rustix::process::Uid::from_raw(foreign_uid)), None, AtFlags::empty()) {
-        if matches!(error, rustix::io::Errno::INVAL | rustix::io::Errno::PERM) {
-            eprintln!("SKIP: cannot assign disposable source uid 65534: {error}");
-            return;
-        }
-        panic!("assign foreign source owner: {error}");
-    }
+    rfs::chownat(rfs::CWD, &source, Some(rustix::process::Uid::from_raw(foreign_uid)), None, AtFlags::empty()).expect("assign foreign source owner");
     fs::set_permissions(&source, fs::Permissions::from_mode(0o044)).expect("make foreign source readable");
     let original = fs::metadata(&source).expect("stat foreign source");
     assert_eq!(original.uid(), foreign_uid);
@@ -185,6 +175,7 @@ fn native_boundary_foreign_readable_file_survives_real_exdev_move() {
 }
 
 #[test]
+#[ignore = "needs uid 0 with CAP_CHOWN and a distinct-device ISH_FS_TEST_CROSS_ROOT; see docs/filesystem-testing.md"]
 fn native_boundary_foreign_owner_denial_retains_real_exdev_source() {
     const CHILD: &str = "ISH_FS_TEST_FOREIGN_OWNER_DENIAL_CHILD";
     const FIXTURE: &str = "ISH_FS_TEST_FOREIGN_OWNER_DENIAL_FIXTURE";
@@ -230,7 +221,7 @@ fn native_boundary_foreign_owner_denial_retains_real_exdev_source() {
 
     let fixture = local("foreign-owner-denial-source");
     let source_device = fs::metadata(fixture.path()).expect("stat source fixture").dev();
-    let Some(cross) = cross_root(source_device) else { return };
+    let cross = cross_root(source_device);
     let destination_parent = OwnedDirectory::create(&cross, "foreign-owner-denial-destination");
 
     let foreign_owner = rustix::process::Uid::from_raw(FOREIGN_UID);
@@ -245,25 +236,10 @@ fn native_boundary_foreign_owner_denial_retains_real_exdev_source() {
     };
     let source = fixture.path().join("source");
     fs::write(&source, b"foreign owner denial payload").expect("write source payload");
-    if let Err(error) = rfs::chownat(rfs::CWD, &source, Some(foreign_owner), Some(rustix::process::Gid::from_raw(child_gid)), AtFlags::empty()) {
-        if matches!(error, rustix::io::Errno::INVAL | rustix::io::Errno::PERM) {
-            eprintln!("SKIP: cannot assign disposable source uid 65534 for ownership-denial fixture: {error}");
-            return;
-        }
-        panic!("assign foreign ownership-denial source owner: {error}");
-    }
-    if child_uid == 0 || child_uid == FOREIGN_UID {
-        eprintln!("SKIP: no distinct unprivileged workspace owner is available for the foreign-owner denial child");
-        return;
-    }
+    rfs::chownat(rfs::CWD, &source, Some(foreign_owner), Some(rustix::process::Gid::from_raw(child_gid)), AtFlags::empty()).expect("assign foreign ownership-denial source owner");
+    assert!(child_uid != 0 && child_uid != FOREIGN_UID, "no distinct unprivileged workspace owner is available for the foreign-owner denial child");
     for directory in [fixture.path(), destination_parent.path()] {
-        if let Err(error) = rfs::chownat(rfs::CWD, directory, Some(rustix::process::Uid::from_raw(child_uid)), Some(rustix::process::Gid::from_raw(child_gid)), AtFlags::empty()) {
-            if matches!(error, rustix::io::Errno::INVAL | rustix::io::Errno::PERM) {
-                eprintln!("SKIP: cannot give the unprivileged child access to ownership-denial fixtures: {error}");
-                return;
-            }
-            panic!("assign unprivileged ownership-denial fixture directory owner: {error}");
-        }
+        rfs::chownat(rfs::CWD, directory, Some(rustix::process::Uid::from_raw(child_uid)), Some(rustix::process::Gid::from_raw(child_gid)), AtFlags::empty()).expect("assign unprivileged ownership-denial fixture directory owner");
         fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).expect("make ownership-denial fixture directory traversable");
     }
     fs::set_permissions(&source, fs::Permissions::from_mode(0o044)).expect("make foreign source readable");
@@ -279,6 +255,7 @@ fn native_boundary_foreign_owner_denial_retains_real_exdev_source() {
 
     let mut child = Command::new(std::env::current_exe().expect("test executable path"));
     child
+        .arg("--ignored")
         .arg("--exact")
         .arg("native_boundary_foreign_owner_denial_retains_real_exdev_source")
         .arg("--nocapture")
@@ -300,15 +277,11 @@ fn native_boundary_foreign_owner_denial_retains_real_exdev_source() {
 }
 
 #[test]
+#[ignore = "needs mounted fixtures in ISH_FS_TEST_NESTED_* and ISH_FS_TEST_CROSS_ROOT; run benches/fs/native-fixtures.sh"]
 fn native_boundary_nested_mount_requires_opt_in() {
-    let (Some(source), Some(tmpfs), Some(bind)) = (
-        env::var_os("ISH_FS_TEST_NESTED_SOURCE"),
-        env::var_os("ISH_FS_TEST_NESTED_MOUNT"),
-        env::var_os("ISH_FS_TEST_NESTED_BIND"),
-    ) else {
-        eprintln!("SKIP: set ISH_FS_TEST_NESTED_SOURCE, ISH_FS_TEST_NESTED_MOUNT, and ISH_FS_TEST_NESTED_BIND to disposable mounted directories under this repo's .work");
-        return;
-    };
+    let source = required_env("ISH_FS_TEST_NESTED_SOURCE");
+    let tmpfs = required_env("ISH_FS_TEST_NESTED_MOUNT");
+    let bind = required_env("ISH_FS_TEST_NESTED_BIND");
     let work = workspace().join(".work");
     fs::create_dir_all(work.join("tmp")).expect("create workspace scratch");
     let work = fs::canonicalize(work).expect("canonicalize workspace .work");
@@ -331,10 +304,7 @@ fn native_boundary_nested_mount_requires_opt_in() {
     let source_fd = File::open(&source).expect("open source fixture");
     let tmpfs_fd = File::open(&tmpfs).expect("open nested tmpfs fixture");
     let bind_fd = File::open(&bind).expect("open nested bind fixture");
-    let source_mount = match platform::linux::mount_id(source_fd.as_fd()) {
-        Ok(id) => id,
-        Err(error) => { eprintln!("SKIP: Linux statx mount IDs are unavailable: {error}"); return; }
-    };
+    let source_mount = platform::linux::mount_id(source_fd.as_fd()).expect("read source mount ID");
     let tmpfs_mount = platform::linux::mount_id(tmpfs_fd.as_fd()).expect("read nested tmpfs mount ID");
     let bind_mount = platform::linux::mount_id(bind_fd.as_fd()).expect("read nested bind mount ID");
     assert_ne!(source_mount, tmpfs_mount, "tmpfs fixture must have a distinct mount ID");
@@ -387,7 +357,7 @@ fn native_boundary_nested_mount_requires_opt_in() {
     assert_eq!(fs::read(&bind_payload).expect("read retained bind payload"), b"nested bind payload");
 
     let source_device = source_meta.dev();
-    let Some(cross) = cross_root(source_device) else { return };
+    let cross = cross_root(source_device);
     let move_parent = OwnedDirectory::create(&cross, "nested-move-destination");
     let move_destination = move_parent.path().join("moved");
     let mut move_request = request(Operation::Move, source.parent().unwrap(), destination_parent.path(), source.file_name().unwrap().as_ref(), &move_destination);
@@ -411,11 +381,10 @@ fn native_boundary_nested_mount_requires_opt_in() {
 }
 
 #[test]
+#[ignore = "needs a bind mount in ISH_FS_TEST_ALIAS_*; run benches/fs/native-fixtures.sh"]
 fn native_boundary_bind_exdev_then_same_mount_alias_preserves_topology() {
-    let (Some(origin), Some(bind)) = (env::var_os("ISH_FS_TEST_ALIAS_ORIGIN"), env::var_os("ISH_FS_TEST_ALIAS_BIND")) else {
-        eprintln!("SKIP: set ISH_FS_TEST_ALIAS_ORIGIN and ISH_FS_TEST_ALIAS_BIND to an owned directory and its bind mount under this repo's .work");
-        return;
-    };
+    let origin = required_env("ISH_FS_TEST_ALIAS_ORIGIN");
+    let bind = required_env("ISH_FS_TEST_ALIAS_BIND");
     let work = fs::canonicalize(workspace().join(".work")).expect("canonicalize workspace .work");
     let origin = fs::canonicalize(origin).expect("canonicalize alias origin");
     let bind = fs::canonicalize(bind).expect("canonicalize alias bind");

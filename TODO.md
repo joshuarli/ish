@@ -41,15 +41,6 @@ Next: 45
 - **Effort:** L (weeks)
 - **Design:** [Callback process boundary](docs/rfc/ISH-8-callback-process-boundary.md)
 
-### ISH-29 · P2 · ish-fs native boundary tests print SKIP and pass
-
-- **Area:** Tests
-- **Where:** `crates/ish-fs/tests/native_boundaries.rs:52-53`, `:63-64`, `:153-154`, `:250-256`, `:309`, `:336`, `:416`, `crates/ish-fs/tests/native_macos.rs:120`, `:155`, `:183`, `:296`, `benches/fs/native-fixtures.sh:85-113`
-- **Problem:** Cross-device, nested-mount, alias and foreign-owner cases return early when `ISH_FS_TEST_*` variables are unset, and `cargo test` hides stderr for passing tests. Only `native-fixtures.sh` sets those variables; `rg ISH_FS_TEST Makefile .github Dockerfile` finds nothing. `ish-fs` is a default member, so `make test` and CI report green for the checks that guard cross-device `mv` retirement. The macOS skips on hosts without APFS are unproven.
-- **Recommendation:** Mark each environment-dependent case `#[ignore = "reason"]` and run it from the fixture script, or fail when the platform requires the fixture. A missing precondition must not read as a pass.
-- **Fix with:** test-audit
-- **Effort:** S (hours)
-
 ### ISH-15 · P2 · Safe library APIs conceal environment mutation preconditions
 
 - **Area:** Security

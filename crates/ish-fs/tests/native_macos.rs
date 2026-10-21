@@ -116,10 +116,7 @@ fn clone_uses_read_only_source_descriptor_and_preserves_0444_mode() {
 
     let clone = match platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
         Ok(Some(clone)) => clone,
-        Ok(None) => {
-            eprintln!("SKIP clone_uses_read_only_source_descriptor_and_preserves_0444_mode: filesystem does not support APFS clones");
-            return;
-        }
+        Ok(None) => panic!("filesystem does not support APFS clones"),
         Err(error) => panic!("clone failed: {error}"),
     };
 
@@ -151,10 +148,7 @@ fn clone_clears_inherited_blocking_flags_from_private_clone() {
     let parent = fixture.parent_fd();
     let clone = match platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
         Ok(Some(clone)) => clone,
-        Ok(None) => {
-            eprintln!("SKIP clone_clears_inherited_blocking_flags_from_private_clone: filesystem does not support APFS clones");
-            return;
-        }
+        Ok(None) => panic!("filesystem does not support APFS clones"),
         Err(error) => panic!("clone failed: {error}"),
     };
     let _clone_flag_reset = FlagReset([source.as_raw_fd(), clone.descriptor.as_raw_fd()]);
@@ -180,7 +174,7 @@ fn clone_does_not_normalize_an_existing_read_only_destination() {
     let parent = fixture.parent_fd();
     let result = platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("destination"));
     match result {
-        Ok(None) => eprintln!("SKIP clone_does_not_normalize_an_existing_read_only_destination: filesystem does not support APFS clones"),
+        Ok(None) => panic!("filesystem does not support APFS clones"),
         Ok(Some(_)) => panic!("clone replaced an existing destination"),
         Err(error) => assert_eq!(error.kind(), io::ErrorKind::AlreadyExists),
     }
@@ -252,10 +246,6 @@ fn clone_normalizes_foreign_0044_and_inherited_deny_read_before_open() {
             .output()
             .expect("run clone permissions subprocess without root privileges");
         assert!(output.status.success(), "clone permissions subprocess failed: {}", String::from_utf8_lossy(&output.stderr));
-        let child_output = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        if child_output.contains("SKIP") {
-            eprintln!("{child_output}");
-        }
     } else {
         assert_clone_opens_after_normalization(&source_path, &staging_path);
     }
@@ -292,10 +282,7 @@ fn clone_uses_acl_read_grant_when_source_mode_denies_owner() {
         .expect("open staging directory");
         let clone = match platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
             Ok(Some(clone)) => clone,
-            Ok(None) => {
-                eprintln!("SKIP clone_uses_acl_read_grant_when_source_mode_denies_owner: filesystem does not support APFS clones");
-                return;
-            }
+            Ok(None) => panic!("filesystem does not support APFS clones"),
             Err(error) => panic!("clone failed using source ACL read grant: {error}"),
         };
         let mut received = [0_u8; 20];
@@ -340,10 +327,6 @@ fn clone_uses_acl_read_grant_when_source_mode_denies_owner() {
             .output()
             .expect("run ACL source test without root privileges");
         assert!(output.status.success(), "ACL source subprocess failed: {}", String::from_utf8_lossy(&output.stderr));
-        let child_output = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        if child_output.contains("SKIP") {
-            eprintln!("{child_output}");
-        }
     } else {
         let source = fs::open(&source_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
             .expect("open source using its ACL read grant");
@@ -351,10 +334,7 @@ fn clone_uses_acl_read_grant_when_source_mode_denies_owner() {
         let parent = fixture.parent_fd();
         let clone = match platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
             Ok(Some(clone)) => clone,
-            Ok(None) => {
-                eprintln!("SKIP clone_uses_acl_read_grant_when_source_mode_denies_owner: filesystem does not support APFS clones");
-                return;
-            }
+            Ok(None) => panic!("filesystem does not support APFS clones"),
             Err(error) => panic!("clone failed using source ACL read grant: {error}"),
         };
         let mut received = [0_u8; 20];
@@ -379,10 +359,7 @@ fn assert_clone_opens_after_normalization(source_path: &Path, staging_path: &Pat
     .expect("open staging directory");
     let clone = match platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
         Ok(Some(clone)) => clone,
-        Ok(None) => {
-            eprintln!("SKIP clone_normalizes_foreign_0044_and_inherited_deny_read_before_open: filesystem does not support APFS clones");
-            return;
-        }
+        Ok(None) => panic!("filesystem does not support APFS clones"),
         Err(error) => panic!("clone failed before read-only open: {error}"),
     };
     assert_eq!(clone.identity, roots::observe_fd(clone.descriptor.as_fd()).unwrap().identity);
@@ -545,11 +522,9 @@ fn private_directory_clears_deny_acl_before_child_cleanup() {
 }
 
 #[test]
+#[ignore = "needs uid 0 to change ownership; run as root with --ignored"]
 fn private_directory_prepares_foreign_owned_staging_directory() {
-    if rustix::process::geteuid().as_raw() != 0 {
-        eprintln!("SKIP private_directory_prepares_foreign_owned_staging_directory: changing ownership requires uid 0");
-        return;
-    }
+    assert_eq!(rustix::process::geteuid().as_raw(), 0, "changing ownership requires uid 0");
 
     let fixture = Fixture::new();
     let parent = fixture.parent_fd();
@@ -875,14 +850,8 @@ fn resource_fork_precancellation_leaves_source_and_target_unchanged() {
         .expect("open destination");
     let fork_name = CString::new("com.apple.ResourceFork").unwrap();
     let fork = b"source resource fork";
-    match fs::fsetxattr(source.as_fd(), fork_name.as_c_str(), fork, fs::XattrFlags::empty()) {
-        Ok(()) => {}
-        Err(error) if error.raw_os_error() == libc::ENOTSUP => {
-            eprintln!("SKIP resource_fork_precancellation_leaves_source_and_target_unchanged: resource forks are unsupported on this filesystem");
-            return;
-        }
-        Err(error) => panic!("set source resource fork: {error}"),
-    }
+    fs::fsetxattr(source.as_fd(), fork_name.as_c_str(), fork, fs::XattrFlags::empty())
+        .expect("set source resource fork on a filesystem that supports resource forks");
     let before = std_fs::metadata(&destination_path).expect("stat destination before cancellation");
     let cancellation = Cancellation::default();
     cancellation.cancel();
@@ -928,14 +897,8 @@ fn resource_fork_copy_cancellation_stops_at_progress_callback() {
     .expect("create destination");
     let fork_name = CString::new("com.apple.ResourceFork").unwrap();
     let fork = vec![0x6d; 8 * 1024 * 1024];
-    match fs::fsetxattr(source.as_fd(), fork_name.as_c_str(), &fork, fs::XattrFlags::empty()) {
-        Ok(()) => {}
-        Err(error) if error.raw_os_error() == libc::ENOTSUP => {
-            eprintln!("SKIP resource_fork_copy_cancellation_stops_at_progress_callback: resource forks are unsupported on this filesystem");
-            return;
-        }
-        Err(error) => panic!("set source resource fork: {error}"),
-    }
+    fs::fsetxattr(source.as_fd(), fork_name.as_c_str(), &fork, fs::XattrFlags::empty())
+        .expect("set source resource fork on a filesystem that supports resource forks");
     let cancellation = Cancellation::default();
     let progress_events = AtomicUsize::new(0);
     let cancel_on_progress = || {
