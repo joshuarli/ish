@@ -28,6 +28,17 @@ stops the target with status 2 before its effects and redirections. The default
 shell has no policy. A policy does not undo effects from earlier commands or
 expansion.
 
+An embedder can register a raw command name with
+`Shell::set_command_placement(name, CommandPlacement::ParentProcess)`. The
+placement table owns each name's bytes and is empty by default. epsh resolves
+nested `command` indirection after expansion, then checks placement before
+calling a command policy, opening the target's redirections, or invoking a
+builtin, function, or external handler. A registered target is refused with
+status 2 when its evaluator process differs from the Shell's owner or when it
+runs in a logical pipeline or command substitution. This also covers evaluator
+paths that continue in the current process. Alias expansion belongs to the
+embedding shell; the expanded command name is checked by the same rule.
+
 The optional redirect-open handler owns only the opening of writable targets:
 truncating output, forced output, append output, and read/write redirections.
 It must honor the requested create, truncate, append, or read-write mode. Input
@@ -49,10 +60,12 @@ remain waitable and keep their output relays. Cleanup terminates a dedicated
 pipeline process group, or individual pipeline children when they share the
 evaluator's process group.
 
-Embedding callbacks can execute in forked evaluator children. A captured host
-mutex held by another thread at fork can remain locked in the child after the
-parent unlocks it. The stdout guard does not protect arbitrary callback state.
-The pending boundary decision is tracked in
+Embedding callbacks can execute in forked evaluator children for targets with
+no parent-process placement. A captured host mutex held by another thread at
+fork can remain locked in the child after the parent unlocks it. The stdout
+guard does not protect arbitrary callback state. This placement API does not
+change callback execution for unregistered targets. The broader callback
+process-boundary decision remains tracked in
 [ISH-8](../../../docs/rfc/ISH-8-callback-process-boundary.md).
 
 The default executor checks cancellation and deadlines between commands and

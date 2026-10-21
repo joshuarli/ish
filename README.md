@@ -1,8 +1,9 @@
 # ish
 
 ish is an interactive shell for macOS and Linux. It provides a native prompt,
-line editing, history search, completion, aliases, minimal job control, and
-protected native file operations. It has no script-file or command-string mode.
+line editing, history search, completion, aliases, minimal job control, native
+`cp` and `mv` commands, and protected deletion. It has no script-file or
+command-string mode.
 
 ## Install and run
 
@@ -102,7 +103,12 @@ its allowed whole-line form, ish refuses the command with status 2 before that
 target runs or opens its redirections. Earlier commands in the input line keep
 their effects. Commands that need shell state, including `alias`, `exit`, `fg`,
 `denv`, and `z`, must be the whole input line. `cd` and `history` can also be
-used in lists. `t` and `trash` must also be the whole input line.
+used in lists. `t` and `trash` must also be the whole input line. Native `cp`
+and `mv` run in lists and support redirections in the shell process. ish refuses
+them in pipelines and command substitutions with status 2 before their target
+redirections or filesystem operations. Argument substitutions are allowed.
+Use `command cp` or an alias for the same parent-process operation. An explicit
+path such as `/bin/cp` selects the external program.
 
 Arithmetic follows [epsh's signed 64-bit rules](crates/epsh/README.md#arithmetic).
 
@@ -120,6 +126,8 @@ ish-specific commands include:
 | `alias [name [command...]]` | Define or list aliases |
 | `history [reset]` | List or clear saved history |
 | `z [query]` | Jump to a frequently used directory; no query goes home |
+| `cp [OPTIONS] SOURCE DESTINATION` | Copy files or directory trees |
+| `mv [OPTIONS] SOURCE DESTINATION` | Move files or directory trees |
 | `t`, `trash` | Permanently delete entries below an explicit directory; `--yes` skips confirmation |
 | `w`, `which`, `type` | Locate a command or alias |
 | `l [path...]` | List files with colors and human-readable sizes |
@@ -137,6 +145,17 @@ boundary stops deletion before it starts. By default, the command asks you to
 type `yes`. Pass `--yes` to skip the prompt. Without a terminal, `--yes` is
 required. A terminal shows scan progress and a deletion progress bar.
 
+ish's `cp` and `mv` use an exact-target form: the source object maps to the
+destination path. For example, `cp report.txt .` reports a type conflict when
+`.` is a directory. Use `cp --into . report.txt` to place the file inside it.
+`--into DIRECTORY` maps each source to a child named after its basename.
+Directories recurse without `-r`; `cp -r` and `cp -R` are accepted as redundant
+flags. Read the [file operation reference](docs/filesystem.md) for collision,
+preservation, mount, durability, cancellation, and partial-completion rules.
+Unsupported required metadata is reported as a failure and the source is
+retained. Explicit paths such as `/bin/cp` and `/bin/mv` still run external
+utilities.
+
 The shell also provides epsh's environment and output builtins, including
 `set`, `export`, `unset`, `echo`, `pwd`, `true`, and `false`. Aliases can be
 defined at the prompt or in config and expand as you type.
@@ -146,6 +165,7 @@ defined at the prompt or in config and expand as you type.
 Ctrl+C interrupts foreground commands, including pipelines.
 Ctrl+Z suspends a foreground job and `fg` resumes it. ish keeps one suspended
 job. If a command in a list suspends, the rest of that list is discarded.
+During native `cp` and `mv`, ish ignores Ctrl+Z and continues the operation.
 
 ### denv
 
@@ -168,4 +188,6 @@ path bytes. Existing approvals remain valid; `denv deny` revokes both formats.
 ## Help and license
 
 Report issues at [GitHub Issues](https://github.com/joshuarli/ish/issues). This
-repository does not specify a license.
+repository does not specify a general license. The `ish-fs` crate is MIT
+licensed; see [its license](crates/ish-fs/LICENSE) and
+[import note](crates/ish-fs/IMPORT.md).

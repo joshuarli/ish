@@ -7,13 +7,14 @@ inductive Rejection where
   | background | compound | functionDefinition | source | parameterOperator | shellBuiltinOutsideLine
   deriving Repr, BEq, DecidableEq
 inductive Exec where
-  | inShell | hybrid | native
+  | inShell | hybrid | foreground | native
   deriving Repr, BEq, DecidableEq
 
 def classify (name : Bytes) : Option Exec :=
-  if ["alias", "copy-scrollback", "denv", "exit", "fg", "ish-dump", "type", "w", "which", "z"].any
+  if ["alias", "copy-scrollback", "denv", "exit", "fg", "ish-dump", "t", "trash", "type", "w", "which", "z"].any
       (fun text => text.toUTF8.toList == name) then some .inShell
   else if ["cd", "history"].any (fun text => text.toUTF8.toList == name) then some .hybrid
+  else if ["cp", "mv"].any (fun text => text.toUTF8.toList == name) then some .foreground
   else if ["c", "l"].any (fun text => text.toUTF8.toList == name) then some .native
   else none
 
@@ -220,6 +221,44 @@ inductive TargetPolicy where
   | unrestricted | ish
   deriving Repr, BEq
 
+inductive PlacementContext where
+  | parent | pipeline | substitution
+  deriving Repr, BEq, DecidableEq
+
+def decodePlacementContext (name : String) : Except String PlacementContext :=
+  match name with
+  | "parent" => .ok .parent
+  | "pipeline" => .ok .pipeline
+  | "substitution" => .ok .substitution
+  | _ => .error "unknown placement context"
+
+def execName : Exec → String
+  | .inShell => "in_shell"
+  | .hybrid => "hybrid"
+  | .foreground => "foreground"
+  | .native => "native"
+
+def encodeExec : Option Exec → Json
+  | none => .null
+  | some exec => toJson (execName exec)
+
+def placementAllowed (context : PlacementContext) : Bool :=
+  context == .parent
+
+def targetAllowedAt (target : Bytes) (context : PlacementContext) : Bool :=
+  dynamicAllowed target && placementAllowed context
+
+def enforcePlacementTarget (target : Bytes) (context : PlacementContext)
+    (state : ShellState) (prior : Trace) : Outcome Execution :=
+  if targetAllowedAt target context then .success { state, status := 0, trace := prior }
+  else .semanticError (.policy target) { state with lastStatus := 2 } prior
+
+theorem placement_refusal_retains_prior_effects (target : Bytes) (context : PlacementContext)
+    (state : ShellState) (prior : Trace) (refused : targetAllowedAt target context = false) :
+    enforcePlacementTarget target context state prior =
+      .semanticError (.policy target) { state with lastStatus := 2 } prior := by
+  simp [enforcePlacementTarget, refused]
+
 def allowsTarget : TargetPolicy → Bytes → Bool
   | .unrestricted, _ => true
   | .ish, target => dynamicAllowed target
@@ -236,6 +275,28 @@ theorem ish_dynamic_shell_state_refusal (target : Bytes) (shell : classify targe
   simp [allowsTarget, dynamicAllowed, shell]
   intro _
   rfl
+
+example : dynamicAllowed "cp".toUTF8.toList = true := by decide +kernel
+example : dynamicAllowed "mv".toUTF8.toList = true := by decide +kernel
+example : decodePlacementContext "pipeline" = .ok .pipeline := by rfl
+example : decodePlacementContext "parallel" = .error "unknown placement context" := by rfl
+
+theorem cp_foreground_class : classify "cp".toUTF8.toList = some .foreground := by decide +kernel
+theorem mv_foreground_class : classify "mv".toUTF8.toList = some .foreground := by decide +kernel
+theorem t_in_shell_class : classify "t".toUTF8.toList = some .inShell := by decide +kernel
+theorem trash_in_shell_class : classify "trash".toUTF8.toList = some .inShell := by decide +kernel
+theorem foreground_parent_allowed : targetAllowedAt "cp".toUTF8.toList .parent = true := by decide +kernel
+theorem foreground_pipeline_refused : targetAllowedAt "cp".toUTF8.toList .pipeline = false := by decide +kernel
+theorem foreground_substitution_refused : targetAllowedAt "mv".toUTF8.toList .substitution = false := by decide +kernel
+theorem trash_dynamic_refused : dynamicAllowed "trash".toUTF8.toList = false := by decide +kernel
+
+theorem static_foreground_plan_remains_epsh :
+    plan ⟨[.simple [] [literalWord "cp", literalWord "source", literalWord "destination"] []]⟩ = .epsh ∧
+    plan ⟨[.pipeline [.simple [] [literalWord "cp", literalWord "source", literalWord "destination"] [],
+      .simple [] [literalWord "cat"] []] false]⟩ = .epsh ∧
+    plan ⟨[.simple [] [literalWord "echo",
+      .mk [.cmdSubst (.simple [] [literalWord "mv", literalWord "source", literalWord "destination"] [])]] []]⟩ = .epsh := by
+  decide +kernel
 
 
 def arrayItems (json : Json) : Except String (List Json) :=
@@ -384,6 +445,16 @@ def run (request : Protocol.Request) : Outcome Json :=
       let target ← Protocol.decodeBytes (← request.input.getObjVal? "target")
       let allowed := dynamicAllowed target
       pure (.mkObj [("allowed", toJson allowed), ("status", toJson (if allowed then (0 : Nat) else 2))])
+    | "placement" =>
+      Protocol.exactObject ["mode", "target", "context"] request.input
+      let target ← Protocol.decodeBytes (← request.input.getObjVal? "target")
+      let contextName ← (← request.input.getObjVal? "context").getStr?
+      let context ← decodePlacementContext contextName
+      let allowed := targetAllowedAt target context
+      pure (.mkObj [
+        ("allowed", toJson allowed),
+        ("status", toJson (if allowed then (0 : Nat) else 2)),
+        ("class", encodeExec (classify target))])
     | _ => throw "unknown policy mode"
   match decoded with
   | .ok value => .success value

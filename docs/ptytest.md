@@ -13,3 +13,24 @@ boundaries when testing denv trust invalidation. Avoid arbitrary settle sleeps.
 Normal exit and Ctrl+D tests verify that the represented terminal lifecycle is
 restored to its initial state. Cleanup after a failed test only prevents a
 stray process; it is not a restoration assertion.
+
+## Native file operation cases
+
+Name `cp` and `mv` PTY cases with the `native_fs_` prefix. Cover list
+continuation, output redirection, and argument substitution in the parent
+process. Check pipeline and command-substitution refusals before target
+redirections or filesystem effects. Include aliases, expanded command names,
+and nested `command` dispatch.
+
+For cancellation cases, start work against an owned fixture, send Ctrl+C, and
+wait for both status 130 and the next usable prompt. Inspect source and
+destination entries after interrupted moves. Ctrl+Z must not suspend an
+in-process file operation; retain the existing suspend/resume checks for
+external foreground commands. Verify terminal restoration through the PTY
+state, not only process cleanup.
+
+The `native_fs_*` lifecycle cases exercise parent-process dispatch, redirection,
+argument expansion, cancellation, terminal restoration, and external job
+control. They pass on Linux. This PTY evidence does not establish native
+macOS behavior, filesystem clone support, cross-device retirement, or
+performance.

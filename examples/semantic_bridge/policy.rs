@@ -4,19 +4,25 @@ use crate::semantic_bridge::{BridgeError, BridgeResult};
 use epsh::ast::{
     Assignment, CaseArm, Command, HereDocBody, ParamOp, Program, Redir, RedirKind, Word, WordPart,
 };
+use epsh::eval::{CommandPlacement, Shell};
 use epsh::parser::Parser;
 use epsh::shell_bytes::ShellBytes;
 use serde_json::{Value, json};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
+    if index % 16 == 5 {
+        return placement_case(index, placement_target((index / 48) % 3));
+    }
     if index % 4 == 1 {
-        return dynamic_case(index, dynamic_target((index / 4) % 10));
+        return dynamic_case(index, dynamic_target((index / 4) % 12));
     }
     let mut random = Generator::new(seed ^ (index as u64).wrapping_mul(0xa0761d6478bd642f));
     let word = format!("item{}", random.below(100_000));
-    let source = match (index / 4) % 16 {
+    let source = match (index / 4) % 20 {
         0 => format!("echo {word}"),
         1 => "l -l".into(),
         2 => "cd /tmp".into(),
@@ -32,7 +38,11 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         12 => format!("echo $value && echo {word}"),
         13 => format!("echo $(echo {word})"),
         14 => format!("alias {word}"),
-        _ => format!("! echo {word}"),
+        15 => format!("! echo {word}"),
+        16 => "cp source destination".into(),
+        17 => "mv source destination".into(),
+        18 => "printf input | cp source destination".into(),
+        _ => "echo \"$(cp source destination)\"".into(),
     };
     let bytes = source.as_bytes().to_vec();
     let source_text = std::str::from_utf8(&bytes)
@@ -58,8 +68,18 @@ fn dynamic_target(index: usize) -> Vec<u8> {
         5 => b"cd".to_vec(),
         6 => b"history".to_vec(),
         7 => b"l".to_vec(),
-        8 => vec![0xff],
+        8 => b"cp".to_vec(),
+        9 => b"mv".to_vec(),
+        10 => vec![0xff],
         _ => "\u{e080}".as_bytes().to_vec(),
+    }
+}
+
+fn placement_target(index: usize) -> Vec<u8> {
+    match index {
+        0 => b"cp".to_vec(),
+        1 => b"mv".to_vec(),
+        _ => vec![0xff],
     }
 }
 
@@ -73,6 +93,39 @@ fn dynamic_case(index: usize, target: Vec<u8>) -> BridgeResult<Request> {
         state,
         fuel: 256,
         input: json!({"mode": "dynamic", "target": target}),
+    })
+}
+
+fn placement_case(index: usize, target: Vec<u8>) -> BridgeResult<Request> {
+    let context = match (index / 16) % 3 {
+        0 => "parent",
+        1 => "pipeline",
+        _ => "substitution",
+    };
+    placement_request(format!("policy-{index:05}"), target, context)
+}
+
+fn placement_request(id: String, target: Vec<u8>, context: &str) -> BridgeResult<Request> {
+    let source = placement_source(context)?;
+    let mut state = empty_state();
+    state["variables"] = json!([["TARGET", target.clone()]]);
+    Ok(Request {
+        id,
+        family: Family::Policy,
+        source: source.into_bytes(),
+        state,
+        fuel: 256,
+        input: json!({"mode": "placement", "target": target, "context": context}),
+    })
+}
+
+fn placement_source(context: &str) -> BridgeResult<String> {
+    let command = "command command \"$TARGET\" source destination > placement-redirection";
+    Ok(match context {
+        "parent" => command.to_owned(),
+        "pipeline" => format!("printf input | {command}"),
+        "substitution" => format!("value=$({command})"),
+        _ => return Err(BridgeError::new("unknown placement context")),
     })
 }
 
@@ -90,6 +143,9 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
             "tag": "success",
             "value": {"allowed": allowed, "status": if allowed { 0 } else { 2 }},
         }));
+    }
+    if request.input["mode"] == "placement" {
+        return actual_placement(request);
     }
     let source = std::str::from_utf8(&request.source)
         .map_err(|_| BridgeError::new("policy source is not UTF-8"))?;
@@ -166,6 +222,16 @@ pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
             })
             .collect();
     }
+    if request.input["mode"] == "placement" {
+        return [
+            (b"cp".to_vec(), "parent"),
+            (b"cp".to_vec(), "pipeline"),
+            (vec![0xff], "substitution"),
+        ]
+        .into_iter()
+        .map(|(target, context)| placement_request(request.id.clone(), target, context))
+        .collect();
+    }
     ["echo x", "z x", "cd /tmp", "echo $(z x)"]
         .into_iter()
         .map(|source| {
@@ -203,6 +269,22 @@ pub(crate) fn validate_case(request: &Request) -> BridgeResult<()> {
         }
         return Ok(());
     }
+    if request.input["mode"] == "placement" {
+        exact_object(&request.input, &["mode", "target", "context"], "placement policy input")?;
+        let target = require_policy_bytes(&request.input["target"])?;
+        let context = request.input["context"]
+            .as_str()
+            .ok_or_else(|| BridgeError::new("placement context is not a string"))?;
+        let expected_source = placement_source(context)?;
+        if request.source != expected_source.as_bytes() {
+            return Err(BridgeError::new("placement source does not match its context"));
+        }
+        if request.state["variables"] != json!([["TARGET", target]]) {
+            return Err(BridgeError::new("placement target differs from TARGET bytes"));
+        }
+        let _ = parse_program(&expected_source)?;
+        return Ok(());
+    }
     exact_object(&request.input, &["mode", "ast"], "static policy input")?;
     if request.source.len() > 256 {
         return Err(BridgeError::new("generated policy source exceeds 256 bytes"));
@@ -215,6 +297,132 @@ pub(crate) fn validate_case(request: &Request) -> BridgeResult<()> {
 
 fn require_policy_bytes(value: &Value) -> BridgeResult<Vec<u8>> {
     crate::semantic_bridge::protocol::require_bytes(value, "dynamic policy target")
+}
+
+struct PolicyProbeDirectory(Option<PathBuf>);
+
+impl PolicyProbeDirectory {
+    fn create() -> BridgeResult<Self> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".work/tmp");
+        fs::create_dir_all(&root)
+            .map_err(|error| BridgeError::new(format!("cannot create {}: {error}", root.display())))?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| BridgeError::new(format!("system clock is before the Unix epoch: {error}")))?
+            .as_nanos();
+        let path = root.join(format!("semantic-policy-{}-{nonce}", std::process::id()));
+        fs::create_dir(&path)
+            .map_err(|error| BridgeError::new(format!("cannot create {}: {error}", path.display())))?;
+        Ok(Self(Some(path)))
+    }
+
+    fn path(&self) -> &PathBuf {
+        self.0.as_ref().expect("policy probe directory is active")
+    }
+
+    fn remove(mut self) -> BridgeResult<()> {
+        let path = self.0.take().expect("policy probe directory is active");
+        fs::remove_dir_all(&path)
+            .map_err(|error| BridgeError::new(format!("cannot remove {}: {error}", path.display())))
+    }
+}
+
+impl Drop for PolicyProbeDirectory {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take()
+            && let Err(error) = fs::remove_dir_all(&path)
+        {
+            eprintln!("cannot remove {}: {error}", path.display());
+        }
+    }
+}
+
+fn actual_placement(request: &Request) -> BridgeResult<Value> {
+    exact_object(&request.input, &["mode", "target", "context"], "placement policy input")?;
+    let target = require_policy_bytes(&request.input["target"])?;
+    let context = request.input["context"]
+        .as_str()
+        .ok_or_else(|| BridgeError::new("placement context is not a string"))?;
+    let parent_context = match context {
+        "parent" => true,
+        "pipeline" | "substitution" => false,
+        _ => return Err(BridgeError::new("unknown placement context")),
+    };
+    let source = std::str::from_utf8(&request.source)
+        .map_err(|_| BridgeError::new("placement source is not UTF-8"))?;
+    let program = Parser::new(source)
+        .parse()
+        .map_err(|error| BridgeError::new(format!("placement source did not parse: {error}")))?;
+    let directory = PolicyProbeDirectory::create()?;
+    let policy_marker = directory.path().join("policy-called");
+    let handler_marker = directory.path().join("handler-called");
+    let redirection_path = directory.path().join("placement-redirection");
+    let observed_target = target.clone();
+    let mut shell = Shell::builder()
+        .cwd(directory.path().clone())
+        .env_clear()
+        .stdout_sink(Arc::new(Mutex::new(std::io::sink())))
+        .stderr_sink(Arc::new(Mutex::new(std::io::sink())))
+        .build();
+    shell
+        .set_var_bytes("TARGET", ShellBytes::from_vec(target.clone()))
+        .map_err(BridgeError::new)?;
+    shell.set_command_placement(
+        ShellBytes::from_vec(target.clone()),
+        CommandPlacement::ParentProcess,
+    );
+    let policy_marker_copy = policy_marker.clone();
+    let policy_target = target.clone();
+    shell.set_command_policy(Box::new(move |name| {
+        if name.as_bytes() == policy_target {
+            fs::write(&policy_marker_copy, b"called").expect("policy marker write succeeds");
+        }
+        ish::dispatch::check_expanded_command(name)
+            .err()
+            .map(|rejection| rejection.to_string())
+    }));
+    let handler_marker_copy = handler_marker.clone();
+    shell.set_external_handler(Box::new(move |args, _environment| {
+        if args
+            .first()
+            .is_some_and(|name| name.as_bytes() == observed_target)
+        {
+            fs::write(&handler_marker_copy, b"called").expect("handler marker write succeeds");
+        }
+        Ok(epsh::error::ExitStatus::SUCCESS)
+    }));
+    let status = shell.run_program(&program).code();
+    let expected_status = if parent_context { 0 } else { 2 };
+    let policy_called = policy_marker.exists();
+    let handler_called = handler_marker.exists();
+    let redirected = redirection_path.exists();
+    if status != expected_status
+        || policy_called != parent_context
+        || handler_called != parent_context
+        || redirected != parent_context
+    {
+        return Err(BridgeError::new(format!(
+            "placement runtime mismatch for {context} target {target:?}: status={status}, policy={policy_called}, handler={handler_called}, redirection={redirected}"
+        )));
+    }
+    let class = std::str::from_utf8(&target)
+        .ok()
+        .and_then(ish::builtin::lookup)
+        .map(|builtin| match builtin.exec {
+            ish::builtin::Exec::InShell => "in_shell",
+            ish::builtin::Exec::Hybrid => "hybrid",
+            ish::builtin::Exec::Foreground => "foreground",
+            ish::builtin::Exec::Native => "native",
+        });
+    directory.remove()?;
+    Ok(json!({
+        "tag": "success",
+        "value": {
+            "allowed": parent_context,
+            "status": status,
+            "class": class,
+        },
+    }))
 }
 
 pub(crate) fn verify_runtime_hook() -> BridgeResult<()> {
@@ -257,6 +465,42 @@ pub(crate) fn verify_runtime_hook() -> BridgeResult<()> {
             return Err(BridgeError::new(
                 "runtime policy hook did not reject eval before assignments and redirections",
             ));
+        }
+    }
+    verify_runtime_placement()
+}
+
+fn verify_runtime_placement() -> BridgeResult<()> {
+    let targets = [b"cp".to_vec(), b"mv".to_vec(), vec![0xff]];
+    let contexts = ["parent", "pipeline", "substitution"];
+    let mut index = 0;
+    for target in targets {
+        for context in contexts {
+            let request = placement_request(
+                format!("policy-placement-probe-{index}"),
+                target.clone(),
+                context,
+            )?;
+            validate_case(&request)?;
+            let outcome = actual_placement(&request)?;
+            if outcome["tag"] != "success"
+                || outcome["value"]["allowed"] != json!(context == "parent")
+            {
+                return Err(BridgeError::new("runtime placement probe returned the wrong context result"));
+            }
+            index += 1;
+        }
+    }
+    for source in [
+        "cp source destination",
+        "mv source destination",
+        "printf input | cp source destination",
+        "value=$(mv source destination)",
+    ] {
+        if !matches!(ish::dispatch::plan(source), Ok(ish::dispatch::Plan::Epsh(_))) {
+            return Err(BridgeError::new(format!(
+                "static foreground target did not remain in epsh: {source}"
+            )));
         }
     }
     Ok(())

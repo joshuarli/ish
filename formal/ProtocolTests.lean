@@ -1,6 +1,7 @@
 import IshSemantics.Protocol
+import IshSemantics.Policy
 
-open Lean IshSemantics IshSemantics.Protocol
+open Lean IshSemantics IshSemantics.Protocol IshSemantics.Policy
 
 def require (condition : Bool) (message : String) : IO Unit :=
   unless condition do throw (IO.userError message)
@@ -35,6 +36,25 @@ def main : IO Unit := do
       require (isError (acceptLine {} line)) s!"malformed input accepted: {line}"
       rejected := rejected + 1
   require (rejected == 12) "missing rejection goldens"
+  let placementRequest : Protocol.Request := {
+    id := "placement-pipeline"
+    family := .policy
+    source := "printf input | command command \"$TARGET\" source destination > placement-redirection".toUTF8.toList
+    state := { variables := [("TARGET", "cp".toUTF8.toList)] }
+    fuel := 128
+    input := .mkObj [
+      ("mode", toJson "placement"),
+      ("target", encodeBytes "cp".toUTF8.toList),
+      ("context", toJson "pipeline")]
+  }
+  match Protocol.decodeRequest (Protocol.encodeRequest placementRequest) with
+  | .error error => throw (IO.userError s!"placement request rejected after round trip: {repr error}")
+  | .ok request =>
+    require (request.input == placementRequest.input) "placement request input changed"
+    require (Policy.run request == .success (.mkObj [
+      ("allowed", toJson false),
+      ("status", toJson (2 : Nat)),
+      ("class", toJson "foreground")])) "pipeline placement was not refused"
   for byte in List.range 256 do
     match decodeBytes (encodeBytes [byte.toUInt8]) with
     | .ok bytes => require (bytes == [byte.toUInt8]) "byte round trip changed"
@@ -49,4 +69,4 @@ def main : IO Unit := do
   let actual := String.intercalate "\n" (outcomes.map fun result =>
     (encodeResponse "outcomes" result).compress) ++ "\n"
   require (actual == expected) "outcome golden changed"
-  IO.println "protocol: 6 family goldens, 12 rejected inputs, 256 byte round trips, 4 outcomes"
+  IO.println "protocol: 6 family goldens, 12 rejected inputs, placement policy request, 256 byte round trips, 4 outcomes"

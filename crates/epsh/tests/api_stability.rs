@@ -81,6 +81,10 @@ fn shell_public_methods() {
     shell.set_stderr_sink(Arc::new(Mutex::new(Vec::<u8>::new())));
     shell.set_external_handler(Box::new(|_args, _env| Ok(error::ExitStatus::SUCCESS)));
     shell.set_command_policy(Box::new(|_target| None));
+    shell.set_command_placement(
+        shell_bytes::ShellBytes::from("cp"),
+        eval::CommandPlacement::ParentProcess,
+    );
     shell.set_redirect_open_handler(Box::new(|request: &eval::RedirectOpen<'_>| {
         let _mode: eval::RedirectOpenMode = request.mode;
         None

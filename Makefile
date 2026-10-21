@@ -13,7 +13,7 @@ cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static r
 RUSTYBENCH_DEFAULT := $(CURDIR)/.work/tools/bin/rustybench
 RUSTYBENCH ?= "$(RUSTYBENCH_DEFAULT)"
 
-.PHONY: build test test-epsh conformance verify verify-mutations verify-refinement check test-ci release release-dynamic verify-release verify-release-dynamic bench bench-syscalls rustybench install install-login-shell lint fix
+.PHONY: build test test-epsh conformance verify verify-mutations verify-refinement check test-ci release release-dynamic verify-release verify-release-dynamic bench bench-fs bench-syscalls rustybench install install-login-shell lint fix
 
 build:
 	$(call cargo,dev) build
@@ -24,6 +24,10 @@ test:
 test-epsh:
 	@mkdir -p .work/tmp
 	TMPDIR="$(CURDIR)/.work/tmp" cargo test -p epsh --lib --tests
+
+bench-fs:
+	@test -n "$(FS_BENCH_ROOT)" -a -n "$(FS_BENCH_IDENTITY)" || { echo 'set FS_BENCH_ROOT and FS_BENCH_IDENTITY from benches/fs/bench.sh prepare' >&2; exit 2; }
+	benches/fs/bench.sh measure "$(FS_BENCH_ROOT)" "$(FS_BENCH_IDENTITY)" "$(or $(FS_BENCH_WORKLOAD),all)" $(if $(FS_BENCH_CROSS_ROOT),"$(FS_BENCH_CROSS_ROOT)" "$(FS_BENCH_CROSS_IDENTITY)")
 
 conformance:
 	@mkdir -p .work/tmp

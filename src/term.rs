@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::fd::{BorrowedFd, RawFd};
 
 pub const STDIN_FD: RawFd = 0;
@@ -67,6 +67,39 @@ impl Drop for RawMode {
         let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
         let _ =
             rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Now, &self.orig);
+    }
+}
+
+pub(crate) struct ForegroundMode {
+    original: Option<Termios>,
+}
+
+impl ForegroundMode {
+    pub(crate) fn enable() -> io::Result<Self> {
+        if !io::stdin().is_terminal() {
+            return Ok(Self { original: None });
+        }
+        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        let original = rustix::termios::tcgetattr(stdin)?;
+        let mut active = original.clone();
+        active.local_modes.insert(rustix::termios::LocalModes::ISIG);
+        rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Drain, &active)?;
+        Ok(Self {
+            original: Some(original),
+        })
+    }
+}
+
+impl Drop for ForegroundMode {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.as_ref() {
+            let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+            let _ = rustix::termios::tcsetattr(
+                stdin,
+                rustix::termios::OptionalActions::Now,
+                original,
+            );
+        }
     }
 }
 

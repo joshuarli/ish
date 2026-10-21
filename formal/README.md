@@ -34,6 +34,11 @@ runs retained regression cases, protocol boundary checks, and one comparator
 control per family. A family comparison fails if either side returns
 `unsupported_domain` or `fuel_exhausted`. Separate effects boundary checks
 require those outcomes for invalid environment inputs and a zero-fuel request.
+Policy cases include static `cp` and `mv` routes and run registered
+parent-process targets through epsh in parent, pipeline, and command-substitution
+contexts. The runtime probe checks status, redirection creation, and target
+policy and external-handler callbacks. Run the policy comparison and placement
+probe with `cargo run --example semantic_bridge -p ish -- --family policy --cases 1000`.
 The coverage matrix records each adapter's domain. A detected semantic
 mismatch is reduced and saved under
 `formal/fixtures/bridge-regressions/`.

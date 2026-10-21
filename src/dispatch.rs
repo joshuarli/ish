@@ -309,6 +309,26 @@ mod tests {
     }
 
     #[test]
+    fn foreground_file_commands_use_epsh_dispatch_in_lists_and_redirections() {
+        for name in ["cp", "mv"] {
+            assert_eq!(builtin::lookup(name).unwrap().exec, Exec::Foreground);
+        }
+        for line in [
+            "cp source destination && echo done",
+            "cp source destination > output.log 2> errors.log",
+            "command cp source destination",
+            "$copy source destination",
+        ] {
+            assert!(matches!(plan(line), Ok(Plan::Epsh(_))), "{line:?}");
+        }
+
+        let mut aliases = crate::alias::AliasMap::new();
+        aliases.set("copy".to_owned(), vec!["cp".to_owned()]);
+        let expanded = aliases.expand_line("copy source destination");
+        assert!(matches!(plan(&expanded), Ok(Plan::Epsh(_))));
+    }
+
+    #[test]
     fn documented_syntax_is_accepted() {
         for line in [
             "echo hi | grep h && echo ok || echo no; echo done",

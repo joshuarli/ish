@@ -19,6 +19,7 @@ pub mod config;
 pub mod denv;
 pub mod dispatch;
 pub mod frecency;
+pub mod foreground;
 pub mod history;
 pub mod input;
 pub mod job;

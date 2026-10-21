@@ -105,6 +105,16 @@ status 2. The policy also checks nested `command` indirection and command
 substitutions. Rejection happens before the target runs or opens redirections.
 The policy does not undo earlier commands or expansion effects.
 
+Command placement is opt-in and disabled by default. Call
+`Shell::set_command_placement` with an owned `ShellBytes` name and
+`CommandPlacement::ParentProcess` to require that target to run in the process
+that created the Shell. epsh resolves nested `command` execution after argument
+expansion and checks placement before command-policy callbacks, target
+redirections, builtins, functions, or the external handler. A registered target
+is refused with status 2 in a pipeline, command substitution, or another
+forked evaluator context. The table owns the command-name bytes. Existing
+embedders keep their current behavior until they register a placement.
+
 When an external handler is installed, epsh passes expanded arguments and the
 complete child environment as byte pairs. Redirections have already been
 applied to file descriptors. The environment includes inherited entries unless

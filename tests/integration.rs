@@ -1964,5 +1964,9 @@ fn builtin_registry_drives_names_and_execution_classes() {
     }
     assert_eq!(builtin::lookup("z").map(|b| b.exec), Some(builtin::Exec::InShell));
     assert_eq!(builtin::lookup("cd").map(|b| b.exec), Some(builtin::Exec::Hybrid));
+    for name in ["cp", "mv"] {
+        assert_eq!(builtin::lookup(name).map(|b| b.exec), Some(builtin::Exec::Foreground));
+        assert_eq!(names.iter().filter(|candidate| **candidate == name).count(), 1);
+    }
     assert!(builtin::lookup("echo").is_none());
 }

@@ -11,15 +11,16 @@ pub enum Exec {
     /// list or pipeline epsh's own builtin or the external-command handler
     /// supplies a stateless form of the same command.
     Hybrid,
+    /// Runs through epsh in lists and redirections, then the parent-process
+    /// external handler.
+    Foreground,
     /// Self-contained: runs through the external-command handler wherever it
     /// appears, including pipeline stages.
     Native,
 }
 
-/// One ish-owned builtin. The handler for [`Exec::InShell`] and
-/// [`Exec::Hybrid`] entries is selected by name in `main.rs`; every other
-/// question about builtins (is it one, what completes, how `w` answers, where
-/// it may run) is answered from this table.
+/// One ish-owned builtin. This table is the command-name and execution-class
+/// contract used by dispatch, completion, lookup, and the external handler.
 pub struct Builtin {
     pub name: &'static str,
     pub exec: Exec,
@@ -29,6 +30,7 @@ const ISH_BUILTINS: &[Builtin] = &[
     Builtin { name: "alias", exec: Exec::InShell },
     Builtin { name: "cd", exec: Exec::Hybrid },
     Builtin { name: "copy-scrollback", exec: Exec::InShell },
+    Builtin { name: "cp", exec: Exec::Foreground },
     Builtin { name: "c", exec: Exec::Native },
     Builtin { name: "denv", exec: Exec::InShell },
     Builtin { name: "exit", exec: Exec::InShell },
@@ -36,6 +38,7 @@ const ISH_BUILTINS: &[Builtin] = &[
     Builtin { name: "history", exec: Exec::Hybrid },
     Builtin { name: "ish-dump", exec: Exec::InShell },
     Builtin { name: "l", exec: Exec::Native },
+    Builtin { name: "mv", exec: Exec::Foreground },
     Builtin { name: "t", exec: Exec::InShell },
     Builtin { name: "trash", exec: Exec::InShell },
     Builtin { name: "type", exec: Exec::InShell },

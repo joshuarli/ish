@@ -152,6 +152,8 @@ impl PtyShell {
     ) -> Self {
         let home_path = home.path().to_str().unwrap().to_string();
         let binary = ish_binary();
+        let temp_path = home.path().join(".tmp");
+        std::fs::create_dir_all(&temp_path).unwrap();
         let cwd = cwd_rel
             .map(|rel| home.path().join(rel))
             .unwrap_or_else(|| home.path().to_path_buf());
@@ -160,6 +162,7 @@ impl PtyShell {
             .env("HOME", &home_path)
             .env("USER", "testuser")
             .env("PWD", &cwd)
+            .env("TMPDIR", &temp_path)
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
         for (key, value) in extra_env {
             command = command.env(key, value);
@@ -173,6 +176,7 @@ impl PtyShell {
         .env("HOME", &home_path)
         .env("USER", "testuser")
         .env("PWD", &cwd)
+        .env("TMPDIR", &temp_path)
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
         let scenario = Scenario::new("ish interactive shell")
             .expect("valid scenario label")
@@ -677,6 +681,327 @@ impl Drop for PtyShell {
         let deadline = terminal.deadline(std::time::Duration::from_secs(2));
         let _ = terminal.finish(deadline);
     }
+}
+
+fn assert_native_fs_status(sh: &PtyShell, expected: i32) {
+    let output = clean(&sh.run_command("echo native-fs-status-$?"));
+    assert!(
+        output
+            .lines()
+            .any(|line| line.trim() == format!("native-fs-status-{expected}")),
+        "expected native filesystem status {expected}: {output:?}"
+    );
+}
+
+fn assert_native_fs_parent_refusal(output: &str) {
+    let output = clean(output);
+    assert!(
+        output.contains("requires the original shell process"),
+        "expected parent-process refusal diagnostic: {output:?}"
+    );
+}
+
+fn native_fs_tree(home: &Path, name: &str, count: usize) -> PathBuf {
+    let root = home.join(name);
+    std::fs::create_dir(&root).unwrap();
+    let contents = (0..4096).map(|index| index as u8).collect::<Vec<_>>();
+    for index in 0..count {
+        std::fs::write(root.join(format!("file-{index:05}")), &contents).unwrap();
+    }
+    root
+}
+
+fn native_fs_cancellable_tree(home: &Path, name: &str) -> PathBuf {
+    let root = home.join(name);
+    std::fs::create_dir(&root).unwrap();
+    let contents = [0x4f; 512];
+    for index in 0..8192 {
+        std::fs::write(root.join(format!("file-{index:05}")), contents).unwrap();
+    }
+    let mut payload = std::fs::File::create(root.join("payload")).unwrap();
+    let contents = vec![0x6d; 1024 * 1024];
+    for _ in 0..64 {
+        std::io::Write::write_all(&mut payload, &contents).unwrap();
+    }
+    root
+}
+
+fn native_fs_wait_for_staging(sh: &PtyShell, command: &str) -> PathBuf {
+    sh.type_str(command);
+    sh.enter();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let stage = std::fs::read_dir(sh.home_path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".ish-fs-stage-"))
+            });
+        if let Some(stage) = stage
+            && std::fs::read_dir(&stage).is_ok_and(|mut entries| entries.next().is_some())
+        {
+            return stage;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native filesystem staging did not begin for {command:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn native_fs_copy_and_move_lists_keep_successes_and_continue_after_failures() {
+    let sh = PtyShell::spawn_with_opts(
+        &[
+            ("first", "first bytes\0"),
+            ("second", "second bytes\n"),
+            ("third", "third bytes\0"),
+        ],
+        &[],
+    );
+
+    sh.run_command("cp first first-copy && mv second second-moved");
+    assert_eq!(std::fs::read(sh.home_path().join("first-copy")).unwrap(), b"first bytes\0");
+    assert_eq!(std::fs::read(sh.home_path().join("second-moved")).unwrap(), b"second bytes\n");
+    assert!(!sh.home_path().join("second").exists());
+    assert_native_fs_status(&sh, 0);
+
+    sh.run_command("cp missing fallback-copy || mv third third-moved");
+    assert!(!sh.home_path().join("fallback-copy").exists());
+    assert_eq!(std::fs::read(sh.home_path().join("third-moved")).unwrap(), b"third bytes\0");
+    assert_native_fs_status(&sh, 0);
+
+    sh.run_command("mv missing failed-move && cp first skipped-copy");
+    assert!(!sh.home_path().join("failed-move").exists());
+    assert!(!sh.home_path().join("skipped-copy").exists());
+    assert_native_fs_status(&sh, 1);
+}
+
+#[test]
+fn native_fs_exact_targets_and_into_directories_preserve_real_bytes() {
+    let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
+        let bytes = [0, 255, 13, 10, 0, 42];
+        for name in ["exact-source", "into-source", "move-source", "move-into-source"] {
+            std::fs::write(home.join(name), bytes).unwrap();
+        }
+        std::fs::create_dir(home.join("copy-into")).unwrap();
+        std::fs::create_dir(home.join("move-into")).unwrap();
+    });
+
+    sh.run_command("cp exact-source exact-target");
+    sh.run_command("cp --into copy-into into-source");
+    sh.run_command("mv move-source move-target");
+    sh.run_command("mv --into move-into move-into-source");
+
+    let bytes = [0, 255, 13, 10, 0, 42];
+    for path in [
+        sh.home_path().join("exact-target"),
+        sh.home_path().join("copy-into/into-source"),
+        sh.home_path().join("move-target"),
+        sh.home_path().join("move-into/move-into-source"),
+    ] {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    for path in ["move-source", "move-into-source"] {
+        assert!(!sh.home_path().join(path).exists());
+    }
+}
+
+#[test]
+fn native_fs_redirections_prevent_failed_transfers_and_capture_stderr() {
+    let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
+        std::fs::write(home.join("source"), b"redirected bytes\0\xff").unwrap();
+    });
+    sh.run_command("cp source blocked > absent-directory/output");
+    assert!(!sh.home_path().join("blocked").exists());
+    assert_native_fs_status(&sh, 2);
+
+    sh.run_command("cp missing never-created 2> copy-error");
+    let error = std::fs::read_to_string(sh.home_path().join("copy-error")).unwrap();
+    assert!(
+        error.contains("No such file or directory"),
+        "stderr redirection did not capture the diagnostic: {error:?}"
+    );
+    assert!(!sh.home_path().join("never-created").exists());
+    assert_native_fs_status(&sh, 1);
+
+    let output = sh.run_command("cp --verbose source verbose-copy 2> copy-verbose");
+    let verbose = std::fs::read_to_string(sh.home_path().join("copy-verbose")).unwrap();
+    assert!(verbose.contains("copied source to verbose-copy"), "verbose stderr was not redirected: {verbose:?}");
+    assert!(!clean(&output).contains("ish: cp: copied source to verbose-copy"));
+    assert_eq!(std::fs::read(sh.home_path().join("verbose-copy")).unwrap(), b"redirected bytes\0\xff");
+    assert_native_fs_status(&sh, 0);
+}
+
+#[test]
+fn native_fs_parent_placement_accepts_command_alias_expanded_name_and_argument_substitution() {
+    let sh = PtyShell::spawn_with_opts(&[("source", "parent bytes\0")], &[]);
+
+    sh.run_command("command cp \"$(echo source)\" command-copy");
+    sh.run_command("alias native-copy cp");
+    sh.run_command("native-copy source alias-copy");
+    sh.run_command("export NATIVE_FS_COMMAND=cp");
+    sh.run_command("$NATIVE_FS_COMMAND source expanded-copy");
+
+    for path in ["command-copy", "alias-copy", "expanded-copy"] {
+        assert_eq!(std::fs::read(sh.home_path().join(path)).unwrap(), b"parent bytes\0");
+    }
+    assert_native_fs_status(&sh, 0);
+}
+
+#[test]
+fn native_fs_static_dynamic_and_nested_fork_contexts_refuse_before_redirections() {
+    let sh = PtyShell::spawn_with_opts(&[("source", "must stay untouched")], &[]);
+
+    let output = sh.run_command("/bin/echo ignored | cp source static-copy > static-redirection");
+    assert_native_fs_parent_refusal(&output);
+    assert!(!sh.home_path().join("static-copy").exists());
+    assert!(!sh.home_path().join("static-redirection").exists());
+    assert_native_fs_status(&sh, 2);
+
+    sh.run_command("export NATIVE_FS_COMMAND=cp");
+    let output = sh.run_command("/bin/echo ignored | $NATIVE_FS_COMMAND source dynamic-copy > dynamic-redirection");
+    assert_native_fs_parent_refusal(&output);
+    assert!(!sh.home_path().join("dynamic-copy").exists());
+    assert!(!sh.home_path().join("dynamic-redirection").exists());
+    assert_native_fs_status(&sh, 2);
+
+    let output = sh.run_command("echo \"$(cp source nested-copy > nested-redirection)\"");
+    assert_native_fs_parent_refusal(&output);
+    assert!(!sh.home_path().join("nested-copy").exists());
+    assert!(!sh.home_path().join("nested-redirection").exists());
+    assert_native_fs_status(&sh, 0);
+
+    let output = sh.run_command("echo \"$(echo $(cp source deep-copy > deep-redirection))\"");
+    assert_native_fs_parent_refusal(&output);
+    assert!(!sh.home_path().join("deep-copy").exists());
+    assert!(!sh.home_path().join("deep-redirection").exists());
+    assert_native_fs_status(&sh, 0);
+}
+
+#[test]
+fn native_fs_quick_no_progress_copy_stays_quiet() {
+    let sh = PtyShell::spawn_with_opts(&[("source", "tiny bytes")], &[]);
+    let output = clean(&sh.run_command("cp source copy"));
+    assert!(!output.contains("files, "), "quick copy printed progress: {output:?}");
+    assert_eq!(std::fs::read(sh.home_path().join("copy")).unwrap(), b"tiny bytes");
+
+    let output = clean(&sh.run_command("cp --no-progress source quiet-copy"));
+    assert!(!output.contains("files, "), "--no-progress printed progress: {output:?}");
+    assert_eq!(std::fs::read(sh.home_path().join("quiet-copy")).unwrap(), b"tiny bytes");
+}
+
+#[test]
+fn native_fs_ctrl_c_during_copy_returns_130_to_a_usable_prompt() {
+    let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
+        native_fs_cancellable_tree(home, "source-tree");
+    });
+    let modes = terminal_state(&sh).modes;
+    let stage = native_fs_wait_for_staging(&sh, "cp -r --jobs 1 source-tree copy-tree");
+    assert!(!sh.home_path().join("copy-tree").exists());
+    sh.ctrl_c();
+    sh.wait_for_prompt_after_line_advance(10000);
+    assert_native_fs_status(&sh, 130);
+    assert!(!stage.exists(), "cancelled copy left its staging tree");
+    assert!(sh.home_path().join("source-tree/file-00000").exists());
+    assert!(!sh.home_path().join("copy-tree").exists());
+    assert!(
+        std::fs::read_dir(sh.home_path().join(".tmp")).unwrap().next().is_none(),
+        "cancelled copy left engine scratch entries"
+    );
+    assert_eq!(terminal_state(&sh).modes, modes);
+    let output = clean(&sh.run_command("/bin/echo native-fs-alive"));
+    assert!(output.contains("native-fs-alive"), "shell did not run a command after cancellation: {output:?}");
+}
+
+#[test]
+fn native_fs_ctrl_z_is_ignored_during_copy_and_external_job_control_still_works() {
+    let sh = PtyShell::spawn_with_setup(
+        &[("bin/sleep", READY_SLEEP_SCRIPT)],
+        &[],
+        &[],
+        24,
+        80,
+        None,
+        |home| {
+            native_fs_cancellable_tree(home, "source-tree");
+        },
+    );
+    let modes = terminal_state(&sh).modes;
+    let stage = native_fs_wait_for_staging(&sh, "cp -r --jobs 1 source-tree copy-tree");
+    assert!(!sh.home_path().join("copy-tree").exists());
+    sh.ctrl_z();
+    let output = sh.wait_for_prompt_after_line_advance(15000);
+    assert!(!output.contains("stopped:"), "native copy was suspended by Ctrl+Z: {output:?}");
+    assert_native_fs_status(&sh, 0);
+    assert!(!stage.exists(), "completed copy retained its staging name");
+    assert_eq!(
+        std::fs::read(sh.home_path().join("copy-tree/file-00000")).unwrap(),
+        [0x4f; 512]
+    );
+    assert_eq!(terminal_state(&sh).modes, modes);
+
+    sh.type_str("./bin/sleep");
+    sh.enter();
+    sh.wait_for("pty-child-ready", 3000);
+    sh.ctrl_z();
+    sh.wait_for("stopped:", 3000);
+    sh.wait_for_prompt_after_line_advance(3000);
+    sh.type_str("fg");
+    sh.enter();
+    sh.wait_for("resuming:", 3000);
+    sh.ctrl_c();
+    sh.wait_for_prompt_after_line_advance(3000);
+}
+
+#[test]
+fn native_fs_sigterm_and_sighup_cancel_and_restore_the_terminal() {
+    for (signal, status) in [(libc::SIGTERM, 143), (libc::SIGHUP, 129)] {
+        let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
+            native_fs_cancellable_tree(home, "source-tree");
+        });
+        let stage = native_fs_wait_for_staging(&sh, "cp -r --jobs 1 source-tree copy-tree");
+        assert!(!sh.home_path().join("copy-tree").exists());
+        let mut terminal = sh.terminal.borrow_mut();
+        terminal.signal(signal).unwrap();
+        let deadline = terminal.deadline(std::time::Duration::from_secs(10));
+        assert_eq!(
+            terminal.wait_for_exit(deadline).expect("native filesystem signal exits ish"),
+            ExitStatus::Code(status)
+        );
+        terminal
+            .assert_terminal_restored(&sh.terminal_baseline)
+            .expect("native filesystem signal restores the terminal");
+        drop(terminal);
+        assert!(!stage.exists(), "signalled copy left its staging tree");
+        assert!(sh.home_path().join("source-tree/file-00000").exists());
+        assert!(!sh.home_path().join("copy-tree").exists());
+        assert!(
+            std::fs::read_dir(sh.home_path().join(".tmp")).unwrap().next().is_none(),
+            "native filesystem signal left engine scratch entries"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_fs_broken_stderr_cancels_bounded_work_and_keeps_the_prompt_usable() {
+    let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
+        native_fs_tree(home, "source-tree", 1024);
+        std::fs::create_dir(home.join("copy-into")).unwrap();
+    });
+
+    sh.run_command("cp --verbose --jobs 4 --into copy-into source-tree/* 2>/dev/full");
+    assert_native_fs_status(&sh, 1);
+    assert!(
+        std::fs::read_dir(sh.home_path().join(".tmp")).unwrap().next().is_none(),
+        "broken stderr left engine scratch entries"
+    );
+    let output = clean(&sh.run_command("/bin/echo native-fs-after-output-error"));
+    assert!(output.contains("native-fs-after-output-error"), "shell did not return after broken stderr: {output:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -3700,6 +4025,10 @@ fn external_commands_run_in_the_directory_a_list_cd_selected() {
 
 fn clean(out: &str) -> String {
     PtyShell::strip_ansi(out)
+}
+
+fn terminal_state(sh: &PtyShell) -> ptytest::TerminalState {
+    sh.terminal.borrow().terminal_state()
 }
 
 // ---------------------------------------------------------------------------

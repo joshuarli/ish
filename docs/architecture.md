@@ -16,6 +16,12 @@ ish's user-facing syntax smaller than epsh's parser and runtime.
    commands with process-group and terminal control. ish synchronizes the
    resulting status and working directory.
 
+The builtin registry assigns `cp` and `mv` the `Exec::Foreground` class. epsh
+handles their list and redirection syntax, then calls ish's handler in the
+original shell process. Explicit executable paths bypass the builtin registry
+and keep the external utility available. The [file operation reference](filesystem.md)
+defines their operands and filesystem policy.
+
 The `Exec` class in [`builtin.rs`](../src/builtin.rs) defines where ish-owned
 commands run. `InShell` commands must be the whole input line. `Hybrid`
 commands such as `cd` and `history` run with shell state when alone and use the
@@ -31,6 +37,101 @@ dispatch. ish uses it to refuse dynamically selected `eval`, `source`, `.`, and
 shell-state builtins outside their whole-line route. These refusals return
 status 2 before the target runs or opens its redirections. The policy does not
 undo effects from earlier commands or expansion.
+
+ish also registers `cp` and `mv` with epsh's additive
+`CommandPlacement::ParentProcess` API. The placement table owns command-name
+bytes and is empty by default for other embedders. epsh captures its owner PID
+when a `Shell` is created and carries that owner through evaluator forks. It
+checks the expanded target, including nested `command`, before command-policy
+callbacks, target redirections, or target dispatch. A pipeline or command
+substitution is rejected with status 2 even when its evaluator path stays in
+the current process. Argument substitutions finish before the handler runs.
+See [epsh's process model](../crates/epsh/docs/process-model.md) for the API and
+its limits.
+
+## Filesystem operation boundaries
+
+`src/fs_command.rs` parses ish's command options and adapts typed requests to
+`ish-fs`. The library's contract covers path anchoring, mapping policy,
+transfer, metadata, publication, and move retirement. It receives the shell
+cwd, raw operands, environment-derived paths, and cancellation explicitly. It
+does not change cwd or process environment.
+
+The operation runs in the parent shell so redirections and list status use
+epsh's normal evaluation. Workers must finish before the handler returns. The
+foreground controller owns signal handling, cancellation, progress output,
+worker event draining, and terminal restoration. `trash` uses the same
+controller while keeping its separate command contract and root protections.
+Workers receive explicit handles and options. They do not mutate shell state,
+cwd, or process environment.
+
+The engine contract uses descriptor-relative paths after resolving supplied
+parents. It stages new objects on the destination filesystem and publishes a
+new root only after its transfer completes. A merge publishes completed leaves
+and can leave partial work. Non-merge same-filesystem moves use a rename without
+walking descendants. Cross-filesystem moves require successful transfer,
+required metadata, and durable destination publication before source retirement.
+Retirement uses records of transferred objects and revalidation; it does not
+recursively delete whatever later appears at a source path.
+
+Stable source and destination trees are the full-correctness baseline. Path
+anchoring and revalidation detect observed changes, but cannot make rename or
+unlink conditional on both inode and mutation version against every concurrent
+writer. The command does not claim protection from another process running as
+the same account with authority over the trees.
+
+Linux workspace and PTY tests, semantic verification, shift refinement, and
+supported native conformance cases pass. Focused campaign strict clippy passes
+on the integrated code; workspace strict clippy remains blocked by
+pre-existing `fdu` issues. The macOS target compiles, but its native tests have
+not run on a macOS host. On this Linux host, `FICLONE` returns `EOPNOTSUPP` on
+ext4. Real EXDEV tests are present, but a genuine distinct-device fixture is
+unavailable here.
+There is no privileged nested-mount fixture, and the foreign-owner `0044` test
+fixture is unavailable. See the [case inventory](../crates/ish-fs/tests/cases.md)
+for native evidence by capability. P3 benchmarking is exploratory, and P3
+performance acceptance remains blocked. These host limits do not change the
+command contract above.
+
+## Current resource limits
+
+The engine defaults to at most four workers and lowers that count to fit its
+descriptor and address-space budgets. `--jobs` accepts 1 through 32 and rejects
+requests that exceed either budget. The operation fails before mutation when
+fewer than 16 descriptors remain after its reservation.
+
+Recursive copy uses a 256-record work queue. Each worker has a 256 KiB transfer
+buffer, and traversal paths are limited to 64 KiB. The foreground controller
+has a separate 256-event queue and coalesces progress events when that queue is
+full. It polls for signals every 50 ms.
+
+Preflight mapping accounting is capped at 64 MiB. Dry-run traversal frames are
+capped at 32 MiB. Traversal, hardlink, and retirement records use unlinked
+temporary files under the configured scratch directory; each decoded record
+is capped at 1 MiB. For a finite address-space limit, worker admission reserves
+64 MiB for records and 512 KiB for the producer stack. Each worker is budgeted
+one 512 KiB stack, a 256 KiB transfer buffer, and four metadata captures. A
+metadata capture is capped at 16 MiB on Linux and 64 MiB on macOS; Linux
+extended attribute buffers use that same 16 MiB cap.
+
+These budgets estimate bounded allocations used to admit workers. They are not
+measured peak RSS limits. Linux resource probes sample descriptor and RSS
+maxima, but sampling can miss short peaks. The constrained Linux cases pass;
+the observations do not establish a universal process-memory maximum or
+macOS resource behavior.
+
+`ish-fs` reports bytes streamed and logical bytes cloned. They describe
+different transfer methods and are not additive measures of physical I/O.
+`transfer_elapsed` includes concurrent transfer work, while
+`destination_sync_work` sums sync calls that can overlap each other and
+transfer. `source_retirement_elapsed` includes source namespace sync. These
+timings do not add up to total operation time. P3 benchmark results are
+exploratory, and P3 performance acceptance remains blocked. No universal speed
+ratio applies.
+
+The repository does not declare a general license. The imported code and
+`ish-fs` subtree carry the MIT license in [its license file](../crates/ish-fs/LICENSE)
+and the single [import note](../crates/ish-fs/IMPORT.md).
 
 ## State and process boundaries
 

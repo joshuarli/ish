@@ -11,6 +11,8 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
+use ish::foreground;
+mod fs_command;
 mod static_word;
 mod trash;
 
@@ -175,6 +177,17 @@ fn main() {
         .cwd(cwd)
         .interactive(true)
         .build();
+    for name in builtin::all_builtin_names().filter(|name| {
+        builtin::lookup(name).is_some_and(|spec| spec.exec == builtin::Exec::Foreground)
+    }) {
+        epsh.set_command_placement(
+            epsh::shell_bytes::ShellBytes::from(name),
+            epsh::eval::CommandPlacement::ParentProcess,
+        );
+    }
+    let fs_default_scratch = store_env_os(&epsh, "TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
 
     let initial_home = store_env_os(&epsh, "HOME");
     let mut aliases = AliasMap::new();
@@ -230,6 +243,13 @@ fn main() {
     // Main loop
     let mut exit_code = 0;
     loop {
+        if let Some(sig) = signal::take_pending_termination() {
+            if let Some(job) = shell.job.take() {
+                abandon_job(job);
+            }
+            exit_code = 128 + sig;
+            break;
+        }
         shell
             .epsh
             .set_exit_status(epsh::error::ExitStatus::from(shell.last_status));
@@ -304,7 +324,7 @@ fn main() {
                     .storage_path()
                     .expect("interactive history has a storage path")
                     .to_path_buf();
-                let handler = make_external_handler(shell_pid, history_log);
+                let handler = make_external_handler(shell_pid, history_log, fs_default_scratch.clone());
                 shell.epsh.set_external_handler(handler);
                 JOB_SLOT_TAKEN.with(|taken| taken.set(shell.job.is_some()));
 
@@ -436,7 +456,7 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                         Ok(()) => shell.last_status = 0,
                         Err(error) => {
                             eprintln!("ish: {name}: {error}");
-                            shell.last_status = 1;
+                            shell.last_status = if error.kind() == std::io::ErrorKind::Interrupted { 130 } else { 1 };
                         }
                     }
                 }
@@ -2611,6 +2631,7 @@ fn env_pair_value(
 fn make_external_handler(
     shell_pid: i32,
     history_log: std::path::PathBuf,
+    fs_default_scratch: std::path::PathBuf,
 ) -> epsh::eval::ExternalHandler {
     Box::new(
         move |args: &[epsh::shell_bytes::ShellBytes],
@@ -2619,6 +2640,23 @@ fn make_external_handler(
 
             // ish interactive builtins
             match name.as_str() {
+                "cp" | "mv" => {
+                    let cwd = epsh::eval::external_command_cwd().ok_or_else(|| {
+                        epsh::error::ShellError::Io(std::io::Error::other("external command cwd was unavailable"))
+                    })?;
+                    let context = ish_fs::Context {
+                        cwd,
+                        home: env_pair_value(env_pairs, "HOME").map(std::path::PathBuf::from),
+                        scratch: env_pair_value(env_pairs, "TMPDIR")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| fs_default_scratch.clone()),
+                    };
+                    let operation = if name == "cp" { ish_fs::Operation::Copy } else { ish_fs::Operation::Move };
+                    let arguments = args[1..].iter()
+                        .map(epsh::shell_bytes::ShellBytes::to_os_string)
+                        .collect::<Vec<_>>();
+                    return fs_command::run(operation, &arguments, context);
+                }
                 "l" => {
                     let l_args: Vec<_> = args[1..].iter().map(|arg| arg.to_path_buf()).collect();
                     let status = builtin::list_directory(&l_args);

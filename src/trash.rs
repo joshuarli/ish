@@ -1,94 +1,22 @@
 use fdu_core::{EntryType, NodeState, NodeStatus, ScanEvent, Tree};
 use fdu_delete::{DeleteEvent, OutcomeKind, create_plan};
 use fdu_scan::{RootAnchor, open_root_no_follow, start_indexed_scan};
+use ish::foreground::Foreground;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
 
 const SCAN_EVENT_CHANNEL_CAPACITY: usize = 512;
 const SCAN_BATCH_CAPACITY: usize = 1024;
 const SCAN_BATCH_POOL_CAPACITY: usize = 8;
 const DELETE_CHANNEL_CAPACITY: usize = 8;
-const PROGRESS_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
 const PROGRESS_BAR_WIDTH: usize = 30;
-
-
-
-
-struct Progress {
-    enabled: bool,
-    drawn: bool,
-    last_draw: Option<Instant>,
-}
-
-impl Progress {
-    fn new() -> Self {
-        Self { enabled: io::stderr().is_terminal(), drawn: false, last_draw: None }
-    }
-
-    
-    fn scanning(&mut self, entries: usize) {
-        self.draw(|| format!("Scanning... {entries} entries"));
-    }
-
-    fn deleting(&mut self, completed: usize, total: usize) {
-        self.draw(|| {
-            let fraction = if total == 0 { 1.0 } else { completed as f64 / total as f64 };
-            let filled = ((fraction * PROGRESS_BAR_WIDTH as f64) as usize).min(PROGRESS_BAR_WIDTH);
-            format!(
-                "Deleting [{}{}] {:>3}% {completed}/{total}",
-                "#".repeat(filled),
-                "-".repeat(PROGRESS_BAR_WIDTH - filled),
-                (fraction * 100.0) as usize,
-            )
-        });
-    }
-
-    fn draw(&mut self, line: impl FnOnce() -> String) {
-        if !self.enabled || self.last_draw.is_some_and(|last| last.elapsed() < PROGRESS_REDRAW_INTERVAL) {
-            return;
-        }
-        self.last_draw = Some(Instant::now());
-        self.drawn = true;
-        if write!(io::stderr(), "\r\x1b[2K{}", line())
-            .and_then(|()| io::stderr().flush())
-            .is_err()
-        {
-            self.enabled = false;
-        }
-    }
-
-    fn clear(&mut self) {
-        if self.drawn {
-            let cleared = write!(io::stderr(), "\r\x1b[2K")
-                .and_then(|()| io::stderr().flush())
-                .is_ok();
-            self.drawn = false;
-            self.enabled &= cleared;
-        }
-    }
-}
-
-impl Drop for Progress {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
-
-
-
-
-
-
-
 
 pub(super) enum Command {
     Help,
@@ -139,6 +67,24 @@ pub(super) fn run(
     assume_yes: bool,
     home: Option<OsString>,
 ) -> io::Result<()> {
+    let mut foreground = Foreground::start()?;
+    let result = run_with_foreground(path, assume_yes, home, &mut foreground);
+    foreground.poll();
+    let cancelled_by_user = foreground.cancellation().reason() == Some(ish_fs::CancelReason::User);
+    let finish = foreground.finish();
+    if cancelled_by_user {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "operation cancelled"));
+    }
+    result?;
+    finish
+}
+
+fn run_with_foreground(
+    path: PathBuf,
+    assume_yes: bool,
+    home: Option<OsString>,
+    foreground: &mut Foreground,
+) -> io::Result<()> {
     let root = open_root_no_follow(&path).map_err(|error| describe_open_failure(&path, error))?;
     let confirmation_path = (!assume_yes)
         .then(|| resolve_confirmation_path(&root, &path))
@@ -150,9 +96,8 @@ pub(super) fn run(
             format!("refusing to empty {}: it is {reason}", path.display()),
         ));
     }
-    let mut progress = Progress::new();
-    let tree = build_index(&root, &mut progress)?;
-    progress.clear();
+    let tree = build_index(&root, foreground)?;
+    foreground.clear_progress()?;
     require_complete_scan_root(&tree).map_err(|error| {
         io::Error::other(format!("refusing to empty {}: {error}", path.display()))
     })?;
@@ -182,13 +127,15 @@ pub(super) fn run(
             confirmation_path.as_deref().expect("confirmation path is resolved"),
             selected.len(),
             total,
+            foreground,
         )?;
     }
     let root_fd = root.try_clone_fd()?;
     let (sender, receiver) = mpsc::sync_channel(DELETE_CHANNEL_CAPACITY);
     let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
     let worker = thread::spawn(move || {
-        fdu_delete::execute(root_fd, plan, cancelled, sender);
+        fdu_delete::execute(root_fd, plan, worker_cancelled, sender);
     });
     let mut deleted = 0usize;
     let mut already_absent = 0usize;
@@ -197,8 +144,11 @@ pub(super) fn run(
     let mut not_attempted = 0usize;
     let mut first_problem: Option<String> = None;
     let mut receive_error = None;
-    loop {
-        match receiver.recv() {
+    let mut finished = false;
+    while !finished {
+        let received = foreground.recv_timeout(&receiver);
+        sync_cancel_flag(foreground, &cancelled);
+        match received {
             Ok(DeleteEvent::Outcomes(outcomes)) => {
                 for outcome in outcomes {
                     match outcome.kind {
@@ -221,37 +171,43 @@ pub(super) fn run(
                         OutcomeKind::Cancelled => not_attempted += 1,
                     }
                 }
+                let completed = deleted + already_absent + changed + failed + not_attempted;
+                let line = deleting_progress(completed, total);
+                if let Err(error) = foreground.report_progress_line(&line) {
+                    receive_error.get_or_insert(error);
+                }
             }
-            Ok(DeleteEvent::Progress { completed, total, .. }) => progress.deleting(completed, total),
+            Ok(DeleteEvent::Progress { .. }) => {}
             Ok(DeleteEvent::Failed { message }) => {
-                receive_error = Some(io::Error::other(format!("deletion stopped: {message}")));
-                break;
+                receive_error.get_or_insert_with(|| io::Error::other(format!("deletion stopped: {message}")));
             }
-            Ok(DeleteEvent::Finished) => break,
-            Err(_) => {
-                receive_error = Some(io::Error::other("deletion worker stopped without finishing"));
-                break;
+            Ok(DeleteEvent::Finished) => finished = true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                receive_error.get_or_insert_with(|| {
+                    io::Error::other("deletion worker stopped without finishing")
+                });
+                finished = true;
             }
         }
     }
-    let worker_result = worker
-        .join()
+    let worker_result = foreground
+        .join(worker)
         .map_err(|_| io::Error::other("deletion worker terminated unexpectedly"));
     match (receive_error, worker_result) {
         (Some(receive_error), Err(worker_error)) => {
-            return Err(io::Error::other(format!("{receive_error}; {worker_error}")).into());
+            return Err(io::Error::other(format!("{receive_error}; {worker_error}")));
         }
-        (Some(error), Ok(())) | (None, Err(error)) => return Err(error.into()),
+        (Some(error), Ok(())) | (None, Err(error)) => return Err(error),
         (None, Ok(())) => {}
     }
-    progress.clear();
+    foreground.clear_progress()?;
     if changed == 0 && failed == 0 && not_attempted == 0 {
         if deleted + already_absent != total {
             return Err(io::Error::other(format!(
                 "deletion reported {} outcomes for {total} planned entries",
                 deleted + already_absent
-            ))
-            .into());
+            )));
         }
         return Ok(());
     }
@@ -261,11 +217,19 @@ pub(super) fn run(
     if let Some(problem) = first_problem {
         summary.push_str(&format!("; first problem: {problem}"));
     }
-    Err(io::Error::other(summary).into())
+    Err(io::Error::other(summary))
 }
 
-
-
+fn deleting_progress(completed: usize, total: usize) -> String {
+    let fraction = if total == 0 { 1.0 } else { completed as f64 / total as f64 };
+    let filled = ((fraction * PROGRESS_BAR_WIDTH as f64) as usize).min(PROGRESS_BAR_WIDTH);
+    format!(
+        "Deleting [{}{}] {:>3}% {completed}/{total}",
+        "#".repeat(filled),
+        "-".repeat(PROGRESS_BAR_WIDTH - filled),
+        (fraction * 100.0) as usize,
+    )
+}
 
 fn describe_open_failure(path: &Path, error: io::Error) -> io::Error {
     if last_path_component_is_symlink(path) {
@@ -357,6 +321,7 @@ fn confirm_interactively(
     resolved_path: &Path,
     top_level: usize,
     total: usize,
+    foreground: &mut Foreground,
 ) -> io::Result<()> {
     if !io::stdin().is_terminal() {
         return Err(io::Error::new(
@@ -366,33 +331,37 @@ fn confirm_interactively(
     }
     verify_confirmation_target(root, selected_path)?;
     verify_confirmation_target(root, resolved_path)?;
-    let mut stderr = io::stderr().lock();
-    write!(
-        stderr,
+    let prompt = write!(
+        io::stderr().lock(),
         "Permanently delete {top_level} entries ({total} including nested) below {}? \
          The directory itself is kept. Type 'yes' to continue: ",
         resolved_path.display()
-    )?;
-    stderr.flush()?;
-    if read_confirmation(&mut io::stdin().lock())? {
+    )
+    .and_then(|()| io::stderr().flush());
+    if let Err(error) = prompt {
+        foreground.cancellation().cancel_for_output();
+        return Err(error);
+    }
+    if foreground
+        .read_confirmation_line()?
+        .is_some_and(|answer| answer.trim() == "yes")
+    {
         Ok(())
     } else {
-        Err(io::Error::new(io::ErrorKind::Interrupted, "not confirmed; nothing was deleted"))
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "not confirmed; nothing was deleted"))
     }
-}
-
-
-
-fn read_confirmation(input: &mut impl BufRead) -> io::Result<bool> {
-    let mut answer = String::new();
-    input.read_line(&mut answer)?;
-    Ok(answer.trim() == "yes")
 }
 
 fn display_name(tree: &Tree, id: fdu_core::NodeId) -> String {
     match tree.name(id) {
         Some(name) => String::from_utf8_lossy(name).into_owned(),
         None => "<unknown>".to_owned(),
+    }
+}
+
+fn sync_cancel_flag(foreground: &Foreground, cancelled: &AtomicBool) {
+    if foreground.cancellation().is_cancelled() {
+        cancelled.store(true, Ordering::Release);
     }
 }
 
@@ -407,7 +376,7 @@ fn require_complete_scan_root(tree: &Tree) -> io::Result<()> {
 
 
 
-fn build_index(root: &RootAnchor, progress: &mut Progress) -> io::Result<Tree> {
+fn build_index(root: &RootAnchor, foreground: &mut Foreground) -> io::Result<Tree> {
     let mut tree = Tree::new(&root.name, root.identity, root.link_count)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "root path exceeds index limits"))?;
     let mut token_nodes = vec![Some(tree.root())];
@@ -420,78 +389,77 @@ fn build_index(root: &RootAnchor, progress: &mut Progress) -> io::Result<Tree> {
         }
     }
     let cancelled = Arc::new(AtomicBool::new(false));
-    let worker = start_indexed_scan(root.clone(), sender, batch_receiver, cancelled);
+    let worker_cancelled = Arc::clone(&cancelled);
+    let worker = start_indexed_scan(root.clone(), sender, batch_receiver, worker_cancelled);
     let mut fatal: Option<String> = None;
     let mut scanned = 0usize;
     let mut done = false;
-    let scan_result = (|| -> io::Result<()> {
-        while !done {
-        let event = receiver
-            .recv()
-            .map_err(|_| io::Error::other("scanner stopped without finishing"))?;
-        match event {
-            ScanEvent::Started { identity, .. } => {
-                if identity != tree.record(tree.root()).expect("root exists").identity {
-                    tree.mark_incomplete_to_root(tree.root());
-                    fatal.get_or_insert("scan root identity changed after it was opened".to_owned());
-                }
-            }
-            ScanEvent::Entries(mut batch) => {
-                scanned += batch.entries.len();
-                progress.scanning(scanned);
-                if let Err(error) = apply_batch(&mut tree, &mut token_nodes, &batch) {
-                    fatal.get_or_insert_with(|| error.to_string());
-                }
-                batch.clear();
-                let _ = batch_sender.try_send(batch);
-            }
-            ScanEvent::DirectoryFinished { directory, complete } => {
-                finish_directory(&mut tree, &token_nodes, directory, complete);
-            }
-            ScanEvent::DirectoriesFinished(directories) => {
-                for (directory, complete) in directories {
-                    finish_directory(&mut tree, &token_nodes, directory, complete);
-                }
-            }
-            ScanEvent::DirectoryExcluded { directory, reason } => {
-                if let Some(node) = token_nodes.get(directory.0 as usize).copied().flatten() {
-                    tree.set_state(node, NodeStatus::Excluded(reason));
-                    if let Some(parent) = tree.record(node).and_then(|record| record.parent()) {
-                        tree.mark_incomplete_to_root(parent);
+    while !done {
+        let received = foreground.recv_timeout(&receiver);
+        sync_cancel_flag(foreground, &cancelled);
+        match received {
+            Ok(event) => match event {
+                ScanEvent::Started { identity, .. } => {
+                    if identity != tree.record(tree.root()).expect("root exists").identity {
+                        tree.mark_incomplete_to_root(tree.root());
+                        fatal.get_or_insert("scan root identity changed after it was opened".to_owned());
                     }
                 }
-            }
-            ScanEvent::DirectoryFailed { directory, .. } => {
-                if let Some(node) = token_nodes.get(directory.0 as usize).copied().flatten() {
-                    tree.mark_incomplete_to_root(node);
-                } else {
-                    tree.mark_incomplete_to_root(tree.root());
-                    fatal.get_or_insert("scan error in an unknown directory".to_owned());
+                ScanEvent::Entries(mut batch) => {
+                    scanned += batch.entries.len();
+                    if let Err(error) = foreground.report_progress("Scanning...", scanned as u64, None) {
+                        fatal.get_or_insert_with(|| error.to_string());
+                    }
+                    if let Err(error) = apply_batch(&mut tree, &mut token_nodes, &batch) {
+                        fatal.get_or_insert_with(|| error.to_string());
+                    }
+                    batch.clear();
+                    let _ = batch_sender.try_send(batch);
                 }
+                ScanEvent::DirectoryFinished { directory, complete } => {
+                    finish_directory(&mut tree, &token_nodes, directory, complete);
+                }
+                ScanEvent::DirectoriesFinished(directories) => {
+                    for (directory, complete) in directories {
+                        finish_directory(&mut tree, &token_nodes, directory, complete);
+                    }
+                }
+                ScanEvent::DirectoryExcluded { directory, reason } => {
+                    if let Some(node) = token_nodes.get(directory.0 as usize).copied().flatten() {
+                        tree.set_state(node, NodeStatus::Excluded(reason));
+                        if let Some(parent) = tree.record(node).and_then(|record| record.parent()) {
+                            tree.mark_incomplete_to_root(parent);
+                        }
+                    }
+                }
+                ScanEvent::DirectoryFailed { directory, .. } => {
+                    if let Some(node) = token_nodes.get(directory.0 as usize).copied().flatten() {
+                        tree.mark_incomplete_to_root(node);
+                    } else {
+                        tree.mark_incomplete_to_root(tree.root());
+                        fatal.get_or_insert("scan error in an unknown directory".to_owned());
+                    }
+                }
+                ScanEvent::Failed { message } => {
+                    fatal.get_or_insert(format!("scan could not continue: {message}"));
+                    tree.mark_incomplete_to_root(tree.root());
+                }
+                ScanEvent::Cancelled => {
+                    fatal.get_or_insert("scan cancelled".to_owned());
+                    tree.mark_scanning_incomplete();
+                }
+                ScanEvent::Finished => done = true,
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                fatal.get_or_insert("scanner stopped without finishing".to_owned());
+                done = true;
             }
-            ScanEvent::Failed { message } => {
-                fatal.get_or_insert(format!("scan could not continue: {message}"));
-                tree.mark_incomplete_to_root(tree.root());
-            }
-            ScanEvent::Cancelled => {
-                fatal.get_or_insert("scan cancelled".to_owned());
-                tree.mark_scanning_incomplete();
-            }
-            ScanEvent::Finished => done = true,
         }
-        }
-        Ok(())
-    })();
-    let worker_result = worker
-        .join()
-        .map_err(|_| io::Error::other("scanner worker terminated unexpectedly"));
-    match (scan_result, worker_result) {
-        (Err(scan_error), Err(worker_error)) => {
-            return Err(io::Error::other(format!("{scan_error}; {worker_error}")));
-        }
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
-        (Ok(()), Ok(())) => {}
     }
+    foreground
+        .join(worker)
+        .map_err(|_| io::Error::other("scanner worker terminated unexpectedly"))?;
     if let Some(message) = fatal {
         return Err(io::Error::other(message));
     }
@@ -605,5 +573,174 @@ fn apply_batch(
         finish(tree, run);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CStr;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn assume_yes_deletes_contents_and_keeps_the_selected_directory() {
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join(".work/tmp");
+        std::fs::create_dir_all(&scratch).expect("scratch directory is available");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_nanos();
+        let root = scratch.join(format!("ish-trash-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&root).expect("trash root is created");
+        std::fs::create_dir(root.join("nested")).expect("nested directory is created");
+        std::fs::write(root.join("nested/file"), b"content").expect("file is created");
+
+        let result = run(root.clone(), true, None);
+
+        assert!(result.is_ok(), "trash failed: {result:?}");
+        assert!(root.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .expect("selected directory remains readable")
+                .count(),
+            0
+        );
+        std::fs::remove_dir(&root).expect("selected directory is removed by test cleanup");
+    }
+
+    #[test]
+    fn interactive_confirmation_deletes_after_yes_and_preserves_after_no() {
+        const CHILD: &str = "ISH_TRASH_INTERACTIVE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().expect("test binary is available"))
+                .arg("--exact")
+                .arg("trash::tests::interactive_confirmation_deletes_after_yes_and_preserves_after_no")
+                .env(CHILD, "1")
+                .status()
+                .expect("interactive trash test child starts");
+            assert!(status.success());
+            return;
+        }
+        let (yes_root, no_root, cancel_root) = test_roots();
+        let yes = with_pty_stdin(b"yes\n", || run(yes_root.clone(), false, None))
+            .expect("yes confirmation uses a PTY");
+        assert!(yes.is_ok(), "yes confirmation failed: {yes:?}");
+        assert!(yes_root.is_dir());
+        assert_eq!(std::fs::read_dir(&yes_root).unwrap().count(), 0);
+
+        let no = with_pty_stdin(b"no\n", || run(no_root.clone(), false, None))
+            .expect("no confirmation uses a PTY");
+        assert_eq!(no.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(no_root.join("nested/file").is_file());
+
+        let cancelled = with_pty_stdin(b"", || {
+            let interrupter = thread::spawn(|| {
+                thread::sleep(std::time::Duration::from_millis(500));
+                // SAFETY: raising SIGINT delivers it to this test process.
+                assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+            });
+            let result = run(cancel_root.clone(), false, None);
+            interrupter.join().expect("interrupt thread completes");
+            result
+        })
+        .expect("cancel confirmation uses a PTY");
+        assert_eq!(cancelled.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(cancel_root.join("nested/file").is_file());
+        std::fs::remove_dir_all(&yes_root).expect("yes root is removed by test cleanup");
+        std::fs::remove_dir_all(&no_root).expect("no root is removed by test cleanup");
+        std::fs::remove_dir_all(&cancel_root).expect("cancelled root is removed by test cleanup");
+    }
+
+    fn test_roots() -> (PathBuf, PathBuf, PathBuf) {
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join(".work/tmp");
+        std::fs::create_dir_all(&scratch).expect("scratch directory is available");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_nanos();
+        let base = scratch.join(format!("ish-trash-confirm-{}-{unique}", std::process::id()));
+        let yes_root = base.join("yes");
+        let no_root = base.join("no");
+        let cancel_root = base.join("cancel");
+        for root in [&yes_root, &no_root, &cancel_root] {
+            std::fs::create_dir_all(root.join("nested")).expect("confirmation root is created");
+            std::fs::write(root.join("nested/file"), b"content").expect("file is created");
+        }
+        (yes_root, no_root, cancel_root)
+    }
+
+    fn with_pty_stdin<T>(input: &[u8], operation: impl FnOnce() -> T) -> io::Result<T> {
+        // SAFETY: posix_openpt returns a new descriptor on success.
+        let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+        if master_raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: master_raw is a newly opened descriptor owned by this function.
+        let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
+        // SAFETY: master is an open pseudo-terminal master.
+        if unsafe { libc::grantpt(master.as_raw_fd()) } != 0
+            // SAFETY: master is an open pseudo-terminal master.
+            || unsafe { libc::unlockpt(master.as_raw_fd()) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: ptsname returns a NUL-terminated name for the open master descriptor.
+        let slave_name = unsafe { libc::ptsname(master.as_raw_fd()) };
+        if slave_name.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: slave_name remains valid until the next ptsname call and is copied immediately.
+        let slave_name = unsafe { CStr::from_ptr(slave_name) }.to_owned();
+        // SAFETY: slave_name is a valid PTY path.
+        let slave_raw = unsafe {
+            libc::open(
+                slave_name.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        if slave_raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: slave_raw is a newly opened descriptor owned by this function.
+        let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+        // SAFETY: dup returns a new descriptor for stdin on success.
+        let original_raw = unsafe { libc::dup(0) };
+        if original_raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: original_raw is a newly duplicated descriptor owned by this function.
+        let original = unsafe { OwnedFd::from_raw_fd(original_raw) };
+        // SAFETY: slave is open and descriptor 0 is replaced with its terminal endpoint.
+        if unsafe { libc::dup2(slave.as_raw_fd(), 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _restore = StdinRestore(original);
+        let mut written = 0;
+        while written < input.len() {
+            // SAFETY: input[written..] is a valid readable buffer and master is open.
+            let count = unsafe {
+                libc::write(
+                    master.as_raw_fd(),
+                    input[written..].as_ptr().cast::<libc::c_void>(),
+                    input.len() - written,
+                )
+            };
+            if count < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            written += count as usize;
+        }
+        Ok(operation())
+    }
+
+    struct StdinRestore(OwnedFd);
+
+    impl Drop for StdinRestore {
+        fn drop(&mut self) {
+            // SAFETY: the saved descriptor is open and descriptor 0 remains the PTY slave.
+            let _ = unsafe { libc::dup2(self.0.as_raw_fd(), 0) };
+        }
+    }
 }
 

@@ -22,6 +22,21 @@ fn is_dot_navigation(path: &Path) -> bool {
     has_component
 }
 
+fn escape_command_name(bytes: &[u8]) -> String {
+    let mut escaped = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        match byte {
+            b' '..=b'~' if byte != b'\\' => escaped.push(byte as char),
+            b'\\' => escaped.push_str("\\\\"),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\x{byte:02x}");
+            }
+        }
+    }
+    escaped
+}
+
 /// True if `path` is a regular file with any execute bit set.
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -224,6 +239,13 @@ pub type ExternalHandler = Box<
 /// `Some(diagnostic)` to refuse it with status 2.
 pub type CommandPolicy = Box<dyn FnMut(&ShellBytes) -> Option<String> + Send>;
 
+/// Required process placement for an expanded command name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandPlacement {
+    /// Run only in the process that created the `Shell`.
+    ParentProcess,
+}
+
 thread_local! {
     static EXTERNAL_COMMAND_CWD: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
@@ -316,6 +338,9 @@ pub struct Shell {
     /// Suppresses set -e (errexit). Mirrors dash's EV_TESTED flag.
     pub(crate) tested: bool,
     pub(crate) in_forked_child: bool,
+    owner_pid: u32,
+    command_placements: FxHashMap<Vec<u8>, CommandPlacement>,
+    placement_context: PlacementContext,
     /// True when the current eval context will exit after the command completes.
     /// Allows eval_external to exec directly instead of fork+exec (dash's EV_EXIT).
     pub(crate) ev_exit: bool,
@@ -343,6 +368,12 @@ pub struct Shell {
     substitution_count: u64,
     pub(crate) pending_stdin: Option<usize>,
     pub(crate) redirection_fds: Vec<Option<HeldDescriptor>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PlacementContext {
+    pipeline_depth: usize,
+    command_substitution_depth: usize,
 }
 
 /// Shell option flags (`set -e`, `set -u`, etc.).
@@ -579,6 +610,9 @@ impl ShellBuilder {
             traps: FxHashMap::default(),
             tested: false,
             in_forked_child: false,
+            owner_pid: std::process::id(),
+            command_placements: FxHashMap::default(),
+            placement_context: PlacementContext::default(),
             ev_exit: false,
             cancel: self.cancel,
             stdout_sink: self.stdout_sink,
@@ -805,6 +839,9 @@ impl Shell {
             traps: FxHashMap::default(),
             tested: false,
             in_forked_child: false,
+            owner_pid: std::process::id(),
+            command_placements: FxHashMap::default(),
+            placement_context: PlacementContext::default(),
             ev_exit: false,
             cancel: None,
             stdout_sink: None,
@@ -914,6 +951,37 @@ impl Shell {
                 crate::builtins::CommandAction::Execute(nested_args) => args = nested_args,
                 crate::builtins::CommandAction::Empty
                 | crate::builtins::CommandAction::Describe { .. } => return Ok(()),
+            }
+        }
+    }
+
+    pub(crate) fn parent_process_refusal(&self, args: &[String]) -> Option<String> {
+        let mut dispatch_args = args;
+        loop {
+            let target = dispatch_args.first()?;
+            let target_bytes = ShellBytes::from_str_lossless(target);
+            if self
+                .command_placements
+                .get(target_bytes.as_bytes())
+                .is_some_and(|placement| *placement == CommandPlacement::ParentProcess)
+                && (std::process::id() != self.owner_pid
+                    || self.placement_context.pipeline_depth > 0
+                    || self.placement_context.command_substitution_depth > 0)
+            {
+                return Some(format!(
+                    "{} requires the original shell process and cannot run in a forked context",
+                    escape_command_name(target_bytes.as_bytes())
+                ));
+            }
+            if target != "command" {
+                return None;
+            }
+            match crate::builtins::command_action(dispatch_args) {
+                crate::builtins::CommandAction::Execute(nested_args) => {
+                    dispatch_args = nested_args;
+                }
+                crate::builtins::CommandAction::Empty
+                | crate::builtins::CommandAction::Describe { .. } => return None,
             }
         }
     }
@@ -1082,6 +1150,16 @@ impl Shell {
     /// Replace the callback that can refuse expanded command targets.
     pub fn set_command_policy(&mut self, policy: CommandPolicy) {
         self.command_policy = Some(policy);
+    }
+
+    /// Require an expanded command name to run in the original shell process.
+    /// Names are stored as owned raw bytes, matching the shell's command names.
+    pub fn set_command_placement(
+        &mut self,
+        name: ShellBytes,
+        placement: CommandPlacement,
+    ) {
+        self.command_placements.insert(name.into_vec(), placement);
     }
 
     /// Install a provider that owns the open of writable redirections
@@ -1326,8 +1404,12 @@ impl Shell {
                 if *bang {
                     self.tested = true;
                 }
-                let status = self.eval_pipeline(commands)?;
+                let previous_context = self.placement_context;
+                self.placement_context.pipeline_depth += 1;
+                let pipeline_result = self.eval_pipeline(commands);
+                self.placement_context = previous_context;
                 self.tested = saved;
+                let status = pipeline_result?;
                 Ok(if *bang { status.inverted() } else { status })
             }
 
@@ -1593,6 +1675,10 @@ impl Shell {
             return self.finish_redirections(result, saved);
         }
 
+        if let Some(diagnostic) = self.parent_process_refusal(&expanded_args) {
+            self.err_msg(&diagnostic);
+            return Ok(ExitStatus::MISUSE);
+        }
         self.check_command_policy_for_dispatch(&expanded_args, span)?;
 
         // xtrace: print $PS4, assignments, then args (like dash's evalcommand)
@@ -2093,7 +2179,7 @@ impl Shell {
             drop(read_end);
             drop(write_end);
             self.traps.remove("EXIT");
-            let status = match self.eval_command(cmd) {
+            let status = match self.eval_in_command_substitution(cmd) {
                 Ok(status) | Err(ShellError::Exit(status)) => status,
                 Err(error) => {
                     self.err_msg(&format!("epsh: {error}"));
@@ -2135,6 +2221,17 @@ impl Shell {
         let mut output = crate::encoding::bytes_to_str(&raw_output);
         while output.ends_with('\n') { output.pop(); }
         Ok(output)
+    }
+
+    fn eval_in_command_substitution(
+        &mut self,
+        cmd: &Command,
+    ) -> crate::error::Result<ExitStatus> {
+        let previous_context = self.placement_context;
+        self.placement_context.command_substitution_depth += 1;
+        let result = self.eval_command(cmd);
+        self.placement_context = previous_context;
+        result
     }
 
 }
@@ -2365,6 +2462,43 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_script("X=$(echo hello)");
         assert_eq!(shell.get_var("X"), Some("hello"));
+    }
+
+    #[test]
+    fn command_substitution_context_refuses_parent_placement_without_forking() {
+        let directory = tempfile::tempdir().unwrap();
+        let handler_called = Arc::new(AtomicBool::new(false));
+        let handler_called_copy = handler_called.clone();
+        let policy_called = Arc::new(AtomicBool::new(false));
+        let policy_called_copy = policy_called.clone();
+        let mut shell = Shell::builder().cwd(directory.path().to_path_buf()).build();
+        shell.set_command_placement(
+            ShellBytes::from("cp"),
+            CommandPlacement::ParentProcess,
+        );
+        shell.set_external_handler(Box::new(move |_args, _environment| {
+            handler_called_copy.store(true, Ordering::Relaxed);
+            Ok(ExitStatus::SUCCESS)
+        }));
+        shell.set_command_policy(Box::new(move |target| {
+            if target.as_bytes() == b"cp" {
+                policy_called_copy.store(true, Ordering::Relaxed);
+            }
+            None
+        }));
+
+        let command = Parser::new("command cp source destination > substitution-target")
+            .parse()
+            .unwrap()
+            .commands
+            .remove(0);
+        assert_eq!(
+            shell.eval_in_command_substitution(&command).unwrap(),
+            ExitStatus::MISUSE
+        );
+        assert!(!handler_called.load(Ordering::Relaxed));
+        assert!(!policy_called.load(Ordering::Relaxed));
+        assert!(!directory.path().join("substitution-target").exists());
     }
 
     #[test]

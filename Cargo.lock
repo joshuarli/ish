@@ -154,11 +154,20 @@ dependencies = [
  "fdu-delete",
  "fdu-scan",
  "fxhash",
+ "ish-fs",
  "laputa-ptytest",
  "libc",
  "rustix",
  "rustybench",
  "serde_json",
+]
+
+[[package]]
+name = "ish-fs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]

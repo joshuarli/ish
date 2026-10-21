@@ -681,6 +681,10 @@ impl Shell {
                 Ok(status)
             }
             CommandAction::Execute(new_args) => {
+                if let Some(diagnostic) = self.parent_process_refusal(new_args) {
+                    self.err_msg(&diagnostic);
+                    return Ok(ExitStatus::MISUSE);
+                }
                 self.check_command_policy_for_dispatch(new_args, span)?;
                 if let Some(status) = self.try_builtin(&new_args[0], new_args, &[], &[], span)? {
                     Ok(status)

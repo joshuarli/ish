@@ -19,6 +19,20 @@ A byte array contains integers from 0 through 255. JSON strings never carry shel
 NUL and invalid UTF-8 remain representable. Each family checks any OS preconditions before execution.
 The session records an ID after structural validation. A failed request leaves the session unchanged.
 
+The policy family has three input modes. `static` carries the generated `ast`
+representation and returns the ish dispatch route. Its planner routes only
+whole-line `InShell` and `Hybrid` commands to ish; `Foreground` commands such as
+`cp` and `mv` remain in epsh, including when nested in a pipeline or command
+substitution. `dynamic` carries a byte-array `target` and checks the
+context-free ish expanded-command policy. `placement` carries a byte-array
+`target` and a `context` of `parent`, `pipeline`, or `substitution`; this mode
+models that target as registered with epsh's `ParentProcess` placement. It
+returns `allowed`, `status`, and the ish registry `class` (`in_shell`, `hybrid`,
+`foreground`, `native`, or `null`). Pipeline and command-substitution contexts
+are refused with status 2, including substitutions that do not fork. The Rust
+bridge runs these requests through the actual epsh evaluator and checks
+redirection and callback effects.
+
 The shell state has exactly these required fields:
 
 | Field | Value |

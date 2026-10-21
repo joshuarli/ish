@@ -7,6 +7,11 @@ use std::os::fd::RawFd;
 static mut PIPE_WRITE: RawFd = -1;
 static mut PIPE_READ: RawFd = -1;
 static SHELL_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static PENDING_FOREGROUND: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static PENDING_TERMINATION: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+static FOREGROUND_SIGNALS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Initialize signal handling: create self-pipe, install handlers.
 /// Returns the read-end fd for polling.
@@ -21,10 +26,6 @@ pub fn init() -> RawFd {
         PIPE_WRITE = write_fd;
     }
 
-    // External jobs are waited synchronously, so SIGCHLD does not need to wake
-    // the input poller. The old rustix self-pipe handler caused the shell to
-    // segfault after child exit on Alpine/musl.
-    // install_handler(rustix::process::Signal::CHILD);
     install_handler(rustix::process::Signal::WINCH);
     // TERM and HUP reach the prompt as events, so the shell restores the
     // terminal and ends any suspended job before exiting.
@@ -80,12 +81,108 @@ fn set_default(sig: rustix::process::Signal) {
 
 /// Read one signal byte from the self-pipe. Returns the signal number or None.
 pub fn read_signal() -> Option<i32> {
+    for (sig, bit) in [
+        (rustix::process::Signal::INT.as_raw(), 1usize),
+        (rustix::process::Signal::TERM.as_raw(), 2),
+        (rustix::process::Signal::HUP.as_raw(), 4),
+    ] {
+        if PENDING_FOREGROUND.fetch_and(!bit, std::sync::atomic::Ordering::AcqRel) & bit != 0 {
+            return Some(sig);
+        }
+    }
+    let fd = unsafe { PIPE_READ };
+    if fd < 0 {
+        return None;
+    }
     let mut byte = 0u8;
-    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(PIPE_READ) };
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
     rustix::io::read(fd, std::slice::from_mut(&mut byte))
         .ok()
         .filter(|&n| n == 1)
         .map(|_| byte as i32)
+}
+
+pub(crate) struct ForegroundSignals {
+    original_int: libc::sigaction,
+    original_tstp: libc::sigaction,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ForegroundSignals {
+    pub(crate) fn install() -> std::io::Result<Self> {
+        let lock = FOREGROUND_SIGNALS_LOCK
+            .lock()
+            .map_err(|_| std::io::Error::other("foreground signal state was poisoned"))?;
+        let original_int = replace_disposition(
+            rustix::process::Signal::INT.as_raw(),
+            handler as *const () as usize,
+            libc::SA_RESTART,
+        )?;
+        match replace_disposition(
+            rustix::process::Signal::TSTP.as_raw(),
+            libc::SIG_IGN,
+            0,
+        ) {
+            Ok(original_tstp) => Ok(Self {
+                original_int,
+                original_tstp,
+                _lock: lock,
+            }),
+            Err(error) => {
+                restore_disposition(rustix::process::Signal::INT.as_raw(), &original_int);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for ForegroundSignals {
+    fn drop(&mut self) {
+        restore_disposition(rustix::process::Signal::INT.as_raw(), &self.original_int);
+        restore_disposition(rustix::process::Signal::TSTP.as_raw(), &self.original_tstp);
+    }
+}
+
+fn replace_disposition(
+    sig: i32,
+    handler: libc::sighandler_t,
+    flags: libc::c_int,
+) -> std::io::Result<libc::sigaction> {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler;
+    action.sa_flags = flags;
+    let mask_result = unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    if mask_result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut original = std::mem::MaybeUninit::uninit();
+    let result = unsafe { libc::sigaction(sig, &action, original.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { original.assume_init() })
+}
+
+fn restore_disposition(sig: i32, action: &libc::sigaction) {
+    if unsafe { libc::sigaction(sig, action, std::ptr::null_mut()) } != 0 {
+        panic!("failed to restore signal {} disposition: {}", sig, std::io::Error::last_os_error());
+    }
+}
+
+pub(crate) fn note_termination(sig: i32) {
+    let _ = PENDING_TERMINATION.compare_exchange(
+        0,
+        sig,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+}
+
+pub fn take_pending_termination() -> Option<i32> {
+    match PENDING_TERMINATION.swap(0, std::sync::atomic::Ordering::AcqRel) {
+        0 => None,
+        sig => Some(sig),
+    }
 }
 
 fn install_handler(sig: rustix::process::Signal) {
@@ -139,12 +236,27 @@ unsafe extern "C" fn handler(sig: i32) {
         }
         return;
     }
+    let pending_bit = match sig {
+        libc::SIGINT => 1,
+        libc::SIGTERM => {
+            note_termination(sig);
+            2
+        }
+        libc::SIGHUP => {
+            note_termination(sig);
+            4
+        }
+        _ => 0,
+    };
+    if pending_bit != 0 {
+        PENDING_FOREGROUND.fetch_or(pending_bit, std::sync::atomic::Ordering::Release);
+    }
     let byte = sig as u8;
-    // SAFETY: write() is async-signal-safe. PIPE_WRITE is valid (set in init).
-    // O_NONBLOCK ensures we never block in the handler. If the pipe is full,
-    // the signal was already pending — dropping the byte is safe.
-    unsafe {
-        let _ = libc::write(PIPE_WRITE, &byte as *const u8 as *const libc::c_void, 1);
+    let fd = unsafe { PIPE_WRITE };
+    if fd >= 0 {
+        unsafe {
+            let _ = libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
+        }
     }
 }
 
@@ -171,4 +283,81 @@ unsafe fn darwin_sigaction(signal: i32, handler: usize, flags: core::ffi::c_int)
         sa_flags: flags,
     };
     let _ = unsafe { sigaction(signal, &action, std::ptr::null_mut()) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn interrupt_is_observed_when_the_signal_pipe_is_full() {
+        const CHILD: &str = "ISH_SIGNAL_PIPE_FULL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            init();
+            let original_int = read_disposition(libc::SIGINT);
+            let original_tstp = read_disposition(libc::SIGTSTP);
+            let foreground = ForegroundSignals::install().expect("signal scope installs");
+            let fd = unsafe { PIPE_WRITE };
+            let bytes = [0u8; 4096];
+            loop {
+                let count = unsafe {
+                    libc::write(
+                        fd,
+                        bytes.as_ptr().cast::<libc::c_void>(),
+                        bytes.len(),
+                    )
+                };
+                if count < 0 {
+                    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EAGAIN));
+                    break;
+                }
+            }
+            assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+            assert_eq!(read_signal(), Some(libc::SIGINT));
+            assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+            assert_eq!(read_signal(), Some(libc::SIGTERM));
+            assert_eq!(take_pending_termination(), Some(libc::SIGTERM));
+            assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+            assert_eq!(read_signal(), Some(libc::SIGHUP));
+            assert_eq!(take_pending_termination(), Some(libc::SIGHUP));
+            drop(foreground);
+            assert_disposition_eq(libc::SIGINT, &original_int);
+            assert_disposition_eq(libc::SIGTSTP, &original_tstp);
+            return;
+        }
+        let status = Command::new(std::env::current_exe().expect("test binary is available"))
+            .arg("--exact")
+            .arg("signal::tests::interrupt_is_observed_when_the_signal_pipe_is_full")
+            .env(CHILD, "1")
+            .status()
+            .expect("signal test child starts");
+        assert!(status.success());
+    }
+
+    fn read_disposition(sig: i32) -> libc::sigaction {
+        let mut action = std::mem::MaybeUninit::uninit();
+        // SAFETY: sig is a valid signal and action points to writable storage.
+        let result = unsafe { libc::sigaction(sig, std::ptr::null(), action.as_mut_ptr()) };
+        assert_eq!(result, 0);
+        // SAFETY: sigaction initialized action on success.
+        unsafe { action.assume_init() }
+    }
+
+    fn assert_disposition_eq(sig: i32, expected: &libc::sigaction) {
+        let actual = read_disposition(sig);
+        assert_eq!(actual.sa_sigaction, expected.sa_sigaction);
+        assert_eq!(actual.sa_flags, expected.sa_flags);
+        #[cfg(target_os = "linux")]
+        let signal_limit = 64;
+        #[cfg(target_os = "macos")]
+        let signal_limit = 31;
+        for member in 1..=signal_limit {
+            // SAFETY: both masks are initialized sigaction values and member is a signal number.
+            let actual_member = unsafe { libc::sigismember(&actual.sa_mask, member) };
+            // SAFETY: both masks are initialized sigaction values and member is a signal number.
+            let expected_member = unsafe { libc::sigismember(&expected.sa_mask, member) };
+            assert_eq!(actual_member, expected_member);
+        }
+    }
 }

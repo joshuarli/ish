@@ -1,6 +1,8 @@
 # Implement native `cp` and `mv` in ish
 
-Status: ready for an execution request. This document does not start the campaign.
+Status: implementation integrated and available local verification passed.
+Acceptance remains blocked by unavailable native evidence and pre-existing
+workspace lint failures. Independent implementation work is finished.
 
 Deliver dependable native copy and move commands inside ish. Import useful code
 and tests from the existing `../fs` checkout without changing that checkout or
@@ -736,12 +738,32 @@ Profile concrete regressions and tune demonstrated bottlenecks. Performance matt
 ## Decision log
 
 Append one dated line per consequential executor judgment with the call and reason.
-No execution decisions have been recorded.
+- 2026-10-21: Execute from current ish HEAD `a9ff530`, preserving the clean sibling at `abded69d49d7e3c449d1394fdf732c1c52bb230c`. Use uncommitted, alternate-index patch handoffs. Prioritize feature/parity work before measurements as requested.
+
+- 2026-10-21: Keep one held `--into` directory descriptor across preflight and execution, while reopening individual operands, so final container symlink resolution stays anchored without per-operand descriptor growth.
+- 2026-10-21: Apply rename-blocking platform flags after publication and before durability receipts. Stream macOS resource forks through native metadata transfer instead of materializing them in the bounded record payload.
+
+- 2026-10-21: Expose selected transfer-method counters and non-additive phase metrics for the required benchmark evidence. Synchronization work sums concurrent calls and is reported separately from transfer wall time.
+- 2026-10-21: Restore access on identity-validated owned staging directories before cancellation cleanup. Source and existing merge-directory permissions remain unchanged.
+- 2026-10-21: Reserve bounded metadata capture memory when admitting workers. Transfer buffers and thread stacks alone do not cover preservation work.
+- 2026-10-21: Scan buffered sparse fallback in 4 KiB windows and warn when destination block accounting reports dense allocation for a sparse source. The warning reports observed accounting, not a filesystem capability or physical-I/O guarantee.
+- 2026-10-21: Use fallible foreground worker creation so process-limit failures return an operational error before transfer. Keep the watchdog tied to advancing progress rather than heartbeat traffic.
+- 2026-10-21: The final Linux release binary is 2,196,792 bytes versus 1,850,456 bytes at the starting revision. The 346,336-byte increase supplies the required native operations and controller; no external dependency was added. These single builds establish size, not a speed comparison. Final release compilation used 17.95 seconds of user CPU and 0.71 seconds of system CPU; readiness passed immediately before and after the build.
 
 ## Campaign log
 
 Append one line per phase end with passed or blocked acceptance and the next action.
-Use this section as the campaign checklist. No campaign execution has started.
+Use this section as the campaign checklist.
+
+- 2026-10-21 P0 underway: G1 parity inventory integrated in `crates/ish-fs/tests/cases.md`; G2 focused baselines passed (8 dispatch, 6 embedding-policy tests). G0 foundation integrated and 4 focused regressions passed; P/L/A/E/S/C implementation underway. Native macOS, successful clone, genuine EXDEV, and privileged mount evidence remain blocked by available host/filesystems. No performance acceptance claimed.
+
+- 2026-10-21 P0 passed: typed foundation, raw-byte/no-replace regressions, parity inventory, and focused baseline loops integrated. P1/P2 feature code is integrated with ongoing hardening: Linux native9, policy9, transfer7, move5, engine fault10, adapter7, and lane PTY10 passed at their checked snapshots. Three independent hardlink regressions were reproduced and fixed or under final regression; resource admission, preservation expansion, and benchmark harness work continue. Native macOS, successful clone, genuine EXDEV, privileged mount and P3 timing acceptance remain unpassed.
+- 2026-10-21 P1 integrated: native copy/move, parent-process placement, shared foreground cancellation, preservation, bounded traversal, and validated move retirement are implemented. Policy14, native Linux11, transfer9, move6, preservation7, publication3, constrained-resource and process-kill tests pass locally. Final metadata-memory hardening continues.
+- 2026-10-21 P2 local checks passed: workspace library/integration tests include all 150 PTY tests. Conformance retains 175 cases (168 passed, seven existing exclusions). Semantic verification, four compiled mutation controls, and Linux shift refinement pass. Two additional filesystem safety mutants fail their intended tests and pass after restoration. Workspace strict Clippy remains blocked by unchanged dead code in `fdu-delete` and `fdu-scan`, plus an existing blank line after an attribute in `fdu-scan`; campaign targets are checked separately.
+- 2026-10-21 P1 final: all independent implementation and deterministic parity work passed, including bounded metadata admission, sparse fallback allocation, restrictive staging cleanup, immediate retirement revalidation, and native/buffered full-engine preservation parity. Acceptance is blocked on native macOS, successful clone, genuine EXDEV, foreign ownership and mount fixtures; exact commands and capability limits are in `crates/ish-fs/tests/cases.md`.
+- 2026-10-21 P2 final: integrated workspace library/integration tests passed, including all 150 PTY tests and the isolated thread-start failure regression. Strict focused Linux Clippy, macOS library all-target Clippy, and macOS shell cross-compilation passed. Semantic verification, mutation checks, shift refinement and retained conformance passed. Full workspace strict Clippy remains blocked by the unchanged `fdu` failures recorded above; native guarantees remain blocked, not inferred from cross-compilation.
+- 2026-10-21 P3 exploratory evidence: five readiness-valid interleaved samples per available side cover all 14 non-cross workloads, with output verification and memory/binary measurements. Readiness checks passed; no busy or overlapping sample was accepted. BusyBox deep copy fails at the retained descriptor limit. Cross-device measurements, successful clone comparisons, Apple/GNU baselines and native macOS remain unavailable. `benches/fs/results-linux.md` records scope differences and variation; no speedup, tuning or P3 acceptance is claimed.
+- 2026-10-21 X final: campaign review and two killed safety mutants passed; unused imported engines and external dependencies were excluded. All independent work is integrated on `master` without commits or pushes, and the sibling checkout is unchanged. Dirty detached lane worktrees remain under `.work/wt/` for review. Campaign acceptance and release readiness remain blocked by the native evidence and workspace lint items above; owner product decisions are not pending.
 
 ## For the owner afterwards
 

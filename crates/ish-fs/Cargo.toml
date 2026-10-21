@@ -1,0 +1,10 @@
+[package]
+name = "ish-fs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Anchored native filesystem operations for ish"
+
+[dependencies]
+rustix = { version = "1.1.4", features = ["fs", "process", "system"] }
+libc = "0.2"

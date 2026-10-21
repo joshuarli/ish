@@ -26,6 +26,11 @@ expanded command target before builtin or function dispatch, including nested
 An embedder can return a diagnostic to stop dispatch with status 2. The policy
 does not undo earlier command or expansion effects.
 
+`Shell::set_command_placement` adds an owned command name to an opt-in
+placement table. A `ParentProcess` target is checked before command-policy
+callbacks and target redirections. epsh refuses it with status 2 in a forked
+process, pipeline, or command substitution. The table is empty by default.
+
 The [arithmetic contract](../README.md#builder-options) defines wrapping,
 errors, shift behavior, and assignment effects.
 
