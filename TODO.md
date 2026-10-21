@@ -104,15 +104,6 @@ Next: 45
 - **Fix with:** error-model, lifecycle-concurrency
 - **Effort:** M (days)
 
-### ISH-40 · P3 · `z` scores relative `cd` targets without the directory they ran in
-
-- **Area:** Data
-- **Where:** `src/frecency.rs:50-65`, `src/frecency.rs:87`, `src/frecency.rs:110-125`
-- **Problem:** History stores each command's cwd, but `z` scores only the command text, so `cd src` or `cd ..` counts as the literal `src` or `..` and is resolved against the current directory, which can jump somewhere unrelated. Every history entry is also parsed with epsh on each `z` call. Cost was not measured.
-- **Recommendation:** Resolve each target against its stored cwd or ignore relative targets, and prefilter on the first word before parsing.
-- **Fix with:** none
-- **Effort:** M (days)
-
 ### ISH-41 · P3 · The default test commands do not cover what ships
 
 - **Area:** Tests

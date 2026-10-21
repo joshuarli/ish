@@ -460,6 +460,10 @@ impl History {
         display_line(self.get(idx))
     }
 
+    pub fn directories(&self, idx: usize) -> impl Iterator<Item = &Path> {
+        self.usages[idx].directories.keys().map(PathBuf::as_path)
+    }
+
     pub fn get(&self, idx: usize) -> &str {
         let (start, len) = self.offsets[idx];
         &self.arena[start..start + len]

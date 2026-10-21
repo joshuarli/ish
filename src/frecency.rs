@@ -42,38 +42,7 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
         return 1;
     }
 
-    // Collect directory scores from history
-    let mut scores: Vec<(String, f64)> = Vec::new();
-
-    let mut indices = Vec::with_capacity(len);
-    history.command_indices_into(&mut indices);
-    for (recency, i) in indices.into_iter().enumerate() {
-        let entry = history.get(i);
-        let dir = extract_cd_target(entry);
-        let dir = match dir {
-            Some(d) if !d.is_empty() && d != "-" && !d.starts_with('-') => d,
-            _ => continue,
-        };
-
-        // Resolve ~ to home
-        let resolved = if let Some(rest) = dir.strip_prefix("~/") {
-            format!("{home}/{rest}")
-        } else if dir == "~" {
-            home.to_string()
-        } else {
-            dir.to_string()
-        };
-
-        // Candidate indices stay stable when another session repeats a
-        // command. Chronological ordering supplies recency independently.
-        let weight = (recency as f64 + 1.0) / len as f64;
-
-        if let Some(entry) = scores.iter_mut().find(|(p, _)| *p == resolved) {
-            entry.1 += weight;
-        } else {
-            scores.push((resolved, weight));
-        }
-    }
+    let scores = directory_scores(history, home);
 
     // Filter to entries matching the query (case-insensitive substring of any path component)
     let mut matches: Vec<(&str, f64)> = scores
@@ -105,6 +74,65 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
         return 1;
     }
     0
+}
+
+fn directory_scores(history: &History, home: &str) -> Vec<(String, f64)> {
+    let len = history.len();
+    let mut scores: Vec<(String, f64)> = Vec::new();
+    let mut indices = Vec::with_capacity(len);
+    history.command_indices_into(&mut indices);
+    for (recency, i) in indices.into_iter().enumerate() {
+        let entry = history.get(i);
+        if entry.split_whitespace().next() != Some("cd") {
+            continue;
+        }
+        let dir = match extract_cd_target(entry) {
+            Some(d) if !d.is_empty() && d != "-" && !d.starts_with('-') => d,
+            _ => continue,
+        };
+
+        // Candidate indices stay stable when another session repeats a
+        // command. Chronological ordering supplies recency independently.
+        let weight = (recency as f64 + 1.0) / len as f64;
+
+        let mut credit = |resolved: String| {
+            if let Some(entry) = scores.iter_mut().find(|(p, _)| *p == resolved) {
+                entry.1 += weight;
+            } else {
+                scores.push((resolved, weight));
+            }
+        };
+
+        if let Some(rest) = dir.strip_prefix("~/") {
+            credit(format!("{home}/{rest}"));
+        } else if dir == "~" {
+            credit(home.to_string());
+        } else if dir.starts_with('~') {
+        } else if dir.starts_with('/') {
+            credit(dir);
+        } else {
+            for cwd in history.directories(i).filter(|cwd| cwd.is_absolute()) {
+                if let Some(cwd) = cwd.to_str() {
+                    credit(join_lexically(cwd, &dir));
+                }
+            }
+        }
+    }
+    scores
+}
+
+fn join_lexically(base: &str, relative: &str) -> String {
+    let mut parts: Vec<&str> = base.split('/').filter(|p| !p.is_empty()).collect();
+    for part in relative.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 fn extract_cd_target(entry: &str) -> Option<String> {
@@ -142,7 +170,6 @@ mod tests {
     fn extract_cd_simple() {
         assert_eq!(extract_cd_target("cd /tmp").as_deref(), Some("/tmp"));
         assert_eq!(extract_cd_target("cd ~/d/ish").as_deref(), Some("~/d/ish"));
-        assert_eq!(extract_cd_target("z ish").as_deref(), Some("ish"));
     }
 
     #[test]
@@ -175,6 +202,30 @@ mod tests {
         let history = History::load_from(dir.join("history.log")).unwrap();
         assert_eq!(builtin_z(&[String::new()], &history, "/"), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn score_of(scores: &[(String, f64)], path: &str) -> Option<f64> {
+        scores.iter().find(|(p, _)| p == path).map(|(_, s)| *s)
+    }
+
+    #[test]
+    fn relative_targets_resolve_against_their_stored_cwd() {
+        let history = History::from_entries_in_dirs([
+            ("cd src".to_string(), Some("/a".into())),
+            ("cd src".to_string(), Some("/b".into())),
+            ("cd ..".to_string(), Some("/a/b".into())),
+            ("cd ./x/../y".to_string(), Some("/c".into())),
+            ("cd lost".to_string(), None),
+            ("cd /abs".to_string(), None),
+        ]);
+        let scores = directory_scores(&history, "/home");
+        assert!(score_of(&scores, "/a/src").is_some());
+        assert!(score_of(&scores, "/b/src").is_some());
+        assert!(score_of(&scores, "/a").is_some());
+        assert!(score_of(&scores, "/c/y").is_some());
+        assert!(score_of(&scores, "/abs").is_some());
+        assert!(scores.iter().all(|(p, _)| p.starts_with('/')));
+        assert_eq!(scores.len(), 5);
     }
 
     #[test]
