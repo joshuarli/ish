@@ -30,7 +30,7 @@ if [ "$#" -eq 5 ]; then
     cross_identity=$5
 fi
 case "$workload" in
-    all|tiny-copy|tiny-move|flat|nested|deep|wide|large|clone|sparse|hardlinks|rename|cross|merge|progress-on|progress-off) ;;
+    all|tiny-copy|tiny-move|flat|nested|deep|wide|large|clone|sparse|hardlinks|rename|cross|cross-flat-1k|cross-flat-4k|cross-flat-16k|merge|dry-run-wide|progress-on|progress-off) ;;
     *) printf 'measure.sh: unknown workload %s\n' "$workload" >&2; exit 2 ;;
 esac
 
@@ -213,12 +213,17 @@ run_sample() {
 
 measure_workload() {
     selected_workload=$1
-    if [ "$selected_workload" = cross ] && [ -z "$cross_root" ]; then
-        printf '%s\n' 'fs-bench: cross workload unavailable; no distinct-device root was designated below .work/tmp'
-        return 0
-    fi
     case "$selected_workload" in
-        tiny-move|rename|cross) side_list='engine builtin native-mv' ;;
+        cross|cross-flat-1k|cross-flat-4k|cross-flat-16k)
+            if [ -z "$cross_root" ]; then
+                printf 'fs-bench: %s workload unavailable; no distinct-device root was designated below .work/tmp\n' "$selected_workload"
+                return 0
+            fi
+            ;;
+    esac
+    case "$selected_workload" in
+        tiny-move|rename|cross|cross-flat-1k|cross-flat-4k|cross-flat-16k) side_list='engine builtin native-mv' ;;
+        dry-run-wide) side_list='engine builtin' ;;
         *) side_list='engine builtin native-cp' ;;
     esac
     case "$selected_workload:$cp_clone_mode" in
@@ -245,7 +250,7 @@ measure_workload() {
 }
 
 if [ "$workload" = all ]; then
-    for selected_workload in tiny-copy tiny-move flat nested deep wide large clone sparse hardlinks rename cross merge progress-on progress-off; do
+    for selected_workload in tiny-copy tiny-move flat nested deep wide large clone sparse hardlinks rename cross cross-flat-1k cross-flat-4k cross-flat-16k merge dry-run-wide progress-on progress-off; do
         if measure_workload "$selected_workload"; then :; else exit $?; fi
     done
 else

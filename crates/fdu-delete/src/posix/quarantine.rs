@@ -156,14 +156,6 @@ fn lock(root: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-#[cfg(test)]
-fn recover_interrupted(root: &OwnedFd) -> io::Result<bool> {
-    #[cfg(test)]
-    let _process_inheritance = PROCESS_INHERITANCE_BARRIER.read().expect("process inheritance barrier");
-    let root = lock(root.as_fd())?;
-    recover(root.as_fd())
-}
-
 fn recover(root: BorrowedFd<'_>) -> io::Result<bool> {
     let (root_identity, mount) = directory_state(root)?;
     let mut recovered = false;
@@ -311,8 +303,6 @@ impl Session {
         let (found, mount) = directory_state(parent)?;
         if found != expected_parent || mount != deletion.root_mount { return Err(invalid("source parent identity or mount changed")); }
         publish(self.directory.as_fd(), &pending, &record, &intent.encode()?)?;
-        #[cfg(test)]
-        (deletion.before_capture)(node);
         match fs::renameat_with(parent, name, &self.directory, capture.as_slice(), fs::RenameFlags::NOREPLACE) {
             Ok(()) => {}
             Err(Errno::NOENT) => { self.clear_record(&record)?; return Ok(OutcomeKind::AlreadyAbsent); }

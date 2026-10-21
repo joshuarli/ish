@@ -516,11 +516,6 @@ fn keep_directory_on_root_mount(
     }
 }
 
-#[cfg(test)]
-fn same_mount(left: &MountIdentity, right: &MountIdentity) -> bool {
-    left == right
-}
-
 pub(super) fn mount_identity(fd: BorrowedFd<'_>) -> io::Result<MountIdentity> {
     let device = fsutil::identity_of(fd)?.device;
     let filesystem = retry(|| fs::fstatfs(fd))?;

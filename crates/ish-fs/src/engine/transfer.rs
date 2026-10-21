@@ -10,7 +10,7 @@ use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::fs::{self, AtFlags, Mode, OFlags};
 
 use super::anchored::{self, DIRECTORY, READ_FILE};
-use super::records::{Record, Records, IndexedRecords};
+use super::records::{Record, Records};
 use super::{Failure, Invocation, rename_object, unique_name};
 use crate::platform::{self, CopyMethod, MetadataTarget, Preservation};
 use crate::policy::{self, Action, Target};
@@ -115,7 +115,8 @@ pub(super) fn whole(invocation: &Invocation<'_>, source: &Root, destination: &Ro
     let observed = source.observed.ok_or_else(|| io::Error::other("source disappeared"))?;
     if observed.identity.kind == EntryKind::Other { return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported source object for transfer").into()); }
     if invocation.request.operation == Operation::Move { invocation.require_descriptors(24)?; }
-    invocation.require_descriptors((if observed.identity.kind == EntryKind::Directory { 10 + 6 * invocation.jobs } else { 8 }) + invocation.index_descriptors())?;
+    let root_discovery_descriptors = if invocation.renamed_trees.lock().unwrap().is_some() { 8 } else { 0 };
+    invocation.require_descriptors((if observed.identity.kind == EntryKind::Directory { 10 + super::WORKER_DESCRIPTORS * invocation.jobs } else { super::WORKER_DESCRIPTORS + 2 }) + invocation.index_descriptors() + root_discovery_descriptors)?;
     invocation.update(|progress| progress.discovered_files += 1);
     let mut stage = new_stage(invocation, destination, observed)?;
     let source_directory = if observed.identity.kind == EntryKind::Directory { Some(source.open_directory()?) } else { None };
@@ -134,11 +135,13 @@ pub(super) fn whole(invocation: &Invocation<'_>, source: &Root, destination: &Ro
     };
     if let Err(error) = transferred { return Err(error.into()); }
     invocation.checkpoint()?;
-    anchored::require_unchanged(source.parent.as_fd(), &source.name, observed)?;
+    anchored::require_unchanged(source.parent.as_fd(), &source.name, invocation.effective(observed)?)?;
     invocation.fault("before_publish")?;
-    validate_sources(source, source_directory.as_ref(), &stage)?;
+    validate_sources(invocation, source, source_directory.as_ref(), &stage)?;
     validate_final_access(&stage)?;
     anchored::identity(stage.parent, &stage.name, stage.observed.identity)?;
+    let root_output = stage.entries.lock().unwrap().find(Path::new(""))?.and_then(|record| record.output).ok_or_else(|| io::Error::other("successful staging output missing"))?;
+    anchored::require_unchanged(stage.parent, &stage.name, invocation.effective(root_output)?)?;
     match action {
         Action::Transfer => platform::rename_noreplace(stage.parent, &stage.name, destination.parent.as_fd(), &destination.name)?,
         Action::Replace => {
@@ -150,10 +153,15 @@ pub(super) fn whole(invocation: &Invocation<'_>, source: &Root, destination: &Ro
     stage.published = true;
     let publication_failure = |error| Failure { state: OperandState::DestinationPublishedSourceRetained, error };
     anchored::identity(destination.parent.as_fd(), &destination.name, stage.observed.identity).map_err(publication_failure)?;
+    let renamed_output = roots::observe(destination.parent.as_fd(), &destination.name).map_err(publication_failure)?;
+    let mut expected_output = invocation.effective(root_output).map_err(publication_failure)?;
+    expected_output.ctime = renamed_output.ctime;
+    if !anchored::unchanged(expected_output, renamed_output) { return Err(publication_failure(io::Error::other("published object changed during rename"))); }
+    invocation.remember_change(renamed_output).map_err(publication_failure)?;
     invocation.fault("after_publish").map_err(publication_failure)?;
-    finalize_published(invocation, source, destination, &stage).map_err(publication_failure)?;
+    finalize_published(invocation, destination, &stage).map_err(publication_failure)?;
     if invocation.durable() { invocation.sync_directory(destination.parent.as_fd()).map_err(publication_failure)?; }
-    refresh_hardlinks(invocation, source, destination, &stage).map_err(publication_failure)?;
+    refresh_hardlinks(invocation, destination, &stage).map_err(publication_failure)?;
     if invocation.request.operation == Operation::Copy { return Ok(None); }
     invocation.require_descriptors(24).map_err(publication_failure)?;
     let source_parent = duplicate(source.parent.as_fd()).map_err(publication_failure)?;
@@ -166,34 +174,38 @@ pub(super) fn whole(invocation: &Invocation<'_>, source: &Root, destination: &Ro
     Ok(Some(DurableReceipt { source_parent, source_name: source.name.clone(), source_path: source.path.clone(), source_directory, records: Mutex::new(entries), directories: Mutex::new(directories), destination_parent, destination_name: destination.name.clone(), destination_directory, destinations: Mutex::new(destinations) }))
 }
 
-fn finalize_published(invocation: &Invocation<'_>, source: &Root, destination: &Root, stage: &Stage<'_>) -> io::Result<()> {
+fn finalize_published(invocation: &Invocation<'_>, destination: &Root, stage: &Stage<'_>) -> io::Result<()> {
     let mut cursor = stage.entries.lock().unwrap().end();
     loop {
         let Some(record) = stage.entries.lock().unwrap().previous(&mut cursor)? else { break; };
         if record.final_flags == 0 { continue; }
         invocation.checkpoint()?;
         let (parent, name) = if record.source.as_os_str().is_empty() { (duplicate(destination.parent.as_fd())?, destination.name.clone()) } else { anchored::parent(stage.directory.as_ref().unwrap().as_fd(), &record.source, &stage.directories, true)? };
-        anchored::identity(parent.as_fd(), &name, record.published)?;
+        let expected = invocation.effective(record.output.ok_or_else(|| io::Error::other("successful metadata output missing"))?)?;
+        anchored::require_unchanged(parent.as_fd(), &name, expected)?;
         let metadata = platform::ExtendedMetadata { flags: record.final_flags, ..platform::ExtendedMetadata::default() };
-        if record.published.kind == EntryKind::Symlink {
+        let actual = if record.published.kind == EntryKind::Symlink {
             platform::apply_final_metadata(MetadataTarget::Symlink { parent: parent.as_fd(), name: &name }, &metadata)?;
+            let actual = roots::observe(parent.as_fd(), &name)?;
             if invocation.durable() { invocation.sync_directory(parent.as_fd())?; }
+            actual
         } else {
             let fd = fs::openat(&parent, &name, READ_FILE, Mode::empty())?;
-            if roots::observe_fd(fd.as_fd())?.identity != record.published { return Err(io::Error::other("published entry identity changed")); }
+            if !anchored::unchanged(expected, roots::observe_fd(fd.as_fd())?) { return Err(io::Error::other("published entry version changed")); }
             platform::apply_final_metadata(MetadataTarget::Fd(fd.as_fd()), &metadata)?;
+            let actual = roots::observe_fd(fd.as_fd())?;
             if invocation.durable() {
                 if record.published.kind == EntryKind::Directory { invocation.sync_directory(fd.as_fd())?; } else { invocation.sync_file(fd.as_fd())?; }
             }
-            if record.observed.identity.kind == EntryKind::RegularFile
-                && let Some(groups) = invocation.hardlinks.lock().unwrap().as_mut()
-                && let Some(mut group) = groups.find_identity(record.observed.identity)? {
-                group.output = Some(roots::observe_fd(fd.as_fd())?);
-                groups.push(&group)?;
-            }
-        }
+            actual
+        };
+        let mut expected = expected;
+        expected.ctime = actual.ctime;
+        if !anchored::unchanged(expected, actual) { return Err(io::Error::other("published output changed during final metadata")); }
+        anchored::require_unchanged(parent.as_fd(), &name, actual)?;
+        invocation.remember_change(actual)?;
+        stage.entries.lock().unwrap().set_output(&record.source, actual)?;
     }
-    let _ = source;
     Ok(())
 }
 
@@ -211,22 +223,18 @@ fn validate_final_access(stage: &Stage<'_>) -> io::Result<()> {
     Ok(())
 }
 
-fn refresh_hardlinks(invocation: &Invocation<'_>, _source: &Root, destination: &Root, stage: &Stage<'_>) -> io::Result<()> {
-    let mut entries = stage.entries.lock().unwrap();
+fn refresh_hardlinks(invocation: &Invocation<'_>, destination: &Root, stage: &Stage<'_>) -> io::Result<()> {
     let mut cursor = 0;
-    let mut groups = invocation.hardlinks.lock().unwrap();
-    if groups.is_none() { return Ok(()); }
-    let groups = groups.as_mut().unwrap();
-    while let Some(mut record) = entries.next(&mut cursor)? {
-        if record.observed.identity.kind != EntryKind::RegularFile { continue; }
-        let Some(existing) = groups.find_identity(record.observed.identity)? else { continue; };
+    while let Some(mut record) = stage.entries.lock().unwrap().next(&mut cursor)? {
+        if !matches!(record.observed.identity.kind, EntryKind::RegularFile | EntryKind::Symlink) { continue; }
+        let Some(existing) = invocation.hardlink_record(record.observed.identity)? else { continue; };
         let (base, relative) = if record.source.as_os_str().is_empty() {
             (destination.path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf(), PathBuf::from(&destination.name))
         } else { (destination.path.clone(), record.source.clone()) };
         record.source = base;
         record.destination = relative;
-        record.output = if stage.observed.identity.kind != EntryKind::Directory { Some(roots::observe(destination.parent.as_fd(), &destination.name)?) } else { existing.output };
-        groups.push(&record)?;
+        record.output = existing.output.map(|output| invocation.effective(output)).transpose()?;
+        invocation.remember_hardlink(&record)?;
     }
     Ok(())
 }
@@ -369,7 +377,10 @@ fn finalize_directories(invocation: &Invocation<'_>, source_fd: BorrowedFd<'_>, 
         let metadata = platform::capture_metadata(MetadataTarget::Fd(source.as_fd()))?;
         if platform::requires_final_metadata(&metadata) { stage.entries.lock().unwrap().set_final_flags(&record.source, metadata.flags)?; }
         platform::apply_metadata(MetadataTarget::Fd(target.as_fd()), &record.observed, &metadata, preservation(invocation))?;
+        let output = roots::observe_fd(target.as_fd())?;
         if invocation.durable() { invocation.sync_directory(target.as_fd())?; }
+        if !anchored::unchanged(output, roots::observe_fd(target.as_fd())?) { return Err(io::Error::other("destination directory changed during synchronization")); }
+        stage.entries.lock().unwrap().set_output(&record.source, output)?;
         invocation.update(|progress| progress.completed_files += 1);
     }
     Ok(())
@@ -396,55 +407,64 @@ fn transfer_leaf(invocation: &Invocation<'_>, source: LeafSource<'_>, target: Le
         Some(source)
     } else { None };
 
-    let mut groups = if observed.identity.kind == EntryKind::RegularFile {
-        let groups = invocation.hardlinks.lock().unwrap();
-        if observed.links > 1 || groups.is_some() { Some(groups) } else { None }
-    } else { None };
-    if let Some(groups) = groups.as_mut() {
-        if groups.is_none() {
-            let existing_self_changes = 2 * usize::from(invocation.self_changes.lock().unwrap().is_some());
-            invocation.require_descriptors((if source_mount.is_some() { 10 + 6 * invocation.jobs } else { 8 }) + existing_self_changes + 2)?;
-            **groups = Some(IndexedRecords::new(&invocation.request.context.scratch)?);
+    if observed.links > 1 {
+        invocation.require_descriptors((if source_mount.is_some() { 10 + super::WORKER_DESCRIPTORS * invocation.jobs } else { super::WORKER_DESCRIPTORS + 2 }) + 4)?;
+    }
+    let _group_work = HardlinkWork::acquire(invocation, observed.identity)?;
+    if invocation.hardlink_record(observed.identity)?.is_none() {
+        discover_renamed_alias(invocation)?;
+    }
+    if let Some(representative) = invocation.hardlink_record(observed.identity)? {
+        if !anchored::unchanged(invocation.effective(representative.observed)?, observed) { return Err(io::Error::other("hardlink source version changed after representative transfer")); }
+        let root = representative_root(invocation, &representative, target_parent, placement)?;
+        let expected_output = invocation.effective(representative.output.ok_or_else(|| io::Error::other("hardlink representative version missing"))?)?;
+        anchored::require_unchanged(root.parent.as_fd(), &root.name, expected_output)?;
+        if representative.published.device != roots::observe_fd(target_parent)?.identity.device { return Err(io::Error::new(io::ErrorKind::Unsupported, "hardlink group cannot span destination filesystems")); }
+        fs::linkat(&root.parent, &root.name, target_parent, target_name, AtFlags::empty())?;
+        let linked = roots::observe(target_parent, target_name)?;
+        let published = linked.identity;
+        let mut expected_linked = expected_output;
+        expected_linked.links += 1;
+        expected_linked.ctime = linked.ctime;
+        if !anchored::unchanged(expected_linked, linked) { return Err(with_cleanup(io::Error::other("hardlink representative changed during linking"), cleanup_owned(target_parent, target_name, published), visible_target)); }
+        if invocation.durable() && linked.identity.kind == EntryKind::RegularFile {
+            let synced = (|| {
+                let fd = fs::openat(target_parent, target_name, READ_FILE, Mode::empty())?;
+                if !anchored::unchanged(linked, roots::observe_fd(fd.as_fd())?) { return Err(io::Error::other("hardlink destination changed before data synchronization")); }
+                invocation.sync_file(fd.as_fd())?;
+                anchored::require_unchanged(target_parent, target_name, linked)
+            })();
+            if let Err(error) = synced { return Err(with_cleanup(error, cleanup_owned(target_parent, target_name, published), visible_target)); }
         }
-        if let Some(representative) = groups.as_mut().unwrap().find_identity(observed.identity)? {
-            if !anchored::unchanged(invocation.effective(representative.observed)?, observed) { return Err(io::Error::other("hardlink source version changed after representative transfer")); }
-            let root = representative_root(invocation, &representative, target_parent, placement)?;
-            let expected_output = representative.output.ok_or_else(|| io::Error::other("hardlink representative version missing"))?;
-            anchored::require_unchanged(root.parent.as_fd(), &root.name, expected_output)?;
-            if representative.published.device != roots::observe_fd(target_parent)?.identity.device { return Err(io::Error::new(io::ErrorKind::Unsupported, "hardlink group cannot span destination filesystems")); }
-            fs::linkat(&root.parent, &root.name, target_parent, target_name, AtFlags::empty())?;
-            let linked = roots::observe(target_parent, target_name)?;
-            let published = linked.identity;
-            let mut expected_linked = expected_output;
-            expected_linked.links += 1;
-            expected_linked.ctime = linked.ctime;
-            if !anchored::unchanged(expected_linked, linked) { return Err(with_cleanup(io::Error::other("hardlink representative changed during linking"), cleanup_owned(target_parent, target_name, published), visible_target)); }
-            let mut updated_representative = representative.clone();
-            updated_representative.output = Some(linked);
-            groups.as_mut().unwrap().push(&updated_representative)?;
-            if let Err(error) = anchored::require_unchanged(source_parent, source_name, observed) { return Err(with_cleanup(error, cleanup_owned(target_parent, target_name, published), visible_target)); }
-            invocation.update(|progress| progress.completed_files += 1);
-            return Ok(Record { source: placement.base.clone(), destination: placement.relative.clone(), observed, published, output: Some(roots::observe(target_parent, target_name)?), parent: Some(roots::observe_fd(target_parent)?.identity), anchor: Some(roots::observe_fd(placement.root)?.identity), ancestry: placement.ancestry()?, final_flags: 0 });
-        }
+        invocation.remember_change(linked)?;
+        let mut updated_representative = representative.clone();
+        updated_representative.output = Some(linked);
+        invocation.remember_hardlink(&updated_representative)?;
+        if let Err(error) = anchored::require_unchanged(source_parent, source_name, invocation.effective(observed)?) { return Err(with_cleanup(error, cleanup_owned(target_parent, target_name, published), visible_target)); }
+        invocation.update(|progress| progress.completed_files += 1);
+        return Ok(Record { source: placement.base.clone(), destination: placement.relative.clone(), observed, published, output: Some(linked), parent: Some(roots::observe_fd(target_parent)?.identity), anchor: Some(roots::observe_fd(placement.root)?.identity), ancestry: placement.ancestry()?, final_flags: 0 });
     }
     let mut final_flags = 0;
-    let created = match observed.identity.kind {
+    let output = match observed.identity.kind {
         EntryKind::RegularFile => {
             let source = source_file.unwrap();
             let metadata = platform::capture_metadata(MetadataTarget::Fd(source.as_fd()))?;
             if platform::requires_final_metadata(&metadata) { final_flags = metadata.flags; }
+            invocation.fault("during_copy")?;
+            invocation.checkpoint()?;
             #[cfg(target_os = "macos")]
-            let cloned = match platform::try_clone_to_dir(source.as_fd(), target_parent, target_name) {
-                Ok(()) => true,
-                Err(platform::AccelerationError::Unsupported) => false,
-                Err(platform::AccelerationError::Io(error)) => return Err(error.into()),
-            };
+            let cloned_file = platform::try_clone_to_dir(source.as_fd(), target_parent, target_name)?;
+            #[cfg(target_os = "macos")]
+            let cloned_identity = cloned_file.as_ref().map(|file| file.identity);
             #[cfg(not(target_os = "macos"))]
-            let cloned = false;
-            let cloned_identity = if cloned {
-                Some(roots::observe(target_parent, target_name).map_err(|error| io::Error::new(error.kind(), format!("cloned staging retained at {visible_target:?}; identity unavailable: {error}")))?.identity)
-            } else { None };
-            let opened = if cloned { fs::openat(target_parent, target_name, READ_FILE, Mode::empty()) } else { fs::openat(target_parent, target_name, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::RUSR | Mode::WUSR) };
+            let cloned_identity = None;
+            let cloned = cloned_identity.is_some();
+            let opened = if cloned {
+                #[cfg(target_os = "macos")]
+                { Ok(cloned_file.unwrap().descriptor) }
+                #[cfg(not(target_os = "macos"))]
+                { unreachable!() }
+            } else { fs::openat(target_parent, target_name, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::RUSR | Mode::WUSR) };
             let target = match opened {
                 Ok(target) => target,
                 Err(error) => return Err(match cloned_identity { Some(identity) => with_cleanup(error.into(), cleanup_owned(target_parent, target_name, identity), visible_target), None => error.into() }),
@@ -453,14 +473,15 @@ fn transfer_leaf(invocation: &Invocation<'_>, source: LeafSource<'_>, target: Le
             if cloned_identity.is_some_and(|identity| identity != published) { return Err(io::Error::other(format!("cloned staging substituted at {visible_target:?}; ambiguous object retained"))); }
             let result = (|| {
                 if !cloned {
-                    invocation.fault("during_copy")?;
                     let stats = platform::copy_data(source.as_fd(), target.as_fd(), observed.size, buffer, invocation.cancellation)?;
                     invocation.update(|progress| { progress.logical_bytes_cloned += if stats.method == CopyMethod::Clone { stats.logical_bytes } else { 0 }; progress.bytes_streamed += stats.streamed_bytes;
                         match stats.method { CopyMethod::Clone => progress.cloned_files += 1, CopyMethod::Native => progress.native_copied_files += 1, CopyMethod::Buffered => progress.buffered_copied_files += 1 } });
                 } else { invocation.update(|progress| { progress.logical_bytes_cloned += observed.size; progress.cloned_files += 1; }); }
                 #[cfg(target_os = "macos")]
-                if !cloned && metadata.resource_fork_size.is_some() { platform::copy_resource_fork(source.as_fd(), target.as_fd())?; }
+                if !cloned && metadata.resource_fork_size.is_some() { platform::copy_resource_fork(source.as_fd(), target.as_fd(), buffer, invocation.cancellation)?; }
+                let copied_output = roots::observe_fd(target.as_fd())?;
                 invocation.fault("after_copy")?;
+                anchored::require_unchanged(target_parent, target_name, copied_output)?;
                 if platform::reports_dense_allocation(source.as_fd(), target.as_fd(), observed.size)? {
                     invocation.emit(Event::Diagnostic(Diagnostic {
                         path: PathBuf::from(source_name),
@@ -470,11 +491,12 @@ fn transfer_leaf(invocation: &Invocation<'_>, source: LeafSource<'_>, target: Le
                 invocation.checkpoint()?;
                 anchored::require_unchanged(source_parent, source_name, observed)?;
                 platform::apply_metadata(MetadataTarget::Fd(target.as_fd()), &observed, &metadata, preservation(invocation))?;
+                let output = roots::observe_fd(target.as_fd())?;
                 invocation.fault("after_metadata")?;
                 invocation.fault("during_sync")?;
                 if invocation.durable() { invocation.sync_file(target.as_fd())?; }
-                anchored::identity(target_parent, target_name, published)?;
-                Ok(published)
+                anchored::require_unchanged(target_parent, target_name, output)?;
+                Ok(output)
             })();
             match result { Ok(published) => published, Err(error) => { let cleanup = cleanup_owned(target_parent, target_name, published); return Err(with_cleanup(error, cleanup, visible_target)); } }
         },
@@ -487,12 +509,12 @@ fn transfer_leaf(invocation: &Invocation<'_>, source: LeafSource<'_>, target: Le
             let published = roots::observe(target_parent, target_name)?.identity;
             let result = platform::apply_metadata(MetadataTarget::Symlink { parent: target_parent, name: target_name }, &observed, &metadata, preservation(invocation)).and_then(|()| anchored::require_unchanged(source_parent, source_name, observed));
             if let Err(error) = result { return Err(with_cleanup(error, cleanup_owned(target_parent, target_name, published), visible_target)); }
-            published
+            roots::observe(target_parent, target_name)?
         },
         _ => return Err(io::Error::other("invalid leaf kind")),
     };
-    let record = Record { source: placement.base.clone(), destination: placement.relative.clone(), observed, published: created, output: Some(roots::observe(target_parent, target_name)?), parent: Some(roots::observe_fd(target_parent)?.identity), anchor: Some(roots::observe_fd(placement.root)?.identity), ancestry: if observed.links > 1 { placement.ancestry()? } else { Vec::new() }, final_flags };
-    if observed.links > 1 && let Some(groups) = groups.as_mut() { groups.as_mut().unwrap().push(&record)?; }
+    let record = Record { source: placement.base.clone(), destination: placement.relative.clone(), observed, published: output.identity, output: Some(output), parent: Some(roots::observe_fd(target_parent)?.identity), anchor: Some(roots::observe_fd(placement.root)?.identity), ancestry: if observed.links > 1 { placement.ancestry()? } else { Vec::new() }, final_flags };
+    if observed.links > 1 { invocation.remember_hardlink(&record)?; }
     invocation.update(|progress| progress.completed_files += 1);
     Ok(record)
 }
@@ -512,7 +534,7 @@ pub(super) fn merge(invocation: &Invocation<'_>, source: &Root, destination: &Ro
     let records = Mutex::new(Records::new(&invocation.request.context.scratch)?);
     let mut skipped = Records::new(&invocation.request.context.scratch)?;
     let mut pending = Records::new(&invocation.request.context.scratch)?;
-    let root_record = Record { source: PathBuf::new(), destination: PathBuf::new(), observed: source.observed.unwrap(), published: destination.observed.unwrap().identity, output: None, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 };
+    let root_record = Record { source: PathBuf::new(), destination: PathBuf::new(), observed: source.observed.unwrap(), published: destination.observed.unwrap().identity, output: destination.observed, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 };
     directories.lock().unwrap().push(&root_record)?;
     records.lock().unwrap().push(&root_record)?;
     pending.push(&root_record)?;
@@ -540,6 +562,8 @@ pub(super) fn merge(invocation: &Invocation<'_>, source: &Root, destination: &Ro
             let mut child_cursor = 0;
             while let Some(child) = children.next(&mut child_cursor)? {
                 invocation.checkpoint()?;
+                let source_expected = invocation.effective(record.observed)?;
+                if !anchored::unchanged(source_expected, roots::observe_fd(source_parent.as_fd())?) { return Err(io::Error::other("merge source directory changed before child operation").into()); }
                 let name = child.source.as_os_str();
                 let source_observed = invocation.effective(child.observed)?;
                 anchored::require_unchanged(source_parent.as_fd(), name, source_observed)?;
@@ -565,10 +589,15 @@ pub(super) fn merge(invocation: &Invocation<'_>, source: &Root, destination: &Ro
                 match action {
                     Action::Skip | Action::SameEntry => {
                         invocation.update(|progress| progress.skipped_files += 1);
-                        skipped.push(&Record { source: relative.clone(), destination: relative, observed: source_observed, published: destination_observed.map(|observed| observed.identity).unwrap_or(source_observed.identity), output: None, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 })?;
+                        let mut ancestor = relative.parent();
+                        while let Some(path) = ancestor {
+                            if skipped.find(path)?.is_some() { break; }
+                            skipped.push(&Record { source: path.to_path_buf(), destination: PathBuf::new(), observed: source_observed, published: source_observed.identity, output: None, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 })?;
+                            ancestor = path.parent();
+                        }
                     },
                     Action::Merge => {
-                        let child = Record { source: relative.clone(), destination: relative, observed: source_observed, published: destination_observed.unwrap().identity, output: None, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 };
+                        let child = Record { source: relative.clone(), destination: relative, observed: source_observed, published: destination_observed.unwrap().identity, output: destination_observed, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 };
                         records.lock().unwrap().push(&child)?;
                         directories.lock().unwrap().push(&child)?;
                         pending.push(&child)?;
@@ -576,13 +605,17 @@ pub(super) fn merge(invocation: &Invocation<'_>, source: &Root, destination: &Ro
                     Action::Transfer | Action::Replace => {
                         let child_source = Root::establish_at(source_parent.as_fd(), name, &source.path.join(&relative), roots::Requirement::Existing)?;
                         let child_destination = Root::establish_at(destination_parent.as_fd(), name, &destination.path.join(&relative), roots::Requirement::MayBeAbsent)?;
-                        if child_source.observed != Some(source_observed) || child_destination.observed != destination_observed { return Err(io::Error::other("merge child changed during planning").into()); }
-                        if invocation.request.operation == Operation::Move {
+                        if !child_source.observed.is_some_and(|observed| anchored::unchanged(source_observed, observed)) || child_destination.observed != destination_observed { return Err(io::Error::other("merge child changed during planning").into()); }
+                        let parent_before = roots::observe_fd(destination_parent.as_fd())?;
+                        let parent_expected = record.output.ok_or_else(|| io::Error::other("merge destination directory observation missing"))?;
+                        if !anchored::unchanged(invocation.effective(parent_expected)?, parent_before) { return Err(io::Error::other("merge destination directory changed before child operation").into()); }
+                        if invocation.request.operation == Operation::Move && invocation.rename_preserves_hardlinks(&child_source)? {
                             match rename_object(invocation, &child_source, &child_destination, action) {
                                 Ok(_) => {
                                     changed = true;
                                     renamed = true;
                                     invocation.remember_change(roots::observe_fd(source_parent.as_fd())?)?;
+                                    remember_directory_change(invocation, parent_before, destination_parent.as_fd())?;
                                     continue;
                                 },
                                 Err(failure) if failure.error.raw_os_error() == Some(libc::EXDEV) => {},
@@ -598,6 +631,7 @@ pub(super) fn merge(invocation: &Invocation<'_>, source: &Root, destination: &Ro
                             failure
                         })?;
                         changed = true;
+                        remember_directory_change(invocation, parent_before, destination_parent.as_fd())?;
                         let Some(receipt) = receipt else { continue; };
                         let mut child_cursor = 0;
                         while let Some(mut child) = receipt.directories.lock().unwrap().next(&mut child_cursor)? {
@@ -628,13 +662,7 @@ pub(super) fn merge(invocation: &Invocation<'_>, source: &Root, destination: &Ro
     let mut transferable = Records::new(&invocation.request.context.scratch)?;
     let mut cursor = 0;
     while let Some(record) = records.lock().unwrap().next(&mut cursor)? {
-        let mut retain = false;
-        if record.observed.identity.kind == EntryKind::Directory {
-            let mut skipped_cursor = 0;
-            while let Some(skipped) = skipped.next(&mut skipped_cursor)? {
-                if skipped.source.starts_with(&record.source) { retain = true; break; }
-            }
-        }
+        let retain = record.observed.identity.kind == EntryKind::Directory && skipped.find(&record.source)?.is_some();
         if !retain { transferable.push(&record)?; }
     }
     if transferable.end() == 0 { return Ok(if changed { OperandState::Moved } else { OperandState::Skipped }); }
@@ -655,19 +683,20 @@ fn snapshot_destinations(invocation: &Invocation<'_>, destination: &Root, root: 
     let mut snapshots = Records::new(&invocation.request.context.scratch)?;
     let mut cursor = 0;
     while let Some(record) = entries.lock().unwrap().next(&mut cursor)? {
-        let (parent, name) = if record.source.as_os_str().is_empty() { (duplicate(destination.parent.as_fd())?, destination.name.clone()) } else { anchored::parent(root.ok_or_else(|| io::Error::other("published directory missing"))?.as_fd(), &record.source, directories, true)? };
+        let (parent, name) = if record.source.as_os_str().is_empty() { (duplicate(destination.parent.as_fd())?, destination.name.clone()) } else { anchored::parent(root.ok_or_else(|| io::Error::other("published directory missing"))?.as_fd(), &record.source, directories, true).map_err(|error| io::Error::new(error.kind(), format!("destination receipt traversal {:?}: {error}", record.source)))? };
         let observed = roots::observe(parent.as_fd(), &name)?;
-        if observed.identity != record.published { return Err(io::Error::other("destination identity changed before receipt")); }
+        let expected = invocation.effective(record.output.ok_or_else(|| io::Error::other("successful destination output missing"))?)?;
+        if !anchored::unchanged(expected, observed) { return Err(io::Error::other("destination identity or version changed before receipt")); }
         snapshots.push(&Record { source: record.source, destination: record.destination, observed, published: observed.identity, output: None, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 })?;
     }
     Ok(snapshots)
 }
 
-fn validate_sources(source: &Root, root: Option<&OwnedFd>, stage: &Stage<'_>) -> io::Result<()> {
+fn validate_sources(invocation: &Invocation<'_>, source: &Root, root: Option<&OwnedFd>, stage: &Stage<'_>) -> io::Result<()> {
     let mut cursor = 0;
     while let Some(record) = stage.entries.lock().unwrap().next(&mut cursor)? {
-        let (parent, name) = if record.source.as_os_str().is_empty() { (duplicate(source.parent.as_fd())?, source.name.clone()) } else { anchored::parent(root.ok_or_else(|| io::Error::other("source directory missing"))?.as_fd(), &record.source, &stage.directories, false)? };
-        anchored::require_unchanged(parent.as_fd(), &name, record.observed)?;
+        let (parent, name) = if record.source.as_os_str().is_empty() { (duplicate(source.parent.as_fd())?, source.name.clone()) } else { anchored::parent(root.ok_or_else(|| io::Error::other("source directory missing"))?.as_fd(), &record.source, &stage.directories, false).map_err(|error| io::Error::new(error.kind(), format!("source validation traversal {:?}: {error}", record.source)))? };
+        anchored::require_unchanged(parent.as_fd(), &name, invocation.effective(record.observed)?)?;
     }
     Ok(())
 }
@@ -742,3 +771,127 @@ impl<'a, 'b> DescriptorReservation<'a, 'b> {
     fn new(invocation: &'a Invocation<'b>, count: usize) -> Self { invocation.descriptor_reservation.fetch_add(count, Ordering::AcqRel); Self { invocation, count } }
 }
 impl Drop for DescriptorReservation<'_, '_> { fn drop(&mut self) { self.invocation.descriptor_reservation.fetch_sub(self.count, Ordering::AcqRel); } }
+
+struct HardlinkWork<'a, 'b> { invocation: &'a Invocation<'b>, identity: Identity }
+impl<'a, 'b> HardlinkWork<'a, 'b> {
+    fn acquire(invocation: &'a Invocation<'b>, identity: Identity) -> io::Result<Self> {
+        let mut active = invocation.active_hardlinks.lock().unwrap();
+        while active.contains(&identity) {
+            invocation.checkpoint()?;
+            active = invocation.hardlink_ready.wait_timeout(active, Duration::from_millis(25)).unwrap().0;
+        }
+        active.insert(identity);
+        Ok(Self { invocation, identity })
+    }
+}
+impl Drop for HardlinkWork<'_, '_> {
+    fn drop(&mut self) {
+        self.invocation.active_hardlinks.lock().unwrap().remove(&self.identity);
+        self.invocation.hardlink_ready.notify_all();
+    }
+}
+
+fn remember_directory_change(invocation: &Invocation<'_>, before: Observation, parent: BorrowedFd<'_>) -> io::Result<()> {
+    let actual = roots::observe_fd(parent)?;
+    let mut expected = before;
+    expected.size = actual.size;
+    expected.links = actual.links;
+    expected.mtime = actual.mtime;
+    expected.ctime = actual.ctime;
+    if !anchored::unchanged(expected, actual) { return Err(io::Error::other("destination directory metadata changed during child publication")); }
+    invocation.remember_change(actual)
+}
+
+struct RootDiscovery<'a, 'b> { invocation: &'a Invocation<'b> }
+impl<'a, 'b> RootDiscovery<'a, 'b> {
+    fn acquire(invocation: &'a Invocation<'b>) -> io::Result<Self> {
+        let mut active = invocation.root_discovery_active.lock().unwrap();
+        while *active {
+            invocation.checkpoint()?;
+            active = invocation.root_discovery_ready.wait_timeout(active, Duration::from_millis(25)).unwrap().0;
+        }
+        *active = true;
+        Ok(Self { invocation })
+    }
+}
+impl Drop for RootDiscovery<'_, '_> {
+    fn drop(&mut self) {
+        *self.invocation.root_discovery_active.lock().unwrap() = false;
+        self.invocation.root_discovery_ready.notify_all();
+    }
+}
+
+pub(super) fn directory_uses_copied_group(invocation: &Invocation<'_>, source: &Root) -> io::Result<bool> {
+    invocation.require_descriptors(12 + invocation.index_descriptors())?;
+    let _discovery = RootDiscovery::acquire(invocation)?;
+    invocation.fault("directory_group_scan")?;
+    visit_tree_leaves(invocation, source, |record| {
+        Ok(invocation.hardlink_record(record.observed.identity)?.is_some_and(|group| group.published != record.observed.identity))
+    })
+}
+
+fn discover_renamed_alias(invocation: &Invocation<'_>) -> io::Result<()> {
+    if invocation.renamed_trees.lock().unwrap().is_none() { return Ok(()); }
+    let _discovery = RootDiscovery::acquire(invocation)?;
+    let mut cursor = invocation.renamed_tree_cursor.load(Ordering::Acquire);
+    loop {
+        invocation.checkpoint()?;
+        let record = invocation.renamed_trees.lock().unwrap().as_mut().unwrap().next(&mut cursor)?;
+        let Some(record) = record else { return Ok(()); };
+        if let Some(expected) = record.output {
+            let root = Root::establish(invocation.cwd, &record.source, roots::Requirement::Existing)?;
+            if record.parent != Some(roots::observe_fd(root.parent.as_fd())?.identity) || !root.observed.is_some_and(|actual| anchored::unchanged(expected, actual)) {
+                return Err(io::Error::other("previously renamed directory changed before hardlink discovery"));
+            }
+            invocation.fault("renamed_tree_index")?;
+            visit_tree_leaves(invocation, &root, |representative| {
+                let observed = representative.observed;
+                if matches!(observed.identity.kind, EntryKind::RegularFile | EntryKind::Symlink) && observed.links > 1 && invocation.hardlink_record(observed.identity)?.is_none() {
+                    invocation.remember_hardlink(&representative)?;
+                }
+                Ok(false)
+            })?;
+        }
+        invocation.renamed_tree_cursor.store(cursor, Ordering::Release);
+    }
+}
+
+fn visit_tree_leaves(invocation: &Invocation<'_>, root: &Root, mut visit: impl FnMut(Record) -> io::Result<bool>) -> io::Result<bool> {
+    let observed = root.observed.ok_or_else(|| io::Error::other("hardlink discovery root disappeared"))?;
+    let directory = root.open_directory()?;
+    let mount = platform::mount_id(directory.as_fd())?;
+    let directories = Mutex::new(Records::new(&invocation.request.context.scratch)?);
+    directories.lock().unwrap().push(&Record { source: PathBuf::new(), destination: PathBuf::new(), observed, published: observed.identity, output: Some(observed), parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 })?;
+    let mut cursor = 0;
+    loop {
+        invocation.checkpoint()?;
+        let Some(record) = directories.lock().unwrap().next(&mut cursor)? else { break; };
+        let parent = anchored::open_directory(directory.as_fd(), &record.source, &directories, false)?;
+        if !anchored::unchanged(record.observed, roots::observe_fd(parent.as_fd())?) { return Err(io::Error::other("hardlink discovery directory changed")); }
+        for entry in fs::Dir::read_from(&parent)? {
+            invocation.checkpoint()?;
+            let entry = entry?;
+            let name = OsStr::from_bytes(entry.file_name().to_bytes());
+            if name == "." || name == ".." { continue; }
+            let path = record.source.join(name);
+            if path.as_os_str().len() > MAX_WORK_PATH { return Err(io::Error::other("hardlink discovery path exceeds bounded record limit")); }
+            let found = roots::observe(parent.as_fd(), name)?;
+            if found.identity.kind == EntryKind::Directory {
+                let child = fs::openat(&parent, name, DIRECTORY, Mode::empty())?;
+                if !anchored::unchanged(found, roots::observe_fd(child.as_fd())?) { return Err(io::Error::other("hardlink discovery directory substituted")); }
+                if !invocation.request.options.cross_file_systems && platform::mount_id(child.as_fd())? != mount { return Err(io::Error::other("hardlink discovery across nested mounts requires --cross-file-systems")); }
+                directories.lock().unwrap().push(&Record { source: path.clone(), destination: path, observed: found, published: found.identity, output: Some(found), parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 })?;
+            } else {
+                if !anchored::unchanged(record.observed, roots::observe_fd(parent.as_fd())?) { return Err(io::Error::other("hardlink discovery directory changed during enumeration")); }
+                anchored::require_unchanged(root.parent.as_fd(), &root.name, observed)?;
+                let placement = Placement { root: directory.as_fd(), base: root.path.clone(), relative: path.clone(), directories: Some(&directories) };
+                let record = Record { source: root.path.clone(), destination: path, observed: found, published: found.identity, output: Some(found), parent: Some(roots::observe_fd(parent.as_fd())?.identity), anchor: Some(observed.identity), ancestry: if found.links > 1 { placement.ancestry()? } else { Vec::new() }, final_flags: 0 };
+                invocation.fault("hardlink_discovery_leaf")?;
+                if visit(record)? { return Ok(true); }
+            }
+        }
+        if !anchored::unchanged(record.observed, roots::observe_fd(parent.as_fd())?) { return Err(io::Error::other("hardlink discovery directory changed during enumeration")); }
+    }
+    anchored::require_unchanged(root.parent.as_fd(), &root.name, observed)?;
+    Ok(false)
+}

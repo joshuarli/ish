@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use epsh::ast::Command;
@@ -55,6 +56,79 @@ fn parent_process_commands_run_in_lists_with_redirections_and_argument_substitut
     assert_eq!(calls[1][1], b"next");
     assert_eq!(calls[2][1], b"source");
     assert_eq!(calls[3][1], b"expanded-source");
+}
+
+#[test]
+fn standalone_negation_runs_parent_process_commands_and_inverts_their_status() {
+    let directory = tempdir().unwrap();
+    let mut shell = Shell::builder().cwd(directory.path().to_path_buf()).build();
+    register_copy(&mut shell);
+    let calls = record_copy_calls(&mut shell);
+
+    assert_eq!(shell.run_script("! cp source destination > copy.log"), 1);
+    assert!(directory.path().join("copy.log").exists());
+    assert_eq!(shell.run_script("! command cp next target"), 1);
+    assert_eq!(shell.run_script("! cp third target && cp skipped target"), 1);
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0][0], b"cp");
+    assert_eq!(calls[1][1], b"next");
+    assert_eq!(calls[2][1], b"third");
+
+    let mut ordinary = Shell::new();
+    assert_eq!(ordinary.run_script("! /bin/sh -c 'exit 2'"), 0);
+    assert_eq!(ordinary.run_script("! printf input | /bin/sh -c 'exit 253'"), 0);
+}
+
+#[test]
+fn standalone_negation_does_not_invert_cancellation_or_continue_the_list() {
+    let cancel = Arc::new(AtomicBool::new(true));
+    let mut shell = Shell::builder().cancel_flag(cancel).build();
+    register_copy(&mut shell);
+    let calls = record_copy_calls(&mut shell);
+
+    assert_eq!(shell.run_script("! true && cp source destination"), 130);
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn command_identity_is_independent_of_parent_process_placement() {
+    let directory = tempdir().unwrap();
+    let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let mut shell = Shell::builder()
+        .cwd(directory.path().to_path_buf())
+        .env_clear()
+        .stdout_sink(stdout.clone())
+        .build();
+    shell.set_var("PATH", "").unwrap();
+    shell.set_command_identity(
+        ShellBytes::from("cp"),
+        epsh::eval::CommandIdentity::Builtin,
+    );
+    shell.set_command_identity(
+        ShellBytes::from("/bin/cp"),
+        epsh::eval::CommandIdentity::Builtin,
+    );
+    shell.set_command_placement(
+        ShellBytes::from("parent-only"),
+        CommandPlacement::ParentProcess,
+    );
+
+    assert_eq!(shell.run_script("command -v cp"), 0);
+    assert_eq!(*stdout.lock().unwrap(), b"cp\n");
+    stdout.lock().unwrap().clear();
+    assert_eq!(shell.run_script("command -V cp"), 0);
+    assert_eq!(*stdout.lock().unwrap(), b"cp is a shell builtin\n");
+    stdout.lock().unwrap().clear();
+    assert_eq!(shell.run_script("type cp"), 0);
+    assert_eq!(*stdout.lock().unwrap(), b"cp is a shell builtin\n");
+    stdout.lock().unwrap().clear();
+    assert_eq!(shell.run_script("command -v /bin/cp"), 0);
+    assert_eq!(*stdout.lock().unwrap(), b"/bin/cp\n");
+    stdout.lock().unwrap().clear();
+    assert_eq!(shell.run_script("command -v parent-only"), 1);
+    assert!(stdout.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -119,6 +193,50 @@ fn parent_process_refusal_precedes_redirections_and_captured_callbacks() {
         assert!(!directory.path().join(name).exists(), "{name}");
     }
     assert!(!policy_marker.exists());
+    assert!(!handler_marker.exists());
+    let diagnostic = String::from_utf8(stderr.lock().unwrap().clone()).unwrap();
+    assert!(diagnostic.contains("cp"), "{diagnostic}");
+    assert!(diagnostic.contains("original shell process"), "{diagnostic}");
+}
+
+#[test]
+fn negated_pipelines_and_substitutions_keep_parent_process_refusals() {
+    let directory = tempdir().unwrap();
+    let handler_marker = directory.path().join("handler-called");
+    let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let mut shell = Shell::builder()
+        .cwd(directory.path().to_path_buf())
+        .stderr_sink(stderr.clone())
+        .build();
+    register_copy(&mut shell);
+    let handler_marker_copy = handler_marker.clone();
+    shell.set_external_handler(Box::new(move |args, _environment| {
+        if args.first().is_some_and(|target| target.as_bytes() == b"cp") {
+            fs::write(&handler_marker_copy, b"called").unwrap();
+        }
+        Ok(ExitStatus::SUCCESS)
+    }));
+
+    assert_eq!(
+        shell.run_script(
+            "cmd=cp; ! printf input | command command $cmd source pipe-copy > negated-pipe-redirection"
+        ),
+        0
+    );
+    assert_eq!(
+        shell.run_script(
+            "cmd=cp; value=$(! command command $cmd source substitution-copy > negated-substitution-redirection)"
+        ),
+        0
+    );
+    for name in [
+        "pipe-copy",
+        "negated-pipe-redirection",
+        "substitution-copy",
+        "negated-substitution-redirection",
+    ] {
+        assert!(!directory.path().join(name).exists(), "{name}");
+    }
     assert!(!handler_marker.exists());
     let diagnostic = String::from_utf8(stderr.lock().unwrap().clone()).unwrap();
     assert!(diagnostic.contains("cp"), "{diagnostic}");

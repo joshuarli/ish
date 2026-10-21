@@ -126,8 +126,14 @@ length and the destination reports dense allocation. The warning reports block
 accounting; filesystem sparse support and exact hole layout remain unverified.
 Capacity failures do not authorize deleting source data.
 
-A same-filesystem non-merge `mv` uses a rename without walking descendants
-when the filesystem permits it. A cross-filesystem move copies transferable
+An isolated same-filesystem non-merge `mv` uses a rename without walking
+descendants when the filesystem permits it. Multiple operands and merges can
+couple renamed directories to later hardlink aliases. ish indexes completed
+renames when a later alias needs them. When an earlier copied group could
+split, ish inspects the next directory and transfers a coupled tree instead
+of renaming it. Regular files and hardlinked symlinks keep their group topology.
+
+A cross-filesystem move copies transferable
 objects and applies required metadata. It synchronizes destination data and
 directory publication before revalidating and retiring transferred source objects.
 Intentional skips, unsupported objects, changed entries, and failed transfers
@@ -148,12 +154,24 @@ and retains the source. Hardlinks outside the transferred source set cannot
 stay linked across filesystems. Filesystem timestamp precision may round
 values.
 
+Move receipts retain the version observed after a successful transfer and
+required metadata application. Publication and merge aggregation validate that
+version. They do not accept a later version merely because the inode matches.
+An observed content or metadata change prevents retirement of the affected
+source entries.
+
 Neither operation preserves ctime, inode numbers, or identical physical extent
 allocation. Linux cannot set creation time, so creation time is outside the
 Linux preservation contract. macOS attempts to preserve birth time and
 platform flags. A meaningful flag or required metadata field that the
 destination cannot represent fails the affected transfer and retains its
 source. Platform-irrelevant fields are outside the contract.
+
+macOS resource forks up to 4 GiB use bounded descriptor-based copying with
+cancellation checks between chunks. Larger forks require a named stream whose
+identity can be verified against the held file descriptor. An unverifiable
+stream fails with an unsupported-operation diagnostic and retains the source.
+The larger-fork path still requires native validation.
 
 `cp` and cross-filesystem `mv` transfer regular files, directories, and symlink
 objects. An unsupported special object fails without opening it as a byte
@@ -207,6 +225,16 @@ cp source destination && echo copied
 cp source destination >output.log 2>errors.log
 mv first second; cp "$(printf '%s' source)" destination
 ```
+
+Standalone negation also runs the operation in the original process. A
+successful `! cp source destination` copies the object and returns status 1.
+A failed `! mv missing destination` returns status 0. Negation leaves
+cancellation at status 130. A refused target still produces its diagnostic
+and has no target effects, even when enclosing negation changes the status.
+
+`command -v`, `command -V`, and `type` identify bare native command names as
+shell builtins, including with an empty `PATH`. Explicit paths retain external
+classification.
 
 Argument substitutions finish before the file operation starts. ish refuses a
 native `cp` or `mv` target in a pipeline or command substitution with status 2,

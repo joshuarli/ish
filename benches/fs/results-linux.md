@@ -1,10 +1,11 @@
 # Linux exploratory filesystem samples
 
-## Scope
+## Original campaign historical snapshot
 
-These samples describe the final Linux source snapshot on one Linux x86_64 host
-with ext4. They are local exploratory evidence. They do not establish P3
-acceptance or support performance tuning.
+These samples preserve the original campaign snapshot on one Linux x86_64 host
+with ext4. They are historical exploratory evidence and do not describe the
+repaired before/after comparison below. They do not establish P3 acceptance or
+support performance tuning.
 
 The fixture verifier read all input bytes before sampling, so the file cache was
 warm. The runner collected five accepted interleaved samples per available
@@ -83,8 +84,11 @@ warmed the cache by reading all input data. The host reported 32 CPU cores, 91%
 free memory, and 502 GiB free on the filesystem before the first measured
 matrix. The runner recorded no discarded overlap.
 
-The candidate `ish` binary was 2,196,344 bytes. Engine samples used a 262,144
-byte transfer buffer, a 256-entry work queue, a 67,108,864 byte record memory
+The original campaign candidate `ish` binary was 2,196,344 bytes. It was built
+before baseline commit `11cef310` and its minor error-path patch. A fresh
+release build from the actual `11cef310` baseline is 2,196,792 bytes. Engine
+samples used a 262,144 byte transfer buffer, a 256-entry work queue, a
+67,108,864 byte record memory
 budget, and descriptor budgets of 256 maximum, 32 reserved, and 16 minimum.
 Deep and wide workloads used a 64-descriptor soft limit and a 1 GiB address
 space limit. Other workloads used a 1,024-descriptor limit and unlimited
@@ -97,7 +101,7 @@ builtin runs, and 847,872 to 3,022,848 bytes for native utilities. This field
 uses the maximum of the runner and waited-child `getrusage` high-water values.
 It is not a polled instantaneous peak.
 
-## Unavailable comparisons
+## Unavailable comparisons in original campaign
 
 The host's `/bin/cp` and `/bin/mv` are BusyBox utilities. BusyBox `cp` is not a
 clone-aware comparison utility. The host was not macOS, the filesystem clone
@@ -110,3 +114,116 @@ cross-filesystem move workload was unavailable. A prior BusyBox `cp` attempt
 under the same 64-descriptor soft limit failed with `EMFILE` at depth 59. The
 final matrix has no deep native timing sample. The engine and PTY deep samples
 remain exploratory evidence without a matched three-side comparison.
+
+## Repaired Linux comparison
+
+Before is baseline commit `11cef310a846dcbbef1aedb67c3103cbbd530ba1`; after is
+the frozen, uncommitted repaired source snapshot. Both used Linux x86_64 with
+an ext4 fixture root (device 66307). Cross-device destinations were separate
+tmpfs mounts (devices 35 and 36) created inside a private user and mount
+namespace. Source and destination devices differed; actual rename returned EXDEV.
+The cross-filesystem traversal option permits nested mounts and does not force
+EXDEV.
+
+The fixture helper verified every input byte before sampling, warming the cache.
+Fixture setup writes were not individually synced and make no durability claim.
+Except for the explicitly marked single 16k builtin result, each measured side
+had five interleaved before/after runs. Every accepted sample passed
+`perf-gate-ready` immediately before and `perf-gate-ready -1` immediately after,
+and passed output verification. No accepted sample overlapped host load. Direct
+engine CPU measures the request operation; builtin CPU covers the whole PTY
+session, while its elapsed time covers command responses; BusyBox CPU includes
+the utility child. These interfaces do not have identical scopes, so compare
+before/after within each interface only.
+
+The table reports CPU seconds as median `[minimum, maximum]`, before → after.
+Every cell has five accepted samples except where marked. Deep BusyBox `cp`
+failed on both versions with `EMFILE` at depth 59 under the workload's 64
+descriptor limit.
+
+| Workload | Engine CPU | Builtin CPU | BusyBox utility CPU |
+| --- | --- | --- | --- |
+| Tiny copy, 32 × 512 B | 0.002799 [0.002760, 0.004939] → 0.006160 [0.006094, 0.006262] | 0.111002 [0.092495, 0.120328] → 0.175803 [0.162965, 0.179869] | cp 0.003559 [0.003472, 0.003696] → 0.003510 [0.003398, 0.003728] |
+| Tiny move, 32 × 512 B | 0.001330 [0.001312, 0.001405] → 0.001343 [0.001326, 0.001380] | 0.111257 [0.104692, 0.114555] → 0.107748 [0.103888, 0.109882] | mv 0.003196 [0.003030, 0.003555] → 0.003162 [0.003018, 0.003301] |
+| Whole-directory rename, 8 MiB payload | 0.000097 [0.000095, 0.000100] → 0.000093 [0.000090, 0.000180] | 0.008363 [0.007475, 0.009659] → 0.007185 [0.006613, 0.008440] | mv 0.000135 [0.000119, 0.000221] → 0.000137 [0.000126, 0.000164] |
+| Wide, 4,096 files / 16 MiB | 0.360678 [0.352058, 0.448751] → 0.408705 [0.334669, 0.420858] | 0.437873 [0.364990, 0.486664] → 0.356620 [0.343212, 0.436063] | cp 0.029001 [0.027498, 0.030772] → 0.030121 [0.028666, 0.031521] |
+| Deep, 96 files / 96 KiB | 0.820345 [0.797429, 0.821947] → 0.303836 [0.294456, 0.322758] | 0.838167 [0.791870, 0.865093] → 0.303297 [0.302086, 0.393618] | cp: `EMFILE` on both versions |
+| Hardlink group plus ordinary files, 274 names | 0.010288 [0.010022, 0.019579] → 0.022315 [0.021917, 0.022762] | 0.021009 [0.019544, 0.022467] → 0.032927 [0.031984, 0.035386] | cp 0.002738 [0.002635, 0.002939] → 0.002817 [0.002616, 0.002845] |
+| Dry run, 64 branches / 20 MiB input | 0.078566 [0.077790, 0.098706] → 0.045913 [0.044641, 0.060236] | 0.204548 [0.194005, 0.241141] → 0.130923 [0.122226, 0.136788] | not applicable |
+| Cross flat, 1,024 files / 4 MiB | 1.722366 [1.630759, 1.870485] → 0.230708 [0.189096, 0.257706] | 1.253761 [1.207061, 1.589326] → 0.210612 [0.204808, 0.339772] | mv 0.010271 [0.009458, 0.012143] → 0.009906 [0.009659, 0.011624] |
+| Cross flat, 4,096 files / 16 MiB | 21.157331 [20.606647, 22.018969] → 0.856117 [0.812355, 0.898678] | 18.014676 [17.559632, 18.548841] → 0.888138 [0.886525, 1.185642] | mv 0.044182 [0.039704, 0.049238] → 0.042277 [0.040510, 0.044699] |
+| Cross flat, 16,384 files / 64 MiB | baseline timed out → 3.837106 [3.798347, 4.029907] | baseline timed out → 4.188633 (one accepted sample) | mv 0.180222 [0.178781, 0.185178] → 0.181343 [0.179197, 0.197923] |
+
+Cross-flat wall elapsed seconds are medians `[minimum, maximum]`, before →
+after:
+
+| Workload | Engine | Builtin | BusyBox `mv` |
+| --- | --- | --- | --- |
+| 1k | 13.676 [11.453, 14.685] → 6.704 [2.509, 11.854] | 2.658 [2.588, 10.523] → 1.657 [1.602, 9.249] | 0.0103 [0.0095, 0.0122] → 0.0099 [0.0097, 0.0117] |
+| 4k | 26.958 [26.405, 59.909] → 6.626 [6.384, 7.663] | 24.388 [22.951, 36.882] → 7.623 [6.418, 21.865] | 0.0446 [0.0402, 0.0497] → 0.0424 [0.0410, 0.0449] |
+| 16k | timeout → 34.913 [26.090, 43.528] | timeout → 38.067 (one accepted sample) | 0.1862 [0.1846, 0.1918] → 0.1874 [0.1818, 0.2290] |
+
+The before engine and builtin each stopped after one timeout with a passing
+after-gate. A second candidate builtin attempt was terminated before it emitted
+a sample record and its owned fixture was cleaned; it is not a result. No
+same-side timeout was retried.
+
+The engine used four jobs for unconstrained workloads and two for wide, deep,
+and dry-run-wide; the constrained workloads used a 64-descriptor soft limit and
+1 GiB address-space limit. Other samples used a 1,024-descriptor limit. Engine
+configuration was a 256 KiB transfer buffer, 256-entry work queue, and 64 MiB
+record-memory budget. The hardlink fixture has 18 names to one inode plus 256
+ordinary files; engine and builtin output checks verified the group remained
+linked and ordinary files remained separate. Dry-run-wide discovered 6,208
+entries, skipped 5,120, completed none, failed none, and left the source and
+destination unchanged. The whole-directory rename discovered and completed
+one entry, confirming it did not enumerate the 8 MiB subtree.
+
+For cross-flat, all engine samples used the buffered move path: 1,024, 4,096,
+and 16,384 files plus one root directory were discovered and completed, with
+4, 16, and 64 MiB streamed. Same-filesystem tiny-copy, wide, deep, and hardlink
+fixtures selected Native (32, 4,096, 96, and 257 data copies respectively); no
+Clone method succeeded.
+Median engine source-retirement elapsed was 13.645 → 6.643 s at 1k and
+26.859 → 6.386 s at 4k; the corresponding 16k candidate median was 33.896 s.
+`transfer_elapsed`, `destination_sync_work`, and source-retirement timings are
+phase measurements and must not be added. The indexed record-lookup regression
+checks also reduced measured record visits from 8,256 / 32,896 at 128 / 256
+records to 1,794 / 4,098. An untimed baseline `strace -f -c` profile of the
+274-entry hardlink sample reported 601 futex calls, 79.87% of traced syscall
+time; tracing overhead excludes it from the timing table. Physical I/O was
+unavailable to the runner.
+
+Median engine phase seconds are listed separately; sync work sums calls and can
+overlap transfer, so these are not additive totals:
+
+| Files | Version | Transfer elapsed | Destination sync work | Source retirement elapsed |
+| --- | --- | --- | --- | --- |
+| 1,024 | before | 0.030500 | 0.000115 | 13.645423 |
+| 1,024 | after | 0.061499 | 0.000119 | 6.642580 |
+| 4,096 | before | 0.098813 | 0.000427 | 26.858591 |
+| 4,096 | after | 0.239977 | 0.000427 | 6.386377 |
+| 16,384 | after | 1.015658 | 0.001412 | 33.895723 |
+
+Cross-device retirement and deep traversal use less CPU in these samples;
+tiny-move and isolated rename show no material CPU change. Tiny-copy and mixed
+hardlink copies use more CPU, with nonoverlapping ranges: the extra output-version
+validation and indexed coordination add small-operation cost. These results do
+not establish a universal speedup. Wide-copy ranges overlap. The deterministic
+concurrency test establishes that unrelated data phases overlap; this small
+hardlink timing fixture does not show a throughput win.
+
+Observed `getrusage` peak RSS across accepted samples ranged from 11,177,984 to
+11,243,520 bytes before and 11,177,984 to 11,505,664 bytes after for engine and
+builtin runs; native utility ranges were 11,243,520 bytes for `cp` and
+11,177,984 to 11,505,664 bytes for `mv`. These are process high-water values,
+not polled instantaneous peaks. The rebuilt baseline and candidate `ish`
+binaries were 2,196,792 and 2,255,160 bytes, a 58,368-byte increase. Both
+release test-runner builds passed readiness checks immediately before and
+after. Baseline took 9.58 s elapsed / 9.04 s user / 0.75 s system; candidate
+took 20.52 s / 38.16 s / 2.02 s. Different isolated targets and cache states
+make these single-build figures noncomparative.
+
+BusyBox `cp` and `mv` are context only: `cp` is not clone-aware, and these
+utility samples do not verify the engine's durability guarantee. No comparison
+across engine, PTY builtin, and native utility timings is claimed.

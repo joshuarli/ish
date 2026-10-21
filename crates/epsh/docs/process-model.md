@@ -39,6 +39,21 @@ runs in a logical pipeline or command substitution. This also covers evaluator
 paths that continue in the current process. Alias expansion belongs to the
 embedding shell; the expanded command name is checked by the same rule.
 
+A one-command negated pipeline such as `! cp` does not create a pipeline child,
+so a parent-process command can run in the Shell's owner process. epsh then
+applies the usual status inversion. A refusal inside a real pipeline or command
+substitution still writes its diagnostic and stops before target effects. The
+refusal returns status 2, and `!` applies its usual inversion to that status.
+Cancellation and timeout propagate as control-flow errors. Negation does not
+invert them or continue the list.
+
+An embedder can register command lookup identity separately with
+`Shell::set_command_identity(name, CommandIdentity::Builtin)`. The identity
+table owns the name bytes and is empty by default. `command -v`, `command -V`,
+and `type` report registered names as shell builtins. Identity does not affect
+dispatch or process placement. Names containing `/` are resolved as paths and
+do not use identity metadata.
+
 The optional redirect-open handler owns only the opening of writable targets:
 truncating output, forced output, append output, and read/write redirections.
 It must honor the requested create, truncate, append, or read-write mode. Input

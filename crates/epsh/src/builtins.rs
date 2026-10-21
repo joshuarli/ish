@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::error::{ExitStatus, ShellError, Span};
-use crate::eval::Shell;
+use crate::eval::{CommandIdentity, Shell};
 use crate::parser::Parser;
 use crate::shell_bytes::ShellBytes;
 use crate::sys;
@@ -662,7 +662,9 @@ impl Shell {
                     if verbose {
                         if self.functions.contains_key(name.as_str()) {
                             self.write_out(&format!("{name} is a function\n"));
-                        } else if is_builtin(name) {
+                        } else if is_builtin(name)
+                            || self.command_identity(name) == Some(CommandIdentity::Builtin)
+                        {
                             self.write_out(&format!("{name} is a shell builtin\n"));
                         } else if let Ok(path) = self.which(name) {
                             self.write_out(&format!("{name} is {path}\n"));
@@ -670,7 +672,10 @@ impl Shell {
                             self.err_msg(&format!("{name}: not found"));
                             status = ExitStatus::FAILURE;
                         }
-                    } else if self.functions.contains_key(name.as_str()) || is_builtin(name) {
+                    } else if self.functions.contains_key(name.as_str())
+                        || is_builtin(name)
+                        || self.command_identity(name) == Some(CommandIdentity::Builtin)
+                    {
                         self.write_out(&format!("{name}\n"));
                     } else if let Ok(path) = self.which(name) {
                         self.write_out(&format!("{path}\n"));
@@ -702,7 +707,9 @@ impl Shell {
         for name in &args[1..] {
             if self.functions.contains_key(name.as_str()) {
                 self.write_out(&format!("{name} is a function\n"));
-            } else if is_builtin(name) {
+            } else if is_builtin(name)
+                || self.command_identity(name) == Some(CommandIdentity::Builtin)
+            {
                 self.write_out(&format!("{name} is a shell builtin\n"));
             } else if let Ok(path) = self.which(name) {
                 self.write_out(&format!("{name} is {path}\n"));
@@ -716,6 +723,15 @@ impl Shell {
 
     fn which(&self, name: &str) -> Result<String, ()> {
         let name_bytes = ShellBytes::from_str_lossless(name);
+        if name_bytes.as_bytes().contains(&b'/') {
+            let path = name_bytes.to_path_buf();
+            let candidate = if path.is_absolute() {
+                path
+            } else {
+                self.cwd.join(path)
+            };
+            return candidate.is_file().then(|| name.to_owned()).ok_or(());
+        }
         let path = self
             .vars
             .get_bytes("PATH")

@@ -34,12 +34,13 @@ device and creates one owned child there. Pass the printed cross root and
 identity to `verify`, `cleanup`, and `measure`. It never removes the mounted
 parent.
 
-Base fixture preparation writes about 267 MiB of real file data and creates a
+Base fixture preparation writes about 307 MiB of real file data and creates a
 1 GiB sparse file with three 1 KiB extents. A designated cross-device setup
-adds one 64 MiB source file on the main filesystem. Verification reads every
-real data byte, checks the sparse holes and extents, checks hardlink identity,
-and checks that the same-filesystem move fixture shares a device with its
-destination. Verification makes the file cache warm. It does not drop caches.
+adds a 64 MiB file and 16,384 4 KiB files on the main filesystem. Verification
+reads every real data byte, checks the sparse holes and extents, checks
+hardlink identity, and checks that the same-filesystem move fixture shares a
+device with its destination. Verification makes the file cache warm. It does
+not drop caches.
 
 ## Fixture shapes
 
@@ -50,12 +51,14 @@ destination. Verification makes the file cache warm. It does not drop caches.
 | Nested tree | 8 directory levels, 32 files of 256 KiB per level | One large nested subtree |
 | Deep tree | 96 directory levels, one 1 KiB file per level | Traversal with a tight descriptor limit |
 | Wide tree | 64 directories with 64 files of 4 KiB each | Traversal with a tight descriptor and address-space limit |
+| Dry-run wide merge | 64 branches with 64 colliding 4 KiB files and a 16-level chain per branch; each destination branch also has an extra file | Skip collisions through a wide and deep merge without writing |
 | Large copy | One 128 MiB patterned file | Real bytes, clone-capable copy when the filesystem and method counters confirm it, and buffered fallback |
 | Sparse copy | One 1 GiB logical file with three written extents | Sparse extent copy and trailing-hole preservation |
 | Same-filesystem move | A nested directory with an 8 MiB leaf | Rename path with a non-empty descendant tree |
 | Cross-filesystem move | One 64 MiB patterned file | Only available with an explicitly designated different-device mount below `.work/tmp` |
+| Cross-filesystem flat move | 1,024, 4,096, or 16,384 files of 4 KiB | Many small files moved to an explicitly designated different-device mount |
 | Merge | Eight branches with 32 MiB of new files and 2 MiB of existing files | Explicit merge with nonconflicting subtrees |
-| Hardlinks | Two names for one 4 KiB inode | Invocation-wide hardlink preservation |
+| Hardlinks | 18 names for one 4 KiB inode and 256 ordinary 4 KiB files | Invocation-wide hardlink preservation mixed with ordinary files |
 | Progress | 4,096-file wide tree, 16 MiB | Actual PTY runs. The enabled run must show a terminal progress line. |
 
 Fixture validation proves that the inputs exist and have the stated shape. It
@@ -114,20 +117,24 @@ ISH_FS_BENCH_FEATURES_READY=1 benches/fs/bench.sh measure \
 
 Use one workload name instead of `all` for a focused matrix. Names are
 `tiny-copy`, `tiny-move`, `flat`, `nested`, `deep`, `wide`, `large`, `clone`,
-`sparse`, `hardlinks`, `rename`, `cross`, `merge`, `progress-on`, and
-`progress-off`.
+`sparse`, `hardlinks`, `rename`, `cross`, `cross-flat-1k`, `cross-flat-4k`,
+`cross-flat-16k`, `merge`, `dry-run-wide`, `progress-on`, and `progress-off`.
 
 Every workload collects five accepted alternating runs for the engine and
-actual interactive builtin, plus the available native utility side. Copy sides use
-the host `cp`; move sides use `mv`. GNU clone-aware `cp` and Apple `cp -c` are
-additional sides for large, clone, and sparse workloads when the utility
-supports them. Cross-device runs are skipped unless the designated root has a
-different device. Each sample prepares its unique inputs and destination before
-the one-attempt readiness check. A timed sample passes that check immediately
+actual interactive builtin. Copy workloads include the available host `cp`
+side, and move workloads include the available host `mv` side. `dry-run-wide`
+has no native utility side because `cp` and `mv` do not provide a matching
+dry-run operation. GNU clone-aware `cp` and Apple `cp -c` are additional sides
+for large, clone, and sparse workloads when the utility supports them.
+Cross-device workloads are skipped unless the designated root has a different
+device. Each sample prepares its unique inputs and destination before the
+one-attempt readiness check. A timed sample passes that check immediately
 before execution and `perf-gate-ready -1` immediately after. Overlapping samples
 are discarded. After three busy checks, measurement stops and reports
-`perf gate deferred: host busy`. The runner never drops caches, reports
-warm-cache samples only, and verifies outputs after each post-sample check.
+`perf gate deferred: host busy`. Dry-run samples reuse their read-only source
+and destination fixture. Other samples prepare their paths before timing. The
+runner never drops caches, reports warm-cache samples only, and verifies
+outputs after each post-sample check.
 
 Each accepted sample prints one `fs_bench_sample` record. It labels the elapsed
 scope: engine request calls, interactive command responses, or native utility

@@ -1,8 +1,12 @@
 # Implement native `cp` and `mv` in ish
 
-Status: implementation integrated and available local verification passed.
-Acceptance remains blocked by unavailable native evidence and pre-existing
-workspace lint failures. Independent implementation work is finished.
+Status: repairs implemented and local gates passed against audited baseline
+`11cef310a846dcbbef1aedb67c3103cbbd530ba1`. Destination-version receipts,
+symlink hardlinks, indexed records, single-pass dry-run, worker coordination,
+negation/discovery, supported builds, and macOS source repairs are integrated.
+Required native acceptance remains pending: successful clone, foreign ownership,
+ARM64 hardware, and macOS execution. See the [acceptance inventory](crates/ish-fs/tests/cases.md)
+and [measurements](benches/fs/results-linux.md). This campaign is not complete.
 
 Deliver dependable native copy and move commands inside ish. Import useful code
 and tests from the existing `../fs` checkout without changing that checkout or
@@ -748,12 +752,15 @@ Append one dated line per consequential executor judgment with the call and reas
 - 2026-10-21: Reserve bounded metadata capture memory when admitting workers. Transfer buffers and thread stacks alone do not cover preservation work.
 - 2026-10-21: Scan buffered sparse fallback in 4 KiB windows and warn when destination block accounting reports dense allocation for a sparse source. The warning reports observed accounting, not a filesystem capability or physical-I/O guarantee.
 - 2026-10-21: Use fallible foreground worker creation so process-limit failures return an operational error before transfer. Keep the watchdog tied to advancing progress rather than heartbeat traffic.
-- 2026-10-21: The final Linux release binary is 2,196,792 bytes versus 1,850,456 bytes at the starting revision. The 346,336-byte increase supplies the required native operations and controller; no external dependency was added. These single builds establish size, not a speed comparison. Final release compilation used 17.95 seconds of user CPU and 0.71 seconds of system CPU; readiness passed immediately before and after the build.
+- 2026-10-21: The original campaign Linux release binary was 2,196,792 bytes versus 1,850,456 bytes at the starting revision. The 346,336-byte increase supplies the required native operations and controller; no external dependency was added. These single builds establish size, not a speed comparison. Final release compilation used 17.95 seconds of user CPU and 0.71 seconds of system CPU; readiness passed immediately before and after the build.
 
 ## Campaign log
 
 Append one line per phase end with passed or blocked acceptance and the next action.
 Use this section as the campaign checklist.
+
+Entries before the repair campaign describe the original checked snapshots.
+The audit at `11cef310` invalidated their claim that independent work was finished.
 
 - 2026-10-21 P0 underway: G1 parity inventory integrated in `crates/ish-fs/tests/cases.md`; G2 focused baselines passed (8 dispatch, 6 embedding-policy tests). G0 foundation integrated and 4 focused regressions passed; P/L/A/E/S/C implementation underway. Native macOS, successful clone, genuine EXDEV, and privileged mount evidence remain blocked by available host/filesystems. No performance acceptance claimed.
 
@@ -764,6 +771,19 @@ Use this section as the campaign checklist.
 - 2026-10-21 P2 final: integrated workspace library/integration tests passed, including all 150 PTY tests and the isolated thread-start failure regression. Strict focused Linux Clippy, macOS library all-target Clippy, and macOS shell cross-compilation passed. Semantic verification, mutation checks, shift refinement and retained conformance passed. Full workspace strict Clippy remains blocked by the unchanged `fdu` failures recorded above; native guarantees remain blocked, not inferred from cross-compilation.
 - 2026-10-21 P3 exploratory evidence: five readiness-valid interleaved samples per available side cover all 14 non-cross workloads, with output verification and memory/binary measurements. Readiness checks passed; no busy or overlapping sample was accepted. BusyBox deep copy fails at the retained descriptor limit. Cross-device measurements, successful clone comparisons, Apple/GNU baselines and native macOS remain unavailable. `benches/fs/results-linux.md` records scope differences and variation; no speedup, tuning or P3 acceptance is claimed.
 - 2026-10-21 X final: campaign review and two killed safety mutants passed; unused imported engines and external dependencies were excluded. All independent work is integrated on `master` without commits or pushes, and the sibling checkout is unchanged. Dirty detached lane worktrees remain under `.work/wt/` for review. Campaign acceptance and release readiness remain blocked by the native evidence and workspace lint items above; owner product decisions are not pending.
+- 2026-10-21 repair underway: reproduce and repair destination-version receipt resets, hardlinked symlinks, quadratic record lookup and dry-run enumeration, hardlink lock scope, unary negation and command discovery, ARM64 musl binding and blocking source lints, and macOS clone access/cancellation/accounting. Six disjoint patch lanes own these repairs. Private user and mount namespaces support disposable tmpfs and same-device bind fixtures below `.work/`; baseline genuine EXDEV and nested-copy tests executed successfully there. Repeat on the integrated repair and record capability skips explicitly.
+
+- 2026-10-21 repair correctness passed: publication and merge receipts retain successful output versions; content/mode/access-metadata and alias mutations retain sources. Symlink hardlinks preserve topology across operands, skips, merges, and genuine EXDEV/rename mixtures. Independent review reproduced both mixed bind-mount counterexamples and verified their repairs. Twenty-two named engine repair tests pass; the immutable deferred-metadata case explicitly skips for EPERM here.
+- 2026-10-21 repair scaling passed: indexed records replace quadratic scans (128/256-entry lookup work 8,256/32,896 before, 1,794/4,098 after including index construction); dry-run reads each directory entry once without scratch state. Per-inode ownership releases the global mutex before data/sync/events; gated tests verify unrelated transfers overlap and failure/cancellation wakes aliases. Isolated exact directory rename still needs neither traversal nor scratch. Multi-source/merge rename coupling uses a bounded lazy index and conditional transfer to preserve hardlinks.
+- 2026-10-21 repair platform evidence passed: private user/mount namespaces provide real ext4-to-tmpfs EXDEV, nested tmpfs, and same-device bind mounts. `benches/fs/native-fixtures.sh` executes preservation/retirement, refusal/explicit traversal, EBUSY mountpoint retirement, and eight mixed hardlink scenarios. Foreign-owner setup explicitly skips because the single-ID namespace cannot chown uid 65534. FICLONE returns EOPNOTSUPP on the available ext4 filesystem.
+- 2026-10-21 repair integration passed: workspace check, strict all-target Clippy, workspace library/integration tests (152 PTY cases), make test, conformance (168 passed, seven retained exclusions), make verify (68 theorem links and four compiled mutants), and Linux shift refinement. Full workspace strict all-target Clippy also passes for aarch64 Linux musl and aarch64 macOS. Selected ARM64 musl engine/native/policy/preservation/publication/move tests execute under QEMU; self-spawning limit/umask fixtures execute directly as isolated emulated children. This is not ARM64 hardware or macOS native evidence.
+- 2026-10-21 repair boundaries: owned epsh command identity is additive and separate from placement; unary negation preserves parent execution, ordinary status inversion, refusal effects, and cancellation 130. Private transfer records/intents are version 2 with indexed output observations; unknown version 1 is rejected rather than silently reused. macOS clone access normalization and native-data cancellation compile; resource forks use bounded positioned descriptor I/O, with an identity-gated named-stream path above 4 GiB still requiring native validation. No dependencies, toolchain pins, workflows, commits, pushes, or sibling changes.
+
+- 2026-10-21 repair measurement evidence: five readiness-valid interleaved samples per version at 1k/4k real EXDEV files verify exact outputs. At 4k files, engine CPU median changes from 21.157 s to 0.856 s with the same Buffered method and 16 MiB streamed; source retirement dominates the original path. The 16k baseline engine reaches the 120 s bound without verified completion, so no numerical duration is claimed for it. Full ranges, fixture limits, utility policy differences and remaining matrix results are in `benches/fs/results-linux.md`.
+
+- 2026-10-21 repair measurement close: candidate 16k engine completes five verified runs, CPU median 3.837 s (3.798–4.030), elapsed median 34.913 s (26.090–43.528), 16,385 entries and 64 MiB streamed. Baseline engine and builtin each time out once at 120 s; no timeout becomes a measurement. One candidate 16k builtin completes; a second attempt interrupted at the driver stop is excluded and cleaned up. Repeated tiny-move results show no material CPU change. No accepted sample overlaps load and all timing readiness gates pass. Native clone and unavailable utility/platform comparisons remain pending.
+
+- 2026-10-21 repair size/build evidence: fresh baseline `11cef310` and candidate release binaries are 2,196,792 and 2,255,160 bytes (+58,368 bytes). No dependency was added. Single readiness-valid release runner builds took 9.58 s elapsed / 9.04 s user / 0.75 s system before and 20.52 s / 38.16 s / 2.02 s after; isolated targets and different cache states prevent attributing a build-time delta. Tiny-copy and hardlink samples regress in CPU, as the report records; validation guarantees remain intact.
 
 ## For the owner afterwards
 

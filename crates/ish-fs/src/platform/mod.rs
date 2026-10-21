@@ -2,6 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 
 use rustix::fd::BorrowedFd;
+#[cfg(target_os = "linux")]
 use rustix::io::Errno;
 
 mod metadata;
@@ -32,6 +33,7 @@ pub(crate) struct CopyStats {
     pub streamed_bytes: u64,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AccelerationError {
     Unsupported,

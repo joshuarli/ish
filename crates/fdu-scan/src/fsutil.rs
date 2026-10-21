@@ -173,8 +173,6 @@ fn raise_soft_nofile_limit() -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-
-
 pub(crate) fn raise_descriptor_limit(cap: u64) -> usize {
     let limit = getrlimit(Resource::Nofile);
     let target = limit.maximum.map_or(cap, |maximum| maximum.min(cap));

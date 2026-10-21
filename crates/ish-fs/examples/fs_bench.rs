@@ -9,6 +9,10 @@ const MARKER: &str = ".ish-fs-bench-owner";
 const SMALL_BYTES: u64 = 4096;
 const LARGE_BYTES: u64 = 128 * 1024 * 1024;
 const SPARSE_BYTES: u64 = 1024 * 1024 * 1024;
+const CROSS_FLAT_FILES: u64 = 16_384;
+const DRY_RUN_BRANCHES: u64 = 64;
+const DRY_RUN_BRANCH_FILES: u64 = 64;
+const DRY_RUN_DEPTH: u64 = 16;
 const MAX_SPARSE_ALLOCATED_BYTES: u64 = 16 * 1024 * 1024;
 const PATTERN_CHUNK: usize = 64 * 1024;
 
@@ -301,13 +305,53 @@ fn create_fixtures(root: &Path) -> io::Result<()> {
     fs::create_dir_all(wide.join("destination"))?;
     for branch in 0..64_u64 {
         let branch_root = wide.join("source").join(format!("branch-{branch:02}"));
+        let destination_branch = wide.join("destination").join(format!("branch-{branch:02}"));
         fs::create_dir(&branch_root)?;
+        fs::create_dir(&destination_branch)?;
         for index in 0..64_u64 {
             write_pattern(
                 &branch_root.join(format!("item-{index:02}")),
                 SMALL_BYTES,
                 branch * 1000 + index,
             )?;
+            write_pattern(
+                &destination_branch.join(format!("item-{index:02}")),
+                SMALL_BYTES,
+                branch * 1000 + index + 1_000_000,
+            )?;
+        }
+    }
+
+    let dry_run = root.join("dry-run");
+    fs::create_dir_all(dry_run.join("source"))?;
+    fs::create_dir_all(dry_run.join("destination"))?;
+    for branch in 0..DRY_RUN_BRANCHES {
+        let branch_name = format!("branch-{branch:02}");
+        let source_branch = dry_run.join("source").join(&branch_name);
+        let destination_branch = dry_run.join("destination").join(&branch_name);
+        fs::create_dir(&source_branch)?;
+        fs::create_dir(&destination_branch)?;
+        for index in 0..DRY_RUN_BRANCH_FILES {
+            let name = format!("item-{index:02}");
+            write_pattern(&source_branch.join(&name), SMALL_BYTES, branch * 1000 + index)?;
+            write_pattern(&destination_branch.join(&name), SMALL_BYTES, branch * 1000 + index + 1_000_000)?;
+        }
+        write_pattern(&destination_branch.join("destination-only"), SMALL_BYTES, branch + 2_000_000)?;
+        let mut source = source_branch.join("deep");
+        let mut destination = destination_branch.join("deep");
+        fs::create_dir(&source)?;
+        fs::create_dir(&destination)?;
+        for depth in 0..DRY_RUN_DEPTH {
+            let seed = branch * 1000 + depth + 100_000;
+            write_pattern(&source.join("leaf"), SMALL_BYTES, seed)?;
+            write_pattern(&destination.join("leaf"), SMALL_BYTES, seed + 1_000_000)?;
+            if depth + 1 < DRY_RUN_DEPTH {
+                let directory = format!("d{depth:02}");
+                source.push(&directory);
+                destination.push(directory);
+                fs::create_dir(&source)?;
+                fs::create_dir(&destination)?;
+            }
         }
     }
 
@@ -347,10 +391,16 @@ fn create_fixtures(root: &Path) -> io::Result<()> {
     fs::create_dir_all(hardlinks.join("source"))?;
     fs::create_dir_all(hardlinks.join("destination"))?;
     write_pattern(&hardlinks.join("source").join("first"), SMALL_BYTES, 8801)?;
-    fs::hard_link(
-        hardlinks.join("source").join("first"),
-        hardlinks.join("source").join("alias"),
-    )?;
+    for index in 0..16_u64 {
+        fs::hard_link(
+            hardlinks.join("source").join("first"),
+            hardlinks.join("source").join(format!("group-{index:02}")),
+        )?;
+    }
+    fs::hard_link(hardlinks.join("source").join("first"), hardlinks.join("source").join("alias"))?;
+    for index in 0..256_u64 {
+        write_pattern(&hardlinks.join("source").join(format!("ordinary-{index:03}")), SMALL_BYTES, 9900 + index)?;
+    }
 
     let same_fs = root.join("same-fs-move");
     fs::create_dir_all(same_fs.join("destination-parent"))?;
@@ -457,7 +507,13 @@ fn cleanup_cross(root: &Path, identity: (u64, u64), owner: (u64, u64)) -> io::Re
 fn create_local_cross_source(root: &Path) -> io::Result<()> {
     let source = root.join("cross-source/source");
     fs::create_dir_all(&source)?;
-    write_pattern(&source.join("payload"), 64 * 1024 * 1024, 9901)
+    write_pattern(&source.join("payload"), 64 * 1024 * 1024, 9901)?;
+    let flat = source.join("flat");
+    fs::create_dir(&flat)?;
+    for index in 0..CROSS_FLAT_FILES {
+        write_pattern(&flat.join(format!("item-{index:05}")), SMALL_BYTES, 10_000 + index)?;
+    }
+    Ok(())
 }
 
 fn verify_local_cross_source(root: &Path) -> io::Result<()> {
@@ -465,7 +521,11 @@ fn verify_local_cross_source(root: &Path) -> io::Result<()> {
         &root.join("cross-source/source/payload"),
         64 * 1024 * 1024,
         9901,
-    )
+    )?;
+    for index in 0..CROSS_FLAT_FILES {
+        verify_pattern(&root.join("cross-source/source/flat").join(format!("item-{index:05}")), SMALL_BYTES, 10_000 + index)?;
+    }
+    Ok(())
 }
 
 fn write_pattern(path: &Path, length: u64, seed: u64) -> io::Result<()> {
@@ -482,7 +542,6 @@ fn write_pattern(path: &Path, length: u64, seed: u64) -> io::Result<()> {
         file.write_all(&bytes[..count])?;
         offset += count as u64;
     }
-    file.sync_all()?;
     Ok(())
 }
 
@@ -578,8 +637,33 @@ fn verify_fixtures(root: &Path) -> io::Result<()> {
     }
     for branch in 0..64_u64 {
         let directory = root.join("wide/source").join(format!("branch-{branch:02}"));
+        let destination = root.join("wide/destination").join(format!("branch-{branch:02}"));
         for index in 0..64_u64 {
             verify_pattern(&directory.join(format!("item-{index:02}")), SMALL_BYTES, branch * 1000 + index)?;
+            verify_pattern(&destination.join(format!("item-{index:02}")), SMALL_BYTES, branch * 1000 + index + 1_000_000)?;
+        }
+    }
+    for branch in 0..DRY_RUN_BRANCHES {
+        let branch_name = format!("branch-{branch:02}");
+        let source_branch = root.join("dry-run/source").join(&branch_name);
+        let destination_branch = root.join("dry-run/destination").join(&branch_name);
+        for index in 0..DRY_RUN_BRANCH_FILES {
+            let name = format!("item-{index:02}");
+            verify_pattern(&source_branch.join(&name), SMALL_BYTES, branch * 1000 + index)?;
+            verify_pattern(&destination_branch.join(&name), SMALL_BYTES, branch * 1000 + index + 1_000_000)?;
+        }
+        verify_pattern(&destination_branch.join("destination-only"), SMALL_BYTES, branch + 2_000_000)?;
+        let mut source = source_branch.join("deep");
+        let mut destination = destination_branch.join("deep");
+        for depth in 0..DRY_RUN_DEPTH {
+            let seed = branch * 1000 + depth + 100_000;
+            verify_pattern(&source.join("leaf"), SMALL_BYTES, seed)?;
+            verify_pattern(&destination.join("leaf"), SMALL_BYTES, seed + 1_000_000)?;
+            if depth + 1 < DRY_RUN_DEPTH {
+                let directory = format!("d{depth:02}");
+                source.push(&directory);
+                destination.push(directory);
+            }
         }
     }
     for branch in 0..8_u64 {
@@ -593,9 +677,13 @@ fn verify_fixtures(root: &Path) -> io::Result<()> {
     verify_pattern(&root.join("large/source/payload"), LARGE_BYTES, 777)?;
     verify_sparse(&root.join("sparse/source/payload"))?;
     verify_pattern(&root.join("hardlinks/source/first"), SMALL_BYTES, 8801)?;
+    for index in 0..256_u64 {
+        verify_pattern(&root.join("hardlinks/source").join(format!("ordinary-{index:03}")), SMALL_BYTES, 9900 + index)?;
+    }
     let first = fs::metadata(root.join("hardlinks/source/first"))?;
     let alias = fs::metadata(root.join("hardlinks/source/alias"))?;
-    if first.dev() != alias.dev() || first.ino() != alias.ino() || first.nlink() < 2 {
+    let last = fs::metadata(root.join("hardlinks/source/group-15"))?;
+    if first.dev() != alias.dev() || first.ino() != alias.ino() || first.dev() != last.dev() || first.ino() != last.ino() || first.nlink() < 18 {
         return Err(io::Error::other("hardlink fixture names do not identify one inode"));
     }
     verify_pattern(&root.join("same-fs-move/source/nested/payload"), 8 * 1024 * 1024, 8810)?;
@@ -614,17 +702,26 @@ fn print_fixture_summary(root: &Path) -> io::Result<()> {
         ("nested", 256, 8 * 32 * 256 * 1024),
         ("deep", 96, 96 * 1024),
         ("wide", 4096, 64 * 64 * SMALL_BYTES),
+        ("dry-run-wide", DRY_RUN_BRANCHES * (DRY_RUN_BRANCH_FILES + DRY_RUN_DEPTH), DRY_RUN_BRANCHES * (DRY_RUN_BRANCH_FILES + DRY_RUN_DEPTH) * SMALL_BYTES),
         ("merge", 1024, 8 * 64 * (64 * 1024 + 4096)),
         ("large", 1, LARGE_BYTES),
         ("sparse", 1, SPARSE_BYTES),
-        ("hardlinks", 2, SMALL_BYTES),
+        ("hardlinks", 274, 274 * SMALL_BYTES),
         ("same-fs-move", 1, 8 * 1024 * 1024),
     ];
     for (name, files, bytes) in rows {
         println!("fixture={name} regular_entries={files} logical_bytes={bytes}");
     }
+    if root.join("cross-source/source/flat").exists() {
+        println!("fixture=cross-flat regular_entries={CROSS_FLAT_FILES} logical_bytes={}", CROSS_FLAT_FILES * SMALL_BYTES);
+    }
     let device = fs::metadata(root)?.dev();
     println!("fixture_device={device}");
+    let cross_bytes = if root.join("cross-source/source/payload").exists() {
+        64 * 1024 * 1024 + CROSS_FLAT_FILES * SMALL_BYTES
+    } else {
+        0
+    };
     println!(
         "fixture_bytes_written={}",
         96 * 512
@@ -632,11 +729,14 @@ fn print_fixture_summary(root: &Path) -> io::Result<()> {
             + 64 * 1024 * 1024
             + 96 * 1024
             + 16 * 1024 * 1024
+            + 16 * 1024 * 1024
+            + DRY_RUN_BRANCHES * (2 * DRY_RUN_BRANCH_FILES + 2 * DRY_RUN_DEPTH + 1) * SMALL_BYTES
             + 8 * 64 * (64 * 1024 + 4096)
             + LARGE_BYTES
             + 3 * 1024
-            + SMALL_BYTES
+            + 257 * SMALL_BYTES
             + 8 * 1024 * 1024
+            + cross_bytes
     );
     Ok(())
 }

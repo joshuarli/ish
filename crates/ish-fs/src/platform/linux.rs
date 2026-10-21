@@ -25,6 +25,11 @@ const COPY_RANGE_CHUNK: usize = 8 * 1024 * 1024;
 const XATTR_CAPTURE_ATTEMPTS: usize = 8;
 const POSIX_ACL_ACCESS: &[u8] = b"system.posix_acl_access";
 const SECURITY_CAPABILITY: &[u8] = b"security.capability";
+#[cfg(target_arch = "aarch64")]
+// The asm-generic ABI assigns fchmodat2 452; pinned libc omits its aarch64 binding.
+const FCHMODAT2_SYSCALL: libc::c_long = 452;
+#[cfg(not(target_arch = "aarch64"))]
+const FCHMODAT2_SYSCALL: libc::c_long = libc::SYS_fchmodat2;
 pub(super) const BLOCKING_FLAGS: u32 = IFlags::APPEND.bits() | IFlags::IMMUTABLE.bits();
 const STRUCTURAL_FLAGS: u32 = 0x0000_0100
     | 0x0000_0200
@@ -51,10 +56,16 @@ const KNOWN_MUTABLE_FLAGS: u32 = IFlags::APPEND.bits()
 
 #[cfg(test)]
 thread_local! {
+    static TEST_DENSE_DESTINATION: Cell<bool> = const { Cell::new(false) };
     static TEST_SKIP_REFLINK: Cell<bool> = const { Cell::new(false) };
     static TEST_SPARSE_SEEK_UNSUPPORTED: Cell<bool> = const { Cell::new(false) };
     static TEST_COPY_RANGE_UNSUPPORTED_AFTER: Cell<Option<u64>> = const { Cell::new(None) };
     static TEST_COPY_RANGE_FAULT_TRIGGERED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_dense_destination_for_test() {
+    TEST_DENSE_DESTINATION.with(|force| force.set(true));
 }
 
 #[cfg(test)]
@@ -171,7 +182,7 @@ fn chmod_held_directory(parent: BorrowedFd<'_>, fd: BorrowedFd<'_>) -> io::Resul
         // AT_EMPTY_PATH applies chmod to that held descriptor.
         let result = unsafe {
             libc::syscall(
-                libc::SYS_fchmodat2,
+                FCHMODAT2_SYSCALL,
                 fd.as_raw_fd(),
             c"".as_ptr(),
                 0o700 as libc::mode_t,
@@ -214,7 +225,13 @@ pub(crate) fn copy_data(
     let result = copy_data_with_source_offset(src, dst, length, scratch, cancel);
     let restore = seek_retry(src, SeekFrom::Start(source_offset));
     match (result, restore) {
-        (Ok(stats), Ok(_)) => Ok(stats),
+        (Ok(stats), Ok(_)) => {
+            #[cfg(test)]
+            if TEST_DENSE_DESTINATION.with(|force| force.replace(false)) && length != 0 {
+                fs::fallocate(dst, fs::FallocateFlags::empty(), 0, length)?;
+            }
+            Ok(stats)
+        },
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(error)) => Err(error.into()),
         (Err(error), Err(restore_error)) => Err(io::Error::new(

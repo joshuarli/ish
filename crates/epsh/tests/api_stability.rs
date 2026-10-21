@@ -85,6 +85,10 @@ fn shell_public_methods() {
         shell_bytes::ShellBytes::from("cp"),
         eval::CommandPlacement::ParentProcess,
     );
+    shell.set_command_identity(
+        shell_bytes::ShellBytes::from("cp"),
+        eval::CommandIdentity::Builtin,
+    );
     shell.set_redirect_open_handler(Box::new(|request: &eval::RedirectOpen<'_>| {
         let _mode: eval::RedirectOpenMode = request.mode;
         None

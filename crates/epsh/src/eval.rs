@@ -246,6 +246,13 @@ pub enum CommandPlacement {
     ParentProcess,
 }
 
+/// How a registered command is reported by command lookup builtins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandIdentity {
+    /// Report the command as a shell builtin.
+    Builtin,
+}
+
 thread_local! {
     static EXTERNAL_COMMAND_CWD: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
@@ -340,6 +347,7 @@ pub struct Shell {
     pub(crate) in_forked_child: bool,
     owner_pid: u32,
     command_placements: FxHashMap<Vec<u8>, CommandPlacement>,
+    command_identities: FxHashMap<Vec<u8>, CommandIdentity>,
     placement_context: PlacementContext,
     /// True when the current eval context will exit after the command completes.
     /// Allows eval_external to exec directly instead of fork+exec (dash's EV_EXIT).
@@ -612,6 +620,7 @@ impl ShellBuilder {
             in_forked_child: false,
             owner_pid: std::process::id(),
             command_placements: FxHashMap::default(),
+            command_identities: FxHashMap::default(),
             placement_context: PlacementContext::default(),
             ev_exit: false,
             cancel: self.cancel,
@@ -841,6 +850,7 @@ impl Shell {
             in_forked_child: false,
             owner_pid: std::process::id(),
             command_placements: FxHashMap::default(),
+            command_identities: FxHashMap::default(),
             placement_context: PlacementContext::default(),
             ev_exit: false,
             cancel: None,
@@ -984,6 +994,14 @@ impl Shell {
                 | crate::builtins::CommandAction::Describe { .. } => return None,
             }
         }
+    }
+
+    pub(crate) fn command_identity(&self, name: &str) -> Option<CommandIdentity> {
+        let name = ShellBytes::from_str_lossless(name);
+        if name.as_bytes().contains(&b'/') {
+            return None;
+        }
+        self.command_identities.get(name.as_bytes()).copied()
     }
 
     /// Check cancellation flag and timeout deadline.
@@ -1160,6 +1178,16 @@ impl Shell {
         placement: CommandPlacement,
     ) {
         self.command_placements.insert(name.into_vec(), placement);
+    }
+
+    /// Register how an expanded command name appears in `command -v`,
+    /// `command -V`, and `type` lookup.
+    ///
+    /// The table owns the command-name bytes. Identity does not affect command
+    /// dispatch or process placement. Names containing `/` are looked up as
+    /// paths.
+    pub fn set_command_identity(&mut self, name: ShellBytes, identity: CommandIdentity) {
+        self.command_identities.insert(name.into_vec(), identity);
     }
 
     /// Install a provider that owns the open of writable redirections
@@ -1405,7 +1433,9 @@ impl Shell {
                     self.tested = true;
                 }
                 let previous_context = self.placement_context;
-                self.placement_context.pipeline_depth += 1;
+                if commands.len() > 1 || !*bang {
+                    self.placement_context.pipeline_depth += 1;
+                }
                 let pipeline_result = self.eval_pipeline(commands);
                 self.placement_context = previous_context;
                 self.tested = saved;
@@ -2078,11 +2108,12 @@ impl Shell {
             );
         }
 
-        if self.opts.pipefail && !pipefail_status.success() {
-            Ok(pipefail_status)
+        let status = if self.opts.pipefail && !pipefail_status.success() {
+            pipefail_status
         } else {
-            Ok(last_status)
-        }
+            last_status
+        };
+        Ok(status)
     }
 
     fn eval_in_subshell(

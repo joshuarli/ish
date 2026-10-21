@@ -9,7 +9,7 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, Condvar};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rustix::fd::{AsFd, BorrowedFd};
@@ -18,9 +18,10 @@ use rustix::fs::{self, Mode, OFlags};
 use crate::policy::{self, Action, PlannedOperand};
 use crate::roots::{self, EntryKind, Observation, Requirement, Root};
 use crate::{CancelReason, Cancellation, Completion, Diagnostic, Event, EventSink, MAX_DESCRIPTORS, MIN_DESCRIPTORS, OperandOutcome, OperandState, Operation, Outcome, Progress, RESERVED_DESCRIPTORS, Request};
-use records::{Record, IndexedRecords};
+use records::{Record, IndexedRecords, Records};
 
 const THREAD_STACK_BYTES: usize = 512 * 1024;
+const WORKER_DESCRIPTORS: usize = if cfg!(target_os = "macos") { 8 } else { 6 };
 
 #[cfg(test)]
 type Hook = std::sync::Arc<dyn Fn(&str) -> io::Result<()> + Send + Sync>;
@@ -43,6 +44,15 @@ struct Invocation<'a> {
     progress: Mutex<Progress>,
     hardlinks: Mutex<Option<IndexedRecords>>,
     self_changes: Mutex<Option<IndexedRecords>>,
+    active_hardlinks: Mutex<std::collections::HashSet<roots::Identity>>,
+    hardlink_ready: Condvar,
+    renamed_trees: Mutex<Option<Records>>,
+    track_renamed_trees: bool,
+    renamed_tree_cursor: AtomicU64,
+    copied_hardlinks: AtomicBool,
+    unverified_directory_rename: AtomicBool,
+    root_discovery_active: Mutex<bool>,
+    root_discovery_ready: Condvar,
     stopped: AtomicBool,
     jobs: usize,
     metrics: Mutex<crate::Metrics>,
@@ -86,6 +96,7 @@ impl Invocation<'_> {
 
     fn checkpoint(&self) -> io::Result<()> {
         cancelled(self.cancellation)?;
+        if self.unverified_directory_rename.load(Ordering::Acquire) { return Err(io::Error::other("prior directory rename lacks validated topology; source retained")); }
         if self.stopped.load(Ordering::Acquire) { Err(io::Error::other("transfer stopped after an error")) } else { Ok(()) }
     }
 
@@ -114,6 +125,41 @@ impl Invocation<'_> {
         changes.as_mut().unwrap().push(&Record { source: PathBuf::new(), destination: PathBuf::new(), observed, published: observed.identity, output: None, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 })
     }
 
+    fn hardlink_record(&self, identity: roots::Identity) -> io::Result<Option<Record>> {
+        match self.hardlinks.lock().unwrap().as_mut() {
+            Some(records) => records.find_identity(identity),
+            None => Ok(None),
+        }
+    }
+
+    fn rename_preserves_hardlinks(&self, source: &Root) -> io::Result<bool> {
+        let observed = source.observed.ok_or_else(|| io::Error::other("rename source missing"))?;
+        if observed.identity.kind == EntryKind::Directory {
+            return if self.copied_hardlinks.load(Ordering::Acquire) { transfer::directory_uses_copied_group(self, source).map(|found| !found) } else { Ok(true) };
+        }
+        if !matches!(observed.identity.kind, EntryKind::RegularFile | EntryKind::Symlink) { return Ok(true); }
+        Ok(self.hardlink_record(observed.identity)?.is_none_or(|record| record.published == observed.identity))
+    }
+
+    fn remember_hardlink(&self, record: &Record) -> io::Result<()> {
+        let mut groups = self.hardlinks.lock().unwrap();
+        if groups.is_none() { *groups = Some(IndexedRecords::new(&self.request.context.scratch)?); }
+        groups.as_mut().unwrap().push(record)?;
+        if record.published != record.observed.identity { self.copied_hardlinks.store(true, Ordering::Release); }
+        Ok(())
+    }
+
+    fn prepare_directory_rename(&self, source: &Root, destination: &Root) -> io::Result<bool> {
+        let observed = source.observed.ok_or_else(|| io::Error::other("rename source missing"))?;
+        if observed.identity.kind != EntryKind::Directory || !self.track_renamed_trees { return Ok(false); }
+        self.require_descriptors(8 + self.index_descriptors() + 1)?;
+        let parent = roots::observe_fd(destination.parent.as_fd())?.identity;
+        let mut trees = self.renamed_trees.lock().unwrap();
+        if trees.is_none() { *trees = Some(Records::new(&self.request.context.scratch)?); }
+        trees.as_mut().unwrap().push(&Record { source: destination.path.clone(), destination: PathBuf::new(), observed, published: observed.identity, output: None, parent: Some(parent), anchor: None, ancestry: Vec::new(), final_flags: 0 })?;
+        Ok(true)
+    }
+
     fn require_descriptors(&self, needed: usize) -> io::Result<()> {
         let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current.unwrap_or(u64::MAX);
         let budget = usize::try_from(limit.saturating_sub(RESERVED_DESCRIPTORS as u64)).unwrap_or(usize::MAX).min(MAX_DESCRIPTORS);
@@ -122,7 +168,7 @@ impl Invocation<'_> {
     }
 
     fn index_descriptors(&self) -> usize {
-        2 * (usize::from(self.hardlinks.lock().unwrap().is_some()) + usize::from(self.self_changes.lock().unwrap().is_some()))
+        2 * (usize::from(self.hardlinks.lock().unwrap().is_some()) + usize::from(self.self_changes.lock().unwrap().is_some())) + usize::from(self.renamed_trees.lock().unwrap().is_some())
     }
 
     fn durable(&self) -> bool { self.request.operation == Operation::Move || self.request.options.durable }
@@ -132,7 +178,7 @@ fn resource_jobs(request: &Request) -> io::Result<usize> {
     let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current.unwrap_or(u64::MAX);
     let budget = usize::try_from(limit.saturating_sub(RESERVED_DESCRIPTORS as u64)).unwrap_or(usize::MAX).min(MAX_DESCRIPTORS);
     if budget < MIN_DESCRIPTORS { return Err(io::Error::other("fewer than 16 descriptors remain after the reservation")); }
-    let descriptor_jobs = ((budget.saturating_sub(10)) / 6).clamp(1, 32);
+    let descriptor_jobs = ((budget.saturating_sub(10)) / WORKER_DESCRIPTORS).clamp(1, 32);
     let memory_jobs = memory_jobs()?;
     let allowed = descriptor_jobs.min(memory_jobs);
     if allowed == 0 {
@@ -160,7 +206,7 @@ pub fn execute(request: &Request, cancellation: &Cancellation, sink: &dyn EventS
         Err(error) => return early_error(request, cancellation, sink, error),
     };
     if let Err(error) = validate_hardlink_devices(&plan.operands) { return early_error(request, cancellation, sink, error); }
-    let invocation = Invocation { request, cancellation, sink, cwd: cwd.as_fd(), progress: Mutex::new(Progress::default()), hardlinks: Mutex::new(None), self_changes: Mutex::new(None), stopped: AtomicBool::new(false), jobs, metrics: Mutex::new(crate::Metrics::default()), descriptor_reservation: std::sync::atomic::AtomicUsize::new(0), #[cfg(test)] hook: HOOK.with(|hook| hook.borrow().clone()) };
+    let invocation = Invocation { request, cancellation, sink, cwd: cwd.as_fd(), progress: Mutex::new(Progress::default()), hardlinks: Mutex::new(None), self_changes: Mutex::new(None), active_hardlinks: Mutex::new(std::collections::HashSet::new()), hardlink_ready: Condvar::new(), renamed_trees: Mutex::new(None), track_renamed_trees: request.options.merge || matches!(&request.operands, crate::Operands::Into { rest, .. } if !rest.is_empty()), renamed_tree_cursor: AtomicU64::new(0), copied_hardlinks: AtomicBool::new(false), unverified_directory_rename: AtomicBool::new(false), root_discovery_active: Mutex::new(false), root_discovery_ready: Condvar::new(), stopped: AtomicBool::new(false), jobs, metrics: Mutex::new(crate::Metrics::default()), descriptor_reservation: std::sync::atomic::AtomicUsize::new(0), #[cfg(test)] hook: HOOK.with(|hook| hook.borrow().clone()) };
     for operand in &plan.operands {
         if cancellation.is_cancelled() {
             invocation.emit(Event::Operand(OperandOutcome { source: operand.source.clone(), destination: operand.destination.clone(), state: OperandState::Cancelled }));
@@ -227,7 +273,7 @@ fn execute_operand(invocation: &Invocation<'_>, operand: &PlannedOperand, into: 
     }
     source.observed = Some(effective);
     if invocation.request.options.dry_run { return dry_run::plan(invocation, &source, &destination, operand.action).map_err(Into::into); }
-    if invocation.request.operation == Operation::Move && operand.action != Action::Merge {
+    if invocation.request.operation == Operation::Move && operand.action != Action::Merge && invocation.rename_preserves_hardlinks(&source)? {
         match rename_object(invocation, &source, &destination, operand.action) {
             Ok(state) => return Ok(state),
             Err(failure) if failure.error.raw_os_error() == Some(libc::EXDEV) => {},
@@ -244,6 +290,7 @@ fn execute_operand(invocation: &Invocation<'_>, operand: &PlannedOperand, into: 
 
 fn rename_object(invocation: &Invocation<'_>, source: &Root, destination: &Root, action: Action) -> Result<OperandState, Failure> {
     invocation.checkpoint()?;
+    let tracked_directory = invocation.prepare_directory_rename(source, destination)?;
     invocation.fault("rename")?;
     anchored::require_unchanged(source.parent.as_fd(), &source.name, source.observed.unwrap())?;
     match action {
@@ -255,16 +302,22 @@ fn rename_object(invocation: &Invocation<'_>, source: &Root, destination: &Root,
         Action::Transfer => crate::platform::rename_noreplace(source.parent.as_fd(), &source.name, destination.parent.as_fd(), &destination.name)?,
         _ => return Err(io::Error::other("invalid rename action").into()),
     }
+    if tracked_directory { invocation.unverified_directory_rename.store(true, Ordering::Release); }
     let expected = source.observed.unwrap();
     let actual = roots::observe(destination.parent.as_fd(), &destination.name).map_err(|error| Failure { state: OperandState::SourcePartiallyRetired, error })?;
-    if actual.identity != expected.identity {
+    let mut renamed_expected = expected;
+    renamed_expected.ctime = actual.ctime;
+    if !anchored::unchanged(renamed_expected, actual) {
         return Err(Failure { state: OperandState::SourcePartiallyRetired, error: io::Error::other("renamed object identity changed") });
     }
-    if actual.identity.kind == EntryKind::RegularFile && actual.links > 1 {
+    if tracked_directory {
+        invocation.fault("renamed_directory_record").map_err(|error| Failure { state: OperandState::SourcePartiallyRetired, error })?;
+        invocation.renamed_trees.lock().unwrap().as_mut().unwrap().set_output(&destination.path, actual).map_err(|error| Failure { state: OperandState::SourcePartiallyRetired, error })?;
+        invocation.unverified_directory_rename.store(false, Ordering::Release);
+    }
+    if matches!(actual.identity.kind, EntryKind::RegularFile | EntryKind::Symlink) && actual.links > 1 {
         invocation.remember_change(actual).map_err(|error| Failure { state: OperandState::SourcePartiallyRetired, error })?;
-        let mut groups = invocation.hardlinks.lock().unwrap();
-        if groups.is_none() { *groups = Some(IndexedRecords::new(&invocation.request.context.scratch)?); }
-        groups.as_mut().unwrap().push(&Record { source: destination.path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(), destination: PathBuf::from(&destination.name), observed: actual, published: actual.identity, output: Some(actual), parent: Some(roots::observe_fd(destination.parent.as_fd())?.identity), anchor: Some(roots::observe_fd(destination.parent.as_fd())?.identity), ancestry: Vec::new(), final_flags: 0 })?;
+        invocation.remember_hardlink(&Record { source: destination.path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(), destination: PathBuf::from(&destination.name), observed: actual, published: actual.identity, output: Some(actual), parent: Some(roots::observe_fd(destination.parent.as_fd())?.identity), anchor: Some(roots::observe_fd(destination.parent.as_fd())?.identity), ancestry: Vec::new(), final_flags: 0 })?;
     }
     invocation.update(|progress| { progress.discovered_files += 1; progress.completed_files += 1; });
     if invocation.request.options.durable {
@@ -296,7 +349,7 @@ impl Drop for Span<'_, '_> {
 fn validate_hardlink_devices(operands: &[PlannedOperand]) -> io::Result<()> {
     let mut known = std::collections::HashMap::new();
     for (index, operand) in operands.iter().enumerate() {
-        if matches!(operand.action, Action::Skip | Action::SameEntry) || operand.source_observed.identity.kind != EntryKind::RegularFile || operand.source_observed.links < 2 { continue; }
+        if matches!(operand.action, Action::Skip | Action::SameEntry) || !matches!(operand.source_observed.identity.kind, EntryKind::RegularFile | EntryKind::Symlink) || operand.source_observed.links < 2 { continue; }
         let identity = operand.source_observed.identity;
         let device = operand.destination_parent.device;
         if let Some(previous) = known.get(&identity) {

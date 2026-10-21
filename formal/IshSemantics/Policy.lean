@@ -222,14 +222,17 @@ inductive TargetPolicy where
   deriving Repr, BEq
 
 inductive PlacementContext where
-  | parent | pipeline | substitution
+  | parent | negatedParent | pipeline | negatedPipeline | substitution | negatedSubstitution
   deriving Repr, BEq, DecidableEq
 
 def decodePlacementContext (name : String) : Except String PlacementContext :=
   match name with
   | "parent" => .ok .parent
+  | "negated-parent" => .ok .negatedParent
   | "pipeline" => .ok .pipeline
+  | "negated-pipeline" => .ok .negatedPipeline
   | "substitution" => .ok .substitution
+  | "negated-substitution" => .ok .negatedSubstitution
   | _ => .error "unknown placement context"
 
 def execName : Exec → String
@@ -243,7 +246,15 @@ def encodeExec : Option Exec → Json
   | some exec => toJson (execName exec)
 
 def placementAllowed (context : PlacementContext) : Bool :=
-  context == .parent
+  context == .parent || context == .negatedParent
+
+def negatedPlacement (context : PlacementContext) : Bool :=
+  context == .negatedParent || context == .negatedPipeline || context == .negatedSubstitution
+
+def enclosingPlacementStatus (context : PlacementContext) (targetStatus : Nat) : Nat :=
+  if negatedPlacement context && targetStatus != 130 then
+    if targetStatus == 0 then 1 else 0
+  else targetStatus
 
 def targetAllowedAt (target : Bytes) (context : PlacementContext) : Bool :=
   dynamicAllowed target && placementAllowed context
@@ -279,6 +290,7 @@ theorem ish_dynamic_shell_state_refusal (target : Bytes) (shell : classify targe
 example : dynamicAllowed "cp".toUTF8.toList = true := by decide +kernel
 example : dynamicAllowed "mv".toUTF8.toList = true := by decide +kernel
 example : decodePlacementContext "pipeline" = .ok .pipeline := by rfl
+example : decodePlacementContext "negated-parent" = .ok .negatedParent := by rfl
 example : decodePlacementContext "parallel" = .error "unknown placement context" := by rfl
 
 theorem cp_foreground_class : classify "cp".toUTF8.toList = some .foreground := by decide +kernel
@@ -289,9 +301,16 @@ theorem foreground_parent_allowed : targetAllowedAt "cp".toUTF8.toList .parent =
 theorem foreground_pipeline_refused : targetAllowedAt "cp".toUTF8.toList .pipeline = false := by decide +kernel
 theorem foreground_substitution_refused : targetAllowedAt "mv".toUTF8.toList .substitution = false := by decide +kernel
 theorem trash_dynamic_refused : dynamicAllowed "trash".toUTF8.toList = false := by decide +kernel
+theorem negated_foreground_parent_allowed : targetAllowedAt "mv".toUTF8.toList .negatedParent = true := by decide +kernel
+theorem negated_foreground_pipeline_refused : targetAllowedAt "mv".toUTF8.toList .negatedPipeline = false := by decide +kernel
+theorem negated_foreground_substitution_refused : targetAllowedAt "mv".toUTF8.toList .negatedSubstitution = false := by decide +kernel
+theorem negated_parent_success_inverts : enclosingPlacementStatus .negatedParent 0 = 1 := by decide +kernel
+theorem negated_pipeline_refusal_inverts : enclosingPlacementStatus .negatedPipeline 2 = 0 := by decide +kernel
+theorem negated_status_preserves_cancellation : enclosingPlacementStatus .negatedPipeline 130 = 130 := by decide +kernel
 
 theorem static_foreground_plan_remains_epsh :
     plan ⟨[.simple [] [literalWord "cp", literalWord "source", literalWord "destination"] []]⟩ = .epsh ∧
+    plan ⟨[.pipeline [.simple [] [literalWord "cp", literalWord "source", literalWord "destination"] []] true]⟩ = .epsh ∧
     plan ⟨[.pipeline [.simple [] [literalWord "cp", literalWord "source", literalWord "destination"] [],
       .simple [] [literalWord "cat"] []] false]⟩ = .epsh ∧
     plan ⟨[.simple [] [literalWord "echo",
@@ -451,9 +470,10 @@ def run (request : Protocol.Request) : Outcome Json :=
       let contextName ← (← request.input.getObjVal? "context").getStr?
       let context ← decodePlacementContext contextName
       let allowed := targetAllowedAt target context
+      let targetStatus := if allowed then (0 : Nat) else 2
       pure (.mkObj [
         ("allowed", toJson allowed),
-        ("status", toJson (if allowed then (0 : Nat) else 2)),
+        ("status", toJson (enclosingPlacementStatus context targetStatus)),
         ("class", encodeExec (classify target))])
     | _ => throw "unknown policy mode"
   match decoded with

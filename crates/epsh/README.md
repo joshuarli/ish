@@ -115,6 +115,13 @@ is refused with status 2 in a pipeline, command substitution, or another
 forked evaluator context. The table owns the command-name bytes. Existing
 embedders keep their current behavior until they register a placement.
 
+Command identity is opt-in and independent of placement. Call
+`Shell::set_command_identity` with an owned `ShellBytes` name and
+`CommandIdentity::Builtin` to report that name as a shell builtin from
+`command -v`, `command -V`, and `type`. This does not change dispatch or
+placement. Names with `/`, such as `/bin/cp`, are looked up as paths without
+using identity metadata or `PATH`.
+
 When an external handler is installed, epsh passes expanded arguments and the
 complete child environment as byte pairs. Redirections have already been
 applied to file descriptors. The environment includes inherited entries unless

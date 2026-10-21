@@ -104,9 +104,16 @@ target runs or opens its redirections. Earlier commands in the input line keep
 their effects. Commands that need shell state, including `alias`, `exit`, `fg`,
 `denv`, and `z`, must be the whole input line. `cd` and `history` can also be
 used in lists. `t` and `trash` must also be the whole input line. Native `cp`
-and `mv` run in lists and support redirections in the shell process. ish refuses
-them in pipelines and command substitutions with status 2 before their target
-redirections or filesystem operations. Argument substitutions are allowed.
+and `mv` run in lists and support redirections in the shell process. Without
+`!`, ish refuses them in pipelines and command substitutions with status 2
+before their target redirections or filesystem operations. Argument
+substitutions are allowed.
+Standalone negation such as `! cp source copy` runs the operation in the shell
+process and inverts its status. Real pipelines and command substitutions still
+refuse native `cp` and `mv` before target redirections or filesystem
+operations. Negation inverts a refusal's status inside a pipeline or command
+substitution, while the diagnostic remains visible. Aliases after `!` expand
+before dispatch.
 Use `command cp` or an alias for the same parent-process operation. An explicit
 path such as `/bin/cp` selects the external program.
 
@@ -135,6 +142,10 @@ ish-specific commands include:
 | `denv` | Trust, revoke, or reload environment files for this directory |
 | `copy-scrollback` | Copy the terminal scrollback through OSC 52 |
 | `ish-dump` | Write the current layout dump |
+
+`command -v` and `command -V` identify registered ish commands as builtins even
+when `PATH` is empty. A command path such as `/bin/cp` is reported and run as
+the external program.
 
 `t PATH` and `trash PATH` scan the directory tree before deleting anything.
 They permanently delete its entries and keep `PATH` itself. The last component

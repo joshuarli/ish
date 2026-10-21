@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
     if index % 16 == 5 {
-        return placement_case(index, placement_target((index / 48) % 3));
+        return placement_case(index, placement_target((index / 96) % 3));
     }
     if index % 4 == 1 {
         return dynamic_case(index, dynamic_target((index / 4) % 12));
@@ -97,10 +97,13 @@ fn dynamic_case(index: usize, target: Vec<u8>) -> BridgeResult<Request> {
 }
 
 fn placement_case(index: usize, target: Vec<u8>) -> BridgeResult<Request> {
-    let context = match (index / 16) % 3 {
+    let context = match (index / 16) % 6 {
         0 => "parent",
-        1 => "pipeline",
-        _ => "substitution",
+        1 => "negated-parent",
+        2 => "pipeline",
+        3 => "negated-pipeline",
+        4 => "substitution",
+        _ => "negated-substitution",
     };
     placement_request(format!("policy-{index:05}"), target, context)
 }
@@ -123,8 +126,11 @@ fn placement_source(context: &str) -> BridgeResult<String> {
     let command = "command command \"$TARGET\" source destination > placement-redirection";
     Ok(match context {
         "parent" => command.to_owned(),
+        "negated-parent" => format!("! {command}"),
         "pipeline" => format!("printf input | {command}"),
+        "negated-pipeline" => format!("! printf input | {command}"),
         "substitution" => format!("value=$({command})"),
+        "negated-substitution" => format!("value=$(! {command})"),
         _ => return Err(BridgeError::new("unknown placement context")),
     })
 }
@@ -343,11 +349,10 @@ fn actual_placement(request: &Request) -> BridgeResult<Value> {
     let context = request.input["context"]
         .as_str()
         .ok_or_else(|| BridgeError::new("placement context is not a string"))?;
-    let parent_context = match context {
-        "parent" => true,
-        "pipeline" | "substitution" => false,
-        _ => return Err(BridgeError::new("unknown placement context")),
-    };
+    let (parent_context, negated) = placement_properties(context)?;
+    let dynamic_allowed =
+        ish::dispatch::check_expanded_command(&ShellBytes::from_vec(target.clone())).is_ok();
+    let target_allowed = parent_context && dynamic_allowed;
     let source = std::str::from_utf8(&request.source)
         .map_err(|_| BridgeError::new("placement source is not UTF-8"))?;
     let program = Parser::new(source)
@@ -392,14 +397,15 @@ fn actual_placement(request: &Request) -> BridgeResult<Value> {
         Ok(epsh::error::ExitStatus::SUCCESS)
     }));
     let status = shell.run_program(&program).code();
-    let expected_status = if parent_context { 0 } else { 2 };
+    let target_status = if target_allowed { 0 } else { 2 };
+    let expected_status = enclosing_placement_status(negated, target_status);
     let policy_called = policy_marker.exists();
     let handler_called = handler_marker.exists();
     let redirected = redirection_path.exists();
     if status != expected_status
-        || policy_called != parent_context
-        || handler_called != parent_context
-        || redirected != parent_context
+        || policy_called != target_allowed
+        || handler_called != target_allowed
+        || redirected != target_allowed
     {
         return Err(BridgeError::new(format!(
             "placement runtime mismatch for {context} target {target:?}: status={status}, policy={policy_called}, handler={handler_called}, redirection={redirected}"
@@ -418,7 +424,7 @@ fn actual_placement(request: &Request) -> BridgeResult<Value> {
     Ok(json!({
         "tag": "success",
         "value": {
-            "allowed": parent_context,
+            "allowed": target_allowed,
             "status": status,
             "class": class,
         },
@@ -472,7 +478,14 @@ pub(crate) fn verify_runtime_hook() -> BridgeResult<()> {
 
 fn verify_runtime_placement() -> BridgeResult<()> {
     let targets = [b"cp".to_vec(), b"mv".to_vec(), vec![0xff]];
-    let contexts = ["parent", "pipeline", "substitution"];
+    let contexts = [
+        "parent",
+        "negated-parent",
+        "pipeline",
+        "negated-pipeline",
+        "substitution",
+        "negated-substitution",
+    ];
     let mut index = 0;
     for target in targets {
         for context in contexts {
@@ -484,7 +497,7 @@ fn verify_runtime_placement() -> BridgeResult<()> {
             validate_case(&request)?;
             let outcome = actual_placement(&request)?;
             if outcome["tag"] != "success"
-                || outcome["value"]["allowed"] != json!(context == "parent")
+                || outcome["value"]["allowed"] != json!(placement_properties(context)?.0)
             {
                 return Err(BridgeError::new("runtime placement probe returned the wrong context result"));
             }
@@ -494,6 +507,8 @@ fn verify_runtime_placement() -> BridgeResult<()> {
     for source in [
         "cp source destination",
         "mv source destination",
+        "! cp source destination",
+        "! mv source destination",
         "printf input | cp source destination",
         "value=$(mv source destination)",
     ] {
@@ -504,6 +519,26 @@ fn verify_runtime_placement() -> BridgeResult<()> {
         }
     }
     Ok(())
+}
+
+fn placement_properties(context: &str) -> BridgeResult<(bool, bool)> {
+    Ok(match context {
+        "parent" => (true, false),
+        "negated-parent" => (true, true),
+        "pipeline" => (false, false),
+        "negated-pipeline" => (false, true),
+        "substitution" => (false, false),
+        "negated-substitution" => (false, true),
+        _ => return Err(BridgeError::new("unknown placement context")),
+    })
+}
+
+fn enclosing_placement_status(negated: bool, target_status: i32) -> i32 {
+    if negated && target_status != 130 {
+        if target_status == 0 { 1 } else { 0 }
+    } else {
+        target_status
+    }
 }
 
 fn program_json(program: &Program) -> Value {

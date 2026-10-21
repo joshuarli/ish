@@ -36,9 +36,11 @@ control per family. A family comparison fails if either side returns
 require those outcomes for invalid environment inputs and a zero-fuel request.
 Policy cases include static `cp` and `mv` routes and run registered
 parent-process targets through epsh in parent, pipeline, and command-substitution
-contexts. The runtime probe checks status, redirection creation, and target
-policy and external-handler callbacks. Run the policy comparison and placement
-probe with `cargo run --example semantic_bridge -p ish -- --family policy --cases 1000`.
+contexts, with and without `!`. The runtime probe checks target admission,
+enclosing status, redirection creation, and target policy and external-handler
+callbacks. In particular, it checks that `!` can return status 0 after a child
+placement refusal without opening the target redirection or invoking callbacks.
+Run the policy comparison and placement probe with `cargo run --example semantic_bridge -p ish -- --family policy --cases 1000`.
 The coverage matrix records each adapter's domain. A detected semantic
 mismatch is reduced and saved under
 `formal/fixtures/bridge-regressions/`.

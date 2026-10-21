@@ -317,8 +317,6 @@ mod posix {
         cancelled: &'a AtomicBool,
         sender: &'a SyncSender<DeleteEvent>,
         after_operation: &'a (dyn Fn(usize) + Sync),
-        #[cfg(test)]
-        before_capture: &'a (dyn Fn(NodeId) + Sync),
         recorded: Vec<AtomicBool>,
         outcomes: Mutex<Vec<DeleteOutcome>>,
         completed: AtomicUsize,
@@ -345,20 +343,7 @@ mod posix {
         threads: usize,
         after_operation: impl Fn(usize) + Sync,
     ) {
-        run_inner(root, plan, cancelled, sender, threads, after_operation, #[cfg(test)] |_| {});
-    }
-
-    #[cfg(test)]
-    pub(super) fn run_with_capture_hook(
-        root: OwnedFd,
-        plan: DeletionPlan,
-        cancelled: Arc<AtomicBool>,
-        sender: SyncSender<DeleteEvent>,
-        threads: usize,
-        after_operation: impl Fn(usize) + Sync,
-        before_capture: impl Fn(NodeId) + Sync,
-    ) {
-        run_inner(root, plan, cancelled, sender, threads, after_operation, before_capture);
+        run_inner(root, plan, cancelled, sender, threads, after_operation);
     }
 
     fn run_inner(
@@ -368,7 +353,6 @@ mod posix {
         sender: SyncSender<DeleteEvent>,
         threads: usize,
         after_operation: impl Fn(usize) + Sync,
-        #[cfg(test)] before_capture: impl Fn(NodeId) + Sync,
     ) {
         let tree: &Tree = &plan.tree;
         let root_record = tree.record(tree.root()).expect("tree has root");
@@ -395,8 +379,6 @@ mod posix {
             cancelled: &cancelled,
             sender: &sender,
             after_operation: &after_operation,
-            #[cfg(test)]
-            before_capture: &before_capture,
             recorded: (0..tree.len()).map(|_| AtomicBool::new(false)).collect(),
             outcomes: Mutex::new(Vec::with_capacity(OUTCOME_BATCH_SIZE)),
             completed: AtomicUsize::new(0),

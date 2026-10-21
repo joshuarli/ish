@@ -177,13 +177,20 @@ fn main() {
         .cwd(cwd)
         .interactive(true)
         .build();
-    for name in builtin::all_builtin_names().filter(|name| {
-        builtin::lookup(name).is_some_and(|spec| spec.exec == builtin::Exec::Foreground)
-    }) {
-        epsh.set_command_placement(
+    for name in builtin::all_builtin_names() {
+        let Some(spec) = builtin::lookup(name) else {
+            continue;
+        };
+        epsh.set_command_identity(
             epsh::shell_bytes::ShellBytes::from(name),
-            epsh::eval::CommandPlacement::ParentProcess,
+            epsh::eval::CommandIdentity::Builtin,
         );
+        if spec.exec == builtin::Exec::Foreground {
+            epsh.set_command_placement(
+                epsh::shell_bytes::ShellBytes::from(name),
+                epsh::eval::CommandPlacement::ParentProcess,
+            );
+        }
     }
     let fs_default_scratch = store_env_os(&epsh, "TMPDIR")
         .map(std::path::PathBuf::from)
@@ -292,7 +299,7 @@ fn main() {
                 shell.session_log.push_str(&line);
                 shell.session_log.push('\n');
 
-                let expanded = shell.aliases.expand_line(&line);
+                let expanded = expand_aliases_for_line(&line, &shell.aliases);
 
                 let plan = match dispatch::plan(&expanded) {
                     Ok(plan) => plan,
@@ -1403,10 +1410,24 @@ enum KeyAction {
     StartCompletion,
 }
 
-/// Expand the first word of each ;/&&/||-separated segment through aliases.
-/// Used to record expanded commands in history (e.g., "g status" → "git status").
 fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
-    aliases.expand_line(line).into_owned()
+    expand_aliases_for_line(line, aliases).into_owned()
+}
+
+fn expand_aliases_for_line<'a>(line: &'a str, aliases: &AliasMap) -> std::borrow::Cow<'a, str> {
+    let trimmed = line.trim_start();
+    let leading = &line[..line.len() - trimmed.len()];
+    if let Some(after_bang) = trimmed.strip_prefix('!')
+        && after_bang.chars().next().is_some_and(char::is_whitespace)
+    {
+        return match aliases.expand_line(&trimmed[1..]) {
+            std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(line),
+            std::borrow::Cow::Owned(expanded) => {
+                std::borrow::Cow::Owned(format!("{leading}!{expanded}"))
+            }
+        };
+    }
+    aliases.expand_line(line)
 }
 
 fn resolve_cd_for_history(line: &str) -> String {
@@ -1639,14 +1660,19 @@ fn navigate_history(
 
 fn try_alias_expand(line: &mut LineBuffer, aliases: &AliasMap) {
     let text = line.text();
-    // Only expand on the first space — if the trimmed text already contains
-    // a space, the alias was already expanded or the user typed arguments.
     let trimmed = text.trim_end();
-    if trimmed.contains(' ') {
+    let mut words = trimmed.split_whitespace();
+    let first = words.next();
+    let command_name = if first == Some("!") {
+        words.next()
+    } else {
+        first
+    };
+    if command_name.is_none() || words.next().is_some() {
         return;
     }
 
-    let expanded = aliases.expand_line(text);
+    let expanded = expand_aliases_for_line(text, aliases);
     if let std::borrow::Cow::Owned(new_text) = expanded {
         line.set(&new_text);
     }

@@ -20,7 +20,7 @@ pub(super) fn retire(invocation: &Invocation<'_>, receipt: DurableReceipt) -> Re
     loop {
         let record = receipt.records.lock().unwrap().next(&mut cursor).map_err(fail)?;
         let Some(record) = record else { break; };
-        validate_destination(&receipt, &record).map_err(fail)?;
+        validate_destination(invocation, &receipt, &record).map_err(fail)?;
         let (parent, name) = source_parent(&receipt, &record).map_err(fail)?;
         let expected = invocation.effective(record.observed).map_err(fail)?;
         anchored::require_unchanged(parent.as_fd(), &name, expected).map_err(fail)?;
@@ -40,8 +40,16 @@ pub(super) fn retire(invocation: &Invocation<'_>, receipt: DurableReceipt) -> Re
             let parent_expected = invocation.effective(parent_record.observed).map_err(|error| failure(error, removed))?;
             if !anchored::unchanged(parent_expected, roots::observe_fd(parent.as_fd()).map_err(|error| failure(error, removed))?) { return Err(failure(io::Error::other("source parent changed before retirement"), removed)); }
         }
-        validate_destination(&receipt, &record).map_err(|error| failure(error, removed))?;
-        let linked_source = if expected.identity.kind == EntryKind::RegularFile && expected.links > 1 { Some(fs::openat(&parent, &name, super::anchored::READ_FILE, rustix::fs::Mode::empty()).map_err(|error| failure(error.into(), removed))?) } else { None };
+        validate_destination(invocation, &receipt, &record).map_err(|error| failure(error, removed))?;
+        let linked_source = if matches!(expected.identity.kind, EntryKind::RegularFile | EntryKind::Symlink) && expected.links > 1 {
+            let flags = if expected.identity.kind == EntryKind::Symlink {
+                #[cfg(target_os = "linux")]
+                { rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC }
+                #[cfg(target_os = "macos")]
+                { rustix::fs::OFlags::from_bits_retain(libc::O_SYMLINK as u32) | rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC }
+            } else { super::anchored::READ_FILE };
+            Some(fs::openat(&parent, &name, flags, rustix::fs::Mode::empty()).map_err(|error| failure(error.into(), removed))?)
+        } else { None };
         let capture = unique_name("retired");
         let intent = unique_name("intent");
         let parent_path = if record.source.as_os_str().is_empty() {
@@ -71,27 +79,32 @@ pub(super) fn retire(invocation: &Invocation<'_>, receipt: DurableReceipt) -> Re
             };
             return Err(failure(error, removed));
         }
+        if linked_source.is_some() { invocation.remember_change(captured).map_err(|error| failure(error, removed))?; }
         if let Err(error) = invocation.fault("after_capture").and_then(|()| invocation.checkpoint()) {
             let restoration = restore(parent.as_fd(), &capture, &name, expected.identity);
             let primary = io::Error::new(error.kind(), format!("{error}; source capture {capture_path:?}, intent {intent_path:?}; restoration {restoration:?}"));
             let primary = if restoration.is_ok() { clean_intent(parent.as_fd(), &intent, intent_identity, primary, &intent_path) } else { primary };
             return Err(failure(primary, removed));
         }
-        if let Err(error) = anchored::require_unchanged(parent.as_fd(), &capture, captured).and_then(|()| validate_destination(&receipt, &record)) {
+        if let Err(error) = anchored::require_unchanged(parent.as_fd(), &capture, captured).and_then(|()| validate_destination(invocation, &receipt, &record)) {
             let restoration = restore(parent.as_fd(), &capture, &name, expected.identity);
             let primary = io::Error::new(error.kind(), format!("{error}; retained source {capture_path:?}, intent {intent_path:?}; restoration {restoration:?}"));
             return Err(failure(if restoration.is_ok() { clean_intent(parent.as_fd(), &intent, intent_identity, primary, &intent_path) } else { primary }, removed));
         }
         let flags = if expected.identity.kind == EntryKind::Directory { AtFlags::REMOVEDIR } else { AtFlags::empty() };
-        if let Err(error) = invocation.fault("before_remove").and_then(|()| anchored::require_unchanged(parent.as_fd(), &capture, captured)).and_then(|()| validate_destination(&receipt, &record)).and_then(|()| fs::unlinkat(&parent, &capture, flags).map_err(Into::into)) {
+        if let Err(error) = invocation.fault("before_remove").and_then(|()| anchored::require_unchanged(parent.as_fd(), &capture, captured)).and_then(|()| validate_destination(invocation, &receipt, &record)).and_then(|()| fs::unlinkat(&parent, &capture, flags).map_err(Into::into)) {
             let restoration = restore(parent.as_fd(), &capture, &name, expected.identity);
             let primary = io::Error::other(format!("source removal failed: {error}; captured {capture_path:?}, intent {intent_path:?}; restoration {restoration:?}"));
             return Err(failure(if restoration.is_ok() { clean_intent(parent.as_fd(), &intent, intent_identity, primary, &intent_path) } else { primary }, removed));
         }
         removed += 1;
         invocation.fault("after_remove").map_err(|error| Failure { state: sync_failure_state, error: io::Error::new(error.kind(), format!("{error}; source entry {removed_path:?} removed before directory synchronization; intent retained at {intent_path:?}")) })?;
-        if expected.identity.kind == EntryKind::RegularFile && expected.links > 1 {
-            let updated = roots::observe_fd(linked_source.as_ref().unwrap().as_fd()).map_err(|error| failure(error, removed))?;
+        if let Some(linked_source) = &linked_source {
+            let updated = roots::observe_fd(linked_source.as_fd()).map_err(|error| failure(error, removed))?;
+            let mut expected_unlinked = captured;
+            expected_unlinked.links -= 1;
+            expected_unlinked.ctime = updated.ctime;
+            if !anchored::unchanged(expected_unlinked, updated) { return Err(failure(io::Error::other("source hardlink changed during retirement"), removed)); }
             invocation.remember_change(updated).map_err(|error| failure(error, removed))?;
         }
         remove_intent(parent.as_fd(), &intent, intent_identity).map_err(|error| failure(io::Error::new(error.kind(), format!("source retired; intent retained at {intent_path:?}: {error}")), removed))?;
@@ -113,7 +126,7 @@ fn source_parent(receipt: &DurableReceipt, record: &Record) -> io::Result<(rusti
     } else {
         let root = receipt.directories.lock().unwrap().find(Path::new(""))?.ok_or_else(|| io::Error::other("source root record missing"))?;
         anchored::identity(receipt.source_parent.as_fd(), &receipt.source_name, root.observed.identity)?;
-        anchored::parent(receipt.source_directory.as_ref().ok_or_else(|| io::Error::other("source directory descriptor missing"))?.as_fd(), &record.source, &receipt.directories, false)
+        anchored::parent(receipt.source_directory.as_ref().ok_or_else(|| io::Error::other("source directory descriptor missing"))?.as_fd(), &record.source, &receipt.directories, false).map_err(|error| io::Error::new(error.kind(), format!("retirement source traversal {:?}: {error}", record.source)))
     }
 }
 
@@ -122,7 +135,7 @@ fn remove_intent(parent: rustix::fd::BorrowedFd<'_>, name: &std::ffi::OsStr, ide
     fs::unlinkat(parent, name, AtFlags::empty()).map_err(Into::into)
 }
 
-fn validate_destination(receipt: &DurableReceipt, record: &Record) -> io::Result<()> {
+fn validate_destination(invocation: &Invocation<'_>, receipt: &DurableReceipt, record: &Record) -> io::Result<()> {
     let expected = receipt.destinations.lock().unwrap().find(&record.source)?.ok_or_else(|| io::Error::other("destination receipt entry missing"))?;
     let root_expected = receipt.directories.lock().unwrap().find(Path::new(""))?;
     if let Some(root) = root_expected { anchored::identity(receipt.destination_parent.as_fd(), &receipt.destination_name, root.published)?; }
@@ -131,7 +144,7 @@ fn validate_destination(receipt: &DurableReceipt, record: &Record) -> io::Result
     } else {
         anchored::parent(receipt.destination_directory.as_ref().ok_or_else(|| io::Error::other("destination root descriptor missing"))?.as_fd(), &record.source, &receipt.directories, true)?
     };
-    if !anchored::unchanged(expected.observed, roots::observe(parent.as_fd(), &name)?) { return Err(io::Error::other("destination identity or version changed before source retirement")); }
+    if !anchored::unchanged(invocation.effective(expected.observed)?, roots::observe(parent.as_fd(), &name)?) { return Err(io::Error::other("destination identity or version changed before source retirement")); }
     Ok(())
 }
 

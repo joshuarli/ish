@@ -115,14 +115,6 @@ impl PooledDirectoryEntries {
         }
     }
 
-    #[cfg(test)]
-    fn capacity(&self) -> usize {
-        match &self.entries {
-            DirectoryEntryStorage::Inline { entries, .. } => entries.len(),
-            DirectoryEntryStorage::Heap(entries) => entries.capacity(),
-        }
-    }
-
     fn reserve(&mut self, additional: usize) {
         if let DirectoryEntryStorage::Inline { entries, len } = &self.entries {
             if *len + additional <= entries.len() {

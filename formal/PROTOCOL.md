@@ -25,13 +25,23 @@ whole-line `InShell` and `Hybrid` commands to ish; `Foreground` commands such as
 `cp` and `mv` remain in epsh, including when nested in a pipeline or command
 substitution. `dynamic` carries a byte-array `target` and checks the
 context-free ish expanded-command policy. `placement` carries a byte-array
-`target` and a `context` of `parent`, `pipeline`, or `substitution`; this mode
-models that target as registered with epsh's `ParentProcess` placement. It
-returns `allowed`, `status`, and the ish registry `class` (`in_shell`, `hybrid`,
+`target` and a `context` of `parent`, `pipeline`, `substitution`,
+`negated-parent`, `negated-pipeline`, or `negated-substitution`; this mode
+models that target as registered with epsh's `ParentProcess` placement. The
+three `negated-*` values represent the same contexts beneath `!`. They extend
+the accepted context strings in protocol version 1. The `allowed` field reports
+direct target admission and stays false for refused pipeline and substitution
+targets. The `status` field reports the enclosing result: an admitted target
+with status 0 becomes 1 under `!`, while a refused target's status 2 becomes 0.
+The model's negation helper preserves status 130. In epsh, cancellation and
+timeout remain hard-abort control-flow errors and bypass normal status
+inversion. Placement refusal itself remains a status 2 policy result before
+the enclosing negation is applied.
+Results also include the ish registry `class` (`in_shell`, `hybrid`,
 `foreground`, `native`, or `null`). Pipeline and command-substitution contexts
-are refused with status 2, including substitutions that do not fork. The Rust
-bridge runs these requests through the actual epsh evaluator and checks
-redirection and callback effects.
+are refused, including substitutions that do not fork. The Rust bridge runs
+these requests through the actual epsh evaluator and checks redirection and
+callback effects, including negated contexts whose enclosing status is 0.
 
 The shell state has exactly these required fields:
 
@@ -86,5 +96,7 @@ These traces describe abstract observations. They do not establish kernel descri
 `fixtures/protocol-v1.jsonl` contains one accepted request per family.
 `fixtures/protocol-invalid.jsonl` contains rejected boundary inputs.
 `fixtures/protocol-outcomes.jsonl` fixes the four response tags.
-`lake exe protocolTests` checks these fixtures and every single-byte round trip from the `formal` directory.
+`lake exe protocolTests` checks these fixtures, placement protocol goldens for
+negated parent and child contexts, and every single-byte round trip from the
+`formal` directory.
 The fixture inputs are empty objects. They check the shared boundary before family validation.

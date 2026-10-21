@@ -1,5 +1,5 @@
 use ish_fs::{
-    Cancellation, Context, Event, Jobs, Metrics, Operands, Operation, Options, Progress, Request,
+    Cancellation, Collision, Context, Event, Jobs, Metrics, Operands, Operation, Options, Progress, Request,
     MAX_DESCRIPTORS, MIN_DESCRIPTORS, QUEUE_CAPACITY, RECORD_MEMORY_BYTES,
     RESERVED_DESCRIPTORS, TRANSFER_BUFFER_BYTES,
 };
@@ -17,7 +17,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const MOVE_ITERATIONS: usize = 32;
+const SMALL_BYTES: u64 = 4096;
 const MAX_SPARSE_ALLOCATED_BYTES: u64 = 16 * 1024 * 1024;
+const CROSS_FLAT_FILES: usize = 16_384;
+const DRY_RUN_BRANCHES: usize = 64;
+const DRY_RUN_BRANCH_FILES: usize = 64;
+const DRY_RUN_DEPTH: usize = 16;
 const RUNS_DIRECTORY: &str = ".ish-fs-bench-runs";
 const RUN_MARKER: &str = ".ish-fs-bench-run-owner";
 
@@ -130,7 +135,11 @@ enum Workload {
     Hardlinks,
     Rename,
     Cross,
+    CrossFlat1k,
+    CrossFlat4k,
+    CrossFlat16k,
     Merge,
+    DryRunWide,
     ProgressOn,
     ProgressOff,
 }
@@ -150,7 +159,11 @@ impl Workload {
             "hardlinks" => Self::Hardlinks,
             "rename" => Self::Rename,
             "cross" => Self::Cross,
+            "cross-flat-1k" => Self::CrossFlat1k,
+            "cross-flat-4k" => Self::CrossFlat4k,
+            "cross-flat-16k" => Self::CrossFlat16k,
             "merge" => Self::Merge,
+            "dry-run-wide" => Self::DryRunWide,
             "progress-on" => Self::ProgressOn,
             "progress-off" => Self::ProgressOff,
             _ => panic!("unknown ISH_FS_BENCH_WORKLOAD={value}"),
@@ -171,18 +184,26 @@ impl Workload {
             Self::Hardlinks => "hardlinks",
             Self::Rename => "rename",
             Self::Cross => "cross",
+            Self::CrossFlat1k => "cross-flat-1k",
+            Self::CrossFlat4k => "cross-flat-4k",
+            Self::CrossFlat16k => "cross-flat-16k",
             Self::Merge => "merge",
+            Self::DryRunWide => "dry-run-wide",
             Self::ProgressOn => "progress-on",
             Self::ProgressOff => "progress-off",
         }
     }
 
     fn is_move(self) -> bool {
-        matches!(self, Self::TinyMove | Self::Rename | Self::Cross)
+        matches!(self, Self::TinyMove | Self::Rename | Self::Cross | Self::CrossFlat1k | Self::CrossFlat4k | Self::CrossFlat16k)
     }
 
     fn constrained(self) -> bool {
-        matches!(self, Self::Deep | Self::Wide)
+        matches!(self, Self::Deep | Self::Wide | Self::DryRunWide)
+    }
+
+    fn cross_device(self) -> bool {
+        matches!(self, Self::Cross | Self::CrossFlat1k | Self::CrossFlat4k | Self::CrossFlat16k)
     }
 
     fn terminal_progress(self) -> Option<bool> {
@@ -191,6 +212,15 @@ impl Workload {
             Self::ProgressOff => Some(false),
             _ => None,
         }
+    }
+}
+
+fn cross_flat_count(workload: Workload) -> Option<usize> {
+    match workload {
+        Workload::CrossFlat1k => Some(1_024),
+        Workload::CrossFlat4k => Some(4_096),
+        Workload::CrossFlat16k => Some(CROSS_FLAT_FILES),
+        _ => None,
     }
 }
 
@@ -232,8 +262,11 @@ impl Config {
             validate_cross_root(root, identity, config.identity);
         }
         validate_sample_name(&config.sample);
-        if config.workload == Workload::Cross && config.cross_root.is_none() {
-            panic!("cross workload requires an explicitly prepared cross-filesystem root");
+        if config.workload.cross_device() && config.cross_root.is_none() {
+            panic!("cross-device workload requires an explicitly prepared cross-filesystem root");
+        }
+        if config.workload == Workload::DryRunWide && matches!(config.side, Side::NativeCopy | Side::NativeClone | Side::NativeMove) {
+            panic!("native utility sides do not support the dry-run workload");
         }
         if config.workload.is_move() != (config.side == Side::NativeMove)
             && matches!(config.side, Side::NativeCopy | Side::NativeClone | Side::NativeMove)
@@ -383,7 +416,9 @@ impl Prepared {
         ensure_run_parent(&config.root, config.identity);
         fs::create_dir(&sample_root).expect("create unique sample directory");
         write_run_marker(&sample_root, config.identity, config.identity);
-        fs::create_dir(sample_root.join("scratch")).expect("create engine scratch directory");
+        if config.workload != Workload::DryRunWide {
+            fs::create_dir(sample_root.join("scratch")).expect("create engine scratch directory");
+        }
         let transfers = prepare_transfers(config, &sample_root);
         Self {
             sample_root,
@@ -394,7 +429,7 @@ impl Prepared {
     fn open(config: &Config) -> Self {
         let sample_root = config.root.join(RUNS_DIRECTORY).join(&config.sample);
         verify_run_marker(&sample_root, config.identity, config.identity);
-        if config.workload == Workload::Cross {
+        if config.workload.cross_device() {
             let cross_root = config.cross_root.as_ref().expect("cross root");
             let cross_identity = config.cross_identity.expect("cross identity");
             verify_run_marker(
@@ -416,7 +451,26 @@ impl Prepared {
 
     fn verify(&self, config: &Config) {
         for transfer in &self.transfers {
-            if transfer.merge {
+            if config.workload == Workload::DryRunWide {
+                verify_dry_run_fixture(&config.root);
+                assert!(!self.sample_root.join("scratch").exists(), "dry run created its missing scratch directory");
+                let mut entries = fs::read_dir(&self.sample_root)
+                    .expect("read dry-run sample namespace")
+                    .map(|entry| entry.expect("read dry-run sample namespace entry").file_name())
+                    .collect::<Vec<_>>();
+                entries.sort();
+                let mut expected_entries = vec![OsString::from(RUN_MARKER)];
+                if config.side == Side::Builtin {
+                    let home = fs::symlink_metadata(self.sample_root.join("home"))
+                        .expect("inspect isolated builtin home");
+                    assert!(home.is_dir() && !home.file_type().is_symlink());
+                    expected_entries.push(OsString::from("home"));
+                }
+                expected_entries.sort();
+                assert_eq!(entries, expected_entries, "dry run created an unexpected sample namespace entry");
+            } else if let Some(count) = cross_flat_count(config.workload) {
+                verify_cross_flat(transfer, count);
+            } else if transfer.merge {
                 verify_merged_tree(
                     &config.root.join("merge/source"),
                     &config.root.join("merge/destination"),
@@ -446,6 +500,10 @@ impl Prepared {
             let first = fs::metadata(destination.join("first")).unwrap();
             let alias = fs::metadata(destination.join("alias")).unwrap();
             assert_eq!((first.dev(), first.ino()), (alias.dev(), alias.ino()));
+            let last = fs::metadata(destination.join("group-15")).unwrap();
+            assert_eq!((first.dev(), first.ino()), (last.dev(), last.ino()));
+            let ordinary = fs::metadata(destination.join("ordinary-000")).unwrap();
+            assert_ne!((first.dev(), first.ino()), (ordinary.dev(), ordinary.ino()));
         }
         if config.workload == Workload::Rename && config.side == Side::Engine {
             assert_eq!(self.transfers.len(), 1);
@@ -455,7 +513,7 @@ impl Prepared {
     fn cleanup(&self, config: &Config) {
         validate_owned_root(&config.root, config.identity);
         verify_run_marker(&self.sample_root, config.identity, config.identity);
-        let cross_sample = if config.workload == Workload::Cross {
+        let cross_sample = if config.workload.cross_device() {
             let root = config.cross_root.as_ref().expect("cross root");
             let identity = config.cross_identity.expect("cross identity");
             Some((root.join(RUNS_DIRECTORY).join(&config.sample), identity))
@@ -546,6 +604,35 @@ fn prepare_transfers(config: &Config, sample_root: &Path) -> Vec<Transfer> {
                 cross_file_systems: true,
             }]
         }
+        Workload::CrossFlat1k | Workload::CrossFlat4k | Workload::CrossFlat16k => {
+            let count = cross_flat_count(config.workload).expect("cross flat count");
+            let expected = source_root.join("cross-source/source/flat");
+            let source = sample_root.join("source");
+            copy_cross_flat_source(&expected, &source, count);
+            let cross_root = config.cross_root.as_ref().expect("cross root");
+            let cross_identity = config.cross_identity.expect("cross identity");
+            let cross_sample = cross_root.join(RUNS_DIRECTORY).join(&config.sample);
+            ensure_run_parent(cross_root, cross_identity);
+            fs::create_dir(&cross_sample).expect("create cross-device sample directory");
+            write_run_marker(&cross_sample, cross_identity, config.identity);
+            vec![Transfer {
+                source,
+                destination: cross_sample.join("destination"),
+                expected,
+                merge: false,
+                cross_file_systems: true,
+            }]
+        }
+        Workload::DryRunWide => {
+            let source = source_root.join("dry-run/source");
+            vec![Transfer {
+                source: source.clone(),
+                destination: source_root.join("dry-run/destination"),
+                expected: source,
+                merge: true,
+                cross_file_systems: false,
+            }]
+        }
         Workload::Merge => {
             let expected = source_root.join("merge/source");
             let destination = sample_root.join("destination");
@@ -627,6 +714,26 @@ fn expected_transfers(config: &Config, sample_root: &Path, create_parent: bool) 
             cross_file_systems: true,
         }];
     }
+    if cross_flat_count(config.workload).is_some() {
+        let cross_root = config.cross_root.as_ref().expect("cross root");
+        return vec![Transfer {
+            source: sample_root.join("source"),
+            destination: cross_root.join(RUNS_DIRECTORY).join(&config.sample).join("destination"),
+            expected: config.root.join("cross-source/source/flat"),
+            merge: false,
+            cross_file_systems: false,
+        }];
+    }
+    if config.workload == Workload::DryRunWide {
+        let source = config.root.join("dry-run/source");
+        return vec![Transfer {
+            source: source.clone(),
+            destination: config.root.join("dry-run/destination"),
+            expected: source,
+            merge: true,
+            cross_file_systems: false,
+        }];
+    }
     if config.workload == Workload::Merge {
         return vec![Transfer {
             source: config.root.join("merge/source"),
@@ -651,6 +758,10 @@ fn expected_transfers(config: &Config, sample_root: &Path, create_parent: bool) 
         | Workload::TinyMove
         | Workload::Rename
         | Workload::Cross
+        | Workload::CrossFlat1k
+        | Workload::CrossFlat4k
+        | Workload::CrossFlat16k
+        | Workload::DryRunWide
         | Workload::Merge => unreachable!("special transfer fixture"),
     };
     let source = config.root.join(source);
@@ -684,9 +795,82 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
+fn copy_cross_flat_source(source: &Path, destination: &Path, count: usize) {
+    fs::create_dir(destination).expect("create local cross-device source copy");
+    for index in 0..count {
+        let name = format!("item-{index:05}");
+        fs::copy(source.join(&name), destination.join(name)).expect("prepare cross-device flat source copy");
+    }
+}
+
+fn verify_cross_flat(transfer: &Transfer, count: usize) {
+    assert_eq!(fs::read_dir(&transfer.destination).expect("read cross-device flat output").count(), count);
+    for index in 0..count {
+        let name = format!("item-{index:05}");
+        assert_eq!(
+            fs::read(transfer.destination.join(&name)).expect("read cross-device flat output file"),
+            fs::read(transfer.expected.join(&name)).expect("read expected cross-device flat file"),
+            "cross-device flat output differs for {name}",
+        );
+    }
+}
+
+fn dry_run_discovered_entries() -> usize {
+    DRY_RUN_BRANCHES * (1 + DRY_RUN_BRANCH_FILES + DRY_RUN_DEPTH * 2)
+}
+
+fn dry_run_skipped_entries() -> usize {
+    DRY_RUN_BRANCHES * (DRY_RUN_BRANCH_FILES + DRY_RUN_DEPTH)
+}
+
+fn verify_pattern(path: &Path, length: u64, seed: u64) {
+    let bytes = fs::read(path).unwrap_or_else(|error| panic!("read benchmark fixture {}: {error}", path.display()));
+    assert_eq!(bytes.len() as u64, length, "{} has unexpected length", path.display());
+    for (index, byte) in bytes.iter().enumerate() {
+        assert_eq!(*byte, ((index as u64 + seed * 131) % 251) as u8, "{} differs at byte {index}", path.display());
+    }
+}
+
+fn verify_dry_run_fixture(root: &Path) {
+    let source_root = root.join("dry-run/source");
+    let destination_root = root.join("dry-run/destination");
+    assert_eq!(fs::read_dir(&source_root).expect("read dry-run source root").count(), DRY_RUN_BRANCHES);
+    assert_eq!(fs::read_dir(&destination_root).expect("read dry-run destination root").count(), DRY_RUN_BRANCHES);
+    for branch in 0..DRY_RUN_BRANCHES {
+        let branch_name = format!("branch-{branch:02}");
+        let source_branch = source_root.join(&branch_name);
+        let destination_branch = destination_root.join(&branch_name);
+        assert_eq!(fs::read_dir(&source_branch).expect("read dry-run source branch").count(), DRY_RUN_BRANCH_FILES + 1);
+        assert_eq!(fs::read_dir(&destination_branch).expect("read dry-run destination branch").count(), DRY_RUN_BRANCH_FILES + 2);
+        for index in 0..DRY_RUN_BRANCH_FILES {
+            let name = format!("item-{index:02}");
+            verify_pattern(&source_branch.join(&name), SMALL_BYTES, (branch * 1000 + index) as u64);
+            verify_pattern(&destination_branch.join(&name), SMALL_BYTES, (branch * 1000 + index + 1_000_000) as u64);
+        }
+        verify_pattern(&destination_branch.join("destination-only"), SMALL_BYTES, (branch + 2_000_000) as u64);
+        let mut source = source_branch.join("deep");
+        let mut destination = destination_branch.join("deep");
+        for depth in 0..DRY_RUN_DEPTH {
+            let entry_count = if depth + 1 < DRY_RUN_DEPTH { 2 } else { 1 };
+            assert_eq!(fs::read_dir(&source).expect("read dry-run source depth").count(), entry_count);
+            assert_eq!(fs::read_dir(&destination).expect("read dry-run destination depth").count(), entry_count);
+            let seed = (branch * 1000 + depth + 100_000) as u64;
+            verify_pattern(&source.join("leaf"), SMALL_BYTES, seed);
+            verify_pattern(&destination.join("leaf"), SMALL_BYTES, seed + 1_000_000);
+            if depth + 1 < DRY_RUN_DEPTH {
+                let directory = format!("d{depth:02}");
+                source.push(&directory);
+                destination.push(directory);
+            }
+        }
+    }
+}
+
 fn options_for(transfer: &Transfer, workload: Workload) -> Options {
     let mut options = Options {
+        collision: if workload == Workload::DryRunWide { Collision::Skip } else { Collision::Error },
         merge: transfer.merge,
+        dry_run: workload == Workload::DryRunWide,
         cross_file_systems: transfer.cross_file_systems,
         jobs: Some(Jobs::new(jobs_for(workload)).expect("fixed benchmark worker count")),
         ..Options::default()
@@ -767,6 +951,12 @@ fn sample_engine(config: &Config, prepared: &Prepared) {
     let mut totals = Totals::default();
     for outcome in outcomes {
         totals.add(outcome);
+    }
+    if config.workload == Workload::DryRunWide {
+        assert_eq!(totals.progress.discovered_files, dry_run_discovered_entries() as u64);
+        assert_eq!(totals.progress.skipped_files, dry_run_skipped_entries() as u64);
+        assert_eq!(totals.progress.completed_files, 0);
+        assert_eq!(totals.progress.failed_files, 0);
     }
     if config.workload == Workload::Rename {
         assert_eq!(totals.progress.discovered_files, 1, "rename enumerated descendants");
@@ -957,6 +1147,10 @@ fn shell_command(config: &Config, transfer: &Transfer) -> String {
     match config.side {
         Side::Builtin => {
             parts.extend(["--jobs".to_owned(), jobs_for(config.workload).to_string()]);
+            if config.workload == Workload::DryRunWide {
+                parts.push("--dry-run".to_owned());
+                parts.push("--no-clobber".to_owned());
+            }
             if transfer.merge {
                 parts.push("--merge".to_owned());
             }
@@ -1462,6 +1656,9 @@ fn verify_sparse_copy(expected: &Path, actual: &Path, require_sparse: bool) {
 }
 
 fn prepared_size(config: &Config) -> u64 {
+    if let Some(count) = cross_flat_count(config.workload) {
+        return count as u64 * SMALL_BYTES;
+    }
     let paths: Vec<PathBuf> = match config.workload {
         Workload::TinyCopy | Workload::TinyMove => (0..MOVE_ITERATIONS)
             .map(|index| {
@@ -1482,6 +1679,8 @@ fn prepared_size(config: &Config) -> u64 {
         Workload::Hardlinks => vec![config.root.join("hardlinks/source")],
         Workload::Rename => vec![config.root.join("same-fs-move/source")],
         Workload::Cross => vec![config.root.join("cross-source/source/payload")],
+        Workload::CrossFlat1k | Workload::CrossFlat4k | Workload::CrossFlat16k => unreachable!("cross flat size is count-based"),
+        Workload::DryRunWide => vec![config.root.join("dry-run/source")],
         Workload::Merge => vec![config.root.join("merge/source")],
     };
     paths.iter().map(|path| logical_size(path)).sum()

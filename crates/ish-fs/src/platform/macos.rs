@@ -3,14 +3,16 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use rustix::fs::{self, CopyfileFlags, Mode, Timestamps};
+use rustix::fs::{self, CopyfileFlags, Mode, OFlags, Timestamps};
 use rustix::io::Errno;
 
 use crate::Cancellation;
 use crate::platform::metadata::{CaptureBudget, allocation_error, too_large};
 use crate::platform::{
-    AccelerationError, CopyMethod, CopyStats, ExtendedMetadata, MetadataTarget, Preservation, Xattr,
+    CopyMethod, CopyStats, ExtendedMetadata, MetadataTarget, Preservation, Xattr,
 };
 use crate::roots::{EntryKind, Identity, Observation, Timestamp, observe_fd};
 
@@ -20,8 +22,17 @@ pub(super) const BLOCKING_FLAGS: u32 = libc::UF_IMMUTABLE
     | libc::UF_APPEND
     | libc::SF_IMMUTABLE
     | libc::SF_APPEND;
-const RESOURCE_FORK_NAME: &[u8] = b"com.apple.ResourceFork";
+const RESOURCE_FORK_NAME: &CStr = c"com.apple.ResourceFork";
+const RESOURCE_FORK_POSITION_LIMIT: u64 = u32::MAX as u64 + 1;
 const PRIVATE_DIRECTORY_MODE: Mode = Mode::from_bits_truncate(0o700);
+const COPYFILE_DATA_FLAGS: CopyfileFlags = CopyfileFlags::from_bits_retain(
+    libc::COPYFILE_DATA | libc::COPYFILE_DATA_SPARSE,
+);
+
+pub(crate) struct ClonedFile {
+    pub descriptor: OwnedFd,
+    pub identity: Identity,
+}
 
 unsafe extern "C" {
     fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
@@ -36,23 +47,53 @@ pub(crate) fn try_clone_to_dir(
     src: BorrowedFd<'_>,
     parent: BorrowedFd<'_>,
     name: &OsStr,
-) -> Result<(), AccelerationError> {
+) -> io::Result<Option<ClonedFile>> {
     if !is_single_component(name) {
-        return Err(AccelerationError::Io(Errno::INVAL));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "clone name is not one path component"));
     }
-    let result = fs::fclonefileat(
-        src,
-        parent,
-        name,
-        fs::CloneFlags::NOOWNERCOPY,
-    );
-    result.map_err(|error| {
-        if is_acceleration_unsupported(error) {
-            AccelerationError::Unsupported
-        } else {
-            AccelerationError::Io(error)
+    match fs::fclonefileat(src, parent, name, fs::CloneFlags::NOOWNERCOPY) {
+        Ok(()) => {}
+        Err(error) if is_acceleration_unsupported(error) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+
+    let identity = crate::roots::observe(parent, name).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("clone at staging name {name:?} could not be identified and was left untouched: {error}"),
+        )
+    })?.identity;
+    let mut cleanup = CloneCleanup::new(parent, name, identity);
+    let result = (|| {
+        require_entry_identity(parent, name, identity)?;
+        let metadata = open_metadata_handle(parent, name)?;
+        require_descriptor_identity(metadata.as_fd(), identity)?;
+        let flags = fs::fstat(metadata.as_fd())?.st_flags;
+        if flags & BLOCKING_FLAGS != 0 {
+            set_flags(metadata.as_fd(), flags & !BLOCKING_FLAGS)?;
         }
-    })
+        apply_acl(metadata.as_fd(), None)?;
+        let current = fs::fstat(metadata.as_fd())?;
+        let mode = (current.st_mode as u32 & 0o1777) | 0o700;
+        fs::fchmod(metadata.as_fd(), Mode::from_bits_truncate(mode as _))?;
+        require_descriptor_identity(metadata.as_fd(), identity)?;
+        require_entry_identity(parent, name, identity)?;
+        let descriptor = fs::openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        require_descriptor_identity(descriptor.as_fd(), identity)?;
+        Ok(ClonedFile { descriptor, identity })
+    })();
+    match result {
+        Ok(clone) => {
+            cleanup.disarm();
+            Ok(Some(clone))
+        }
+        Err(error) => Err(cleanup.remove_after(error)),
+    }
 }
 
 pub(crate) fn prepare_directory(
@@ -105,6 +146,20 @@ pub(crate) fn copy_data(
     scratch: &mut [u8],
     cancel: &Cancellation,
 ) -> io::Result<CopyStats> {
+    copy_data_with_native_copy(src, dst, length, scratch, cancel, None, |progress_hook| {
+        native_data_copy(src, dst, cancel, progress_hook)
+    })
+}
+
+pub(crate) fn copy_data_with_native_copy(
+    src: BorrowedFd<'_>,
+    dst: BorrowedFd<'_>,
+    length: u64,
+    scratch: &mut [u8],
+    cancel: &Cancellation,
+    progress_hook: Option<&(dyn Fn() + Send + Sync)>,
+    native_copy: impl FnOnce(Option<&(dyn Fn() + Send + Sync)>) -> io::Result<u64>,
+) -> io::Result<CopyStats> {
     if scratch.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "copy buffer is empty"));
     }
@@ -112,7 +167,7 @@ pub(crate) fn copy_data(
         return Err(cancelled());
     }
 
-    match native_data_copy(src, dst) {
+    match native_copy(progress_hook) {
         Ok(copied) if copied >= length => {
             fs::ftruncate(dst, length)?;
             if cancel.is_cancelled() {
@@ -128,7 +183,8 @@ pub(crate) fn copy_data(
             io::ErrorKind::UnexpectedEof,
             "source ended before captured length",
         )),
-        Err(error) if is_acceleration_unsupported(error) => {
+        Err(_error) if cancel.is_cancelled() => Err(cancelled()),
+        Err(error) if is_acceleration_unsupported_io(&error) => {
             fs::ftruncate(dst, 0)?;
             let streamed = super::buffered_copy(src, dst, length, scratch, cancel)?;
             Ok(CopyStats {
@@ -137,25 +193,147 @@ pub(crate) fn copy_data(
                 streamed_bytes: streamed,
             })
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
 }
 
 pub(crate) fn copy_resource_fork(
     src: BorrowedFd<'_>,
     dst: BorrowedFd<'_>,
+    scratch: &mut [u8],
+    cancel: &Cancellation,
 ) -> io::Result<()> {
+    copy_resource_fork_inner(src, dst, scratch, cancel, None)
+}
+
+pub(crate) fn copy_resource_fork_inner(
+    src: BorrowedFd<'_>,
+    dst: BorrowedFd<'_>,
+    scratch: &mut [u8],
+    cancel: &Cancellation,
+    progress_hook: Option<&(dyn Fn() + Send + Sync)>,
+) -> io::Result<()> {
+    if scratch.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "copy buffer is empty"));
+    }
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
     let expected_size = capture_resource_fork_size(src)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "source resource fork disappeared before copy")
     })?;
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
     prepare_metadata_target(dst)?;
-    let state = fs::copyfile_state_alloc()?;
-    let result = unsafe {
-        fs::fcopyfile(src, dst, state, CopyfileFlags::XATTR)
+    let source_identity = observe_fd(src)?.identity;
+    let destination_identity = observe_fd(dst)?.identity;
+    let uses_stream_descriptors = expected_size > RESOURCE_FORK_POSITION_LIMIT;
+    let source_stream = if uses_stream_descriptors {
+        Some(open_resource_fork(src, source_identity, libc::O_RDONLY)?)
+    } else {
+        None
     };
-    let free_result = unsafe { fs::copyfile_state_free(state) };
-    result?;
-    free_result?;
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    fs::fsetxattr(
+        dst,
+        RESOURCE_FORK_NAME,
+        &[],
+        fs::XattrFlags::empty(),
+    )?;
+    let destination_stream = if uses_stream_descriptors {
+        Some(open_resource_fork(dst, destination_identity, libc::O_WRONLY)?)
+    } else {
+        None
+    };
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    let source_size = match &source_stream {
+        Some(source) => {
+            let size = fs::fstat(source.as_fd())?.st_size;
+            u64::try_from(size).map_err(|_| invalid_data("source resource fork has a negative length"))?
+        }
+        None => capture_resource_fork_size(src)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "source resource fork disappeared before copy")
+        })?,
+    };
+    if source_size != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source resource fork length changed before copy",
+        ));
+    }
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    if let Some(destination) = &destination_stream {
+        fs::ftruncate(destination.as_fd(), expected_size)?;
+    }
+    let mut offset = 0_u64;
+    while offset < expected_size {
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        let wanted = usize::try_from((expected_size - offset).min(scratch.len() as u64))
+            .expect("bounded by resource fork buffer");
+        let read = loop {
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
+            let result = match &source_stream {
+                Some(source) => rustix::io::pread(source.as_fd(), &mut scratch[..wanted], offset)
+                    .map_err(io::Error::from),
+                None => read_resource_fork_chunk(src, &mut scratch[..wanted], offset),
+            };
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result?,
+            }
+        };
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "resource fork ended before captured length",
+            ));
+        }
+        if read > wanted {
+            return Err(invalid_data("resource fork read exceeded the requested length"));
+        }
+        let mut written = 0;
+        while written < read {
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
+            let remaining = &scratch[written..read];
+            match &destination_stream {
+                Some(destination) => match rustix::io::pwrite(
+                    destination.as_fd(),
+                    remaining,
+                    offset + written as u64,
+                ) {
+                    Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "resource fork write made no progress")),
+                    Ok(count) if count <= remaining.len() => written += count,
+                    Ok(_) => return Err(invalid_data("resource fork write exceeded the requested length")),
+                    Err(error) if error == Errno::INTR => continue,
+                    Err(error) => return Err(error.into()),
+                },
+                None => {
+                    write_resource_fork_chunk(dst, remaining, offset + written as u64)?;
+                    written = read;
+                }
+            }
+        }
+        offset += read as u64;
+        if let Some(progress_hook) = progress_hook {
+            progress_hook();
+        }
+    }
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
     let actual_size = capture_resource_fork_size(dst)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "destination resource fork is missing after copy")
     })?;
@@ -270,17 +448,354 @@ pub(crate) fn mount_id(fd: BorrowedFd<'_>) -> io::Result<u64> {
     Ok((u64::from(parts[0] as u32) << 32) | u64::from(parts[1] as u32))
 }
 
-fn native_data_copy(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Result<u64, Errno> {
-    let state = fs::copyfile_state_alloc()?;
-    let flags = CopyfileFlags::DATA | CopyfileFlags::from_bits_retain(libc::COPYFILE_DATA_SPARSE);
-    let result = unsafe { fs::fcopyfile(src, dst, state, flags) }
-        .and_then(|()| unsafe { fs::copyfile_state_get_copied(state) });
-    let free_result = unsafe { fs::copyfile_state_free(state) };
-    match result {
-        Ok(copied) => {
-            free_result?;
-            Ok(copied)
+pub(crate) fn native_data_copy(
+    src: BorrowedFd<'_>,
+    dst: BorrowedFd<'_>,
+    cancel: &Cancellation,
+    progress_hook: Option<&(dyn Fn() + Send + Sync)>,
+) -> io::Result<u64> {
+    fcopyfile_with_cancellation(src, dst, COPYFILE_DATA_FLAGS, cancel, progress_hook)?
+        .ok_or_else(|| invalid_data("native data copy did not report its byte count"))
+}
+
+fn fcopyfile_with_cancellation(
+    src: BorrowedFd<'_>,
+    dst: BorrowedFd<'_>,
+    flags: CopyfileFlags,
+    cancel: &Cancellation,
+    progress_hook: Option<&(dyn Fn() + Send + Sync)>,
+) -> io::Result<Option<u64>> {
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    let mut state = CopyfileState::allocate()?;
+    let mut context = CopyfileCallbackContext {
+        cancel,
+        progress_hook,
+        panicked: AtomicBool::new(false),
+    };
+    let result = (|| {
+        state.set(
+            libc::COPYFILE_STATE_STATUS_CB as u32,
+            copyfile_cancel_callback as *const () as *const libc::c_void,
+        )?;
+        state.set(
+            libc::COPYFILE_STATE_STATUS_CTX as u32,
+            (&mut context as *mut CopyfileCallbackContext<'_>).cast(),
+        )?;
+        // SAFETY: both descriptors and the allocated state remain live; Apple invokes the registered callback before this synchronous call returns.
+        let result = unsafe { libc::fcopyfile(src.as_raw_fd(), dst.as_raw_fd(), state.0, flags.bits()) };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if context.panicked.load(Ordering::Acquire) {
+                return Err(io::Error::other("copyfile progress callback panicked"));
+            }
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
+            return Err(error);
         }
+        if context.panicked.load(Ordering::Acquire) {
+            return Err(io::Error::other("copyfile progress callback panicked"));
+        }
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        if flags.contains(CopyfileFlags::DATA) {
+            state.copied().map(Some)
+        } else {
+            Ok(None)
+        }
+    })();
+    let release = state.release();
+    match (result, release) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(release)) => Err(release),
+        (Err(primary), Err(release)) => Err(io::Error::new(
+            primary.kind(),
+            format!("{primary}; copyfile state release failed: {release}"),
+        )),
+    }
+}
+
+struct CopyfileState(libc::copyfile_state_t);
+
+impl CopyfileState {
+    fn allocate() -> io::Result<Self> {
+        // SAFETY: copyfile_state_alloc returns either a new opaque state or null and does not retain caller pointers.
+        let state = unsafe { libc::copyfile_state_alloc() };
+        if state.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self(state))
+        }
+    }
+
+    fn set(&self, flag: u32, value: *const libc::c_void) -> io::Result<()> {
+        // SAFETY: `self.0` is allocated and live; each value pointer has the representation required by its copyfile state flag.
+        let result = unsafe { libc::copyfile_state_set(self.0, flag, value) };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn copied(&self) -> io::Result<u64> {
+        let mut copied: libc::off_t = 0;
+        // SAFETY: `self.0` is live and COPYFILE_STATE_COPIED writes an off_t to the provided pointer.
+        let result = unsafe {
+            libc::copyfile_state_get(
+                self.0,
+                libc::COPYFILE_STATE_COPIED as u32,
+                (&mut copied as *mut libc::off_t).cast(),
+            )
+        };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        u64::try_from(copied).map_err(|_| invalid_data("copyfile returned a negative byte count"))
+    }
+
+    fn release(&mut self) -> io::Result<()> {
+        if self.0.is_null() {
+            return Ok(());
+        }
+        let state = std::mem::replace(&mut self.0, std::ptr::null_mut());
+        // SAFETY: this state was allocated by copyfile_state_alloc and is released at most once.
+        let result = unsafe { libc::copyfile_state_free(state) };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for CopyfileState {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+struct CopyfileCallbackContext<'a> {
+    cancel: &'a Cancellation,
+    progress_hook: Option<&'a (dyn Fn() + Send + Sync)>,
+    panicked: AtomicBool,
+}
+
+extern "C" fn copyfile_cancel_callback(
+    _what: libc::c_int,
+    stage: libc::c_int,
+    _state: libc::copyfile_state_t,
+    _source: *const libc::c_char,
+    _destination: *const libc::c_char,
+    raw_context: *mut libc::c_void,
+) -> libc::c_int {
+    if raw_context.is_null() {
+        return libc::COPYFILE_QUIT;
+    }
+    // SAFETY: fcopyfile_with_cancellation stores this live stack context in the copyfile state and keeps it alive until fcopyfile returns.
+    let context = unsafe { &*raw_context.cast::<CopyfileCallbackContext<'_>>() };
+    match catch_unwind(AssertUnwindSafe(|| {
+        if stage == libc::COPYFILE_ERR {
+            return libc::COPYFILE_QUIT;
+        }
+        if stage == libc::COPYFILE_PROGRESS {
+            if let Some(progress_hook) = context.progress_hook {
+                progress_hook();
+            }
+            if context.cancel.is_cancelled() {
+                return libc::COPYFILE_QUIT;
+            }
+        }
+        libc::COPYFILE_CONTINUE
+    })) {
+        Ok(decision) => decision,
+        Err(_) => {
+            context.panicked.store(true, Ordering::Release);
+            libc::COPYFILE_QUIT
+        }
+    }
+}
+
+fn open_metadata_handle(parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "clone name contains NUL"))?;
+    // SAFETY: `parent` is live and `name` is NUL-terminated; O_EVTONLY opens the entry for metadata access without requiring file read permission.
+    let raw = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a newly owned descriptor returned by openat.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+fn open_resource_fork(
+    fd: BorrowedFd<'_>,
+    expected_identity: Identity,
+    flags: libc::c_int,
+) -> io::Result<OwnedFd> {
+    require_descriptor_identity(fd, expected_identity)?;
+    let base_path = descriptor_path(fd)?;
+    let mut fork_path = base_path.as_bytes().to_vec();
+    fork_path.extend_from_slice(b"/..namedfork/rsrc");
+    let fork_path = CString::new(fork_path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "resource fork path contains NUL"))?;
+    // SAFETY: `fork_path` is NUL-terminated and remains live for the open call.
+    let raw = unsafe { libc::open(fork_path.as_ptr(), flags | libc::O_CLOEXEC, 0o600) };
+    if raw == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a newly owned descriptor returned by open.
+    let fork = unsafe { OwnedFd::from_raw_fd(raw) };
+    if observe_fd(fork.as_fd())?.identity != expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "named resource fork does not expose the base file identity",
+        ));
+    }
+    Ok(fork)
+}
+
+fn read_resource_fork_chunk(
+    fd: BorrowedFd<'_>,
+    buffer: &mut [u8],
+    offset: u64,
+) -> io::Result<usize> {
+    let position = u32::try_from(offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::Unsupported, "resource fork exceeds positioned xattr range"))?;
+    // SAFETY: `fd` is live, the static xattr name is NUL-terminated, and `buffer` is writable for its length.
+    let read = unsafe {
+        libc::fgetxattr(
+            fd.as_raw_fd(),
+            RESOURCE_FORK_NAME.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            position,
+            0,
+        )
+    };
+    if read == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        usize::try_from(read).map_err(|_| invalid_data("resource fork read returned a negative length"))
+    }
+}
+
+fn write_resource_fork_chunk(fd: BorrowedFd<'_>, buffer: &[u8], offset: u64) -> io::Result<()> {
+    let position = u32::try_from(offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::Unsupported, "resource fork exceeds positioned xattr range"))?;
+    // SAFETY: `fd` is live, the static xattr name is NUL-terminated, and `buffer` is readable for its length.
+    if unsafe {
+        libc::fsetxattr(
+            fd.as_raw_fd(),
+            RESOURCE_FORK_NAME.as_ptr(),
+            buffer.as_ptr().cast(),
+            buffer.len(),
+            position,
+            0,
+        )
+    } == -1
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn descriptor_path(fd: BorrowedFd<'_>) -> io::Result<CString> {
+    let mut path = [0_i8; libc::MAXPATHLEN as usize];
+    // SAFETY: `fd` is live and `path` provides the MAXPATHLEN buffer required by F_GETPATH.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if !path.contains(&0) {
+        return Err(invalid_data("file descriptor path was not NUL-terminated"));
+    }
+    // SAFETY: successful F_GETPATH writes a NUL-terminated path into the provided buffer.
+    let path = unsafe { CStr::from_ptr(path.as_ptr()) };
+    if path.to_bytes().is_empty() || !path.to_bytes().starts_with(b"/") {
+        return Err(invalid_data("file descriptor has no absolute path"));
+    }
+    CString::new(path.to_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file descriptor path contains NUL"))
+}
+
+fn require_descriptor_identity(fd: BorrowedFd<'_>, expected: Identity) -> io::Result<()> {
+    if observe_fd(fd)?.identity == expected {
+        Ok(())
+    } else {
+        Err(io::Error::other("cloned staging descriptor identity changed"))
+    }
+}
+
+fn require_entry_identity(parent: BorrowedFd<'_>, name: &OsStr, expected: Identity) -> io::Result<()> {
+    if crate::roots::observe(parent, name)?.identity == expected {
+        Ok(())
+    } else {
+        Err(io::Error::other("cloned staging entry identity changed"))
+    }
+}
+
+struct CloneCleanup<'a> {
+    parent: BorrowedFd<'a>,
+    name: &'a OsStr,
+    identity: Identity,
+    armed: bool,
+}
+
+impl<'a> CloneCleanup<'a> {
+    fn new(parent: BorrowedFd<'a>, name: &'a OsStr, identity: Identity) -> Self {
+        Self { parent, name, identity, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn remove_after(&mut self, primary: io::Error) -> io::Error {
+        self.armed = false;
+        match remove_clone(self.parent, self.name, self.identity) {
+            Ok(()) => primary,
+            Err(cleanup) => io::Error::new(
+                primary.kind(),
+                format!("{primary}; cleanup of clone at staging name {:?} failed: {cleanup}", self.name),
+            ),
+        }
+    }
+}
+
+impl Drop for CloneCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = remove_clone(self.parent, self.name, self.identity);
+        }
+    }
+}
+
+fn remove_clone(parent: BorrowedFd<'_>, name: &OsStr, identity: Identity) -> io::Result<()> {
+    match crate::roots::observe(parent, name) {
+        Ok(observation) if observation.identity == identity => {
+            let metadata = open_metadata_handle(parent, name)?;
+            require_descriptor_identity(metadata.as_fd(), identity)?;
+            let flags = fs::fstat(metadata.as_fd())?.st_flags;
+            if flags & BLOCKING_FLAGS != 0 {
+                set_flags(metadata.as_fd(), flags & !BLOCKING_FLAGS)?;
+            }
+            require_descriptor_identity(metadata.as_fd(), identity)?;
+            require_entry_identity(parent, name, identity)?;
+            fs::unlinkat(parent, name, fs::AtFlags::empty()).map_err(Into::into)
+        }
+        Ok(_) => Err(io::Error::other("staging name was replaced; clone location cannot be verified and replacement was left untouched")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::other("clone is absent from its staging name; current location cannot be verified")),
         Err(error) => Err(error),
     }
 }
@@ -293,7 +808,7 @@ fn capture_xattrs(fd: BorrowedFd<'_>, budget: &mut CaptureBudget) -> io::Result<
         let end = xattr_name_end(&names, start)?;
         let name = CStr::from_bytes_with_nul(&names[start..=end])
             .map_err(|_| invalid_data("filesystem returned a malformed xattr name"))?;
-        if name.to_bytes() != RESOURCE_FORK_NAME {
+        if name.to_bytes() != RESOURCE_FORK_NAME.to_bytes() {
             xattr_count = xattr_count.checked_add(1).ok_or_else(too_large)?;
         }
         start = end + 1;
@@ -310,7 +825,7 @@ fn capture_xattrs(fd: BorrowedFd<'_>, budget: &mut CaptureBudget) -> io::Result<
         let end = xattr_name_end(&names, start)?;
         let name = CStr::from_bytes_with_nul(&names[start..=end])
             .map_err(|_| invalid_data("filesystem returned a malformed xattr name"))?;
-        if name.to_bytes() != RESOURCE_FORK_NAME {
+        if name.to_bytes() != RESOURCE_FORK_NAME.to_bytes() {
             let value = capture_xattr_value(fd, name, budget)?;
             let name = copy_xattr_name(name.to_bytes(), budget)?;
             attrs.push(Xattr { name, value });
@@ -448,7 +963,7 @@ fn reconcile_xattrs(fd: BorrowedFd<'_>, desired: &[Xattr]) -> io::Result<()> {
         }
         let name = CStr::from_bytes_with_nul(&names[start..=end])
             .map_err(|_| invalid_data("filesystem returned a malformed xattr name"))?;
-        if name.to_bytes() != RESOURCE_FORK_NAME
+        if name.to_bytes() != RESOURCE_FORK_NAME.to_bytes()
             && !desired.iter().any(|wanted| wanted.name.as_bytes() == name.to_bytes())
         {
             fs::fremovexattr(fd, name)?;
@@ -640,6 +1155,16 @@ fn is_symlink(mode: u16) -> bool {
 
 fn is_acceleration_unsupported(error: Errno) -> bool {
     error == Errno::NOTSUP || error == Errno::OPNOTSUPP || error == Errno::NOSYS || error == Errno::XDEV
+}
+
+fn is_acceleration_unsupported_io(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::ENOTSUP
+            || code == libc::EOPNOTSUPP
+            || code == libc::ENOSYS
+            || code == libc::EXDEV
+    )
 }
 
 fn is_no_xattrs(error: Errno) -> bool {

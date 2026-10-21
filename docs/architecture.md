@@ -80,18 +80,19 @@ unlink conditional on both inode and mutation version against every concurrent
 writer. The command does not claim protection from another process running as
 the same account with authority over the trees.
 
-Linux workspace and PTY tests, semantic verification, shift refinement, and
-supported native conformance cases pass. Focused campaign strict clippy passes
-on the integrated code; workspace strict clippy remains blocked by
-pre-existing `fdu` issues. The macOS target compiles, but its native tests have
-not run on a macOS host. On this Linux host, `FICLONE` returns `EOPNOTSUPP` on
-ext4. Real EXDEV tests are present, but a genuine distinct-device fixture is
-unavailable here.
-There is no privileged nested-mount fixture, and the foreign-owner `0044` test
-fixture is unavailable. See the [case inventory](../crates/ish-fs/tests/cases.md)
-for native evidence by capability. P3 benchmarking is exploratory, and P3
-performance acceptance remains blocked. These host limits do not change the
-command contract above.
+Linux workspace tests (including 152 PTY cases), strict all-target Clippy,
+semantic verification, shift refinement, and retained conformance pass.
+The full workspace also passes strict all-target Clippy for ARM64 musl and
+ARM64 macOS. Selected ARM64 musl tests execute under QEMU; neither emulation
+nor cross-compilation establishes native hardware behavior.
+
+Private mount namespaces provide genuine ext4-to-tmpfs EXDEV, nested tmpfs,
+same-device bind mounts, and mountpoint-retirement evidence. Linux FICLONE
+returns EOPNOTSUPP on the available ext4 filesystem; foreign-owner setup cannot
+map uid 65534. Native macOS and ARM64 hardware runs remain unavailable.
+See the [case inventory](../crates/ish-fs/tests/cases.md) for required commands
+and capability skips, and the [measurements](../benches/fs/results-linux.md)
+for benchmark scope and variation. These limits keep campaign acceptance pending.
 
 ## Current resource limits
 
@@ -105,14 +106,40 @@ buffer, and traversal paths are limited to 64 KiB. The foreground controller
 has a separate 256-event queue and coalesces progress events when that queue is
 full. It polls for signals every 50 ms.
 
-Preflight mapping accounting is capped at 64 MiB. Dry-run traversal frames are
-capped at 32 MiB. Traversal, hardlink, and retirement records use unlinked
+Preflight mapping accounting is capped at 64 MiB. Dry-run traversal frames,
+retained child names, and vector capacities are capped together at 32 MiB.
+Each directory is enumerated once without creating scratch files.
+Traversal, hardlink, and retirement records use unlinked
 temporary files under the configured scratch directory; each decoded record
 is capped at 1 MiB. For a finite address-space limit, worker admission reserves
 64 MiB for records and 512 KiB for the producer stack. Each worker is budgeted
 one 512 KiB stack, a 256 KiB transfer buffer, and four metadata captures. A
 metadata capture is capped at 16 MiB on Linux and 64 MiB on macOS; Linux
 extended attribute buffers use that same 16 MiB cap.
+
+Path lookup uses an AVL index in the existing record spool. Each record has
+a 17-byte index header, and output observations occupy a fixed 94-byte slot.
+The index adds no descriptors. Lookup takes logarithmic record work, including
+directory-anchor and retirement lookups. The private record and retained-intent
+encoding is version 2. Unknown versions are rejected rather than guessed.
+
+Hardlink coordination keeps one active owner per source inode. Coordinator
+locks are released before data transfer, synchronization, and event delivery.
+Regular files and symlink objects share this coordination. Symlinks are linked
+without following their targets.
+
+Multi-source moves and merges record completed directory renames without
+enumerating their children. A later hardlink transfer indexes each recorded
+tree once. If copied representatives already exist, a directory is inspected
+before rename to detect a coupled group. A coupled tree uses transfer and
+guarded retirement. An isolated directory rename needs neither traversal nor
+scratch storage. Reused regular-file representatives are synchronized before
+they authorize durable retirement.
+
+Worker admission reserves six descriptors per worker on Linux and eight on
+macOS. The macOS budget covers two verified named-fork stream descriptors for
+resource forks above the positioned-xattr range. Resource-fork copying reuses
+the worker's existing transfer buffer.
 
 These budgets estimate bounded allocations used to admit workers. They are not
 measured peak RSS limits. Linux resource probes sample descriptor and RSS

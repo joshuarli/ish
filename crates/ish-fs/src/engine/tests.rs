@@ -63,13 +63,9 @@ fn dense_destination_allocation_is_reported_without_claiming_sparse_support() {
             let source_allocated = fs::metadata(&source).unwrap().blocks() * 512;
             let mut request = fixture.request();
             request.operation = Operation::Copy;
-            let directory = fixture.0.clone();
             let (outcome, events) = fixture.run(&request, move |point| {
-                if force_dense_destination && point == "after_copy" {
-                    let stage = fs::read_dir(&directory).unwrap()
-                        .map(|entry| entry.unwrap().path())
-                        .find(|path| path.file_name().unwrap().as_encoded_bytes().starts_with(b".ish-fs-stage-")).unwrap();
-                    fs::write(stage, vec![u8::from(dense_source); length]).unwrap();
+                if force_dense_destination && point == "during_copy" {
+                    crate::platform::linux::force_dense_destination_for_test();
                 }
                 Ok(())
             });
@@ -778,3 +774,6 @@ fn public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks() {
         assert_eq!(snapshot.acl, source_acl);
     }
 }
+
+#[path = "repair_tests.rs"]
+mod repair_tests;

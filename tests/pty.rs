@@ -701,6 +701,7 @@ fn assert_native_fs_parent_refusal(output: &str) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn native_fs_tree(home: &Path, name: &str, count: usize) -> PathBuf {
     let root = home.join(name);
     std::fs::create_dir(&root).unwrap();
@@ -850,6 +851,46 @@ fn native_fs_parent_placement_accepts_command_alias_expanded_name_and_argument_s
         assert_eq!(std::fs::read(sh.home_path().join(path)).unwrap(), b"parent bytes\0");
     }
     assert_native_fs_status(&sh, 0);
+}
+
+#[test]
+fn native_fs_standalone_negation_runs_in_the_shell_process() {
+    let sh = PtyShell::spawn_with_opts(&[("source", "negated copy bytes")], &[]);
+
+    sh.run_command("! cp source negated-copy");
+    assert_eq!(std::fs::read(sh.home_path().join("negated-copy")).unwrap(), b"negated copy bytes");
+    assert_native_fs_status(&sh, 1);
+
+    sh.run_command("! mv absent-source negated-move");
+    assert!(!sh.home_path().join("negated-move").exists());
+    assert_native_fs_status(&sh, 0);
+
+    sh.run_command("! mv negated-copy negated-move-success");
+    assert!(!sh.home_path().join("negated-copy").exists());
+    assert_eq!(
+        std::fs::read(sh.home_path().join("negated-move-success")).unwrap(),
+        b"negated copy bytes"
+    );
+    assert_native_fs_status(&sh, 1);
+
+    sh.run_command("export NATIVE_FS_COMMAND=cp");
+    sh.run_command(
+        "! command command $NATIVE_FS_COMMAND negated-move-success nested-negated-copy > nested-negated-redirection",
+    );
+    assert_eq!(
+        std::fs::read(sh.home_path().join("nested-negated-copy")).unwrap(),
+        b"negated copy bytes"
+    );
+    assert!(sh.home_path().join("nested-negated-redirection").exists());
+    assert_native_fs_status(&sh, 1);
+
+    sh.run_command("alias negated-copy-command cp");
+    sh.run_command("! negated-copy-command source alias-negated-copy");
+    assert_eq!(
+        std::fs::read(sh.home_path().join("alias-negated-copy")).unwrap(),
+        b"negated copy bytes"
+    );
+    assert_native_fs_status(&sh, 1);
 }
 
 #[test]
@@ -1531,6 +1572,33 @@ fn which_uses_store_path_not_os_env() {
         out.contains("/bin/ls"),
         "absolute path lookup must still work: {out:?}"
     );
+}
+
+#[test]
+fn command_lookup_classifies_ish_commands_with_empty_path() {
+    let sh = PtyShell::spawn_with_setup(&[("source", "external copy bytes")], &[], &[], 24, 80, None, |home| {
+        std::fs::create_dir(home.join("destination-directory")).unwrap();
+    });
+    sh.run_command("export PATH=");
+
+    let output = clean(&sh.run_command("command -v cp"));
+    assert!(output.lines().any(|line| line.trim() == "cp"), "{output:?}");
+    assert_native_fs_status(&sh, 0);
+
+    let output = clean(&sh.run_command("command -V mv"));
+    assert!(output.lines().any(|line| line.trim() == "mv is a shell builtin"), "{output:?}");
+    assert_native_fs_status(&sh, 0);
+
+    let output = clean(&sh.run_command("command -v /bin/cp"));
+    assert!(output.lines().any(|line| line.trim() == "/bin/cp"), "{output:?}");
+    assert_native_fs_status(&sh, 0);
+
+    sh.run_command("/bin/cp source destination-directory");
+    assert_eq!(
+        std::fs::read(sh.home_path().join("destination-directory/source")).unwrap(),
+        b"external copy bytes"
+    );
+    assert_native_fs_status(&sh, 0);
 }
 
 #[test]
