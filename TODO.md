@@ -77,15 +77,6 @@ Next: 45
 - **Fix with:** none
 - **Effort:** S (hours)
 
-### ISH-43 · P3 · History search allocates on every key
-
-- **Area:** Performance
-- **Where:** `src/main.rs:881`, `src/main.rs:2161-2182`, `src/main.rs:2177`, `src/main.rs:2308`
-- **Problem:** AGENTS.md requires reusing buffers on the keystroke path. `handle_history_search_key` calls `query.text().to_string()` on every key, the paste path does the same, and `update_history_search` moves the candidate vector into the stack with `mem::take`, leaving an empty vector that regrows. Not measured.
-- **Recommendation:** Keep one reusable previous-query buffer in the search mode and recycle popped candidate vectors, then confirm with the existing benchmark.
-- **Fix with:** make-it-fast
-- **Effort:** S (hours)
-
 ### ISH-44 · P3 · About 900 comments contradict the repo's no-comment contract and excuse code smells
 
 - **Area:** Navigability

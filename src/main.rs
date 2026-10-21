@@ -79,6 +79,8 @@ enum Mode {
         candidates: Vec<usize>,
         scratch: Vec<usize>,
         candidate_stack: Vec<(usize, Vec<usize>)>,
+        spare_candidates: Vec<Vec<usize>>,
+        previous_query: String,
         selected: usize,
         saved_line: String,
     },
@@ -659,6 +661,8 @@ fn capture_layout_dump(
             candidates,
             scratch,
             candidate_stack,
+            spare_candidates: _,
+            previous_query: _,
             selected,
             saved_line,
         } => {
@@ -948,20 +952,25 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
                     candidates,
                     scratch,
                     candidate_stack,
+                    spare_candidates,
+                    previous_query,
                     selected,
                     ..
                 } = &mut mode
                 {
-                    let previous = (query.text().to_string(), query.cursor());
+                    previous_query.clear();
+                    previous_query.push_str(query.text());
+                    let previous_cursor = query.cursor();
                     query.insert_str(&text);
                     update_history_search(
                         query,
-                        (&previous.0, previous.1),
+                        (previous_query, previous_cursor),
                         matches,
                         HistoryCandidates {
                             candidates,
                             scratch,
                             candidate_stack,
+                            spare_candidates,
                         },
                         selected,
                         shell,
@@ -1086,6 +1095,8 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
                                     candidates,
                                     scratch,
                                     candidate_stack: Vec::new(),
+                                    spare_candidates: Vec::new(),
+                                    previous_query: String::new(),
                                     selected: 0,
                                     saved_line: saved_line.clone(),
                                 };
@@ -1261,16 +1272,20 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
                         candidates,
                         scratch,
                         candidate_stack,
+                        spare_candidates,
+                        previous_query,
                         selected,
                         saved_line,
                     } => match handle_history_search_key(
                         key,
                         query,
+                        previous_query,
                         matches,
                         HistoryCandidates {
                             candidates,
                             scratch,
                             candidate_stack,
+                            spare_candidates,
                         },
                         selected,
                         shell,
@@ -2233,22 +2248,33 @@ struct HistoryCandidates<'a> {
     candidates: &'a mut Vec<usize>,
     scratch: &'a mut Vec<usize>,
     candidate_stack: &'a mut Vec<(usize, Vec<usize>)>,
+    spare_candidates: &'a mut Vec<Vec<usize>>,
+}
+
+fn recycle_candidate_stack(
+    candidate_stack: &mut Vec<(usize, Vec<usize>)>,
+    spare_candidates: &mut Vec<Vec<usize>>,
+) {
+    spare_candidates.extend(candidate_stack.drain(..).map(|(_, candidates)| candidates));
 }
 
 fn handle_history_search_key(
     key: KeyEvent,
     query: &mut LineBuffer,
+    previous_query: &mut String,
     matches: &mut Vec<FuzzyMatch>,
     HistoryCandidates {
         candidates,
         scratch,
         candidate_stack,
+        spare_candidates,
     }: HistoryCandidates<'_>,
     selected: &mut usize,
     shell: &Shell,
 ) -> HistoryAction {
     let mut re_search = false;
-    let prev_text = query.text().to_string();
+    previous_query.clear();
+    previous_query.push_str(query.text());
     let prev_cursor = query.cursor();
     match (key.key, key.mods.ctrl, key.mods.alt) {
         (Key::Escape, _, _) => return HistoryAction::Cancel,
@@ -2324,12 +2350,13 @@ fn handle_history_search_key(
     if re_search {
         update_history_search(
             query,
-            (&prev_text, prev_cursor),
+            (previous_query, prev_cursor),
             matches,
             HistoryCandidates {
                 candidates,
                 scratch,
                 candidate_stack,
+                spare_candidates,
             },
             selected,
             shell,
@@ -2346,6 +2373,7 @@ fn update_history_search(
         candidates,
         scratch,
         candidate_stack,
+        spare_candidates,
     }: HistoryCandidates<'_>,
     selected: &mut usize,
     shell: &Shell,
@@ -2360,30 +2388,31 @@ fn update_history_search(
         && new_text.len() < prev_text.len()
         && prev_text.starts_with(new_text);
     if append_at_end {
-        candidate_stack.push((prev_text.len(), std::mem::take(candidates)));
+        let narrowed = spare_candidates.pop().unwrap_or_default();
+        let wider = std::mem::replace(candidates, narrowed);
+        candidate_stack.push((prev_text.len(), wider));
         shell.history.fuzzy_search_subset_into_in_dir(
             new_text,
             &candidate_stack.last().unwrap().1,
-            scratch,
+            candidates,
             matches,
             200,
             shell.epsh.cwd(),
         );
-        std::mem::swap(candidates, scratch);
     } else if delete_at_end {
         while candidate_stack
             .last()
             .is_some_and(|(len, _)| *len > new_text.len())
         {
             if let Some((_, old_candidates)) = candidate_stack.pop() {
-                *scratch = old_candidates;
+                spare_candidates.push(old_candidates);
             }
         }
         if let Some((len, _)) = candidate_stack.last()
             && *len == new_text.len()
         {
             let (_, old_candidates) = candidate_stack.pop().unwrap();
-            *candidates = old_candidates;
+            spare_candidates.push(std::mem::replace(candidates, old_candidates));
             shell.history.fuzzy_search_subset_into_in_dir(
                 new_text,
                 candidates,
@@ -2393,7 +2422,7 @@ fn update_history_search(
                 shell.epsh.cwd(),
             );
         } else {
-            candidate_stack.clear();
+            recycle_candidate_stack(candidate_stack, spare_candidates);
             shell.history.search_entry_indices_into(scratch);
             shell.history.fuzzy_search_subset_into_in_dir(
                 new_text,
@@ -2406,7 +2435,7 @@ fn update_history_search(
             std::mem::swap(candidates, scratch);
         }
     } else {
-        candidate_stack.clear();
+        recycle_candidate_stack(candidate_stack, spare_candidates);
         shell.history.search_entry_indices_into(scratch);
         shell.history.fuzzy_search_subset_into_in_dir(
             new_text,
