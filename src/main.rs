@@ -1,31 +1,20 @@
 use ish::alias::AliasMap;
+use ish::cd_rewrite::{maybe_rewrite_cd, resolve_cd_for_history};
+use ish::complete::needs_quoting;
+use ish::diagnostics::{self, base64_encode};
+use ish::mode::{CompletionMode, DirPicker, HistorySearch, Mode};
 use ish::complete::CompletionState;
 use ish::history::FuzzyMatch;
 use ish::input::{InputEvent, InputReader, Key, KeyEvent};
-use ish::job::Job;
+use ish::job::{self, Job};
+use ish::external;
 use ish::line::LineBuffer;
 use ish::term::TermWriter;
 use ish::{builtin, capture, complete, config, denv, dispatch, frecency, history, path, prompt, render, signal, term};
-use std::cell::RefCell;
 use std::ffi::OsString;
-use std::fmt::Write as _;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use ish::builtin::{ExternalCommand, ShellCommand};
-use ish::foreground;
-mod fs_command;
-mod static_word;
+use ish::builtin::ShellCommand;
 mod trash;
-
-// Thread-local storage for a stopped job's info, written by the external handler
-// and consumed by the main loop. Avoids needing to thread state through epsh's
-// callback boundary.
-thread_local! {
-    static STOPPED_JOB: RefCell<Option<(i32, String, term::Termios)>> =
-        const { RefCell::new(None) };
-    /// Whether the shell already holds a suspended job while a command runs.
-    static JOB_SLOT_TAKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
 
 struct Shell {
     aliases: AliasMap,
@@ -65,29 +54,6 @@ enum ReadResult {
     /// SIGTERM or SIGHUP arrived through the self-pipe.
     Terminated(i32),
     Empty,
-}
-
-enum Mode {
-    Normal,
-    Completion {
-        state: CompletionState,
-        base_line: LineBuffer,
-    },
-    HistorySearch {
-        query: LineBuffer,
-        matches: Vec<FuzzyMatch>,
-        candidates: Vec<usize>,
-        scratch: Vec<usize>,
-        candidate_stack: Vec<(usize, Vec<usize>)>,
-        spare_candidates: Vec<Vec<usize>>,
-        previous_query: String,
-        selected: usize,
-        saved_line: String,
-    },
-    DirPicker {
-        entries: Vec<String>,
-        selected: usize,
-    },
 }
 
 struct Args {
@@ -261,7 +227,7 @@ fn main() {
     loop {
         if let Some(sig) = signal::take_pending_termination() {
             if let Some(job) = shell.job.take() {
-                abandon_job(job);
+                job::abandon(job);
             }
             exit_code = 128 + sig;
             break;
@@ -352,9 +318,9 @@ fn main() {
                     .storage_path()
                     .expect("interactive history has a storage path")
                     .to_path_buf();
-                let handler = make_external_handler(shell_pid, history_log, fs_default_scratch.clone());
+                let handler = external::make_external_handler(shell_pid, history_log, fs_default_scratch.clone());
                 shell.epsh.set_external_handler(handler);
-                JOB_SLOT_TAKEN.with(|taken| taken.set(shell.job.is_some()));
+                external::begin_command(shell.job.is_some());
 
                 let buffer = std::mem::take(&mut shell.last_output);
                 let (status, mut session) =
@@ -371,8 +337,8 @@ fn main() {
 
                 // Detect job suspension (status 148 = 128 + SIGTSTP).
                 if shell.last_status == 148
-                    && let Some((pgid, cmd, termios)) =
-                        STOPPED_JOB.with(|cell| cell.borrow_mut().take())
+                    && let Some(external::StoppedJob { pgid, cmd, termios }) =
+                        external::take_stopped_job()
                 {
                     eprintln!("ish: stopped: {} (pgid={})", cmd, pgid);
                     shell.job = Some(Job { pgid, cmd, termios, capture: session.take() });
@@ -390,7 +356,7 @@ fn main() {
                 // The terminal is already restored: read_line's raw-mode guard
                 // dropped on its way out.
                 if let Some(job) = shell.job.take() {
-                    abandon_job(job);
+                    job::abandon(job);
                 }
                 exit_code = 128 + sig;
                 break;
@@ -607,119 +573,16 @@ fn capture_layout_dump(
         } else {
             None
         };
-    let suggestion_display_len = suggestion.map(ish::line::str_width).unwrap_or(0);
-
-    shell.layout_dump.clear();
-    let out = &mut shell.layout_dump;
-    let _ = writeln!(out, "ish layout dump");
-    let _ = writeln!(out, "version: {}", env!("CARGO_PKG_VERSION"));
-    let _ = writeln!(out, "terminal.rows: {}", shell.rows);
-    let _ = writeln!(out, "terminal.cols: {}", shell.cols);
-    let _ = writeln!(out, "prompt.display_len: {prompt_display_len}");
-    let _ = writeln!(out, "line.bytes: {}", line.text().len());
-    let _ = writeln!(out, "line.cursor_byte: {}", line.cursor());
-    let _ = writeln!(
-        out,
-        "line.cursor_display_col: {}",
-        line.display_cursor_pos()
-    );
-    let _ = writeln!(out, "line.display_len: {}", line.display_len());
-    let _ = writeln!(out, "suggestion.present: {}", suggestion.is_some());
-    let _ = writeln!(out, "suggestion.display_len: {suggestion_display_len}");
-    let _ = writeln!(out, "line.has_newlines: {}", line.has_newlines());
-    let _ = writeln!(out, "rendered_region: {region:?}");
-    let _ = writeln!(out, "mode: {}", mode_name(mode));
-    render::debug_dump_prompt_layout(
-        out,
+    let snapshot = diagnostics::LayoutSnapshot {
+        rows: shell.rows,
+        cols: shell.cols,
         prompt_display_len,
         line,
-        suggestion_display_len,
-        shell.cols,
-    );
-
-    match mode {
-        Mode::Normal => {}
-        Mode::Completion { state, base_line } => {
-            let _ = writeln!(
-                out,
-                "completion.base_line.cursor_byte: {}",
-                base_line.cursor()
-            );
-            let _ = writeln!(out, "completion.selected: {}", state.selected);
-            let _ = writeln!(out, "completion.cols: {}", state.cols);
-            let _ = writeln!(out, "completion.rows: {}", state.rows);
-            let _ = writeln!(out, "completion.scroll: {}", state.scroll);
-            let _ = writeln!(out, "completion.term_cols: {}", state.term_cols);
-            let _ = writeln!(out, "completion.dir_prefix_bytes: {}", state.dir_prefix.len());
-            let _ = writeln!(out, "completion.in_quote: {}", state.in_quote);
-            let _ = writeln!(out, "completion.entries: {:?}", state.comp.entries);
-            render::debug_dump_completion_layout(out, state);
-        }
-        Mode::HistorySearch {
-            query,
-            matches,
-            candidates,
-            scratch,
-            candidate_stack,
-            spare_candidates: _,
-            previous_query: _,
-            selected,
-            saved_line,
-        } => {
-            let _ = writeln!(out, "history.query.cursor_byte: {}", query.cursor());
-            let _ = writeln!(
-                out,
-                "history.query.cursor_display_col: {}",
-                query.display_cursor_pos()
-            );
-            let _ = writeln!(out, "history.matches: {:?}", matches);
-            let _ = writeln!(out, "history.candidates: {candidates:?}");
-            let _ = writeln!(out, "history.scratch: {scratch:?}");
-            let _ = writeln!(out, "history.candidate_stack: {candidate_stack:?}");
-            let _ = writeln!(out, "history.selected: {selected}");
-            let _ = writeln!(out, "history.saved_line_bytes: {}", saved_line.len());
-            render::debug_dump_pager_layout(
-                out,
-                render::PagerInput {
-                    prefix_width: ish::line::str_width("search: "),
-                    query_width: ish::line::str_width(query.text()),
-                    suffix_width: 0,
-                    query_cursor: query.display_cursor_pos(),
-                    total_entries: matches.len(),
-                    selected: *selected,
-                    term_rows: shell.rows,
-                    term_cols: shell.cols,
-                },
-            );
-        }
-        Mode::DirPicker { entries, selected } => {
-            let _ = writeln!(out, "dir_picker.entry_count: {}", entries.len());
-            let _ = writeln!(out, "dir_picker.selected: {selected}");
-            render::debug_dump_pager_layout(
-                out,
-                render::PagerInput {
-                    prefix_width: ish::line::str_width("dirs:"),
-                    query_width: 0,
-                    suffix_width: 0,
-                    query_cursor: 0,
-                    total_entries: entries.len(),
-                    selected: *selected,
-                    term_rows: shell.rows,
-                    term_cols: shell.cols,
-                },
-            );
-        }
-    }
-
-}
-
-fn mode_name(mode: &Mode) -> &'static str {
-    match mode {
-        Mode::Normal => "normal",
-        Mode::Completion { .. } => "completion",
-        Mode::HistorySearch { .. } => "history_search",
-        Mode::DirPicker { .. } => "dir_picker",
-    }
+        suggestion_display_len: suggestion.map(ish::line::str_width),
+        region,
+        mode,
+    };
+    diagnostics::render_layout_dump(&mut shell.layout_dump, snapshot);
 }
 
 /// Write the captured layout dump to a fresh file in `~/.cache/ish/dump-<hex>`.
@@ -728,39 +591,8 @@ fn mode_name(mode: &Mode) -> &'static str {
 /// changing its contents. The dump holds geometry and lengths only, never typed
 /// text, and the directory and files are private to the user.
 fn write_layout_dump_to_file(shell: &Shell) -> Result<String, String> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-
-    let home = store_env_os(&shell.epsh, "HOME").filter(|home| !home.is_empty())
-        .ok_or_else(|| "ish-dump: HOME is not set".to_string())?;
-    let dir = Path::new(&home).join(".cache/ish");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|error| format!("ish-dump: could not create {}: {error}", dir.display()))?;
-
-    for _ in 0..8 {
-        let path = dir.join(format!("dump-{}", random_dump_hex()));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                std::io::Write::write_all(&mut file, shell.layout_dump.as_bytes()).map_err(
-                    |error| format!("ish-dump: could not write {}: {error}", path.display()),
-                )?;
-                return Ok(path.display().to_string());
-            }
-            Err(_) => continue,
-        }
-    }
-
-    Err(format!(
-        "ish-dump: could not choose a unique dump filename in {}",
-        dir.display()
-    ))
+    let home = store_env_os(&shell.epsh, "HOME").unwrap_or_default();
+    diagnostics::write_layout_dump_file(&home, &shell.layout_dump)
 }
 
 fn write_layout_dump(shell: &Shell) -> i32 {
@@ -774,31 +606,6 @@ fn write_layout_dump(shell: &Shell) -> i32 {
             1
         }
     }
-}
-
-fn random_dump_hex() -> String {
-    let mut bytes = [0u8; 16];
-    let random_read = std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes));
-    if random_read.is_err() {
-        let mut value = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            ^ (rustix::process::getpid().as_raw_pid() as u128);
-        for byte in &mut bytes {
-            value ^= value << 13;
-            value ^= value >> 7;
-            value ^= value << 17;
-            *byte = value as u8;
-        }
-    }
-
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
 }
 
 fn store_env_os(epsh: &epsh::eval::Shell, name: &str) -> Option<OsString> {
@@ -846,6 +653,37 @@ fn read_line(shell: &mut Shell) -> ReadResult {
     result
 }
 
+struct EditView {
+    tw: TermWriter,
+    line: LineBuffer,
+    history_idx: Option<usize>,
+    saved_line: String,
+    grid_column: Option<usize>,
+    prompt_str: String,
+    prompt_display_len: usize,
+    region: render::RenderedRegion,
+    history_cache: render::HistoryPagerCache,
+}
+
+enum Next {
+    Stay,
+    Normal,
+}
+
+fn emit_working_directory(shell: &Shell) {
+    let pwd = shell.epsh.vars().get("PWD").unwrap_or("");
+    if !pwd.is_empty() {
+        let hostname = shell.epsh.vars().get("HOSTNAME").unwrap_or("");
+        // Percent-encode every byte outside the URI unreserved set so
+        // control and non-ASCII bytes cannot end or inject sequences.
+        let mut osc = String::from("\x1b]7;file://");
+        prompt::push_percent_encoded(&mut osc, hostname.as_bytes(), false);
+        prompt::push_percent_encoded(&mut osc, pwd.as_bytes(), true);
+        osc.push('\x07');
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
+    }
+}
+
 fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadResult {
     let _raw = match term::RawMode::enable() {
         Ok(r) => r,
@@ -856,25 +694,8 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
     };
 
     let mut tw = TermWriter::new();
-    let mut line = LineBuffer::new();
-    let mut mode = Mode::Normal;
-    let mut history_idx: Option<usize> = None;
-    let mut saved_line = String::new();
-    let mut grid_column: Option<usize> = None;
-    // Emit OSC 7 so terminal emulators track the working directory
-    {
-        let pwd = shell.epsh.vars().get("PWD").unwrap_or("");
-        if !pwd.is_empty() {
-            let hostname = shell.epsh.vars().get("HOSTNAME").unwrap_or("");
-            // Percent-encode every byte outside the URI unreserved set so
-            // control and non-ASCII bytes cannot end or inject sequences.
-            let mut osc = String::from("\x1b]7;file://");
-            prompt::push_percent_encoded(&mut osc, hostname.as_bytes(), false);
-            prompt::push_percent_encoded(&mut osc, pwd.as_bytes(), true);
-            osc.push('\x07');
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
-        }
-    }
+    let line = LineBuffer::new();
+    emit_working_directory(shell);
 
     if shell.prompt_needs_line_start {
         // Commands write directly to the terminal, so ish cannot observe
@@ -894,7 +715,7 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
     let prompt_str = std::mem::take(&mut shell.prompt_buf);
     let prompt_display_len = shell.prompt.display_len(&prompt_str);
 
-    let info = render_prompt_region(
+    let region = render_prompt_region(
         &mut tw,
         shell,
         &line,
@@ -902,493 +723,526 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
         prompt_display_len,
         render::RenderedRegion::default(),
     );
-    let mut region = info;
-    let mut history_cache = render::HistoryPagerCache::default();
     let _ = tw.flush_to_stdout();
 
-    loop {
-        let event = reader.read_event();
-        match event {
-            InputEvent::Signal(sig) => {
-                if sig == rustix::process::Signal::TERM.as_raw()
-                    || sig == rustix::process::Signal::HUP.as_raw()
-                {
-                    return ReadResult::Terminated(sig);
-                }
-                if sig == rustix::process::Signal::WINCH.as_raw() {
-                    let (rows, cols) = term::term_size();
-                    shell.rows = rows;
-                    shell.cols = cols;
-                    grid_column = None;
-                    update_mode_layout_for_resize(&mut mode, shell);
+    let mut view = EditView {
+        tw,
+        line,
+        history_idx: None,
+        saved_line: String::new(),
+        grid_column: None,
+        prompt_str,
+        prompt_display_len,
+        region,
+        history_cache: render::HistoryPagerCache::default(),
+    };
+    let mut mode = Mode::Normal;
 
-                    // Terminal emulators reflow the live cursor and their
-                    // DEC saved cursor differently on resize. The saved
-                    // RenderedRegion anchor is therefore no longer a safe
-                    // basis for an incremental repaint. Start from a known
-                    // screen position and rebuild the active region.
-                    tw.clear_screen();
-                    region = render::RenderedRegion::default();
-                    history_cache.clear();
-                }
-                region = render_active_mode(
-                    &mut tw,
-                    &mode,
-                    shell,
-                    &line,
-                    &prompt_str,
-                    prompt_display_len,
-                    region,
-                    &mut history_cache,
-                );
-                let _ = tw.flush_to_stdout();
-                continue;
-            }
+    loop {
+        let finished = match reader.read_event() {
+            InputEvent::Signal(sig) => handle_signal(&mut view, &mut mode, shell, sig),
             InputEvent::Paste(text) => {
-                grid_column = None;
-                if let Mode::HistorySearch {
-                    query,
-                    matches,
-                    candidates,
-                    scratch,
-                    candidate_stack,
-                    spare_candidates,
-                    previous_query,
-                    selected,
-                    ..
-                } = &mut mode
-                {
-                    previous_query.clear();
-                    previous_query.push_str(query.text());
-                    let previous_cursor = query.cursor();
-                    query.insert_str(&text);
-                    update_history_search(
-                        query,
-                        (previous_query, previous_cursor),
-                        matches,
-                        HistoryCandidates {
-                            candidates,
-                            scratch,
-                            candidate_stack,
-                            spare_candidates,
-                        },
-                        selected,
-                        shell,
-                    );
-                } else {
-                    line.insert_str(&text);
-                }
-                region = render_active_mode(
-                    &mut tw,
-                    &mode,
-                    shell,
-                    &line,
-                    &prompt_str,
-                    prompt_display_len,
-                    region,
-                    &mut history_cache,
-                );
-                let _ = tw.flush_to_stdout();
-                continue;
+                handle_paste(&mut view, &mut mode, shell, &text);
+                None
             }
             InputEvent::PasteRejected => {
-                grid_column = None;
+                view.grid_column = None;
                 // The line stays as typed (a message inserted into it could be
                 // run); ring the bell instead of repainting.
-                tw.write_str("\x07");
-                let _ = tw.flush_to_stdout();
-                continue;
+                view.tw.write_str("\x07");
+                let _ = view.tw.flush_to_stdout();
+                None
             }
-            InputEvent::Key(key) => {
-                // Ctrl+P writes a layout dump in any mode and does not repaint,
-                // so it captures the screen exactly as it is (including the
-                // status line) without disturbing it. Intercept before mode
-                // dispatch so every mode is covered uniformly.
-                if key.key == Key::Char('p') && key.mods.ctrl {
-                    capture_layout_dump(
-                        shell,
-                        &mode,
-                        &line,
-                        prompt_display_len,
-                        region,
-                    );
-                    if let Err(message) = write_layout_dump_to_file(shell) {
-                        eprintln!("{message}");
-                    }
-                    continue;
-                }
-                match &mut mode {
-                    Mode::Normal => {
-                        match handle_normal_key(
-                            key,
-                            &mut line,
-                            &mut history_idx,
-                            &mut saved_line,
-                            &mut grid_column,
-                            prompt_display_len,
-                            shell,
-                        ) {
-                            KeyAction::Continue => {}
-                            KeyAction::Execute(text) => {
-                                capture_layout_dump(
-                                    shell,
-                                    &mode,
-                                    &line,
-                                    prompt_display_len,
-                                    region,
-                                );
-                                // Clear autosuggestion ghost text before freezing the line
-                                if line.cursor() == line.text().len() {
-                                    tw.write_str("\x1b[J");
-                                }
-                                tw.write_str("\r\n");
-                                let _ = tw.flush_to_stdout();
-                                shell.prompt_buf = prompt_str;
-                                return if text.is_empty() {
-                                    ReadResult::Empty
-                                } else {
-                                    ReadResult::Line(text)
-                                };
-                            }
-                            KeyAction::Continuation => {
-                                line.insert_char('\n');
-                                history_idx = None;
-                            }
-                            KeyAction::Cancel => {
-                                tw.write_str("^C\r\n");
-                                let _ = tw.flush_to_stdout();
-                                shell.prompt_buf = prompt_str;
-                                return ReadResult::Empty;
-                            }
-                            KeyAction::Exit => {
-                                tw.write_str("\r\n");
-                                let _ = tw.flush_to_stdout();
-                                shell.prompt_buf = prompt_str;
-                                return handle_exit(shell);
-                            }
-                            KeyAction::ClearScreen => {
-                                tw.clear_screen();
-                                region = render::RenderedRegion::default();
-                            }
-                            KeyAction::StartHistorySearch => {
-                                if let Err(error) = shell.history.sync() {
-                                    eprintln!("ish: cannot sync history: {error}");
-                                }
-                                saved_line = line.text().to_string();
-                                let mut candidates = Vec::new();
-                                shell.history.search_entry_indices_into(&mut candidates);
-                                let mut scratch = Vec::new();
-                                let mut matches = std::mem::take(&mut shell.history_match_buffer);
-                                shell.history.fuzzy_search_subset_into_in_dir(
-                                    "",
-                                    &candidates,
-                                    &mut scratch,
-                                    &mut matches,
-                                    200,
-                                    shell.epsh.cwd(),
-                                );
-                                std::mem::swap(&mut candidates, &mut scratch);
-                                region.clear(&mut tw);
-                                mode = Mode::HistorySearch {
-                                    query: LineBuffer::new(),
-                                    matches,
-                                    candidates,
-                                    scratch,
-                                    candidate_stack: Vec::new(),
-                                    spare_candidates: Vec::new(),
-                                    previous_query: String::new(),
-                                    selected: 0,
-                                    saved_line: saved_line.clone(),
-                                };
-                                history_cache.clear();
-                                region = render_history_mode(
-                                    &mut tw,
-                                    &mode,
-                                    shell,
-                                    render::RenderedRegion::default(),
-                                    &mut history_cache,
-                                );
-                                let _ = tw.flush_to_stdout();
-                                continue;
-                            }
-                            KeyAction::StartDirPicker => {
-                                // Show dir stack in reverse (most recent first),
-                                // excluding the current directory
-                                let pwd = std::env::current_dir()
-                                    .map(|p| p.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                let entries: Vec<String> = shell
-                                    .dir_stack
-                                    .iter()
-                                    .rev()
-                                    .filter(|d| *d != &pwd)
-                                    .cloned()
-                                    .collect();
-                                if entries.is_empty() {
-                                    // No history yet — stay in normal mode
-                                } else {
-                                    region.clear(&mut tw);
-                                    mode = Mode::DirPicker {
-                                        entries,
-                                        selected: 0,
-                                    };
-                                    region = render_dir_picker_mode(&mut tw, &mode, shell, region);
-                                    let _ = tw.flush_to_stdout();
-                                    continue;
-                                }
-                            }
-                            KeyAction::StartCompletion => {
-                                let comp = std::mem::take(&mut shell.completion_buffer);
-                                let base_line = line.clone();
-                                let mut cs = start_completion(
-                                    &base_line,
-                                    shell.cols,
-                                    shell.home.as_deref(),
-                                    &shell.aliases,
-                                    &shell.epsh,
-                                    comp,
-                                );
-                                if cs.comp.len() == 1 {
-                                    preview_completion(&mut line, &cs, &base_line);
-                                    shell.completion_buffer = cs.comp;
-                                } else if !cs.comp.is_empty() {
-                                    cs.selected = usize::MAX;
-                                    preview_completion(&mut line, &cs, &base_line);
-                                    mode = Mode::Completion {
-                                        state: cs,
-                                        base_line,
-                                    };
-                                } else {
-                                    shell.completion_buffer = cs.comp;
-                                }
-                            }
-                        }
+            InputEvent::Key(key) => handle_key(&mut view, &mut mode, shell, key),
+        };
+        if let Some(result) = finished {
+            return result;
+        }
+    }
+}
 
-                        region = render_active_mode(
-                            &mut tw,
-                            &mode,
-                            shell,
-                            &line,
-                            &prompt_str,
-                            prompt_display_len,
-                            region,
-                            &mut history_cache,
-                        );
-                        let _ = tw.flush_to_stdout();
-                    }
+fn repaint(view: &mut EditView, mode: &Mode, shell: &mut Shell) {
+    view.region = render_active_mode(
+        &mut view.tw,
+        mode,
+        shell,
+        &view.line,
+        &view.prompt_str,
+        view.prompt_display_len,
+        view.region,
+        &mut view.history_cache,
+    );
+    let _ = view.tw.flush_to_stdout();
+}
 
-                    Mode::Completion { state, base_line } => {
-                        let (p, pdl) = active_prompt(&prompt_str, prompt_display_len);
-                        match handle_completion_key(key, state, base_line) {
-                            CompletionAction::Navigate => {
-                                preview_completion(&mut line, state, base_line);
-                                // Cursor is on prompt line — repaint grid in-place
-                                let info = render::render_line(
-                                    &mut tw,
-                                    p,
-                                    pdl,
-                                    &line,
-                                    shell.cols,
-                                    region,
-                                    &render::RenderOpts::default(),
-                                );
-                                region = info;
-                                render::render_completions(&mut tw, state, info, false);
-                                let _ = tw.flush_to_stdout();
-                                continue;
-                            }
-                            CompletionAction::Refilter => {
-                                // Reclaim buffer from current state, re-run completion
-                                let selected = state.selected;
-                                let comp = std::mem::take(&mut state.comp);
-                                let mut cs = start_completion(
-                                    base_line,
-                                    shell.cols,
-                                    shell.home.as_deref(),
-                                    &shell.aliases,
-                                    &shell.epsh,
-                                    comp,
-                                );
-                                if !cs.comp.is_empty() {
-                                    cs.selected = if selected == usize::MAX {
-                                        usize::MAX
-                                    } else {
-                                        selected.min(cs.comp.len() - 1)
-                                    };
-                                    preview_completion(&mut line, &cs, base_line);
-                                    let info = render::render_line(
-                                        &mut tw,
-                                        p,
-                                        pdl,
-                                        &line,
-                                        shell.cols,
-                                        region,
-                                        &render::RenderOpts::default(),
-                                    );
-                                    region = info;
-                                    render::render_completions(&mut tw, &cs, info, true);
-                                    mode = Mode::Completion {
-                                        state: cs,
-                                        base_line: base_line.clone(),
-                                    };
-                                    let _ = tw.flush_to_stdout();
-                                    continue;
-                                } else {
-                                    line = base_line.clone();
-                                    shell.completion_buffer = cs.comp;
-                                    mode = Mode::Normal;
-                                }
-                            }
-                            CompletionAction::Accept => {
-                                preview_completion(&mut line, state, base_line);
-                                shell.completion_buffer = std::mem::take(&mut state.comp);
-                                mode = Mode::Normal;
-                            }
-                            CompletionAction::Cancel => {
-                                line = base_line.clone();
-                                shell.completion_buffer = std::mem::take(&mut state.comp);
-                                mode = Mode::Normal;
-                            }
-                        }
+fn redraw_prompt_line(view: &mut EditView, shell: &Shell) {
+    view.region = render::render_line(
+        &mut view.tw,
+        &view.prompt_str,
+        view.prompt_display_len,
+        &view.line,
+        shell.cols,
+        render::RenderedRegion::default(),
+        &render::RenderOpts::default(),
+    );
+    let _ = view.tw.flush_to_stdout();
+}
 
-                        // Cursor is on prompt line — render_line's \r + clear_to_end_of_screen
-                        // naturally clears the grid below
-                        let info = render::render_line(
-                            &mut tw,
-                            p,
-                            pdl,
-                            &line,
-                            shell.cols,
-                            region,
-                            &render::RenderOpts::default(),
-                        );
-                        region = info;
-                        let _ = tw.flush_to_stdout();
-                    }
+fn handle_signal(
+    view: &mut EditView,
+    mode: &mut Mode,
+    shell: &mut Shell,
+    sig: i32,
+) -> Option<ReadResult> {
+    if sig == rustix::process::Signal::TERM.as_raw() || sig == rustix::process::Signal::HUP.as_raw()
+    {
+        return Some(ReadResult::Terminated(sig));
+    }
+    if sig == rustix::process::Signal::WINCH.as_raw() {
+        let (rows, cols) = term::term_size();
+        shell.rows = rows;
+        shell.cols = cols;
+        view.grid_column = None;
+        update_mode_layout_for_resize(mode, shell);
 
-                    Mode::HistorySearch {
-                        query,
-                        matches,
-                        candidates,
-                        scratch,
-                        candidate_stack,
-                        spare_candidates,
-                        previous_query,
-                        selected,
-                        saved_line,
-                    } => match handle_history_search_key(
-                        key,
-                        query,
-                        previous_query,
-                        matches,
-                        HistoryCandidates {
-                            candidates,
-                            scratch,
-                            candidate_stack,
-                            spare_candidates,
-                        },
-                        selected,
-                        shell,
-                    ) {
-                        HistoryAction::Continue => {
-                            region = render_history_mode(
-                                &mut tw,
-                                &mode,
-                                shell,
-                                region,
-                                &mut history_cache,
-                            );
-                            let _ = tw.flush_to_stdout();
-                        }
-                        HistoryAction::Accept(text) => {
-                            line.set(&text);
-                            shell.history_match_buffer = std::mem::take(matches);
-                            history_cache.clear();
-                            mode = Mode::Normal;
-                            region.clear_from_cursor(&mut tw);
-                            let info = render::render_line(
-                                &mut tw,
-                                &prompt_str,
-                                prompt_display_len,
-                                &line,
-                                shell.cols,
-                                render::RenderedRegion::default(),
-                                &render::RenderOpts::default(),
-                            );
-                            region = info;
-                            let _ = tw.flush_to_stdout();
-                        }
-                        HistoryAction::Cancel => {
-                            line.set(saved_line);
-                            shell.history_match_buffer = std::mem::take(matches);
-                            history_cache.clear();
-                            mode = Mode::Normal;
-                            region.clear_from_cursor(&mut tw);
-                            let info = render::render_line(
-                                &mut tw,
-                                &prompt_str,
-                                prompt_display_len,
-                                &line,
-                                shell.cols,
-                                render::RenderedRegion::default(),
-                                &render::RenderOpts::default(),
-                            );
-                            region = info;
-                            let _ = tw.flush_to_stdout();
-                        }
-                    },
+        // Terminal emulators reflow the live cursor and their
+        // DEC saved cursor differently on resize. The saved
+        // RenderedRegion anchor is therefore no longer a safe
+        // basis for an incremental repaint. Start from a known
+        // screen position and rebuild the active region.
+        view.tw.clear_screen();
+        view.region = render::RenderedRegion::default();
+        view.history_cache.clear();
+    }
+    repaint(view, mode, shell);
+    None
+}
 
-                    Mode::DirPicker { entries, selected } => match (key.key, key.mods.ctrl) {
-                        (Key::Escape, _) | (Key::Char('c'), true) => {
-                            mode = Mode::Normal;
-                            region.clear(&mut tw);
-                            let info = render::render_line(
-                                &mut tw,
-                                &prompt_str,
-                                prompt_display_len,
-                                &line,
-                                shell.cols,
-                                render::RenderedRegion::default(),
-                                &render::RenderOpts::default(),
-                            );
-                            region = info;
-                            let _ = tw.flush_to_stdout();
-                        }
-                        (Key::Enter, _) => {
-                            if let Some(dir) = entries.get(*selected) {
-                                let dir = dir.clone();
-                                eprintln!("{dir}");
-                                change_directory(&dir, shell);
-                            }
-                            mode = Mode::Normal;
-                            region.clear(&mut tw);
-                            let info = render::render_line(
-                                &mut tw,
-                                &prompt_str,
-                                prompt_display_len,
-                                &line,
-                                shell.cols,
-                                render::RenderedRegion::default(),
-                                &render::RenderOpts::default(),
-                            );
-                            region = info;
-                            let _ = tw.flush_to_stdout();
-                        }
-                        (Key::Up, _) if *selected > 0 => {
-                            *selected -= 1;
-                            region = render_dir_picker_mode(&mut tw, &mode, shell, region);
-                            let _ = tw.flush_to_stdout();
-                        }
-                        (Key::Down, _) if *selected + 1 < entries.len() => {
-                            *selected += 1;
-                            region = render_dir_picker_mode(&mut tw, &mode, shell, region);
-                            let _ = tw.flush_to_stdout();
-                        }
-                        _ => {}
-                    },
-                }
+fn handle_paste(view: &mut EditView, mode: &mut Mode, shell: &mut Shell, text: &str) {
+    view.grid_column = None;
+    if let Mode::HistorySearch(search) = mode {
+        let HistorySearch {
+            query,
+            matches,
+            candidates,
+            scratch,
+            candidate_stack,
+            spare_candidates,
+            previous_query,
+            selected,
+            ..
+        } = search;
+        previous_query.clear();
+        previous_query.push_str(query.text());
+        let previous_cursor = query.cursor();
+        query.insert_str(text);
+        update_history_search(
+            query,
+            (previous_query, previous_cursor),
+            matches,
+            HistoryCandidates {
+                candidates,
+                scratch,
+                candidate_stack,
+                spare_candidates,
+            },
+            selected,
+            shell,
+        );
+    } else {
+        view.line.insert_str(text);
+    }
+    repaint(view, mode, shell);
+}
+
+fn handle_key(
+    view: &mut EditView,
+    mode: &mut Mode,
+    shell: &mut Shell,
+    key: KeyEvent,
+) -> Option<ReadResult> {
+    // Ctrl+P writes a layout dump in any mode and does not repaint,
+    // so it captures the screen exactly as it is (including the
+    // status line) without disturbing it. Intercept before mode
+    // dispatch so every mode is covered uniformly.
+    if key.key == Key::Char('p') && key.mods.ctrl {
+        capture_layout_dump(shell, mode, &view.line, view.prompt_display_len, view.region);
+        if let Err(message) = write_layout_dump_to_file(shell) {
+            eprintln!("{message}");
+        }
+        return None;
+    }
+    let next = match &mut *mode {
+        Mode::Normal => return handle_normal_key_event(view, mode, shell, key),
+        Mode::Completion(completion) => handle_completion_key_event(view, shell, key, completion),
+        Mode::HistorySearch(search) => handle_history_key_event(view, shell, key, search),
+        Mode::DirPicker(picker) => handle_dir_picker_key_event(view, shell, key, picker),
+    };
+    if let Next::Normal = next {
+        *mode = Mode::Normal;
+    }
+    None
+}
+
+fn handle_normal_key_event(
+    view: &mut EditView,
+    mode: &mut Mode,
+    shell: &mut Shell,
+    key: KeyEvent,
+) -> Option<ReadResult> {
+    match handle_normal_key(
+        key,
+        &mut view.line,
+        &mut view.history_idx,
+        &mut view.saved_line,
+        &mut view.grid_column,
+        view.prompt_display_len,
+        shell,
+    ) {
+        KeyAction::Continue => {}
+        KeyAction::Execute(text) => {
+            capture_layout_dump(shell, mode, &view.line, view.prompt_display_len, view.region);
+            // Clear autosuggestion ghost text before freezing the line
+            if view.line.cursor() == view.line.text().len() {
+                view.tw.write_str("\x1b[J");
+            }
+            view.tw.write_str("\r\n");
+            let _ = view.tw.flush_to_stdout();
+            shell.prompt_buf = std::mem::take(&mut view.prompt_str);
+            return Some(if text.is_empty() {
+                ReadResult::Empty
+            } else {
+                ReadResult::Line(text)
+            });
+        }
+        KeyAction::Continuation => {
+            view.line.insert_char('\n');
+            view.history_idx = None;
+        }
+        KeyAction::Cancel => {
+            view.tw.write_str("^C\r\n");
+            let _ = view.tw.flush_to_stdout();
+            shell.prompt_buf = std::mem::take(&mut view.prompt_str);
+            return Some(ReadResult::Empty);
+        }
+        KeyAction::Exit => {
+            view.tw.write_str("\r\n");
+            let _ = view.tw.flush_to_stdout();
+            shell.prompt_buf = std::mem::take(&mut view.prompt_str);
+            return Some(handle_exit(shell));
+        }
+        KeyAction::ClearScreen => {
+            view.tw.clear_screen();
+            view.region = render::RenderedRegion::default();
+        }
+        KeyAction::StartHistorySearch => {
+            start_history_search(view, mode, shell);
+            return None;
+        }
+        KeyAction::StartDirPicker => {
+            if start_dir_picker(view, mode, shell) {
+                return None;
             }
         }
+        KeyAction::StartCompletion => start_completion_mode(view, mode, shell),
+    }
+
+    repaint(view, mode, shell);
+    None
+}
+
+fn start_history_search(view: &mut EditView, mode: &mut Mode, shell: &mut Shell) {
+    if let Err(error) = shell.history.sync() {
+        eprintln!("ish: cannot sync history: {error}");
+    }
+    view.saved_line = view.line.text().to_string();
+    let mut candidates = Vec::new();
+    shell.history.search_entry_indices_into(&mut candidates);
+    let mut scratch = Vec::new();
+    let mut matches = std::mem::take(&mut shell.history_match_buffer);
+    shell.history.fuzzy_search_subset_into_in_dir(
+        "",
+        &candidates,
+        &mut scratch,
+        &mut matches,
+        200,
+        shell.epsh.cwd(),
+    );
+    std::mem::swap(&mut candidates, &mut scratch);
+    view.region.clear(&mut view.tw);
+    let search = HistorySearch {
+        query: LineBuffer::new(),
+        matches,
+        candidates,
+        scratch,
+        candidate_stack: Vec::new(),
+        spare_candidates: Vec::new(),
+        previous_query: String::new(),
+        selected: 0,
+        saved_line: view.saved_line.clone(),
+    };
+    view.history_cache.clear();
+    view.region = render_history_mode(
+        &mut view.tw,
+        &search,
+        shell,
+        render::RenderedRegion::default(),
+        &mut view.history_cache,
+    );
+    *mode = Mode::HistorySearch(search);
+    let _ = view.tw.flush_to_stdout();
+}
+
+fn start_dir_picker(view: &mut EditView, mode: &mut Mode, shell: &Shell) -> bool {
+    // Show dir stack in reverse (most recent first),
+    // excluding the current directory
+    let pwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let entries: Vec<String> = shell
+        .dir_stack
+        .iter()
+        .rev()
+        .filter(|d| *d != &pwd)
+        .cloned()
+        .collect();
+    if entries.is_empty() {
+        return false;
+    }
+    view.region.clear(&mut view.tw);
+    let picker = DirPicker {
+        entries,
+        selected: 0,
+    };
+    view.region = render_dir_picker_mode(&mut view.tw, &picker, shell, view.region);
+    *mode = Mode::DirPicker(picker);
+    let _ = view.tw.flush_to_stdout();
+    true
+}
+
+fn start_completion_mode(view: &mut EditView, mode: &mut Mode, shell: &mut Shell) {
+    let comp = std::mem::take(&mut shell.completion_buffer);
+    let base_line = view.line.clone();
+    let mut cs = start_completion(
+        &base_line,
+        shell.cols,
+        shell.home.as_deref(),
+        &shell.aliases,
+        &shell.epsh,
+        comp,
+    );
+    if cs.comp.len() == 1 {
+        preview_completion(&mut view.line, &cs, &base_line);
+        shell.completion_buffer = cs.comp;
+    } else if !cs.comp.is_empty() {
+        cs.selected = usize::MAX;
+        preview_completion(&mut view.line, &cs, &base_line);
+        *mode = Mode::Completion(CompletionMode {
+            state: cs,
+            base_line,
+        });
+    } else {
+        shell.completion_buffer = cs.comp;
+    }
+}
+
+fn handle_completion_key_event(
+    view: &mut EditView,
+    shell: &mut Shell,
+    key: KeyEvent,
+    completion: &mut CompletionMode,
+) -> Next {
+    let CompletionMode { state, base_line } = completion;
+    let (p, pdl) = active_prompt(&view.prompt_str, view.prompt_display_len);
+    let next = match handle_completion_key(key, state, base_line) {
+        CompletionAction::Navigate => {
+            preview_completion(&mut view.line, state, base_line);
+            // Cursor is on prompt line — repaint grid in-place
+            let info = render::render_line(
+                &mut view.tw,
+                p,
+                pdl,
+                &view.line,
+                shell.cols,
+                view.region,
+                &render::RenderOpts::default(),
+            );
+            view.region = info;
+            render::render_completions(&mut view.tw, state, info, false);
+            let _ = view.tw.flush_to_stdout();
+            return Next::Stay;
+        }
+        CompletionAction::Refilter => {
+            // Reclaim buffer from current state, re-run completion
+            let selected = state.selected;
+            let comp = std::mem::take(&mut state.comp);
+            let mut cs = start_completion(
+                base_line,
+                shell.cols,
+                shell.home.as_deref(),
+                &shell.aliases,
+                &shell.epsh,
+                comp,
+            );
+            if !cs.comp.is_empty() {
+                cs.selected = if selected == usize::MAX {
+                    usize::MAX
+                } else {
+                    selected.min(cs.comp.len() - 1)
+                };
+                preview_completion(&mut view.line, &cs, base_line);
+                let info = render::render_line(
+                    &mut view.tw,
+                    p,
+                    pdl,
+                    &view.line,
+                    shell.cols,
+                    view.region,
+                    &render::RenderOpts::default(),
+                );
+                view.region = info;
+                render::render_completions(&mut view.tw, &cs, info, true);
+                *completion = CompletionMode {
+                    state: cs,
+                    base_line: base_line.clone(),
+                };
+                let _ = view.tw.flush_to_stdout();
+                return Next::Stay;
+            } else {
+                view.line = base_line.clone();
+                shell.completion_buffer = cs.comp;
+                Next::Normal
+            }
+        }
+        CompletionAction::Accept => {
+            preview_completion(&mut view.line, state, base_line);
+            shell.completion_buffer = std::mem::take(&mut state.comp);
+            Next::Normal
+        }
+        CompletionAction::Cancel => {
+            view.line = base_line.clone();
+            shell.completion_buffer = std::mem::take(&mut state.comp);
+            Next::Normal
+        }
+    };
+
+    // Cursor is on prompt line — render_line's \r + clear_to_end_of_screen
+    // naturally clears the grid below
+    let (p, pdl) = active_prompt(&view.prompt_str, view.prompt_display_len);
+    let info = render::render_line(
+        &mut view.tw,
+        p,
+        pdl,
+        &view.line,
+        shell.cols,
+        view.region,
+        &render::RenderOpts::default(),
+    );
+    view.region = info;
+    let _ = view.tw.flush_to_stdout();
+    next
+}
+
+fn handle_history_key_event(
+    view: &mut EditView,
+    shell: &mut Shell,
+    key: KeyEvent,
+    search: &mut HistorySearch,
+) -> Next {
+    let action = {
+        let HistorySearch {
+            query,
+            matches,
+            candidates,
+            scratch,
+            candidate_stack,
+            spare_candidates,
+            previous_query,
+            selected,
+            ..
+        } = &mut *search;
+        handle_history_search_key(
+            key,
+            query,
+            previous_query,
+            matches,
+            HistoryCandidates {
+                candidates,
+                scratch,
+                candidate_stack,
+                spare_candidates,
+            },
+            selected,
+            shell,
+        )
+    };
+    match action {
+        HistoryAction::Continue => {
+            view.region = render_history_mode(
+                &mut view.tw,
+                search,
+                shell,
+                view.region,
+                &mut view.history_cache,
+            );
+            let _ = view.tw.flush_to_stdout();
+            Next::Stay
+        }
+        HistoryAction::Accept(text) => {
+            view.line.set(&text);
+            leave_history_search(view, shell, search);
+            Next::Normal
+        }
+        HistoryAction::Cancel => {
+            view.line.set(&search.saved_line);
+            leave_history_search(view, shell, search);
+            Next::Normal
+        }
+    }
+}
+
+fn leave_history_search(view: &mut EditView, shell: &mut Shell, search: &mut HistorySearch) {
+    shell.history_match_buffer = std::mem::take(&mut search.matches);
+    view.history_cache.clear();
+    view.region.clear_from_cursor(&mut view.tw);
+    redraw_prompt_line(view, shell);
+}
+
+fn handle_dir_picker_key_event(
+    view: &mut EditView,
+    shell: &mut Shell,
+    key: KeyEvent,
+    picker: &mut DirPicker,
+) -> Next {
+    match (key.key, key.mods.ctrl) {
+        (Key::Escape, _) | (Key::Char('c'), true) => {
+            view.region.clear(&mut view.tw);
+            redraw_prompt_line(view, shell);
+            Next::Normal
+        }
+        (Key::Enter, _) => {
+            if let Some(dir) = picker.entries.get(picker.selected) {
+                let dir = dir.clone();
+                eprintln!("{dir}");
+                change_directory(&dir, shell);
+            }
+            view.region.clear(&mut view.tw);
+            redraw_prompt_line(view, shell);
+            Next::Normal
+        }
+        (Key::Up, _) if picker.selected > 0 => {
+            picker.selected -= 1;
+            view.region = render_dir_picker_mode(&mut view.tw, picker, shell, view.region);
+            let _ = view.tw.flush_to_stdout();
+            Next::Stay
+        }
+        (Key::Down, _) if picker.selected + 1 < picker.entries.len() => {
+            picker.selected += 1;
+            view.region = render_dir_picker_mode(&mut view.tw, picker, shell, view.region);
+            let _ = view.tw.flush_to_stdout();
+            Next::Stay
+        }
+        _ => Next::Stay,
     }
 }
 
@@ -1459,7 +1313,7 @@ fn render_active_mode(
         Mode::Normal => {
             render_prompt_region(tw, shell, line, prompt_str, prompt_display_len, region)
         }
-        Mode::Completion { state, .. } => {
+        Mode::Completion(CompletionMode { state, .. }) => {
             let (p, pdl) = active_prompt(prompt_str, prompt_display_len);
             let info = render::render_line(
                 tw,
@@ -1473,13 +1327,13 @@ fn render_active_mode(
             render::render_completions(tw, state, info, true);
             info
         }
-        Mode::HistorySearch { .. } => render_history_mode(tw, mode, shell, region, history_cache),
-        Mode::DirPicker { .. } => render_dir_picker_mode(tw, mode, shell, region),
+        Mode::HistorySearch(search) => render_history_mode(tw, search, shell, region, history_cache),
+        Mode::DirPicker(picker) => render_dir_picker_mode(tw, picker, shell, region),
     }
 }
 
 fn update_mode_layout_for_resize(mode: &mut Mode, shell: &Shell) {
-    if let Mode::Completion { state, .. } = mode {
+    if let Mode::Completion(CompletionMode { state, .. }) = mode {
         let (cols, rows) = complete::compute_grid(&state.comp.entries, shell.cols);
         state.cols = cols;
         state.rows = rows;
@@ -1517,61 +1371,6 @@ fn expand_aliases_for_line<'a>(line: &'a str, aliases: &AliasMap) -> std::borrow
         };
     }
     aliases.expand_line(line)
-}
-
-fn resolve_cd_for_history(line: &str) -> String {
-    use epsh::lexer::{Lexer, Token};
-
-    let trimmed = line.trim();
-    let mut lexer = Lexer::new(trimmed);
-    lexer.recognize_reserved = false;
-    let Ok((Token::Word(command_parts, _), _)) = lexer.next_token() else {
-        return line.to_string();
-    };
-    let Some(command) = static_word::static_word(&command_parts) else {
-        return line.to_string();
-    };
-    let prefix = match command.as_str() {
-        "cd" => "cd ",
-        "z" => "z ",
-        _ => return line.to_string(),
-    };
-    let Ok((Token::Word(parts, _), _)) = lexer.next_token() else {
-        return line.to_string();
-    };
-    let Some(text) = static_word::static_word(&parts) else {
-        return line.to_string();
-    };
-    if text.is_empty() || text.starts_with(['/', '~']) || text == "-" || text.contains(['*', '?', '[']) {
-        return line.to_string();
-    }
-    let Ok((_, next_span)) = lexer.next_token() else {
-        return line.to_string();
-    };
-    let suffix_start = trimmed
-        .char_indices()
-        .nth(next_span.offset)
-        .map_or(trimmed.len(), |(index, _)| index);
-    let suffix = &trimmed[suffix_start..];
-    let Ok(cwd) = std::env::current_dir() else {
-        return line.to_string();
-    };
-    let target = epsh::shell_bytes::ShellBytes::from_str_lossless(&text).to_path_buf();
-    let resolved = cwd.join(target);
-    let resolved = resolved.canonicalize().unwrap_or(resolved);
-    let Some(path) = resolved.to_str() else {
-        return line.to_string();
-    };
-    let target = if needs_quoting(path) || path.contains('\'') || path.chars().any(char::is_control) {
-        format!("'{}'", path.replace('\'', "'\\''"))
-    } else {
-        path.to_string()
-    };
-    if suffix.is_empty() {
-        format!("{prefix}{target}")
-    } else {
-        format!("{prefix}{target} {suffix}")
-    }
 }
 
 fn handle_normal_key(
@@ -1912,32 +1711,6 @@ fn find_comp_word_start(s: &str) -> (usize, bool) {
         }
     }
     (word_start, in_single)
-}
-
-/// Whether a completion string needs quoting for the shell.
-fn needs_quoting(s: &str) -> bool {
-    s.bytes().any(|b| {
-        matches!(
-            b,
-            b' ' | b'\t'
-                | b'('
-                | b')'
-                | b'$'
-                | b'*'
-                | b'?'
-                | b'['
-                | b']'
-                | b'|'
-                | b'&'
-                | b'>'
-                | b'<'
-                | b';'
-                | b'#'
-                | b'\\'
-                | b'"'
-                | b'`'
-        )
-    })
 }
 
 fn start_completion(
@@ -2452,33 +2225,23 @@ fn update_history_search(
 
 fn render_history_mode(
     tw: &mut TermWriter,
-    mode: &Mode,
+    search: &HistorySearch,
     shell: &Shell,
     prev: render::RenderedRegion,
     cache: &mut render::HistoryPagerCache,
 ) -> render::RenderedRegion {
-    if let Mode::HistorySearch {
-        query,
-        matches,
-        selected,
-        ..
-    } = mode
-    {
-        render::render_history_pager_cached(
-            tw,
-            query.text(),
-            matches,
-            &shell.history,
-            *selected,
-            shell.rows,
-            shell.cols,
-            query.display_cursor_pos(),
-            prev,
-            cache,
-        )
-    } else {
-        render::RenderedRegion::default()
-    }
+    render::render_history_pager_cached(
+        tw,
+        search.query.text(),
+        &search.matches,
+        &shell.history,
+        search.selected,
+        shell.rows,
+        shell.cols,
+        search.query.display_cursor_pos(),
+        prev,
+        cache,
+    )
 }
 
 /// Apply denv environment changes to epsh's variable store.
@@ -2517,26 +2280,6 @@ fn sync_cwd_change(shell: &mut Shell, old_cwd: &Path, new_cwd: std::path::PathBu
     let changes = denv::on_cd(&shell.denv, &shell.epsh);
     apply_denv_changes(&changes, &mut shell.epsh);
     sync_shell_store_derived(shell);
-}
-
-/// Parse a command line into shell words only.
-/// Returns `None` if the line contains operators, redirections, or lexer errors.
-fn lex_simple_command_words(line: &str) -> Option<Vec<epsh::ast::Word>> {
-    let mut lex = epsh::lexer::Lexer::new(line);
-    lex.recognize_reserved = false;
-
-    let mut words = Vec::new();
-    loop {
-        match lex.next_token() {
-            Ok((epsh::lexer::Token::Word(parts, _), span)) => {
-                words.push(epsh::ast::Word { parts, span });
-            }
-            Ok((epsh::lexer::Token::Eof, _)) => break,
-            Ok(_) | Err(_) => return None,
-        }
-    }
-
-    (!words.is_empty()).then_some(words)
 }
 
 /// Expand intercepted builtin arguments with epsh so top-level builtins honor
@@ -2622,32 +2365,19 @@ fn push_dir_stack(dir_stack: &mut Vec<String>) {
 
 fn render_dir_picker_mode(
     tw: &mut TermWriter,
-    mode: &Mode,
+    picker: &DirPicker,
     shell: &Shell,
     prev: render::RenderedRegion,
 ) -> render::RenderedRegion {
-    if let Mode::DirPicker { entries, selected } = mode {
-        render::render_dir_picker(
-            tw,
-            entries,
-            *selected,
-            &shell.home_display,
-            shell.rows,
-            shell.cols,
-            prev,
-        )
-    } else {
-        render::RenderedRegion::default()
-    }
-}
-
-/// Terminate a suspended job when the shell quits. SIGCONT follows SIGTERM
-/// because a stopped process does not act on SIGTERM until it is continued.
-fn abandon_job(job: Job) {
-    if let Some(pgid) = rustix::process::Pid::from_raw(job.pgid) {
-        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::TERM);
-        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::CONT);
-    }
+    render::render_dir_picker(
+        tw,
+        &picker.entries,
+        picker.selected,
+        &shell.home_display,
+        shell.rows,
+        shell.cols,
+        prev,
+    )
 }
 
 /// Handle the "exit" command typed at the prompt. Returns true if the shell should break.
@@ -2660,7 +2390,7 @@ fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
     if shell.job.is_some() {
         if shell.exit_warned {
             if let Some(job) = shell.job.take() {
-                abandon_job(job);
+                job::abandon(job);
             }
             shell.last_status = code;
             return true;
@@ -2746,269 +2476,6 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
     }
 }
 
-/// Look up a variable in the store-derived child environment the handler
-/// receives. Returns `None` when unset or not exported.
-fn env_pair_value(
-    env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)],
-    name: &str,
-) -> Option<OsString> {
-    env_pairs
-        .iter()
-        .find_map(|(k, v)| (k.as_bytes() == name.as_bytes()).then(|| v.to_os_string()))
-}
-
-/// Build the external handler for epsh. Handles ish-specific builtins
-/// and fork/exec with job control for external commands.
-fn make_external_handler(
-    shell_pid: i32,
-    history_log: std::path::PathBuf,
-    fs_default_scratch: std::path::PathBuf,
-) -> epsh::eval::ExternalHandler {
-    Box::new(
-        move |args: &[epsh::shell_bytes::ShellBytes],
-              env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)]| {
-            let name = args[0].to_shell_string();
-
-            let external = builtin::lookup(&name).and_then(builtin::Builtin::external_command);
-            match external {
-                Some(command @ (ExternalCommand::Copy | ExternalCommand::Move)) => {
-                    let cwd = epsh::eval::external_command_cwd().ok_or_else(|| {
-                        epsh::error::ShellError::Io(std::io::Error::other("external command cwd was unavailable"))
-                    })?;
-                    let context = ish_fs::Context {
-                        cwd,
-                        home: env_pair_value(env_pairs, "HOME").map(std::path::PathBuf::from),
-                        scratch: env_pair_value(env_pairs, "TMPDIR")
-                            .map(std::path::PathBuf::from)
-                            .unwrap_or_else(|| fs_default_scratch.clone()),
-                    };
-                    let operation = match command {
-                        ExternalCommand::Copy => ish_fs::Operation::Copy,
-                        _ => ish_fs::Operation::Move,
-                    };
-                    let arguments = args[1..].iter()
-                        .map(epsh::shell_bytes::ShellBytes::to_os_string)
-                        .collect::<Vec<_>>();
-                    return fs_command::run(operation, &arguments, context);
-                }
-                Some(ExternalCommand::List) => {
-                    let l_args: Vec<_> = args[1..].iter().map(|arg| arg.to_path_buf()).collect();
-                    let status = builtin::list_directory(&l_args);
-                    return Ok(epsh::error::ExitStatus::from(status));
-                }
-                Some(ExternalCommand::ClearScreen) => {
-                    print!("\x1b[H\x1b[2J");
-                    return Ok(epsh::error::ExitStatus::SUCCESS);
-                }
-                Some(ExternalCommand::History) => {
-                    if args.len() > 1 {
-                        let argument = args[1].to_shell_string();
-                        if args.len() == 2 && matches!(argument.as_str(), "-h" | "--help") {
-                            println!("Usage: history [reset]");
-                            return Ok(epsh::error::ExitStatus::SUCCESS);
-                        }
-                        eprintln!("ish: history: storage subcommands require a standalone command");
-                        return Ok(epsh::error::ExitStatus::FAILURE);
-                    }
-                    // Open the session's history log independently so forked
-                    // readers do not share file offsets or lock ownership.
-                    match history::render_history_log(&history_log) {
-                        Ok(content) => {
-                            print!("{content}");
-                            return Ok(epsh::error::ExitStatus::SUCCESS);
-                        }
-                        Err(e) => {
-                            eprintln!("ish: history: {e}");
-                            return Ok(epsh::error::ExitStatus::FAILURE);
-                        }
-                    }
-                }
-                None => {}
-            }
-
-            spawn_external(args, env_pairs, shell_pid)
-        },
-    )
-}
-
-/// Fork/exec an external command with job control when running in the
-/// shell process itself; pipeline children wait without terminal handoff.
-fn spawn_external(
-    args: &[epsh::shell_bytes::ShellBytes],
-    env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)],
-    shell_pid: i32,
-) -> epsh::error::Result<epsh::error::ExitStatus> {
-    let name = args[0].to_shell_string();
-    let is_main = rustix::process::getpid().as_raw_pid() == shell_pid;
-
-    let mut cmd = std::process::Command::new(args[0].to_os_string());
-    cmd.args(args[1..].iter().map(|arg| arg.to_os_string()));
-    // `cd` inside a list changes epsh's working directory, not the
-    // process's; run the child where the shell is.
-    if let Some(cwd) = epsh::eval::external_command_cwd() {
-        cmd.current_dir(cwd);
-    }
-
-    // Store-authoritative child environment: the child inherits
-    // nothing from ish's process environment. Its env comes entirely
-    // from epsh's variable store (exported vars, inherited
-    // non-shell-name entries) plus any prefix assignments, so
-    // `set`/`export`/`unset` are reflected exactly in children.
-    cmd.env_clear();
-    for (k, v) in env_pairs {
-        cmd.env(k.to_os_string(), v.to_os_string());
-    }
-
-    // SAFETY: the child only changes its process group and signal dispositions before exec.
-    unsafe {
-        cmd.pre_exec(move || {
-            if is_main {
-                let _ = rustix::process::setpgid(None, None);
-            }
-            ish::signal::restore_defaults();
-            Ok(())
-        });
-    }
-
-    match cmd.spawn() {
-        Ok(mut child) => {
-            let child_id = child.id() as i32;
-            let child_pid = unsafe { rustix::process::Pid::from_raw_unchecked(child_id) };
-
-            if is_main {
-                if let Err(error) = rustix::process::setpgid(Some(child_pid), Some(child_pid))
-                    && !matches!(error, rustix::io::Errno::ACCESS | rustix::io::Errno::SRCH)
-                {
-                    eprintln!("ish: cannot set process group for {name}: {error}");
-                }
-                if let Err(error) = ish::job::hand_terminal_to(child_pid) {
-                    eprintln!("ish: cannot hand the terminal to {name}: {error}");
-                }
-
-                // Wait with WUNTRACED for job control. The shell tracks one
-                // suspended job; while that slot is taken, a second stop is
-                // refused by continuing the new job, since it could never be
-                // resumed with `fg`.
-                let waited = loop {
-                    let waited = ish::job::retry_interrupted(|| {
-                        rustix::process::waitpid(
-                            Some(child_pid),
-                            rustix::process::WaitOptions::UNTRACED,
-                        )
-                    });
-
-                    ish::job::reclaim_terminal();
-
-                    if let Ok(Some((_, status))) = &waited
-                        && status.stopped()
-                        && JOB_SLOT_TAKEN.with(|taken| taken.get())
-                        && let Ok(stopped_termios) = term::save_termios()
-                    {
-                        eprintln!(
-                            "\nish: a job is already suspended; resume it with fg before suspending another"
-                        );
-                        if let Err(error) =
-                            ish::job::continue_in_foreground(child_pid, &stopped_termios)
-                        {
-                            eprintln!("ish: cannot continue {name}: {error}");
-                            ish::job::kill_group(child_pid);
-                        }
-                        continue;
-                    }
-                    break waited;
-                };
-
-                let status = match waited {
-                    Ok(Some((_, status))) => status,
-                    Ok(None) => {
-                        term::restore_startup_termios();
-                        return Ok(epsh::error::ExitStatus::from(ish::job::WAIT_FAILURE_STATUS));
-                    }
-                    Err(error) => {
-                        eprintln!("ish: cannot wait for {name}: {error}");
-                        term::restore_startup_termios();
-                        return Ok(epsh::error::ExitStatus::from(ish::job::WAIT_FAILURE_STATUS));
-                    }
-                };
-
-                if status.stopped() {
-                    let saved_termios = match term::save_termios() {
-                        Ok(termios) => termios,
-                        Err(error) => {
-                            eprintln!("ish: cannot save terminal attributes for {name}: {error}");
-                            ish::job::kill_group(child_pid);
-                            let _ = ish::job::retry_interrupted(|| {
-                                rustix::process::waitpid(
-                                    Some(child_pid),
-                                    rustix::process::WaitOptions::empty(),
-                                )
-                            });
-                            term::restore_startup_termios();
-                            return Ok(epsh::error::ExitStatus::from(
-                                ish::job::WAIT_FAILURE_STATUS,
-                            ));
-                        }
-                    };
-                    let cmd = args[0].to_shell_string();
-                    STOPPED_JOB.with(|cell| {
-                        *cell.borrow_mut() = Some((child_id, cmd, saved_termios));
-                    });
-                }
-                term::restore_startup_termios();
-                if status.stopped() {
-                    Err(epsh::error::ShellError::Stopped {
-                        pid: child_id,
-                        pgid: child_id,
-                    })
-                } else if status.exited() {
-                    Ok(epsh::error::ExitStatus::from(
-                        status.exit_status().unwrap_or(1),
-                    ))
-                } else if status.signaled() {
-                    Ok(epsh::error::ExitStatus::from(
-                        128 + status.terminating_signal().unwrap_or(0),
-                    ))
-                } else {
-                    Ok(epsh::error::ExitStatus::FAILURE)
-                }
-            } else {
-                // Pipeline child: just wait normally
-                match child.wait() {
-                    Ok(s) => Ok(epsh::error::ExitStatus::from(s.code().unwrap_or(128))),
-                    Err(e) => Err(epsh::error::ShellError::Io(e)),
-                }
-            }
-        }
-        Err(e) => {
-            if let Some(code) = e.raw_os_error() {
-                // Match epsh's default exec error reporting: an executable
-                // script whose interpreter is broken surfaces as a bare
-                // ENOTDIR/ENOENT/EACCES.
-                let cwd = std::env::current_dir().unwrap_or_default();
-                let path_env = env_pair_value(env_pairs, "PATH")
-                    .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
-                if let Some(msg) = epsh::eval::bad_interpreter_message_os(&args[0].to_os_string(), code, &cwd, &path_env) {
-                    use std::io::Write;
-                    use std::os::unix::ffi::OsStrExt;
-                    let mut stderr = std::io::stderr().lock();
-                    stderr.write_all(msg.as_bytes())?;
-                    stderr.write_all(b"\n")?;
-                    return Ok(epsh::error::ExitStatus::NOT_EXECUTABLE);
-                }
-            }
-            if e.kind() == std::io::ErrorKind::NotFound {
-                eprintln!("{name}: not found");
-                Ok(epsh::error::ExitStatus::NOT_FOUND)
-            } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                eprintln!("{name}: permission denied");
-                Ok(epsh::error::ExitStatus::NOT_EXECUTABLE)
-            } else {
-                Err(epsh::error::ShellError::Io(e))
-            }
-        }
-    }
-}
-
 /// Check if input needs a continuation line (open quotes, trailing operator, etc.)
 fn needs_continuation(input: &str) -> bool {
     let trimmed = input.trim_end();
@@ -3046,7 +2513,7 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
     if shell.job.is_some() {
         if shell.exit_warned {
             if let Some(job) = shell.job.take() {
-                abandon_job(job);
+                job::abandon(job);
             }
             ReadResult::Exit
         } else {
@@ -3058,88 +2525,3 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
         ReadResult::Exit
     }
 }
-
-fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &std::ffi::OsStr, path_env: &[u8]) -> String {
-    let trimmed = line.trim();
-    let words = match lex_simple_command_words(trimmed) {
-        Some(words) => words,
-        None => return line.to_string(),
-    };
-    let first = match words.first() {
-        Some(word) => word,
-        None => return line.to_string(),
-    };
-    let first_bytes = epsh::shell_bytes::ShellBytes::from_str_lossless(&epsh::lexer::parts_to_text(&first.parts));
-    let Some(first_text) = first_bytes.as_utf8_str() else {
-        return line.to_string();
-    };
-    let first_quoted = epsh::lexer::parts_have_quoting(&first.parts);
-
-    if !first_quoted && first_text == "cd" {
-        return line.to_string();
-    }
-
-    if words.len() == 1
-        && !first_quoted
-        && first_text.len() >= 2
-        && first_text.bytes().all(|b| b == b'.')
-    {
-        let levels = first_text.len() - 1;
-        let path = (0..levels).map(|_| "..").collect::<Vec<_>>().join("/");
-        return format!("cd {path}");
-    }
-
-    if words.len() != 1 || builtin::is_builtin(first_text) || aliases.get(first_text).is_some() {
-        return line.to_string();
-    }
-
-    let expanded = first_text.strip_prefix('~').map(|rest| {
-        let mut path = home.to_os_string();
-        path.push(rest);
-        std::path::PathBuf::from(path)
-    });
-    let path = expanded.as_deref().unwrap_or_else(|| Path::new(first_text));
-    if path.is_dir()
-        && !is_executable(path)
-        && (first_text.contains('/') || path::scan_path(first_text, path_env).is_none())
-    {
-        return format!("cd {trimmed}");
-    }
-
-    line.to_string()
-}
-
-fn is_executable(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .map(|m| m.permissions().mode() & 0o111 != 0 && m.is_file())
-        .unwrap_or(false)
-}
-
-fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[((n >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(n & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-#[path = "main_history_tests.rs"]
-mod history_tests;

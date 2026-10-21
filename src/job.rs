@@ -132,3 +132,12 @@ pub fn resume_job(job: &mut Option<Job>, last_output: &mut crate::capture::Outpu
     }
     status
 }
+
+/// Terminate a suspended job when the shell quits. SIGCONT follows SIGTERM
+/// because a stopped process does not act on SIGTERM until it is continued.
+pub fn abandon(job: Job) {
+    if let Some(pgid) = rustix::process::Pid::from_raw(job.pgid) {
+        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::TERM);
+        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::CONT);
+    }
+}

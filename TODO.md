@@ -59,15 +59,6 @@ Next: 45
 - **Fix with:** single-source-of-truth, durable-state
 - **Effort:** L (weeks)
 
-### ISH-34 · P3 · `main.rs` holds the loop, editor, spawn path and diagnostics in one 3000-line file
-
-- **Area:** Architecture
-- **Where:** `src/main.rs:771-1306`, `src/main.rs:146-382`, `src/main.rs:518-725`, `src/main.rs:1692-2160`, `src/main.rs:2669-2830`, `src/lib.rs:32`
-- **Problem:** `read_line_with_reader` is 535 lines and the file mixes the event loop, completion tokenizing, the layout-dump diagnostic with its `/dev/urandom` name generator, base64, `cd` rewriting and external spawning with job handling. The keystroke path has no unit seam; `main_history_tests.rs` is 22 lines. `static_word` is compiled twice, once in the library and once as a binary module. `/dev/urandom` failure falls back silently to a time-seeded value for the dump file name (`src/main.rs:701-724`).
-- **Recommendation:** Move the external handler, spawn and job wait into one library module, the dump and base64 helpers into a diagnostics module, and split the input function per mode. Declare each module once. Fail the dump name on randomness errors.
-- **Fix with:** api-surface-and-module-boundaries
-- **Effort:** L (weeks)
-
 ### ISH-42 · P3 · Release delivery lacks a ref guard and integrity checks, and release panics are silent
 
 - **Area:** Build

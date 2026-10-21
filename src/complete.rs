@@ -889,6 +889,32 @@ pub fn complete_hostnames(prefix: &str, home: &str, comp: &mut Completions) {
     }
 }
 
+/// Whether a completion string needs quoting for the shell.
+pub fn needs_quoting(s: &str) -> bool {
+    s.bytes().any(|b| {
+        matches!(
+            b,
+            b' ' | b'\t'
+                | b'('
+                | b')'
+                | b'$'
+                | b'*'
+                | b'?'
+                | b'['
+                | b']'
+                | b'|'
+                | b'&'
+                | b'>'
+                | b'<'
+                | b';'
+                | b'#'
+                | b'\\'
+                | b'"'
+                | b'`'
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

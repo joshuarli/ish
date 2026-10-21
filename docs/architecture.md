@@ -163,8 +163,12 @@ Evaluator fork, wait, callback, and cancellation behavior belongs to the
 [epsh process model](../crates/epsh/docs/process-model.md).
 
 Module entry points are [src/lib.rs](../src/lib.rs) and the interactive event
-loop in [src/main.rs](../src/main.rs). Parser and evaluator internals belong to
-[epsh's architecture](../crates/epsh/docs/architecture.md).
+loop in [src/main.rs](../src/main.rs). [external.rs](../src/external.rs) owns the
+external-command handler, spawning, foreground job waits, and the stopped-job
+handoff. [diagnostics.rs](../src/diagnostics.rs) owns the layout dump,
+[cd_rewrite.rs](../src/cd_rewrite.rs) owns `cd` history rewriting, and
+[mode.rs](../src/mode.rs) holds the editor mode state. Parser and evaluator
+internals belong to [epsh's architecture](../crates/epsh/docs/architecture.md).
 
 ## Semantic verification
 
