@@ -78,15 +78,6 @@ Next: 53
 - **Fix with:** none
 - **Effort:** S (hours)
 
-### ISH-46 · P3 · Remaining early-return skips and unrun fixtures in ish-fs and fdu-delete
-
-- **Area:** Tests
-- **Where:** `crates/ish-fs/src/engine/tests.rs:60,725,739,753`, `crates/ish-fs/src/engine/repair_tests.rs:258,263`, `crates/ish-fs/tests/native_boundaries.rs` (foreign-owner cases), `benches/fs/native-fixtures.sh`, `crates/fdu-delete/src/posix/quarantine.rs`
-- **Problem:** The sparse, reflink, `copy_file_range` and immutable-flag lib tests still return early and report a pass when the filesystem lacks the capability. After ISH-29 nothing runs the two foreign-owner cases automatically: the script's single-ID user namespace cannot assign uid 65534. `crates/fdu-delete` has no `#[test]` functions, so the ISH-41 ticket's claim of three tests guarding `t`'s destructive path does not match the tree; adding it to `default-members` only builds it.
-- **Recommendation:** Mark the capability-dependent lib tests `#[ignore = "reason"]` and run them from the fixture script, run the foreign-owner cases from a multi-ID namespace or document the manual root run as required evidence, and write tests for `fdu-delete`'s quarantine path or remove the claim.
-- **Fix with:** test-audit
-- **Effort:** M (days)
-
 ### ISH-47 · P3 · denv and history leave unreclaimed or unobserved state after abnormal exit
 
 - **Area:** Data

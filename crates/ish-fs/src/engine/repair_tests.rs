@@ -237,6 +237,7 @@ fn repair_published_access_metadata_mutation_retains_source() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "needs CAP_LINUX_IMMUTABLE and a filesystem with inode flags under .work/tmp"]
 fn repair_deferred_metadata_validates_successful_output() {
     use rustix::fs::{IFlags, ioctl_getflags, ioctl_setflags};
     struct ResetFlags(Vec<PathBuf>);
@@ -255,12 +256,12 @@ fn repair_deferred_metadata_validates_successful_output() {
         let file = File::open(&source).unwrap();
         let flags = match ioctl_getflags(&file) {
             Ok(flags) => flags,
-            Err(rustix::io::Errno::NOTSUP | rustix::io::Errno::NOTTY) => { eprintln!("SKIP deferred metadata: inode flags unsupported"); return; },
+            Err(error @ (rustix::io::Errno::NOTSUP | rustix::io::Errno::NOTTY)) => panic!("inode flags unsupported: {error}"),
             Err(error) => panic!("capture flags: {error}"),
         };
         match ioctl_setflags(&file, flags | IFlags::IMMUTABLE) {
             Ok(()) => {},
-            Err(error) if matches!(error, rustix::io::Errno::PERM | rustix::io::Errno::NOTSUP | rustix::io::Errno::NOTTY) => { eprintln!("SKIP deferred metadata: cannot set immutable flag: {error}"); return; },
+            Err(error @ (rustix::io::Errno::PERM | rustix::io::Errno::NOTSUP | rustix::io::Errno::NOTTY)) => panic!("cannot set immutable flag: {error}"),
             Err(error) => panic!("set immutable flag: {error}"),
         }
         let _reset = ResetFlags(vec![source.clone(), destination.clone()]);

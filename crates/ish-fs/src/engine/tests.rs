@@ -57,8 +57,7 @@ fn dense_destination_allocation_is_reported_without_claiming_sparse_support() {
                 fs::File::create(&source).unwrap().set_len(length as u64).unwrap();
             }
             if !dense_source && fs::metadata(&source).unwrap().blocks() * 512 >= length as u64 {
-                eprintln!("SKIP: fixture filesystem does not expose sparse allocation");
-                return;
+                panic!("fixture filesystem does not expose sparse allocation");
             }
             let source_allocated = fs::metadata(&source).unwrap().blocks() * 512;
             let mut request = fixture.request();
@@ -696,6 +695,25 @@ fn native_copy_capability(fixture: &Fixture) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "needs a FICLONE-capable filesystem under .work/tmp"]
+fn public_copy_selects_reflink_when_ficlone_works() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.0.join("left")).unwrap();
+    fs::create_dir_all(fixture.0.join("right")).unwrap();
+    fs::write(fixture.0.join("left/alpha"), vec![7; 512 * 1024]).unwrap();
+    fs::hard_link(fixture.0.join("left/alpha"), fixture.0.join("right/beta")).unwrap();
+    fs::write(fixture.0.join("readonly"), vec![9; 256 * 1024]).unwrap();
+    symlink("target", fixture.0.join("raw-link")).unwrap();
+    if let Err(error) = clone_probe(&fixture) {
+        panic!("FICLONE is unavailable on the fixture filesystem: {error}");
+    }
+    let (progress, _) = execute_copy_strategy(&fixture, "out-clone", false, None);
+    assert_eq!(progress.cloned_files, 2);
+    assert_eq!(progress.logical_bytes_cloned, 768 * 1024);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.0.join("left")).unwrap();
@@ -739,9 +757,7 @@ fn public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks() {
     assert_eq!(automatic_progress.logical_bytes_cloned + automatic_progress.bytes_streamed, expected_streamed_bytes);
     if automatic_progress.cloned_files == 0 {
         match clone_probe(&fixture) {
-            Err(error) if matches!(error, rustix::io::Errno::XDEV | rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::NOTTY | rustix::io::Errno::INVAL) => {
-                eprintln!("SKIP reflink method proof: FICLONE probe returned {error}");
-            }
+            Err(rustix::io::Errno::XDEV | rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::NOTTY | rustix::io::Errno::INVAL) => {}
             Ok(()) => panic!("automatic public copy selected no clones although FICLONE succeeded on the fixture filesystem"),
             Err(error) => panic!("FICLONE capability probe failed unexpectedly: {error}"),
         }
@@ -754,7 +770,7 @@ fn public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks() {
     assert_eq!(native_progress.logical_bytes_cloned + native_progress.bytes_streamed, expected_streamed_bytes);
     if native_progress.native_copied_files == 0 {
         match native_copy_capability(&fixture) {
-            Err(reason) => eprintln!("SKIP native copy_file_range method proof: {reason}"),
+            Err(reason) => panic!("native copy_file_range method proof needs a capable filesystem: {reason}"),
             Ok(()) => panic!("public copy selected no native files although sparse seeking and copy_file_range work on the fixture filesystem"),
         }
     }
@@ -768,7 +784,7 @@ fn public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks() {
     assert_eq!(buffered_progress.bytes_streamed, expected_streamed_bytes);
     if !copy_range_fault_triggered {
         match native_copy_capability(&fixture) {
-            Err(reason) => eprintln!("SKIP forced copy_file_range fallback proof: {reason}; buffered exact-byte path was selected"),
+            Err(reason) => panic!("forced copy_file_range fallback proof needs a capable filesystem: {reason}"),
             Ok(()) => panic!("copy_file_range test hook was not reached although native copy capabilities work on the fixture filesystem"),
         }
     }
