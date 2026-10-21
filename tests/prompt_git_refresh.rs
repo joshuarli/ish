@@ -47,13 +47,14 @@ fn prompt_refreshes_negative_git_lookup_after_repository_creation() {
     let (_directory_handle, cwd) = directory_fd_path(directory.path());
     let mut prompt = Prompt::new();
 
-    prompt.render_with_state(0, &cwd, false);
+    let mut rendered = String::new();
+    prompt.render_into(&mut rendered, 0, &cwd, false);
 
     let git_dir = directory.path().join(".git");
     std::fs::create_dir(&git_dir).unwrap();
     std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/late-branch\n").unwrap();
 
-    let rendered = prompt.render_with_state(0, &cwd, false);
+    prompt.render_into(&mut rendered, 0, &cwd, false);
     assert!(rendered.contains(" late-branch"), "{rendered:?}");
 }
 
@@ -66,12 +67,13 @@ fn prompt_refreshes_negative_git_lookup_after_ancestor_repository_creation() {
     let cwd = format!("/dev/fd/{}/child", directory_handle.as_raw_fd());
     let mut prompt = Prompt::new();
 
-    prompt.render_with_state(0, &cwd, false);
+    let mut rendered = String::new();
+    prompt.render_into(&mut rendered, 0, &cwd, false);
 
     let git_dir = directory.path().join(".git");
     std::fs::create_dir(&git_dir).unwrap();
     std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/ancestor-branch\n").unwrap();
 
-    let rendered = prompt.render_with_state(0, &cwd, false);
+    prompt.render_into(&mut rendered, 0, &cwd, false);
     assert!(rendered.contains(" ancestor-branch"), "{rendered:?}");
 }

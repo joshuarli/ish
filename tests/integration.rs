@@ -968,11 +968,13 @@ fn prompt_display_len_utf8() {
 fn prompt_render_status_colors() {
     let mut p = prompt::Prompt::new();
     // status 0 → green, status 1 → red
-    let r0 = p.render_with_state(0, "/", false);
+    let mut r0 = String::new();
+    p.render_into(&mut r0, 0, "/", false);
     assert!(r0.contains("\x1b[38;5;10m")); // bright green
     assert!(r0.ends_with(" $ "));
 
-    let r1 = p.render_with_state(1, "/", false);
+    let mut r1 = String::new();
+    p.render_into(&mut r1, 1, "/", false);
     assert!(r1.contains("\x1b[38;5;1m")); // red
     assert!(r1.ends_with(" $ "));
 }
@@ -980,7 +982,8 @@ fn prompt_render_status_colors() {
 #[test]
 fn prompt_render_dirty_indicator() {
     let mut p = prompt::Prompt::new();
-    let r1 = p.render_with_state(0, "/tmp", true);
+    let mut r1 = String::new();
+    p.render_into(&mut r1, 0, "/tmp", true);
     assert!(r1.contains("\x1b[38;5;1m *"));
 }
 
@@ -1002,7 +1005,8 @@ fn prompt_git_branch_in_git_repo() {
     // We're running from within a git repo (ish itself)
     let mut p = prompt::Prompt::new();
     let cwd = std::env::current_dir().unwrap();
-    let rendered = p.render_with_state(0, cwd.to_str().unwrap(), false);
+    let mut rendered = String::new();
+    p.render_into(&mut rendered, 0, cwd.to_str().unwrap(), false);
     // Should detect git branch — the rendered prompt should contain a branch name
     // We can't predict the exact branch name, but it should be there
     // At minimum, the prompt should not crash
@@ -1829,7 +1833,8 @@ fn prompt_git_branch_detects_repo() {
 
     // Render sets PWD, but other tests may race. Just verify the code path runs.
     let mut p = prompt::Prompt::new();
-    let rendered = p.render_with_state(0, dir.to_str().unwrap(), false);
+    let mut rendered = String::new();
+    p.render_into(&mut rendered, 0, dir.to_str().unwrap(), false);
     // If PWD wasn't clobbered, we see the branch. Either way, no crash.
     assert!(rendered.ends_with(" $ "));
 }
@@ -1842,7 +1847,8 @@ fn prompt_git_branch_detached_head() {
     std::fs::write(git_dir.join("HEAD"), "abc12345deadbeef\n").unwrap();
 
     let mut p = prompt::Prompt::new();
-    let rendered = p.render_with_state(0, dir.to_str().unwrap(), false);
+    let mut rendered = String::new();
+    p.render_into(&mut rendered, 0, dir.to_str().unwrap(), false);
     assert!(rendered.ends_with(" $ "));
 }
 
@@ -1850,7 +1856,8 @@ fn prompt_git_branch_detached_head() {
 fn prompt_git_branch_no_repo() {
     let dir = tempdir_with_files(&[]);
     let mut p = prompt::Prompt::new();
-    let rendered = p.render_with_state(0, dir.to_str().unwrap(), false);
+    let mut rendered = String::new();
+    p.render_into(&mut rendered, 0, dir.to_str().unwrap(), false);
     assert!(rendered.ends_with(" $ "));
 }
 
@@ -1863,10 +1870,11 @@ fn prompt_git_cache_no_repo_reuse() {
     let mut p = prompt::Prompt::new();
 
     // First render in dir with no repo — caches NoRepo
-    let _ = p.render_with_state(0, dir.to_str().unwrap(), false);
+    let mut r = String::new();
+    p.render_into(&mut r, 0, dir.to_str().unwrap(), false);
 
     // Render in subdir — exercises the NoRepo cache path
-    let r = p.render_with_state(0, subdir.to_str().unwrap(), false);
+    p.render_into(&mut r, 0, subdir.to_str().unwrap(), false);
     assert!(r.ends_with(" $ "));
 }
 
@@ -1878,11 +1886,12 @@ fn prompt_git_invalidate_clears_cache() {
     std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
 
     let mut p = prompt::Prompt::new();
-    let _ = p.render_with_state(0, dir.to_str().unwrap(), false);
+    let mut r = String::new();
+    p.render_into(&mut r, 0, dir.to_str().unwrap(), false);
 
     // Invalidate and re-render — exercises the Unknown→Repo path again
     p.invalidate_git();
-    let r = p.render_with_state(0, dir.to_str().unwrap(), false);
+    p.render_into(&mut r, 0, dir.to_str().unwrap(), false);
     assert!(r.ends_with(" $ "));
 }
 
@@ -1894,7 +1903,8 @@ fn prompt_git_bare_ref() {
     std::fs::write(git_dir.join("HEAD"), "ref: refs/remotes/origin/main\n").unwrap();
 
     let mut p = prompt::Prompt::new();
-    let rendered = p.render_with_state(0, dir.to_str().unwrap(), false);
+    let mut rendered = String::new();
+    p.render_into(&mut rendered, 0, dir.to_str().unwrap(), false);
     assert!(rendered.ends_with(" $ "));
 }
 
@@ -1915,7 +1925,8 @@ fn prompt_git_worktree_gitdir_file() {
     .unwrap();
 
     let mut p = prompt::Prompt::new();
-    let rendered = p.render_with_state(0, worktree.to_str().unwrap(), false);
+    let mut rendered = String::new();
+    p.render_into(&mut rendered, 0, worktree.to_str().unwrap(), false);
     assert!(rendered.ends_with(" $ "));
 }
 

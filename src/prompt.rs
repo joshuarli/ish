@@ -102,12 +102,6 @@ impl Prompt {
         out.push_str(" $ ");
     }
 
-    pub fn render_with_state(&mut self, last_status: i32, pwd: &str, denv_dirty: bool) -> String {
-        let mut out = String::with_capacity(128);
-        self.render_into(&mut out, last_status, pwd, denv_dirty);
-        out
-    }
-
     /// Compute the display length of the prompt (excluding ANSI escapes).
     pub fn display_len(&self, prompt_str: &str) -> usize {
         let mut len = 0;
@@ -422,7 +416,8 @@ mod tests {
     fn prompt_neutralizes_control_characters() {
         let mut prompt = Prompt::with_identity("u", "/home/u");
         let pwd = "/tmp/a\x1b]52;c;aGk=\x07b";
-        let out = prompt.render_with_state(0, pwd, false);
+        let mut out = String::new();
+        prompt.render_into(&mut out, 0, pwd, false);
         assert!(!out.contains('\x07'));
         assert!(!out.contains("\x1b]"));
     }

@@ -96,15 +96,6 @@ Next: 57
 - **Fix with:** os-boundaries
 - **Effort:** S (hours)
 
-### ISH-55 · P4 · `Prompt::render_with_state` is a test-only wrapper
-
-- **Area:** Dead code
-- **Where:** `src/prompt.rs` (`render_with_state`), `tests/prompt_identity.rs`, `tests/integration.rs`
-- **Problem:** `src/main.rs` renders through `render_into`; `render_with_state` is called only from tests, so the tests exercise a path production does not take.
-- **Recommendation:** Point the tests at `render_into` and delete the wrapper, or keep the wrapper and name it for tests.
-- **Fix with:** dead-code-archaeology
-- **Effort:** S (hours)
-
 ### ISH-56 · P4 · Startup record cleanup in denv treats a pid from another pid namespace as dead
 
 - **Area:** Data
