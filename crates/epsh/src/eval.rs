@@ -37,7 +37,6 @@ fn escape_command_name(bytes: &[u8]) -> String {
     escaped
 }
 
-/// True if `path` is a regular file with any execute bit set.
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
@@ -46,8 +45,6 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// The interpreter path from a script's `#!` line, or None if the first line
-/// is not a shebang (or the file cannot be read). Mirrors bash's `getinterp`.
 fn read_shebang_interpreter(path: &Path) -> Option<OsString> {
     let mut buf = [0u8; 128];
     let mut file = std::fs::File::open(path).ok()?;
@@ -69,7 +66,6 @@ fn read_shebang_interpreter(path: &Path) -> Option<OsString> {
     Some(OsString::from_vec(buf[start..i].to_vec()))
 }
 
-/// The platform's strerror text for an errno, e.g. "Not a directory".
 fn os_error_string(code: i32) -> String {
     unsafe {
         let msg = libc::strerror(code);
@@ -80,9 +76,6 @@ fn os_error_string(code: i32) -> String {
     }
 }
 
-/// The file exec would attempt for `cmd_name`: slash paths resolve against
-/// `cwd`; slashless names search `path_env` like `execve_with_env`. Returns
-/// None for a slashless name found in no PATH directory.
 fn resolve_exec_path(cmd_name: &OsStr, cwd: &Path, path_env: &OsStr) -> Option<PathBuf> {
     let name_path = PathBuf::from(cmd_name);
     if cmd_name.as_bytes().contains(&b'/') {
@@ -324,54 +317,32 @@ pub type RedirectOpenHandler =
 /// ```
 pub struct Shell {
     pub(crate) vars: Variables,
-    /// Defined functions: name → AST body
     pub(crate) functions: FxHashMap<String, Command>,
-    /// Last command's exit status ($?)
     pub(crate) exit_status: ExitStatus,
-    /// Shell's PID ($$)
     pub(crate) pid: u32,
-    /// Current working directory — per-Shell, not process-global.
-    /// All relative paths (redirections, glob, source) resolve against this.
     pub(crate) cwd: PathBuf,
-    /// True when `cwd` contains no unresolved symlinks.
     pub(crate) cwd_is_canonical: bool,
-    /// Number of nested loops (for break/continue counting)
     pub(crate) loop_depth: usize,
-    /// Shell options
     pub(crate) opts: ShellOpts,
-    /// Trap handlers: signal name → command string
     pub(crate) traps: FxHashMap<String, String>,
-    /// True when evaluating a condition (if test, while cond, && / || operands).
-    /// Suppresses set -e (errexit). Mirrors dash's EV_TESTED flag.
     pub(crate) tested: bool,
     pub(crate) in_forked_child: bool,
     owner_pid: u32,
     command_placements: FxHashMap<Vec<u8>, CommandPlacement>,
     command_identities: FxHashMap<Vec<u8>, CommandIdentity>,
     placement_context: PlacementContext,
-    /// True when the current eval context will exit after the command completes.
-    /// Allows eval_external to exec directly instead of fork+exec (dash's EV_EXIT).
     pub(crate) ev_exit: bool,
-    /// Optional cancellation flag. When set to true, the shell aborts execution.
     cancel: Option<Arc<AtomicBool>>,
-    /// Optional stdout sink. When set, builtin output goes here instead of fd 1.
     pub(crate) stdout_sink: Option<Arc<Mutex<dyn Write + Send>>>,
-    /// Optional stderr sink. When set, error output goes here instead of fd 2.
     pub(crate) stderr_sink: Option<Arc<Mutex<dyn Write + Send>>>,
     pub(crate) descriptor_sinks: FxHashMap<RawFd, OutputSink>,
-    /// PIDs of currently running child processes (for cancellation cleanup).
     pub(crate) child_pids: Vec<i32>,
     child_groups: FxHashMap<i32, i32>,
     child_relays: FxHashMap<i32, ChildRelays>,
-    /// Optional execution deadline. When exceeded, shell aborts with TimedOut.
     timeout: Option<std::time::Instant>,
-    /// Optional callback that replaces eval_external for spawning processes.
-    /// Lets embedders control process creation (job control, sandboxing, etc.).
     external_handler: Option<ExternalHandler>,
     command_policy: Option<CommandPolicy>,
-    /// Optional provider that opens writable redirection targets.
     pub(crate) redirect_open_handler: Option<RedirectOpenHandler>,
-    /// PID of the last background command ($!).
     last_bg_pid: Option<u32>,
     substitution_count: u64,
     pub(crate) pending_stdin: Option<usize>,
@@ -1003,7 +974,6 @@ impl Shell {
         self.command_identities.get(name.as_bytes()).copied()
     }
 
-    /// Check cancellation flag and timeout deadline.
     fn check_cancel(&self) -> crate::error::Result<()> {
         if let Some(ref flag) = self.cancel
             && flag.load(Ordering::Relaxed)
@@ -1028,8 +998,6 @@ impl Shell {
         self.stderr_sink = Some(sink);
     }
 
-    /// Write a string to stdout (sink or fd 1).
-    /// Decodes PUA-encoded bytes back to raw bytes for non-UTF-8 preservation.
     pub(crate) fn write_out(&self, s: &str) {
         let data = crate::encoding::str_to_bytes(s);
         if let Some(ref sink) = self.stdout_sink {
@@ -1037,12 +1005,10 @@ impl Shell {
                 let _ = w.write_all(&data);
             }
         } else {
-            // SAFETY: fd 1 (stdout) is always valid; data pointer and length are from a live Vec.
-            sys::write(1, data.as_ptr() as *const _, data.len());
+            sys::write(1, &data);
         }
     }
 
-    /// Write a string to stderr (sink or fd 2).
     pub(crate) fn write_err(&self, s: &str) {
         let data = crate::encoding::str_to_bytes(s);
         if let Some(ref sink) = self.stderr_sink {
@@ -1050,12 +1016,10 @@ impl Shell {
                 let _ = w.write_all(&data);
             }
         } else {
-            // SAFETY: fd 2 (stderr) is always valid; data pointer and length are from a live Vec.
-            sys::write(2, data.as_ptr() as *const _, data.len());
+            sys::write(2, &data);
         }
     }
 
-    /// Write a formatted error message to stderr.
     pub(crate) fn err_msg(&self, msg: &str) {
         self.write_err(msg);
         if !msg.ends_with('\n') {
@@ -1146,7 +1110,6 @@ impl Shell {
         }
     }
 
-    /// Build the xtrace prefix string ($PS4, default "+ ").
     fn xtrace_prefix(&self) -> String {
         self.vars.get_shell("PS4").unwrap_or_else(|| "+ ".into())
     }
@@ -1294,11 +1257,9 @@ impl Shell {
         self.exit_status
     }
 
-    /// Check for pending signals and run their trap handlers.
     fn run_pending_traps(&mut self) {
         for sig_name in crate::signal::take_pending() {
             if let Some(action) = self.traps.get(sig_name) {
-                // Empty action means ignore (trap '' SIG)
                 if action.is_empty() {
                     continue;
                 }
@@ -1313,7 +1274,6 @@ impl Shell {
         }
     }
 
-    /// Run the EXIT trap if one is set.
     pub(crate) fn run_exit_trap(&mut self) {
         if let Some(action) = self.traps.remove("EXIT") {
             let status = self.exit_status;
@@ -1353,18 +1313,14 @@ impl Shell {
         self.vars.get_bytes(name)
     }
 
-    /// Expand a word to a list of fields (with field splitting and globbing).
     pub(crate) fn expand_fields(&mut self, word: &Word) -> crate::error::Result<Vec<String>> {
         expand::expand_word_to_fields(word, self)
     }
 
-    /// Expand a word to a single string (no field splitting or globbing).
     pub(crate) fn expand_string(&mut self, word: &Word) -> crate::error::Result<String> {
         expand::expand_word_to_string(word, self)
     }
 
-    /// Expand word parts into a fnmatch-ready pattern string.
-    /// Glob chars from quoted regions are escaped.
     pub(crate) fn expand_pattern(&mut self, word: &Word) -> crate::error::Result<String> {
         expand::expand_pattern(&word.parts, self)
     }
@@ -1386,11 +1342,6 @@ impl Shell {
         let status = self.eval_command_inner(cmd)?;
         self.exit_status = status;
 
-        // Errexit check — mirrors dash's eval.c line 330.
-        // Only fires from "leaf" nodes (simple commands, pipelines, subshells)
-        // where checkexit = EV_TESTED. Compound commands (if, while, for, etc.)
-        // propagate status but don't trigger errexit directly.
-        // Bang (!) pipelines suppress errexit on the inverted result (POSIX).
         let is_bang = matches!(cmd, Command::Pipeline { bang: true, .. });
         let is_leaf = matches!(
             cmd,
@@ -1407,8 +1358,6 @@ impl Shell {
     }
 
     fn eval_command_inner(&mut self, cmd: &Command) -> crate::error::Result<ExitStatus> {
-        // ev_exit only applies to the final simple command in an exit context.
-        // Clear it for compound commands so nested commands don't exec-direct.
         if !matches!(cmd, Command::Simple { .. }) {
             self.ev_exit = false;
         }
@@ -1425,8 +1374,6 @@ impl Shell {
                 bang,
                 span: _,
             } => {
-                // bang (!) suppresses errexit for both the inner pipeline
-                // AND the inverted result (POSIX requirement).
                 let saved = self.tested;
                 if *bang {
                     self.tested = true;
@@ -1443,14 +1390,12 @@ impl Shell {
             }
 
             Command::And(left, right) => {
-                // Left side of && is always tested (errexit suppressed)
                 let saved = self.tested;
                 self.tested = true;
                 let status = self.eval_command(left)?;
                 self.tested = saved;
                 self.exit_status = status;
                 if status.success() {
-                    // Right side inherits parent's tested flag (like dash)
                     self.eval_command(right)
                 } else {
                     Ok(status)
@@ -1594,7 +1539,6 @@ impl Shell {
                     }
                     expanded
                 } else {
-                    // No 'in' clause: use positional parameters
                     self.vars.positional_shell_strings()
                 };
 
@@ -1660,13 +1604,11 @@ impl Shell {
             }
 
             Command::Background { cmd, redirs } => {
-                // Fork and run in background
                 self.eval_background(cmd, redirs)
             }
         }
     }
 
-    /// Evaluate a simple command (the most common case).
     fn eval_simple(
         &mut self,
         assigns: &[Assignment],
@@ -1675,7 +1617,6 @@ impl Shell {
         span: Span,
     ) -> crate::error::Result<ExitStatus> {
         let substitutions_before = self.substitution_count;
-        // Expand arguments
         let mut expanded_args: Vec<String> = Vec::new();
         for arg in args {
             expanded_args.extend(self.expand_fields(arg)?);
@@ -1710,7 +1651,6 @@ impl Shell {
         }
         self.check_command_policy_for_dispatch(&expanded_args, span)?;
 
-        // xtrace: print $PS4, assignments, then args (like dash's evalcommand)
         if self.opts.xtrace {
             let mut trace = self.xtrace_prefix();
             for assign in assigns {
@@ -1735,7 +1675,6 @@ impl Shell {
 
         let cmd_name = &expanded_args[0];
 
-        // exec is special: its redirections are permanent (no save/restore)
         let mut dispatch_args = expanded_args.as_slice();
         while dispatch_args.first().is_some_and(|name| name == "command") {
             match crate::builtins::command_action(dispatch_args) {
@@ -1745,17 +1684,14 @@ impl Shell {
         }
         let is_exec = dispatch_args.first().is_some_and(|name| name == "exec");
 
-        // Setup redirections before executing (applies to builtins, functions, externals)
         let saved_fds = self.setup_redirections(redirs)?;
 
-        // Every outcome, including builtin errors, falls through to the
-        // descriptor restoration below.
         let result = match self.try_builtin(cmd_name, &expanded_args, assigns, &[], span) {
             Ok(Some(status)) => Ok(status),
             Err(e) => Err(e),
             Ok(None) => {
                 if let Some(func_body) = self.functions.get(cmd_name).cloned() {
-                    self.ev_exit = false; // function body may have multiple commands
+                    self.ev_exit = false;
                     self.eval_function(&func_body, &expanded_args, assigns, &[], span)
                 } else if self.external_handler.is_some() {
                     self.call_external_handler(&expanded_args, assigns)
@@ -1772,13 +1708,6 @@ impl Shell {
         }
     }
 
-    /// Run an external command through the embedder's handler.
-    ///
-    /// Builds the complete child environment for the handler: inherited
-    /// non-shell-name entries, exported shell variables, and prefix
-    /// assignments (which override exported values). This mirrors what
-    /// eval_external would hand to exec, so the handler's child inherits
-    /// nothing from the embedder's process environment beyond the store.
     pub(crate) fn call_external_handler(
         &mut self,
         args: &[String],
@@ -1811,7 +1740,6 @@ impl Shell {
         result
     }
 
-    /// Evaluate a function call.
     fn eval_function(
         &mut self,
         body: &Command,
@@ -1820,26 +1748,21 @@ impl Shell {
         redirs: &[Redir],
         _span: Span,
     ) -> crate::error::Result<ExitStatus> {
-        // Save and set positional parameters (take avoids clone)
         let saved_positional = std::mem::replace(
             &mut self.vars.positional,
             args[1..].iter().map(|s| ShellBytes::from_str_lossless(s)).collect(),
         );
 
-        // Push scope for local variables
         self.vars.push_scope();
 
-        // Apply temporary assignments
         for assign in assigns {
             let value = self.expand_string(&assign.value)?;
             self.vars.make_local(&assign.name);
             let _ = self.vars.set_shell(&assign.name, &value);
         }
 
-        // Setup redirections
         let saved_fds = self.setup_redirections(redirs)?;
 
-        // Execute function body
         let result = match self.eval_command(body) {
             Ok(s) => Ok(s),
             Err(ShellError::Return(n)) => Ok(n),
@@ -1853,14 +1776,11 @@ impl Shell {
         result
     }
 
-    /// Handle exec/spawn failure — report error and return appropriate status.
     fn handle_exec_error(
         &self,
         e: &std::io::Error,
         cmd_name: &str,
     ) -> crate::error::Result<ExitStatus> {
-        // An executable script whose interpreter is broken surfaces as a bare
-        // ENOTDIR/ENOENT/EACCES; report it bash-style instead of a raw errno.
         if let Some(code) = e.raw_os_error() {
             let path_env = self.vars.get_bytes("PATH")
                 .map(|value| value.to_os_string())
@@ -1882,7 +1802,6 @@ impl Shell {
         }
     }
 
-    /// Execute an external command.
     pub(crate) fn eval_external(
         &mut self,
         args: &[String],
@@ -1899,11 +1818,7 @@ impl Shell {
             assign_bytes.push((assign.name.clone(), ShellBytes::from_str_lossless(&value)));
         }
 
-        // When ev_exit is set (pipeline child about to _exit), exec directly
-        // instead of fork+exec. Mirrors dash's shellexec fast-path.
         if self.ev_exit {
-            // Avoid mutating the process environment after fork: another thread
-            // may hold Rust's environment lock when the child is created.
             let env = self.vars.env_for_command_os(&assign_bytes);
             if let Err(error) = std::env::set_current_dir(&self.cwd) {
                 return self.finish_redirections(Err(error.into()), saved);
@@ -1918,13 +1833,11 @@ impl Shell {
         cmd.current_dir(&self.cwd);
         if !self.in_forked_child { cmd.process_group(0); }
 
-        // Set environment: exported vars + temporary assignments
         cmd.env_clear();
         for (k, v) in self.vars.env_for_command_os(&assign_bytes) {
             cmd.env(k, v);
         }
 
-        // When sinks are set, capture child stdout/stderr and relay to sinks.
         if self.stdout_sink.is_some() {
             cmd.stdout(std::process::Stdio::piped());
         }
@@ -1983,7 +1896,6 @@ impl Shell {
         self.finish_redirections(result, saved)
     }
 
-    /// Execute a pipeline.
     fn eval_pipeline(&mut self, commands: &[Command]) -> crate::error::Result<ExitStatus> {
         if commands.len() == 1 {
             return self.eval_command(&commands[0]);
@@ -1997,7 +1909,6 @@ impl Shell {
         let mut children = Vec::new();
         let mut pgid = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
         for (i, cmd) in commands.iter().enumerate() {
-            // SAFETY: every descriptor has an owner in the parent; the child installs its endpoints and exits without unwinding.
             let pid = match self.fork_evaluator() {
                 Ok(pid) => pid,
                 Err(error) => {
@@ -2042,16 +1953,14 @@ impl Shell {
         drop(pipes);
         self.relay_fork_outputs(*children.last().unwrap(), outputs, &children)?;
 
-        // Interactive mode: give the pipeline the terminal
         if self.opts.interactive && pgid > 0 {
-            // SAFETY: pgid is a valid process group from setpgid; fd 0 is stdin.
+            // SAFETY: descriptor 0 stays open for the life of the process.
             let _ = rustix::termios::tcsetpgrp(
                 unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
                 rustix::process::Pid::from_raw(pgid).unwrap(),
             );
         }
 
-        // Wait for all children, checking cancel between stages
         let mut last_status = ExitStatus::SUCCESS;
         let mut pipefail_status = ExitStatus::SUCCESS;
         for (i, &pid) in children.iter().enumerate() {
@@ -2065,8 +1974,7 @@ impl Shell {
                     }
                 }
                 Err(ShellError::Stopped { pid: _, pgid: _ }) if self.opts.interactive => {
-                    // Reclaim terminal before propagating
-                    // SAFETY: getpgrp() and tcsetpgrp are always safe with valid fd.
+                    // SAFETY: descriptor 0 stays open for the life of the process.
                     let _ = rustix::termios::tcsetpgrp(
                         unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
                         rustix::process::getpgrp(),
@@ -2098,9 +2006,8 @@ impl Shell {
             }
         }
 
-        // Interactive mode: reclaim the terminal
         if self.opts.interactive && pgid > 0 {
-            // SAFETY: getpgrp() returns our process group; fd 0 is stdin.
+            // SAFETY: descriptor 0 stays open for the life of the process.
             let _ = rustix::termios::tcsetpgrp(
                 unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
                 rustix::process::getpgrp(),
@@ -2122,7 +2029,6 @@ impl Shell {
     ) -> crate::error::Result<ExitStatus> {
         let outputs = self.fork_outputs(true)?;
         let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
-        // SAFETY: the child has independent evaluator state and exits without unwinding into its caller.
         let pid = self.fork_evaluator()?;
         if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
         if pid == 0 {
@@ -2160,7 +2066,6 @@ impl Shell {
     ) -> crate::error::Result<ExitStatus> {
         let outputs = self.fork_outputs(true)?;
         let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
-        // SAFETY: the parent retains the child PID and its output relays; the child exits without unwinding.
         let pid = self.fork_evaluator()?;
         if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
         if pid == 0 {
@@ -2198,7 +2103,6 @@ impl Shell {
         let flags = rustix::fs::fcntl_getfl(&read_end).map_err(std::io::Error::from)?;
         rustix::fs::fcntl_setfl(&read_end, flags | rustix::fs::OFlags::NONBLOCK).map_err(std::io::Error::from)?;
         let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
-        // SAFETY: the child has its own evaluator state and exits without unwinding into the embedder.
         let pid = self.fork_evaluator()?;
         if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
         if pid == 0 {
@@ -2354,7 +2258,6 @@ mod tests {
     #[test]
     fn run_while_loop() {
         let mut shell = Shell::new();
-        // Use a counter that doesn't need arithmetic expansion
         shell.run_script("I=x; while test $I != xxx; do I=${I}x; done");
         assert_eq!(shell.get_var("I"), Some("xxx"));
     }
@@ -2419,8 +2322,6 @@ mod tests {
     #[test]
     fn run_set_errexit() {
         let mut shell = Shell::new();
-        // set -e should cause exit on first failure
-        // The script sets X=before, then false fails, so X=after never runs
         let status = shell.run_script("set -e; X=before; false; X=after");
         assert_eq!(status, 1);
         assert_eq!(shell.get_var("X"), Some("before"));
@@ -2467,7 +2368,6 @@ mod tests {
     #[test]
     fn run_subshell() {
         let mut shell = Shell::new();
-        // Subshell changes shouldn't affect parent
         shell.run_script("X=outer; (X=inner)");
         assert_eq!(shell.get_var("X"), Some("outer"));
     }
@@ -2548,7 +2448,6 @@ mod tests {
     #[test]
     fn run_command_substitution_in_args() {
         let mut shell = Shell::new();
-        // echo receives the output of the subcommand
         let status = shell.run_script("R=$(echo hello world); true");
         assert_eq!(status, 0);
         assert_eq!(shell.get_var("R"), Some("hello world"));
@@ -2585,18 +2484,6 @@ mod tests {
         assert!(shell.traps.contains_key("INT"));
     }
 
-    // Regression test: heredoc stdin must not dup2 fd 0 in the parent process.
-    //
-    // When epsh runs on a background thread with stdout/stderr sinks (as nerv
-    // does), the old code did dup2(pipe_read_fd, 0) in the parent to set up
-    // heredoc stdin.  dup2 is process-wide, so between setup_redirections and
-    // restore_redirections the main thread's fd 0 pointed at the (soon-to-be-
-    // exhausted) pipe instead of the terminal.  The main thread read EOF and
-    // set should_quit, causing nerv to exit mid-session.
-    //
-    // The fix: when sinks are set, store the heredoc pipe read fd in
-    // Shell::pending_stdin and apply it via cmd.stdin() after fork so that
-    // the parent's fd 0 is never touched.
     #[test]
     fn heredoc_with_sinks_does_not_corrupt_fd0() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2605,9 +2492,6 @@ mod tests {
         let corrupted = Arc::new(AtomicBool::new(false));
         let corrupted_clone = corrupted.clone();
 
-        // Watcher thread: continuously polls fd 0 to detect corruption.
-        // fcntl(0, F_GETFD) returns -1 if fd 0 is closed/replaced with a pipe
-        // that has already been consumed.
         let watcher = std::thread::spawn(move || {
             for _ in 0..2000 {
                 let r = rustix::io::fcntl_getfd(unsafe { std::os::fd::BorrowedFd::borrow_raw(0) });
@@ -2618,8 +2502,6 @@ mod tests {
             }
         });
 
-        // Run 20 heredoc commands via sinks on a background thread, mirroring
-        // how nerv's epsh tool runs commands.
         let worker = std::thread::spawn(move || {
             for i in 0..20 {
                 let out: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));

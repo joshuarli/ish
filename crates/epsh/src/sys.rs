@@ -78,11 +78,9 @@ pub fn read(fd: RawFd, buf: *mut c_void, len: usize) -> isize {
     }
 }
 
-/// Write `len` bytes from `buf` to `fd`. Mirrors libc `write`.
-pub fn write(fd: RawFd, buf: *const u8, len: usize) {
-    // SAFETY: caller guarantees `buf` is valid for `len` bytes.
-    let slice = unsafe { std::slice::from_raw_parts(buf, len) };
-    let _ = rustix::io::write(unsafe { BorrowedFd::borrow_raw(fd) }, slice);
+pub fn write(fd: RawFd, buf: &[u8]) {
+    // SAFETY: callers pass descriptors that stay open for the duration of the call.
+    let _ = rustix::io::write(unsafe { BorrowedFd::borrow_raw(fd) }, buf);
 }
 
 pub fn dup2_result(oldfd: RawFd, newfd: RawFd) -> std::io::Result<()> {

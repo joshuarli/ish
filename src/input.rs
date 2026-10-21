@@ -86,11 +86,7 @@ impl KeyEvent {
 pub enum InputEvent {
     Key(KeyEvent),
     Signal(i32),
-    /// A bracketed paste under the paste limit (8192 bytes). Contains the full pasted text.
-    /// The caller should insert it into the line buffer in one shot.
     Paste(String),
-    /// A bracketed paste exceeded the paste limit and was rejected.
-    /// The caller must leave the line buffer untouched and tell the user.
     PasteRejected,
 }
 
@@ -109,7 +105,6 @@ enum PollResult {
     Stdin,
     Signal,
     Timeout,
-    /// stdin fd has POLLHUP without POLLIN, or polling failed fatally — treat as EOF.
     StdinHup,
 }
 
@@ -119,7 +114,6 @@ enum SkipPasteResult {
 }
 
 impl InputReader {
-    /// The process-owned stdin and signal descriptors must stay open while this reader is used.
     pub fn new(signal_fd: RawFd) -> Self {
         Self::with_fds(STDIN_FD, signal_fd)
     }
@@ -137,21 +131,15 @@ impl InputReader {
         }
     }
 
-    /// True while inside a bracketed paste (`\x1b[200~` … `\x1b[201~`).
     pub fn in_paste(&self) -> bool {
         self.in_paste
     }
 
-    /// Accumulate a single key event into the in-progress paste buffer,
-    /// tracking the byte limit.  Once exceeded the buffer is discarded and
-    /// `paste_limit_hit` is set so remaining bytes are suppressed.
     fn accumulate_paste_key(&mut self, key: KeyEvent) {
         if self.paste_limit_hit {
             return;
         }
         match key.key {
-            // Control bytes 0x01-0x1a decode as Ctrl+letter; inserting the
-            // letter would turn pasted control data into ordinary text.
             Key::Char(_) if key.mods.ctrl || key.mods.alt => {}
             Key::Char(c) => self.paste_buf.push(c),
             Key::Enter => self.paste_buf.push('\n'),
@@ -164,33 +152,24 @@ impl InputReader {
         }
     }
 
-    /// Block until a key or signal event is available.
-    ///
-    /// During a bracketed paste, all key events are accumulated into a single
-    /// `String` and returned as `Paste(String)` when the paste ends — no
-    /// per-character events are dispatched, so the caller can insert the
-    /// entire text in one shot and render once.
     pub fn read_event(&mut self) -> InputEvent {
         loop {
-            // Drain buffered data without polling the kernel for every byte.
             while self.buf_pos < self.buf_end && !(self.in_paste && self.paste_limit_hit) {
                 if let Some(key) = self.decode_key() {
                     if self.in_paste {
                         self.accumulate_paste_key(key);
                         if self.paste_limit_hit {
-                            break; // limit hit mid-buffer — skip rest below
+                            break;
                         }
                         continue;
                     }
                     return InputEvent::Key(key);
                 }
-                // decode_key returned None (CSI 200~/201~, suppressed byte, etc.)
                 if !self.in_paste {
                     break;
                 }
             }
 
-            // Paste under limit and just ended — return accumulated text.
             if !self.in_paste && !self.paste_buf.is_empty() {
                 self.paste_limit_hit = false;
                 return InputEvent::Paste(std::mem::take(&mut self.paste_buf));
@@ -215,7 +194,7 @@ impl InputReader {
                     if let Some(key) = self.decode_key() {
                         if self.in_paste {
                             self.accumulate_paste_key(key);
-                            continue; // back to the drain loop
+                            continue;
                         }
                         return InputEvent::Key(key);
                     }
@@ -236,8 +215,6 @@ impl InputReader {
                 }
                 PollResult::Timeout => {}
                 PollResult::StdinHup => {
-                    // PTY master closed (or stdin EOF) — synthesise Ctrl+D so the
-                    // shell exits cleanly rather than spinning in poll forever.
                     return InputEvent::Key(KeyEvent::ctrl('d'));
                 }
             }
@@ -257,8 +234,6 @@ impl InputReader {
             rustix::event::PollFd::from_borrowed_fd(signal, rustix::event::PollFlags::IN),
         ];
         loop {
-            // SAFETY: poll on two valid fds (stdin + signal pipe). Returns
-            // count of ready fds, 0 on timeout, -1 on error.
             let timeout = poll_timeout(timeout_ms);
             let n = match rustix::event::poll(&mut fds, timeout.as_ref()) {
                 Ok(n) => n,
@@ -274,8 +249,6 @@ impl InputReader {
             if fds[0].revents().contains(rustix::event::PollFlags::IN) {
                 return PollResult::Stdin;
             }
-            // POLLHUP on stdin without POLLIN: PTY master was closed (or similar).
-            // Treat as EOF so the shell exits rather than spinning.
             if fds[0].revents().contains(rustix::event::PollFlags::HUP) {
                 return PollResult::StdinHup;
             }
@@ -283,13 +256,11 @@ impl InputReader {
         }
     }
 
-    /// Returns true if stdin has data available to read immediately.
     pub fn has_pending_input(&self) -> bool {
         self.buf_pos < self.buf_end || self.poll_stdin(0)
     }
 
     fn poll_stdin(&self, timeout_ms: i32) -> bool {
-        // Data already buffered — no need to ask the kernel.
         if self.buf_pos < self.buf_end {
             return true;
         }
@@ -299,7 +270,6 @@ impl InputReader {
             stdin,
             rustix::event::PollFlags::IN,
         )];
-        // SAFETY: poll on a single valid fd (stdin). Stack-allocated pollfd array.
         let timeout_ms = timeout_ms.max(0) as i64;
         let timeout = rustix::event::Timespec {
             tv_sec: timeout_ms / 1000,
@@ -429,7 +399,6 @@ impl InputReader {
             0x0a | 0x0d => Some(KeyEvent::key(Key::Enter)),
             0x1b => self.decode_escape(),
             0x7f => Some(KeyEvent::key(Key::Backspace)),
-            // Ctrl+a through Ctrl+z (0x01-0x1a, excluding above)
             b @ 0x01..=0x1a => Some(KeyEvent::ctrl((b - 1 + b'a') as char)),
             b if b < 0x20 => None,
             b if b < 0x80 => Some(KeyEvent::char(b as char)),
@@ -604,12 +573,12 @@ mod tests {
 
     #[test]
     fn modifier_parsing() {
-        let m = modifier_from_param(5); // 1 + ctrl(4)
+        let m = modifier_from_param(5);
         assert!(m.ctrl);
         assert!(!m.alt);
         assert!(!m.shift);
 
-        let m = modifier_from_param(3); // 1 + alt(2)
+        let m = modifier_from_param(3);
         assert!(!m.ctrl);
         assert!(m.alt);
         assert!(!m.shift);
@@ -649,13 +618,11 @@ mod tests {
 
         assert!(!reader.in_paste());
 
-        // CSI 200~ starts a paste and clears the accumulated buffer.
         assert!(reader.csi_to_key(b'~', &[200]).is_none());
         assert!(reader.in_paste());
         assert!(reader.paste_buf.is_empty());
         assert!(!reader.paste_limit_hit);
 
-        // CSI 201~ ends the paste.
         assert!(reader.csi_to_key(b'~', &[201]).is_none());
         assert!(!reader.in_paste());
         assert!(!reader.paste_limit_hit);
@@ -665,23 +632,19 @@ mod tests {
     fn paste_accumulation_stops_at_limit() {
         let mut reader = InputReader::new(-1);
 
-        // Start paste.
         reader.csi_to_key(b'~', &[200]);
         assert!(reader.in_paste());
 
-        // Accumulate characters up to PASTE_LIMIT — flag stays clear.
         for c in "a".repeat(PASTE_LIMIT).chars() {
             reader.accumulate_paste_key(KeyEvent::char(c));
         }
         assert_eq!(reader.paste_buf.len(), PASTE_LIMIT);
         assert!(!reader.paste_limit_hit);
 
-        // One more character pushes us over.
         reader.accumulate_paste_key(KeyEvent::char('x'));
         assert!(reader.paste_buf.is_empty());
         assert!(reader.paste_limit_hit);
 
-        // End paste — flag stays set until consumed by read_event.
         reader.csi_to_key(b'~', &[201]);
         assert!(!reader.in_paste());
         assert!(reader.paste_limit_hit);

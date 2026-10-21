@@ -1,8 +1,7 @@
-/// Line editing buffer with cursor and kill ring.
 #[derive(Clone)]
 pub struct LineBuffer {
     buf: String,
-    cursor: usize, // byte offset into buf
+    cursor: usize,
     kill_ring: String,
 }
 
@@ -33,14 +32,12 @@ impl LineBuffer {
         self.buf.is_empty()
     }
 
-    /// Set content and move cursor to end.
     pub fn set(&mut self, s: &str) {
         self.buf.clear();
         self.buf.push_str(s);
         self.cursor = self.buf.len();
     }
 
-    /// Set content and place cursor at the given byte offset.
     pub fn set_with_cursor(&mut self, s: &str, cursor: usize) {
         self.buf.clear();
         self.buf.push_str(s);
@@ -50,7 +47,6 @@ impl LineBuffer {
         }
     }
 
-    /// Number of display columns from start of line to cursor.
     pub fn display_cursor_pos(&self) -> usize {
         if self.buf.is_ascii() {
             self.cursor
@@ -59,7 +55,6 @@ impl LineBuffer {
         }
     }
 
-    /// Number of display columns for the full line.
     pub fn display_len(&self) -> usize {
         if self.buf.is_ascii() {
             self.buf.len()
@@ -68,7 +63,6 @@ impl LineBuffer {
         }
     }
 
-    // -- Insertion / Deletion --
 
     pub fn insert_char(&mut self, c: char) {
         self.buf.insert(self.cursor, c);
@@ -80,7 +74,6 @@ impl LineBuffer {
         self.cursor += s.len();
     }
 
-    /// Delete char before cursor (Backspace).
     pub fn delete_back(&mut self) -> bool {
         if self.cursor == 0 {
             return false;
@@ -91,7 +84,6 @@ impl LineBuffer {
         true
     }
 
-    /// Delete char at cursor (Delete / Ctrl+D).
     pub fn delete_forward(&mut self) -> bool {
         if self.cursor >= self.buf.len() {
             return false;
@@ -101,7 +93,6 @@ impl LineBuffer {
         true
     }
 
-    // -- Cursor Movement --
 
     pub fn move_left(&mut self) -> bool {
         if self.cursor == 0 {
@@ -119,11 +110,6 @@ impl LineBuffer {
         true
     }
 
-    /// Return the terminal row and column for the cursor in a wrapped prompt.
-    ///
-    /// `prompt_display_len` is the prompt's display width on the first row;
-    /// `term_cols` is the terminal width. This only models a single-line
-    /// buffer (explicit newlines use the multiline navigation below).
     pub fn grid_cursor_position(
         &self,
         prompt_display_len: usize,
@@ -134,11 +120,6 @@ impl LineBuffer {
         (total / cols, total % cols)
     }
 
-    /// Move the cursor up one wrapped terminal row, preserving `target_col`.
-    ///
-    /// The target column is the terminal column rather than a byte or line
-    /// offset. It is kept by the caller so a short wrapped row does not make a
-    /// later Down press permanently lose the user's intended column.
     pub fn move_grid_up(
         &mut self,
         prompt_display_len: usize,
@@ -148,7 +129,6 @@ impl LineBuffer {
         self.move_grid(-1, prompt_display_len, term_cols, target_col)
     }
 
-    /// Move the cursor down one wrapped terminal row, preserving `target_col`.
     pub fn move_grid_down(
         &mut self,
         prompt_display_len: usize,
@@ -188,8 +168,6 @@ impl LineBuffer {
             return false;
         };
 
-        // Convert the terminal coordinate back to a display offset in the
-        // line. Rows occupied only by the prompt clamp to the start of input.
         let target_total = target_row * cols + target_col.min(cols - 1);
         let target_display = target_total.saturating_sub(prompt_display_len);
         self.cursor = self.byte_offset_for_display_pos(target_display);
@@ -223,7 +201,6 @@ impl LineBuffer {
     }
 
     pub fn move_word_left(&mut self) {
-        // Skip whitespace, then skip non-whitespace
         while self.cursor > 0 && self.char_before_cursor().is_some_and(|c| c.is_whitespace()) {
             self.cursor = self.prev_char_boundary();
         }
@@ -238,7 +215,6 @@ impl LineBuffer {
 
     pub fn move_word_right(&mut self) {
         let len = self.buf.len();
-        // Skip non-whitespace, then skip whitespace
         while self.cursor < len && self.char_at_cursor().is_some_and(|c| !c.is_whitespace()) {
             self.cursor = self.next_char_boundary();
         }
@@ -247,34 +223,26 @@ impl LineBuffer {
         }
     }
 
-    // -- Multiline Navigation --
 
-    /// Whether the buffer contains newline characters.
     pub fn has_newlines(&self) -> bool {
         self.buf.contains('\n')
     }
 
-    /// True if cursor is on the first line (no `\n` before it).
     pub fn on_first_line(&self) -> bool {
         !self.buf[..self.cursor].contains('\n')
     }
 
-    /// True if cursor is on the last line (no `\n` after it).
     pub fn on_last_line(&self) -> bool {
         !self.buf[self.cursor..].contains('\n')
     }
 
-    /// Move cursor up one line, preserving column position.
-    /// Returns false if already on the first line.
     pub fn move_line_up(&mut self) -> bool {
-        // Find start of current line
         let cur_line_start = match self.buf[..self.cursor].rfind('\n') {
             Some(i) => i + 1,
-            None => return false, // already on first line
+            None => return false,
         };
         let col = str_width(&self.buf[cur_line_start..self.cursor]);
 
-        // Find start of previous line
         let prev_line_start = self.buf[..cur_line_start - 1]
             .rfind('\n')
             .map(|i| i + 1)
@@ -284,20 +252,16 @@ impl LineBuffer {
         true
     }
 
-    /// Move cursor down one line, preserving column position.
-    /// Returns false if already on the last line.
     pub fn move_line_down(&mut self) -> bool {
-        // Find start of current line
         let cur_line_start = self.buf[..self.cursor]
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
         let col = str_width(&self.buf[cur_line_start..self.cursor]);
 
-        // Find end of current line (\n position)
         let cur_line_end = match self.buf[self.cursor..].find('\n') {
             Some(i) => self.cursor + i,
-            None => return false, // already on last line
+            None => return false,
         };
 
         let next_line_start = cur_line_end + 1;
@@ -310,9 +274,7 @@ impl LineBuffer {
         true
     }
 
-    // -- Kill Ring Operations --
 
-    /// Kill from cursor to end of line (Ctrl+K).
     pub fn kill_to_end(&mut self) {
         if self.cursor < self.buf.len() {
             self.kill_ring = self.buf[self.cursor..].to_string();
@@ -320,7 +282,6 @@ impl LineBuffer {
         }
     }
 
-    /// Kill from start to cursor (Ctrl+U).
     pub fn kill_to_start(&mut self) {
         if self.cursor > 0 {
             self.kill_ring = self.buf[..self.cursor].to_string();
@@ -329,10 +290,8 @@ impl LineBuffer {
         }
     }
 
-    /// Kill word backward (Ctrl+W).
     pub fn kill_word_back(&mut self) {
         let end = self.cursor;
-        // Skip whitespace, then skip non-whitespace
         while self.cursor > 0 && self.char_before_cursor().is_some_and(|c| c.is_whitespace()) {
             self.cursor = self.prev_char_boundary();
         }
@@ -349,7 +308,6 @@ impl LineBuffer {
         }
     }
 
-    /// Kill word forward (Ctrl+Delete / Alt+D).
     pub fn kill_word_forward(&mut self) {
         let start = self.cursor;
         let len = self.buf.len();
@@ -366,24 +324,19 @@ impl LineBuffer {
         }
     }
 
-    /// Yank (paste) from kill ring (Ctrl+Y).
     pub fn yank(&mut self) {
         if !self.kill_ring.is_empty() {
-            // Take the kill ring to avoid borrow conflict with insert_str,
-            // then restore it. mem::take replaces with empty String (no alloc).
             let text = std::mem::take(&mut self.kill_ring);
             self.insert_str(&text);
             self.kill_ring = text;
         }
     }
 
-    // -- Internal helpers --
 
     fn prev_char_boundary(&self) -> usize {
         if self.cursor == 0 {
             return 0;
         }
-        // ASCII fast path: previous byte is always a char boundary
         let prev = self.cursor - 1;
         if self.buf.as_bytes()[prev] < 0x80 {
             return prev;
@@ -400,7 +353,6 @@ impl LineBuffer {
         if next >= self.buf.len() {
             return self.buf.len();
         }
-        // ASCII fast path: next byte is always a char boundary
         if self.buf.as_bytes()[self.cursor] < 0x80 {
             return next;
         }
@@ -415,7 +367,6 @@ impl LineBuffer {
         if self.cursor == 0 {
             return None;
         }
-        // ASCII fast path
         let b = self.buf.as_bytes()[self.cursor - 1];
         if b < 0x80 {
             return Some(b as char);
@@ -427,7 +378,6 @@ impl LineBuffer {
         if self.cursor >= self.buf.len() {
             return None;
         }
-        // ASCII fast path
         let b = self.buf.as_bytes()[self.cursor];
         if b < 0x80 {
             return Some(b as char);
@@ -436,9 +386,6 @@ impl LineBuffer {
     }
 }
 
-/// Byte offset of the first char boundary in `line` whose display column is at
-/// least `col`, or the line length when the line is narrower. Vertical motion
-/// uses display columns because byte offsets can land inside a character.
 fn offset_at_column(line: &str, col: usize) -> usize {
     let mut width = 0;
     for (i, c) in line.char_indices() {
@@ -450,14 +397,10 @@ fn offset_at_column(line: &str, col: usize) -> usize {
     line.len()
 }
 
-/// Character drawn for `c`: controls become a visible placeholder so a pasted
-/// tab or escape never reaches the terminal as an instruction.
 pub fn display_char(c: char) -> char {
     if c.is_control() { '\u{FFFD}' } else { c }
 }
 
-/// Display width of a string in terminal columns. An emoji sequence joined by
-/// ZWJ draws as one glyph, so a character right after a joiner adds nothing.
 pub fn str_width(s: &str) -> usize {
     let mut width = 0;
     let mut after_joiner = false;
@@ -470,35 +413,29 @@ pub fn str_width(s: &str) -> usize {
     width
 }
 
-/// Display width of a character in terminal columns.
 pub fn char_width(c: char) -> usize {
     let cp = c as u32;
     if cp < 0x7F {
         return 1;
     }
-    // Controls are drawn as a one-column placeholder (see `display_char`).
     if c.is_control() {
         return 1;
     }
     if cp == 0xAD {
         return 0;
     }
-    // Zero-width characters
     if matches!(cp, 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064 | 0xFEFF) {
         return 0;
     }
-    // Variation selectors and emoji skin-tone modifiers attach to the
-    // preceding glyph.
     if matches!(cp, 0xFE00..=0xFE0F | 0x1F3FB..=0x1F3FF) {
         return 0;
     }
-    // Combining marks
     if matches!(cp,
-        0x0300..=0x036F   // Combining Diacritical Marks
-        | 0x1AB0..=0x1AFF // Combining Diacritical Marks Extended
-        | 0x1DC0..=0x1DFF // Combining Diacritical Marks Supplement
-        | 0x20D0..=0x20FF // Combining Marks for Symbols
-        | 0xFE20..=0xFE2F // Combining Half Marks
+        0x0300..=0x036F
+        | 0x1AB0..=0x1AFF
+        | 0x1DC0..=0x1DFF
+        | 0x20D0..=0x20FF
+        | 0xFE20..=0xFE2F
     ) {
         return 0;
     }
@@ -507,10 +444,10 @@ pub fn char_width(c: char) -> usize {
 
 fn is_wide(cp: u32) -> bool {
     matches!(cp,
-        0x1100..=0x115F   // Hangul Jamo
-        | 0x231A..=0x231B // Watch, Hourglass
-        | 0x2329..=0x232A // Angle brackets
-        | 0x23E9..=0x23F3 // Various symbols
+        0x1100..=0x115F
+        | 0x231A..=0x231B
+        | 0x2329..=0x232A
+        | 0x23E9..=0x23F3
         | 0x23F8..=0x23FA
         | 0x25FD..=0x25FE
         | 0x2614..=0x2615
@@ -555,34 +492,34 @@ fn is_wide(cp: u32) -> bool {
         | 0x2B1B..=0x2B1C
         | 0x2B50
         | 0x2B55
-        | 0x2E80..=0x303E  // CJK Radicals, Kangxi, Ideographic, CJK Symbols
-        | 0x3040..=0x33BF  // Hiragana, Katakana, Bopomofo, Hangul Compat, Kanbun
-        | 0x3400..=0x4DBF  // CJK Extension A
-        | 0x4E00..=0xA4CF  // CJK Unified, Yi
-        | 0xA960..=0xA97C  // Hangul Jamo Extended-A
-        | 0xAC00..=0xD7A3  // Hangul Syllables
-        | 0xF900..=0xFAFF  // CJK Compatibility Ideographs
-        | 0xFE10..=0xFE19  // Vertical Forms
-        | 0xFE30..=0xFE6B  // CJK Compatibility Forms
-        | 0xFF01..=0xFF60  // Fullwidth Forms
-        | 0xFFE0..=0xFFE6  // Fullwidth Signs
+        | 0x2E80..=0x303E
+        | 0x3040..=0x33BF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0xA4CF
+        | 0xA960..=0xA97C
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE10..=0xFE19
+        | 0xFE30..=0xFE6B
+        | 0xFF01..=0xFF60
+        | 0xFFE0..=0xFFE6
         | 0x1F004
         | 0x1F0CF
         | 0x1F170..=0x1F171
         | 0x1F17E..=0x1F17F
         | 0x1F18E
         | 0x1F191..=0x1F19A
-        | 0x1F1E0..=0x1F1FF // Regional Indicators (flags)
+        | 0x1F1E0..=0x1F1FF
         | 0x1F200..=0x1F202
         | 0x1F210..=0x1F23B
         | 0x1F240..=0x1F248
         | 0x1F250..=0x1F251
         | 0x1F260..=0x1F265
-        | 0x1F300..=0x1F9FF // Misc Symbols, Emoticons, Transport, etc.
+        | 0x1F300..=0x1F9FF
         | 0x1FA00..=0x1FA6F
         | 0x1FA70..=0x1FAFF
-        | 0x20000..=0x2FA1F // CJK Extension B-F + Compatibility
-        | 0x30000..=0x3134F // CJK Extension G
+        | 0x20000..=0x2FA1F
+        | 0x30000..=0x3134F
     )
 }
 
@@ -612,43 +549,37 @@ mod tests {
 
     #[test]
     fn char_widths() {
-        // ASCII
         assert_eq!(char_width('a'), 1);
         assert_eq!(char_width(' '), 1);
-        // Control
         assert_eq!(char_width('\0'), 1);
         assert_eq!(char_width('\x1b'), 1);
-        // Fullwidth
-        assert_eq!(char_width('｜'), 2); // U+FF5C fullwidth vertical bar
-        assert_eq!(char_width('Ａ'), 2); // U+FF21 fullwidth A
-        // CJK
+        assert_eq!(char_width('｜'), 2);
+        assert_eq!(char_width('Ａ'), 2);
         assert_eq!(char_width('漢'), 2);
-        assert_eq!(char_width('ア'), 2); // katakana
-        // Regular non-ASCII (Latin extended, etc.)
+        assert_eq!(char_width('ア'), 2);
         assert_eq!(char_width('é'), 1);
         assert_eq!(char_width('ñ'), 1);
-        // Combining marks
-        assert_eq!(char_width('\u{0301}'), 0); // combining acute accent
+        assert_eq!(char_width('\u{0301}'), 0);
     }
 
     #[test]
     fn str_widths() {
         assert_eq!(str_width("hello"), 5);
-        assert_eq!(str_width("a｜b"), 4); // 1 + 2 + 1
+        assert_eq!(str_width("a｜b"), 4);
         assert_eq!(str_width("漢字"), 4);
-        assert_eq!(str_width("café"), 4); // all width-1
+        assert_eq!(str_width("café"), 4);
     }
 
     #[test]
     fn display_with_fullwidth() {
         let mut lb = LineBuffer::new();
-        lb.set("a｜b"); // 'a'(1) + '｜'(2) + 'b'(1) = 4 columns
+        lb.set("a｜b");
         assert_eq!(lb.display_len(), 4);
-        assert_eq!(lb.display_cursor_pos(), 4); // cursor at end
-        lb.move_left(); // before 'b'
-        assert_eq!(lb.display_cursor_pos(), 3); // 1 + 2 = 3
-        lb.move_left(); // before '｜'
-        assert_eq!(lb.display_cursor_pos(), 1); // just 'a' = 1
+        assert_eq!(lb.display_cursor_pos(), 4);
+        lb.move_left();
+        assert_eq!(lb.display_cursor_pos(), 3);
+        lb.move_left();
+        assert_eq!(lb.display_cursor_pos(), 1);
     }
 
     #[test]
@@ -667,10 +598,8 @@ mod tests {
         lb.set_with_cursor("hello world", 5);
         assert_eq!(lb.text(), "hello world");
         assert_eq!(lb.cursor(), 5);
-        // Clamp to end
         lb.set_with_cursor("hi", 100);
         assert_eq!(lb.cursor(), 2);
-        // Position 0
         lb.set_with_cursor("test", 0);
         assert_eq!(lb.cursor(), 0);
     }
@@ -719,7 +648,6 @@ mod tests {
         lb.set("hello world");
         lb.move_home();
         lb.move_word_right();
-        // move_word_right skips non-ws then ws, cursor is at 'w' (pos 6)
         lb.kill_to_start();
         assert_eq!(lb.text(), "world");
         lb.move_end();

@@ -23,8 +23,6 @@ pub fn take_stopped_job() -> Option<StoppedJob> {
     STOPPED_JOB.with(|cell| cell.borrow_mut().take())
 }
 
-/// Look up a variable in the store-derived child environment the handler
-/// receives. Returns `None` when unset or not exported.
 fn env_pair_value(
     env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)],
     name: &str,
@@ -34,8 +32,6 @@ fn env_pair_value(
         .find_map(|(k, v)| (k.as_bytes() == name.as_bytes()).then(|| v.to_os_string()))
 }
 
-/// Build the external handler for epsh. Handles ish-specific builtins
-/// and fork/exec with job control for external commands.
 pub fn make_external_handler(
     shell_pid: i32,
     history_log: std::path::PathBuf,
@@ -87,8 +83,6 @@ pub fn make_external_handler(
                         eprintln!("ish: history: storage subcommands require a standalone command");
                         return Ok(epsh::error::ExitStatus::FAILURE);
                     }
-                    // Open the session's history log independently so forked
-                    // readers do not share file offsets or lock ownership.
                     match history::render_history_log(&history_log) {
                         Ok(content) => {
                             print!("{content}");
@@ -108,8 +102,6 @@ pub fn make_external_handler(
     )
 }
 
-/// Fork/exec an external command with job control when running in the
-/// shell process itself; pipeline children wait without terminal handoff.
 fn spawn_external(
     args: &[epsh::shell_bytes::ShellBytes],
     env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)],
@@ -120,17 +112,10 @@ fn spawn_external(
 
     let mut cmd = std::process::Command::new(args[0].to_os_string());
     cmd.args(args[1..].iter().map(|arg| arg.to_os_string()));
-    // `cd` inside a list changes epsh's working directory, not the
-    // process's; run the child where the shell is.
     if let Some(cwd) = epsh::eval::external_command_cwd() {
         cmd.current_dir(cwd);
     }
 
-    // Store-authoritative child environment: the child inherits
-    // nothing from ish's process environment. Its env comes entirely
-    // from epsh's variable store (exported vars, inherited
-    // non-shell-name entries) plus any prefix assignments, so
-    // `set`/`export`/`unset` are reflected exactly in children.
     cmd.env_clear();
     for (k, v) in env_pairs {
         cmd.env(k.to_os_string(), v.to_os_string());
@@ -162,10 +147,6 @@ fn spawn_external(
                     eprintln!("ish: cannot hand the terminal to {name}: {error}");
                 }
 
-                // Wait with WUNTRACED for job control. The shell tracks one
-                // suspended job; while that slot is taken, a second stop is
-                // refused by continuing the new job, since it could never be
-                // resumed with `fg`.
                 let waited = loop {
                     let waited = crate::job::retry_interrupted(|| {
                         rustix::process::waitpid(
@@ -253,7 +234,6 @@ fn spawn_external(
                     Ok(epsh::error::ExitStatus::FAILURE)
                 }
             } else {
-                // Pipeline child: just wait normally
                 match child.wait() {
                     Ok(s) => Ok(epsh::error::ExitStatus::from(s.code().unwrap_or(128))),
                     Err(e) => Err(epsh::error::ShellError::Io(e)),
@@ -262,9 +242,6 @@ fn spawn_external(
         }
         Err(e) => {
             if let Some(code) = e.raw_os_error() {
-                // Match epsh's default exec error reporting: an executable
-                // script whose interpreter is broken surfaces as a bare
-                // ENOTDIR/ENOENT/EACCES.
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let path_env = env_pair_value(env_pairs, "PATH")
                     .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());

@@ -61,8 +61,6 @@ fn is_executable(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Parse a command line into shell words only.
-/// Returns `None` if the line contains operators, redirections, or lexer errors.
 pub(crate) fn lex_simple_command_words(line: &str) -> Option<Vec<epsh::ast::Word>> {
     let mut lex = epsh::lexer::Lexer::new(line);
     lex.recognize_reserved = false;

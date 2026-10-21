@@ -53,13 +53,8 @@ impl RawMode {
         raw.special_codes[rustix::termios::SpecialCodeIndex::VMIN] = 0;
         raw.special_codes[rustix::termios::SpecialCodeIndex::VTIME] = 0;
 
-        // SAFETY: tcsetattr with TCSADRAIN drains output, then applies settings.
-        // Preserves pending input so typeahead typed during child execution
-        // is available to read_line.
         rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Drain, &raw)?;
 
-        // Enable bracketed paste mode so the terminal wraps pastes in
-        // \x1b[200~ ... \x1b[201~, letting us distinguish paste from typing.
         let _ = io::stdout().write_all(b"\x1b[?2004h");
         let _ = io::stdout().flush();
 
@@ -69,11 +64,8 @@ impl RawMode {
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        // Disable bracketed paste mode before restoring cooked terminal.
         let _ = io::stdout().write_all(b"\x1b[?2004l");
         let _ = io::stdout().flush();
-        // SAFETY: Restores saved termios. TCSANOW avoids blocking if output
-        // hasn't drained (e.g. PTY). orig was captured in enable().
         let stdin = stdin();
         let _ =
             rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Now, &self.orig);
@@ -121,7 +113,6 @@ pub fn term_size() -> (u16, u16) {
     }
 }
 
-/// Save original termios without entering raw mode (for child process restoration).
 pub fn save_termios() -> io::Result<Termios> {
     let stdin = stdin();
     Ok(rustix::termios::tcgetattr(stdin)?)
@@ -167,7 +158,6 @@ impl TermWriter {
     }
 
     pub fn clear_screen(&mut self) {
-        // ESC[H moves cursor home, ESC[2J clears visible screen (not scrollback)
         self.write_str("\x1b[H\x1b[2J");
     }
 
@@ -217,8 +207,6 @@ impl TermWriter {
         self.write_str("\x1b8");
     }
 
-    /// Write CSI sequence `\x1b[{n}{suffix}` directly into the buffer.
-    /// Inline u16→ASCII avoids format!() heap allocation on every cursor move.
     fn push_csi(&mut self, n: u16, suffix: u8) {
         self.buf.extend_from_slice(b"\x1b[");
         let mut tmp = [0u8; 5];

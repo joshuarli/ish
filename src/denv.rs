@@ -1,9 +1,3 @@
-//! Native .envrc/.env loading for ish.
-//!
-//! ish owns discovery, trust, active-state restore, and prompt flags directly.
-//! `.env` is parsed in Rust. Trusted `.envrc` files are evaluated via `bash`
-//! when line 1 mentions `bash`, otherwise via an embedded epsh shell, and then
-//! diffed against the current environment.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -23,16 +17,10 @@ use std::time::{Duration, Instant};
 
 mod sha256;
 
-/// Child-environment variable carrying the `.envrc` bytes that were hashed, so
-/// bash evaluates exactly what was trusted rather than re-reading the path.
 const ENVRC_SOURCE_VAR: &str = "__DENV_ENVRC_SOURCE";
 
-/// Prefix of child-environment variables carrying `.env` values, so values
-/// never become shell script text.
 const DOTENV_VALUE_VAR_PREFIX: &str = "__DENV_DOT_";
 
-/// Upper bound for one bash `.envrc` evaluation. The child holds the terminal
-/// while ish waits, so a hung `.envrc` must fail loudly instead of wedging cd.
 const ENVRC_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
 const ACTIVE_TEMP_NAME_ATTEMPTS: u64 = 128;
 const ACTIVE_FORMAT_HEADER: &str = "DENV-ACTIVE 1";
@@ -44,7 +32,6 @@ static NEXT_ACTIVE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 const BASH_STDLIB: &str = include_str!("denv_stdlib.sh");
 
-/// A single environment variable change applied by denv.
 pub enum EnvChange {
     Set(String, String),
     Unset(String),
@@ -138,7 +125,6 @@ enum EnvRcInterpreter {
     Epsh,
 }
 
-/// Initialize ish's native denv state vars in epsh's variable store.
 pub fn init(epsh: &mut epsh::eval::Shell) -> Session {
     let data_dir = data_dir(epsh);
     let record_id = new_record_id().map_err(|err| format!("cannot name the active record: {err}"));
@@ -161,17 +147,14 @@ pub fn on_exit(session: &Session) {
     }
 }
 
-/// Called once at shell startup.
 pub fn on_startup(session: &Session, epsh: &epsh::eval::Shell) -> Vec<EnvChange> {
     refresh(session, false, epsh).unwrap_or_else(report_error)
 }
 
-/// Called after any directory change.
 pub fn on_cd(session: &Session, epsh: &epsh::eval::Shell) -> Vec<EnvChange> {
     refresh(session, false, epsh).unwrap_or_else(report_error)
 }
 
-/// Handle `denv allow|deny|reload`.
 pub fn command(session: &Session, args: &[String], epsh: &epsh::eval::Shell) -> CommandOutcome {
     match args.first().map(|s| s.as_str()) {
         Some("allow") => match allow_current_dir(session, epsh) {
@@ -521,8 +504,6 @@ fn stat_regular_file_mtime(path: &Path) -> Option<u64> {
         .then_some(st.st_mtime as u64)
 }
 
-/// A `.envrc` or `.env` read once, with the canonical path it was read from
-/// and the hash of exactly those bytes.
 struct TrustCandidate {
     path: PathBuf,
     bytes: Vec<u8>,
@@ -851,8 +832,6 @@ fn clear_active(data_dir: &Path, record_id: &str) -> Result<(), String> {
     }
 }
 
-/// Keys the `.env` file may never set: the trust store location and denv's own
-/// bookkeeping.
 fn is_reserved_dotenv_key(key: &str) -> bool {
     key == "DENV_DATA_DIR" || key.starts_with("__DENV_")
 }
@@ -865,8 +844,6 @@ fn is_valid_env_key(key: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// Parse `.env` bytes, skipping (with a warning) entries that cannot be set
-/// safely: malformed keys, NUL in values, and reserved names.
 fn load_dotenv_entries(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
     let content = std::str::from_utf8(bytes).map_err(|e| format!("read .env: {e}"))?;
     let mut entries = Vec::new();
@@ -1116,7 +1093,6 @@ fn eval_env_bash(
     env_pairs: &[(OsString, OsString)],
     timeout: Duration,
 ) -> Result<EnvDiff, String> {
-    // An environment variable cannot carry NUL, and bash would truncate there.
     if source.contains(&0) {
         return Err(".envrc contains a NUL byte".to_string());
     }
@@ -1141,13 +1117,11 @@ fn eval_env_bash(
     let mut script = String::with_capacity(BASH_STDLIB.len() + 256);
     script.push_str(BASH_STDLIB);
     script.push('\n');
-    // Keep the source out of the exported environment seen by the .envrc.
     script.push_str("__denv_src=$");
     script.push_str(ENVRC_SOURCE_VAR);
     script.push_str("\nunset ");
     script.push_str(ENVRC_SOURCE_VAR);
     script.push_str("\nenv -0 >&3\neval \"$__denv_src\"\nunset __denv_src\n");
-    // Keys were validated as identifiers; values travel through the environment.
     for (i, (key, _)) in dotenv_entries.iter().enumerate() {
         writeln!(script, "export {key}=\"${DOTENV_VALUE_VAR_PREFIX}{i}\"").unwrap();
     }
@@ -1332,7 +1306,6 @@ fn remap_snapshot_writers(
 }
 
 fn dup_snapshot_writer_to(source: &OwnedFd, target: RawFd) -> io::Result<()> {
-    // rustix::io::dup2 requires an owned target, but these child targets may be closed.
     // SAFETY: dup2 accepts a closed target and replaces it with the owned source descriptor.
     let result = unsafe { libc::dup2(source.as_raw_fd(), target) };
     if result == -1 {
@@ -2612,8 +2585,6 @@ mod tests {
         let data = tmp.path().join("data");
         let file = tmp.path().join(".env");
         std::fs::write(&file, "A=1\n").unwrap();
-        // The process environment is shared with tests that rewrite it, so
-        // the allow directory is passed explicitly.
         let allow = data.join("allow");
 
         let before = read_trusted_candidate(&file).unwrap();

@@ -68,11 +68,3 @@ Next: 45
 - **Fix with:** none
 - **Effort:** S (hours)
 
-### ISH-44 · P3 · About 900 comments contradict the repo's no-comment contract and excuse code smells
-
-- **Area:** Navigability
-- **Where:** `rg '^\s*//'` counts: `src/main.rs` 166, `src/render.rs` 63, `src/line.rs` 72, `src/input.rs` 41, `src/dispatch.rs` 29, `src/signal.rs` 28, `crates/epsh/src/parser.rs` 68, `crates/epsh/src/eval.rs` 57, `crates/epsh/src/lexer.rs` 54, `src/history/store.rs:76-77,152-153,182-183,317,344,370-371`, `src/denv.rs:1049,1074,1080,2460`
-- **Problem:** Counts include allowed SAFETY and API comments, so the violating share was not separated. Worst groups: false SAFETY claims (`src/signal.rs:4-8`, `:22-24` say single-threaded; `src/term.rs:42-45` is a SAFETY comment on a safe call); design rationale that belongs in types or tests (`src/main.rs:20-22`, `:2674`, `:2713`, `src/history/store.rs`); epsh comments citing line numbers of an external dash tree (`crates/epsh/src/eval.rs:1389-1393`, `crates/epsh/src/lexer.rs:700`, `:826`); and narration. `crates/fdu-delete` and `crates/ish-fs` are clean.
-- **Recommendation:** Delete each group and fix the code it excused, starting with the false SAFETY claims. Move behaviour rules into test names.
-- **Fix with:** comment-cleanup
-- **Effort:** M (days)

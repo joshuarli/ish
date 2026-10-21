@@ -11,8 +11,6 @@ static PENDING_TERMINATION: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(0);
 static FOREGROUND_SIGNALS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Initialize signal handling: create self-pipe, install handlers.
-/// Returns the read-end fd for polling.
 pub fn init() -> RawFd {
     let (read_fd, write_fd) =
         sys::pipe_nonblock_cloexec().expect("pipe() failed for signal self-pipe");
@@ -21,8 +19,6 @@ pub fn init() -> RawFd {
     PIPE_WRITE.store(write_fd, std::sync::atomic::Ordering::Release);
 
     install_handler(rustix::process::Signal::WINCH);
-    // TERM and HUP reach the prompt as events, so the shell restores the
-    // terminal and ends any suspended job before exiting.
     SHELL_PID.store(
         rustix::process::getpid().as_raw_pid(),
         std::sync::atomic::Ordering::Relaxed,
@@ -30,21 +26,16 @@ pub fn init() -> RawFd {
     install_handler(rustix::process::Signal::TERM);
     install_handler(rustix::process::Signal::HUP);
 
-    // Shell ignores these — it must not be suspended/stopped
     ignore(rustix::process::Signal::TSTP);
     ignore(rustix::process::Signal::TTOU);
     ignore(rustix::process::Signal::TTIN);
     ignore(rustix::process::Signal::QUIT);
     ignore(rustix::process::Signal::PIPE);
-    // SIGINT: we're in raw mode (ISIG off) at the prompt so we get 0x03 as a byte.
-    // During child exec, the child's pgid is foreground so SIGINT goes there.
-    // Ignore SIGINT for the shell itself as a safety net.
     ignore(rustix::process::Signal::INT);
 
     read_fd
 }
 
-/// Restore default signal dispositions — called in child after fork, before exec.
 pub fn restore_defaults() {
     for &sig in &[
         rustix::process::Signal::INT,
@@ -72,7 +63,6 @@ fn set_default(sig: rustix::process::Signal) {
     }
 }
 
-/// Read one signal byte from the self-pipe. Returns the signal number or None.
 pub fn read_signal() -> Option<i32> {
     for (sig, bit) in [
         (rustix::process::Signal::INT.as_raw(), 1usize),
@@ -181,9 +171,6 @@ pub fn take_pending_termination() -> Option<i32> {
 fn install_handler(sig: rustix::process::Signal) {
     #[cfg(target_os = "linux")]
     unsafe {
-        // rustix's kernel_sigaction trampoline segfaults when a signal is
-        // delivered to a statically linked musl binary, so handlers are
-        // installed through libc::signal instead.
         let _ = libc::signal(sig.as_raw(), handler as *const () as usize);
     }
 
@@ -233,10 +220,6 @@ unsafe extern "C" fn handler(sig: i32) {
 }
 
 unsafe fn deliver(sig: i32) {
-    // A process forked from the shell without exec (a pipeline stage) inherits
-    // this handler. TERM and HUP must still end it: restore the default
-    // action and re-raise instead of queueing the signal for the shell.
-    // getpid, signal, and raise are async-signal-safe.
     if (sig == libc::SIGTERM || sig == libc::SIGHUP)
         && unsafe { libc::getpid() } != SHELL_PID.load(std::sync::atomic::Ordering::Relaxed)
     {

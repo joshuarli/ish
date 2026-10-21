@@ -1,14 +1,3 @@
-//! Decide how one accepted input line runs.
-//!
-//! The line is parsed once with epsh. The parsed program is then checked
-//! against the syntax ish documents: pipelines, `&&`/`||` lists, `;` lists,
-//! redirections, quoting, tilde and parameter expansion, command substitution,
-//! and globbing. epsh's AST can express much more (background jobs, compound
-//! commands, functions, `source`, `eval`); those are refused here instead of
-//! being run. The check is a flat walk over epsh's own AST.
-//!
-//! The same parse decides whether a shell-owned builtin is the whole line, so
-//! `z nothing; echo X` is a refusal rather than `z` receiving `nothing;`.
 
 use crate::builtin::{self, Exec};
 use epsh::ast::{Command, HereDocBody, Program, RedirKind, Word, WordPart};
@@ -16,20 +5,15 @@ use epsh::parser::Parser;
 use epsh::shell_bytes::ShellBytes;
 use std::fmt;
 
-/// How an accepted input line will run.
 #[derive(Debug)]
 pub enum Plan {
-    /// Run the parsed program through epsh.
     Epsh(Program),
-    /// A shell-owned builtin that is the entire line. `args` are the
-    /// unexpanded shell words after the command name.
     Builtin {
         name: &'static str,
         args: Vec<Word>,
     },
 }
 
-/// Why a line was refused before running anything.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Rejection {
     Syntax(String),
@@ -84,10 +68,6 @@ fn refused_command_name(
         .map(|spec| outside_line(spec.name))
 }
 
-/// Refuse an expanded command name that ish cannot route safely.
-///
-/// `eval`, `source`, `.`, and InShell builtins are rejected. Other names,
-/// including non-UTF-8 names, are allowed.
 pub fn check_expanded_command(target: &ShellBytes) -> Result<(), Rejection> {
     let Some(name) = target.as_utf8_str() else {
         return Ok(());
@@ -98,10 +78,6 @@ pub fn check_expanded_command(target: &ShellBytes) -> Result<(), Rejection> {
     }
 }
 
-/// Parse `line` and decide how it runs, or refuse it.
-///
-/// `${NAME}` without an operator parses to the same tree as `$NAME`, so it is
-/// accepted; operators such as `${NAME:-x}` and `${#NAME}` are refused.
 pub fn plan(line: &str) -> Result<Plan, Rejection> {
     let program = Parser::new(line)
         .parse()
@@ -202,7 +178,6 @@ fn check_parts(parts: &[WordPart]) -> Result<(), Rejection> {
         match part {
             WordPart::Literal(_) | WordPart::SingleQuoted(_) | WordPart::Tilde(_) => {}
             WordPart::DoubleQuoted(inner) | WordPart::Arith(inner) => check_parts(inner)?,
-            // A bad substitution is reported by epsh when it expands.
             WordPart::Param(param) => {
                 if !matches!(
                     param.op,
@@ -217,8 +192,6 @@ fn check_parts(parts: &[WordPart]) -> Result<(), Rejection> {
     Ok(())
 }
 
-/// The text of a word made only of literal and quoted-literal parts, or
-/// `None` when any part expands.
 fn static_text(word: &Word) -> Option<String> {
     fn push(parts: &[WordPart], out: &mut String) -> Option<()> {
         for part in parts {
@@ -322,8 +295,6 @@ mod tests {
         ] {
             assert!(matches!(plan(line), Ok(Plan::Epsh(_))), "{line:?}");
         }
-        // Native builtins are not intercepted when alone: they run through
-        // the external handler like any command.
         assert!(matches!(plan("l -l"), Ok(Plan::Epsh(_))));
     }
 

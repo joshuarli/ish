@@ -5,7 +5,6 @@ use crate::term::TermWriter;
 use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-/// Geometry for a rendered region, relative to the region's top row.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RenderedRegion {
     pub anchored: bool,
@@ -22,12 +21,6 @@ impl RenderedRegion {
         tw.clear_to_end_of_screen();
     }
 
-    /// Clear from the cursor position currently left by the renderer.
-    ///
-    /// This is safer than restoring the DEC saved cursor when leaving a
-    /// pager: terminal scrolling can reflow the live cursor and the saved
-    /// anchor differently, while the pager's relative cursor row remains
-    /// known.
     pub fn clear_from_cursor(self, tw: &mut TermWriter) {
         if !self.anchored {
             return;
@@ -123,9 +116,6 @@ fn restore_cursor_smart(tw: &mut TermWriter, region: RenderedRegion, rows_up_fro
     }
 }
 
-/// Write user-controlled text with control characters replaced by a visible
-/// placeholder. Terminals would otherwise execute them (or draw nothing), and
-/// the width math counts each as one column.
 fn write_text(tw: &mut TermWriter, s: &str) {
     if !s.chars().any(char::is_control) {
         tw.write_str(s);
@@ -159,7 +149,7 @@ fn write_history_row(
         }
         if !is_selected {
             if is_match && !in_match {
-                tw.write_str("\x1b[1;33m"); // bold yellow
+                tw.write_str("\x1b[1;33m");
                 in_match = true;
             } else if !is_match && in_match {
                 tw.write_str("\x1b[0m");
@@ -271,12 +261,9 @@ struct CompletionGridLayout {
     col_widths: [usize; 6],
 }
 
-/// Optional display hints for render_line.
 #[derive(Default)]
 pub struct RenderOpts<'a> {
-    /// Color the command word: Some(true) = green, Some(false) = red, None = no color.
     pub cmd_color: Option<bool>,
-    /// Autosuggestion ghost text to show after the cursor.
     pub suggestion: &'a str,
 }
 
@@ -444,9 +431,6 @@ fn layout_completion_grid(state: &CompletionState) -> CompletionGridLayout {
     }
 }
 
-/// Dump the computed prompt geometry without writing terminal control sequences.
-/// This is kept next to the layout functions so diagnostics describe the same
-/// values that the renderer uses.
 pub fn debug_dump_prompt_layout(
     out: &mut String,
     prompt_display_len: usize,
@@ -460,9 +444,6 @@ pub fn debug_dump_prompt_layout(
         let _ = writeln!(out, "prompt_layout: {layout:?}");
         return;
     }
-    // Reveal the intermediate arithmetic so a single-line layout bug can be
-    // traced without re-running the terminal. These are exactly the values
-    // `layout_single_line_prompt` and `render_line` derive from the same inputs.
     let before_cursor = prompt_display_len + line.display_cursor_pos();
     let full = prompt_display_len + line.display_len() + suggestion_display_len;
     let layout = layout_single_line_prompt(prompt_display_len, line, suggestion_display_len, cols);
@@ -474,29 +455,22 @@ pub fn debug_dump_prompt_layout(
     let _ = writeln!(out, "prompt_layout: {layout:?}");
 }
 
-/// Dump the computed pager geometry used by history and directory picker.
 pub fn debug_dump_pager_layout(out: &mut String, input: PagerInput) {
     let layout = layout_pager(input);
 
     let _ = writeln!(out, "pager_layout: {layout:?}");
 }
 
-/// Dump the computed completion grid geometry.
 pub fn debug_dump_completion_layout(out: &mut String, state: &CompletionState) {
     let layout = layout_completion_grid(state);
     let _ = writeln!(out, "completion_grid_layout: {layout:?}");
 }
 
-/// Dump cached history-search layout keys used to decide whether a row redraw is safe.
 pub fn debug_dump_history_cache(out: &mut String, cache: &HistoryPagerCache) {
     let _ = writeln!(out, "history_cache.header: {:?}", cache.header);
     let _ = writeln!(out, "history_cache.rows: {:?}", cache.rows);
 }
 
-/// Render the prompt + line buffer. Positions cursor correctly.
-/// `prev` is the geometry from the previous render of this region. It lets us
-/// move back to the top before clearing.
-/// Returns prompt geometry so completion rendering can restore cursor.
 pub fn render_line(
     tw: &mut TermWriter,
     prompt: &str,
@@ -509,7 +483,6 @@ pub fn render_line(
     let text = line.text();
     let cols = (term_cols as usize).max(1);
 
-    // Multiline path: buffer contains explicit newlines
     if text.contains('\n') {
         return render_line_multiline(tw, prompt, prompt_display_len, line, cols, prev, opts);
     }
@@ -524,7 +497,6 @@ pub fn render_line(
 
     tw.write_str(prompt);
 
-    // Write line text with optional command-word coloring
     match opts.cmd_color {
         Some(valid) => {
             let color = if valid { "\x1b[32m" } else { "\x1b[31m" };
@@ -537,7 +509,6 @@ pub fn render_line(
         None => write_text(tw, text),
     }
 
-    // Autosuggestion ghost text (dim gray, after line content)
     if !opts.suggestion.is_empty() {
         tw.write_str("\x1b[38;5;8m");
         write_text(tw, opts.suggestion);
@@ -557,8 +528,6 @@ pub fn render_line(
     }
 }
 
-/// Render a multiline buffer (contains `\n`). First line gets the main prompt,
-/// subsequent lines get a continuation prompt "  ".
 fn render_line_multiline(
     tw: &mut TermWriter,
     prompt: &str,
@@ -577,7 +546,6 @@ fn render_line_multiline(
         if i == 0 {
             tw.write_str(prompt);
 
-            // Command-word coloring on first line
             match opts.cmd_color {
                 Some(valid) => {
                     let color = if valid { "\x1b[32m" } else { "\x1b[31m" };
@@ -611,9 +579,6 @@ fn render_line_multiline(
     }
 }
 
-/// Render the completion grid below the current line.
-/// `initial`: true for first render (adds newline), false for repaint.
-/// Cursor should be on the prompt line. Leaves cursor on the prompt line.
 pub fn render_completions(
     tw: &mut TermWriter,
     state: &CompletionState,
@@ -664,8 +629,6 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, layout: &CompletionGr
         let row = layout.scroll_start + vr;
         tw.carriage_return();
         tw.clear_to_end_of_line();
-        // Avoid writing into the terminal's last column: exact-edge writes can
-        // leave the cursor in a terminal-dependent pending-wrap state.
         let mut remaining_width = state.term_cols.saturating_sub(1) as usize;
 
         for (col, &col_w) in layout.col_widths[..state.cols].iter().enumerate() {
@@ -677,10 +640,9 @@ fn draw_grid(tw: &mut TermWriter, state: &CompletionState, layout: &CompletionGr
             let is_selected = idx == state.selected;
 
             if is_selected {
-                tw.write_str("\x1b[7m"); // reverse video
+                tw.write_str("\x1b[7m");
             }
 
-            // Color: symlink=cyan, dir=blue, exec=green, host=magenta
             if entry.is_host() {
                 tw.write_str("\x1b[35m");
             } else if entry.is_link() {
@@ -765,7 +727,6 @@ fn write_completion_name(
     written
 }
 
-/// Render the Ctrl+R history search pager.
 #[allow(clippy::too_many_arguments)]
 pub fn render_history_pager(
     tw: &mut TermWriter,
@@ -845,7 +806,7 @@ pub fn render_history_pager_cached(
             tw.carriage_return();
             tw.clear_to_end_of_line();
             if row_key.selected {
-                tw.write_str("\x1b[7m"); // reverse video
+                tw.write_str("\x1b[7m");
             }
             let text = history.display(m.entry_idx);
             write_history_row(tw, &text, m, layout.max_width, row_key.selected);
@@ -855,8 +816,6 @@ pub fn render_history_pager_cached(
             tw.clear_to_end_of_line();
             cache.rows[i] = row_key;
         }
-        // Row diffs leave the terminal cursor on the last changed row, not at
-        // the pager's bottom edge, so restore from the saved anchor.
         restore_cursor_from_anchor(tw, layout.region);
         tw.show_cursor();
         return RenderedRegion {
@@ -867,7 +826,7 @@ pub fn render_history_pager_cached(
 
     begin_region_render(tw, prev, layout.region);
 
-    tw.write_str("\x1b[1m"); // bold
+    tw.write_str("\x1b[1m");
     tw.write_str(prefix);
     tw.write_str("\x1b[0m");
     write_text(tw, query);
@@ -892,7 +851,7 @@ pub fn render_history_pager_cached(
 
         let row_key = history_row_key(m, abs_idx == selected);
         if row_key.selected {
-            tw.write_str("\x1b[7m"); // reverse video
+            tw.write_str("\x1b[7m");
         }
 
         let text = history.display(m.entry_idx);
@@ -907,10 +866,8 @@ pub fn render_history_pager_cached(
         cache.rows.push(row_key);
     }
 
-    // Clear remaining lines
     tw.clear_to_end_of_screen();
 
-    // Position cursor in search field
     restore_cursor_from_end(tw, layout.rows_up_from_end, layout.region.cursor_col);
     tw.show_cursor();
     cache.header = Some(header_key);
@@ -921,7 +878,6 @@ pub fn render_history_pager_cached(
     }
 }
 
-/// Render the directory picker pager.
 pub fn render_dir_picker(
     tw: &mut TermWriter,
     entries: &[String],
@@ -1117,10 +1073,8 @@ mod tests {
         }
     }
 
-    // When total display width is NOT a multiple of cols, no force-wrap needed.
     #[test]
     fn prompt_info_no_wrap() {
-        // "$ " (2) + "hi" (2) = 4 in 10-col terminal → row 0
         let (info, buf) = render_simple("$ ", "hi", 10);
         assert_eq!(info.painted_rows, 1);
         assert_eq!(info.cursor_row, 0);
@@ -1131,56 +1085,43 @@ mod tests {
         );
     }
 
-    // When total display width wraps but doesn't land on exact boundary.
     #[test]
     fn prompt_info_partial_wrap() {
-        // "$ " (2) + 9 chars = 11 in 10-col terminal → rows 0-1
         let (info, _) = render_simple("$ ", "123456789", 10);
         assert_eq!(info.painted_rows, 2);
         assert_eq!(info.cursor_row, 1);
         assert_eq!(info.cursor_col, 1);
     }
 
-    // Exact multiple of cols → force-wrap triggers, painted_rows accounts for it.
     #[test]
     fn prompt_info_exact_boundary() {
-        // "$ " (2) + "12345678" (8) = 10 in 10-col terminal → fills row 0 exactly
         let (info, buf) = render_simple("$ ", "12345678", 10);
-        // Force-wrap adds an extra row for the cursor
         assert_eq!(info.painted_rows, 2);
         assert_eq!(info.cursor_row, 1);
         assert_eq!(info.cursor_col, 0);
         assert!(buf.windows(2).any(|w| w == b" \r"), "should force-wrap");
     }
 
-    // Exact multiple with suggestion — cursor in the middle, not at pending-wrap.
     #[test]
     fn prompt_info_exact_boundary_with_suggestion() {
-        // "$ " (2) + "ab" (2) = 4 before cursor; + suggestion "123456" (6) → 10 total
         let (info, buf) = render_with_suggestion("$ ", "ab", "123456", 10);
         assert_eq!(info.painted_rows, 2);
-        // Cursor at position 4 → row 0, col 4
         assert_eq!(info.cursor_row, 0);
         assert_eq!(info.cursor_col, 4);
         assert!(buf.windows(2).any(|w| w == b" \r"), "should force-wrap");
     }
 
-    // Two full rows (2 * cols) — force-wrap triggers.
     #[test]
     fn prompt_info_two_full_rows() {
-        // "$ " (2) + 18 chars = 20, cols = 10 → 2 full rows
         let (info, buf) = render_simple("$ ", "abcdefghijklmnopqr", 10);
-        assert_eq!(info.painted_rows, 3); // 2 content rows + 1 cursor row from force-wrap
+        assert_eq!(info.painted_rows, 3);
         assert_eq!(info.cursor_row, 2);
         assert_eq!(info.cursor_col, 0);
         assert!(buf.windows(2).any(|w| w == b" \r"), "should force-wrap");
     }
 
-    // Multiline buffer with last segment filling exact boundary.
     #[test]
     fn multiline_exact_boundary() {
-        // First segment: "$ " (2) + "ab" (2) = 4, then newline
-        // Second segment: "  " (2) + "12345678" (8) = 10 fills cols exactly
         let mut tw = TermWriter::new();
         let mut line = LineBuffer::new();
         for c in "ab\n12345678".chars() {
@@ -1196,13 +1137,10 @@ mod tests {
             &RenderOpts::default(),
         );
         let buf = tw.as_bytes();
-        // Row 0: "$ ab" (4 cols), row 1: "  12345678" (10 cols, exact boundary)
-        // Force-wrap adds row 2 for the cursor
         assert_eq!(info.painted_rows, 3);
         assert!(buf.windows(2).any(|w| w == b" \r"), "should force-wrap");
     }
 
-    // Multiline buffer where last segment does NOT hit exact boundary → no force-wrap.
     #[test]
     fn multiline_no_force_wrap() {
         let mut tw = TermWriter::new();
@@ -1220,7 +1158,6 @@ mod tests {
             &RenderOpts::default(),
         );
         let buf = tw.as_bytes();
-        // Row 0: "$ ab" (4), row 1: "  1234567" (9) — no exact boundary
         assert_eq!(info.painted_rows, 2);
         assert!(
             !buf.windows(2).any(|w| w == b" \r"),

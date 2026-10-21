@@ -24,15 +24,9 @@ struct Shell {
     cols: u16,
     history: history::History,
     prompt: prompt::Prompt,
-    /// Reusable buffer for rendered prompt string — avoids allocation per render.
     prompt_buf: String,
-    /// Reusable completion arena — avoids allocation per tab press.
     completion_buffer: complete::Completions,
-    /// Reusable fuzzy match buffer — avoids allocation per Ctrl+R keystroke.
     history_match_buffer: Vec<history::FuzzyMatch>,
-    /// The previous evaluated command may have left the terminal mid-line.
-    /// The next prompt must begin at a fresh row so its layout starts from a
-    /// known column, even when command output omitted its final newline.
     prompt_needs_line_start: bool,
     job: Option<Job>,
     path_cache: path::PathCache,
@@ -51,14 +45,13 @@ struct Shell {
 enum ReadResult {
     Line(String),
     Exit,
-    /// SIGTERM or SIGHUP arrived through the self-pipe.
     Terminated(i32),
     Empty,
 }
 
 struct Args {
-    config: Option<OsString>, // -c <path>: custom config file
-    no_config: bool,          // --no-config: skip config loading
+    config: Option<OsString>,
+    no_config: bool,
 }
 
 fn parse_args() -> Args {
@@ -116,19 +109,14 @@ fn ish_command_policy(target: &epsh::shell_bytes::ShellBytes) -> Option<String> 
 fn main() {
     let cli = parse_args();
 
-    // Set $SHELL to ish binary path
     if let Ok(exe) = std::env::current_exe() {
         ish::shell_setenv_os("SHELL", exe.as_os_str());
     }
 
-    // Set $PWD — parent process (terminal emulator) may not provide it
     if let Ok(cwd) = std::env::current_dir() {
         ish::shell_setenv_os("PWD", cwd.as_os_str());
     }
 
-    // Initialize signals before taking terminal control. When launched through
-    // macOS login(1), the shell starts in a background process group behind the
-    // login process; tcsetpgrp from that state raises SIGTTOU unless ignored.
     let signal_fd = signal::init();
     term::install_panic_hook();
 
@@ -222,7 +210,6 @@ fn main() {
         .epsh
         .set_command_policy(Box::new(ish_command_policy));
 
-    // Main loop
     let mut exit_code = 0;
     loop {
         if let Some(sig) = signal::take_pending_termination() {
@@ -243,7 +230,6 @@ fn main() {
                 if line.trim().is_empty() {
                     continue;
                 }
-                // A second `exit` confirms the warning the first one printed.
                 if line.split_whitespace().next() != Some("exit") {
                     shell.exit_warned = false;
                 }
@@ -255,22 +241,16 @@ fn main() {
                     store_path_env(&shell.epsh),
                 );
 
-                // Expand aliases before recording in history so "g status"
-                // becomes "git status" — matches what actually runs.
-                // Resolve relative cd paths to absolute so `z` can use them.
                 let history_line =
                     resolve_cd_for_history(&expand_aliases_for_history(&line, &shell.aliases));
                 let history_cwd = shell.epsh.cwd().to_path_buf();
 
-                // Persist accepted input before execution so killing the shell
-                // or a long-running command cannot lose the command itself.
                 if history_line.trim() != "l"
                     && let Err(error) = shell.history.add_in_dir(&history_line, Some(&history_cwd))
                 {
                     eprintln!("ish: command was not saved to history: {error}");
                 }
 
-                // Log for session transcript
                 shell.session_log.push_str(&line);
                 shell.session_log.push('\n');
 
@@ -308,10 +288,8 @@ fn main() {
                     dispatch::Plan::Epsh(program) => program,
                 };
 
-                // Save cwd before execution to detect cd
                 let prev_cwd = shell.epsh.cwd().to_path_buf();
 
-                // Set up external handler for ish-specific builtins
                 let shell_pid = shell.shell_pid;
                 let history_log = shell
                     .history
@@ -328,14 +306,12 @@ fn main() {
                 shell.last_status = status;
                 sync_shell_store_derived(&mut shell);
 
-                // Detect cwd change from epsh (compound commands with cd, pushd, etc.)
                 if shell.epsh.cwd() != prev_cwd {
                     let new_cwd = shell.epsh.cwd().to_path_buf();
                     let _ = std::env::set_current_dir(&new_cwd);
                     sync_cwd_change(&mut shell, &prev_cwd, new_cwd);
                 }
 
-                // Detect job suspension (status 148 = 128 + SIGTSTP).
                 if shell.last_status == 148
                     && let Some(external::StoppedJob { pgid, cmd, termios }) =
                         external::take_stopped_job()
@@ -353,8 +329,6 @@ fn main() {
                 break;
             }
             ReadResult::Terminated(sig) => {
-                // The terminal is already restored: read_line's raw-mode guard
-                // dropped on its way out.
                 if let Some(job) = shell.job.take() {
                     job::abandon(job);
                 }
@@ -371,10 +345,6 @@ fn main() {
     }
 }
 
-/// Run `run` with the shell's terminal output captured. The session is `None`
-/// when capture is unavailable, which is reported unless stdout is not a
-/// terminal. Otherwise the caller stores the output with
-/// `Session::finish_into`, or hands the session to a suspended job.
 fn capture_output<T>(
     mut buffer: capture::OutputBuffer,
     run: impl FnOnce() -> T,
@@ -421,13 +391,7 @@ fn copy_last_output(args: &[epsh::ast::Word], output: &capture::OutputBuffer) ->
     0
 }
 
-/// Run a shell-owned builtin that is the whole input line. Returns true when
-/// the shell should quit. `line` is the alias-expanded text; `args` are the
-/// unexpanded shell words after the command name.
 fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &mut Shell) -> bool {
-    // Builtins that take arguments expand them first, so quoting, variables,
-    // command substitution, and globbing behave as for any command. A failed
-    // expansion has already reported itself and set the status.
     macro_rules! expanded_args {
         () => {
             match expand_builtin_args(args, shell, name) {
@@ -538,7 +502,6 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
             };
             shell.last_status = frecency::builtin_z(&args, &shell.history, home);
             if shell.last_status == 0 {
-                // z already did chdir — run post-cd hooks
                 let old_cwd = shell.epsh.cwd().to_path_buf();
                 let new_cwd = std::env::current_dir().unwrap_or_default();
                 sync_cwd_change(shell, &old_cwd, new_cwd);
@@ -585,11 +548,6 @@ fn capture_layout_dump(
     diagnostics::render_layout_dump(&mut shell.layout_dump, snapshot);
 }
 
-/// Write the captured layout dump to a fresh file in `~/.cache/ish/dump-<hex>`.
-/// Returns the written path on success, or an error message. Deliberately does
-/// not write to the terminal, so Ctrl+P can capture a corrupted screen without
-/// changing its contents. The dump holds geometry and lengths only, never typed
-/// text, and the directory and files are private to the user.
 fn write_layout_dump_to_file(shell: &Shell) -> Result<String, String> {
     let home = store_env_os(&shell.epsh, "HOME").unwrap_or_default();
     diagnostics::write_layout_dump_file(&home, &shell.layout_dump)
@@ -620,11 +578,6 @@ fn store_env_display(epsh: &epsh::eval::Shell, name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// `$PATH` as raw bytes from epsh's variable store — the single source of
-/// truth for the environment. Empty when unset. ish's in-process PATH lookups
-/// (command coloring, `which`/`type`, completion) use this instead of the OS
-/// environment, which is only a denv mirror and can be stale after
-/// `set`/`export`/`unset`.
 fn store_path_env(epsh: &epsh::eval::Shell) -> &[u8] {
     epsh.vars().get_bytes("PATH").map_or(&[], |v| v.as_bytes())
 }
@@ -674,8 +627,6 @@ fn emit_working_directory(shell: &Shell) {
     let pwd = shell.epsh.vars().get("PWD").unwrap_or("");
     if !pwd.is_empty() {
         let hostname = shell.epsh.vars().get("HOSTNAME").unwrap_or("");
-        // Percent-encode every byte outside the URI unreserved set so
-        // control and non-ASCII bytes cannot end or inject sequences.
         let mut osc = String::from("\x1b]7;file://");
         prompt::push_percent_encoded(&mut osc, hostname.as_bytes(), false);
         prompt::push_percent_encoded(&mut osc, pwd.as_bytes(), true);
@@ -698,15 +649,10 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
     emit_working_directory(shell);
 
     if shell.prompt_needs_line_start {
-        // Commands write directly to the terminal, so ish cannot observe
-        // whether their output ended with a newline. Start the prompt on a
-        // fresh row to keep prompt geometry independent of child output.
         tw.write_str("\r\n");
         shell.prompt_needs_line_start = false;
     }
 
-    // Render prompt — zero-alloc: reuse shell.prompt_buf, read state from epsh.
-    // Take ownership so prompt_str can be borrowed independently of shell.
     let pwd = shell.epsh.vars().get("PWD").unwrap_or("");
     let denv_dirty = shell.epsh.vars().get("__DENV_DIRTY") == Some("1");
     shell
@@ -747,8 +693,6 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
             }
             InputEvent::PasteRejected => {
                 view.grid_column = None;
-                // The line stays as typed (a message inserted into it could be
-                // run); ring the bell instead of repainting.
                 view.tw.write_str("\x07");
                 let _ = view.tw.flush_to_stdout();
                 None
@@ -805,11 +749,6 @@ fn handle_signal(
         view.grid_column = None;
         update_mode_layout_for_resize(mode, shell);
 
-        // Terminal emulators reflow the live cursor and their
-        // DEC saved cursor differently on resize. The saved
-        // RenderedRegion anchor is therefore no longer a safe
-        // basis for an incremental repaint. Start from a known
-        // screen position and rebuild the active region.
         view.tw.clear_screen();
         view.region = render::RenderedRegion::default();
         view.history_cache.clear();
@@ -861,10 +800,6 @@ fn handle_key(
     shell: &mut Shell,
     key: KeyEvent,
 ) -> Option<ReadResult> {
-    // Ctrl+P writes a layout dump in any mode and does not repaint,
-    // so it captures the screen exactly as it is (including the
-    // status line) without disturbing it. Intercept before mode
-    // dispatch so every mode is covered uniformly.
     if key.key == Key::Char('p') && key.mods.ctrl {
         capture_layout_dump(shell, mode, &view.line, view.prompt_display_len, view.region);
         if let Err(message) = write_layout_dump_to_file(shell) {
@@ -902,7 +837,6 @@ fn handle_normal_key_event(
         KeyAction::Continue => {}
         KeyAction::Execute(text) => {
             capture_layout_dump(shell, mode, &view.line, view.prompt_display_len, view.region);
-            // Clear autosuggestion ghost text before freezing the line
             if view.line.cursor() == view.line.text().len() {
                 view.tw.write_str("\x1b[J");
             }
@@ -994,8 +928,6 @@ fn start_history_search(view: &mut EditView, mode: &mut Mode, shell: &mut Shell)
 }
 
 fn start_dir_picker(view: &mut EditView, mode: &mut Mode, shell: &Shell) -> bool {
-    // Show dir stack in reverse (most recent first),
-    // excluding the current directory
     let pwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -1057,7 +989,6 @@ fn handle_completion_key_event(
     let next = match handle_completion_key(key, state, base_line) {
         CompletionAction::Navigate => {
             preview_completion(&mut view.line, state, base_line);
-            // Cursor is on prompt line — repaint grid in-place
             let info = render::render_line(
                 &mut view.tw,
                 p,
@@ -1073,7 +1004,6 @@ fn handle_completion_key_event(
             return Next::Stay;
         }
         CompletionAction::Refilter => {
-            // Reclaim buffer from current state, re-run completion
             let selected = state.selected;
             let comp = std::mem::take(&mut state.comp);
             let mut cs = start_completion(
@@ -1126,8 +1056,6 @@ fn handle_completion_key_event(
         }
     };
 
-    // Cursor is on prompt line — render_line's \r + clear_to_end_of_screen
-    // naturally clears the grid below
     let (p, pdl) = active_prompt(&view.prompt_str, view.prompt_display_len);
     let info = render::render_line(
         &mut view.tw,
@@ -1446,7 +1374,6 @@ fn handle_normal_key(
         }
         (Key::Right, _, _) => {
             if line.cursor() >= line.text().len() && !line.has_newlines() {
-                // At end of line — accept autosuggestion from history
                 if let Some(entry) = shell.history.session_prefix_search(line.text(), 0) {
                     let owned = entry.to_string();
                     line.set(&owned);
@@ -1566,7 +1493,6 @@ fn try_alias_expand(line: &mut LineBuffer, aliases: &AliasMap) {
     }
 }
 
-// -- Completion --
 
 enum CompletionAction {
     Navigate,
@@ -1575,8 +1501,6 @@ enum CompletionAction {
     Refilter,
 }
 
-/// Returns the byte offset of the start of the current shell command segment
-/// (the text after the last unquoted |, ;, or && in `s`).
 fn current_cmd_start(s: &str) -> usize {
     let mut in_single = false;
     let bytes = s.as_bytes();
@@ -1602,7 +1526,6 @@ fn current_cmd_start(s: &str) -> usize {
     start
 }
 
-/// Split a shell command segment into tokens, stripping single-quote delimiters.
 fn shell_tokens(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
@@ -1624,8 +1547,6 @@ fn shell_tokens(s: &str) -> Vec<String> {
     tokens
 }
 
-/// Collect the arguments already present in the current command before `word_start`,
-/// skipping the command name itself. Used to filter duplicates from completions.
 fn existing_cmd_args(before_cursor: &str, word_start: usize) -> Vec<String> {
     let prefix = &before_cursor[..word_start];
     let cmd_start = current_cmd_start(prefix);
@@ -1637,8 +1558,6 @@ fn existing_cmd_args(before_cursor: &str, word_start: usize) -> Vec<String> {
     }
 }
 
-/// Remove completion entries whose full form (dir_prefix + name) is already
-/// present in `existing`. Leaves the names arena intact; orphaned bytes are harmless.
 fn filter_existing_args(comp: &mut complete::Completions, existing: &[String], dir_prefix: &str) {
     if existing.is_empty() {
         return;
@@ -1648,7 +1567,6 @@ fn filter_existing_args(comp: &mut complete::Completions, existing: &[String], d
         .iter()
         .map(|e| {
             let full = format!("{}{}", dir_prefix, comp.entry_name(e));
-            // Directories are inserted with a trailing '/', so check both forms.
             existing
                 .iter()
                 .any(|a| *a == full || (e.is_dir() && a.strip_suffix('/') == Some(full.as_str())))
@@ -1662,8 +1580,6 @@ fn filter_existing_args(comp: &mut complete::Completions, existing: &[String], d
     });
 }
 
-/// Whether the cursor is at a command position (first word, after | && ;,
-/// or immediately after sudo/doas/su).
 fn is_command_position(before_cursor: &str, word_start: usize) -> bool {
     if word_start == 0 {
         return true;
@@ -1672,7 +1588,6 @@ fn is_command_position(before_cursor: &str, word_start: usize) -> bool {
     if before_word.ends_with('|') || before_word.ends_with(';') || before_word.ends_with("&&") {
         return true;
     }
-    // The argument after sudo/doas/su is also a command
     let prev_word = before_word
         .rsplit_once(|c: char| c.is_whitespace() || c == '|' || c == ';')
         .map(|(_, w)| w)
@@ -1680,8 +1595,6 @@ fn is_command_position(before_cursor: &str, word_start: usize) -> bool {
     matches!(prev_word, "sudo" | "doas" | "su")
 }
 
-/// Find the start of the completion word, respecting quotes.
-/// Returns (byte_offset_of_word_start, currently_inside_single_quote).
 fn find_comp_word_start(s: &str) -> (usize, bool) {
     let mut in_single = false;
     let mut in_double = false;
@@ -1729,8 +1642,6 @@ fn start_completion(
     let existing = existing_cmd_args(before_cursor, word_start);
     let raw_word = &before_cursor[word_start..];
 
-    // Strip quotes for filesystem lookup; track whether the word was quoted.
-    // Handles: open quote ('path), balanced quote ('path'), and tilde (~/'path').
     let (partial, in_quote): (String, bool) = if in_single {
         (raw_word.strip_prefix('\'').unwrap_or(raw_word).into(), true)
     } else if let Some(rest) = raw_word.strip_prefix("~/'") {
@@ -1764,7 +1675,6 @@ fn start_completion(
         None => "",
     };
 
-    // Command position: first word or after |, &&, ;
     if !partial.is_empty()
         && !partial.contains('/')
         && is_command_position(before_cursor, word_start)
@@ -1780,7 +1690,6 @@ fn start_completion(
             }
         }
         path::complete_commands(&partial, &mut comp, store_path_env(epsh));
-        // Directories are valid commands (implicit cd)
         complete::complete_path_into(&partial, true, &mut comp);
         comp.sort_entries();
         comp.dedup_sorted();
@@ -1798,11 +1707,8 @@ fn start_completion(
         };
     }
 
-    // Detect if first word is cd → complete only directories
     let dirs_only = first_command_word == "cd" && word_start > 0;
 
-    // After ssh-like commands, offer hostnames beside local files. There is no
-    // remote path completion: it would run ssh from the completion path.
     if word_start > 0 && SSH_CMDS.contains(&first_command_word) && !partial.contains([':', '/']) {
         complete::complete_hostnames(&partial, home, &mut comp);
         complete::complete_path_into(&partial, false, &mut comp);
@@ -1824,7 +1730,6 @@ fn start_completion(
         }
     }
 
-    // Expand tilde for filesystem lookup
     let expanded = if partial == "~" {
         format!("{home}/")
     } else if let Some(rest) = partial.strip_prefix("~/") {
@@ -1833,7 +1738,6 @@ fn start_completion(
         partial.clone()
     };
 
-    // dir_prefix keeps the original (unexpanded) form for accept_completion
     let dir_prefix = if let Some(slash_pos) = partial.rfind('/') {
         partial[..=slash_pos].to_string()
     } else {
@@ -1856,11 +1760,8 @@ fn start_completion(
         };
     }
 
-    // Fish-style partial path completion: each intermediate component is a prefix.
-    // e.g., "~/de/s" → resolve "de" to "dev", complete "s" in ~/dev/
     let (partial_comp, groups) = complete::complete_partial_path(&expanded, dirs_only);
     if !groups.is_empty() {
-        // Determine the user-facing root prefix (for tilde re-contraction)
         let (user_root, expanded_root) = if partial.starts_with("~/") || partial == "~" {
             ("~/".to_string(), format!("{home}/"))
         } else if partial.starts_with('/') {
@@ -1869,8 +1770,6 @@ fn start_completion(
             (String::new(), String::new())
         };
 
-        // Build entries with resolved intermediate components in the name.
-        // comp is already empty — reuse its arena for combined "rel_dir/name" strings.
         for (resolved_dir, start, count) in &groups {
             let rel_dir = if expanded_root.is_empty() {
                 resolved_dir.as_str()
@@ -1903,7 +1802,6 @@ fn start_completion(
         };
     }
 
-    // Nothing found — return empty state, preserving the buffer for reuse.
     CompletionState {
         comp,
         selected: 0,
@@ -1986,11 +1884,6 @@ fn preview_completion(line: &mut LineBuffer, state: &CompletionState, base_line:
         inner.push(':');
     }
 
-    // Single-quote the completion if it contains special characters.
-    // Always close the quote so the line is valid for immediate execution.
-    // On the next tab press, start_completion strips the outer quotes for lookup.
-    // Keep ~/ outside the quotes so tilde expansion still works.
-    // Escape embedded single quotes: ' → '\'' (end quote, escaped quote, reopen).
     let replacement = if state.in_quote || needs_quoting(&inner) || inner.contains('\'') {
         let escaped = inner.replace('\'', "'\\''");
         if let Some(rest) = escaped.strip_prefix("~/") {
@@ -2007,7 +1900,6 @@ fn preview_completion(line: &mut LineBuffer, state: &CompletionState, base_line:
     line.set_with_cursor(&new_text, new_cursor);
 }
 
-// -- History Search --
 
 enum HistoryAction {
     Continue,
@@ -2015,8 +1907,6 @@ enum HistoryAction {
     Cancel,
 }
 
-/// The incremental-narrowing state of a history search, borrowed together so
-/// the key handler stays within a reasonable argument count.
 struct HistoryCandidates<'a> {
     candidates: &'a mut Vec<usize>,
     scratch: &'a mut Vec<usize>,
@@ -2066,7 +1956,6 @@ fn handle_history_search_key(
             *selected += 1;
         }
 
-        // Query editing — cursor movement
         (Key::Left, _, false) if key.mods.ctrl => {
             query.move_word_left();
         }
@@ -2084,7 +1973,6 @@ fn handle_history_search_key(
         (Key::Char('b'), _, true) => query.move_word_left(),
         (Key::Char('f'), _, true) => query.move_word_right(),
 
-        // Query editing — text modification
         (Key::Backspace, _, _) => {
             query.delete_back();
             re_search = true;
@@ -2244,8 +2132,6 @@ fn render_history_mode(
     )
 }
 
-/// Apply denv environment changes to epsh's variable store.
-/// The changes are already applied to process env by denv.
 fn apply_denv_changes(changes: &[denv::EnvChange], epsh: &mut epsh::eval::Shell) {
     for change in changes {
         match change {
@@ -2266,8 +2152,6 @@ fn sync_path_var(epsh: &mut epsh::eval::Shell, name: &str, path: &Path) {
         name,
         epsh::shell_bytes::ShellBytes::from_os_str(path.as_os_str()),
     );
-    // PWD/OLDPWD must be exported so they survive denv's process-env mirror
-    // sync and reach children (matches bash, which exports both).
     epsh.vars_mut().export(name);
 }
 
@@ -2282,8 +2166,6 @@ fn sync_cwd_change(shell: &mut Shell, old_cwd: &Path, new_cwd: std::path::PathBu
     sync_shell_store_derived(shell);
 }
 
-/// Expand intercepted builtin arguments with epsh so top-level builtins honor
-/// quoting, variables, command substitution, and globbing like normal commands.
 fn expand_builtin_args(
     words: &[epsh::ast::Word],
     shell: &mut Shell,
@@ -2323,8 +2205,6 @@ fn expand_builtin_args_bytes(
     Some(args)
 }
 
-/// Change directory and run all post-cd hooks (OLDPWD, epsh sync, dir stack, denv, prompt).
-/// Returns 0 on success, 1 on failure.
 fn change_directory(target: &str, shell: &mut Shell) -> i32 {
     let home = store_env_os(&shell.epsh, "HOME").unwrap_or_default();
     let resolved = if target == "~" || target.is_empty() {
@@ -2352,10 +2232,8 @@ fn change_directory_path(target: &Path, shell: &mut Shell) -> i32 {
 fn push_dir_stack(dir_stack: &mut Vec<String>) {
     if let Ok(pwd) = std::env::current_dir() {
         let pwd = pwd.to_string_lossy().into_owned();
-        // Don't push duplicates at the top
         if dir_stack.last().map(|s| s.as_str()) != Some(&pwd) {
             dir_stack.push(pwd);
-            // Cap at 50 entries
             if dir_stack.len() > 50 {
                 dir_stack.remove(0);
             }
@@ -2380,7 +2258,6 @@ fn render_dir_picker_mode(
     )
 }
 
-/// Handle the "exit" command typed at the prompt. Returns true if the shell should break.
 fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
     let code: i32 = line
         .split_whitespace()
@@ -2405,7 +2282,6 @@ fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
     std::process::exit(code);
 }
 
-/// Handle the "alias" command typed at the prompt.
 fn handle_alias(line: &str, shell: &mut Shell) {
     let words = parse_alias_words(line);
     if words.len() >= 2 {
@@ -2438,7 +2314,6 @@ fn parse_alias_words(line: &str) -> Vec<String> {
     ish::alias::lex_words(rest)
 }
 
-/// Handle the "history" command. Returns true if handled (no fallthrough needed).
 fn handle_history(line: &str, shell: &mut Shell) -> bool {
     let sub = line.split_whitespace().nth(1);
     match sub {
@@ -2476,7 +2351,6 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
     }
 }
 
-/// Check if input needs a continuation line (open quotes, trailing operator, etc.)
 fn needs_continuation(input: &str) -> bool {
     let trimmed = input.trim_end();
     if trimmed.is_empty() {
@@ -2508,7 +2382,6 @@ fn scan_quote_state(input: &[u8]) -> (bool, bool, bool) {
     (in_single, in_double, escape)
 }
 
-/// Handle Ctrl+D exit (from read_line).
 fn handle_exit(shell: &mut Shell) -> ReadResult {
     if shell.job.is_some() {
         if shell.exit_warned {

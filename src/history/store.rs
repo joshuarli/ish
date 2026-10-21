@@ -73,8 +73,6 @@ fn open_file(path: &Path, flags: rustix::fs::OFlags) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
-// Each operation opens its own lock descriptor and drops it before user commands
-// can fork. The lock inode survives atomic replacement of the data file.
 fn lock(path: &Path) -> io::Result<File> {
     let file = open_file(
         &suffixed_path(path, ".lock"),
@@ -150,8 +148,6 @@ impl Store {
             .checked_add(frame.len() as u64)
             .ok_or_else(|| invalid("file offset overflow"))?;
         file.seek(SeekFrom::Start(cursor.offset))?;
-        // Publish the occurrence to memory only after both its bytes and metadata
-        // are durable. A failed write must leave the valid prefix retryable.
         if let Err(error) = file.write_all(&frame).and_then(|_| file.sync_all()) {
             if let Err(rollback) = file.set_len(cursor.offset).and_then(|_| file.sync_all()) {
                 return Err(io::Error::other(format!(
@@ -167,9 +163,6 @@ impl Store {
         Ok((snapshot, id))
     }
 
-    /// Replace the log with an empty one. Only the header is consulted, so
-    /// reset still works when records are damaged. A file with an unreadable
-    /// header is kept aside rather than destroyed.
     pub fn reset(&mut self) -> io::Result<i64> {
         let _lock = lock(&self.path)?;
         let mut file = open_file(&self.path, rustix::fs::OFlags::RDWR)?;
@@ -179,8 +172,6 @@ impl Store {
                 .ok_or_else(|| invalid("generation exhausted"))?,
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                 fs::hard_link(&self.path, corrupt_path(&self.path))?;
-                // Other shells hold an older generation; a time-derived one
-                // cannot collide with a small counter.
                 i64::try_from(super::now_millis()).map_err(|_| invalid("clock out of range"))?
             }
             Err(error) => return Err(error),
@@ -191,8 +182,6 @@ impl Store {
         Ok(generation)
     }
 
-    /// Keep the valid prefix of a log with a damaged record and move the rest
-    /// to a `.corrupt-*` file next to it.
     pub fn salvage(&mut self) -> io::Result<Salvage> {
         let _lock = lock(&self.path)?;
         let mut file = open_file(&self.path, rustix::fs::OFlags::RDWR)?;
@@ -244,8 +233,6 @@ fn corrupt_path(path: &Path) -> PathBuf {
     )
 }
 
-/// A record that fails validation at a known offset, as opposed to an I/O
-/// failure or an unusable header.
 #[derive(Debug)]
 struct FrameCorruption {
     offset: u64,
@@ -315,7 +302,6 @@ fn read_snapshot(
         };
     }
     let cutoff = if current == generation { last_id } else { 0 };
-    // A caller with an older generation needs the complete replacement snapshot.
     if current != generation && cursor.offset != HEADER_SIZE {
         cursor.offset = HEADER_SIZE;
         cursor.last_id = 0;
@@ -343,7 +329,6 @@ fn read_snapshot(
         let length = u64::from_le_bytes(length_bytes);
         let length_crc = u32::from_le_bytes(frame_header[8..12].try_into().unwrap());
         if crc32(&length_bytes) != length_crc {
-            // A size-extended torn write leaves zero fill, not a frame.
             if frame_header.iter().all(|&b| b == 0) && rest_is_zero(&mut reader)? {
                 recover_tail(reader.get_ref(), cursor.offset)?;
                 break;
@@ -369,8 +354,6 @@ fn read_snapshot(
         reader.read_exact(&mut payload)?;
         let checksum = u32::from_le_bytes(frame_header[12..].try_into().unwrap());
         if crc32(&payload) != checksum {
-            // A final frame that runs exactly to EOF is a torn write; the
-            // same mismatch before further records is real corruption.
             if frame_size == remaining {
                 discarded_complete_frame = true;
                 break;
