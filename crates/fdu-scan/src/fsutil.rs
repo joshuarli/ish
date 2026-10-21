@@ -105,6 +105,7 @@ pub(crate) fn identity_and_link_count(fd: BorrowedFd<'_>) -> io::Result<(FileIde
     Ok((identity(&stat)?, link_count(&stat)?))
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn identity_link_count_and_modified_time(
     fd: BorrowedFd<'_>,
 ) -> io::Result<(FileIdentity, u64, ModifiedTime)> {

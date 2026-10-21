@@ -87,15 +87,6 @@ Next: 53
 - **Fix with:** api-surface-and-module-boundaries
 - **Effort:** L (weeks)
 
-### ISH-50 · P4 · Small dead and stale leftovers: `RootAnchor::modified_time`, the legacy prompt label, an empty `~user` branch
-
-- **Area:** Dead code
-- **Where:** `crates/fdu-scan/src/lib.rs` (`RootAnchor::modified_time`), `src/prompt.rs` (`render_with_state`), `src/frecency.rs` (`directory_scores`), `src/history/persistence_tests.rs` (`let _ = first_end;`)
-- **Problem:** `RootAnchor::modified_time` has no caller. `Prompt::render_with_state` is still labelled legacy though the tests and the real path use it. `directory_scores` skips `~user` targets with an empty `else if` arm. `reset_works_on_a_log_with_damaged_records_or_header` carries a dead `let _ = first_end;`.
-- **Recommendation:** Delete the unused method and the dead statement, drop the stale label, and fold the `~user` skip into the target filter.
-- **Fix with:** dead-code-archaeology
-- **Effort:** S (hours)
-
 ### ISH-52 · P4 · Two SAFETY claims in `denv.rs` say ish is single-threaded without proof
 
 - **Area:** Security

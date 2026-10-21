@@ -87,7 +87,14 @@ fn directory_scores(history: &History, home: &str) -> Vec<(String, f64)> {
             continue;
         }
         let dir = match extract_cd_target(entry) {
-            Some(d) if !d.is_empty() && d != "-" && !d.starts_with('-') => d,
+            Some(d)
+                if !d.is_empty()
+                    && d != "-"
+                    && !d.starts_with('-')
+                    && (!d.starts_with('~') || d == "~" || d.starts_with("~/")) =>
+            {
+                d
+            }
             _ => continue,
         };
 
@@ -107,7 +114,6 @@ fn directory_scores(history: &History, home: &str) -> Vec<(String, f64)> {
             credit(format!("{home}/{rest}"));
         } else if dir == "~" {
             credit(home.to_string());
-        } else if dir.starts_with('~') {
         } else if dir.starts_with('/') {
             credit(dir);
         } else {

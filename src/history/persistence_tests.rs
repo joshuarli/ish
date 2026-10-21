@@ -629,14 +629,13 @@ fn salvage_invalidates_existing_readers_and_reused_occurrence_cutoffs() {
 #[test]
 fn reset_works_on_a_log_with_damaged_records_or_header() {
     let fixture = Fixture::new();
-    let (path, mut bytes, first_end) = two_frame_log(&fixture);
+    let (path, mut bytes, _) = two_frame_log(&fixture);
     let mut history = History::load_from(fixture.path()).unwrap();
     bytes[16 + 12] ^= 0x80;
     fs::write(&path, &bytes).unwrap();
     history.reset().unwrap();
     assert_eq!(fixture.occurrences(), 0);
     assert_eq!(History::load_from(fixture.path()).unwrap().len(), 0);
-    let _ = first_end;
 
     fs::write(&path, b"not a history log at all").unwrap();
     history.reset().unwrap();

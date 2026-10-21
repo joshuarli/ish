@@ -25,7 +25,6 @@ pub struct RootAnchor {
     fd: Arc<OwnedFd>,
     pub name: Vec<u8>,
     pub identity: FileIdentity,
-    modified_time: ModifiedTime,
     pub link_count: u64,
 }
 
@@ -37,21 +36,16 @@ impl RootAnchor {
     pub fn try_clone_fd(&self) -> io::Result<OwnedFd> {
         self.fd.try_clone()
     }
-
-    pub fn modified_time(&self) -> ModifiedTime {
-        self.modified_time
-    }
 }
 
 pub fn open_root_no_follow(path: &Path) -> io::Result<RootAnchor> {
     let open_path = without_trailing_slashes(path);
     let fd = fsutil::open_directory_no_follow(open_path.as_ref())?;
-    let (identity, link_count, modified_time) = fsutil::identity_link_count_and_modified_time(fd.as_fd())?;
+    let (identity, link_count) = fsutil::identity_and_link_count(fd.as_fd())?;
     Ok(RootAnchor {
         fd: Arc::new(fd),
         name: path.as_os_str().as_bytes().to_vec(),
         identity,
-        modified_time,
         link_count,
     })
 }

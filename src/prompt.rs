@@ -102,7 +102,6 @@ impl Prompt {
         out.push_str(" $ ");
     }
 
-    /// Legacy render helper with explicit shell-owned prompt state.
     pub fn render_with_state(&mut self, last_status: i32, pwd: &str, denv_dirty: bool) -> String {
         let mut out = String::with_capacity(128);
         self.render_into(&mut out, last_status, pwd, denv_dirty);
