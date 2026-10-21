@@ -68,15 +68,6 @@ Next: 45
 - **Fix with:** api-surface-and-module-boundaries
 - **Effort:** L (weeks)
 
-### ISH-35 · P3 · Command policy facts are written in several places
-
-- **Area:** Architecture
-- **Where:** `src/builtin.rs:29-48`, `src/main.rs:384-516`, `src/main.rs:2669-2720`, `src/dispatch.rs:81-91`, `src/dispatch.rs:142-151`, `crates/epsh/src/builtins.rs:1273-1278`
-- **Problem:** AGENTS.md says each builtin is registered once in `builtin.rs`. The class lives there, but behaviour is matched again by raw name in `run_shell_builtin` and the external handler, so a table entry compiles without a handler arm and a `Native` entry with no arm falls through to a PATH lookup. `plan()` and the dynamic check each hardcode `"eval" | "source" | "."` and the InShell lookup with different rejection variants, and epsh's `BUILTIN_NAMES` and `try_builtin` arms are a third copy with no test tying them together.
-- **Recommendation:** Give each registry entry a typed handler per class and resolve all dispatch through `lookup()`. Add one `refused_command_name` shared by both policy checks and a test that every epsh builtin is allowed or refused.
-- **Fix with:** single-source-of-truth
-- **Effort:** M (days)
-
 ### ISH-36 · P3 · Library and epsh public surfaces are wider than their one consumer
 
 - **Area:** Architecture

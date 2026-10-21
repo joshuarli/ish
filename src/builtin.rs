@@ -19,33 +19,113 @@ pub enum Exec {
     Native,
 }
 
-/// One ish-owned builtin. This table is the command-name and execution-class
-/// contract used by dispatch, completion, lookup, and the external handler.
+/// A builtin that runs in the shell process as the whole input line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellCommand {
+    CopyLastOutput,
+    Alias,
+    ChangeDirectory,
+    CopyScrollback,
+    Denv,
+    Exit,
+    ResumeJob,
+    History,
+    DumpLayout,
+    Trash,
+    Locate,
+    Jump,
+}
+
+/// A builtin the external-command handler runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalCommand {
+    Copy,
+    Move,
+    List,
+    ClearScreen,
+    History,
+}
+
+#[derive(Clone, Copy)]
+enum Handler {
+    InShell(ShellCommand),
+    Hybrid {
+        shell: ShellCommand,
+        stateless: Option<ExternalCommand>,
+    },
+    Foreground(ExternalCommand),
+    Native(ExternalCommand),
+}
+
+/// One ish-owned builtin. This table is the command-name, execution-class, and
+/// handler contract used by dispatch, completion, lookup, and the shell and
+/// external handlers. Only the constructors build entries, so `exec` always
+/// matches the handler.
 pub struct Builtin {
     pub name: &'static str,
     pub exec: Exec,
+    handler: Handler,
+}
+
+impl Builtin {
+    const fn in_shell(name: &'static str, command: ShellCommand) -> Self {
+        Self { name, exec: Exec::InShell, handler: Handler::InShell(command) }
+    }
+
+    const fn hybrid(
+        name: &'static str,
+        shell: ShellCommand,
+        stateless: Option<ExternalCommand>,
+    ) -> Self {
+        Self { name, exec: Exec::Hybrid, handler: Handler::Hybrid { shell, stateless } }
+    }
+
+    const fn foreground(name: &'static str, command: ExternalCommand) -> Self {
+        Self { name, exec: Exec::Foreground, handler: Handler::Foreground(command) }
+    }
+
+    const fn native(name: &'static str, command: ExternalCommand) -> Self {
+        Self { name, exec: Exec::Native, handler: Handler::Native(command) }
+    }
+
+    /// The handler for running as the whole input line, for classes that have one.
+    pub fn shell_command(&self) -> Option<ShellCommand> {
+        match self.handler {
+            Handler::InShell(command) | Handler::Hybrid { shell: command, .. } => Some(command),
+            Handler::Foreground(_) | Handler::Native(_) => None,
+        }
+    }
+
+    /// The handler the external-command handler runs, for classes that have one.
+    pub fn external_command(&self) -> Option<ExternalCommand> {
+        match self.handler {
+            Handler::Hybrid { stateless, .. } => stateless,
+            Handler::Foreground(command) | Handler::Native(command) => Some(command),
+            Handler::InShell(_) => None,
+        }
+    }
 }
 
 const ISH_BUILTINS: &[Builtin] = &[
-    Builtin { name: "?", exec: Exec::InShell },
-    Builtin { name: "alias", exec: Exec::InShell },
-    Builtin { name: "cd", exec: Exec::Hybrid },
-    Builtin { name: "copy-scrollback", exec: Exec::InShell },
-    Builtin { name: "cp", exec: Exec::Foreground },
-    Builtin { name: "c", exec: Exec::Native },
-    Builtin { name: "denv", exec: Exec::InShell },
-    Builtin { name: "exit", exec: Exec::InShell },
-    Builtin { name: "fg", exec: Exec::InShell },
-    Builtin { name: "history", exec: Exec::Hybrid },
-    Builtin { name: "ish-dump", exec: Exec::InShell },
-    Builtin { name: "l", exec: Exec::Native },
-    Builtin { name: "mv", exec: Exec::Foreground },
-    Builtin { name: "t", exec: Exec::InShell },
-    Builtin { name: "trash", exec: Exec::InShell },
-    Builtin { name: "type", exec: Exec::InShell },
-    Builtin { name: "w", exec: Exec::InShell },
-    Builtin { name: "which", exec: Exec::InShell },
-    Builtin { name: "z", exec: Exec::InShell },
+    Builtin::in_shell("?", ShellCommand::CopyLastOutput),
+    Builtin::in_shell("alias", ShellCommand::Alias),
+    Builtin::hybrid("cd", ShellCommand::ChangeDirectory, None),
+    Builtin::in_shell("copy-scrollback", ShellCommand::CopyScrollback),
+    Builtin::foreground("cp", ExternalCommand::Copy),
+    Builtin::native("c", ExternalCommand::ClearScreen),
+    Builtin::in_shell("denv", ShellCommand::Denv),
+    Builtin::in_shell("exit", ShellCommand::Exit),
+    Builtin::in_shell("fg", ShellCommand::ResumeJob),
+    Builtin::hybrid("history", ShellCommand::History, Some(ExternalCommand::History)),
+    Builtin::in_shell("ish-dump", ShellCommand::DumpLayout),
+    Builtin::native("l", ExternalCommand::List),
+    Builtin::foreground("mv", ExternalCommand::Move),
+    Builtin::in_shell("t", ShellCommand::Trash),
+    Builtin::in_shell("trash", ShellCommand::Trash),
+    Builtin::in_shell("type", ShellCommand::Locate),
+    Builtin::in_shell("w", ShellCommand::Locate),
+    Builtin::in_shell("which", ShellCommand::Locate),
+    Builtin::in_shell("z", ShellCommand::Jump),
 ];
 
 /// The ish-owned builtin called `name`, if any.

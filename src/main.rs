@@ -11,6 +11,7 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
+use ish::builtin::{ExternalCommand, ShellCommand};
 use ish::foreground;
 mod fs_command;
 mod static_word;
@@ -463,12 +464,18 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
         };
     }
 
-    match name {
-        "alias" => handle_alias(line, shell),
-        "exit" => {
+    let Some(command) = builtin::lookup(name).and_then(builtin::Builtin::shell_command) else {
+        eprintln!("ish: internal error: no shell handler for builtin {name}");
+        shell.last_status = 1;
+        return false;
+    };
+
+    match command {
+        ShellCommand::Alias => handle_alias(line, shell),
+        ShellCommand::Exit => {
             return handle_exit_command(line, shell);
         }
-        "cd" => {
+        ShellCommand::ChangeDirectory => {
             let args = match expand_builtin_args_bytes(args, shell, name) {
                 Some(args) => args,
                 None => return false,
@@ -500,16 +507,16 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                 shell.last_status = change_directory_path(&target, shell);
             }
         }
-        "history" => {
+        ShellCommand::History => {
             handle_history(line, shell);
         }
-        "copy-scrollback" => {
+        ShellCommand::CopyScrollback => {
             write_clipboard(shell.session_log.as_bytes());
             shell.last_status = 0;
         }
-        "?" => shell.last_status = copy_last_output(args, &shell.last_output),
-        "ish-dump" => shell.last_status = write_layout_dump(shell),
-        "t" | "trash" => {
+        ShellCommand::CopyLastOutput => shell.last_status = copy_last_output(args, &shell.last_output),
+        ShellCommand::DumpLayout => shell.last_status = write_layout_dump(shell),
+        ShellCommand::Trash => {
             let args = match expand_builtin_args_bytes(args, shell, name) {
                 Some(args) => args
                     .iter()
@@ -539,17 +546,17 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                 }
             }
         }
-        "denv" => {
+        ShellCommand::Denv => {
             let args = expanded_args!();
             let outcome = denv::command(&shell.denv, &args, &shell.epsh);
             apply_denv_changes(&outcome.changes, &mut shell.epsh);
             sync_shell_store_derived(shell);
             shell.last_status = outcome.status;
         }
-        "fg" => {
+        ShellCommand::ResumeJob => {
             shell.last_status = ish::job::resume_job(&mut shell.job, &mut shell.last_output);
         }
-        "z" => {
+        ShellCommand::Jump => {
             let args = expanded_args!();
             let Some(home) = shell.home.as_deref() else {
                 eprintln!("ish: z: HOME is not UTF-8");
@@ -564,7 +571,7 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                 sync_cwd_change(shell, &old_cwd, new_cwd);
             }
         }
-        "w" | "which" | "type" => {
+        ShellCommand::Locate => {
             let args = expanded_args!();
             shell.last_status = builtin::locate_command(
                 &args,
@@ -572,10 +579,6 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                 |name| shell.epsh.functions().contains_key(name),
                 store_path_env(&shell.epsh),
             );
-        }
-        other => {
-            eprintln!("ish: internal error: no shell handler for builtin {other}");
-            shell.last_status = 1;
         }
     }
     false
@@ -2731,9 +2734,9 @@ fn make_external_handler(
               env_pairs: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)]| {
             let name = args[0].to_shell_string();
 
-            // ish interactive builtins
-            match name.as_str() {
-                "cp" | "mv" => {
+            let external = builtin::lookup(&name).and_then(builtin::Builtin::external_command);
+            match external {
+                Some(command @ (ExternalCommand::Copy | ExternalCommand::Move)) => {
                     let cwd = epsh::eval::external_command_cwd().ok_or_else(|| {
                         epsh::error::ShellError::Io(std::io::Error::other("external command cwd was unavailable"))
                     })?;
@@ -2744,22 +2747,25 @@ fn make_external_handler(
                             .map(std::path::PathBuf::from)
                             .unwrap_or_else(|| fs_default_scratch.clone()),
                     };
-                    let operation = if name == "cp" { ish_fs::Operation::Copy } else { ish_fs::Operation::Move };
+                    let operation = match command {
+                        ExternalCommand::Copy => ish_fs::Operation::Copy,
+                        _ => ish_fs::Operation::Move,
+                    };
                     let arguments = args[1..].iter()
                         .map(epsh::shell_bytes::ShellBytes::to_os_string)
                         .collect::<Vec<_>>();
                     return fs_command::run(operation, &arguments, context);
                 }
-                "l" => {
+                Some(ExternalCommand::List) => {
                     let l_args: Vec<_> = args[1..].iter().map(|arg| arg.to_path_buf()).collect();
                     let status = builtin::list_directory(&l_args);
                     return Ok(epsh::error::ExitStatus::from(status));
                 }
-                "c" => {
+                Some(ExternalCommand::ClearScreen) => {
                     print!("\x1b[H\x1b[2J");
                     return Ok(epsh::error::ExitStatus::SUCCESS);
                 }
-                "history" => {
+                Some(ExternalCommand::History) => {
                     if args.len() > 1 {
                         let argument = args[1].to_shell_string();
                         if args.len() == 2 && matches!(argument.as_str(), "-h" | "--help") {
@@ -2782,7 +2788,7 @@ fn make_external_handler(
                         }
                     }
                 }
-                _ => {}
+                None => {}
             }
 
             spawn_external(args, env_pairs, shell_pid)

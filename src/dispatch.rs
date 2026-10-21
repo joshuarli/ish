@@ -72,6 +72,18 @@ impl fmt::Display for Rejection {
     }
 }
 
+fn refused_command_name(
+    name: &str,
+    outside_line: fn(&'static str) -> Rejection,
+) -> Option<Rejection> {
+    if matches!(name, "eval" | "source" | ".") {
+        return Some(Rejection::Source(name.to_owned()));
+    }
+    builtin::lookup(name)
+        .filter(|spec| spec.exec == Exec::InShell)
+        .map(|spec| outside_line(spec.name))
+}
+
 /// Refuse an expanded command name that ish cannot route safely.
 ///
 /// `eval`, `source`, `.`, and InShell builtins are rejected. Other names,
@@ -80,17 +92,10 @@ pub fn check_expanded_command(target: &ShellBytes) -> Result<(), Rejection> {
     let Some(name) = target.as_utf8_str() else {
         return Ok(());
     };
-    if matches!(name, "eval" | "source" | ".") {
-        return Err(Rejection::Source(name.to_owned()));
+    match refused_command_name(name, Rejection::ExpandedShellBuiltin) {
+        Some(rejection) => Err(rejection),
+        None => Ok(()),
     }
-
-    if let Some(spec) = builtin::lookup(name)
-        && spec.exec == Exec::InShell
-    {
-        return Err(Rejection::ExpandedShellBuiltin(spec.name));
-    }
-
-    Ok(())
 }
 
 /// Parse `line` and decide how it runs, or refuse it.
@@ -139,15 +144,11 @@ fn check_command(command: &Command) -> Result<(), Rejection> {
             redirs,
             ..
         } => {
-            if let Some(name) = args.first().and_then(static_text) {
-                if matches!(name.as_str(), "eval" | "source" | ".") {
-                    return Err(Rejection::Source(name));
-                }
-                if let Some(spec) = builtin::lookup(&name)
-                    && spec.exec == Exec::InShell
-                {
-                    return Err(Rejection::ShellBuiltinOutsideLine(spec.name));
-                }
+            if let Some(name) = args.first().and_then(static_text)
+                && let Some(rejection) =
+                    refused_command_name(&name, Rejection::ShellBuiltinOutsideLine)
+            {
+                return Err(rejection);
             }
             for assign in assigns {
                 check_word(&assign.value)?;
@@ -291,6 +292,23 @@ mod tests {
             assert!(
                 matches!(rejection(line), Rejection::ShellBuiltinOutsideLine(_)),
                 "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_epsh_builtin_is_allowed_or_refused() {
+        const ALLOWED: &[&str] = &[
+            ":", "true", "false", "echo", "printf", "cd", "pwd", "return", "break", "continue",
+            "export", "readonly", "unset", "set", "shift", "test", "[", "read", "local", "exec",
+            "command", "wait", "trap", "kill", "umask", "getopts",
+        ];
+        for name in epsh::builtins::BUILTIN_NAMES {
+            let refused = refused_command_name(name, Rejection::ShellBuiltinOutsideLine);
+            assert_eq!(
+                refused.is_none(),
+                ALLOWED.contains(name),
+                "classify epsh builtin {name:?} as allowed or refused"
             );
         }
     }
