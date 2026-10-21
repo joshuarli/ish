@@ -63,7 +63,8 @@ Two ish-fs lib cases need capabilities the script cannot provide without sudo,
 so they are `#[ignore]` and panic when the capability is missing: the reflink
 case and the immutable-flag case run from the rows below. The sparse and
 `copy_file_range` lib cases run unconditionally and panic on a filesystem
-without those capabilities.
+without those capabilities. The xattr and Linux ACL fixtures in the copy-method
+parity and repair lib cases likewise panic when the filesystem rejects them.
 
 The foreign-owner cases need uid 0 with CAP_CHOWN. The script's single-ID user
 namespace cannot assign uid 65534, so it does not run them; see the

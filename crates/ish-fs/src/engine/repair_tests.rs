@@ -221,7 +221,7 @@ fn repair_published_access_metadata_mutation_retains_source() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join("source"), b"original").unwrap();
     let source = File::open(fixture.0.join("source")).unwrap();
-    if !set_test_xattr(&source, b"user.ish-fs-test", b"original") { return; }
+    set_test_xattr(&source, b"user.ish-fs-test", b"original");
     let destination = fixture.0.join("destination");
     let (outcome, _) = fixture.run(&fixture.request(), move |point| {
         force_exdev(point)?;

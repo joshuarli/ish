@@ -162,7 +162,7 @@ mod tests {
         fn new() -> Self {
             let unique = SystemTime::now().duration_since(UNIX_EPOCH).expect("read fixture clock").as_nanos();
             let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.work/tmp").join(format!("dry-run-count-{}-{unique}", std::process::id()));
-            std::fs::create_dir(&path).expect("create dry-run count fixture");
+            std::fs::create_dir_all(&path).expect("create dry-run count fixture");
             Self(path)
         }
     }

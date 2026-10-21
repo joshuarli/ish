@@ -96,15 +96,6 @@ Next: 57
 - **Fix with:** os-boundaries
 - **Effort:** S (hours)
 
-### ISH-53 · P3 · Two ish-fs tests still skip silently, and two `dry_run` tests fail in a fresh checkout
-
-- **Area:** Tests
-- **Where:** `crates/ish-fs/src/engine/repair_tests.rs` (`repair_published_access_metadata_mutation_retains_source`, about line 224), `crates/ish-fs/src/engine/tests.rs` (Linux ACL branch of `public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks`, about line 733), `crates/ish-fs/src/engine/dry_run.rs:165`
-- **Problem:** The first test returns early when xattrs are unsupported, and the ACL branch logs "unavailable" and continues, so both pass without checking what they guard. Separately, `dry_run.rs:165` calls `create_dir`, not `create_dir_all`, so two `dry_run` tests fail the first time `cargo test -p ish-fs --lib` runs in a worktree where `.work/tmp` does not exist.
-- **Recommendation:** Give the two skips the ISH-46 treatment (`#[ignore = "reason"]` and a panic when the capability is missing), and create the scratch directory with `create_dir_all`.
-- **Fix with:** test-audit
-- **Effort:** S (hours)
-
 ### ISH-54 · P4 · `fdu-delete` recovery and mount-identity paths have no tests
 
 - **Area:** Tests

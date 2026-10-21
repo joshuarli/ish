@@ -111,14 +111,9 @@ fn set_test_mtime(path: &std::path::Path, seconds: i64, nanoseconds: i64) {
 }
 
 #[cfg(target_os = "linux")]
-fn set_test_xattr(fd: impl AsFd, name: &[u8], value: &[u8]) -> bool {
-    match rustix::fs::fsetxattr(fd, OsStr::from_bytes(name), value, rustix::fs::XattrFlags::empty()) {
-        Ok(()) => true,
-        Err(error) if matches!(error, rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::XDEV | rustix::io::Errno::INVAL | rustix::io::Errno::PERM) => {
-            eprintln!("Linux metadata fixture unavailable for {}: {error}", String::from_utf8_lossy(name));
-            false
-        }
-        Err(error) => panic!("set Linux metadata fixture {}: {error}", String::from_utf8_lossy(name)),
+fn set_test_xattr(fd: impl AsFd, name: &[u8], value: &[u8]) {
+    if let Err(error) = rustix::fs::fsetxattr(fd, OsStr::from_bytes(name), value, rustix::fs::XattrFlags::empty()) {
+        panic!("set Linux metadata fixture {}: {error}", String::from_utf8_lossy(name));
     }
 }
 
@@ -725,16 +720,8 @@ fn public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks() {
     fs::write(&linked_path, &linked_bytes).unwrap();
     fs::set_permissions(&linked_path, fs::Permissions::from_mode(0o640)).unwrap();
     let linked_file = OpenOptions::new().read(true).write(true).open(&linked_path).unwrap();
-    let user_xattr = set_test_xattr(linked_file.as_fd(), b"user.ish-fs-engine-parity", b"parity xattr");
-    let acl = test_access_acl();
-    let acl_set = match rustix::fs::fsetxattr(linked_file.as_fd(), OsStr::from_bytes(b"system.posix_acl_access"), &acl, rustix::fs::XattrFlags::empty()) {
-        Ok(()) => true,
-        Err(error) if matches!(error, rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::XDEV | rustix::io::Errno::INVAL | rustix::io::Errno::PERM) => {
-            eprintln!("Linux ACL fixture unavailable: {error}");
-            false
-        }
-        Err(error) => panic!("set Linux ACL fixture: {error}"),
-    };
+    set_test_xattr(linked_file.as_fd(), b"user.ish-fs-engine-parity", b"parity xattr");
+    set_test_xattr(linked_file.as_fd(), b"system.posix_acl_access", &test_access_acl());
     set_test_mtime(&linked_path, 1_700_001_100, 123_000_000);
     drop(linked_file);
     fs::hard_link(&linked_path, fixture.0.join("right/beta")).unwrap();
@@ -747,8 +734,8 @@ fn public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks() {
     let source_readonly_metadata = path_metadata(&readonly_path);
     assert_eq!(source_linked_metadata.mode, 0o640);
     assert_eq!(source_readonly_metadata.mode, 0o444);
-    let source_xattr = user_xattr.then(|| get_test_xattr(&linked_path, b"user.ish-fs-engine-parity"));
-    let source_acl = acl_set.then(|| get_test_xattr(&linked_path, b"system.posix_acl_access"));
+    let source_xattr = Some(get_test_xattr(&linked_path, b"user.ish-fs-engine-parity"));
+    let source_acl = Some(get_test_xattr(&linked_path, b"system.posix_acl_access"));
     let expected_streamed_bytes = (linked_bytes.len() + readonly_bytes.len()) as u64;
 
     let (automatic_progress, _) = execute_copy_strategy(&fixture, "out-auto", false, None);
@@ -790,9 +777,9 @@ fn public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks() {
     }
 
     let snapshots = [
-        strategy_snapshot(&fixture, "out-auto", user_xattr, acl_set),
-        strategy_snapshot(&fixture, "out-native", user_xattr, acl_set),
-        strategy_snapshot(&fixture, "out-buffered", user_xattr, acl_set),
+        strategy_snapshot(&fixture, "out-auto", true, true),
+        strategy_snapshot(&fixture, "out-native", true, true),
+        strategy_snapshot(&fixture, "out-buffered", true, true),
     ];
     assert_eq!(snapshots[0], snapshots[1]);
     assert_eq!(snapshots[1], snapshots[2]);
