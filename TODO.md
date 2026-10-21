@@ -1,5 +1,5 @@
 Prefix: ISH
-Next: 59
+Next: 60
 
 ### ISH-26 · P2 · A trusted `.envrc` runs unhashed files through `source_env`, `source_up` and `dotenv`
 
@@ -97,3 +97,12 @@ Next: 59
 - **Effort:** S (hours)
 
 
+
+### ISH-59 · P4 · The prompt's `NoRepo` cache path has no test
+
+- **Area:** Tests
+- **Where:** `src/prompt.rs` (`GitCache::NoRepo`, `resolve_git`), `tests/integration.rs`
+- **Problem:** ISH-57 deleted `prompt_git_cache_no_repo_reuse`, which only asserted `ends_with(" $ ")`. A meaningful version needs a directory with no repository above it, and the test scratch directories sit under the checkout's `.git`, so nothing exercises the `NoRepo` cache reuse and invalidation.
+- **Recommendation:** Add a unit test in `src/prompt.rs` that builds the cache state directly (or a scratch root outside any repository) and checks that a second render in the same directory skips the ancestor walk and that `invalidate_git` clears it.
+- **Fix with:** test-audit
+- **Effort:** S (hours)
