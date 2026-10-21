@@ -2884,6 +2884,9 @@ fn spawn_external(
                     STOPPED_JOB.with(|cell| {
                         *cell.borrow_mut() = Some((child_id, cmd, saved_termios));
                     });
+                }
+                term::restore_startup_termios();
+                if status.is_some_and(|status| status.stopped()) {
                     Err(epsh::error::ShellError::Stopped {
                         pid: child_id,
                         pgid: child_id,

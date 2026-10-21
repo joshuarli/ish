@@ -3962,6 +3962,35 @@ fn job_suspend_and_resume() {
     );
 }
 
+fn stty_state(output: &str) -> String {
+    output
+        .split(|c: char| !(c.is_ascii_hexdigit() || c == ':'))
+        .find(|token| token.matches(':').count() >= 8)
+        .unwrap_or_else(|| panic!("no `stty -g` state in {output:?}"))
+        .to_string()
+}
+
+#[test]
+fn killed_child_in_raw_mode_does_not_leak_into_the_next_command() {
+    let sh = PtyShell::spawn();
+    let baseline = stty_state(&sh.run_command("stty -g"));
+    sh.run_command("sh -c 'stty raw -echo; kill -KILL $$'");
+    let next = stty_state(&sh.run_command("stty -g"));
+    assert_eq!(next, baseline, "killed child's raw mode reached the next command");
+}
+
+#[test]
+fn stopped_child_in_raw_mode_restores_baseline_then_fg_restores_its_own_mode() {
+    let sh = PtyShell::spawn();
+    let baseline = stty_state(&sh.run_command("stty -g"));
+    sh.run_command("sh -c 'stty raw -echo; kill -STOP $$'");
+    let at_stop = stty_state(&sh.run_command("stty -g"));
+    assert_eq!(at_stop, baseline, "stopped child's raw mode reached the prompt");
+    sh.run_command("fg");
+    let after_fg = stty_state(&sh.run_command("stty -g"));
+    assert_eq!(after_fg, baseline, "resumed child's raw mode reached the next command after fg");
+}
+
 fn clipboard_writes(raw: &str) -> Vec<Vec<u8>> {
     const PREFIX: &str = "\x1b]52;c;";
     let mut writes = Vec::new();

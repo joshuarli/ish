@@ -24,15 +24,19 @@ pub fn install_panic_hook() {
     }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if let Some(termios) = STARTUP_TERMIOS.get() {
+        if STARTUP_TERMIOS.get().is_some() {
             let stdout = stdout();
             let _ = rustix::io::write(stdout, b"\x1b[?2004l\x1b[?25h");
-            let stdin = stdin();
-            let _ =
-                rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Now, termios);
+            restore_startup_termios();
         }
         previous(info);
     }));
+}
+
+pub fn restore_startup_termios() {
+    if let Some(termios) = STARTUP_TERMIOS.get() {
+        let _ = rustix::termios::tcsetattr(stdin(), rustix::termios::OptionalActions::Now, termios);
+    }
 }
 
 pub struct RawMode {

@@ -68,15 +68,6 @@ Next: 45
 - **Fix with:** api-surface-and-module-boundaries
 - **Effort:** L (weeks)
 
-### ISH-37 · P3 · A child that stops or dies in raw mode may leave its terminal state as the shell's baseline
-
-- **Area:** Operability
-- **Where:** `src/main.rs:2808-2810`, `src/term.rs:35-46`, `src/term.rs:56-67`, `src/job.rs:14-16`
-- **Problem:** `RawMode::enable` captures whatever termios is current as `orig`, and `drop` restores it before the next command. `STARTUP_TERMIOS` is used only by the panic hook. After a child stops or is killed while holding raw mode, the next prompt's `orig` is that raw state and later commands run under it. Traced from code, not executed in a PTY; programs such as vim restore termios themselves on SIGTSTP, which lowers likelihood.
-- **Recommendation:** Capture the baseline once at startup, apply it after every foreground wait in `spawn_external` and `resume_job`, and restore a job's own saved termios only for `fg`.
-- **Fix with:** os-boundaries
-- **Effort:** S (hours)
-
 ### ISH-38 · P3 · Foreground wait, handoff and signal paths drop errors
 
 - **Area:** Errors

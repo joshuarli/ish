@@ -55,6 +55,7 @@ pub fn resume_job(job: &mut Option<Job>, last_output: &mut crate::capture::Outpu
                 termios: new_termios.unwrap_or(j.termios),
                 capture: j.capture,
             });
+            crate::term::restore_startup_termios();
             return 148;
         }
         Ok(Some((_, status))) if status.exited() => status.exit_status().unwrap_or(1),
@@ -63,6 +64,7 @@ pub fn resume_job(job: &mut Option<Job>, last_output: &mut crate::capture::Outpu
         }
         _ => 1,
     };
+    crate::term::restore_startup_termios();
     if let Some(capture) = j.capture {
         capture.finish_into(last_output);
     }
