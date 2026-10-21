@@ -87,15 +87,6 @@ Next: 53
 - **Fix with:** api-surface-and-module-boundaries
 - **Effort:** L (weeks)
 
-### ISH-49 · P4 · Per-key history search allocation in `search_limited` is unmeasured, and no benchmark reaches the key handler
-
-- **Area:** Performance
-- **Where:** `src/history.rs` (`search_limited`), `benches/bench.rs`
-- **Problem:** `search_limited` allocates a `Vec<RankKey>` sized to the limit on every search, which is likely a larger per-key allocation than the two removed by ISH-43. The existing history benchmarks call the search directly and cannot show a change in the key handler, so ISH-43 was closed on code reading, not measurement.
-- **Recommendation:** Add a benchmark or counting-allocator test that drives the key handler, then reuse the rank buffer if it shows up.
-- **Fix with:** make-it-fast
-- **Effort:** S (hours)
-
 ### ISH-50 · P4 · Small dead and stale leftovers: `RootAnchor::modified_time`, the legacy prompt label, an empty `~user` branch
 
 - **Area:** Dead code
