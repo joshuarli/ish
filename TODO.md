@@ -21,15 +21,6 @@ Next: 45
 - **Effort:** M (days)
 - **Design:** [Builtin allowlist](docs/rfc/ISH-24-builtin-allowlist.md)
 
-### ISH-28 · P2 · Prompt Git inspection blocks on repo-controlled paths and misses the cache for worktrees
-
-- **Area:** Security
-- **Where:** `src/prompt.rs:189-192`, `src/prompt.rs:290-309`, `src/prompt.rs:146-149`, `src/prompt.rs:188-198`
-- **Problem:** `read_head_into` runs on every prompt with a blocking, symlink-following `File::open`. Reproduced in a PTY: after `cd` into a directory whose `.git/HEAD` is a FIFO, ish never returned to the prompt, while a control directory with a regular `HEAD` worked. An extracted archive or untrusted checkout can freeze the shell on `cd`. Separately, `cache_git_dir` sets the cache root to the parent of the resolved git dir, which for a worktree or submodule `.git` file is `.git/worktrees` or `.git/modules`; `cwd.starts_with(root)` never holds, so every prompt walks ancestors and rereads the files.
-- **Recommendation:** Open with `O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC` through rustix, `fstat`, require a regular file, then read. Cache the directory that contains the `.git` entry.
-- **Fix with:** os-boundaries
-- **Effort:** S (hours)
-
 ### ISH-5 · P2 · Stopped pipelines disappear from foreground job control
 
 - **Area:** Concurrency

@@ -158,8 +158,8 @@ impl Prompt {
                 if from.starts_with(cwd) {
                     return false;
                 }
-                if let Some(git_dir) = find_git_dir(cwd, Some(from), None) {
-                    return self.cache_git_dir(git_dir, cwd);
+                if let Some(location) = find_git_dir(cwd, Some(from), None) {
+                    return self.cache_git_dir(location);
                 }
                 return false;
             }
@@ -172,9 +172,7 @@ impl Prompt {
     fn resolve_git(&mut self, cwd: &Path) -> bool {
         let mut checked_markers = Vec::new();
         match find_git_dir(cwd, None, Some(&mut checked_markers)) {
-            Some(git_dir) => {
-                self.cache_git_dir(git_dir, cwd)
-            }
+            Some(location) => self.cache_git_dir(location),
             None => {
                 self.git = GitCache::NoRepo {
                     from: cwd.to_path_buf(),
@@ -185,13 +183,12 @@ impl Prompt {
         }
     }
 
-    fn cache_git_dir(&mut self, git_dir: PathBuf, cwd: &Path) -> bool {
-        let root = git_dir.parent().unwrap_or(cwd).to_path_buf();
-        let head_path = git_dir.join("HEAD");
+    fn cache_git_dir(&mut self, location: GitLocation) -> bool {
+        let head_path = location.git_dir.join("HEAD");
         self.branch_buf.clear();
         let found = read_head_into(&head_path, &mut self.branch_buf);
         self.git = GitCache::Repo {
-            root,
+            root: location.root,
             head: head_path,
         };
         found
@@ -253,17 +250,25 @@ fn shorten_pwd_into(pwd: &str, home: &str, out: &mut String) {
 
 // -- Git helpers --
 
+struct GitLocation {
+    root: PathBuf,
+    git_dir: PathBuf,
+}
+
 fn find_git_dir(
     start: &Path,
     ceiling: Option<&Path>,
     mut checked_markers: Option<&mut Vec<PathBuf>>,
-) -> Option<PathBuf> {
+) -> Option<GitLocation> {
     let mut dir = start.to_path_buf();
     loop {
         let dot_git = dir.join(".git");
         if let Ok(meta) = std::fs::symlink_metadata(&dot_git) {
             if meta.is_dir() {
-                return Some(dot_git);
+                return Some(GitLocation {
+                    root: dir,
+                    git_dir: dot_git,
+                });
             }
             if meta.is_file() {
                 let git_dir = resolve_gitdir_file(&dot_git);
@@ -272,7 +277,7 @@ fn find_git_dir(
                 {
                     markers.push(dot_git);
                 }
-                return git_dir;
+                return git_dir.map(|git_dir| GitLocation { root: dir, git_dir });
             }
         }
         if let Some(markers) = checked_markers.as_deref_mut() {
@@ -287,10 +292,24 @@ fn find_git_dir(
     }
 }
 
+fn read_regular_file_prefix(path: &Path, buf: &mut [u8]) -> Option<usize> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let stat = rustix::fs::fstat(&fd).ok()?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return None;
+    }
+    rustix::io::read(&fd, buf).ok()
+}
+
 fn resolve_gitdir_file(path: &Path) -> Option<PathBuf> {
-    use std::io::Read;
     let mut buf = [0u8; 512];
-    let n = std::fs::File::open(path).ok()?.read(&mut buf).ok()?;
+    let n = read_regular_file_prefix(path, &mut buf)?;
     let raw = std::str::from_utf8(&buf[..n]).ok()?.trim();
     let target = Path::new(raw.strip_prefix("gitdir: ")?);
     Some(if target.is_absolute() {
@@ -301,11 +320,9 @@ fn resolve_gitdir_file(path: &Path) -> Option<PathBuf> {
 }
 
 fn read_head_into(head_path: &Path, out: &mut String) -> bool {
-    use std::io::Read;
     let mut buf = [0u8; 256];
-    let n = match std::fs::File::open(head_path).and_then(|mut f| f.read(&mut buf)) {
-        Ok(n) => n,
-        Err(_) => return false,
+    let Some(n) = read_regular_file_prefix(head_path, &mut buf) else {
+        return false;
     };
     let line = match std::str::from_utf8(&buf[..n]) {
         Ok(s) => s.trim_end(),
@@ -453,6 +470,75 @@ mod tests {
             assert_eq!(read_head_into(&head, &mut out), expected.is_some());
             assert_eq!(out.as_str(), expected.unwrap_or(""));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".work/tmp")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn fifo_head_returns_without_branch() {
+        let dir = scratch_dir("head-fifo");
+        let head = dir.join("HEAD");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &head,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = head.clone();
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            let found = read_head_into(&reader, &mut out);
+            let _ = tx.send((found, out));
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        if result.is_err() {
+            drop(std::fs::OpenOptions::new().write(true).open(&head));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result.expect("read_head_into blocked on a FIFO"), (false, String::new()));
+    }
+
+    #[test]
+    fn symlinked_head_is_unavailable() {
+        let dir = scratch_dir("head-symlink");
+        std::fs::write(dir.join("real"), "ref: refs/heads/main\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("HEAD")).unwrap();
+        let mut out = String::new();
+        assert!(!read_head_into(&dir.join("HEAD"), &mut out));
+        assert!(out.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worktree_gitdir_file_hits_cache_below_repo_root() {
+        let dir = scratch_dir("worktree-cache");
+        let store = dir.join("main/.git/worktrees/wt");
+        let repo = dir.join("wt");
+        let cwd = repo.join("src/deep");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(store.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+        let dot_git = repo.join(".git");
+        std::fs::write(&dot_git, format!("gitdir: {}\n", store.display())).unwrap();
+
+        let mut prompt = Prompt::with_identity("u", "/home/u");
+        assert!(prompt.git_branch_into(&cwd));
+        assert_eq!(prompt.branch_buf, "feature");
+
+        std::fs::remove_file(&dot_git).unwrap();
+        assert!(prompt.git_branch_into(&cwd));
+        assert_eq!(prompt.branch_buf, "feature");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
