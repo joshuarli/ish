@@ -2,7 +2,7 @@
 
 
 use crate::fsutil::{open_directory_at, stat_entry_at};
-use crate::{DirectoryToken, EntryBatch, RootAnchor, ScanExclusions, ScanQueueMetrics};
+use crate::{DirectoryToken, EntryBatch, RootAnchor};
 use fdu_core::{EntryType, ExclusionReason, FileIdentity, ModifiedTime, NodeStatus, ScanEntry, ScanEvent};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::cell::RefCell;
@@ -77,12 +77,11 @@ pub(crate) struct IndexedScanLimits {
 
 struct ScanEventSender<'a> {
     sender: &'a SyncSender<ScanEvent>,
-    metrics: &'a ScanQueueMetrics,
 }
 
 impl ScanEventSender<'_> {
     fn send(&self, event: ScanEvent) -> Result<(), ScanEvent> {
-        self.metrics.send(self.sender, event)
+        self.sender.send(event).map_err(|error| error.0)
     }
 }
 
@@ -126,7 +125,6 @@ struct IndexedDirectoryTask {
     source: IndexedDirectorySource,
     lineage: Arc<DirectoryLineage>,
     token: DirectoryToken,
-    exclusion_node: Option<usize>,
 }
 
 const NO_PARENT: u32 = u32::MAX;
@@ -487,7 +485,6 @@ struct ScanContext<'a> {
     seen_directories: &'a SeenDirectories,
     next_token: &'a AtomicUsize,
     root_mount: &'a MountIdentity,
-    exclusions: &'a ScanExclusions,
     hints: ScanHints,
     progress: &'a ScanProgress<'a>,
     queue: &'a IndexedWorkQueue,
@@ -594,15 +591,12 @@ fn take_batch(returned_batches: &Mutex<Receiver<EntryBatch>>) -> EntryBatch {
 
 pub(crate) fn scan_indexed(
     anchor: &RootAnchor,
-    exclusions: &ScanExclusions,
     sender: SyncSender<ScanEvent>,
     returned_batches: Receiver<EntryBatch>,
     cancelled: Arc<AtomicBool>,
-    metrics: ScanQueueMetrics,
 ) {
     let event_sender = ScanEventSender {
         sender: &sender,
-        metrics: &metrics,
     };
     let fail = |message: String| {
         let _ = event_sender.send(ScanEvent::Failed { message });
@@ -655,7 +649,6 @@ pub(crate) fn scan_indexed(
         seen_directories: &seen_directories,
         next_token: &next_token,
         root_mount: &root_mount,
-        exclusions,
         hints: scan_hints(anchor.as_fd()),
         progress: &progress,
         queue: &queue,
@@ -678,7 +671,6 @@ pub(crate) fn scan_indexed(
             }),
             lineage: Arc::new(DirectoryLineage { parent: None, name: Vec::new(), identity: root_identity }),
             token: DirectoryToken(0),
-            exclusion_node: exclusions.root_node(),
         };
         if !run_task_tree(root_task, context, &mut Outbox::new()) {
             queue.cancel();
@@ -842,7 +834,6 @@ fn classify_entry(
     directory: BorrowedFd<'_>,
     lineage: &Arc<DirectoryLineage>,
     token: DirectoryToken,
-    exclusion_node: Option<usize>,
     context: &ScanContext<'_>,
     outbox: &mut Outbox,
 ) -> ClassifiedEntry {
@@ -954,7 +945,6 @@ fn classify_entry(
                 identity: facts.identity,
             }),
             token: child_token,
-            exclusion_node: exclusion_node.filter(|node| context.exclusions.has_children(*node)),
         });
     }
     found
@@ -1001,14 +991,7 @@ fn scan_indexed_directory_with_buffer(
             continue;
         }
 
-        let child_exclusion_node = context.exclusions.child(task.exclusion_node, name_bytes);
-        if child_exclusion_node.is_some_and(|node| context.exclusions.excludes(node)) {
-            
-            complete = false;
-            continue;
-        }
-
-        let mut found = classify_entry(&entry, directory, &task.lineage, token, child_exclusion_node, context, outbox);
+        let mut found = classify_entry(&entry, directory, &task.lineage, token, context, outbox);
         if found.state != NodeStatus::Complete {
             complete = false;
         }

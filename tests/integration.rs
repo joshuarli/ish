@@ -968,11 +968,11 @@ fn prompt_display_len_utf8() {
 fn prompt_render_status_colors() {
     let mut p = prompt::Prompt::new();
     // status 0 → green, status 1 → red
-    let r0 = p.render(0);
+    let r0 = p.render_with_state(0, "/", false);
     assert!(r0.contains("\x1b[38;5;10m")); // bright green
     assert!(r0.ends_with(" $ "));
 
-    let r1 = p.render(1);
+    let r1 = p.render_with_state(1, "/", false);
     assert!(r1.contains("\x1b[38;5;1m")); // red
     assert!(r1.ends_with(" $ "));
 }
@@ -1007,18 +1007,6 @@ fn prompt_git_branch_in_git_repo() {
     // We can't predict the exact branch name, but it should be there
     // At minimum, the prompt should not crash
     assert!(rendered.ends_with(" $ "));
-}
-
-#[test]
-fn prompt_render_multiple() {
-    // Exercise the render path multiple times — exercises PWD caching
-    // and git branch detection. Can't assert exact equality due to
-    // env var races in parallel tests; just verify no panics.
-    let mut p = prompt::Prompt::new();
-    let r1 = p.render(0);
-    assert!(r1.ends_with(" $ "));
-    let r2 = p.render(1);
-    assert!(r2.ends_with(" $ "));
 }
 
 // ---------------------------------------------------------------------------

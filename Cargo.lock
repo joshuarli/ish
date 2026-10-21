@@ -106,7 +106,6 @@ dependencies = [
  "fdu-core",
  "hashbrown",
  "libc",
- "rayon",
  "rustix",
 ]
 

@@ -102,14 +102,6 @@ impl Prompt {
         out.push_str(" $ ");
     }
 
-    /// Legacy render — allocates. Used by benchmarks and tests.
-    pub fn render(&mut self, last_status: i32) -> String {
-        let pwd = std::env::current_dir()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.render_with_state(last_status, &pwd, false)
-    }
-
     /// Legacy render helper with explicit shell-owned prompt state.
     pub fn render_with_state(&mut self, last_status: i32, pwd: &str, denv_dirty: bool) -> String {
         let mut out = String::with_capacity(128);

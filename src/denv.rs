@@ -1541,23 +1541,6 @@ fn print_summary<'a>(items: impl Iterator<Item = (char, &'a str)>) {
     }
 }
 
-/// Benchmark-only compatibility helper for the old export/unset text parser.
-/// Returns the number of directives parsed.
-pub fn apply_bash_output_bench(output: &str) -> usize {
-    let mut count = 0;
-    for line in output.lines() {
-        let line = line.trim_end_matches(';');
-        if let Some(rest) = line.strip_prefix("export ") {
-            if rest.contains('=') {
-                count += 1;
-            }
-        } else if line.strip_prefix("unset ").is_some() {
-            count += 1;
-        }
-    }
-    count
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1937,12 +1920,6 @@ mod tests {
         assert_eq!(parsed.0, 1);
         assert_eq!(parsed.1, 2);
         assert_eq!(parsed.2, "/tmp/path with spaces");
-    }
-
-    #[test]
-    fn apply_bash_output_bench_counts_directives() {
-        let count = apply_bash_output_bench("export A='1';\nunset B;\nexport C='3';");
-        assert_eq!(count, 3);
     }
 
     #[test]

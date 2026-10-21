@@ -2,46 +2,23 @@ use std::borrow::Cow;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 pub use fdu_core::{DirectoryToken, EntryBatch, FileIdentity, ModifiedTime, ScanEvent};
-pub use exclusions::ScanExclusions;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("fdu supports Linux and macOS");
 
 mod fsutil;
-mod exclusions;
 mod indexed;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-
-
-pub struct ScanOptions {
-    pub path: PathBuf,
-    pub apparent: bool,
-}
-
-
-pub struct TopLevelDirectory {
-    pub name: std::ffi::OsString,
-    pub disk_size: u64,
-    pub exclusion: Option<fdu_core::ExclusionReason>,
-}
-
-
-pub struct ScanReport {
-    pub directories: Vec<TopLevelDirectory>,
-    pub skipped_entries: usize,
-    pub mount_boundaries: usize,
-    pub unsupported_aliases: usize,
-}
 
 #[derive(Clone)]
 pub struct RootAnchor {
@@ -66,88 +43,18 @@ impl RootAnchor {
     }
 }
 
-#[derive(Clone)]
-pub struct ScanQueueMetrics {
-    capacity: usize,
-    enabled: bool,
-    outstanding: Arc<std::sync::atomic::AtomicUsize>,
-    high_water: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl Default for ScanQueueMetrics {
-    fn default() -> Self {
-        Self::new(0, false)
-    }
-}
-
-impl ScanQueueMetrics {
-    pub fn new(capacity: usize, enabled: bool) -> Self {
-        Self {
-            capacity,
-            enabled,
-            outstanding: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            high_water: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
-    }
-
-    pub fn event_queue_high_water(&self) -> usize {
-        self.high_water.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub(crate) fn send(&self, sender: &SyncSender<ScanEvent>, event: ScanEvent) -> Result<(), ScanEvent> {
-        if self.enabled {
-            let outstanding = self.outstanding.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            self.high_water
-                .fetch_max(outstanding.min(self.capacity), std::sync::atomic::Ordering::Relaxed);
-        }
-        match sender.send(event) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if self.enabled {
-                    self.decrement_outstanding();
-                }
-                Err(error.0)
-            }
-        }
-    }
-
-    
-    pub fn event_received(&self) {
-        if self.enabled {
-            self.decrement_outstanding();
-        }
-    }
-
-    fn decrement_outstanding(&self) {
-        let mut current = self.outstanding.load(std::sync::atomic::Ordering::Relaxed);
-        while current != 0 {
-            match self.outstanding.compare_exchange_weak(
-                current,
-                current - 1,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(updated) => current = updated,
-            }
-        }
-    }
-}
-
-pub fn open_root(path: &std::path::Path) -> io::Result<RootAnchor> {
-    anchor_root(path, fsutil::open_directory(path)?)
-}
-
-
-
-
-
-pub fn open_root_no_follow(path: &std::path::Path) -> io::Result<RootAnchor> {
+pub fn open_root_no_follow(path: &Path) -> io::Result<RootAnchor> {
     let open_path = without_trailing_slashes(path);
-    anchor_root(path, fsutil::open_directory_no_follow(open_path.as_ref())?)
+    let fd = fsutil::open_directory_no_follow(open_path.as_ref())?;
+    let (identity, link_count, modified_time) = fsutil::identity_link_count_and_modified_time(fd.as_fd())?;
+    Ok(RootAnchor {
+        fd: Arc::new(fd),
+        name: path.as_os_str().as_bytes().to_vec(),
+        identity,
+        modified_time,
+        link_count,
+    })
 }
-
-
 
 fn without_trailing_slashes(path: &Path) -> Cow<'_, Path> {
     let bytes = path.as_os_str().as_bytes();
@@ -162,98 +69,11 @@ fn without_trailing_slashes(path: &Path) -> Cow<'_, Path> {
     }
 }
 
-fn anchor_root(path: &std::path::Path, fd: OwnedFd) -> io::Result<RootAnchor> {
-    use std::os::unix::ffi::OsStrExt;
-    let (identity, link_count, modified_time) = fsutil::identity_link_count_and_modified_time(fd.as_fd())?;
-    Ok(RootAnchor {
-        fd: Arc::new(fd),
-        name: path.as_os_str().as_bytes().to_vec(),
-        identity,
-        modified_time,
-        link_count,
-    })
-}
-
-pub fn scan(options: &ScanOptions) -> io::Result<ScanReport> {
-    scan_with_exclusions(options, &ScanExclusions::default())
-}
-
-
-pub fn scan_with_exclusions(options: &ScanOptions, exclusions: &ScanExclusions) -> io::Result<ScanReport> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::scan(&options.path, options.apparent, exclusions)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos::scan(&options.path, options.apparent, exclusions)
-    }
-}
-
-
 pub fn start_indexed_scan(
     root: RootAnchor,
     sender: SyncSender<ScanEvent>,
     returned_batches: Receiver<EntryBatch>,
     cancelled: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
-    start_indexed_scan_with_exclusions_and_metrics(
-        root,
-        ScanExclusions::default(),
-        sender,
-        returned_batches,
-        cancelled,
-        ScanQueueMetrics::default(),
-    )
+    thread::spawn(move || indexed::scan_indexed(&root, sender, returned_batches, cancelled))
 }
-
-
-pub fn start_indexed_scan_with_exclusions(
-    root: RootAnchor,
-    exclusions: ScanExclusions,
-    sender: SyncSender<ScanEvent>,
-    returned_batches: Receiver<EntryBatch>,
-    cancelled: Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    start_indexed_scan_with_exclusions_and_metrics(
-        root,
-        exclusions,
-        sender,
-        returned_batches,
-        cancelled,
-        ScanQueueMetrics::default(),
-    )
-}
-
-
-pub fn start_indexed_scan_with_metrics(
-    root: RootAnchor,
-    sender: SyncSender<ScanEvent>,
-    returned_batches: Receiver<EntryBatch>,
-    cancelled: Arc<AtomicBool>,
-    metrics: ScanQueueMetrics,
-) -> JoinHandle<()> {
-    start_indexed_scan_with_exclusions_and_metrics(
-        root,
-        ScanExclusions::default(),
-        sender,
-        returned_batches,
-        cancelled,
-        metrics,
-    )
-}
-
-
-pub fn start_indexed_scan_with_exclusions_and_metrics(
-    root: RootAnchor,
-    exclusions: ScanExclusions,
-    sender: SyncSender<ScanEvent>,
-    returned_batches: Receiver<EntryBatch>,
-    cancelled: Arc<AtomicBool>,
-    metrics: ScanQueueMetrics,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        indexed::scan_indexed(&root, &exclusions, sender, returned_batches, cancelled, metrics)
-    })
-}
-

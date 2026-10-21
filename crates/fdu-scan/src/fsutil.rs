@@ -137,10 +137,6 @@ pub(crate) fn open_directory_at(
     with_descriptor_retry(|| retry(|| fs::openat(parent, name, DIRECTORY_FLAGS, Mode::empty())))
 }
 
-pub(crate) fn open_directory(path: &std::path::Path) -> io::Result<OwnedFd> {
-    retry(|| fs::open(path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()))
-}
-
 pub(crate) fn open_directory_no_follow(path: &std::path::Path) -> io::Result<OwnedFd> {
     retry(|| fs::open(path, DIRECTORY_FLAGS, Mode::empty()))
 }

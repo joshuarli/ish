@@ -59,15 +59,6 @@ Next: 45
 - **Fix with:** single-source-of-truth, durable-state
 - **Effort:** L (weeks)
 
-### ISH-33 · P3 · Unused scan engine and test-only API ship in production code
-
-- **Area:** Dead code
-- **Where:** `crates/fdu-scan/src/lib.rs:177-190`, `crates/fdu-scan/src/linux.rs:346-890`, `crates/fdu-scan/src/macos.rs`, `crates/fdu-scan/src/exclusions.rs`, `src/denv.rs:1474-1489`, `src/prompt.rs:105-118`
-- **Problem:** The only consumer of `fdu-scan` is `src/trash.rs:3`, which imports `RootAnchor`, `open_root_no_follow` and `start_indexed_scan`. `rg` finds no use of `scan`, `scan_with_exclusions`, `ScanOptions` or `ScanExclusions` outside the crate, leaving about 2k lines, a second traversal implementation and its unsafe code and dependencies. `apply_bash_output_bench` has no caller outside its unit test, and `Prompt::render` is labelled legacy and used only by tests. `indexed.rs` shares platform helpers with the dead code, so removal needs care.
-- **Recommendation:** Delete the one-shot scan entry points, exclusions and unused wrappers, then prune dependencies. Delete `apply_bash_output_bench` and rename or delete the legacy prompt render.
-- **Fix with:** dead-code-archaeology
-- **Effort:** M (days)
-
 ### ISH-34 · P3 · `main.rs` holds the loop, editor, spawn path and diagnostics in one 3000-line file
 
 - **Area:** Architecture
