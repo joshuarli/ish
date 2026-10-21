@@ -135,6 +135,11 @@ pub fn init(epsh: &mut epsh::eval::Shell) -> Session {
     }
     let _ = vars.set("__DENV_SHELL", "bash");
     vars.export("__DENV_SHELL");
+    if let Ok(data_dir) = &data_dir
+        && let Err(err) = remove_dead_shell_records(data_dir)
+    {
+        eprintln!("denv: {err}");
+    }
     Session { data_dir, record_id }
 }
 
@@ -830,6 +835,60 @@ fn clear_active(data_dir: &Path, record_id: &str) -> Result<(), String> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(format!("failed to remove active file: {err}")),
     }
+}
+
+fn record_owner(name: &str) -> Option<rustix::process::Pid> {
+    let (rest, temporary) = match name.strip_prefix(".active_") {
+        Some(rest) => (rest.strip_suffix(".tmp")?, true),
+        None => (name.strip_prefix("active_")?, false),
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (pid, suffix) = rest.split_at(digits);
+    let suffix_ok = match suffix.bytes().next() {
+        None => !temporary,
+        Some(b'-') => true,
+        Some(b'.') => temporary,
+        Some(_) => false,
+    };
+    if !suffix_ok {
+        return None;
+    }
+    rustix::process::Pid::from_raw(pid.parse().ok()?)
+}
+
+fn shell_is_alive(pid: rustix::process::Pid) -> bool {
+    !matches!(
+        rustix::process::test_kill_process(pid),
+        Err(rustix::io::Errno::SRCH)
+    )
+}
+
+fn remove_dead_shell_records(data_dir: &Path) -> Result<(), String> {
+    let entries = match fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("failed to list active records: {err}")),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to list active records: {err}"))?;
+        let Some(owner) = entry.file_name().to_str().and_then(record_owner) else {
+            continue;
+        };
+        if shell_is_alive(owner) {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "failed to remove stale active record {}: {err}",
+                    entry.path().display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_reserved_dotenv_key(key: &str) -> bool {
@@ -1885,6 +1944,49 @@ mod tests {
         drop(session);
 
         assert!(active_record_names(&data).is_empty());
+    }
+
+    #[test]
+    fn startup_removes_records_of_dead_shells_and_keeps_live_ones() {
+        let _process_env = ProcessEnvGuard::new();
+        let tmp = TempDir::new("ish_denv_stale_records");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let live = std::process::id();
+        let dead = i32::MAX - 1;
+        let token = "00112233445566778899aabbccddeeff";
+        let stale = [
+            format!("active_{dead}-{token}"),
+            format!(".active_{dead}-{token}.3.tmp"),
+            format!("active_{dead}"),
+            format!(".active_{dead}.7.tmp"),
+        ];
+        let kept = [
+            format!("active_{live}-{token}"),
+            format!(".active_{live}-{token}.3.tmp"),
+            format!("active_{live}"),
+            "active_notapid".to_string(),
+            format!("allow_{dead}"),
+        ];
+        for name in stale.iter().chain(&kept) {
+            std::fs::write(data.join(name), "x").unwrap();
+        }
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut epsh = denv_test_shell(&data, &project, &[]);
+
+        let session = init(&mut epsh);
+
+        for name in &stale {
+            assert!(!data.join(name).exists(), "{name} should be removed");
+        }
+        for name in &kept {
+            assert!(data.join(name).exists(), "{name} should be kept");
+        }
+        let own = active_path(&data, session.record_id().unwrap());
+        std::fs::write(&own, "x").unwrap();
+        drop(session);
+        assert!(!own.exists());
     }
 
     #[test]

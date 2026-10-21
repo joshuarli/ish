@@ -316,11 +316,11 @@ fn read_snapshot(
     file.seek(SeekFrom::Start(cursor.offset))?;
     let mut reader = BufReader::with_capacity(64 * 1024, &mut *file);
     let mut payload = Vec::new();
-    let mut discarded_complete_frame = false;
+    let mut discarded_tail = false;
     while cursor.offset < metadata.len() {
         let remaining = metadata.len() - cursor.offset;
         if remaining < FRAME_HEADER_SIZE {
-            recover_tail(reader.get_ref(), cursor.offset)?;
+            discarded_tail = true;
             break;
         }
         let mut frame_header = [0u8; FRAME_HEADER_SIZE as usize];
@@ -330,7 +330,7 @@ fn read_snapshot(
         let length_crc = u32::from_le_bytes(frame_header[8..12].try_into().unwrap());
         if crc32(&length_bytes) != length_crc {
             if frame_header.iter().all(|&b| b == 0) && rest_is_zero(&mut reader)? {
-                recover_tail(reader.get_ref(), cursor.offset)?;
+                discarded_tail = true;
                 break;
             }
             return Err(corrupt(cursor.offset, "frame length checksum mismatch"));
@@ -342,7 +342,7 @@ fn read_snapshot(
             .checked_add(length)
             .ok_or_else(|| invalid("frame length overflow"))?;
         if frame_size > remaining {
-            recover_tail(reader.get_ref(), cursor.offset)?;
+            discarded_tail = true;
             break;
         }
         let length =
@@ -355,7 +355,7 @@ fn read_snapshot(
         let checksum = u32::from_le_bytes(frame_header[12..].try_into().unwrap());
         if crc32(&payload) != checksum {
             if frame_size == remaining {
-                discarded_complete_frame = true;
+                discarded_tail = true;
                 break;
             }
             return Err(corrupt(cursor.offset, "frame payload checksum mismatch"));
@@ -377,7 +377,7 @@ fn read_snapshot(
             occurrences.push(occurrence);
         }
     }
-    if discarded_complete_frame {
+    if discarded_tail {
         let kept = cursor.offset;
         let next = current
             .checked_add(1)
@@ -408,11 +408,6 @@ fn rest_is_zero(reader: &mut impl Read) -> io::Result<bool> {
             return Ok(false);
         }
     }
-}
-
-fn recover_tail(file: &File, offset: u64) -> io::Result<()> {
-    file.set_len(offset)?;
-    file.sync_all()
 }
 
 fn decode(payload: &[u8]) -> io::Result<Occurrence> {

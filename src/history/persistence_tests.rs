@@ -414,7 +414,7 @@ fn incomplete_final_frames_recover_the_valid_prefix() {
             .write_all(&tail)
             .unwrap();
         history.sync().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(&path).unwrap()[16..], original[16..]);
         history.add_in_dir("next", None).unwrap();
         assert_eq!(fixture.occurrences(), 2);
     }
@@ -466,6 +466,48 @@ fn recovering_an_observed_final_frame_invalidates_existing_readers() {
     assert_eq!(observer.prefix_search("second", 0), None);
     assert_eq!(observer.prefix_search("latest", 0), Some("latest"));
     assert_eq!(observer.session_get(0), None);
+}
+
+fn observed_final_frame_damage_invalidates_existing_readers(damage: impl Fn(&mut Vec<u8>, usize)) {
+    let fixture = Fixture::new();
+    let (path, mut bytes, first_end) = two_frame_log(&fixture);
+    let mut observer = History::load_from(fixture.path()).unwrap();
+    assert_eq!(observer.len(), 2);
+    damage(&mut bytes, first_end);
+    fs::write(&path, &bytes).unwrap();
+
+    let mut recovered = History::load_from(fixture.path()).unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered.generation, 1);
+    recovered.add_in_dir("latest", None).unwrap();
+
+    observer.sync().unwrap();
+    assert_eq!(observer.len(), 2);
+    assert_eq!(observer.get(0), "first");
+    assert_eq!(observer.get(1), "latest");
+    assert_eq!(observer.prefix_search("second", 0), None);
+    assert_eq!(observer.prefix_search("latest", 0), Some("latest"));
+}
+
+#[test]
+fn zeroed_final_frame_invalidates_existing_readers() {
+    observed_final_frame_damage_invalidates_existing_readers(|bytes, first_end| {
+        bytes[first_end..].fill(0);
+    });
+}
+
+#[test]
+fn overlong_final_frame_truncation_invalidates_existing_readers() {
+    observed_final_frame_damage_invalidates_existing_readers(|bytes, first_end| {
+        bytes.truncate(first_end + 24);
+    });
+}
+
+#[test]
+fn short_final_frame_truncation_invalidates_existing_readers() {
+    observed_final_frame_damage_invalidates_existing_readers(|bytes, first_end| {
+        bytes.truncate(first_end + 5);
+    });
 }
 
 #[test]

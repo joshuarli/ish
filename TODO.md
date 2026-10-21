@@ -78,15 +78,6 @@ Next: 53
 - **Fix with:** none
 - **Effort:** S (hours)
 
-### ISH-47 · P3 · denv and history leave unreclaimed or unobserved state after abnormal exit
-
-- **Area:** Data
-- **Where:** `src/denv.rs` (active record directory), `src/history/store.rs` (`read_snapshot` recovery)
-- **Problem:** After ISH-27, an `active_<pid>-<token>` record and its `.tmp` files from a shell killed by SIGKILL or a crash are never reused and never deleted, so they accumulate in the denv data directory; old `active_<pid>` files are orphaned the same way. After ISH-22, a reader that observed a frame later zeroed out or truncated externally within one generation is still not invalidated, the same class of fault with a different trigger. Neither was reproduced end to end.
-- **Recommendation:** Prune records whose pid is gone at startup, and publish every recovery that removes an observable occurrence as a new generation, covering the zero-fill and short-tail cases.
-- **Fix with:** durable-state
-- **Effort:** M (days)
-
 ### ISH-48 · P3 · `main.rs` still holds the editor and `Shell`, and the keystroke path has no unit seam
 
 - **Area:** Architecture
