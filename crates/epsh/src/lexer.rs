@@ -5,6 +5,35 @@ use crate::shell_bytes::ShellBytes;
 /// Pattern escape marker in shell pattern strings.
 pub const CTLESC: char = '\u{FFFE}';
 
+pub(crate) const MAX_NESTING_DEPTH: u32 = 32;
+
+thread_local! {
+    static NESTING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) struct NestingGuard;
+
+impl NestingGuard {
+    pub(crate) fn enter(span: Span) -> std::result::Result<Self, ShellError> {
+        NESTING_DEPTH.with(|depth| {
+            if depth.get() >= MAX_NESTING_DEPTH {
+                return Err(ShellError::Syntax {
+                    msg: format!("nesting deeper than {MAX_NESTING_DEPTH} levels"),
+                    span,
+                });
+            }
+            depth.set(depth.get() + 1);
+            Ok(NestingGuard)
+        })
+    }
+}
+
+impl Drop for NestingGuard {
+    fn drop(&mut self) {
+        NESTING_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
 /// Token types produced by the lexer.
 #[derive(Debug, Clone)]
 pub enum Token {
@@ -696,6 +725,7 @@ impl Lexer {
         in_dquote: bool,
         span: Span,
     ) -> std::result::Result<WordPart, ShellError> {
+        let _nesting = NestingGuard::enter(span)?;
         // ${#var} — length prefix. But ${##pattern} is $# with trim, not length of #.
         // Mirrors dash parsesub lines 1400-1418.
         let mut length = false;
@@ -1057,6 +1087,7 @@ impl Lexer {
 
     /// Read `$((expr))` arithmetic expansion after `$((` has been consumed.
     fn read_arith_expansion(&mut self, span: Span) -> std::result::Result<WordPart, ShellError> {
+        let _nesting = NestingGuard::enter(span)?;
         let content_span = self.span();
         let mut content = String::new();
         let mut depth = 1u32;
@@ -1075,7 +1106,7 @@ impl Lexer {
                     return Ok(WordPart::Arith(inner_parts));
                 }
                 Some(')') => {
-                    depth -= 1;
+                    depth = unbalanced_arith_close(depth, span)?;
                     content.push(')');
                 }
                 Some('(') => {
@@ -1166,6 +1197,7 @@ impl Lexer {
         word: &mut String,
         span: Span,
     ) -> std::result::Result<(), ShellError> {
+        let _nesting = NestingGuard::enter(span)?;
         match self.peek() {
             Some('{') => {
                 word.push('{');
@@ -1358,7 +1390,7 @@ impl Lexer {
                     return Ok(());
                 }
                 Some(')') => {
-                    depth -= 1;
+                    depth = unbalanced_arith_close(depth, span)?;
                     word.push(')');
                 }
                 Some('(') => {
@@ -1542,6 +1574,13 @@ fn try_split_assignment(parts: &[WordPart]) -> Option<(String, Vec<WordPart>)> {
 }
 
 use crate::parser::{coalesce_literals, parse_cmdsubst_content};
+
+pub(crate) fn unbalanced_arith_close(depth: u32, span: Span) -> std::result::Result<u32, ShellError> {
+    depth.checked_sub(1).ok_or_else(|| ShellError::Syntax {
+        msg: "unbalanced ) in $((".into(),
+        span,
+    })
+}
 
 fn rebase_nested_parse_error(error: ShellError, base: Span) -> ShellError {
     match error {

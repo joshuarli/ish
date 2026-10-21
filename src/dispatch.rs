@@ -373,4 +373,13 @@ mod tests {
         assert!(matches!(rejection("echo 'unterminated"), Rejection::Syntax(_)));
         assert!(matches!(rejection("echo |"), Rejection::Syntax(_)));
     }
+
+    #[test]
+    fn deeply_nested_substitutions_are_refused_not_crashed() {
+        let command_substitutions = format!("echo {}x{}", "$(echo ".repeat(1000), ")".repeat(1000));
+        let arithmetic = format!("echo {}1{}", "$(( ".repeat(1000), " ))".repeat(1000));
+        assert!(matches!(rejection(&command_substitutions), Rejection::Syntax(_)));
+        assert!(matches!(rejection(&arithmetic), Rejection::Syntax(_)));
+        assert!(matches!(rejection("echo $(( ) )"), Rejection::Syntax(_)));
+    }
 }

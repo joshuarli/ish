@@ -1,7 +1,10 @@
 use crate::ast::*;
 use crate::shell_bytes::ShellBytes;
 use crate::error::{ShellError, Span};
-use crate::lexer::{Lexer, PendingHereDoc, Token, parts_have_quoting, parts_to_text};
+use crate::lexer::{
+    Lexer, NestingGuard, PendingHereDoc, Token, parts_have_quoting, parts_to_text,
+    unbalanced_arith_close,
+};
 
 /// Recursive-descent parser for POSIX shell grammar.
 ///
@@ -208,6 +211,8 @@ impl Parser {
     /// compound_list = and_or { (';' | '&' | newline) and_or } [';' | '&']
     /// Used inside compound commands where newlines act as separators.
     fn parse_compound_list(&mut self) -> Result<Command, ShellError> {
+        let (_, span) = self.peek()?;
+        let _nesting = NestingGuard::enter(span)?;
         self.parse_command_list(true)
     }
 
@@ -1085,6 +1090,7 @@ fn parse_word_parts_heredoc(
     raw: &str,
     nested_errors: NestedCommandErrors,
 ) -> Result<Vec<WordPart>, ShellError> {
+    let _nesting = NestingGuard::enter(Span::default())?;
     let mut parts = Vec::new();
     let chars: Vec<char> = raw.chars().collect();
     let mut i = 0;
@@ -1367,7 +1373,7 @@ fn parse_dollar(
                         content.push(chars[*i]);
                         *i += 1;
                     } else if chars[*i] == ')' {
-                        depth -= 1;
+                        depth = unbalanced_arith_close(depth, Span::default())?;
                         content.push(chars[*i]);
                         *i += 1;
                     } else {
@@ -1682,6 +1688,7 @@ pub(crate) fn coalesce_literals(parts: Vec<WordPart>) -> Vec<WordPart> {
 }
 
 pub(crate) fn parse_cmdsubst_content(content: &str) -> Result<Command, ShellError> {
+    let _nesting = NestingGuard::enter(Span::default())?;
     let program = Parser::from_shell_string(content).parse()?;
     let command = if program.commands.is_empty() {
         empty_command_substitution()
@@ -2117,6 +2124,97 @@ mod tests {
                 assert!(matches!(p.op, ParamOp::TrimPrefixLarge(_)));
             }
             other => panic!("expected Param, got {other:?}"),
+        }
+    }
+
+    fn nested_command_substitution(levels: u32) -> String {
+        format!(
+            "echo {}x{}",
+            "$(echo ".repeat(levels as usize),
+            ")".repeat(levels as usize)
+        )
+    }
+
+    fn nested_arithmetic(levels: u32) -> String {
+        format!(
+            "echo {}1{}",
+            "$(( ".repeat(levels as usize),
+            " ))".repeat(levels as usize)
+        )
+    }
+
+    fn nested_brace_defaults(levels: u32) -> String {
+        format!(
+            "echo {}x{}",
+            "${a:-".repeat(levels as usize),
+            "}".repeat(levels as usize)
+        )
+    }
+
+    fn nested_subshells(levels: u32) -> String {
+        format!(
+            "{}echo x{}",
+            "(".repeat(levels as usize),
+            ")".repeat(levels as usize)
+        )
+    }
+
+    fn assert_syntax_error(src: &str) {
+        match Parser::new(src).parse() {
+            Err(ShellError::Syntax { .. }) => {}
+            other => panic!("expected syntax error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_substitution_nesting_is_bounded() {
+        let limit = crate::lexer::MAX_NESTING_DEPTH;
+        Parser::new(&nested_command_substitution(limit)).parse().unwrap();
+        assert_syntax_error(&nested_command_substitution(limit + 1));
+        assert_syntax_error(&nested_command_substitution(100_000));
+    }
+
+    #[test]
+    fn arithmetic_nesting_is_bounded() {
+        let limit = crate::lexer::MAX_NESTING_DEPTH;
+        Parser::new(&nested_arithmetic(limit)).parse().unwrap();
+        assert_syntax_error(&nested_arithmetic(limit + 1));
+        assert_syntax_error(&nested_arithmetic(100_000));
+    }
+
+    #[test]
+    fn brace_default_nesting_is_bounded() {
+        let limit = crate::lexer::MAX_NESTING_DEPTH;
+        Parser::new(&nested_brace_defaults(limit)).parse().unwrap();
+        assert_syntax_error(&nested_brace_defaults(limit + 1));
+        assert_syntax_error(&nested_brace_defaults(100_000));
+    }
+
+    #[test]
+    fn subshell_nesting_is_bounded() {
+        let limit = crate::lexer::MAX_NESTING_DEPTH;
+        Parser::new(&nested_subshells(limit)).parse().unwrap();
+        assert_syntax_error(&nested_subshells(limit + 1));
+        assert_syntax_error(&nested_subshells(100_000));
+    }
+
+    #[test]
+    fn unbalanced_close_in_arithmetic_is_syntax_error() {
+        assert_syntax_error("echo $(( ) )");
+        assert_syntax_error("echo \"$(( ) )\"");
+        assert_syntax_error("echo $(echo $(( ) ) )");
+        assert!(matches!(
+            try_parse_word_parts("$(( ) )"),
+            Err(ShellError::Syntax { .. })
+        ));
+    }
+
+    #[test]
+    fn nesting_budget_is_released_after_each_parse() {
+        let limit = crate::lexer::MAX_NESTING_DEPTH;
+        for _ in 0..3 {
+            Parser::new(&nested_command_substitution(limit)).parse().unwrap();
+            assert_syntax_error(&nested_command_substitution(limit + 1));
         }
     }
 }

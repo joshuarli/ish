@@ -21,15 +21,6 @@ Next: 45
 - **Effort:** M (days)
 - **Design:** [Builtin allowlist](docs/rfc/ISH-24-builtin-allowlist.md)
 
-### ISH-25 · P2 · Deeply nested `$(` or `$((` input overflows the stack and kills the shell
-
-- **Area:** Errors
-- **Where:** `crates/epsh/src/lexer.rs` (`read_dollar_raw`, `read_arith_expansion`), `crates/epsh/src/parser.rs`, `src/dispatch.rs:101`, `crates/epsh/src/lexer.rs:1077-1080`
-- **Problem:** `dispatch::plan` parses before any refusal. Reproduced on the debug binary in a PTY: a line with 1000 nested `$(` ends ish with exit 139 and the next command never runs; the epsh lane measured 300 levels fine and 600 or more crashing. One pasted or history-recalled line is enough. The release threshold is unproven; `panic=abort` does not change a stack overflow. Separately, `echo $(( ) )` underflows a `u32` depth counter and panics in debug builds but wraps in release, so debug and release disagree on the same input.
-- **Recommendation:** Count nesting in the lexer and parser and return a syntax error past a fixed limit. Use checked arithmetic on every `depth -= 1` site (`lexer.rs:994,1228,1278,1361`, `parser.rs:1370,1388,1622`). Add parser tests at the limit and past it.
-- **Fix with:** error-model
-- **Effort:** M (days)
-
 ### ISH-27 · P2 · denv's per-pid active file outlives the shell, so a reused pid restores another session's values
 
 - **Area:** Data
