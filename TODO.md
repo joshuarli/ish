@@ -105,15 +105,6 @@ Next: 53
 - **Fix with:** dead-code-archaeology
 - **Effort:** S (hours)
 
-### ISH-51 · P3 · A 0555 directory carrying a `user.*` xattr may fail the same way ISH-30 did for files
-
-- **Area:** Data
-- **Where:** `crates/ish-fs/src/engine/transfer.rs:379`, `crates/ish-fs/src/engine/transfer.rs:493`, `crates/ish-fs/src/platform/linux.rs`
-- **Problem:** ISH-30 reordered `apply_fd_metadata` so xattrs and the ACL precede the final `fchmod`. Directories go through the same `apply_metadata` at the two call sites, but no test combines a read-only directory with a `user.*` xattr and the check was not run (`setfattr` is absent on this host).
-- **Recommendation:** Add one test with a 0555 directory carrying a `user.*` xattr and fix the directory path if it fails.
-- **Fix with:** os-boundaries
-- **Effort:** S (hours)
-
 ### ISH-52 · P4 · Two SAFETY claims in `denv.rs` say ish is single-threaded without proof
 
 - **Area:** Security

@@ -24,6 +24,14 @@ impl Fixture {
     }
 }
 impl Drop for Fixture { fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); } }
+struct RestoreWritable(Vec<PathBuf>);
+impl Drop for RestoreWritable {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            if path.exists() { fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap(); }
+        }
+    }
+}
 
 #[test]
 fn copy_always_transfers_even_same_size_same_mtime() {
@@ -92,6 +100,22 @@ fn readonly_file_with_user_xattr_transfers_with_its_xattr() {
     assert_eq!(fs::metadata(&destination_file).unwrap().mode() & 0o777, 0o444);
     let mut value = [0; 16];
     let length = rustix::fs::getxattr(&destination_file, "user.ish-fs-readonly", &mut value).unwrap();
+    assert_eq!(&value[..length], b"value");
+}
+
+#[test]
+fn readonly_directory_with_user_xattr_transfers_with_its_xattr() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.0.join("source")).unwrap();
+    fs::write(fixture.0.join("source/file"), b"contents").unwrap();
+    rustix::fs::setxattr(fixture.0.join("source"), "user.ish-fs-readonly", b"value", rustix::fs::XattrFlags::empty()).unwrap();
+    fs::set_permissions(fixture.0.join("source"), fs::Permissions::from_mode(0o555)).unwrap();
+    let _restore = RestoreWritable(vec![fixture.0.join("source"), fixture.0.join("destination")]);
+    assert_eq!(fixture.run(&fixture.request("source", "destination")), 0);
+    assert_eq!(fs::read(fixture.0.join("destination/file")).unwrap(), b"contents");
+    assert_eq!(fs::metadata(fixture.0.join("destination")).unwrap().mode() & 0o777, 0o555);
+    let mut value = [0; 16];
+    let length = rustix::fs::getxattr(fixture.0.join("destination"), "user.ish-fs-readonly", &mut value).unwrap();
     assert_eq!(&value[..length], b"value");
 }
 
