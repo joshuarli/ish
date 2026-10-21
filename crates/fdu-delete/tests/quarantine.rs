@@ -401,3 +401,32 @@ fn intent_naming_another_root_is_not_applied() {
     assert_rejected_untouched(root, "root identity changed");
     assert!(!root.join("original").exists());
 }
+
+#[test]
+fn intent_claiming_more_ancestors_than_bytes_is_rejected() {
+    let scratch = Scratch::new("intent-count");
+    let root = &scratch.0;
+    let workspace = workspace(root);
+    let mut bytes = intent(identity(root), &[], "original");
+    let count_at = INTENT_MAGIC.len() + 16;
+    bytes[count_at..count_at + 4].copy_from_slice(&1000u32.to_le_bytes());
+    fs::write(workspace.join("4.entry"), b"captured").unwrap();
+    fs::write(workspace.join("4.intent"), &bytes).unwrap();
+
+    assert_rejected_untouched(root, "invalid recovery ancestor count");
+    assert_eq!(fs::read(workspace.join("4.entry")).unwrap(), b"captured");
+    assert!(!root.join("original").exists());
+}
+
+#[test]
+fn non_numeric_capture_id_is_rejected_and_kept() {
+    let scratch = Scratch::new("capture-id");
+    let root = &scratch.0;
+    let workspace = workspace(root);
+    fs::write(workspace.join("abc.entry"), b"captured").unwrap();
+    fs::write(workspace.join("abc.intent"), intent(identity(root), &[], "original")).unwrap();
+
+    assert_rejected_untouched(root, "invalid capture identifier");
+    assert_eq!(fs::read(workspace.join("abc.entry")).unwrap(), b"captured");
+    assert!(!root.join("original").exists());
+}

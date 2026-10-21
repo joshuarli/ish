@@ -289,8 +289,6 @@ mod posix {
         mount_point: Vec<u8>,
     }
 
-    
-    
     #[cfg(target_os = "linux")]
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct MountIdentity {

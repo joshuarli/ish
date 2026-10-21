@@ -97,11 +97,3 @@ Next: 59
 - **Effort:** S (hours)
 
 
-### ISH-58 · P4 · `fdu-delete` recovery still has uncovered branches and a stray whitespace line
-
-- **Area:** Tests
-- **Where:** `crates/fdu-delete/src/posix/quarantine.rs`, `crates/fdu-delete/tests/quarantine.rs`, `crates/fdu-delete/src/lib.rs:292-293`
-- **Problem:** ISH-54 left two recovery cases untested: an intent whose parent-name count exceeds the remaining bytes, and a non-numeric capture id. The mount-changed branches need a second mount, and `lib.rs` has a whitespace-only line between the macOS and Linux `MountIdentity` definitions.
-- **Recommendation:** Add the two malformed-record cases to the hand-written workspace tests, and decide whether the mount branches get a native fixture under `benches/fs/native-fixtures.sh`.
-- **Fix with:** test-audit
-- **Effort:** S (hours)
