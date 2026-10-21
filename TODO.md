@@ -96,15 +96,6 @@ Next: 57
 - **Fix with:** os-boundaries
 - **Effort:** S (hours)
 
-### ISH-54 · P4 · `fdu-delete` recovery and mount-identity paths have no tests
-
-- **Area:** Tests
-- **Where:** `crates/fdu-delete/src/posix/quarantine.rs`, `crates/fdu-delete/tests/quarantine.rs`
-- **Problem:** ISH-46 added four tests for delete, identity mismatch, an absent entry and an unindexed child. Interrupted-run recovery (`recover`, `Intent::decode`, rejection of damaged quarantine entries), mount-identity checks, and rename and fsync failures inside the quarantine remain untested; reaching them needs a crash or hand-written quarantine files.
-- **Recommendation:** Hand-write quarantine and intent files in a scratch directory to cover `recover` and damaged entries, and decide whether the mount checks need a native fixture.
-- **Fix with:** test-audit
-- **Effort:** M (days)
-
 ### ISH-55 · P4 · `Prompt::render_with_state` is a test-only wrapper
 
 - **Area:** Dead code

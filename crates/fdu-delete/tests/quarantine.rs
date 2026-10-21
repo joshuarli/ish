@@ -269,8 +269,8 @@ fn capture_whose_ancestor_identity_changed_is_retained() {
     let root = &scratch.0;
     fs::create_dir(root.join("sub")).unwrap();
     let recorded = identity(&root.join("sub"));
-    fs::remove_dir(root.join("sub")).unwrap();
     fs::create_dir(root.join("other")).unwrap();
+    fs::remove_dir(root.join("sub")).unwrap();
     fs::rename(root.join("other"), root.join("sub")).unwrap();
     assert_ne!(identity(&root.join("sub")), recorded);
     let workspace = workspace(root);
