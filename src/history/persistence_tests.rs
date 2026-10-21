@@ -59,7 +59,23 @@ fn cache_fixture(commands: &[&str], timestamps: &[u64]) -> Vec<u8> {
 }
 
 #[test]
-fn migrates_cache_without_changing_originals() {
+fn deleting_the_log_after_migration_does_not_resurrect_legacy_history() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path(), record(1_700_000_000_000, "secret text")).unwrap();
+    fs::write(
+        legacy::cache_path(&fixture.path()),
+        cache_fixture(&["secret cache"], &[1_700_000_000_000]),
+    )
+    .unwrap();
+    assert_eq!(fixture.occurrences(), 2);
+    fs::remove_file(store::storage_path(&fixture.path())).unwrap();
+    assert_eq!(fixture.occurrences(), 0);
+    assert!(!fixture.path().exists());
+    assert!(!legacy::cache_path(&fixture.path()).exists());
+}
+
+#[test]
+fn migrates_cache_and_retires_originals() {
     {
         let fixture = Fixture::new();
         let timestamp = 1_700_000_000_000;
@@ -79,11 +95,8 @@ fn migrates_cache_without_changing_originals() {
             history.usages[repeated].directories[Path::new("/work/project")].count,
             2
         );
-        assert_eq!(fs::read(fixture.path()).unwrap(), text.as_bytes());
-        assert_eq!(
-            fs::read(legacy::cache_path(&fixture.path())).unwrap(),
-            bytes
-        );
+        assert!(!fixture.path().exists());
+        assert!(!legacy::cache_path(&fixture.path()).exists());
         drop(history);
         let reopened = History::load_from(fixture.path()).unwrap();
         assert_eq!(reopened.frequency(repeated), 3);
@@ -233,7 +246,7 @@ fn reset_invalidates_stale_sessions_before_their_next_append() {
     assert_eq!(resetting.len(), 1);
     assert_eq!(resetting.session_get(0), None);
     assert_eq!(fixture.occurrences(), 1);
-    assert_eq!(fs::read(fixture.path()).unwrap(), b"legacy\n");
+    assert!(!fixture.path().exists());
     let reopened = History::load_from(fixture.path()).unwrap();
     assert_eq!(reopened.get(0), "after reset");
 }

@@ -29,6 +29,17 @@ pub(super) fn cache_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+pub(super) fn retire(path: &Path) -> io::Result<()> {
+    for file in [path.to_path_buf(), cache_path(path)] {
+        match fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn read(path: &Path) -> io::Result<Vec<Occurrence>> {
     let mut text = Vec::new();
     if let Some(bytes) = read_if_present(path)? {

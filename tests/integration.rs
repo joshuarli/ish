@@ -1516,7 +1516,7 @@ fn history_file_io() {
 }
 
 #[test]
-fn history_migrates_legacy_once_without_changing_originals() {
+fn history_migrates_legacy_once_and_retires_originals() {
     let dir = tempdir_with_files(&[]);
     let path = dir.join("history");
     let legacy = "echo imported\necho retained\n";
@@ -1534,8 +1534,8 @@ fn history_migrates_legacy_once_without_changing_originals() {
     let mut h = History::load_from(path.clone()).unwrap();
     assert_eq!(h.len(), 3);
     h.add("echo log only").unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
-    assert_eq!(std::fs::read(dir.join("history.bin")).unwrap(), cache);
+    assert!(!path.exists());
+    assert!(!dir.join("history.bin").exists());
     assert!(dir.join("history.log").exists());
 
     std::fs::write(&path, format!("{legacy}echo late legacy\n")).unwrap();

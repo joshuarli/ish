@@ -75,7 +75,8 @@ Typing or pasting edits the search query and filters the matches.
 Use Up and Down to navigate, Enter to accept, and Escape to cancel. History is
 saved in `~/.local/share/ish/history.log`; Ctrl+R searches saved commands across
 sessions, while Up and Down use this session's history snapshot. `history`
-prints the list and `history reset` clears it. Run `history -h` for help.
+prints the list and `history reset` clears it. The first run after an upgrade
+imports the old `history` and `history.bin` files and deletes them. Run `history -h` for help.
 
 ## Commands and syntax
 

@@ -104,15 +104,6 @@ Next: 45
 - **Fix with:** error-model, lifecycle-concurrency
 - **Effort:** M (days)
 
-### ISH-39 · P3 · Deleting `history.log` brings back the legacy history, which is never retired
-
-- **Area:** Data
-- **Where:** `src/history/store.rs:102-113`, `src/history/store.rs:172-192`, `src/history/legacy.rs:35-58`
-- **Problem:** `Store::open` re-imports the legacy text and `.bin` cache whenever `history.log` is missing, and nothing removes them after migration. A user who deletes the log to clear history, or a crash between `reset` renaming a bad log and writing its replacement, resurrects old commands that may contain secrets.
-- **Recommendation:** Rename or delete the legacy files after a successful import, and write the replacement before moving the old log aside.
-- **Fix with:** durable-state
-- **Effort:** S (hours)
-
 ### ISH-40 · P3 · `z` scores relative `cd` targets without the directory they ran in
 
 - **Area:** Data

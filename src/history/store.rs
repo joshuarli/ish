@@ -110,6 +110,7 @@ impl Store {
                         .ok_or_else(|| invalid("too many occurrences"))?;
                 }
                 replace(&path, 0, &occurrences)?;
+                legacy::retire(legacy_path)?;
             }
             Err(error) => return Err(error),
         }
@@ -177,8 +178,7 @@ impl Store {
                 .checked_add(1)
                 .ok_or_else(|| invalid("generation exhausted"))?,
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                let aside = corrupt_path(&self.path);
-                fs::rename(&self.path, &aside)?;
+                fs::hard_link(&self.path, corrupt_path(&self.path))?;
                 // Other shells hold an older generation; a time-derived one
                 // cannot collide with a small counter.
                 i64::try_from(super::now_millis()).map_err(|_| invalid("clock out of range"))?
