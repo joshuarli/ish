@@ -2,17 +2,13 @@ use ptytest::{CommandSpec, ProtocolProfile, PtyTest, Scenario, TestEnv};
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod common;
+
 struct Home(PathBuf);
 
 impl Home {
     fn new() -> Self {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-        let mut path = std::env::temp_dir().join("ish-signals-XXXXXX")
-            .as_os_str().as_bytes().to_vec();
-        path.push(0);
-        assert!(!unsafe { libc::mkdtemp(path.as_mut_ptr().cast()) }.is_null());
-        path.pop();
-        Self(PathBuf::from(std::ffi::OsString::from_vec(path)))
+        Self(common::scratch_dir("ish-signals"))
     }
 }
 
@@ -61,7 +57,7 @@ fn external_commands_restore_terminal_signals_in_every_context() {
         .env("HOME", &home.0).env("USER", "testuser")
         .env("PWD", &home.0).env("PATH", "/usr/bin:/bin");
     let scenario = Scenario::new("external command signal dispositions").unwrap()
-        .command(CommandSpec::new(env!("CARGO_BIN_EXE_ish")).current_dir(&home.0))
+        .command(CommandSpec::new(common::ish_binary()).current_dir(&home.0))
         .environment(environment)
         .protocol_profile(ProtocolProfile::xterm_minimal_v1());
     let mut terminal = PtyTest::spawn(scenario).unwrap();

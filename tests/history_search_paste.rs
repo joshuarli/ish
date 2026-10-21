@@ -1,7 +1,8 @@
 use ptytest::{CommandSpec, ProtocolProfile, PtyTest, Scenario, Size, TestEnv};
-use std::os::unix::ffi::OsStringExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
+
+mod common;
 
 struct SearchShell {
     terminal: PtyTest,
@@ -10,15 +11,7 @@ struct SearchShell {
 
 impl SearchShell {
     fn spawn(history: &[&str]) -> Self {
-        let mut template = std::env::temp_dir()
-            .join("ish_history_paste_XXXXXX")
-            .into_os_string()
-            .into_vec();
-        template.push(0);
-        let home = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
-        assert!(!home.is_null(), "create isolated shell home");
-        template.pop();
-        let home = PathBuf::from(std::ffi::OsString::from_vec(template));
+        let home = common::scratch_dir("ish_history_paste");
         let data = home.join(".local/share/ish");
         std::fs::create_dir_all(&data).unwrap();
         std::fs::write(data.join("history"), history.join("\n") + "\n").unwrap();
@@ -32,7 +25,7 @@ impl SearchShell {
         .env("USER", "testuser")
         .env("PWD", &home)
         .env("PATH", "/usr/bin:/bin");
-        let command = CommandSpec::new(Path::new(env!("CARGO_BIN_EXE_ish")))
+        let command = CommandSpec::new(common::ish_binary())
             .current_dir(&home)
             .env("HOME", &home)
             .env("USER", "testuser")

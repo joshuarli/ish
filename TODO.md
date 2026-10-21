@@ -68,15 +68,6 @@ Next: 45
 - **Fix with:** api-surface-and-module-boundaries
 - **Effort:** L (weeks)
 
-### ISH-41 · P3 · The default test commands do not cover what ships
-
-- **Area:** Tests
-- **Where:** `Makefile:58-61`, `tests/pty.rs:61`, `tests/external_signals.rs:64`, `tests/history_search_paste.rs:35`, `Cargo.toml:15`, `crates/fdu-delete/src/posix/quarantine.rs:247`, `tests/fs_bench.rs:29`, `tests/pty.rs:36-38`
-- **Problem:** `make test-ci` sets `ISH_TEST_BINARY`, but only `pty.rs` reads it; the signal and paste suites run the test-profile binary, and none of the tests use the build-std, `-Cpanic=immediate-abort` binary that is released. `default-members` omits `fdu-delete`, whose three tests guard `t`'s destructive path and run only under `--workspace`. `tests/fs_bench.rs` is 1,702 lines of ignored benchmark driver under `tests/`. The PTY suites use `temp_dir()` instead of `.work/tmp`.
-- **Recommendation:** Resolve the binary through one helper used by all three suites, add `fdu-delete` to `default-members`, move the benchmark driver under `benches/fs`, and base test scratch on `.work/tmp`.
-- **Fix with:** renovate-tests
-- **Effort:** M (days)
-
 ### ISH-42 · P3 · Release delivery lacks a ref guard and integrity checks, and release panics are silent
 
 - **Area:** Build

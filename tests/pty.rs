@@ -10,10 +10,13 @@ use ish::history::History;
 use ptytest::{
     CommandSpec, ExitStatus, ProtocolProfile, PtyTest, Scenario, Size, TerminalBaseline, TestEnv,
 };
-use std::cell::{Cell, RefCell};
 use std::os::unix::ffi::OsStringExt;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+mod common;
+use common::ish_binary;
 
 // ---------------------------------------------------------------------------
 // PTY harness
@@ -34,16 +37,7 @@ const READY_SLEEP_SCRIPT: &str = "#!/bin/sh\nprintf 'pty-child-ready\\n'\nexec /
 
 impl TempDir {
     fn new(prefix: &str) -> Self {
-        let mut path = std::env::temp_dir()
-            .join(format!("{prefix}_XXXXXX"))
-            .into_os_string()
-            .into_vec();
-        path.push(0);
-        let ptr = unsafe { libc::mkdtemp(path.as_mut_ptr() as *mut libc::c_char) };
-        assert!(!ptr.is_null(), "mkdtemp failed");
-        path.pop();
-        let path = PathBuf::from(std::ffi::OsString::from_vec(path));
-        Self(std::fs::canonicalize(&path).unwrap_or(path))
+        Self(common::scratch_dir(prefix))
     }
 
     fn path(&self) -> &Path {
@@ -55,31 +49,6 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-fn ish_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("ISH_TEST_BINARY") {
-        let path = PathBuf::from(path);
-        assert!(path.exists(), "ish binary not found at {}", path.display());
-        return path;
-    }
-
-    // Cargo provides the exact binary path for integration tests. This also
-    // works with Cargo versions that keep test artifacts in a per-package
-    // build directory instead of `target/{profile}/deps`.
-    if let Some(path) = option_env!("CARGO_BIN_EXE_ish") {
-        let path = PathBuf::from(path);
-        assert!(path.exists(), "ish binary not found at {}", path.display());
-        return path;
-    }
-
-    // Find the debug binary relative to the test binary
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // remove test binary name
-    path.pop(); // remove `deps`
-    path.push("ish");
-    assert!(path.exists(), "ish binary not found at {}", path.display());
-    path
 }
 
 impl PtyShell {

@@ -111,7 +111,8 @@ ISH_FS_BENCH_FEATURES_READY=1 benches/fs/bench.sh measure \
 ```
 
 Use one workload name instead of `all` for a focused run. The workload list is
-in [measure.sh](measure.sh); fixture construction and validation live in
+in [measure.sh](measure.sh); the ignored sample runner is
+[fs_bench.rs](fs_bench.rs) (test target `fs_bench`); fixture construction and validation live in
 [fs_bench.rs](../../crates/ish-fs/examples/fs_bench.rs).
 
 Every workload collects five accepted alternating runs for the engine and

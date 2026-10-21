@@ -12,7 +12,7 @@ members = [
     "crates/fdu-scan",
     "crates/ish-fs",
 ]
-default-members = [".", "crates/epsh", "crates/ish-fs"]
+default-members = [".", "crates/epsh", "crates/fdu-delete", "crates/ish-fs"]
 
 [workspace.dependencies]
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }
@@ -35,6 +35,10 @@ serde_json = "1"
 [[bench]]
 name = "bench"
 harness = false
+
+[[test]]
+name = "fs_bench"
+path = "benches/fs/fs_bench.rs"
 
 [profile.dev]
 incremental = false
