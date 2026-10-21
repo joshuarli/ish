@@ -1,7 +1,7 @@
 # Testing
 
 Build, test, or package epsh from the workspace root. Select `-p epsh` because
-both crates share a workspace and lockfile:
+the crate shares ish's workspace and lockfile:
 
     cargo build -p epsh
     cargo package -p epsh

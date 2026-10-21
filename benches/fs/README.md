@@ -1,8 +1,7 @@
 # Filesystem benchmark harness
 
 `bench.sh` prepares, checks, measures, and removes bounded filesystem fixtures
-under `.work/tmp`. Local P3 samples remain locked until the integrator confirms
-feature readiness and available P2 gates.
+under `.work/tmp`. Measure only after the relevant correctness checks pass.
 
 ## Prepare and remove fixtures
 
@@ -68,8 +67,8 @@ checks complete output bytes and directory entries after the post-sample load
 check. It checks sparse allocation and hole bytes for engine and builtin
 outputs, hardlink identity for ish, and that the same-filesystem rename reports
 one discovered and completed entry. Native sparse copies are checked for
-length and bytes; allocated extent preservation is utility-specific. P2 parity
-tests remain the correctness gate for measured implementations. Move
+length and bytes; allocated extent preservation is utility-specific. [Filesystem tests](../../docs/filesystem-testing.md) remain the correctness
+gate for measured implementations. Move
 samples also verify that every source path was retired, and the PTY runner reads
 the shell's exit status after every builtin command.
 
@@ -89,14 +88,10 @@ proof that the filesystem supports cloning.
 
 ## Run the matrix
 
-Set `ISH_FS_BENCH_FEATURES_READY=1` only after the integrator confirms feature
-readiness and the available local P2 gates. Native parity cases that need an
-unavailable host or utility may remain blocked; this flag does not complete
-those cases or establish whole-campaign acceptance. Samples collected while
-they are blocked are local evidence only. Do not use them to accept timing or
-guide performance tuning until the remaining parity gates pass. The harness
-builds its release test runner only after checking the feature gate and host
-memory/disk capacity.
+Set `ISH_FS_BENCH_FEATURES_READY=1` after checking the affected behavior and
+available native fixtures. The flag unlocks measurement; it does not establish
+unavailable native guarantees. The harness checks host capacity before building
+its release runner.
 
 ```sh
 ISH_FS_BENCH_FEATURES_READY=1 benches/fs/bench.sh measure \
@@ -115,10 +110,9 @@ ISH_FS_BENCH_FEATURES_READY=1 benches/fs/bench.sh measure \
     "$CROSS_ROOT" CROSS_DEVICE:INODE
 ```
 
-Use one workload name instead of `all` for a focused matrix. Names are
-`tiny-copy`, `tiny-move`, `flat`, `nested`, `deep`, `wide`, `large`, `clone`,
-`sparse`, `hardlinks`, `rename`, `cross`, `cross-flat-1k`, `cross-flat-4k`,
-`cross-flat-16k`, `merge`, `dry-run-wide`, `progress-on`, and `progress-off`.
+Use one workload name instead of `all` for a focused run. The workload list is
+in [measure.sh](measure.sh); fixture construction and validation live in
+[fs_bench.rs](../../crates/ish-fs/examples/fs_bench.rs).
 
 Every workload collects five accepted alternating runs for the engine and
 actual interactive builtin. Copy workloads include the available host `cp`
@@ -170,13 +164,11 @@ durable move completion; native `mv` durability is unverified. Native `cp`
 preservation is utility-specific. Compare only when output mapping and required
 preservation match, and retain the label when they do not.
 
-## Measurement gate
+## Recorded evidence
 
-The local Linux exploratory samples are in [results-linux.md](results-linux.md).
-
-The host used to prepare this harness is Linux x86_64. Its `cp` and `mv` are
-BusyBox. It has no GNU clone-aware `cp` and is not a macOS host. No successful
-filesystem clone or genuine cross-filesystem move has been measured. A mounted
-cross-device root was not designated, so the cross-device comparison is
-unavailable. Those comparisons remain acceptance blockers until a supported
-host and designated filesystem provide the required capabilities.
+[results-linux.md](results-linux.md) records the Linux before/after runs,
+including genuine ext4-to-tmpfs moves. Successful cloning, GNU clone-aware
+comparisons, and native macOS measurements remain unavailable in that record.
+BusyBox utility results have weaker preservation and durability policies.
+See [filesystem testing](../../docs/filesystem-testing.md) for capability
+requirements; a fallback or skipped case does not prove native support.

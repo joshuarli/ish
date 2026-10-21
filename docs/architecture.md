@@ -68,8 +68,8 @@ cwd, or process environment.
 The engine contract uses descriptor-relative paths after resolving supplied
 parents. It stages new objects on the destination filesystem and publishes a
 new root only after its transfer completes. A merge publishes completed leaves
-and can leave partial work. Non-merge same-filesystem moves use a rename without
-walking descendants. Cross-filesystem moves require successful transfer,
+and can leave partial work. An isolated exact same-filesystem move renames
+without walking descendants. Cross-filesystem moves require successful transfer,
 required metadata, and durable destination publication before source retirement.
 Retirement uses records of transferred objects and revalidation; it does not
 recursively delete whatever later appears at a source path.
@@ -80,85 +80,42 @@ unlink conditional on both inode and mutation version against every concurrent
 writer. The command does not claim protection from another process running as
 the same account with authority over the trees.
 
-Linux workspace tests (including 152 PTY cases), strict all-target Clippy,
-semantic verification, shift refinement, and retained conformance pass.
-The full workspace also passes strict all-target Clippy for ARM64 musl and
-ARM64 macOS. Selected ARM64 musl tests execute under QEMU; neither emulation
-nor cross-compilation establishes native hardware behavior.
+Native validation requirements and observed limits belong to
+[filesystem testing](filesystem-testing.md). Recorded measurements are in
+[the benchmark report](../benches/fs/results-linux.md).
 
-Private mount namespaces provide genuine ext4-to-tmpfs EXDEV, nested tmpfs,
-same-device bind mounts, and mountpoint-retirement evidence. Linux FICLONE
-returns EOPNOTSUPP on the available ext4 filesystem; foreign-owner setup cannot
-map uid 65534. Native macOS and ARM64 hardware runs remain unavailable.
-See the [case inventory](../crates/ish-fs/tests/cases.md) for required commands
-and capability skips, and the [measurements](../benches/fs/results-linux.md)
-for benchmark scope and variation. These limits keep campaign acceptance pending.
+## Filesystem resources and hardlinks
 
-## Current resource limits
+The engine admits workers against descriptor and memory budgets, including
+thread stacks, reused transfer buffers, and metadata captures. Budget constants
+and admission checks live in [engine/mod.rs](../crates/ish-fs/src/engine/mod.rs).
+These are allocation estimates, not measured peak RSS limits.
+[The foreground controller](../src/foreground.rs) owns bounded event delivery,
+progress coalescing, and signal polling.
 
-The engine defaults to at most four workers and lowers that count to fit its
-descriptor and address-space budgets. `--jobs` accepts 1 through 32 and rejects
-requests that exceed either budget. The operation fails before mutation when
-fewer than 16 descriptors remain after its reservation.
+[Dry-run](../crates/ish-fs/src/engine/dry_run.rs) enumerates each directory once,
+charging retained names and frame capacities to its memory budget. It creates
+no scratch state. Transfer, hardlink, and retirement records use unlinked spool
+files. [Records](../crates/ish-fs/src/engine/records.rs) uses an in-spool AVL index
+for logarithmic path lookup without extra descriptors. Private record and
+retained-intent encoding is version 2; unknown versions are rejected.
 
-Recursive copy uses a 256-record work queue. Each worker has a 256 KiB transfer
-buffer, and traversal paths are limited to 64 KiB. The foreground controller
-has a separate 256-event queue and coalesces progress events when that queue is
-full. It polls for signals every 50 ms.
-
-Preflight mapping accounting is capped at 64 MiB. Dry-run traversal frames,
-retained child names, and vector capacities are capped together at 32 MiB.
-Each directory is enumerated once without creating scratch files.
-Traversal, hardlink, and retirement records use unlinked
-temporary files under the configured scratch directory; each decoded record
-is capped at 1 MiB. For a finite address-space limit, worker admission reserves
-64 MiB for records and 512 KiB for the producer stack. Each worker is budgeted
-one 512 KiB stack, a 256 KiB transfer buffer, and four metadata captures. A
-metadata capture is capped at 16 MiB on Linux and 64 MiB on macOS; Linux
-extended attribute buffers use that same 16 MiB cap.
-
-Path lookup uses an AVL index in the existing record spool. Each record has
-a 17-byte index header, and output observations occupy a fixed 94-byte slot.
-The index adds no descriptors. Lookup takes logarithmic record work, including
-directory-anchor and retirement lookups. The private record and retained-intent
-encoding is version 2. Unknown versions are rejected rather than guessed.
-
-Hardlink coordination keeps one active owner per source inode. Coordinator
-locks are released before data transfer, synchronization, and event delivery.
-Regular files and symlink objects share this coordination. Symlinks are linked
-without following their targets.
+Hardlink coordination keeps one active owner per source inode. Locks are
+released before data transfer, synchronization, and event delivery. Regular
+files and symlink objects share coordination; linking never follows a symlink.
 
 Multi-source moves and merges record completed directory renames without
-enumerating their children. A later hardlink transfer indexes each recorded
-tree once. If copied representatives already exist, a directory is inspected
-before rename to detect a coupled group. A coupled tree uses transfer and
-guarded retirement. An isolated directory rename needs neither traversal nor
-scratch storage. Reused regular-file representatives are synchronized before
-they authorize durable retirement.
+walking them. A later hardlink transfer indexes each recorded tree once. If
+copied representatives already exist, the next directory is inspected for a
+coupled group. A coupled tree uses transfer and guarded retirement. Reused
+regular-file representatives are synchronized before durable retirement.
+See [transfer.rs](../crates/ish-fs/src/engine/transfer.rs) and its
+[repair regressions](../crates/ish-fs/src/engine/repair_tests.rs).
 
-Worker admission reserves six descriptors per worker on Linux and eight on
-macOS. The macOS budget covers two verified named-fork stream descriptors for
-resource forks above the positioned-xattr range. Resource-fork copying reuses
-the worker's existing transfer buffer.
-
-These budgets estimate bounded allocations used to admit workers. They are not
-measured peak RSS limits. Linux resource probes sample descriptor and RSS
-maxima, but sampling can miss short peaks. The constrained Linux cases pass;
-the observations do not establish a universal process-memory maximum or
-macOS resource behavior.
-
-`ish-fs` reports bytes streamed and logical bytes cloned. They describe
-different transfer methods and are not additive measures of physical I/O.
-`transfer_elapsed` includes concurrent transfer work, while
-`destination_sync_work` sums sync calls that can overlap each other and
-transfer. `source_retirement_elapsed` includes source namespace sync. These
-timings do not add up to total operation time. P3 benchmark results are
-exploratory, and P3 performance acceptance remains blocked. No universal speed
-ratio applies.
-
-The repository does not declare a general license. The imported code and
-`ish-fs` subtree carry the MIT license in [its license file](../crates/ish-fs/LICENSE)
-and the single [import note](../crates/ish-fs/IMPORT.md).
+Transfer counter meanings are defined on
+[Progress and Metrics](../crates/ish-fs/src/lib.rs). Logical cloned bytes and
+streamed bytes do not measure physical I/O. Phase timings can overlap and must
+not be added to estimate elapsed time.
 
 ## State and process boundaries
 
@@ -171,6 +128,10 @@ and the single [import note](../crates/ish-fs/IMPORT.md).
 - Directory listing, completion, pathname expansion, and prompt Git inspection
   run in-process. External commands and command substitutions may start child
   processes. A `.envrc` that requests bash evaluation may also start one.
+
+denv trust filenames use SHA-256 of canonical path bytes to keep storage names
+bounded. Revocation removes both current and legacy approvals. The storage
+boundary is implemented in [denv.rs](../src/denv.rs).
 
 Evaluator fork, wait, callback, and cancellation behavior belongs to the
 [epsh process model](../crates/epsh/docs/process-model.md).

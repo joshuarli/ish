@@ -14,6 +14,10 @@ Normal exit and Ctrl+D tests verify that the represented terminal lifecycle is
 restored to its initial state. Cleanup after a failed test only prevents a
 stray process; it is not a restoration assertion.
 
+The panic hook in [term.rs](../src/term.rs) attempts terminal restoration before
+calling the previous hook. Release builds abort on panic, so cleanup cannot
+rely on `RawMode::drop`. Development builds use the default unwind strategy.
+
 ## Native file operation cases
 
 Name `cp` and `mv` PTY cases with the `native_fs_` prefix. Cover list

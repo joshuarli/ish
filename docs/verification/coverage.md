@@ -9,14 +9,11 @@ translation of a production Rust function, subject to the documented extractor
 trust boundary. `TESTED BOUNDARY` identifies explicit protocol and
 domain rejection checks outside the semantic case count.
 
-The last combined run before placement cases were added passed 1,000 supported
-semantic cases in each of six families, for 6,000 comparisons. Each family
-rejected its comparator control. Protocol checks and explicit effects boundary
-checks also passed. The bridge rejects `unsupported_domain` and `fuel_exhausted`
-outcomes during semantic comparisons. Its effects boundary cases test those
-outcomes separately. The current policy-only run passed 1,000 generated cases,
-including placement cases, with a rejected comparator control. Run the combined
-comparison with `cargo run --example semantic_bridge -p ish -- --family all --cases 1000`.
+Run all six families with
+`cargo run --example semantic_bridge -p ish -- --family all --cases 1000`.
+The bridge rejects `unsupported_domain` and `fuel_exhausted` during semantic
+comparisons; explicit effects boundary cases require those outcomes separately.
+Each family also checks a comparator control.
 `make verify` also compiles and detects four [production mutations](mutation-testing.md).
 The expansion [generation reference](expansion-generation.md) lists the seeded
 315-combination schedule that follows the first 53 fixtures.

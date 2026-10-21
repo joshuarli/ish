@@ -103,19 +103,16 @@ its allowed whole-line form, ish refuses the command with status 2 before that
 target runs or opens its redirections. Earlier commands in the input line keep
 their effects. Commands that need shell state, including `alias`, `exit`, `fg`,
 `denv`, and `z`, must be the whole input line. `cd` and `history` can also be
-used in lists. `t` and `trash` must also be the whole input line. Native `cp`
-and `mv` run in lists and support redirections in the shell process. Without
-`!`, ish refuses them in pipelines and command substitutions with status 2
-before their target redirections or filesystem operations. Argument
-substitutions are allowed.
-Standalone negation such as `! cp source copy` runs the operation in the shell
-process and inverts its status. Real pipelines and command substitutions still
-refuse native `cp` and `mv` before target redirections or filesystem
-operations. Negation inverts a refusal's status inside a pipeline or command
-substitution, while the diagnostic remains visible. Aliases after `!` expand
-before dispatch.
-Use `command cp` or an alias for the same parent-process operation. An explicit
-path such as `/bin/cp` selects the external program.
+used in lists. `t` and `trash` must also be the whole input line.
+
+Native `cp` and `mv` run in the shell process, including lists, redirections,
+and standalone negation. `! cp source copy` performs the copy and inverts its
+status. Genuine pipelines and command substitutions refuse native operations
+before target redirections or filesystem effects. Refusal returns 2; an
+expression's `!` can invert that status while retaining the diagnostic.
+Argument substitutions are allowed. Aliases after `!` expand before dispatch.
+Use `command cp` or an alias for the same native operation. Use an explicit
+path such as `/bin/cp` to run the external utility.
 
 Arithmetic follows [epsh's signed 64-bit rules](crates/epsh/README.md#arithmetic).
 
@@ -193,8 +190,6 @@ using `DENV_DATA_DIR` or `$HOME/.local/share/denv`. Project changes to `HOME` or
 `DENV_DATA_DIR` do not move that storage. Leaving a project restores its variables.
 If an active restoration record is malformed or uses an unsupported version,
 `denv` reports an error and leaves the process environment unchanged.
-Trust records use bounded SHA-256 filenames derived from each file's canonical
-path bytes. Existing approvals remain valid; `denv deny` revokes both formats.
 
 ## Help and license
 

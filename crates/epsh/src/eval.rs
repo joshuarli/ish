@@ -393,7 +393,6 @@ pub struct ShellOpts {
     pub nounset: bool,
     /// -x: print commands before execution (xtrace)
     pub xtrace: bool,
-    /// -o pipefail: return highest nonzero status from any pipeline stage
     pub pipefail: bool,
     /// -f: disable pathname expansion (globbing)
     pub noglob: bool,

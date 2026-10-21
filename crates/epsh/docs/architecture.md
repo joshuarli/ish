@@ -31,7 +31,7 @@ placement table. A `ParentProcess` target is checked before command-policy
 callbacks and target redirections. epsh refuses it with status 2 in a forked
 process, pipeline, or command substitution. The table is empty by default.
 
-The [arithmetic contract](../README.md#builder-options) defines wrapping,
+The [arithmetic contract](../README.md#arithmetic) defines wrapping,
 errors, shift behavior, and assignment effects.
 
 Use shell terms consistently: a token is a lexical unit; a word is an

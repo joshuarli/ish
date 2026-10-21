@@ -62,9 +62,7 @@ impl Prompt {
         }
     }
 
-    /// Render the prompt into a caller-owned buffer (zero allocation steady-state).
     /// Layout: `user@host colored_pwd[*][ branch][ [Xs]] $ `
-    /// `pwd` and `denv_dirty` are passed in to avoid env var reads.
     pub fn render_into(&mut self, out: &mut String, last_status: i32, pwd: &str, denv_dirty: bool) {
         let color = if last_status == 0 {
             "\x1b[38;5;10m" // bright green

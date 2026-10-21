@@ -3,8 +3,8 @@ behavior contract.
 
 ## Commands
 
-- `make build` builds the workspace.
-- `make test` runs workspace library, integration, PTY, and conformance tests.
+- `make build` builds the default workspace members.
+- `make test` tests the default members, including PTY and conformance tests.
 - `make test-epsh` runs epsh library and integration tests.
 - `make conformance` prints all retained native conformance case results.
 - `make verify` checks Lean models, theorem axioms, the Rust bridge, and production mutations.
@@ -28,7 +28,7 @@ behavior contract.
 - Update the README and relevant integration or PTY coverage when user-visible behavior changes.
 - Keep dynamic command policy checks in epsh expansion and dispatch paths; ish refuses dynamic `eval`, `source`, `.`, and out-of-line shell-state builtins with status 2 before target effects.
 - Keep arithmetic overflow behavior explicit: wrapping add, subtract, multiply, and negate; errors for zero division or remainder, signed division or remainder overflow, and invalid shift counts.
-- Keep Rust workspace tests and the native 175-case byte-preserving conformance corpus in CI on supported hosts.
+- Keep Rust workspace tests and the retained native byte-preserving conformance corpus in CI on supported hosts.
 - Treat Lean theorems as claims about the model. Use the differential bridge and Rust tests for implementation correspondence and behavior.
 
 ## Topic map
@@ -37,6 +37,9 @@ behavior contract.
   outcomes](docs/rfc/ISH-5-foreground-job-outcomes.md) and [callback process
   boundaries](docs/rfc/ISH-8-callback-process-boundary.md).
 
+- Build, test, installation, and release commands: [Development](docs/development.md).
+- File operation behavior: [Filesystem](docs/filesystem.md). Native fixtures, required runs, and evidence limits: [Filesystem testing](docs/filesystem-testing.md).
+- Filesystem measurements: [Benchmark harness](benches/fs/README.md) and [recorded results](benches/fs/results-linux.md).
 - Execution flow, epsh integration, command routing, process boundaries, and module ownership: [Architecture](docs/architecture.md).
 - History search ranking and session snapshots: [History search](docs/history-search.md).
 - Completion matching, ordering, and hot-path constraints: [Completion](docs/completion.md).
