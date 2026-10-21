@@ -1,5 +1,5 @@
 Prefix: ISH
-Next: 53
+Next: 57
 
 ### ISH-26 · P2 · A trusted `.envrc` runs unhashed files through `source_env`, `source_up` and `dotenv`
 
@@ -72,7 +72,7 @@ Next: 53
 ### ISH-45 · P3 · macOS-only edits from the backlog run were never compiled
 
 - **Area:** Tests
-- **Where:** `crates/ish-fs/tests/native_macos.rs`, `crates/ish-fs/src/engine/mod.rs` (`replace_by_exchange`), `crates/fdu-scan/src/macos.rs`, `src/signal.rs` (`errno_slot`), `crates/ish-fs/src/platform/mod.rs` (`rename_exchange`)
+- **Where:** `crates/ish-fs/tests/native_macos.rs`, `crates/ish-fs/src/engine/mod.rs` (`replace_by_exchange`), `crates/fdu-scan/src/macos.rs`, `src/signal.rs` (`errno_slot`), `crates/ish-fs/src/platform/mod.rs` (`rename_exchange`), `crates/fdu-scan/src/fsutil.rs` (`identity_link_count_and_modified_time` is now `cfg(target_os = "macos")`)
 - **Problem:** ISH-29, ISH-31, ISH-33 and ISH-38 changed macOS code paths on a Linux host. `native_macos.rs` now panics instead of skipping, `rename_exchange` relies on rustix mapping `RenameFlags::EXCHANGE` to `RENAME_SWAP`, `fdu-scan/src/macos.rs` lost its one-shot scanner, and the signal handler uses `libc::__error`. None of it was compiled or run.
 - **Recommendation:** On a macOS host run workspace check, strict clippy, `make test`, and `cargo test -p ish-fs --test native_macos -- --include-ignored` as uid 0, and fix what fails.
 - **Fix with:** none
@@ -94,4 +94,40 @@ Next: 53
 - **Problem:** The comments claim a single-threaded process, but `foreground.rs` spawns worker threads. This overlaps ISH-15 and was left unverified by the comment cleanup.
 - **Recommendation:** Resolve with ISH-15: state the real precondition at the call sites or remove the process-environment mutation.
 - **Fix with:** os-boundaries
+- **Effort:** S (hours)
+
+### ISH-53 · P3 · Two ish-fs tests still skip silently, and two `dry_run` tests fail in a fresh checkout
+
+- **Area:** Tests
+- **Where:** `crates/ish-fs/src/engine/repair_tests.rs` (`repair_published_access_metadata_mutation_retains_source`, about line 224), `crates/ish-fs/src/engine/tests.rs` (Linux ACL branch of `public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks`, about line 733), `crates/ish-fs/src/engine/dry_run.rs:165`
+- **Problem:** The first test returns early when xattrs are unsupported, and the ACL branch logs "unavailable" and continues, so both pass without checking what they guard. Separately, `dry_run.rs:165` calls `create_dir`, not `create_dir_all`, so two `dry_run` tests fail the first time `cargo test -p ish-fs --lib` runs in a worktree where `.work/tmp` does not exist.
+- **Recommendation:** Give the two skips the ISH-46 treatment (`#[ignore = "reason"]` and a panic when the capability is missing), and create the scratch directory with `create_dir_all`.
+- **Fix with:** test-audit
+- **Effort:** S (hours)
+
+### ISH-54 · P4 · `fdu-delete` recovery and mount-identity paths have no tests
+
+- **Area:** Tests
+- **Where:** `crates/fdu-delete/src/posix/quarantine.rs`, `crates/fdu-delete/tests/quarantine.rs`
+- **Problem:** ISH-46 added four tests for delete, identity mismatch, an absent entry and an unindexed child. Interrupted-run recovery (`recover`, `Intent::decode`, rejection of damaged quarantine entries), mount-identity checks, and rename and fsync failures inside the quarantine remain untested; reaching them needs a crash or hand-written quarantine files.
+- **Recommendation:** Hand-write quarantine and intent files in a scratch directory to cover `recover` and damaged entries, and decide whether the mount checks need a native fixture.
+- **Fix with:** test-audit
+- **Effort:** M (days)
+
+### ISH-55 · P4 · `Prompt::render_with_state` is a test-only wrapper
+
+- **Area:** Dead code
+- **Where:** `src/prompt.rs` (`render_with_state`), `tests/prompt_identity.rs`, `tests/integration.rs`
+- **Problem:** `src/main.rs` renders through `render_into`; `render_with_state` is called only from tests, so the tests exercise a path production does not take.
+- **Recommendation:** Point the tests at `render_into` and delete the wrapper, or keep the wrapper and name it for tests.
+- **Fix with:** dead-code-archaeology
+- **Effort:** S (hours)
+
+### ISH-56 · P4 · Startup record cleanup in denv treats a pid from another pid namespace as dead
+
+- **Area:** Data
+- **Where:** `src/denv.rs` (`remove_dead_shell_records`, `shell_is_alive`)
+- **Problem:** Records are kept when `kill(pid, 0)` succeeds or fails with `EPERM` and removed on `ESRCH`. Two shells in different pid namespaces (containers or `unshare`) sharing one `DENV_DATA_DIR` see each other's pids as dead, so a new shell deletes a live shell's record and that shell cannot restore its saved variables. Not reproduced.
+- **Recommendation:** Record the pid-namespace identity (`/proc/self/ns/pid` inode on Linux) in the record name or contents and skip removal for foreign namespaces, or document the limit in the README.
+- **Fix with:** durable-state
 - **Effort:** S (hours)
