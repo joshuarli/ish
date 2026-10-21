@@ -168,7 +168,7 @@ fn main() {
     // control of the terminal. Called once at startup, single-threaded.
     let pid = rustix::process::getpid();
     let _ = rustix::process::setpgid(None, None);
-    let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
+    let stdin = term::stdin();
     let _ = rustix::termios::tcsetpgrp(stdin, pid);
 
     let (rows, cols) = term::term_size();
@@ -2844,7 +2844,7 @@ fn spawn_external(
                 // Parent: duplicate setpgid (child did it too — no race)
                 // and hand the terminal to the new process group.
                 let _ = rustix::process::setpgid(Some(child_pid), Some(child_pid));
-                let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
+                let stdin = term::stdin();
                 let _ = rustix::termios::tcsetpgrp(stdin, child_pid);
 
                 // Wait with WUNTRACED for job control. The shell tracks one

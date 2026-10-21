@@ -68,15 +68,6 @@ Next: 45
 - **Fix with:** api-surface-and-module-boundaries
 - **Effort:** L (weeks)
 
-### ISH-36 · P3 · Library and epsh public surfaces are wider than their one consumer
-
-- **Area:** Architecture
-- **Where:** `src/lib.rs:1-34`, `src/sys.rs:7`, `src/job.rs:13-17`, `crates/epsh/src/lib.rs:40-60`, `crates/epsh/tests/api_stability.rs`
-- **Problem:** The ish library exports every module as `pub`, including unsafe or ambient-descriptor helpers such as `continue_in_foreground`, although the only consumer is the binary and its tests. About 30 `BorrowedFd::borrow_raw(0 or 1)` calls repeat across five files. epsh exports `arith`, `glob`, `encoding`, `var`, `lexer`, `expand` and `builtins`; nothing in `src` uses `epsh::arith`, `epsh::glob` or `epsh::encoding`, and `api_stability.rs` freezes the whole surface, so ish-driven changes look breaking. How much of it is dead was not enumerated.
-- **Recommendation:** Make unused modules `pub(crate)`, add `term::stdin()` and `term::stdout()` borrowed-fd accessors, and shrink `api_stability.rs` to the supported embedding API. If epsh is meant as a general crate, say so in its README.
-- **Fix with:** api-surface-and-module-boundaries
-- **Effort:** M (days)
-
 ### ISH-37 · P3 · A child that stops or dies in raw mode may leave its terminal state as the shell's baseline
 
 - **Area:** Operability

@@ -13,7 +13,7 @@ pub struct Job {
 /// Restoring the settings is critical for programs like vim/less that set raw
 /// mode: without it they would resume with the shell's terminal settings.
 pub fn continue_in_foreground(pgid: rustix::process::Pid, termios: &crate::term::Termios) {
-    let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
+    let stdin = crate::term::stdin();
     let _ = rustix::termios::tcsetpgrp(stdin, pgid);
     let _ = rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Drain, termios);
     let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::CONT);
@@ -39,7 +39,7 @@ pub fn resume_job(job: &mut Option<Job>, last_output: &mut crate::capture::Outpu
     };
     continue_in_foreground(pgid, &j.termios);
 
-    let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
+    let stdin = crate::term::stdin();
     // Wait for the job, detecting if it stops again
     let result = rustix::process::waitpgid(pgid, rustix::process::WaitOptions::UNTRACED);
 

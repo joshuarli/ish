@@ -13,11 +13,9 @@ use std::time::Duration;
 // Verify all public modules are accessible
 use epsh::ast;
 use epsh::builtins;
-use epsh::encoding;
 use epsh::error;
 use epsh::eval;
 use epsh::expand;
-use epsh::glob;
 use epsh::lexer;
 use epsh::parser;
 use epsh::shell_bytes;
@@ -259,32 +257,9 @@ fn builtin_list_api() {
 }
 
 #[test]
-fn encoding_api() {
-    // bytes_to_str and str_to_bytes are public
-    let s: String = encoding::bytes_to_str(b"hello");
-    let b: Vec<u8> = encoding::str_to_bytes(&s);
-    assert_eq!(b, b"hello");
-
-    // Roundtrip with non-UTF-8
-    let input = &[0x80u8, 0xFF];
-    let encoded = encoding::bytes_to_str(input);
-    let decoded = encoding::str_to_bytes(&encoded);
-    assert_eq!(decoded, input);
-}
-
-#[test]
 fn expand_trait_accessible() {
     // ShellExpand trait is public (for custom implementations)
     fn _takes_expand(_: &mut dyn expand::ShellExpand) {}
-}
-
-#[test]
-fn glob_api() {
-    use std::path::Path;
-    // Public functions
-    let _: bool = glob::has_glob_chars("*.txt");
-    let _: bool = glob::fnmatch("*.txt", "file.txt");
-    let _: Vec<String> = glob::glob("*.nonexistent", Path::new("/tmp"));
 }
 
 #[test]

@@ -31,5 +31,5 @@ pub mod prompt;
 pub mod render;
 pub mod signal;
 mod static_word;
-pub mod sys;
+pub(crate) mod sys;
 pub mod term;

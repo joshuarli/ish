@@ -4,6 +4,16 @@ use std::os::fd::{BorrowedFd, RawFd};
 pub const STDIN_FD: RawFd = 0;
 pub const STDOUT_FD: RawFd = 1;
 
+pub fn stdin() -> BorrowedFd<'static> {
+    // SAFETY: descriptor 0 stays open for the life of the process; the shell never closes it.
+    unsafe { BorrowedFd::borrow_raw(STDIN_FD) }
+}
+
+pub fn stdout() -> BorrowedFd<'static> {
+    // SAFETY: descriptor 1 stays open for the life of the process; the shell never closes it.
+    unsafe { BorrowedFd::borrow_raw(STDOUT_FD) }
+}
+
 pub type Termios = rustix::termios::Termios;
 
 static STARTUP_TERMIOS: std::sync::OnceLock<Termios> = std::sync::OnceLock::new();
@@ -15,9 +25,9 @@ pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Some(termios) = STARTUP_TERMIOS.get() {
-            let stdout = unsafe { BorrowedFd::borrow_raw(STDOUT_FD) };
+            let stdout = stdout();
             let _ = rustix::io::write(stdout, b"\x1b[?2004l\x1b[?25h");
-            let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+            let stdin = stdin();
             let _ =
                 rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Now, termios);
         }
@@ -31,7 +41,7 @@ pub struct RawMode {
 
 impl RawMode {
     pub fn enable() -> io::Result<Self> {
-        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        let stdin = stdin();
         let orig = rustix::termios::tcgetattr(stdin)?;
 
         let mut raw = orig.clone();
@@ -60,7 +70,7 @@ impl Drop for RawMode {
         let _ = io::stdout().flush();
         // SAFETY: Restores saved termios. TCSANOW avoids blocking if output
         // hasn't drained (e.g. PTY). orig was captured in enable().
-        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        let stdin = stdin();
         let _ =
             rustix::termios::tcsetattr(stdin, rustix::termios::OptionalActions::Now, &self.orig);
     }
@@ -75,7 +85,7 @@ impl ForegroundMode {
         if !io::stdin().is_terminal() {
             return Ok(Self { original: None });
         }
-        let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+        let stdin = stdin();
         let original = rustix::termios::tcgetattr(stdin)?;
         let mut active = original.clone();
         active.local_modes.insert(rustix::termios::LocalModes::ISIG);
@@ -89,7 +99,7 @@ impl ForegroundMode {
 impl Drop for ForegroundMode {
     fn drop(&mut self) {
         if let Some(original) = self.original.as_ref() {
-            let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+            let stdin = stdin();
             let _ = rustix::termios::tcsetattr(
                 stdin,
                 rustix::termios::OptionalActions::Now,
@@ -100,7 +110,7 @@ impl Drop for ForegroundMode {
 }
 
 pub fn term_size() -> (u16, u16) {
-    let stdout = unsafe { BorrowedFd::borrow_raw(STDOUT_FD) };
+    let stdout = stdout();
     match rustix::termios::tcgetwinsize(stdout) {
         Ok(ws) if ws.ws_col > 0 => (ws.ws_row, ws.ws_col),
         _ => (24, 80),
@@ -109,7 +119,7 @@ pub fn term_size() -> (u16, u16) {
 
 /// Save original termios without entering raw mode (for child process restoration).
 pub fn save_termios() -> io::Result<Termios> {
-    let stdin = unsafe { BorrowedFd::borrow_raw(STDIN_FD) };
+    let stdin = stdin();
     Ok(rustix::termios::tcgetattr(stdin)?)
 }
 
