@@ -73,7 +73,7 @@ results, Enter to accept, and Escape to cancel.
 Ctrl+R opens a case-insensitive fuzzy-search pager with matches highlighted.
 Typing or pasting edits the search query and filters the matches.
 Use Up and Down to navigate, Enter to accept, and Escape to cancel. History is
-saved in `~/.local/share/ish/history`; Ctrl+R searches saved commands across
+saved in `~/.local/share/ish/history.log`; Ctrl+R searches saved commands across
 sessions, while Up and Down use this session's history snapshot. `history`
 prints the list and `history reset` clears it. Run `history -h` for help.
 
@@ -152,6 +152,11 @@ symlinks themselves and leaves their targets alone. An incomplete scan or mount
 boundary stops deletion before it starts. By default, the command asks you to
 type `yes`. Pass `--yes` to skip the prompt. Without a terminal, `--yes` is
 required. A terminal shows scan progress and a deletion progress bar.
+If deletion is interrupted, entries may remain in a `.fdu-quarantine-v1-*`
+directory inside `PATH`. The next `t PATH` restores them and reports
+"interrupted deletion recovered; rescan before deleting"; run it again to
+delete. A damaged or unrelated directory with that prefix blocks deletion until
+you move it away.
 
 ish's `cp` and `mv` use an exact-target form: the source object maps to the
 destination path. For example, `cp report.txt .` reports a type conflict when
