@@ -847,11 +847,6 @@ fn apply_fd_metadata(
         )?;
     }
 
-    let mut mode = observation.mode & 0o7777;
-    if preservation == Preservation::Copy && !copy_owner_matches {
-        mode &= !0o6000;
-    }
-    fs::fchmod(fd, fs::Mode::from_raw_mode(mode as _))?;
     remove_unpreserved_fd_xattrs(fd, metadata, preservation, copy_owner_matches)?;
 
     for xattr in &metadata.xattrs {
@@ -866,6 +861,12 @@ fn apply_fd_metadata(
     if let Some(acl) = &metadata.acl {
         fs::fsetxattr(fd, POSIX_ACL_ACCESS, acl, fs::XattrFlags::empty())?;
     }
+
+    let mut mode = observation.mode & 0o7777;
+    if preservation == Preservation::Copy && !copy_owner_matches {
+        mode &= !0o6000;
+    }
+    fs::fchmod(fd, fs::Mode::from_raw_mode(mode as _))?;
     apply_timestamps_fd(fd, observation.atime, observation.mtime)?;
     apply_prepublication_flags(fd, metadata.flags)
 }

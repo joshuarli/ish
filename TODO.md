@@ -50,15 +50,6 @@ Next: 45
 - **Fix with:** os-boundaries, api-surface-and-module-boundaries
 - **Effort:** M (days)
 
-### ISH-30 · P3 · Linux metadata copy applies mode before xattrs, so read-only files with `user.*` xattrs fail
-
-- **Area:** Data
-- **Where:** `crates/ish-fs/src/platform/linux.rs:845-856`, `crates/ish-fs/tests/transfer.rs:69`, `crates/ish-fs/tests/native_linux.rs:346`
-- **Problem:** `apply_fd_metadata` runs `fchmod` with the final mode and then `fsetxattr`. The review lane ran `setxattr` as uid 1000 on this ext4 volume after `chmod 444`; it returned EACCES for both path and fd. A 0444 or 0555 source carrying a `user.*` xattr therefore fails metadata application and the transfer reports failure with the source retained, against the preserved-xattr and read-only-mode contract in `docs/filesystem.md`. No test combines the two. The ish-fs path itself was not run end to end.
-- **Recommendation:** Apply xattrs and ACL before the final `fchmod`. Add one test with a 0444 file carrying a `user.*` xattr.
-- **Fix with:** os-boundaries
-- **Effort:** S (hours)
-
 ### ISH-31 · P3 · `--replace` checks the destination and then renames over it
 
 - **Area:** Data

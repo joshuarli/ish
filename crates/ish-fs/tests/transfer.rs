@@ -80,6 +80,22 @@ fn readable_readonly_files_and_directory_modes_work() {
 }
 
 #[test]
+fn readonly_file_with_user_xattr_transfers_with_its_xattr() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.0.join("source")).unwrap();
+    let source_file = fixture.0.join("source/file");
+    fs::write(&source_file, b"readonly").unwrap();
+    rustix::fs::setxattr(&source_file, "user.ish-fs-readonly", b"value", rustix::fs::XattrFlags::empty()).unwrap();
+    fs::set_permissions(&source_file, fs::Permissions::from_mode(0o444)).unwrap();
+    assert_eq!(fixture.run(&fixture.request("source", "destination")), 0);
+    let destination_file = fixture.0.join("destination/file");
+    assert_eq!(fs::metadata(&destination_file).unwrap().mode() & 0o777, 0o444);
+    let mut value = [0; 16];
+    let length = rustix::fs::getxattr(&destination_file, "user.ish-fs-readonly", &mut value).unwrap();
+    assert_eq!(&value[..length], b"value");
+}
+
+#[test]
 fn wide_tree_bounds_queue_records_and_descriptors() {
     let fixture = Fixture::new(); fs::create_dir(fixture.0.join("source")).unwrap();
     for index in 0_u32..1024 { fs::write(fixture.0.join(format!("source/{index}")), index.to_le_bytes()).unwrap(); }
