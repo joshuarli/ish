@@ -164,12 +164,16 @@ fn main() {
     let signal_fd = signal::init();
     term::install_panic_hook();
 
-    // SAFETY: Set shell as its own process group leader and take foreground
-    // control of the terminal. Called once at startup, single-threaded.
     let pid = rustix::process::getpid();
-    let _ = rustix::process::setpgid(None, None);
+    if let Err(error) = rustix::process::setpgid(None, None)
+        && error != rustix::io::Errno::PERM
+    {
+        eprintln!("ish: cannot become a process group leader: {error}");
+    }
     let stdin = term::stdin();
-    let _ = rustix::termios::tcsetpgrp(stdin, pid);
+    if let Err(error) = rustix::termios::tcsetpgrp(stdin, pid) {
+        eprintln!("ish: cannot take the terminal: {error}");
+    }
 
     let (rows, cols) = term::term_size();
     let shell_pid = rustix::process::getpid().as_raw_pid();
@@ -328,6 +332,7 @@ fn main() {
                             run_shell_builtin(name, &args, &expanded, &mut shell)
                         };
                         if quit {
+                            exit_code = shell.last_status;
                             break;
                         }
                         continue;
@@ -2618,12 +2623,18 @@ fn abandon_job(job: Job) {
 
 /// Handle the "exit" command typed at the prompt. Returns true if the shell should break.
 fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
+    let code: i32 = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     if shell.job.is_some() {
         if shell.exit_warned {
             if let Some(job) = shell.job.take() {
                 abandon_job(job);
             }
-            return true; // break
+            shell.last_status = code;
+            return true;
         } else {
             eprintln!("ish: there is a suspended job. Exit again to force quit.");
             shell.exit_warned = true;
@@ -2631,11 +2642,6 @@ fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
             return false;
         }
     }
-    let code: i32 = line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
     denv::on_exit(&shell.denv);
     std::process::exit(code);
 }
@@ -2841,61 +2847,95 @@ fn spawn_external(
             let child_pid = unsafe { rustix::process::Pid::from_raw_unchecked(child_id) };
 
             if is_main {
-                // Parent: duplicate setpgid (child did it too — no race)
-                // and hand the terminal to the new process group.
-                let _ = rustix::process::setpgid(Some(child_pid), Some(child_pid));
-                let stdin = term::stdin();
-                let _ = rustix::termios::tcsetpgrp(stdin, child_pid);
+                if let Err(error) = rustix::process::setpgid(Some(child_pid), Some(child_pid))
+                    && !matches!(error, rustix::io::Errno::ACCESS | rustix::io::Errno::SRCH)
+                {
+                    eprintln!("ish: cannot set process group for {name}: {error}");
+                }
+                if let Err(error) = ish::job::hand_terminal_to(child_pid) {
+                    eprintln!("ish: cannot hand the terminal to {name}: {error}");
+                }
 
                 // Wait with WUNTRACED for job control. The shell tracks one
                 // suspended job; while that slot is taken, a second stop is
                 // refused by continuing the new job, since it could never be
                 // resumed with `fg`.
-                let status = loop {
-                    let status = rustix::process::waitpid(
-                        Some(child_pid),
-                        rustix::process::WaitOptions::UNTRACED,
-                    )
-                    .ok()
-                    .and_then(|result| result.map(|(_, status)| status));
+                let waited = loop {
+                    let waited = ish::job::retry_interrupted(|| {
+                        rustix::process::waitpid(
+                            Some(child_pid),
+                            rustix::process::WaitOptions::UNTRACED,
+                        )
+                    });
 
-                    // Reclaim terminal
-                    let _ = rustix::termios::tcsetpgrp(stdin, rustix::process::getpgrp());
+                    ish::job::reclaim_terminal();
 
-                    if status.is_some_and(|status| status.stopped())
+                    if let Ok(Some((_, status))) = &waited
+                        && status.stopped()
                         && JOB_SLOT_TAKEN.with(|taken| taken.get())
                         && let Ok(stopped_termios) = term::save_termios()
                     {
                         eprintln!(
                             "\nish: a job is already suspended; resume it with fg before suspending another"
                         );
-                        ish::job::continue_in_foreground(child_pid, &stopped_termios);
+                        if let Err(error) =
+                            ish::job::continue_in_foreground(child_pid, &stopped_termios)
+                        {
+                            eprintln!("ish: cannot continue {name}: {error}");
+                            ish::job::kill_group(child_pid);
+                        }
                         continue;
                     }
-                    break status;
+                    break waited;
                 };
 
-                if status.is_some_and(|status| status.stopped()) {
-                    // Capture the terminal state the stopped process left behind,
-                    // then save it in the thread-local so the main loop can build a Job.
-                    let saved_termios =
-                        term::save_termios().expect("terminal attributes unavailable");
+                let status = match waited {
+                    Ok(Some((_, status))) => status,
+                    Ok(None) => {
+                        term::restore_startup_termios();
+                        return Ok(epsh::error::ExitStatus::from(ish::job::WAIT_FAILURE_STATUS));
+                    }
+                    Err(error) => {
+                        eprintln!("ish: cannot wait for {name}: {error}");
+                        term::restore_startup_termios();
+                        return Ok(epsh::error::ExitStatus::from(ish::job::WAIT_FAILURE_STATUS));
+                    }
+                };
+
+                if status.stopped() {
+                    let saved_termios = match term::save_termios() {
+                        Ok(termios) => termios,
+                        Err(error) => {
+                            eprintln!("ish: cannot save terminal attributes for {name}: {error}");
+                            ish::job::kill_group(child_pid);
+                            let _ = ish::job::retry_interrupted(|| {
+                                rustix::process::waitpid(
+                                    Some(child_pid),
+                                    rustix::process::WaitOptions::empty(),
+                                )
+                            });
+                            term::restore_startup_termios();
+                            return Ok(epsh::error::ExitStatus::from(
+                                ish::job::WAIT_FAILURE_STATUS,
+                            ));
+                        }
+                    };
                     let cmd = args[0].to_shell_string();
                     STOPPED_JOB.with(|cell| {
                         *cell.borrow_mut() = Some((child_id, cmd, saved_termios));
                     });
                 }
                 term::restore_startup_termios();
-                if status.is_some_and(|status| status.stopped()) {
+                if status.stopped() {
                     Err(epsh::error::ShellError::Stopped {
                         pid: child_id,
                         pgid: child_id,
                     })
-                } else if let Some(status) = status.filter(|status| status.exited()) {
+                } else if status.exited() {
                     Ok(epsh::error::ExitStatus::from(
                         status.exit_status().unwrap_or(1),
                     ))
-                } else if let Some(status) = status.filter(|status| status.signaled()) {
+                } else if status.signaled() {
                     Ok(epsh::error::ExitStatus::from(
                         128 + status.terminating_signal().unwrap_or(0),
                     ))

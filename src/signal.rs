@@ -1,11 +1,9 @@
 use crate::sys;
 use std::os::fd::RawFd;
+use std::sync::atomic::AtomicI32;
 
-// SAFETY: These are written once in init() before any signal can fire,
-// then only read from handler() (async-signal context) and read_signal()
-// (main thread). The shell is single-threaded, so no data race.
-static mut PIPE_WRITE: RawFd = -1;
-static mut PIPE_READ: RawFd = -1;
+static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+static PIPE_READ: AtomicI32 = AtomicI32::new(-1);
 static SHELL_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static PENDING_FOREGROUND: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -19,12 +17,8 @@ pub fn init() -> RawFd {
     let (read_fd, write_fd) =
         sys::pipe_nonblock_cloexec().expect("pipe() failed for signal self-pipe");
 
-    // SAFETY: Called once at startup before any signals are installed.
-    // Single-threaded — no concurrent access.
-    unsafe {
-        PIPE_READ = read_fd;
-        PIPE_WRITE = write_fd;
-    }
+    PIPE_READ.store(read_fd, std::sync::atomic::Ordering::Release);
+    PIPE_WRITE.store(write_fd, std::sync::atomic::Ordering::Release);
 
     install_handler(rustix::process::Signal::WINCH);
     // TERM and HUP reach the prompt as events, so the shell restores the
@@ -47,8 +41,7 @@ pub fn init() -> RawFd {
     // Ignore SIGINT for the shell itself as a safety net.
     ignore(rustix::process::Signal::INT);
 
-    // SAFETY: PIPE_READ was set above, single-threaded.
-    unsafe { PIPE_READ }
+    read_fd
 }
 
 /// Restore default signal dispositions — called in child after fork, before exec.
@@ -90,7 +83,7 @@ pub fn read_signal() -> Option<i32> {
             return Some(sig);
         }
     }
-    let fd = unsafe { PIPE_READ };
+    let fd = PIPE_READ.load(std::sync::atomic::Ordering::Acquire);
     if fd < 0 {
         return None;
     }
@@ -222,7 +215,24 @@ fn set_linux_disposition(sig: rustix::process::Signal, handler: libc::sighandler
     }
 }
 
+#[cfg(target_os = "linux")]
+fn errno_slot() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+fn errno_slot() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
 unsafe extern "C" fn handler(sig: i32) {
+    let slot = errno_slot();
+    let saved = unsafe { *slot };
+    unsafe { deliver(sig) };
+    unsafe { *slot = saved };
+}
+
+unsafe fn deliver(sig: i32) {
     // A process forked from the shell without exec (a pipeline stage) inherits
     // this handler. TERM and HUP must still end it: restore the default
     // action and re-raise instead of queueing the signal for the shell.
@@ -252,7 +262,7 @@ unsafe extern "C" fn handler(sig: i32) {
         PENDING_FOREGROUND.fetch_or(pending_bit, std::sync::atomic::Ordering::Release);
     }
     let byte = sig as u8;
-    let fd = unsafe { PIPE_WRITE };
+    let fd = PIPE_WRITE.load(std::sync::atomic::Ordering::Acquire);
     if fd >= 0 {
         unsafe {
             let _ = libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
@@ -298,7 +308,7 @@ mod tests {
             let original_int = read_disposition(libc::SIGINT);
             let original_tstp = read_disposition(libc::SIGTSTP);
             let foreground = ForegroundSignals::install().expect("signal scope installs");
-            let fd = unsafe { PIPE_WRITE };
+            let fd = PIPE_WRITE.load(std::sync::atomic::Ordering::Acquire);
             let bytes = [0u8; 4096];
             loop {
                 let count = unsafe {
@@ -313,7 +323,9 @@ mod tests {
                     break;
                 }
             }
+            unsafe { *errno_slot() = libc::EBADF };
             assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+            assert_eq!(unsafe { *errno_slot() }, libc::EBADF);
             assert_eq!(read_signal(), Some(libc::SIGINT));
             assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
             assert_eq!(read_signal(), Some(libc::SIGTERM));

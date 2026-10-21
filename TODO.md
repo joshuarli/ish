@@ -68,15 +68,6 @@ Next: 45
 - **Fix with:** api-surface-and-module-boundaries
 - **Effort:** L (weeks)
 
-### ISH-38 · P3 · Foreground wait, handoff and signal paths drop errors
-
-- **Area:** Errors
-- **Where:** `src/main.rs:2770-2790`, `src/main.rs:2808-2809`, `src/main.rs:2551-2571`, `src/job.rs:14-45`, `src/signal.rs:4-25`, `src/signal.rs:166-170`, `src/foreground.rs:238`
-- **Problem:** `waitpid(...).ok()` turns ECHILD into a silent status 1; `tcsetpgrp`, `setpgid` and `tcsetattr` results are discarded; a stopped child whose `save_termios` fails reaches `expect("terminal attributes unavailable")` and aborts the shell. `resume_job` takes the job out of the slot and drops it on any wait error. `exit 3` with a suspended job and the warning already shown exits 0. The signal self-pipe is `static mut` under a SAFETY comment claiming one thread while `Foreground` spawns workers, and the handler does not preserve errno.
-- **Recommendation:** Report wait and handoff errors with a defined status, put the job back on error, carry the exit status through `ReadResult`, make the pipe descriptors atomics and save errno in the handler.
-- **Fix with:** error-model, lifecycle-concurrency
-- **Effort:** M (days)
-
 ### ISH-41 · P3 · The default test commands do not cover what ships
 
 - **Area:** Tests

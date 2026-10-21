@@ -531,6 +531,12 @@ impl PtyShell {
         }
     }
 
+    fn wait_for_exit_status(&self, timeout_ms: u64) -> ExitStatus {
+        let mut terminal = self.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::from_millis(timeout_ms));
+        terminal.wait_for_exit(deadline).expect("wait for ish exit")
+    }
+
     /// Strip ANSI escape sequences from output for easier text matching.
     fn strip_ansi(s: &str) -> String {
         let mut result = String::new();
@@ -3920,6 +3926,25 @@ fn exit_twice_with_stopped_job_warns_then_exits() {
     sh.type_str("exit");
     sh.enter();
     sh.wait_for_exit(3000);
+}
+
+#[test]
+fn confirmed_exit_with_stopped_job_keeps_the_requested_status() {
+    let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
+    sh.type_str("./bin/sleep");
+    sh.enter();
+    sh.wait_for("pty-child-ready", 3000);
+    sh.ctrl_z();
+    sh.wait_for("stopped:", 3000);
+    sh.wait_for_prompt_after_line_advance(3000);
+
+    sh.type_str("exit 3");
+    sh.enter();
+    sh.wait_for("suspended job", 3000);
+    sh.wait_for_prompt_after_line_advance(3000);
+    sh.type_str("exit 3");
+    sh.enter();
+    assert_eq!(sh.wait_for_exit_status(3000), ExitStatus::Code(3));
 }
 
 #[test]
