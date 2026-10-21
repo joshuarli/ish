@@ -123,7 +123,7 @@ impl Store {
         let _lock = lock(&self.path)?;
         let mut file = open_file(&self.path, rustix::fs::OFlags::RDWR)?;
         let mut cursor = self.cursor;
-        let snapshot = read_snapshot(&mut file, &mut cursor, generation, last_id)?;
+        let snapshot = read_snapshot(&self.path, &mut file, &mut cursor, generation, last_id)?;
         self.cursor = cursor;
         Ok(snapshot)
     }
@@ -137,7 +137,7 @@ impl Store {
         let _lock = lock(&self.path)?;
         let mut file = open_file(&self.path, rustix::fs::OFlags::RDWR)?;
         let mut cursor = self.cursor;
-        let mut snapshot = read_snapshot(&mut file, &mut cursor, generation, last_id)?;
+        let mut snapshot = read_snapshot(&self.path, &mut file, &mut cursor, generation, last_id)?;
         let id = cursor
             .last_id
             .checked_add(1)
@@ -196,7 +196,7 @@ impl Store {
     pub fn salvage(&mut self) -> io::Result<Salvage> {
         let _lock = lock(&self.path)?;
         let mut file = open_file(&self.path, rustix::fs::OFlags::RDWR)?;
-        let kept = match read_snapshot(&mut file, &mut Cursor::default(), -1, 0) {
+        let kept = match read_snapshot(&self.path, &mut file, &mut Cursor::default(), -1, 0) {
             Ok(_) => return Err(invalid("salvage requested but the log is intact")),
             Err(error) => match error
                 .get_ref()
@@ -294,6 +294,7 @@ fn read_header(file: &mut File) -> io::Result<i64> {
 }
 
 fn read_snapshot(
+    path: &Path,
     file: &mut File,
     cursor: &mut Cursor,
     generation: i64,
@@ -327,8 +328,9 @@ fn read_snapshot(
         });
     }
     file.seek(SeekFrom::Start(cursor.offset))?;
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut reader = BufReader::with_capacity(64 * 1024, &mut *file);
     let mut payload = Vec::new();
+    let mut discarded_complete_frame = false;
     while cursor.offset < metadata.len() {
         let remaining = metadata.len() - cursor.offset;
         if remaining < FRAME_HEADER_SIZE {
@@ -370,7 +372,7 @@ fn read_snapshot(
             // A final frame that runs exactly to EOF is a torn write; the
             // same mismatch before further records is real corruption.
             if frame_size == remaining {
-                recover_tail(reader.get_ref(), cursor.offset)?;
+                discarded_complete_frame = true;
                 break;
             }
             return Err(corrupt(cursor.offset, "frame payload checksum mismatch"));
@@ -391,6 +393,20 @@ fn read_snapshot(
         if occurrence.id > cutoff {
             occurrences.push(occurrence);
         }
+    }
+    if discarded_complete_frame {
+        let kept = cursor.offset;
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| invalid("generation exhausted"))?;
+        publish(path, next, |writer| {
+            file.seek(SeekFrom::Start(HEADER_SIZE))?;
+            io::copy(&mut Read::by_ref(&mut *file).take(kept - HEADER_SIZE), writer)?;
+            Ok(())
+        })?;
+        *file = open_file(path, rustix::fs::OFlags::RDWR)?;
+        *cursor = Cursor::default();
+        return read_snapshot(path, file, cursor, generation, last_id);
     }
     Ok(Snapshot {
         generation: current,
@@ -591,7 +607,7 @@ fn publish(
 pub(super) fn render(path: &Path) -> io::Result<String> {
     let _lock = lock(path)?;
     let mut file = open_file(path, rustix::fs::OFlags::RDWR)?;
-    let snapshot = read_snapshot(&mut file, &mut Cursor::default(), -1, 0)?;
+    let snapshot = read_snapshot(path, &mut file, &mut Cursor::default(), -1, 0)?;
     let mut latest = fxhash::FxHashMap::default();
     for occurrence in snapshot.occurrences {
         let usage = latest.entry(occurrence.command).or_insert((0, 0));

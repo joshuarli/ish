@@ -68,15 +68,6 @@ Next: 45
 - **Effort:** L (weeks)
 - **Design:** [Callback process boundary](docs/rfc/ISH-8-callback-process-boundary.md)
 
-### ISH-22 · P2 · History tail recovery leaves concurrent readers on stale occurrence IDs
-
-- **Area:** Data
-- **Where:** `src/history/store.rs`, `src/history.rs`
-- **Problem:** Final-frame recovery truncates without changing the store generation. A focused regression loaded two entries into an existing reader, corrupted the final frame, and opened a fresh reader that retained one entry. After recovery and an external append reusing occurrence ID 2, the existing reader still contained the discarded second command and could not see the new external command.
-- **Recommendation:** Publish recovery that removes previously observable occurrences as a new generation, atomically replacing the retained prefix so readers rebuild their snapshots and reset occurrence cutoffs.
-- **Fix with:** durable-state
-- **Effort:** M (days)
-
 ### ISH-29 · P2 · ish-fs native boundary tests print SKIP and pass
 
 - **Area:** Tests

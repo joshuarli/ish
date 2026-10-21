@@ -433,6 +433,44 @@ fn damaged_final_frame_is_a_torn_tail() {
 }
 
 #[test]
+fn recovering_an_observed_final_frame_invalidates_existing_readers() {
+    let fixture = Fixture::new();
+    let (path, mut bytes, first_end) = two_frame_log(&fixture);
+    let mut observer = History::load_from(fixture.path()).unwrap();
+    assert_eq!(observer.len(), 2);
+    bytes[first_end + 40] ^= 0x80;
+    fs::write(&path, &bytes).unwrap();
+
+    let mut recovered = History::load_from(fixture.path()).unwrap();
+    assert_eq!(recovered.len(), 1);
+    recovered.add_in_dir("latest", None).unwrap();
+    assert_eq!(fs::read(&path).unwrap().len(), bytes.len());
+
+    observer.sync().unwrap();
+    assert_eq!(observer.len(), 2);
+    assert_eq!(observer.get(0), "first");
+    assert_eq!(observer.get(1), "latest");
+    assert_eq!(observer.prefix_search("second", 0), None);
+    assert_eq!(observer.prefix_search("latest", 0), Some("latest"));
+    assert_eq!(observer.session_get(0), None);
+}
+
+#[test]
+fn recovering_an_observed_final_frame_publishes_a_new_generation() {
+    let fixture = Fixture::new();
+    let (path, mut bytes, first_end) = two_frame_log(&fixture);
+    bytes[first_end + 40] ^= 0x80;
+    fs::write(&path, &bytes).unwrap();
+    let before = fs::read(&path).unwrap();
+    let recovered = History::load_from(fixture.path()).unwrap();
+    assert_eq!(recovered.generation, 1);
+    let after = fs::read(&path).unwrap();
+    assert_eq!(after[..8], before[..8]);
+    assert_eq!(after[8..16], 1i64.to_le_bytes());
+    assert_eq!(after[16..], before[16..first_end]);
+}
+
+#[test]
 fn zero_fill_after_the_last_frame_is_a_torn_tail() {
     for fill in [1usize, 15, 16, 64, 20_000] {
         let fixture = Fixture::new();
