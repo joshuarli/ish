@@ -90,6 +90,15 @@ pub(crate) fn rename_noreplace(
     rustix::fs::renameat_with(from_parent, from_name, to_parent, to_name, flags).map_err(Into::into)
 }
 
+pub(crate) fn rename_exchange(
+    from_parent: BorrowedFd<'_>,
+    from_name: &OsStr,
+    to_parent: BorrowedFd<'_>,
+    to_name: &OsStr,
+) -> io::Result<()> {
+    rustix::fs::renameat_with(from_parent, from_name, to_parent, to_name, rustix::fs::RenameFlags::EXCHANGE).map_err(Into::into)
+}
+
 pub(crate) fn sync_file(fd: BorrowedFd<'_>) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     let result = rustix::fs::fcntl_fullfsync(fd);

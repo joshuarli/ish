@@ -4,7 +4,7 @@ mod transfer;
 mod retirement;
 mod dry_run;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 #[cfg(target_os = "linux")]
 use std::io::Read;
@@ -288,6 +288,19 @@ fn execute_operand(invocation: &Invocation<'_>, operand: &PlannedOperand, into: 
     }
 }
 
+fn replace_by_exchange(from_parent: BorrowedFd<'_>, from_name: &OsStr, to_parent: BorrowedFd<'_>, to_name: &OsStr, expected: Observation) -> io::Result<()> {
+    crate::platform::rename_exchange(from_parent, from_name, to_parent, to_name)?;
+    let displaced = roots::observe(from_parent, from_name);
+    if displaced.as_ref().is_ok_and(|displaced| { let mut expected = expected; expected.ctime = displaced.ctime; anchored::unchanged(expected, *displaced) }) { return Ok(()); }
+    crate::platform::rename_exchange(from_parent, from_name, to_parent, to_name).map_err(|error| io::Error::new(error.kind(), format!("replacement displaced an unobserved destination and could not restore it; it remains at the source name: {error}")))?;
+    Err(io::Error::other("destination changed during replacement; previous destination restored"))
+}
+
+fn retire_displaced(parent: BorrowedFd<'_>, name: &OsStr, displaced: Observation) -> io::Result<()> {
+    anchored::identity(parent, name, displaced.identity)?;
+    fs::unlinkat(parent, name, fs::AtFlags::empty()).map_err(Into::into)
+}
+
 fn rename_object(invocation: &Invocation<'_>, source: &Root, destination: &Root, action: Action) -> Result<OperandState, Failure> {
     invocation.checkpoint()?;
     let tracked_directory = invocation.prepare_directory_rename(source, destination)?;
@@ -296,8 +309,9 @@ fn rename_object(invocation: &Invocation<'_>, source: &Root, destination: &Root,
     match action {
         Action::Replace => {
             let expected = destination.observed.ok_or_else(|| io::Error::other("replacement target is absent"))?;
-            anchored::require_unchanged(destination.parent.as_fd(), &destination.name, expected)?;
-            fs::renameat(&source.parent, &source.name, &destination.parent, &destination.name)?;
+            invocation.fault("before_replace")?;
+            replace_by_exchange(source.parent.as_fd(), &source.name, destination.parent.as_fd(), &destination.name, expected)?;
+            retire_displaced(source.parent.as_fd(), &source.name, expected).map_err(|error| Failure { state: OperandState::SourcePartiallyRetired, error })?;
         },
         Action::Transfer => crate::platform::rename_noreplace(source.parent.as_fd(), &source.name, destination.parent.as_fd(), &destination.name)?,
         _ => return Err(io::Error::other("invalid rename action").into()),

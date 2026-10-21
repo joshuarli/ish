@@ -115,7 +115,10 @@ already have published other completed entries.
 
 An explicit file replacement publishes a completed new object atomically at
 the selected name. It does not truncate the previous destination inode, so
-other hardlinks to that inode remain unchanged. ish does not require a content
+other hardlinks to that inode remain unchanged. ish exchanges the new object with
+the destination name, verifies that the displaced object is the one it
+observed, and then removes it. If another object was swapped in, ish exchanges
+it back and fails, so an unobserved destination is never destroyed. ish does not require a content
 hash to copy a file. Clone, native-copy, and buffered paths follow the same
 logical metadata policy.
 

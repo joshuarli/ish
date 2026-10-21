@@ -598,6 +598,24 @@ fn replacement_revalidation_retains_late_changed_destination() {
 }
 
 #[test]
+fn rename_replacement_restores_late_swapped_destination() {
+    let fixture = Fixture::new(); fs::write(fixture.0.join("source"), b"source").unwrap(); fs::write(fixture.0.join("destination"), b"old").unwrap();
+    let destination = fixture.0.join("destination"); let retained = fixture.0.join("retained");
+    let mut request = fixture.request(); request.options.collision = crate::Collision::Replace;
+    let (outcome, _) = fixture.run(&request, move |point| { if point == "before_replace" { fs::rename(&destination, &retained).unwrap(); fs::write(&destination, b"late existing").unwrap(); } Ok(()) });
+    assert_eq!(outcome.status(), 1); assert_eq!(fs::read(fixture.0.join("destination")).unwrap(), b"late existing"); assert_eq!(fs::read(fixture.0.join("retained")).unwrap(), b"old"); assert_eq!(fs::read(fixture.0.join("source")).unwrap(), b"source"); assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 3);
+}
+
+#[test]
+fn copy_replacement_restores_late_swapped_destination() {
+    let fixture = Fixture::new(); fs::write(fixture.0.join("source"), b"source").unwrap(); fs::write(fixture.0.join("destination"), b"old").unwrap();
+    let destination = fixture.0.join("destination"); let retained = fixture.0.join("retained");
+    let mut request = fixture.request(); request.operation = Operation::Copy; request.options.collision = crate::Collision::Replace;
+    let (outcome, _) = fixture.run(&request, move |point| { if point == "before_replace" { fs::rename(&destination, &retained).unwrap(); fs::write(&destination, b"late existing").unwrap(); } Ok(()) });
+    assert_eq!(outcome.status(), 1); assert_eq!(fs::read(fixture.0.join("destination")).unwrap(), b"late existing"); assert_eq!(fs::read(fixture.0.join("retained")).unwrap(), b"old"); assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 3);
+}
+
+#[test]
 fn cancellation_emits_terminal_outcomes_for_all_unstarted_operands() {
     let fixture = Fixture::new(); fs::create_dir(fixture.0.join("out")).unwrap();
     for name in ["a", "b", "c"] { fs::write(fixture.0.join(name), name.as_bytes()).unwrap(); }

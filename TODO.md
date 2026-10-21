@@ -50,15 +50,6 @@ Next: 45
 - **Fix with:** os-boundaries, api-surface-and-module-boundaries
 - **Effort:** M (days)
 
-### ISH-31 · P3 · `--replace` checks the destination and then renames over it
-
-- **Area:** Data
-- **Where:** `crates/ish-fs/src/engine/transfer.rs:147-149`, `crates/ish-fs/src/engine/mod.rs:297-300`, `docs/filesystem.md`
-- **Problem:** Replace calls `require_unchanged(destination)` and then `renameat` over the name. An object created or swapped in between is destroyed unobserved. Other publish paths use `RENAME_NOREPLACE`; replace is the one place that can lose an object the engine never saw.
-- **Recommendation:** Exchange atomically (`RENAME_EXCHANGE` on Linux, `RENAME_SWAP` on macOS), verify the displaced object matches the observed destination, and restore it on mismatch.
-- **Fix with:** os-boundaries
-- **Effort:** M (days)
-
 ### ISH-32 · P3 · Two capture-and-retire protocols and duplicated identity code across `fdu-*` and `ish-fs`
 
 - **Area:** Architecture

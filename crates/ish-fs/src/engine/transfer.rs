@@ -142,16 +142,19 @@ pub(super) fn whole(invocation: &Invocation<'_>, source: &Root, destination: &Ro
     anchored::identity(stage.parent, &stage.name, stage.observed.identity)?;
     let root_output = stage.entries.lock().unwrap().find(Path::new(""))?.and_then(|record| record.output).ok_or_else(|| io::Error::other("successful staging output missing"))?;
     anchored::require_unchanged(stage.parent, &stage.name, invocation.effective(root_output)?)?;
+    let publication_failure = |error| Failure { state: OperandState::DestinationPublishedSourceRetained, error };
     match action {
         Action::Transfer => platform::rename_noreplace(stage.parent, &stage.name, destination.parent.as_fd(), &destination.name)?,
         Action::Replace => {
-            anchored::require_unchanged(destination.parent.as_fd(), &destination.name, destination.observed.ok_or_else(|| io::Error::other("replacement observation missing"))?)?;
-            fs::renameat(stage.parent, &stage.name, &destination.parent, &destination.name)?;
+            let expected = destination.observed.ok_or_else(|| io::Error::other("replacement observation missing"))?;
+            invocation.fault("before_replace")?;
+            super::replace_by_exchange(stage.parent, &stage.name, destination.parent.as_fd(), &destination.name, expected)?;
+            stage.published = true;
+            super::retire_displaced(stage.parent, &stage.name, expected).map_err(publication_failure)?;
         },
         _ => return Err(io::Error::other("invalid whole-object publication action").into()),
     }
     stage.published = true;
-    let publication_failure = |error| Failure { state: OperandState::DestinationPublishedSourceRetained, error };
     anchored::identity(destination.parent.as_fd(), &destination.name, stage.observed.identity).map_err(publication_failure)?;
     let renamed_output = roots::observe(destination.parent.as_fd(), &destination.name).map_err(publication_failure)?;
     let mut expected_output = invocation.effective(root_output).map_err(publication_failure)?;
