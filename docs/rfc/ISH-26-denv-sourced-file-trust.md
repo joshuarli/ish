@@ -1,6 +1,7 @@
 # ISH-26: Trust for sourced denv files
 
-Status: accepted; implementation pending (2026-10-22)
+Status: accepted; implemented with Linux acceptance for both evaluators
+(2026-10-22).
 
 ## Decision
 
@@ -86,9 +87,8 @@ coverage; keeping that permissive test would contradict the decision.
 1. Remove all helper loader bodies, install the rejecting diagnostics, and
    propagate their failure independently of the script's final status through
    both epsh and bash evaluation, including forked contexts. Failure-channel
-   setup and cleanup must not leak descriptors or extend the timeout. Until
-   ISH-15 removes ambient environment swaps, restore the existing evaluator's
-   snapshot on every new failure path.
+   setup and cleanup must not leak descriptors or extend the timeout. Apply
+   accepted candidates only through the explicit shell environment.
 2. Test every retired name with existing and missing files. Include an
    untrusted parent reached through `source_up`, a previously approved parent
    later denied or edited, and a changed shared file. The target must never be
@@ -105,10 +105,9 @@ coverage; keeping that permissive test would contradict the decision.
    on its own, and after edit/revocation. Preserve precedence, previous-layer
    restoration, and dirty-state reporting. Values containing `$()`, backticks,
    quotes, and semicolons must not create a marker file or execute a command.
-5. Update the README and denv documentation when implemented. Keep ISH-26 open
-   until both evaluator paths and the trust regressions pass. ISH-15 changes
-   the environment transport, but is not a prerequisite for retiring loaders;
-   its later implementation must preserve these rejection semantics.
+5. The README documents the trust boundary, removed helpers, automatic `.env`
+   behavior, and failure effects. The environment transport preserves rejection
+   semantics without process-environment mutation.
 
 ## Why not checked imports?
 

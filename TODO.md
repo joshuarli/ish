@@ -13,7 +13,7 @@ verification limits. Open implementation and acceptance work is listed below.
 | Tickets | Accepted direction | Implementation dependency |
 |---|---|---|
 | [ISH-24](docs/rfc/ISH-24-builtin-allowlist.md) | Finite builtin policy; environment-only `set`; shared dispatch/lookup/completion rules | Implemented; focused Linux acceptance passed |
-| [ISH-26](docs/rfc/ISH-26-denv-sourced-file-trust.md) | Retire implicit sourcing helpers; keep trusted `.env` assignment parsing | Ready; preserve semantics through ISH-15 |
+| [ISH-26](docs/rfc/ISH-26-denv-sourced-file-trust.md) | Retire implicit sourcing helpers; keep trusted `.env` assignment parsing | Implemented; both evaluators and rejection regressions passed |
 | [ISH-15, ISH-52](docs/rfc/ISH-15-environment-and-shell-ownership.md) | Explicit environments; remove host environment mutation and unsupported safety comments | Implemented; focused Linux acceptance passed; macOS remains under ISH-45 |
 | [ISH-5](docs/rfc/ISH-5-foreground-job-outcomes.md) | Structured stopped-job handles; epsh owns every child wait | Implemented; Linux PTY and process tests passed; macOS is tracked under ISH-45 |
 | [ISH-8](docs/rfc/ISH-8-callback-process-boundary.md) | Creator-process callbacks by default; explicit unsafe child opt-in | Implemented after ISH-5; Linux callback boundary tests passed; macOS is tracked under ISH-45 |
@@ -22,17 +22,6 @@ verification limits. Open implementation and acceptance work is listed below.
 | [ISH-48](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor) | Private binary `Shell`; reusable library editor | Extraction can proceed; final integration follows ISH-15's environment contract |
 
 ## Open implementation tickets
-
-### ISH-26 · P2 · A trusted `.envrc` runs unhashed files through `source_env`, `source_up` and `dotenv`
-
-- **Status:** Decision accepted; implementation pending.
-- **Area:** Security
-- **Where:** `src/denv_stdlib.sh:153-189`, `src/denv.rs:1071-1079`, `src/denv.rs:466-475`
-- **Problem:** The stdlib is prepended to every `.envrc` evaluation. `source_env`, `source_env_if_exists`, `source_up`, `dotenv` and `dotenv_if_exists` run `. "$file"`. Those files never reach `read_trusted_candidate` or `is_allowed_in`. A trusted child `.envrc` that calls `source_up` executes the nearest parent `.envrc` even if it is untrusted, edited after `denv allow`, or revoked with `denv deny`. A trusted `source_env ./shared.sh` runs whatever a later `git pull` put there, and `dotenv` executes `.env` as shell code. README says editing a trusted file revokes trust, untrusted discovered files are never loaded, and `.env` is read as variable assignments. Read from code; no end-to-end run.
-- **Recommendation:** Implement the accepted retirement of all six implicit sourcing helpers, with diagnostic-only refusals that invalidate the candidate even when a script masks the immediate status. Keep automatic trusted `.env` parsing, preserve `.env` precedence, and document that approved `.envrc` code is not sandboxed. Add both-interpreter rejection and trust-regression coverage.
-- **Fix with:** os-boundaries
-- **Effort:** M (days)
-- **Design:** [Trust for sourced denv files](docs/rfc/ISH-26-denv-sourced-file-trust.md)
 
 ### ISH-32 · P3 · Two capture-and-retire protocols and duplicated identity code across `fdu-*` and `ish-fs`
 
