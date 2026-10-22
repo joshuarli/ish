@@ -76,8 +76,8 @@ foreign-owner row below.
 
 The completion branch extracts the shared identity and quarantine
 implementation into `fdu-posix`. Linux engine and fdu callers use it. ISH-32
-remains open because native ARM64 evidence is still missing. Its native macOS
-acceptance belongs to ISH-45.
+remains open for native ARM64 acceptance, which is outside this Linux x86_64
+host's scope. Its native macOS acceptance belongs to ISH-45.
 
 `cargo test -p fdu-posix -p fdu-delete --lib --test recovery --test quarantine`
 passed the shared journal tests (two unit tests, seven recovery tests, two
@@ -196,13 +196,13 @@ macOS failed to compile against unavailable rustix APIs. The local x86_64 musl
 and semantic gates above pass on the completion branch, but no hosted run has
 tested that branch.
 
-## Required native evidence still missing
+## Native evidence deferred beyond Linux x86_64
 
-| Required run | Setup and acceptance condition |
+| Deferred run | Setup and acceptance condition |
 | --- | --- |
-| Native ARM64 musl | On ARM64 Linux musl hardware, run workspace check, strict all-target Clippy, workspace library/integration tests, `make test`, and `benches/fs/native-fixtures.sh`. Cross-build and QEMU execution are supporting checks, not native hardware evidence. |
+| Native ARM64 musl | Outside this Linux x86_64 host's scope. Keep this acceptance under ISH-32. On native ARM64 Linux musl hardware, run workspace check, strict all-target Clippy, workspace library/integration tests, `make test`, and `benches/fs/native-fixtures.sh`. Cross-build and QEMU execution are supporting checks, not native hardware evidence. |
 | Native macOS | Deferred to [TODO.md, ISH-45](../TODO.md), per the Linux-host scope. No macOS build or native acceptance is claimed. The pending run requires ordinary-user workspace checks and tests, separate privileged cases, clone/access normalization, ACLs, foreign ownership, blocking flags, cancellation, sparse fallback, resource forks above 4 GiB, unsupported identity failure, and a release panic probe. |
-| Apple clone-aware utility comparison | Compare Apple `cp` and `cp -c` on native macOS with a clone-capable filesystem. GNU Coreutils 9.11 `cp --archive --reflink=always` passed on Linux Btrfs; the method and preservation/durability results are recorded above. |
+| Apple clone-aware utility comparison | Deferred with ISH-45. Compare Apple `cp` and `cp -c` on native macOS with a clone-capable filesystem. GNU Coreutils 9.11 `cp --archive --reflink=always` passed on Linux Btrfs; the method and preservation/durability results are recorded above. |
 
 The repair run passed native x86_64 musl workspace checks, strict Clippy, Rust
 and PTY tests, conformance, semantic verification, and shift refinement.
