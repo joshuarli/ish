@@ -28,9 +28,13 @@ Lean commands run from `formal/` so Elan finds the project pin without a global
 default toolchain.
 
 The checker downloads [Aeneas nightly-2026.10.17-e62dd83](https://github.com/AeneasVerif/aeneas/releases/tag/nightly-2026.10.17-e62dd83)
-and its matching Charon under `.work/tools/`. Both tools use Apache 2.0 licenses.
-The extractor needs a separate Rust nightly-2026-09-17 toolchain under that
-directory. The production Rust pin remains nightly-2026-09-15.
+and its matching Charon under `.work/tools/`. It verifies the pinned SHA-256
+for the Linux x86_64 or ARM64 archive before extraction. Both tools use Apache
+2.0 licenses. The extractor needs a separate Rust nightly-2026-09-17 toolchain
+under that directory, installed by verified rustup 1.29.1 GNU-host installers.
+The production Rust pin remains nightly-2026-09-15. Existing tool caches are
+reused only after a completed refinement run; older incomplete caches are
+discarded and rebuilt from the verified downloads.
 
 The main bundle is about 153.4 MiB. A fresh installed tool tree occupies about
 3.75 GiB, including GNU Rust, the Aeneas Lean backend, and mathlib sources and

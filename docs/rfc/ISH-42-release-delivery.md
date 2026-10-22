@@ -1,6 +1,6 @@
 # ISH-42: Release delivery and diagnostics
 
-Status: accepted; implementation pending (2026-10-22)
+Status: accepted; Linux implementation verified (2026-10-22); native macOS panic probe pending under ISH-45
 
 ## Decision
 
@@ -9,11 +9,11 @@ the final release archives, verify downloaded executable tools before use, and
 retain panic diagnostics in release builds. The small size benefit of silent
 panics does not justify losing the evidence needed to fix a broken shell.
 
-The following requirements apply to future changes in
+The following requirements apply to changes in
 [`release.yml`](../../.github/workflows/release.yml),
 [`check-refinement.py`](../../scripts/check-refinement.py),
 [`Makefile`](../../Makefile), and [`Dockerfile`](../../Dockerfile). This decision
-does not claim those changes are already implemented.
+retains the implementation and acceptance requirements below.
 
 ## Ref and publication policy
 
@@ -100,5 +100,6 @@ or recovery from a panic. Expected operational failures still use errors.
   its tag deliberately after inspection; do not reassign its name to different
   bytes. Fixes get a new commit and therefore a new release tag.
 
-Keep ISH-42 open until these workflow, downloader, build-flag, and documentation
-changes land and are validated.
+The release workflow, downloader, build flags, and documentation changes are
+implemented and locally validated on Linux. The native macOS panic probe remains
+in ISH-45 because it requires a macOS host.

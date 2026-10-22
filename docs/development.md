@@ -31,14 +31,31 @@ variant. `TARGET` selects the target triple. Use the corresponding
 `verify-release` target to inspect Linux linking. These commands use build-std
 and require the pinned toolchain's rust-src component.
 
+Releases include a `SHA256SUMS` asset alongside the archives. Verify an archive
+after downloading it:
+
+```sh
+sha256sum -c SHA256SUMS
+```
+
+On macOS, use:
+
+```sh
+shasum -a 256 -c SHA256SUMS
+```
+
+To roll back a release, install a previous release only after verifying its
+archive against that release's `SHA256SUMS`. A defective published prerelease
+and its tag must be withdrawn deliberately after inspection; release tags are
+not reassigned to different bytes. A fix receives a new release tag.
+
 `make install` installs the release binary in `~/usr/bin` and signs it on macOS.
 `make install-login-shell` also edits `/etc/shells` and changes the account's
 login shell, using sudo or doas when needed. Run that target only when you
 intend to change account state.
 
-## Accepted release policy awaiting implementation
+## Release policy
 
-[ISH-42](rfc/ISH-42-release-delivery.md) records the accepted decisions for
-release dispatch, final-archive checksums, verified build-tool downloads, and
-panic diagnostics. The existing workflow and build flags still need that work;
-the RFC includes its validation and rollback requirements.
+[ISH-42](rfc/ISH-42-release-delivery.md) records the release dispatch policy,
+final-archive checksums, verified build-tool downloads, and panic diagnostics.
+The RFC includes its validation and rollback requirements.

@@ -3,18 +3,16 @@ Next: 60
 
 ## Accepted owner decisions — 2026-10-22
 
-The nine decisions below are accepted. Their implementation is still open;
-this documentation update does not close defects or change runtime behavior.
-The linked RFCs are the implementation contracts, with acceptance criteria.
-Retain accepted decisions after implementation and update the shipped behavior
-references when the code lands.
+The decisions below are accepted. Their RFCs remain the implementation
+contracts, with acceptance criteria. Retain accepted decisions after delivery
+and update the shipped behavior references when implementation lands.
 
 **Next implementation: ISH-24.** Close the interactive builtin boundary first,
-including argument checks for `set` and nested `command` dispatch. ISH-26 and
-ISH-42 can proceed independently. Implement ISH-15 and ISH-52 together; coordinate
-ISH-5/8 on epsh dispatch and child ownership, and use the resulting boundaries
-when extracting the editor for ISH-48. ISH-32 is a separate filesystem change
-whose closure requires native Linux and macOS evidence.
+including argument checks for `set` and nested `command` dispatch. ISH-26 can
+proceed independently. Implement ISH-15 and ISH-52 together; coordinate ISH-5/8
+on epsh dispatch and child ownership, and use the resulting boundaries when
+extracting the editor for ISH-48. ISH-32 is a separate filesystem change whose
+closure requires native Linux and macOS evidence.
 
 | Tickets | Accepted direction | Implementation dependency |
 |---|---|---|
@@ -24,7 +22,7 @@ whose closure requires native Linux and macOS evidence.
 | [ISH-5](docs/rfc/ISH-5-foreground-job-outcomes.md) | Structured stopped-job handles; epsh owns every child wait | Ready; coordinate with ISH-8 |
 | [ISH-8](docs/rfc/ISH-8-callback-process-boundary.md) | Creator-process callbacks by default; explicit unsafe child opt-in | Coordinate external dispatch with ISH-5 and policy with ISH-24 |
 | [ISH-32](docs/rfc/ISH-32-capture-and-retire.md) | Shared journaled fdu quarantine and identity primitives | Native recovery validation; account for ISH-45 |
-| [ISH-42](docs/rfc/ISH-42-release-delivery.md) | Default-branch releases, verified bytes, diagnostic panic aborts | Ready; independent |
+| [ISH-42](docs/rfc/ISH-42-release-delivery.md) | Default-branch releases, verified bytes, diagnostic panic aborts | Linux implementation verified; native macOS panic probe is tracked under ISH-45 |
 | [ISH-48](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor) | Private binary `Shell`; reusable library editor | Extraction can proceed; final integration follows ISH-15's environment contract |
 
 ## Open implementation tickets
@@ -95,23 +93,12 @@ whose closure requires native Linux and macOS evidence.
 - **Effort:** L (weeks)
 - **Design:** [Shared capture and retirement](docs/rfc/ISH-32-capture-and-retire.md)
 
-### ISH-42 · P3 · Release delivery lacks a ref guard and integrity checks, and release panics are silent
-
-- **Status:** Decision accepted; implementation pending.
-- **Area:** Build
-- **Where:** `.github/workflows/release.yml:4`, `:22`, `:110-116`, `scripts/check-refinement.py:26-29`, `:48-52`, `:89-93`, `Makefile:11`, `Dockerfile:124`, `Cargo.toml:51`
-- **Problem:** `workflow_dispatch` publishes a pre-release from any branch with a zip only, no checksum, and the build job holds `actions: write` with no visible use. Rollback is deleting `release-<sha>` by hand. `check-refinement.py` runs an Aeneas tarball and `rustup-init` downloaded without digests, while the Dockerfile verifies equivalents with `sha256sum`. Release uses `-Cpanic=immediate-abort`, which skips the panic hook, so a panic ends in SIGABRT with no message; not run, inferred from the flag.
-- **Recommendation:** Implement the accepted release policy: fail non-default-branch dispatches, bind publication to the dispatch SHA, validate the expected artifacts and publish final-ZIP SHA256SUMS, remove unused permissions, verify pinned tool downloads/caches, and use diagnostic-preserving `panic=abort` instead of immediate-abort.
-- **Fix with:** none
-- **Effort:** S (hours)
-- **Design:** [Release delivery](docs/rfc/ISH-42-release-delivery.md)
-
 ### ISH-45 · P3 · macOS platform build and native acceptance remain unverified
 
 - **Area:** Tests
 - **Where:** `src/capture.rs:202,227`, `src/denv.rs:96`, `src/diagnostics.rs:175`, `src/prompt.rs:475`, `crates/ish-fs/tests/native_macos.rs`, `crates/ish-fs/src/engine/mod.rs` (`replace_by_exchange`), `crates/fdu-scan/src/macos.rs`, `src/signal.rs` (`errno_slot`), `crates/ish-fs/src/platform/mod.rs` (`rename_exchange`), `crates/fdu-scan/src/fsutil.rs` (`identity_link_count_and_modified_time` is now `cfg(target_os = "macos")`)
 - **Problem:** ISH-29, ISH-31, ISH-33 and ISH-38 changed macOS code paths on a Linux host. The latest macOS CI run fails to compile because the pinned rustix lacks `OpenptFlags::CLOEXEC`, `pipe_with`/`PipeFlags`, `rand::getrandom`/`GetRandomFlags`, and `fs::mknodat` at the listed call sites. `native_macos.rs` also changes a caller-owned destination to mode `0044` and then reopens its path, which fails for an unprivileged owner. Existing paths still need compilation and native validation.
-- **Recommendation:** On a native macOS host, first run workspace check, strict all-target Clippy, workspace tests, and `make test` as an ordinary user; repair unsupported calls with platform-supported APIs while preserving descriptor ownership, close-on-exec, cleanup, secure randomness, and FIFO setup. Fix the read-only destination test using a descriptor opened before chmod or restore access only for fixture verification. Run native clone/access normalization, ACL, foreign-owner, blocking-flag, cancellation, sparse fallback, and resource-fork cases, with privileged cases separately. Compare clone-capable Apple `cp`/`cp -c` and GNU `cp --reflink=auto` on supported native filesystems, recording selected methods and preservation/durability differences.
+- **Recommendation:** On a native macOS host, first run workspace check, strict all-target Clippy, workspace tests, and `make test` as an ordinary user; repair unsupported calls with platform-supported APIs while preserving descriptor ownership, close-on-exec, cleanup, secure randomness, and FIFO setup. Fix the read-only destination test using a descriptor opened before chmod or restore access only for fixture verification. Run native clone/access normalization, ACL, foreign-owner, blocking-flag, cancellation, sparse fallback, and resource-fork cases, with privileged cases separately. Compare clone-capable Apple `cp`/`cp -c` and GNU `cp --reflink=auto` on supported native filesystems, recording selected methods and preservation/durability differences. Build a panic probe with the actual release flags and verify its diagnostic on macOS; record binary size as informational evidence.
 - **Fix with:** none
 - **Effort:** S (hours)
 

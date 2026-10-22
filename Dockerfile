@@ -121,7 +121,7 @@ esac
 
 mode=${MUSL_BUILD_MODE:-static}
 native="-L native=/usr/lib -Clink-arg=-B$crt"
-release="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort"
+release="-Cpanic=abort"
 case "$mode" in
     static|test|driver)
         flags=$native

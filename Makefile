@@ -8,7 +8,7 @@ CARGO_CMD  := $(if $(findstring -linux-musl,$(TARGET)),$(shell command -v musl-c
 # Docker's musl-cargo wrapper owns linker, CRT, and loader flags. The Makefile
 # selects only the build mode and keeps Cargo invocations readable on macOS as
 # well as in the Linux release image.
-cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static release-dynamic test,$(1)),CARGO_TARGET_$(TARGET_ENV)_LINKER=clang ,)$(if $(filter release-static release-dynamic,$(1)),RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort")) MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" $(CARGO_CMD)
+cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static release-dynamic test,$(1)),CARGO_TARGET_$(TARGET_ENV)_LINKER=clang ,)$(if $(filter release-static release-dynamic,$(1)),RUSTFLAGS="-Cpanic=abort")) MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" $(CARGO_CMD)
 
 RUSTYBENCH_DEFAULT := $(CURDIR)/.work/tools/bin/rustybench
 RUSTYBENCH ?= "$(RUSTYBENCH_DEFAULT)"
