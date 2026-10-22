@@ -1136,7 +1136,9 @@ fn actual_in_scratch(
     }
     let callback_dir = scratch.path.clone();
     let callback_observations = observations.to_vec();
-    shell.set_external_handler(Box::new(move |argv, environment| {
+    // SAFETY: The bridge runs single-threaded; this callback captures owned data, writes independent files, and does not use inherited locks.
+    unsafe {
+        shell.set_external_handler_in_children(Box::new(move |argv, environment| {
         let command = argv
             .first()
             .ok_or_else(|| ShellError::CommandNotFound(String::new()))?;
@@ -1188,8 +1190,9 @@ fn actual_in_scratch(
             stderr.write_all(&observation.stderr).map_err(ShellError::Io)?;
             stderr.flush().map_err(ShellError::Io)?;
         }
-        Ok(ExitStatus::from(observation.status as i32))
-    }));
+            Ok(ExitStatus::from(observation.status as i32))
+        }));
+    }
     let capture = OutputCapture::new(scratch)?;
     let returned = shell.run_program(parsed).code();
     let shell_status = shell.exit_status().code();

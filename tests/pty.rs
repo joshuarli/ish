@@ -723,12 +723,12 @@ fn native_fs_cancellable_tree(home: &Path, name: &str) -> PathBuf {
     let root = home.join(name);
     std::fs::create_dir(&root).unwrap();
     let contents = [0x4f; 512];
-    for index in 0..8192 {
+    for index in 0..2048 {
         std::fs::write(root.join(format!("file-{index:05}")), contents).unwrap();
     }
     let mut payload = std::fs::File::create(root.join("payload")).unwrap();
     let contents = vec![0x6d; 1024 * 1024];
-    for _ in 0..64 {
+    for _ in 0..8 {
         std::io::Write::write_all(&mut payload, &contents).unwrap();
     }
     root
@@ -739,17 +739,25 @@ fn native_fs_wait_for_staging(sh: &PtyShell, command: &str) -> PathBuf {
     sh.enter();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        let stage = std::fs::read_dir(sh.home_path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with(".ish-fs-stage-"))
-            });
-        if let Some(stage) = stage
-            && std::fs::read_dir(&stage).is_ok_and(|mut entries| entries.next().is_some())
-        {
+        let mut stage = None;
+        for session in std::fs::read_dir(sh.home_path()).unwrap().flatten() {
+            if !session.file_name().to_string_lossy().starts_with(".fdu-quarantine-v2-") {
+                continue;
+            }
+            for entry in std::fs::read_dir(session.path()).into_iter().flatten().flatten() {
+                if entry.file_name().to_string_lossy().ends_with(".entry")
+                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && std::fs::read_dir(entry.path()).is_ok_and(|mut entries| entries.next().is_some())
+                {
+                    stage = Some(entry.path());
+                    break;
+                }
+            }
+            if stage.is_some() {
+                break;
+            }
+        }
+        if let Some(stage) = stage {
             return stage;
         }
         assert!(
@@ -1398,14 +1406,121 @@ fn set_no_args_lists_env_vars() {
 }
 
 #[test]
-fn set_option_forms_fall_through_to_epsh() {
+fn set_option_and_positional_forms_are_refused_without_target_effects() {
     let sh = PtyShell::spawn();
-    let out = sh.run_command("set -e");
-    let text = PtyShell::strip_ansi(&out);
-    assert!(
-        !text.contains("not a valid variable name"),
-        "set -e should fall through to epsh: {text:?}"
-    );
+    for operands in ["-e", "+e", "-o pipefail", "-o noexec", "-", "--", "7 value", "NAME=value", "-e NAME value"] {
+        let target = sh.home_path().join("set-target");
+        std::fs::write(&target, b"preserved").unwrap();
+        let output = PtyShell::strip_ansi(&sh.run_command(&format!("set {operands} >set-target")));
+        assert!(output.contains("expected a variable name"), "missing set refusal: {operands}: {output:?}");
+        assert_policy_status(&sh, 2);
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserved");
+    }
+    sh.run_command("set OPERAND -e");
+    sh.run_command("command -p command -- set \"$OPERAND\" >expanded-set-target");
+    assert_policy_status(&sh, 2);
+    assert!(!sh.home_path().join("expanded-set-target").exists());
+    let output = PtyShell::strip_ansi(&sh.run_command("false; printf 'still-executing'"));
+    assert!(output.contains("still-executing"));
+    sh.run_command("set EMPTY");
+    sh.run_command("set OPTIONS -e +e --");
+    sh.run_command("printf '[%s][%s]' \"$EMPTY\" \"$OPTIONS\" >allowed-set-values");
+    assert_eq!(std::fs::read(sh.home_path().join("allowed-set-values")).unwrap(), b"[][-e +e --]");
+}
+
+fn assert_policy_status(sh: &PtyShell, expected: i32) {
+    let output = PtyShell::strip_ansi(&sh.run_command("printf 'policy-status-%s\\n' \"$?\""));
+    assert!(output.lines().any(|line| line.trim() == format!("policy-status-{expected}")), "wrong policy status: {output:?}");
+}
+
+#[test]
+fn exec_and_trap_refusals_preserve_the_shell_and_target_files() {
+    let sh = PtyShell::spawn();
+    for (name, operands) in [("exec", "/bin/true"), ("trap", "ignored TERM")] {
+        sh.run_command(&format!("set BLOCKED {name}"));
+        sh.run_command(&format!("alias blocked_{name} {name}"));
+        sh.run_command(&format!("/bin/touch static-prior; command -- {name} {operands} >static-target"));
+        assert_policy_status(&sh, 2);
+        assert!(!sh.home_path().join("static-prior").exists());
+        assert!(!sh.home_path().join("static-target").exists());
+        for target in [name.to_owned(), format!("'{name}'"), format!("blocked_{name}"), "$BLOCKED".to_owned(), "command -p command -- $BLOCKED".to_owned()] {
+            std::fs::write(sh.home_path().join("refused-target"), b"preserved").unwrap();
+            let output = PtyShell::strip_ansi(&sh.run_command(&format!("{target} {operands} >refused-target")));
+            assert!(output.contains("not supported") || output.contains("not available"), "missing refusal for {target}: {output:?}");
+            assert_policy_status(&sh, 2);
+            assert_eq!(std::fs::read(sh.home_path().join("refused-target")).unwrap(), b"preserved");
+        }
+        sh.run_command(&format!("$BLOCKED {operands} >pipeline-target | /bin/cat"));
+        assert_policy_status(&sh, 2);
+        assert!(!sh.home_path().join("pipeline-target").exists());
+        sh.run_command(&format!("printf '%s' \"$(command command $BLOCKED {operands} >substitution-target)\" >outer-target"));
+        assert_policy_status(&sh, 2);
+        assert!(!sh.home_path().join("substitution-target").exists());
+        assert!(!sh.home_path().join("outer-target").exists());
+    }
+    let output = PtyShell::strip_ansi(&sh.run_command("printf 'shell-alive'"));
+    assert!(output.contains("shell-alive"));
+    let mut terminal = sh.terminal.borrow_mut();
+    terminal.signal(libc::SIGTERM).unwrap();
+    let deadline = terminal.deadline(std::time::Duration::from_secs(3));
+    assert_eq!(terminal.wait_for_exit(deadline).unwrap(), ExitStatus::Code(143));
+    terminal.assert_terminal_restored(&sh.terminal_baseline).unwrap();
+}
+
+#[test]
+fn builtin_lookup_completion_and_explicit_paths_share_the_policy() {
+    let script = "#!/bin/sh\nprintf explicit-exec\nprintf entered >explicit-marker\n";
+    let sh = PtyShell::spawn_with_opts(&[("bin/exec", script), ("bin/trap", script)], &[]);
+    sh.run_command(&format!("set PATH {}/bin", sh.home_path().display()));
+    for query in ["command -v exec", "command -V trap"] {
+        sh.run_command(&format!("{query} >query-output 2>query-error"));
+        assert_policy_status(&sh, 1);
+        assert!(std::fs::read(sh.home_path().join("query-output")).unwrap().is_empty());
+    }
+    for query in ["w exec", "which trap", "type exec"] {
+        let output = PtyShell::strip_ansi(&sh.run_command(query));
+        assert!(output.contains("not found"), "refused command was advertised: {output:?}");
+        assert_policy_status(&sh, 1);
+    }
+    sh.run_command("command -v exit >supported-lookup");
+    assert_eq!(std::fs::read(sh.home_path().join("supported-lookup")).unwrap(), b"exit\n");
+    sh.run_command("command exit >refused-exit");
+    assert_policy_status(&sh, 2);
+    assert!(!sh.home_path().join("refused-exit").exists());
+    sh.type_str("exe");
+    sh.tab();
+    sh.wait_for_quiescence(100);
+    assert!(!active_prompt_text(&sh.screen()).contains("exec"), "refused PATH builtin appeared in completion");
+    sh.ctrl_c();
+    sh.wait_for_prompt_after_line_advance(2000);
+    sh.type_str("ech");
+    sh.tab();
+    sh.wait_for_quiescence(100);
+    assert!(active_prompt_text(&sh.screen()).contains("echo"), "approved builtin was missing from completion");
+    sh.ctrl_c();
+    sh.wait_for_prompt_after_line_advance(2000);
+    sh.run_command("./bin/exec");
+    assert_eq!(std::fs::read(sh.home_path().join("explicit-marker")).unwrap(), b"entered");
+    std::fs::create_dir(sh.home_path().join("exec")).unwrap();
+    sh.run_command("set PATH");
+    sh.run_command("exec");
+    assert_policy_status(&sh, 2);
+    sh.run_command("pwd >cwd-after-refusal");
+    assert_eq!(std::fs::read_to_string(sh.home_path().join("cwd-after-refusal")).unwrap().trim(), sh.home_path().to_str().unwrap());
+}
+
+#[test]
+fn approved_builtin_classes_remain_available() {
+    let sh = PtyShell::spawn_with_opts(&[("sub/.keep", "")], &[]);
+    for line in [
+        "echo output", "printf '%s' output", "pwd", "true", "false", ":",
+        "test 1 = 1", "[ 1 = 1 ]", "kill -0 $$", "export POLICY_VAR=value",
+        "unset POLICY_VAR", "set POLICY_VAR -value +value", "command -p -- printf output",
+        "cd sub && pwd", "history; echo listed",
+    ] {
+        sh.run_command(line);
+        assert_policy_status(&sh, if line == "false" { 1 } else { 0 });
+    }
 }
 
 #[test]
@@ -2869,13 +2984,16 @@ fn expanded_targets_obey_ish_execution_policy() {
     std::fs::write(home.join("native-list-sentinel"), b"").unwrap();
     sh.run_command("set TARGET l");
     let output = PtyShell::strip_ansi(&sh.run_command(&format!(
-        "$TARGET {} | /bin/cat",
+        "$TARGET {}; true",
         home.display()
     )));
     assert!(
         output.contains("native-list-sentinel"),
-        "dynamic Native builtin did not run in a pipeline: {output:?}"
+        "dynamic native builtin did not run in a list: {output:?}"
     );
+    sh.run_command("/bin/printf input | $TARGET . >native-pipeline-target");
+    assert_policy_status(&sh, 2);
+    assert!(!subdir.join("native-pipeline-target").exists());
 }
 
 #[test]
@@ -3279,7 +3397,7 @@ fn history_shared_shell_processes_keep_all_commands() {
     );
 
     let third = PtyShell::spawn_in_home(first._home.clone(), &[], 24, 80, None);
-    let text = PtyShell::strip_ansi(&third.run_command("history | /bin/cat"));
+    let text = PtyShell::strip_ansi(&third.run_command("history"));
     for command in [
         "first_process_0",
         "first_process_1",
@@ -3319,7 +3437,7 @@ fn history_read_only_commands_preserve_another_writer() {
     let path = sh.home_path().join(".local/share/ish/history");
     let mut writer = History::load_from(path.clone()).unwrap();
     writer.add("echo concurrent_history_marker").unwrap();
-    sh.run_command("history | /bin/cat");
+    sh.run_command("history");
     sh.run_command("history > history-output");
     let h = History::load_from(path).unwrap();
     assert_eq!(
@@ -3335,7 +3453,7 @@ fn history_reset_reopens_storage_in_existing_shell_processes() {
     let first = PtyShell::spawn_with_opts(&[], &["echo before_reset_marker"]);
     let second = PtyShell::spawn_in_home(first._home.clone(), &[], 24, 80, None);
     first.run_command("history reset");
-    let text = PtyShell::strip_ansi(&second.run_command("history | /bin/cat"));
+    let text = PtyShell::strip_ansi(&second.run_command("history"));
     assert!(
         !text.contains("before_reset_marker"),
         "stale process restored reset history: {text:?}"
@@ -3363,10 +3481,10 @@ fn history_readers_keep_startup_log_after_home_changes() {
         "set HOME {}",
         sh.home_path().join("new-home").display()
     ));
-    let text = PtyShell::strip_ansi(&sh.run_command("history | /bin/cat"));
+    let text = PtyShell::strip_ansi(&sh.run_command("history"));
     assert!(
         text.contains("echo startup_log_marker"),
-        "history pipeline lost original log: {text:?}"
+        "history listing lost original log: {text:?}"
     );
     sh.run_command("history > history-after-home-change");
     let output = std::fs::read_to_string(sh.home_path().join("history-after-home-change")).unwrap();
@@ -3384,7 +3502,7 @@ fn history_reset_refuses_pipeline_and_command_substitution() {
     for command in ["history reset | /bin/cat", "echo $(history reset)"] {
         let text = PtyShell::strip_ansi(&sh.run_command(command));
         assert!(
-            text.contains("storage subcommands require a standalone command"),
+            text.contains("requires the original shell process"),
             "missing history refusal diagnostic: {text:?}"
         );
         let h = History::load_from(sh.home_path().join(".local/share/ish/history")).unwrap();
@@ -3820,20 +3938,116 @@ fn denv_path_add_relative_dir() {
 }
 
 #[test]
-fn denv_dotenv_helper_loads_env_file() {
+fn denv_dotenv_helper_rejects_the_entire_candidate() {
     let sh = spawn_with_allowed(
         &[
-            ("project/.envrc", "dotenv\nexport AFTER='1'\n"),
+            ("project/.envrc", "export BEFORE=1\ndotenv || true\nexport AFTER=1\n"),
+            ("project/.env", "FROM_ENV=loaded\n"),
+        ],
+        &["project/.envrc", "project/.env"],
+    );
+    let entered = PtyShell::strip_ansi(&sh.run_command("cd project"));
+    assert!(entered.contains("dotenv") && entered.contains("removed"), "{entered:?}");
+    let text = PtyShell::strip_ansi(&sh.run_command("echo =$FROM_ENV=:$BEFORE=:$AFTER=:$__DENV_DIRTY="));
+    assert!(
+        text.contains("==:=:=:1="),
+        "rejected candidate leaked variables or failed to mark dirty: {text:?}"
+    );
+    assert!(sh.run_command("echo still-usable").contains("still-usable"));
+}
+
+#[test]
+fn denv_automatic_dotenv_loads_without_a_helper() {
+    let sh = spawn_with_allowed(
+        &[
+            ("project/.envrc", "export AFTER=1\n"),
             ("project/.env", "FROM_ENV=loaded\n"),
         ],
         &["project/.envrc", "project/.env"],
     );
     sh.run_command("cd project");
     let text = PtyShell::strip_ansi(&sh.run_command("echo $FROM_ENV $AFTER"));
-    assert!(
-        text.contains("loaded 1"),
-        "expected dotenv helper values: {text:?}"
+    assert!(text.contains("loaded 1"), "{text:?}");
+}
+
+#[test]
+fn denv_automatic_dotenv_keeps_shell_text_as_data_and_revokes_edits() {
+    let sh = spawn_with_allowed(
+        &[
+            ("project/.envrc", "export DENV_PAIR=envrc\n"),
+            ("project/.env", "DENV_PAIR=dotenv\nDENV_LITERAL=$(touch marker); `touch marker`; \"quoted\"\n"),
+        ],
+        &["project/.envrc", "project/.env"],
     );
+    sh.run_command("cd project");
+    let loaded = PtyShell::strip_ansi(&sh.run_command("echo $DENV_PAIR $DENV_LITERAL"));
+    assert!(loaded.contains("dotenv $(touch marker); `touch marker`; \"quoted\""), "{loaded:?}");
+    assert!(!sh.home_path().join("project/marker").exists());
+    std::fs::write(sh.home_path().join("project/.env"), "DENV_PAIR=edited\n").unwrap();
+    let blocked = PtyShell::strip_ansi(&sh.run_command("denv reload"));
+    assert!(blocked.contains("blocked"), "{blocked:?}");
+    let rejected = PtyShell::strip_ansi(&sh.run_command("echo =$DENV_PAIR=:$DENV_LITERAL=:$__DENV_DIRTY="));
+    assert!(rejected.contains("==:=:1="), "{rejected:?}");
+    sh.run_command("denv allow");
+    assert!(sh.run_command("echo $DENV_PAIR").contains("edited"));
+    sh.run_command("denv deny");
+    let denied = PtyShell::strip_ansi(&sh.run_command("echo =$DENV_PAIR=:$__DENV_DIRTY="));
+    assert!(denied.contains("==:1="), "{denied:?}");
+}
+
+#[test]
+fn denv_rejects_parent_helpers_after_parent_revocation_or_edit() {
+    for bash in [false, true] {
+        for state in ["untrusted", "denied", "edited"] {
+            let child_source = format!("{}export CANDIDATE=before\nsource_up || true\nexport CANDIDATE=after\n", if bash { "#!/usr/bin/env bash\n" } else { "" });
+            let allowed = if state == "untrusted" {
+                vec!["parent/project/.envrc"]
+            } else {
+                vec!["parent/.envrc", "parent/project/.envrc"]
+            };
+            let sh = spawn_with_allowed(
+                &[
+                    ("parent/.envrc", "export PARENT_VALUE=old\nprintf touched > parent-marker\n"),
+                    ("parent/project/.envrc", &child_source),
+                ],
+                &allowed,
+            );
+            if state == "denied" {
+                sh.run_command("cd parent");
+                sh.run_command("denv deny");
+                sh.run_command("cd ..");
+                std::fs::remove_file(sh.home_path().join("parent/parent-marker")).unwrap();
+            } else if state == "edited" {
+                std::fs::write(sh.home_path().join("parent/.envrc"), "export PARENT_VALUE=changed\nprintf touched > parent-marker\n").unwrap();
+            }
+            let entered = PtyShell::strip_ansi(&sh.run_command("cd parent/project"));
+            assert!(entered.contains("source_up") && entered.contains("removed"), "{state}: {entered:?}");
+            let text = PtyShell::strip_ansi(&sh.run_command("echo =$PARENT_VALUE=:$CANDIDATE=:$__DENV_DIRTY="));
+            assert!(text.contains("==:=:1="), "{state}: {text:?}");
+            assert!(!sh.home_path().join("parent/project/parent-marker").exists());
+            assert!(!sh.home_path().join("parent/parent-marker").exists());
+        }
+    }
+}
+
+#[test]
+fn denv_rejects_changed_shared_file_helpers() {
+    for bash in [false, true] {
+        let source = format!("{}export BEFORE=1\nsource_env shared || true\nexport AFTER=1\n", if bash { "#!/usr/bin/env bash\n" } else { "" });
+        let sh = spawn_with_allowed(
+            &[
+                ("project/.envrc", &source),
+                ("project/shared", "export SHARED=original\n"),
+            ],
+            &["project/.envrc"],
+        );
+        std::fs::write(sh.home_path().join("project/shared"), "export SHARED=edited\nprintf touched > shared-marker\n").unwrap();
+        let entered = PtyShell::strip_ansi(&sh.run_command("cd project"));
+        assert!(entered.contains("source_env") && entered.contains("removed"), "{entered:?}");
+        let text = PtyShell::strip_ansi(&sh.run_command("echo =$BEFORE=:$AFTER=:$SHARED=:$__DENV_DIRTY="));
+        assert!(text.contains("==:=:=:1="), "{text:?}");
+        assert!(!sh.home_path().join("project/shared-marker").exists());
+    }
 }
 
 #[test]
@@ -3917,6 +4131,106 @@ fn confirmed_exit_with_stopped_job_keeps_the_requested_status() {
 }
 
 #[test]
+fn pipeline_suspend_and_resume_retains_every_stage() {
+    let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
+    sh.type_str("./bin/sleep | cat");
+    sh.enter();
+    sh.wait_for("pty-child-ready", 3000);
+    sh.ctrl_z();
+    let stopped = sh.wait_for("stopped:", 3000);
+    assert!(stopped.contains("stopped:"), "pipeline stop was lost: {stopped:?}");
+    sh.wait_for_prompt_after_line_advance(3000);
+    sh.type_str("fg");
+    sh.enter();
+    let resumed = sh.wait_for("resuming:", 3000);
+    assert!(resumed.contains("resuming:"), "pipeline job was lost: {resumed:?}");
+    sh.wait_for_quiescence(100);
+    sh.ctrl_c();
+    let prompt = sh.wait_for_prompt_after_line_advance(3000);
+    assert!(prompt.contains("$ "), "pipeline did not finish: {prompt:?}");
+    assert!(sh.run_command("echo pipeline-alive").contains("pipeline-alive"));
+}
+
+#[test]
+fn native_handlers_refuse_child_execution_before_target_redirections() {
+    let sh = PtyShell::spawn();
+    for name in ["l", "c", "history"] {
+        for command in [
+            format!("command {name} >native-target | /bin/cat"),
+            format!("echo $(command {name} >native-target)"),
+        ] {
+            let output = PtyShell::strip_ansi(&sh.run_command(&command));
+            assert!(output.contains("requires the original shell process"), "native callback entered a child: {command}: {output:?}");
+            assert!(!sh.home_path().join("native-target").exists());
+        }
+    }
+    assert!(PtyShell::strip_ansi(&sh.run_command("printf parent-safe | /bin/cat")).contains("parent-safe"));
+    assert!(PtyShell::strip_ansi(&sh.run_command("echo $(printf substitution-safe)")).contains("substitution-safe"));
+    sh.run_command("l >native-parent");
+    assert!(std::fs::read_to_string(sh.home_path().join("native-parent")).unwrap().contains(".config"));
+}
+
+#[test]
+fn external_input_redirections_preserve_foreground_terminal_ownership() {
+    let sh = PtyShell::spawn_with_opts(&[("input", "redirected-input\n")], &[]);
+    let output = PtyShell::strip_ansi(&sh.run_command("/bin/cat <input"));
+    assert!(output.contains("redirected-input"), "input redirection broke terminal handoff: {output:?}");
+    sh.run_command("/bin/true 0<&-");
+    let output = PtyShell::strip_ansi(&sh.run_command("echo $?"));
+    assert!(output.lines().any(|line| line.trim() == "0"), "closed input broke command execution: {output:?}");
+}
+
+#[test]
+fn ordinary_exit_148_does_not_create_a_suspended_job() {
+    let sh = PtyShell::spawn_with_opts(&[("bin/exit148", "#!/bin/sh\nexit 148\n")], &[]);
+    sh.run_command("./bin/exit148");
+    let output = PtyShell::strip_ansi(&sh.run_command("fg"));
+    assert!(output.contains("no suspended job"), "numeric status created a job: {output:?}");
+}
+
+#[test]
+fn occupied_job_slot_restores_new_job_terminal_modes_before_continuing() {
+    let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
+    sh.type_str("./bin/sleep");
+    sh.enter();
+    sh.wait_for("pty-child-ready", 3000);
+    sh.ctrl_z();
+    sh.wait_for("stopped:", 3000);
+    sh.wait_for_prompt_after_line_advance(3000);
+    let baseline = stty_state(&sh.run_command("stty -g"));
+    sh.run_command("sh -c 'stty raw -echo; stty -g >raw-before; kill -STOP $$; stty -g >raw-after; stty sane'");
+    assert_eq!(
+        std::fs::read(sh.home_path().join("raw-before")).unwrap(),
+        std::fs::read(sh.home_path().join("raw-after")).unwrap()
+    );
+    assert_eq!(stty_state(&sh.run_command("stty -g")), baseline);
+    sh.type_str("fg");
+    sh.enter();
+    sh.wait_for("resuming:", 3000);
+    sh.wait_for_quiescence(100);
+    sh.ctrl_c();
+    sh.wait_for_prompt_after_line_advance(3000);
+}
+
+#[test]
+fn stopped_pipeline_discards_the_remaining_list() {
+    let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
+    sh.type_str("./bin/sleep | /bin/cat; /bin/touch forbidden-remainder");
+    sh.enter();
+    sh.wait_for("pty-child-ready", 3000);
+    sh.ctrl_z();
+    sh.wait_for("stopped:", 3000);
+    sh.wait_for_prompt_after_line_advance(3000);
+    sh.type_str("fg");
+    sh.enter();
+    sh.wait_for("resuming:", 3000);
+    sh.wait_for_quiescence(100);
+    sh.ctrl_c();
+    sh.wait_for_prompt_after_line_advance(3000);
+    assert!(!sh.home_path().join("forbidden-remainder").exists());
+}
+
+#[test]
 fn job_suspend_and_resume() {
     let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
     sh.type_str("./bin/sleep");
@@ -3954,6 +4268,30 @@ fn job_suspend_and_resume() {
         out.contains("alive"),
         "shell unresponsive after job resume: {out:?}"
     );
+}
+
+#[test]
+fn pipeline_suspend_and_resume_keeps_job_owned() {
+    let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
+    sh.type_str("./bin/sleep | cat");
+    sh.enter();
+    sh.wait_for("pty-child-ready", 3000);
+    sh.ctrl_z();
+
+    let out = sh.wait_for("stopped:", 3000);
+    assert!(out.contains("stopped:"), "expected pipeline stop notification: {out:?}");
+    sh.wait_for_prompt_after_line_advance(3000);
+
+    sh.type_str("fg");
+    sh.enter();
+    let out = sh.wait_for("resuming:", 3000);
+    assert!(out.contains("resuming:"), "expected pipeline resume notification: {out:?}");
+    sh.wait_for_quiescence(100);
+    sh.ctrl_c();
+    sh.wait_for_prompt_after_line_advance(3000);
+
+    let out = sh.run_command("echo alive");
+    assert!(out.contains("alive"), "shell did not recover after pipeline resume: {out:?}");
 }
 
 fn stty_state(output: &str) -> String {
@@ -4515,4 +4853,18 @@ fn prompt_identity_displays_unicode_and_replaces_only_invalid_display_bytes() {
     assert!(!out.contains('\u{e000}'), "{out}");
     let out = clean(&sh.run_command("USER=$(printf '\\0200')"));
     assert!(out.contains("\u{fffd}@"), "{out}");
+}
+
+#[test]
+fn native_copy_uses_current_store_and_prefix_tmpdir_values() {
+    let sh = PtyShell::spawn_with_opts(&[("source/file", "selected scratch"), ("scratch/.keep", "")], &[]);
+    sh.run_command("set TMPDIR scratch");
+    sh.run_command("TMPDIR=missing cp source refused-copy");
+    assert_native_fs_status(&sh, 1);
+    assert!(!sh.home_path().join("refused-copy").exists());
+    sh.run_command("cp source accepted-copy");
+    assert_native_fs_status(&sh, 0);
+    assert_eq!(std::fs::read(sh.home_path().join("accepted-copy/file")).unwrap(), b"selected scratch");
+    sh.run_command("/bin/sh -c 'printf %s \"$TMPDIR\"' >selected-tmpdir");
+    assert_eq!(std::fs::read(sh.home_path().join("selected-tmpdir")).unwrap(), b"scratch");
 }

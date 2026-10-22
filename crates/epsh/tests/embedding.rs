@@ -836,7 +836,7 @@ mod command_policy {
     }
 
     #[test]
-    fn policy_reaches_command_substitution_fast_and_fork_paths() {
+    fn safe_policy_refuses_inherited_command_substitution_callbacks() {
         let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut shell = Shell::builder()
             .stderr_sink(stderr.clone())
@@ -850,7 +850,7 @@ mod command_policy {
         assert_eq!(shell.run_script("$(source absent-policy-source)"), 2);
         assert!(String::from_utf8(stderr.lock().unwrap().clone())
             .unwrap()
-            .contains("disabled by command policy"));
+            .contains("command policy callback cannot execute in a child process"));
     }
 
     #[test]
@@ -883,5 +883,33 @@ mod command_policy {
 
         assert_eq!(shell.run_program(&program).code(), 2);
         assert_eq!(*observed.lock().unwrap(), b"command-\x80");
+    }
+}
+
+mod explicit_environment {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn explicit_raw_entries_reach_children_and_prefixes_remain_local_to_dispatch() {
+        let directory = tempdir().unwrap();
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let name = OsString::from_vec(b"epsh-name-\xff".to_vec());
+        let value = OsString::from_vec(b"value\x80".to_vec());
+        let mut shell = Shell::builder().cwd(directory.path().to_path_buf())
+            .environment(vec![(name.clone(), value.clone()), ("PREFIX".into(), "original".into()), ("RAW".into(), value.clone())])
+            .stdout_sink(output.clone()).build();
+        assert_eq!(shell.run_script("PREFIX=temporary /usr/bin/env -0"), 0);
+        let output = output.lock().unwrap();
+        let entries: Vec<_> = output.split(|byte| *byte == 0).collect();
+        assert!(entries.contains(&b"epsh-name-\xff=value\x80".as_slice()));
+        assert!(entries.contains(&b"RAW=value\x80".as_slice()));
+        assert!(entries.contains(&b"PREFIX=temporary".as_slice()));
+        assert_eq!(shell.get_var("PREFIX"), Some("original"));
+        assert_eq!(shell.get_var_bytes("RAW").unwrap().as_bytes(), b"value\x80");
+        assert!(shell.vars().env_for_command_os(&[]).contains(&(name, value)));
+        let empty = Shell::builder().environment(Vec::new()).build();
+        assert!(empty.get_var_bytes("RAW").is_none());
     }
 }

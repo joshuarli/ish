@@ -83,6 +83,17 @@ fn placement_target(index: usize) -> Vec<u8> {
     }
 }
 
+fn dynamic_target_rejection(target: &ShellBytes) -> Option<ish::dispatch::Rejection> {
+    let name = target.as_utf8_str()?;
+    if let Some(builtin) = ish::builtin::lookup(name)
+        .filter(|builtin| builtin.exec == ish::builtin::Exec::InShell)
+    {
+        return Some(ish::dispatch::Rejection::ShellBuiltinOutsideLine(builtin.name));
+    }
+    ish::builtin::is_refused_epsh_builtin(name)
+        .then(|| ish::dispatch::Rejection::UnsupportedBuiltin(name.to_owned()))
+}
+
 fn dynamic_case(index: usize, target: Vec<u8>) -> BridgeResult<Request> {
     let mut state = empty_state();
     state["variables"] = json!([["TARGET", target]]);
@@ -144,7 +155,7 @@ fn parse_program(source: &str) -> BridgeResult<Program> {
 pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
     if request.input["mode"] == "dynamic" {
         let target = require_policy_bytes(&request.input["target"])?;
-        let allowed = ish::dispatch::check_expanded_command(&ShellBytes::from_vec(target)).is_ok();
+        let allowed = dynamic_target_rejection(&ShellBytes::from_vec(target)).is_none();
         return Ok(json!({
             "tag": "success",
             "value": {"allowed": allowed, "status": if allowed { 0 } else { 2 }},
@@ -190,10 +201,12 @@ fn rejection_name(rejection: &ish::dispatch::Rejection) -> Option<&'static str> 
         ish::dispatch::Rejection::Background => "background",
         ish::dispatch::Rejection::Compound(_) => "compound",
         ish::dispatch::Rejection::FunctionDefinition => "function_definition",
-        ish::dispatch::Rejection::Source(_) => "source",
+        ish::dispatch::Rejection::UnsupportedBuiltin(name)
+            if matches!(name.as_str(), "eval" | "source" | ".") => "source",
+        ish::dispatch::Rejection::UnsupportedBuiltin(_) => "unsupported_builtin",
+        ish::dispatch::Rejection::Arguments(_) => "arguments",
         ish::dispatch::Rejection::ParameterOperator => "parameter_operator",
         ish::dispatch::Rejection::ShellBuiltinOutsideLine(_) => "shell_builtin_outside_line",
-        ish::dispatch::Rejection::ExpandedShellBuiltin(_) => return None,
     })
 }
 
@@ -350,8 +363,7 @@ fn actual_placement(request: &Request) -> BridgeResult<Value> {
         .as_str()
         .ok_or_else(|| BridgeError::new("placement context is not a string"))?;
     let (parent_context, negated) = placement_properties(context)?;
-    let dynamic_allowed =
-        ish::dispatch::check_expanded_command(&ShellBytes::from_vec(target.clone())).is_ok();
+    let dynamic_allowed = dynamic_target_rejection(&ShellBytes::from_vec(target.clone())).is_none();
     let target_allowed = parent_context && dynamic_allowed;
     let source = std::str::from_utf8(&request.source)
         .map_err(|_| BridgeError::new("placement source is not UTF-8"))?;
@@ -378,14 +390,15 @@ fn actual_placement(request: &Request) -> BridgeResult<Value> {
     );
     let policy_marker_copy = policy_marker.clone();
     let policy_target = target.clone();
-    shell.set_command_policy(Box::new(move |name| {
-        if name.as_bytes() == policy_target {
-            fs::write(&policy_marker_copy, b"called").expect("policy marker write succeeds");
-        }
-        ish::dispatch::check_expanded_command(name)
-            .err()
-            .map(|rejection| rejection.to_string())
-    }));
+    // SAFETY: The callback reads immutable command data and may create one marker file; it takes no inherited lock and its captures have safe child-process destructors.
+    unsafe {
+        shell.set_command_policy_in_children(Box::new(move |name| {
+            if name.as_bytes() == policy_target {
+                fs::write(&policy_marker_copy, b"called").expect("policy marker write succeeds");
+            }
+            dynamic_target_rejection(name).map(|rejection| rejection.to_string())
+        }));
+    }
     let handler_marker_copy = handler_marker.clone();
     shell.set_external_handler(Box::new(move |args, _environment| {
         if args
@@ -408,7 +421,7 @@ fn actual_placement(request: &Request) -> BridgeResult<Value> {
         || redirected != target_allowed
     {
         return Err(BridgeError::new(format!(
-            "placement runtime mismatch for {context} target {target:?}: status={status}, policy={policy_called}, handler={handler_called}, redirection={redirected}"
+            "placement runtime mismatch for {context} target {target:?}: status={status} expected={expected_status}, allowed={target_allowed}, policy={policy_called}, handler={handler_called}, redirection={redirected}"
         )));
     }
     let class = std::str::from_utf8(&target)
@@ -418,7 +431,6 @@ fn actual_placement(request: &Request) -> BridgeResult<Value> {
             ish::builtin::Exec::InShell => "in_shell",
             ish::builtin::Exec::Hybrid => "hybrid",
             ish::builtin::Exec::Foreground => "foreground",
-            ish::builtin::Exec::Native => "native",
         });
     directory.remove()?;
     Ok(json!({
@@ -448,9 +460,7 @@ pub(crate) fn verify_runtime_hook() -> BridgeResult<()> {
         .set_var("POLICY_BRIDGE_MARKER", "before")
         .map_err(BridgeError::new)?;
     shell.set_command_policy(Box::new(|target| {
-        ish::dispatch::check_expanded_command(target)
-            .err()
-            .map(|rejection| rejection.to_string())
+        dynamic_target_rejection(target).map(|rejection| rejection.to_string())
     }));
     for source in [
         "POLICY_PREFIX=$((POLICY_BRIDGE_MARKER=9)) \"$TARGET\" POLICY_BRIDGE_MARKER=after 8>policy-bridge-redirection-probe",

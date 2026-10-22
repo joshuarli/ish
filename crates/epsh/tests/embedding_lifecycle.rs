@@ -148,7 +148,7 @@ fn large_heredocs_do_not_wait_for_a_reader_during_setup() {
 #[test]
 fn timeout_interrupts_descendant_output_and_command_substitutions() {
     isolated("timeout_interrupts_descendant_output_and_command_substitutions", || {
-        for script in ["/bin/sh -c 'sleep 1 & wait'", "echo \"$(/bin/sleep 1)\""] {
+        for script in ["/bin/sh -c 'sleep 1 & wait'", "/bin/sh -c 'sleep 1 &'", "echo \"$(/bin/sleep 1)\""] {
             let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
             let mut shell = Shell::builder().stdout_sink(sink).timeout(Duration::from_millis(30)).build();
             let started = std::time::Instant::now();

@@ -9,6 +9,12 @@ use epsh::parser::Parser;
 use epsh::shell_bytes::ShellBytes;
 use tempfile::tempdir;
 
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn register_copy(shell: &mut Shell) {
     shell.set_command_placement(
         ShellBytes::from("cp"),
@@ -33,6 +39,7 @@ fn record_copy_calls(shell: &mut Shell) -> Arc<Mutex<Vec<Vec<Vec<u8>>>>> {
 
 #[test]
 fn parent_process_commands_run_in_lists_with_redirections_and_argument_substitution() {
+    let _guard = lock_test();
     let directory = tempdir().unwrap();
     let mut shell = Shell::builder().cwd(directory.path().to_path_buf()).build();
     register_copy(&mut shell);
@@ -60,6 +67,7 @@ fn parent_process_commands_run_in_lists_with_redirections_and_argument_substitut
 
 #[test]
 fn standalone_negation_runs_parent_process_commands_and_inverts_their_status() {
+    let _guard = lock_test();
     let directory = tempdir().unwrap();
     let mut shell = Shell::builder().cwd(directory.path().to_path_buf()).build();
     register_copy(&mut shell);
@@ -83,6 +91,7 @@ fn standalone_negation_runs_parent_process_commands_and_inverts_their_status() {
 
 #[test]
 fn standalone_negation_does_not_invert_cancellation_or_continue_the_list() {
+    let _guard = lock_test();
     let cancel = Arc::new(AtomicBool::new(true));
     let mut shell = Shell::builder().cancel_flag(cancel).build();
     register_copy(&mut shell);
@@ -94,6 +103,7 @@ fn standalone_negation_does_not_invert_cancellation_or_continue_the_list() {
 
 #[test]
 fn command_identity_is_independent_of_parent_process_placement() {
+    let _guard = lock_test();
     let directory = tempdir().unwrap();
     let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
     let mut shell = Shell::builder()
@@ -133,6 +143,7 @@ fn command_identity_is_independent_of_parent_process_placement() {
 
 #[test]
 fn parent_process_refusal_precedes_redirections_and_captured_callbacks() {
+    let _guard = lock_test();
     let directory = tempdir().unwrap();
     let policy_marker = directory.path().join("policy-called");
     let handler_marker = directory.path().join("handler-called");
@@ -201,6 +212,7 @@ fn parent_process_refusal_precedes_redirections_and_captured_callbacks() {
 
 #[test]
 fn negated_pipelines_and_substitutions_keep_parent_process_refusals() {
+    let _guard = lock_test();
     let directory = tempdir().unwrap();
     let handler_marker = directory.path().join("handler-called");
     let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -245,6 +257,7 @@ fn negated_pipelines_and_substitutions_keep_parent_process_refusals() {
 
 #[test]
 fn non_utf8_parent_process_targets_are_matched_and_escaped_in_diagnostics() {
+    let _guard = lock_test();
     let directory = tempdir().unwrap();
     let target = vec![b'c', 0x1b, 0xff];
     let policy_marker = directory.path().join("policy-called");
@@ -285,12 +298,23 @@ fn non_utf8_parent_process_targets_are_matched_and_escaped_in_diagnostics() {
     assert!(!policy_marker.exists());
     assert!(!handler_marker.exists());
     let diagnostic = String::from_utf8(stderr.lock().unwrap().clone()).unwrap();
+    assert!(diagnostic.contains("command policy callback"), "{diagnostic:?}");
+    stderr.lock().unwrap().clear();
+    let mut substitution = b"value=$('".to_vec();
+    substitution.extend_from_slice(&target);
+    substitution.extend_from_slice(b"' source destination > byte-name-redirection)");
+    assert_eq!(shell.run_program(&Parser::new_bytes(&substitution).parse().unwrap()).code(), 2);
+    assert!(!directory.path().join("byte-name-redirection").exists());
+    assert!(!policy_marker.exists());
+    assert!(!handler_marker.exists());
+    let diagnostic = String::from_utf8(stderr.lock().unwrap().clone()).unwrap();
     assert!(diagnostic.contains("c\\x1b\\xff"), "{diagnostic:?}");
     assert!(!diagnostic.as_bytes().contains(&0x1b));
 }
 
 #[test]
-fn placement_names_are_owned_bytes_and_unregistered_embedders_keep_default_behavior() {
+fn placement_names_are_owned_bytes_and_default_execution_obeys_callback_boundaries() {
+    let _guard = lock_test();
     let directory = tempdir().unwrap();
     let mut unrestricted = Shell::builder().cwd(directory.path().to_path_buf()).build();
     let default_marker = directory.path().join("default-handler-called");
@@ -301,8 +325,13 @@ fn placement_names_are_owned_bytes_and_unregistered_embedders_keep_default_behav
         }
         Ok(ExitStatus::SUCCESS)
     }));
-    assert_eq!(unrestricted.run_script("printf input | cp source destination"), 0);
-    assert!(default_marker.exists());
+    assert_eq!(unrestricted.run_script("printf input | cp source destination >refused-output"), 2);
+    assert!(!default_marker.exists());
+    assert!(!directory.path().join("refused-output").exists());
+    fs::write(directory.path().join("source"), b"default executor").unwrap();
+    let mut default_executor = Shell::builder().cwd(directory.path().to_path_buf()).build();
+    assert_eq!(default_executor.run_script("printf input | cp source destination"), 0);
+    assert_eq!(fs::read(directory.path().join("destination")).unwrap(), b"default executor");
 
     let mut placed = Shell::builder().cwd(directory.path().to_path_buf()).build();
     let calls = record_copy_calls(&mut placed);
@@ -318,6 +347,7 @@ fn placement_names_are_owned_bytes_and_unregistered_embedders_keep_default_behav
 
 #[test]
 fn single_stage_pipeline_fast_path_still_refuses_parent_process_commands() {
+    let _guard = lock_test();
     let directory = tempdir().unwrap();
     let marker = directory.path().join("handler-called");
     let marker_copy = marker.clone();

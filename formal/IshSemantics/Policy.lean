@@ -4,7 +4,8 @@ import IshSemantics.Protocol
 namespace IshSemantics.Policy
 open Lean
 inductive Rejection where
-  | background | compound | functionDefinition | source | parameterOperator | shellBuiltinOutsideLine
+  | background | compound | functionDefinition | source | unsupportedBuiltin | arguments
+  | parameterOperator | shellBuiltinOutsideLine
   deriving Repr, BEq, DecidableEq
 inductive Exec where
   | inShell | hybrid | foreground | native
@@ -20,8 +21,20 @@ def classify (name : Bytes) : Option Exec :=
 
 def forbiddenTarget (name : Bytes) : Bool :=
   ["eval", "source", "."].any (fun text => text.toUTF8.toList == name)
+
+def unavailableEpshBuiltin (name : Bytes) : Bool :=
+  ["return", "break", "continue", "readonly", "shift", "eval", ".", "source",
+    "read", "local", "exec", "wait", "trap", "umask", "getopts"].any
+      (fun text => text.toUTF8.toList == name)
+
+def shellNameBytes (name : Bytes) : Bool := Id.run do
+  let initial b := b == 95 || (65 ≤ b.toNat && b.toNat ≤ 90) || (97 ≤ b.toNat && b.toNat ≤ 122)
+  match name with
+  | [] => return false
+  | head :: tail => return initial head && tail.all (fun b => initial b || (48 ≤ b.toNat && b.toNat ≤ 57))
+
 def dynamicAllowed (name : Bytes) : Bool :=
-  !forbiddenTarget name && classify name != some .inShell
+  !forbiddenTarget name && !unavailableEpshBuiltin name && classify name != some .inShell
 mutual
   def staticParts : List WordPart → Option Bytes
     | [] => some []
@@ -40,6 +53,10 @@ def targetRejection (args : List Word) : Option Rejection := do
   let name ← staticText first
   if forbiddenTarget name then some .source
   else if classify name == some .inShell then some .shellBuiltinOutsideLine
+  else if unavailableEpshBuiltin name then some .unsupportedBuiltin
+  else if name == "set".toUTF8.toList && (match args[1]?.bind staticText with
+      | some argument => !shellNameBytes argument
+      | none => false) then some .arguments
   else none
 
 inductive Tree where
@@ -283,9 +300,9 @@ theorem ish_dynamic_source_refusal (target : Bytes) (forbidden : forbiddenTarget
 
 theorem ish_dynamic_shell_state_refusal (target : Bytes) (shell : classify target = some .inShell) :
     allowsTarget .ish target = false := by
-  simp [allowsTarget, dynamicAllowed, shell]
-  intro _
-  rfl
+  cases forbidden : forbiddenTarget target <;>
+    cases unavailable : unavailableEpshBuiltin target <;>
+    simp [allowsTarget, dynamicAllowed, shell, forbidden, unavailable] <;> decide
 
 example : dynamicAllowed "cp".toUTF8.toList = true := by decide +kernel
 example : dynamicAllowed "mv".toUTF8.toList = true := by decide +kernel
@@ -440,6 +457,8 @@ def rejectionName : Rejection → String
   | .compound => "compound"
   | .functionDefinition => "function_definition"
   | .source => "source"
+  | .unsupportedBuiltin => "unsupported_builtin"
+  | .arguments => "arguments"
   | .parameterOperator => "parameter_operator"
   | .shellBuiltinOutsideLine => "shell_builtin_outside_line"
 
@@ -494,6 +513,8 @@ example : checkTree (commandTree (.simple [] [.mk [.param "x" (.default false []
 example : checkTree (commandTree (.simple [] [.mk [.param "x" .badSubst]] [])) = none := by decide +kernel
 example : plan ⟨[.simple [] [.mk [.param "target" .normal]] []]⟩ = .epsh := by decide +kernel
 example : plan ⟨[.simple [] [literalWord "eval"] []]⟩ = .reject .source := by decide +kernel
+example : plan ⟨[.simple [] [literalWord "exec"] []]⟩ = .reject .unsupportedBuiltin := by decide +kernel
+example : plan ⟨[.simple [] [literalWord "set", literalWord "-e"] []]⟩ = .reject .arguments := by decide +kernel
 example : plan ⟨[.pipeline [.simple [] [literalWord "cd"] []] false]⟩ = .epsh := by decide +kernel
 example : decodeCommand 20 (.arr #[toJson "simple", .arr #[], .arr #[], .arr #[], .null]) =
     .error "invalid command tag or arity" := rfl

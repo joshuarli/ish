@@ -51,7 +51,7 @@ fn quoted_at_retains_order_and_first_last_concatenation() {
 #[test]
 fn scalar_expansion_retains_literal_glob_bytes() {
     let program = Parser::new("\"*?[]\\\\\"").parse().unwrap();
-    let Command::Simple { args, .. } = &program.commands[0] else { panic!("expected simple command") };
+    let epsh::ast::Command::Simple { args, .. } = &program.commands[0] else { panic!("expected simple command") };
     let mut shell = Shell::new();
     assert_eq!(epsh::expand::expand_word_to_string(&args[0], &mut shell).unwrap(), "*?[]\\");
     shell.set_var("HOME", "*?").unwrap();
@@ -68,7 +68,7 @@ fn repeated_quoted_at_merges_adjacent_edge_fields() {
 #[test]
 fn quoted_raw_bytes_and_effect_results_preserve_expansion_contract() {
     let program = Parser::new_bytes(b"'\xff\x00*' \"$RAW\"").parse().unwrap();
-    let Command::Simple { args, .. } = &program.commands[0] else { panic!("expected simple command") };
+    let epsh::ast::Command::Simple { args, .. } = &program.commands[0] else { panic!("expected simple command") };
     let mut shell = Shell::new();
     shell.set_var_bytes("RAW", vec![255, 0, b'*'].into()).unwrap();
     let expanded: Vec<Vec<u8>> = args.iter()
@@ -83,16 +83,6 @@ fn quoted_raw_bytes_and_effect_results_preserve_expansion_contract() {
 fn command_substitution_does_not_inherit_locked_stdout() {
     const PROBE: &str = "EPSH_STDOUT_LOCK_PROBE";
     const NAME: &str = "command_substitution_does_not_inherit_locked_stdout";
-
-    fn buffered_handler_output(
-        _: &[epsh::shell_bytes::ShellBytes],
-        _: &[(epsh::shell_bytes::ShellBytes, epsh::shell_bytes::ShellBytes)],
-    ) -> epsh::error::Result<epsh::error::ExitStatus> {
-        use std::io::Write as _;
-        let stdout = std::io::stdout();
-        stdout.lock().write_all(b"handler-output")?;
-        Ok(epsh::error::ExitStatus::SUCCESS)
-    }
 
     if std::env::var_os(PROBE).is_some() {
         let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
@@ -116,9 +106,18 @@ fn command_substitution_does_not_inherit_locked_stdout() {
         let mut shell = Shell::builder().timeout(timeout).build();
         assert_eq!(fields("\"$(printf value)\"", &mut shell), ["value"]);
 
-        let handler: epsh::eval::ExternalHandler = Box::new(buffered_handler_output);
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("callback-ran");
+        let callback_marker = marker.clone();
+        let handler: epsh::eval::ExternalHandler = Box::new(move |_, _| {
+            std::fs::write(&callback_marker, b"called")?;
+            Ok(epsh::error::ExitStatus::SUCCESS)
+        });
         let mut shell = Shell::builder().external_handler(handler).timeout(timeout).build();
-        assert_eq!(fields("\"$(handler)\"", &mut shell), ["handler-output"]);
+        let program = Parser::new("\"$(handler)\"").parse().unwrap();
+        let epsh::ast::Command::Simple { args, .. } = &program.commands[0] else { panic!("expected simple command") };
+        assert!(matches!(expand_word_to_fields(&args[0], &mut shell), Err(epsh::error::ShellError::CallbackProcess { kind: epsh::eval::CallbackKind::External })));
+        assert!(!marker.exists());
         return;
     }
 
