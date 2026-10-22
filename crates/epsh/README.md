@@ -94,16 +94,46 @@ legacy empty-command recovery; shell execution uses the strict parser.
 | cancel_flag(Arc<AtomicBool>) | Stop execution when the flag becomes true. |
 | timeout(Duration) | Set a deadline measured from shell construction. |
 | env_clear() | Start without importing the process environment. |
+| environment(entries) | Import owned OS name/value pairs instead, preserving raw bytes and non-shell names. |
 | external_handler(...) | Delegate external command execution to the embedder. |
 | redirect_open_handler(...) | Let the embedder open writable redirection targets. |
 | interactive(bool) | Enable foreground terminal handoff and stopped-process detection for pipelines. |
 | command_policy(...) | Refuse expanded command targets before builtin or function dispatch. |
+| command_argv_policy(...) | Validate expanded raw argv before target redirections or dispatch assignments. |
 
 Command policy is opt-in and disabled by default. The callback receives the
 expanded target as `ShellBytes`. Returning a diagnostic refuses the target with
 status 2. The policy also checks nested `command` indirection and command
 substitutions. Rejection happens before the target runs or opens redirections.
 The policy does not undo earlier commands or expansion effects.
+
+Safe callback registrations execute only in the registering process. Child
+invocation returns `ShellError::CallbackProcess` and maps to status 2 at numeric
+entry points. This rule covers external handlers, both command policies, and
+writable redirection openers. A private control channel preserves refusals
+through evaluator forks and command substitutions. Refusal during substitution
+suppresses the enclosing target. An ordinary command exiting 2 keeps normal
+substitution semantics.
+
+The `set_external_handler_in_children`, `set_external_dispatcher_in_children`,
+`set_command_policy_in_children`, `set_command_argv_policy_in_children`, and
+`set_redirect_open_handler_in_children` methods are unsafe opt-ins. Their safety
+contracts cover every reachable operation, destructor, and error path.
+Immutable captures and `Send` alone do not establish child safety.
+
+`set_external_dispatcher(names, dispatcher)` selects a callback by owned raw
+command names. It returns `ExternalDispatch::Handled(status)` or `NotHandled`.
+The latter uses epsh's default executor with the already-expanded environment.
+Status-only external handlers remain supported and own processes they create.
+
+Interactive embedders use `run_program_outcome` and match `ProgramOutcome`.
+`Completed` carries an exit status. `Stopped` transfers a non-cloneable
+`ForegroundJob` containing the owned group and output relays. Call
+`resume_foreground(&mut job)` until it returns `Some(status)` or use
+`terminate_foreground(&mut job)`. `None` means the group stopped again.
+The job belongs to its original shell and process. Dropping a job terminates
+and reaps its owned children. Numeric `run_program` and `run_script` terminate
+stopped jobs, print a diagnostic, and return 148.
 
 Command placement is opt-in and disabled by default. Call
 `Shell::set_command_placement` with an owned `ShellBytes` name and
@@ -127,6 +157,14 @@ complete child environment as byte pairs. Redirections have already been
 applied to file descriptors. The environment includes inherited entries unless
 env_clear was selected, exported shell variables, and command-prefix
 assignments.
+
+`ShellBuilder::environment` and `Variables::from_environment` use the same import
+rules as the default inherited environment. Non-shell variable names remain
+available to children. An explicit empty environment imports no inherited values;
+`IFS` retains its normal default. Shells never mutate the host environment.
+`Variables` can be cloned for validation before replacing a store. Its `binding`
+accessor exposes value and flags; `unexport` retains a local value, and `declare`
+creates an unset local binding without replacing an existing one.
 
 ## Arithmetic
 

@@ -75,13 +75,29 @@ remain waitable and keep their output relays. Cleanup terminates a dedicated
 pipeline process group, or individual pipeline children when they share the
 evaluator's process group.
 
-Embedding callbacks can execute in forked evaluator children for targets with
-no parent-process placement. A captured host mutex held by another thread at
-fork can remain locked in the child after the parent unlocks it. The stdout
-guard does not protect arbitrary callback state. This placement API does not
-change callback execution for unregistered targets. The broader callback
-process-boundary decision remains tracked in
-[ISH-8](../../../docs/rfc/ISH-8-callback-process-boundary.md).
+Safe callback registrations record their registering process. Every invocation
+checks the real process identity, including forks made outside epsh.
+External handlers, name and argv policies, and writable redirection openers
+return `ShellError::CallbackProcess` when inherited by another process.
+Dispatch preflights required callbacks before target redirections and checks
+again immediately before invocation. A refused opener never falls back to a
+default open. Inherited disallowed callbacks are neither invoked nor dropped.
+
+Unsafe `set_*_in_children` registrations require an audit of all reachable
+operations, destructors, and error paths at every possible fork point.
+Inherited host locks, runtime services, environment mutation, and dependencies
+on vanished threads violate that contract. Immutable captures and `Send` do
+not prove safety. Child mutations remain local to the child.
+
+Each evaluator fork has a private close-on-exec control pipe. Callback and
+command-policy refusals remain typed across waits and command substitutions.
+A refusal during substitution suppresses the enclosing target's effects.
+Numeric entry points report status 2. Ordinary exit 2 does not use this channel
+and preserves ordinary substitution output. Earlier commands and completed
+expansion effects are not rolled back.
+
+These checks establish the callback boundary. The Rust evaluator still runs
+after fork and has no general safety guarantee after a multithreaded fork.
 
 The default executor checks cancellation and deadlines between commands and
 while waiting for children. On cancellation or timeout it terminates tracked

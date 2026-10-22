@@ -16,7 +16,7 @@ verification limits. Open implementation and acceptance work is listed below.
 | [ISH-26](docs/rfc/ISH-26-denv-sourced-file-trust.md) | Retire implicit sourcing helpers; keep trusted `.env` assignment parsing | Ready; preserve semantics through ISH-15 |
 | [ISH-15, ISH-52](docs/rfc/ISH-15-environment-and-shell-ownership.md) | Explicit environments; remove host environment mutation and unsupported safety comments | Implemented; focused Linux acceptance passed; macOS remains under ISH-45 |
 | [ISH-5](docs/rfc/ISH-5-foreground-job-outcomes.md) | Structured stopped-job handles; epsh owns every child wait | Implemented; Linux PTY and process tests passed; macOS is tracked under ISH-45 |
-| [ISH-8](docs/rfc/ISH-8-callback-process-boundary.md) | Creator-process callbacks by default; explicit unsafe child opt-in | Coordinate external dispatch with ISH-5 and policy with ISH-24 |
+| [ISH-8](docs/rfc/ISH-8-callback-process-boundary.md) | Creator-process callbacks by default; explicit unsafe child opt-in | Implemented after ISH-5; Linux callback boundary tests passed; macOS is tracked under ISH-45 |
 | [ISH-32](docs/rfc/ISH-32-capture-and-retire.md) | Shared journaled fdu quarantine and identity primitives | Native recovery validation; account for ISH-45 |
 | [ISH-42](docs/rfc/ISH-42-release-delivery.md) | Default-branch releases, verified bytes, diagnostic panic aborts | Linux implementation verified; native macOS panic probe is tracked under ISH-45 |
 | [ISH-48](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor) | Private binary `Shell`; reusable library editor | Extraction can proceed; final integration follows ISH-15's environment contract |
@@ -33,17 +33,6 @@ verification limits. Open implementation and acceptance work is listed below.
 - **Fix with:** os-boundaries
 - **Effort:** M (days)
 - **Design:** [Trust for sourced denv files](docs/rfc/ISH-26-denv-sourced-file-trust.md)
-
-### ISH-8 · P2 · Forked external callbacks can deadlock on captured host locks
-
-- **Status:** Decision accepted; implementation pending.
-- **Area:** Concurrency
-- **Where:** `crates/epsh/src/eval.rs`
-- **Problem:** ExternalHandler is Send but can capture a mutex held by another host thread when command substitution forks. The child invokes the copied callback with a permanently locked copy. A fresh-source library probe completed with status 0 when unlocked; when held across fork, the parent thread released at 99 ms but the child stayed blocked until the one-second shell timeout returned 130.
-- **Recommendation:** Implement creator-process-only callbacks through safe APIs, with typed child refusal and separate unsafe registration for audited child execution. Apply the rule to external, policy/argv-policy, and redirect callbacks; propagate substitution refusals without target effects. Preserve ish pipelines using owned policy data and individually justified internal boundaries; no broker or silent fallback.
-- **Fix with:** lifecycle-concurrency, api-surface-and-module-boundaries
-- **Effort:** L (weeks)
-- **Design:** [Callback process boundary](docs/rfc/ISH-8-callback-process-boundary.md)
 
 ### ISH-32 · P3 · Two capture-and-retire protocols and duplicated identity code across `fdu-*` and `ish-fs`
 

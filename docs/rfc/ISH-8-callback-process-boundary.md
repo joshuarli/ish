@@ -1,6 +1,7 @@
 # ISH-8: Callback process boundary
 
-Status: accepted; implementation pending (2026-10-22)
+Status: accepted; implemented with Linux callback-boundary acceptance
+(2026-10-22); native macOS acceptance remains under ISH-45.
 
 ## Decision
 
@@ -13,9 +14,9 @@ another executor, policy or redirection opener.
 
 Apply one boundary to external handlers, command policies (including the
 argv-aware policy required by [ISH-24](ISH-24-builtin-allowlist.md)) and
-redirect-open handlers. This decision is accepted; the current callback APIs
-do not yet enforce it. Retain this RFC after implementation and document the
-shipped registration APIs in epsh's process model and public API docs.
+redirect-open handlers. This decision remains the contract. The callback
+boundary is implemented and described in epsh's process model and public API
+documentation.
 
 ## Why
 

@@ -116,6 +116,12 @@ Argument substitutions are allowed. Aliases after `!` expand before dispatch.
 Use `command cp` or an alias for the same native operation. Use an explicit
 path such as `/bin/cp` to run the external utility.
 
+Native `l`, `c`, and the list form of `history` also require the ish process.
+They refuse pipeline stages and command substitutions with status 2 before
+target redirections. Their host callbacks have no child-execution safety
+contract. Ordinary external programs, epsh builtins, and hybrid `cd` retain
+their pipeline and substitution forms.
+
 Arithmetic follows [epsh's signed 64-bit rules](crates/epsh/README.md#arithmetic).
 
 A bare directory name becomes an implicit `cd` only when it does not match a
