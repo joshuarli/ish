@@ -150,43 +150,6 @@ load_prefix() {
   return 0
 }
 
-source_env() { # shellcheck disable=SC1090
-  [ -f "$1" ] && . "$1"
-}
-source_env_if_exists() { # shellcheck disable=SC1090
-  [ -f "$1" ] && . "$1" || :
-}
-
-source_up() {
-  _denv_dir=$PWD
-  while :; do
-    _denv_dir=${_denv_dir%/*}
-    [ -z "$_denv_dir" ] && _denv_dir=/
-    if [ -f "$_denv_dir/.envrc" ]; then
-      # shellcheck disable=SC1091
-      . "$_denv_dir/.envrc"
-      unset _denv_dir
-      return 0
-    fi
-    [ "$_denv_dir" = "/" ] && break
-  done
-  unset _denv_dir
-  return 1
-}
-
-source_up_if_exists() { source_up 2>/dev/null || :; }
-
-dotenv() {
-  _denv_file=${1:-.env}
-  [ -f "$_denv_file" ] || return 1
-  set -a
-  # shellcheck disable=SC1090
-  . "$_denv_file"
-  set +a
-  unset _denv_file
-}
-
-dotenv_if_exists() { dotenv "${1:-.env}" 2>/dev/null || :; }
 log_status() { printf 'denv: %s\n' "$*" >&2; }
 log_error() { printf 'denv: error: %s\n' "$*" >&2; }
 strict_env() { set -euo pipefail; }

@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::Path;
 
-pub struct LayoutSnapshot<'a> {
+pub(crate) struct LayoutSnapshot<'a> {
     pub rows: u16,
     pub cols: u16,
     pub prompt_display_len: usize,
@@ -15,7 +15,7 @@ pub struct LayoutSnapshot<'a> {
     pub mode: &'a Mode,
 }
 
-pub fn render_layout_dump(out: &mut String, snapshot: LayoutSnapshot<'_>) {
+pub(crate) fn render_layout_dump(out: &mut String, snapshot: LayoutSnapshot<'_>) {
     let LayoutSnapshot {
         rows,
         cols,
@@ -130,6 +130,10 @@ pub fn render_layout_dump(out: &mut String, snapshot: LayoutSnapshot<'_>) {
 }
 
 pub fn write_layout_dump_file(home: &OsStr, dump: &str) -> Result<String, String> {
+    write_layout_dump_with_names(home, dump, random_dump_hex)
+}
+
+fn write_layout_dump_with_names(home: &OsStr, dump: &str, mut next_name: impl FnMut() -> rustix::io::Result<String>) -> Result<String, String> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     if home.is_empty() {
@@ -143,7 +147,7 @@ pub fn write_layout_dump_file(home: &OsStr, dump: &str) -> Result<String, String
         .map_err(|error| format!("ish-dump: could not create {}: {error}", dir.display()))?;
 
     for _ in 0..8 {
-        let name = random_dump_hex()
+        let name = next_name()
             .map_err(|error| format!("ish-dump: could not read random bytes: {error}"))?;
         let path = dir.join(format!("dump-{name}"));
         match std::fs::OpenOptions::new()
@@ -158,7 +162,8 @@ pub fn write_layout_dump_file(home: &OsStr, dump: &str) -> Result<String, String
                 })?;
                 return Ok(path.display().to_string());
             }
-            Err(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("ish-dump: could not open {}: {error}", path.display())),
         }
     }
 
@@ -231,4 +236,40 @@ mod tests {
         assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_ne!(first, second);
     }
+    struct DumpDirectory(std::path::PathBuf);
+    impl DumpDirectory {
+        fn new() -> Self {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".work/tmp").join(format!("ish-dump-test-{}", random_dump_hex().unwrap()));
+            std::fs::create_dir_all(path.join(".cache/ish")).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for DumpDirectory {
+        fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
+    }
+
+    #[test]
+    fn dump_retries_collisions_without_overwriting_existing_output() {
+        let directory = DumpDirectory::new();
+        let existing = directory.0.join(".cache/ish/dump-collision");
+        std::fs::write(&existing, b"preserved").unwrap();
+        let mut names = ["collision", "available"].into_iter();
+        let path = super::write_layout_dump_with_names(directory.0.as_os_str(), "new output", || Ok(names.next().unwrap().into())).unwrap();
+        assert_eq!(std::fs::read(existing).unwrap(), b"preserved");
+        assert_eq!(std::fs::read(path).unwrap(), b"new output");
+    }
+
+    #[test]
+    fn dump_noncollision_open_error_preserves_the_failed_path_and_cause() {
+        let directory = DumpDirectory::new();
+        let name = "x".repeat(300);
+        let path = directory.0.join(format!(".cache/ish/dump-{name}"));
+        let mut calls = 0;
+        let error = super::write_layout_dump_with_names(directory.0.as_os_str(), "output", || { calls += 1; Ok(name.clone()) }).unwrap_err();
+        assert_eq!(calls, 1, "noncollision errors must not be retried: {error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("File name too long") || error.contains("Filename too long"), "{error}");
+        assert!(!error.contains("unique dump filename"), "{error}");
+    }
+
 }

@@ -40,6 +40,7 @@ pub mod builtins;
 pub mod encoding;
 /// Error types: [`error::ShellError`], [`error::ExitStatus`].
 pub mod error;
+mod callback;
 /// Shell interpreter: [`eval::Shell`], [`eval::ShellBuilder`].
 pub mod eval;
 /// Word expansion: tilde, parameter, arithmetic, field splitting, and pathname expansion.

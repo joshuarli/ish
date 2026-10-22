@@ -34,7 +34,7 @@ pub fn maybe_rewrite_cd(line: &str, aliases: &AliasMap, home: &std::ffi::OsStr, 
         return format!("cd {path}");
     }
 
-    if words.len() != 1 || builtin::is_builtin(first_text) || aliases.get(first_text).is_some() {
+    if words.len() != 1 || builtin::is_builtin(first_text) || builtin::is_refused_epsh_builtin(first_text) || aliases.get(first_text).is_some() {
         return line.to_string();
     }
 

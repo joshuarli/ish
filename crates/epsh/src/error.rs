@@ -31,6 +31,8 @@ impl fmt::Display for Span {
 /// directly, or if you need to distinguish cancellation from timeout in custom control flow.
 #[derive(Debug)]
 pub enum ShellError {
+    CallbackProcess { kind: crate::eval::CallbackKind },
+    CommandRefused { diagnostic: String, span: Span },
     /// `exit [n]` — terminate the shell.
     Exit(ExitStatus),
     /// `return [n]` — return from function or dot-script.
@@ -95,6 +97,9 @@ impl ShellError {
 impl fmt::Display for ShellError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ShellError::CommandRefused { diagnostic, span } => write!(f, "{span}: {diagnostic}"),
+            ShellError::CallbackProcess { kind } => write!(f, "{kind} callback cannot execute in a child process; it belongs to its registering process"),
+
             ShellError::Exit(n) => write!(f, "exit {n}"),
             ShellError::Return(n) => write!(f, "return {n}"),
             ShellError::Break(n) => write!(f, "break {n}"),

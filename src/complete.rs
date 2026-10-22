@@ -466,9 +466,19 @@ fn finish_candidates(comp: &mut Completions, before: usize, prefix: &str, prefix
 /// preferring prefix matches when any exist. Substring fallback is
 /// case-insensitive (like fish) so "tom" matches "Cargo.toml".
 fn complete_in_dir(dir: &str, prefix: &str, dirs_only: bool, comp: &mut Completions) {
+    complete_in_directory(std::ffi::OsStr::new(dir), prefix, dirs_only, comp);
+}
+
+pub(crate) fn complete_path_from(cwd: &std::path::Path, partial: &str, dirs_only: bool, comp: &mut Completions) {
+    let (directory, prefix) = split_path(partial);
+    complete_in_directory(cwd.join(directory).as_os_str(), prefix, dirs_only, comp);
+}
+
+fn complete_in_directory(dir: &std::ffi::OsStr, prefix: &str, dirs_only: bool, comp: &mut Completions) {
+    use std::os::unix::ffi::OsStrExt;
     // Keep libc directory/stat calls here: rustix::fs::Dir allocates, while
     // warmed completion must remain zero-allocation.
-    let dir_path = if dir.is_empty() { "." } else { dir };
+    let dir_path = if dir.is_empty() { std::ffi::OsStr::new(".") } else { dir };
 
     // Build NUL-terminated dir path on stack
     let dir_bytes = dir_path.as_bytes();
@@ -624,6 +634,40 @@ pub fn complete_partial_path(
         }
     }
     (comp, groups)
+}
+
+pub(crate) fn complete_partial_path_from(cwd: &std::path::Path, partial: &str, dirs_only: bool) -> (Completions, Vec<(String, usize, usize)>) {
+    let (directory, prefix) = split_path(partial);
+    if directory.is_empty() { return (Completions::new(), Vec::new()); }
+    let path = cwd.join(directory.trim_end_matches('/'));
+    if path.is_dir() { return (Completions::new(), Vec::new()); }
+    let mut completions = Completions::new();
+    let mut groups = Vec::new();
+    for directory in resolve_directory(&path) {
+        let displayed = if std::path::Path::new(partial).is_absolute() { directory.as_path() } else { directory.strip_prefix(cwd).unwrap_or(&directory) };
+        let Some(displayed) = displayed.to_str() else { continue; };
+        let start = completions.len();
+        complete_in_directory(directory.as_os_str(), prefix, dirs_only, &mut completions);
+        let count = completions.len() - start;
+        if count > 0 { groups.push((format!("{displayed}/"), start, count)); }
+    }
+    (completions, groups)
+}
+
+fn resolve_directory(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if path.is_dir() { return vec![path.to_path_buf()]; }
+    let Some(parent) = path.parent() else { return Vec::new(); };
+    let Some(component) = path.file_name() else { return Vec::new(); };
+    let mut directories = Vec::new();
+    for parent in resolve_directory(parent) {
+        let Ok(entries) = std::fs::read_dir(parent) else { continue; };
+        for entry in entries.flatten() {
+            if entry.file_name().as_bytes().starts_with(component.as_bytes()) && entry.path().is_dir() { directories.push(entry.path()); }
+        }
+    }
+    directories.sort_unstable();
+    directories
 }
 
 /// Check if path is a directory using libc::stat — zero allocation.

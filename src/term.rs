@@ -224,8 +224,7 @@ impl TermWriter {
         self.buf.push(suffix);
     }
 
-    #[cfg(test)]
-    pub fn as_bytes(&self) -> &[u8] {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.buf
     }
 }

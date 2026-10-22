@@ -71,19 +71,20 @@ impl Var {
 }
 
 /// Saved variable state for scope restoration.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SavedVar {
     name: String,
     previous: Option<Var>,
 }
 
 /// Variable scope pushed on function call or dot-script.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Scope {
     saved: Vec<SavedVar>,
 }
 
 /// Variable storage with scoping support.
+#[derive(Clone)]
 pub struct Variables {
     /// All shell variables (flat namespace, latest value wins).
     vars: FxHashMap<String, Var>,
@@ -122,10 +123,15 @@ impl Variables {
     }
 
     pub fn new() -> Self {
+        Self::from_environment(env::vars_os())
+    }
+
+    /// Import an explicit environment, preserving non-shell names and raw values.
+    pub fn from_environment(entries: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
         let mut vars = FxHashMap::default();
         let mut inherited_env = Vec::new();
 
-        for (key, value) in env::vars_os() {
+        for (key, value) in entries {
             let key_bytes = ShellBytes::from_os_string(key);
             let value_bytes = ShellBytes::from_os_string(value);
             if let Some(name) = is_shell_name_bytes(key_bytes.as_bytes()) {
@@ -251,6 +257,19 @@ impl Variables {
             .entry(name.to_string())
             .or_insert_with(|| Var::new(None, VarFlags::new()));
         entry.flags.set(VarFlags::EXPORT);
+    }
+
+    /// Declare an unset local binding without changing an existing binding.
+    pub fn declare(&mut self, name: &str) {
+        self.vars.entry(name.to_string()).or_insert_with(|| Var::new(None, VarFlags::new()));
+    }
+
+    /// The complete current binding, including its export and readonly flags.
+    pub fn binding(&self, name: &str) -> Option<&Var> { self.vars.get(name) }
+
+    /// Keep a variable local rather than exporting it to child processes.
+    pub fn unexport(&mut self, name: &str) {
+        if let Some(binding) = self.vars.get_mut(name) { binding.flags.clear(VarFlags::EXPORT); }
     }
 
     /// Mark a variable as readonly.

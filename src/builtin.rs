@@ -8,15 +8,12 @@ pub enum Exec {
     /// must stay in the shell process. It runs only as the whole input line.
     InShell,
     /// As the whole input line it runs in the shell with shell state; inside a
-    /// list or pipeline epsh's own builtin or the external-command handler
+    /// list epsh's own builtin or the parent-process external-command handler
     /// supplies a stateless form of the same command.
     Hybrid,
     /// Runs through epsh in lists and redirections, then the parent-process
     /// external handler.
     Foreground,
-    /// Self-contained: runs through the external-command handler wherever it
-    /// appears, including pipeline stages.
-    Native,
 }
 
 /// A builtin that runs in the shell process as the whole input line.
@@ -54,7 +51,6 @@ enum Handler {
         stateless: Option<ExternalCommand>,
     },
     Foreground(ExternalCommand),
-    Native(ExternalCommand),
 }
 
 /// One ish-owned builtin. This table is the command-name, execution-class, and
@@ -84,15 +80,11 @@ impl Builtin {
         Self { name, exec: Exec::Foreground, handler: Handler::Foreground(command) }
     }
 
-    const fn native(name: &'static str, command: ExternalCommand) -> Self {
-        Self { name, exec: Exec::Native, handler: Handler::Native(command) }
-    }
-
     /// The handler for running as the whole input line, for classes that have one.
     pub fn shell_command(&self) -> Option<ShellCommand> {
         match self.handler {
             Handler::InShell(command) | Handler::Hybrid { shell: command, .. } => Some(command),
-            Handler::Foreground(_) | Handler::Native(_) => None,
+            Handler::Foreground(_) => None,
         }
     }
 
@@ -100,7 +92,7 @@ impl Builtin {
     pub fn external_command(&self) -> Option<ExternalCommand> {
         match self.handler {
             Handler::Hybrid { stateless, .. } => stateless,
-            Handler::Foreground(command) | Handler::Native(command) => Some(command),
+            Handler::Foreground(command) => Some(command),
             Handler::InShell(_) => None,
         }
     }
@@ -112,13 +104,13 @@ const ISH_BUILTINS: &[Builtin] = &[
     Builtin::hybrid("cd", ShellCommand::ChangeDirectory, None),
     Builtin::in_shell("copy-scrollback", ShellCommand::CopyScrollback),
     Builtin::foreground("cp", ExternalCommand::Copy),
-    Builtin::native("c", ExternalCommand::ClearScreen),
+    Builtin::foreground("c", ExternalCommand::ClearScreen),
     Builtin::in_shell("denv", ShellCommand::Denv),
     Builtin::in_shell("exit", ShellCommand::Exit),
     Builtin::in_shell("fg", ShellCommand::ResumeJob),
     Builtin::hybrid("history", ShellCommand::History, Some(ExternalCommand::History)),
     Builtin::in_shell("ish-dump", ShellCommand::DumpLayout),
-    Builtin::native("l", ExternalCommand::List),
+    Builtin::foreground("l", ExternalCommand::List),
     Builtin::foreground("mv", ExternalCommand::Move),
     Builtin::in_shell("t", ShellCommand::Trash),
     Builtin::in_shell("trash", ShellCommand::Trash),
@@ -127,6 +119,61 @@ const ISH_BUILTINS: &[Builtin] = &[
     Builtin::in_shell("which", ShellCommand::Locate),
     Builtin::in_shell("z", ShellCommand::Jump),
 ];
+
+struct EpshBuiltin {
+    name: &'static str,
+    arguments: Option<epsh::eval::CommandRule>,
+}
+
+impl EpshBuiltin {
+    const fn any_arguments(name: &'static str) -> Self { Self { name, arguments: None } }
+}
+
+const EPSH_BUILTINS: &[EpshBuiltin] = &[
+    EpshBuiltin::any_arguments("echo"),
+    EpshBuiltin::any_arguments("printf"),
+    EpshBuiltin::any_arguments("pwd"),
+    EpshBuiltin::any_arguments("true"),
+    EpshBuiltin::any_arguments("false"),
+    EpshBuiltin::any_arguments(":"),
+    EpshBuiltin::any_arguments("test"),
+    EpshBuiltin::any_arguments("["),
+    EpshBuiltin::any_arguments("kill"),
+    EpshBuiltin::any_arguments("export"),
+    EpshBuiltin::any_arguments("unset"),
+    EpshBuiltin { name: "set", arguments: Some(epsh::eval::CommandRule::VariableAssignment) },
+    EpshBuiltin::any_arguments("command"),
+];
+
+/// Epsh implementation names exposed by the interactive policy, including hybrid fallbacks.
+pub fn epsh_builtin_names() -> impl Iterator<Item = &'static str> {
+    EPSH_BUILTINS.iter().map(|builtin| builtin.name).chain(
+        ISH_BUILTINS.iter().filter(|builtin| builtin.exec == Exec::Hybrid && builtin.external_command().is_none()).map(|builtin| builtin.name)
+    )
+}
+
+/// The owned argument restriction for an exposed epsh command, if any.
+pub fn epsh_argument_rule(name: &str) -> Option<&'static epsh::eval::CommandRule> {
+    EPSH_BUILTINS.iter().find(|builtin| builtin.name == name).and_then(|builtin| builtin.arguments.as_ref())
+}
+
+/// Whether a reserved epsh builtin name is unavailable in ish, including PATH lookup.
+pub fn is_refused_epsh_builtin(name: &str) -> bool {
+    epsh::builtins::is_builtin(name) && !is_builtin(name)
+}
+
+/// Install the interactive execution policy without changing standalone epsh defaults.
+pub fn install_epsh_policy(shell: &mut epsh::eval::Shell) {
+    shell.set_builtin_allowlist(epsh_builtin_names().map(epsh::shell_bytes::ShellBytes::from).collect());
+    for builtin in ISH_BUILTINS.iter().filter(|builtin| builtin.exec == Exec::InShell) {
+        shell.set_command_rule(epsh::shell_bytes::ShellBytes::from(builtin.name), epsh::eval::CommandRule::Deny(format!("{} changes shell state or needs the ish process, so it requires a statically named whole-line command", builtin.name)));
+    }
+    for builtin in EPSH_BUILTINS {
+        if let Some(rule) = &builtin.arguments {
+            shell.set_command_rule(epsh::shell_bytes::ShellBytes::from(builtin.name), rule.clone());
+        }
+    }
+}
 
 /// The ish-owned builtin called `name`, if any.
 pub fn lookup(name: &str) -> Option<&'static Builtin> {
@@ -140,18 +187,15 @@ pub fn replaces_last_output(name: &str) -> bool {
     !matches!(name, "?" | "fg" | "exit")
 }
 
-/// Check if a command name is a builtin in either ish or epsh.
+/// Whether ish exposes this command as a builtin.
 pub fn is_builtin(name: &str) -> bool {
-    lookup(name).is_some() || epsh::builtins::is_builtin(name)
+    lookup(name).is_some() || EPSH_BUILTINS.iter().any(|builtin| builtin.name == name)
 }
 
-/// All builtin names (ish + epsh), each once, for completion.
+/// Every exposed builtin name once, for lookup and completion.
 pub fn all_builtin_names() -> impl Iterator<Item = &'static str> {
-    ISH_BUILTINS.iter().map(|b| b.name).chain(
-        epsh::builtins::BUILTIN_NAMES
-            .iter()
-            .copied()
-            .filter(|name| lookup(name).is_none()),
+    ISH_BUILTINS.iter().map(|builtin| builtin.name).chain(
+        EPSH_BUILTINS.iter().map(|builtin| builtin.name).filter(|name| lookup(name).is_none())
     )
 }
 
@@ -178,6 +222,11 @@ pub fn locate_command(
     if is_builtin(name) {
         println!("builtin");
         return 0;
+    }
+
+    if is_refused_epsh_builtin(name) {
+        eprintln!("ish: w: not found: {name}");
+        return 1;
     }
 
     if function_exists(name) {

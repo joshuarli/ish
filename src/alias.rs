@@ -87,3 +87,19 @@ fn char_to_byte_offset(source: &str, char_offset: usize) -> usize {
         .map(|(idx, _)| idx)
         .unwrap_or(source.len())
 }
+
+pub fn expand_command_line<'a>(line: &'a str, aliases: &AliasMap) -> std::borrow::Cow<'a, str> {
+    let trimmed = line.trim_start();
+    let leading = &line[..line.len() - trimmed.len()];
+    if let Some(after_bang) = trimmed.strip_prefix('!')
+        && after_bang.chars().next().is_some_and(char::is_whitespace)
+    {
+        return match aliases.expand_line(&trimmed[1..]) {
+            std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(line),
+            std::borrow::Cow::Owned(expanded) => {
+                std::borrow::Cow::Owned(format!("{leading}!{expanded}"))
+            }
+        };
+    }
+    aliases.expand_line(line)
+}

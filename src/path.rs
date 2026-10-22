@@ -205,6 +205,7 @@ pub fn complete_commands(prefix: &str, comp: &mut crate::complete::Completions, 
                 Ok(s) => s,
                 Err(_) => continue,
             };
+            if crate::builtin::is_refused_epsh_builtin(name) { continue; }
             comp.push(name, false, false, true);
         }
 

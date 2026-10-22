@@ -10,6 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::ast::*;
+use crate::callback::Registered;
+pub use crate::callback::CallbackKind;
+
+#[path = "jobs.rs"]
+mod jobs;
+pub use jobs::{ForegroundJob, ProgramOutcome};
 
 fn is_dot_navigation(path: &Path) -> bool {
     let mut has_component = false;
@@ -232,6 +238,41 @@ pub type ExternalHandler = Box<
 /// `Some(diagnostic)` to refuse it with status 2.
 pub type CommandPolicy = Box<dyn FnMut(&ShellBytes) -> Option<String> + Send>;
 
+/// Optional raw-argv validation before target redirections and dispatch assignments.
+pub type CommandArgvPolicy = Box<dyn FnMut(&[ShellBytes]) -> Option<String> + Send>;
+
+/// The result of an external dispatcher, including delegation to epsh's executor.
+pub enum ExternalDispatch {
+    Handled(ExitStatus),
+    NotHandled,
+}
+
+/// A callback selected by owned command names that may delegate to epsh.
+pub type ExternalDispatcher = Box<dyn FnMut(&[ShellBytes], &[(ShellBytes, ShellBytes)]) -> crate::error::Result<ExternalDispatch> + Send>;
+
+/// Owned command validation that runs without an embedding callback.
+#[derive(Clone)]
+pub enum CommandRule {
+    Deny(String),
+    VariableAssignment,
+}
+
+
+impl CommandRule {
+    /// Validate raw argv (command name followed by operands) without a host callback.
+    pub fn validate_arguments(&self, args: &[ShellBytes]) -> Result<(), String> {
+        match self {
+            Self::Deny(message) => Err(message.clone()),
+            Self::VariableAssignment if args.get(1).is_some_and(|name| crate::var::is_shell_name_bytes(name.as_bytes()).is_none()) => {
+                let name = args.first().map(ShellBytes::to_shell_string).unwrap_or_default();
+                Err(format!("{name}: expected a variable name"))
+            }
+            Self::VariableAssignment => Ok(()),
+        }
+    }
+}
+
+
 /// Required process placement for an expanded command name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandPlacement {
@@ -249,6 +290,20 @@ pub enum CommandIdentity {
 thread_local! {
     static EXTERNAL_COMMAND_CWD: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
+}
+
+struct ExternalCwdGuard(Option<PathBuf>);
+
+impl ExternalCwdGuard {
+    fn enter(cwd: PathBuf) -> Self {
+        Self(EXTERNAL_COMMAND_CWD.with(|current| current.borrow_mut().replace(cwd)))
+    }
+}
+
+impl Drop for ExternalCwdGuard {
+    fn drop(&mut self) {
+        EXTERNAL_COMMAND_CWD.with(|current| *current.borrow_mut() = self.0.take());
+    }
 }
 
 /// Working directory of the command currently being passed to the external
@@ -328,6 +383,9 @@ pub struct Shell {
     pub(crate) tested: bool,
     pub(crate) in_forked_child: bool,
     owner_pid: u32,
+    job_owner: Arc<()>,
+    pending_job: Option<ForegroundJob>,
+    terminal_descriptor: Option<HeldDescriptor>,
     command_placements: FxHashMap<Vec<u8>, CommandPlacement>,
     command_identities: FxHashMap<Vec<u8>, CommandIdentity>,
     placement_context: PlacementContext,
@@ -339,10 +397,18 @@ pub struct Shell {
     pub(crate) child_pids: Vec<i32>,
     child_groups: FxHashMap<i32, i32>,
     child_relays: FxHashMap<i32, ChildRelays>,
+    child_controls: FxHashMap<i32, HeldDescriptor>,
+    callback_reporter: Option<HeldDescriptor>,
+    pub(crate) private_descriptors: Vec<std::sync::Weak<Mutex<Option<OwnedFd>>>>,
     timeout: Option<std::time::Instant>,
-    external_handler: Option<ExternalHandler>,
-    command_policy: Option<CommandPolicy>,
-    pub(crate) redirect_open_handler: Option<RedirectOpenHandler>,
+    external_handler: Option<Registered<ExternalHandler>>,
+    external_dispatcher: Option<Registered<ExternalDispatcher>>,
+    external_dispatch_names: Vec<ShellBytes>,
+    command_rules: FxHashMap<Vec<u8>, CommandRule>,
+    builtin_allowlist: Option<Vec<ShellBytes>>,
+    command_policy: Option<Registered<CommandPolicy>>,
+    command_argv_policy: Option<Registered<CommandArgvPolicy>>,
+    pub(crate) redirect_open_handler: Option<Registered<RedirectOpenHandler>>,
     last_bg_pid: Option<u32>,
     substitution_count: u64,
     pub(crate) pending_stdin: Option<usize>,
@@ -449,10 +515,15 @@ pub struct ShellBuilder {
     stdout_sink: Option<Arc<Mutex<dyn Write + Send>>>,
     stderr_sink: Option<Arc<Mutex<dyn Write + Send>>>,
     timeout: Option<std::time::Duration>,
-    env_clear: bool,
-    external_handler: Option<ExternalHandler>,
-    command_policy: Option<CommandPolicy>,
-    redirect_open_handler: Option<RedirectOpenHandler>,
+    environment: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    external_handler: Option<Registered<ExternalHandler>>,
+    external_dispatcher: Option<Registered<ExternalDispatcher>>,
+    external_dispatch_names: Vec<ShellBytes>,
+    command_rules: FxHashMap<Vec<u8>, CommandRule>,
+    builtin_allowlist: Option<Vec<ShellBytes>>,
+    command_policy: Option<Registered<CommandPolicy>>,
+    command_argv_policy: Option<Registered<CommandArgvPolicy>>,
+    redirect_open_handler: Option<Registered<RedirectOpenHandler>>,
 }
 
 impl Default for ShellBuilder {
@@ -476,9 +547,14 @@ impl ShellBuilder {
             stdout_sink: None,
             stderr_sink: None,
             timeout: None,
-            env_clear: false,
+            environment: None,
             external_handler: None,
+            external_dispatcher: None,
+            external_dispatch_names: Vec::new(),
+            command_rules: FxHashMap::default(),
+            builtin_allowlist: None,
             command_policy: None,
+            command_argv_policy: None,
             redirect_open_handler: None,
         }
     }
@@ -536,30 +612,39 @@ impl ShellBuilder {
     }
     /// Don't inherit process environment variables.
     pub fn env_clear(mut self) -> Self {
-        self.env_clear = true;
+        self.environment = Some(Vec::new());
+        self
+    }
+    /// Replace inherited environment input with owned, byte-preserving OS entries.
+    pub fn environment(mut self, entries: Vec<(std::ffi::OsString, std::ffi::OsString)>) -> Self {
+        self.environment = Some(entries);
         self
     }
     /// Set a callback for external command execution.
     pub fn external_handler(mut self, handler: ExternalHandler) -> Self {
-        self.external_handler = Some(handler);
+        self.external_handler = Some(Registered::new(handler));
         self
     }
     /// Set a callback that can refuse expanded command targets. Without a callback, all targets are allowed.
     pub fn command_policy(mut self, policy: CommandPolicy) -> Self {
-        self.command_policy = Some(policy);
+        self.command_policy = Some(Registered::new(policy));
         self
     }
     /// Set a provider that opens writable redirection targets.
+    pub fn command_argv_policy(mut self, policy: CommandArgvPolicy) -> Self {
+        self.command_argv_policy = Some(Registered::new(policy));
+        self
+    }
+
     pub fn redirect_open_handler(mut self, handler: RedirectOpenHandler) -> Self {
-        self.redirect_open_handler = Some(handler);
+        self.redirect_open_handler = Some(Registered::new(handler));
         self
     }
 
     pub fn build(self) -> Shell {
-        let vars = if self.env_clear {
-            Variables::new_clean()
-        } else {
-            Variables::new()
+        let vars = match self.environment {
+            Some(entries) => Variables::from_environment(entries),
+            None => Variables::new(),
         };
         let (cwd, cwd_is_canonical) = match self.cwd {
             Some(cwd) => (cwd, false),
@@ -589,6 +674,9 @@ impl ShellBuilder {
             tested: false,
             in_forked_child: false,
             owner_pid: std::process::id(),
+            job_owner: Arc::new(()),
+            pending_job: None,
+            terminal_descriptor: None,
             command_placements: FxHashMap::default(),
             command_identities: FxHashMap::default(),
             placement_context: PlacementContext::default(),
@@ -600,9 +688,17 @@ impl ShellBuilder {
             descriptor_sinks: FxHashMap::default(),
             child_groups: FxHashMap::default(),
             child_relays: FxHashMap::default(),
+            child_controls: FxHashMap::default(),
+            callback_reporter: None,
+            private_descriptors: Vec::new(),
             timeout: self.timeout.map(|d| std::time::Instant::now() + d),
             external_handler: self.external_handler,
+            external_dispatcher: self.external_dispatcher,
+            external_dispatch_names: self.external_dispatch_names,
+            command_rules: self.command_rules,
+            builtin_allowlist: self.builtin_allowlist,
             command_policy: self.command_policy,
+            command_argv_policy: self.command_argv_policy,
             redirect_open_handler: self.redirect_open_handler,
             last_bg_pid: None,
             substitution_count: 0,
@@ -620,6 +716,7 @@ impl Default for Shell {
 
 impl Drop for Shell {
     fn drop(&mut self) {
+        if std::process::id() != self.owner_pid { return; }
         self.kill_children();
         let orphaned_relays: Vec<_> = self.child_relays.keys().copied().collect();
         for pid in orphaned_relays { self.discard_child_relays(pid); }
@@ -646,6 +743,20 @@ impl Shell {
         }
     }
 
+    pub(crate) fn ensure_terminal_descriptor(&mut self) -> crate::error::Result<()> {
+        if !self.opts.interactive || self.in_forked_child || self.terminal_descriptor.is_some() { return Ok(()); }
+        let descriptor = sys::duplicate_fd_above(0, 3)?;
+        if !rustix::termios::isatty(&descriptor) { return Ok(()); }
+        let descriptor = Arc::new(Mutex::new(Some(descriptor)));
+        self.private_descriptors.push(Arc::downgrade(&descriptor));
+        self.terminal_descriptor = Some(descriptor);
+        Ok(())
+    }
+
+    fn terminal_raw_fd(&self) -> RawFd {
+        self.terminal_descriptor.as_ref().and_then(|descriptor| descriptor.lock().unwrap().as_ref().map(AsRawFd::as_raw_fd)).unwrap_or(0)
+    }
+
     fn fork_outputs(&self, capture_stdout: bool) -> crate::error::Result<Vec<ForkOutput>> {
         let mut outputs = Vec::new();
         let mut targets: Vec<_> = self.descriptor_sinks.keys().copied().collect();
@@ -663,6 +774,7 @@ impl Shell {
     fn enter_forked_child(&mut self, outputs: &[ForkOutput], pgid: i32) -> std::io::Result<()> {
         rustix::process::setpgid(None, rustix::process::Pid::from_raw(pgid))?;
         self.in_forked_child = true;
+        self.terminal_descriptor = None;
         self.child_pids.clear();
         self.child_groups.clear();
         let inherited_readers: Vec<_> = self.child_relays.values().flat_map(|relays| relays.descriptors.iter().copied()).collect();
@@ -723,16 +835,75 @@ impl Shell {
         Ok(())
     }
 
-    fn fork_evaluator(&self) -> crate::error::Result<i32> {
+    fn fork_evaluator(&mut self) -> crate::error::Result<i32> {
+        let (control_read, control_write) = sys::pipe_owned()?;
         let stdout = std::io::stdout();
         let mut stdout_guard = stdout.lock();
         stdout_guard.flush()?;
+        self.private_descriptors.retain(|descriptor| descriptor.strong_count() > 0);
+        let private: Vec<_> = self.private_descriptors.iter().filter_map(std::sync::Weak::upgrade).collect();
+        let private_guards: Vec<_> = private.iter().map(|descriptor| descriptor.lock().unwrap()).collect();
         let guards: Vec<_> = self.redirection_fds.iter().flatten().map(|descriptor| descriptor.lock().unwrap()).collect();
         // SAFETY: stdout is flushed and locked, and descriptor readers are paused; both processes release copied guards before evaluating.
         let pid = unsafe { sys::fork() };
         drop(guards);
+        drop(private_guards);
+        drop(private);
         drop(stdout_guard);
+        if pid == 0 {
+            self.private_descriptors.clear();
+            let reporter = Arc::new(Mutex::new(Some(control_write)));
+            self.private_descriptors.push(Arc::downgrade(&reporter));
+            self.callback_reporter = Some(reporter);
+            self.child_controls.clear();
+            drop(control_read);
+        } else if pid > 0 {
+            let reader = Arc::new(Mutex::new(Some(control_read)));
+            self.private_descriptors.push(Arc::downgrade(&reader));
+            self.child_controls.insert(pid, reader);
+        }
         Ok(pid)
+    }
+
+    fn report_child_refusal(&self, error: &ShellError) {
+        let tag = match error {
+            ShellError::CallbackProcess { kind: CallbackKind::External } => 1,
+            ShellError::CallbackProcess { kind: CallbackKind::CommandPolicy } => 2,
+            ShellError::CallbackProcess { kind: CallbackKind::RedirectOpen } => 3,
+            ShellError::CommandRefused { .. } => 4,
+            _ => return,
+        };
+        if let Some(reporter) = &self.callback_reporter {
+            let held = reporter.lock().unwrap();
+            let Some(writer) = held.as_ref() else { return; };
+            while let Err(rustix::io::Errno::INTR) = rustix::io::write(writer, &[tag]) {}
+        }
+    }
+
+    fn read_child_refusal(descriptor: &HeldDescriptor) -> crate::error::Result<()> {
+        let held = descriptor.lock().unwrap();
+        let reader = held.as_ref().ok_or_else(|| ShellError::Io(std::io::Error::other("callback control channel was closed")))?;
+        let mut tag = [0u8];
+        let length = loop {
+            match rustix::io::read(reader, &mut tag) {
+                Err(rustix::io::Errno::INTR) => continue,
+                result => break result.map_err(std::io::Error::from)?,
+            }
+        };
+        if length == 0 { return Ok(()); }
+        let kind = match tag[0] {
+            1 => CallbackKind::External,
+            2 => CallbackKind::CommandPolicy,
+            3 => CallbackKind::RedirectOpen,
+            4 => return Err(ShellError::CommandRefused { diagnostic: "command refused by policy in child evaluator".to_owned(), span: Span::default() }),
+            _ => return Err(ShellError::Io(std::io::Error::other("invalid child callback refusal"))),
+        };
+        Err(ShellError::CallbackProcess { kind })
+    }
+
+    fn take_child_refusal(&mut self, pid: i32) -> crate::error::Result<()> {
+        if let Some(reader) = self.child_controls.remove(&pid) { Self::read_child_refusal(&reader)?; }
+        Ok(())
     }
 
     fn track_child(&mut self, pid: i32, pgid: i32) {
@@ -819,6 +990,9 @@ impl Shell {
             tested: false,
             in_forked_child: false,
             owner_pid: std::process::id(),
+            job_owner: Arc::new(()),
+            pending_job: None,
+            terminal_descriptor: None,
             command_placements: FxHashMap::default(),
             command_identities: FxHashMap::default(),
             placement_context: PlacementContext::default(),
@@ -830,9 +1004,17 @@ impl Shell {
             descriptor_sinks: FxHashMap::default(),
             child_groups: FxHashMap::default(),
             child_relays: FxHashMap::default(),
+            child_controls: FxHashMap::default(),
+            callback_reporter: None,
+            private_descriptors: Vec::new(),
             timeout: None,
             external_handler: None,
+            external_dispatcher: None,
+            external_dispatch_names: Vec::new(),
+            command_rules: FxHashMap::default(),
+            builtin_allowlist: None,
             command_policy: None,
+            command_argv_policy: None,
             redirect_open_handler: None,
             last_bg_pid: None,
             substitution_count: 0,
@@ -904,11 +1086,8 @@ impl Shell {
             return Ok(());
         };
         let target = ShellBytes::from_str_lossless(target);
-        if let Some(diagnostic) = policy(&target) {
-            return Err(ShellError::Runtime {
-                msg: diagnostic,
-                span,
-            });
+        if let Some(diagnostic) = policy.get(CallbackKind::CommandPolicy)?(&target) {
+            return Err(ShellError::CommandRefused { diagnostic, span });
         }
         Ok(())
     }
@@ -923,7 +1102,23 @@ impl Shell {
             let Some(target) = args.first() else {
                 return Ok(());
             };
+            let target_bytes = ShellBytes::from_str_lossless(target);
+            if let Some(allowed) = &self.builtin_allowlist
+                && crate::builtins::is_builtin(target)
+                && !allowed.iter().any(|name| name == &target_bytes)
+            {
+                return Err(ShellError::CommandRefused { diagnostic: format!("{target}: builtin is not available"), span });
+            }
+            if let Some(rule) = self.command_rules.get(target_bytes.as_bytes()) {
+                let argv: Vec<_> = args.iter().map(|arg| ShellBytes::from_str_lossless(arg)).collect();
+                if let Err(diagnostic) = rule.validate_arguments(&argv) { return Err(ShellError::CommandRefused { diagnostic, span }); }
+            }
             self.check_command_policy(target, span)?;
+            if let Some(policy) = self.command_argv_policy.as_mut() {
+                let callback = policy.get(CallbackKind::CommandPolicy)?;
+                let argv: Vec<_> = args.iter().map(|arg| ShellBytes::from_str_lossless(arg)).collect();
+                if let Some(diagnostic) = callback(&argv) { return Err(ShellError::CommandRefused { diagnostic, span }); }
+            }
             if target != "command" {
                 return Ok(());
             }
@@ -964,6 +1159,12 @@ impl Shell {
                 | crate::builtins::CommandAction::Describe { .. } => return None,
             }
         }
+    }
+
+    pub(crate) fn command_lookup_available(&self, name: &str) -> bool {
+        self.command_identity(name).is_some()
+            || !crate::builtins::is_builtin(name)
+            || self.builtin_allowlist.as_ref().is_none_or(|allowed| allowed.iter().any(|candidate| candidate == &ShellBytes::from_str_lossless(name)))
     }
 
     pub(crate) fn command_identity(&self, name: &str) -> Option<CommandIdentity> {
@@ -1052,6 +1253,7 @@ impl Shell {
                 Err(error) => {
                     self.discard_child_relays(pid);
                     self.forget_child(pid);
+                    self.child_controls.remove(&pid);
                     return Err(ShellError::Io(error.into()));
                 }
             }
@@ -1069,6 +1271,7 @@ impl Shell {
             }
         };
         self.forget_child(pid);
+        self.take_child_refusal(pid)?;
         if let Some(error) = interruption { return Err(error); }
         relays?;
         self.check_cancel()?;
@@ -1084,6 +1287,7 @@ impl Shell {
     fn kill_owned_children(&mut self, children: &[i32]) {
         let mut owned_children = Vec::new();
         for &pid in children {
+            self.child_controls.remove(&pid);
             let observation = loop {
                 match rustix::process::waitid(rustix::process::WaitId::Pid(rustix::process::Pid::from_raw(pid).unwrap()), rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT | rustix::process::WaitIdOptions::NOHANG) {
                     Err(rustix::io::Errno::INTR) => continue,
@@ -1124,12 +1328,86 @@ impl Shell {
     ///   inherited non-shell-name entries, exported variables, and prefix
     ///   assignments
     pub fn set_external_handler(&mut self, handler: ExternalHandler) {
-        self.external_handler = Some(handler);
+        self.external_handler = Some(Registered::new(handler));
     }
 
-    /// Replace the callback that can refuse expanded command targets.
+    /// Register a process-bound external dispatcher for an owned set of raw names.
+    pub fn set_external_dispatcher(&mut self, names: Vec<ShellBytes>, dispatcher: ExternalDispatcher) {
+        self.external_dispatch_names = names;
+        self.external_dispatcher = Some(Registered::new(dispatcher));
+    }
+
+    /// Register an external handler audited for execution in inherited child processes.
+    ///
+    /// # Safety
+    /// Every reachable operation, including destructors and error paths, must be valid
+    /// after every possible fork. Inherited host locks, runtime services, environment
+    /// mutation, and dependencies on vanished threads are prohibited. A function pointer, immutable capture,
+    /// or Send bound alone does not establish this contract. Child mutations remain child-local.
+    pub unsafe fn set_external_handler_in_children(&mut self, handler: ExternalHandler) {
+        // SAFETY: the caller accepts the complete child-execution contract above.
+        self.external_handler = Some(unsafe { Registered::in_children(handler) });
+    }
+
+    /// Register a command policy audited for inherited child execution.
+    ///
+    /// # Safety
+    /// The complete operation and destructor contract of
+    /// [`Self::set_external_handler_in_children`] applies to this policy.
+    pub unsafe fn set_command_policy_in_children(&mut self, policy: CommandPolicy) {
+        // SAFETY: the caller accepts the complete child-execution contract above.
+        self.command_policy = Some(unsafe { Registered::in_children(policy) });
+    }
+
+    /// Register a redirection opener audited for inherited child execution.
+    ///
+    /// # Safety
+    /// The complete operation and destructor contract of
+    /// [`Self::set_external_handler_in_children`] applies to this opener.
+    pub unsafe fn set_redirect_open_handler_in_children(&mut self, handler: RedirectOpenHandler) {
+        // SAFETY: the caller accepts the complete child-execution contract above.
+        self.redirect_open_handler = Some(unsafe { Registered::in_children(handler) });
+    }
+
+    /// Replace the process-bound callback that validates raw expanded argv.
+    pub fn set_command_argv_policy(&mut self, policy: CommandArgvPolicy) {
+        self.command_argv_policy = Some(Registered::new(policy));
+    }
+
+    /// Register an argv policy audited for inherited child execution.
+    ///
+    /// # Safety
+    /// The complete operation and destructor contract of
+    /// [`Self::set_external_handler_in_children`] applies to this policy.
+    pub unsafe fn set_command_argv_policy_in_children(&mut self, policy: CommandArgvPolicy) {
+        // SAFETY: the caller accepts the complete child-execution contract above.
+        self.command_argv_policy = Some(unsafe { Registered::in_children(policy) });
+    }
+
+    /// Register a named external dispatcher audited for inherited child execution.
+    ///
+    /// # Safety
+    /// The complete operation and destructor contract of
+    /// [`Self::set_external_handler_in_children`] applies to this dispatcher.
+    pub unsafe fn set_external_dispatcher_in_children(&mut self, names: Vec<ShellBytes>, dispatcher: ExternalDispatcher) {
+        self.external_dispatch_names = names;
+        // SAFETY: the caller accepts the complete child-execution contract above.
+        self.external_dispatcher = Some(unsafe { Registered::in_children(dispatcher) });
+    }
+
+    /// Install owned validation for a command name without a callback.
+    pub fn set_command_rule(&mut self, name: ShellBytes, rule: CommandRule) {
+        self.command_rules.insert(name.as_bytes().to_vec(), rule);
+    }
+
+    /// Permit only the listed epsh builtins. External paths remain ordinary commands.
+    pub fn set_builtin_allowlist(&mut self, names: Vec<ShellBytes>) {
+        self.builtin_allowlist = Some(names);
+    }
+
+    /// Replace the process-bound callback that can refuse expanded targets.
     pub fn set_command_policy(&mut self, policy: CommandPolicy) {
-        self.command_policy = Some(policy);
+        self.command_policy = Some(Registered::new(policy));
     }
 
     /// Require an expanded command name to run in the original shell process.
@@ -1155,11 +1433,11 @@ impl Shell {
     /// Install a provider that owns the open of writable redirections
     /// (`>`, `>|`, `>>`, `<>`). See [`RedirectOpenHandler`].
     pub fn set_redirect_open_handler(&mut self, handler: RedirectOpenHandler) {
-        self.redirect_open_handler = Some(handler);
+        self.redirect_open_handler = Some(Registered::new(handler));
     }
 
-    pub(crate) fn has_external_handler(&self) -> bool {
-        self.external_handler.is_some()
+    pub(crate) fn has_external_handler(&self, target: &str) -> bool {
+        self.external_handler.is_some() || self.external_dispatch_names.iter().any(|name| name == &ShellBytes::from_str_lossless(target))
     }
 
     /// Set the shell's working directory.
@@ -1224,6 +1502,19 @@ impl Shell {
     /// This is the library-facing entry point — parse once with `Parser`,
     /// then execute via `run_program`.
     pub fn run_program(&mut self, program: &crate::ast::Program) -> ExitStatus {
+        match self.run_program_outcome(program) {
+            ProgramOutcome::Completed(status) => status,
+            ProgramOutcome::Stopped(job) => {
+                drop(job);
+                self.err_msg("epsh: numeric execution cannot retain a stopped job; terminated it");
+                self.exit_status
+            }
+        }
+    }
+
+    /// Execute a program, transferring an owned foreground job when execution stops.
+    /// The remainder of a stopped command list is discarded.
+    pub fn run_program_outcome(&mut self, program: &crate::ast::Program) -> ProgramOutcome {
         for cmd in &program.commands {
             match self.eval_command(cmd) {
                 Ok(status) => {
@@ -1232,29 +1523,40 @@ impl Shell {
                 Err(ShellError::Exit(n)) => {
                     self.exit_status = n;
                     self.run_exit_trap();
-                    return self.exit_status;
+                    return ProgramOutcome::Completed(self.exit_status);
                 }
                 Err(ShellError::Cancelled) | Err(ShellError::TimedOut) => {
                     self.exit_status = ExitStatus::from_signal(2);
                     self.kill_children();
-                    return self.exit_status;
+                    return ProgramOutcome::Completed(self.exit_status);
                 }
                 Err(ShellError::Stopped { .. }) => {
                     self.exit_status = ExitStatus::from(148);
-                    return self.exit_status;
+                    if let Some(job) = self.pending_job.take() { return ProgramOutcome::Stopped(job); }
+                    return ProgramOutcome::Completed(self.exit_status);
                 }
                 Err(e) => {
                     self.err_msg(&format!("epsh: {e}"));
                     self.exit_status = ExitStatus::MISUSE;
                     self.run_exit_trap();
-                    return self.exit_status;
+                    return ProgramOutcome::Completed(self.exit_status);
                 }
             }
             self.run_pending_traps();
         }
 
         self.run_exit_trap();
-        self.exit_status
+        ProgramOutcome::Completed(self.exit_status)
+    }
+
+    fn eval_trap_program(&mut self, program: &Program) {
+        for command in &program.commands {
+            if let Err(error @ (ShellError::CallbackProcess { .. } | ShellError::CommandRefused { .. })) = self.eval_command(command) {
+                self.report_child_refusal(&error);
+                self.err_msg(&format!("epsh: {error}"));
+                break;
+            }
+        }
     }
 
     fn run_pending_traps(&mut self) {
@@ -1266,9 +1568,7 @@ impl Shell {
                 let action = action.clone();
                 let mut parser = Parser::from_shell_string(&action);
                 if let Ok(program) = parser.parse() {
-                    for cmd in &program.commands {
-                        let _ = self.eval_command(cmd);
-                    }
+                    self.eval_trap_program(&program);
                 }
             }
         }
@@ -1279,9 +1579,7 @@ impl Shell {
             let status = self.exit_status;
             let mut parser = Parser::from_shell_string(&action);
             if let Ok(program) = parser.parse() {
-                for cmd in &program.commands {
-                    let _ = self.eval_command(cmd);
-                }
+                self.eval_trap_program(&program);
             }
             self.exit_status = status;
         }
@@ -1385,6 +1683,7 @@ impl Shell {
                 let pipeline_result = self.eval_pipeline(commands);
                 self.placement_context = previous_context;
                 self.tested = saved;
+                if *bang && let Some(job) = self.pending_job.as_mut() { job.invert(); }
                 let status = pipeline_result?;
                 Ok(if *bang { status.inverted() } else { status })
             }
@@ -1598,9 +1897,10 @@ impl Shell {
             Command::Not(cmd) => {
                 let saved = self.tested;
                 self.tested = true;
-                let status = self.eval_command(cmd)?;
+                let result = self.eval_command(cmd);
+                if let Some(job) = self.pending_job.as_mut() { job.invert(); }
                 self.tested = saved;
-                Ok(status.inverted())
+                Ok(result?.inverted())
             }
 
             Command::Background { cmd, redirs } => {
@@ -1650,6 +1950,8 @@ impl Shell {
             return Ok(ExitStatus::MISUSE);
         }
         self.check_command_policy_for_dispatch(&expanded_args, span)?;
+        self.preflight_external(&expanded_args)?;
+        self.preflight_redirects(redirs)?;
 
         if self.opts.xtrace {
             let mut trace = self.xtrace_prefix();
@@ -1693,7 +1995,7 @@ impl Shell {
                 if let Some(func_body) = self.functions.get(cmd_name).cloned() {
                     self.ev_exit = false;
                     self.eval_function(&func_body, &expanded_args, assigns, &[], span)
-                } else if self.external_handler.is_some() {
+                } else if self.has_external_handler(cmd_name) {
                     self.call_external_handler(&expanded_args, assigns)
                 } else {
                     self.eval_external(&expanded_args, assigns, &[], span)
@@ -1708,11 +2010,36 @@ impl Shell {
         }
     }
 
+    fn preflight_external(&self, args: &[String]) -> crate::error::Result<()> {
+        let mut target = args;
+        let mut bypass_functions = false;
+        while target.first().is_some_and(|name| name == "command") {
+            match crate::builtins::command_action(target) {
+                crate::builtins::CommandAction::Execute(nested) => { target = nested; bypass_functions = true; }
+                _ => return Ok(()),
+            }
+        }
+        let Some(name) = target.first() else { return Ok(()); };
+        if crate::builtins::is_builtin(name) || (!bypass_functions && self.functions.contains_key(name)) { return Ok(()); }
+        if self.external_dispatch_names.iter().any(|registered| registered == &ShellBytes::from_str_lossless(name)) {
+            if let Some(dispatcher) = &self.external_dispatcher { dispatcher.check(CallbackKind::External)?; }
+        } else if let Some(handler) = &self.external_handler { handler.check(CallbackKind::External)?; }
+        Ok(())
+    }
+
+    pub(crate) fn preflight_redirects(&self, redirs: &[Redir]) -> crate::error::Result<()> {
+        if redirs.iter().any(|redir| matches!(redir.kind, RedirKind::Output(_) | RedirKind::Clobber(_) | RedirKind::Append(_) | RedirKind::ReadWrite(_)))
+            && let Some(handler) = &self.redirect_open_handler
+        { handler.check(CallbackKind::RedirectOpen)?; }
+        Ok(())
+    }
+
     pub(crate) fn call_external_handler(
         &mut self,
         args: &[String],
         assigns: &[Assignment],
     ) -> crate::error::Result<ExitStatus> {
+        self.preflight_external(args)?;
         let mut assign_bytes: Vec<(String, ShellBytes)> = Vec::with_capacity(assigns.len());
         for assign in assigns {
             let value = self.expand_string(&assign.value)?;
@@ -1730,14 +2057,22 @@ impl Shell {
             })
             .collect();
         let args_bytes: Vec<ShellBytes> = args.iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
-        let handler = self
-            .external_handler
-            .as_mut()
-            .expect("call_external_handler requires an installed handler");
-        let previous = EXTERNAL_COMMAND_CWD.with(|cwd| cwd.borrow_mut().replace(self.cwd.clone()));
-        let result = handler(&args_bytes, &env_pairs);
-        EXTERNAL_COMMAND_CWD.with(|cwd| *cwd.borrow_mut() = previous);
-        result
+        let cwd_guard = ExternalCwdGuard::enter(self.cwd.clone());
+        let result = (|| {
+            if self.external_dispatch_names.iter().any(|name| name == &args_bytes[0]) {
+                self.external_dispatcher.as_mut().expect("registered dispatcher").get(CallbackKind::External)?(&args_bytes, &env_pairs)
+            } else {
+                self.external_handler.as_mut().expect("registered external handler").get(CallbackKind::External)?(&args_bytes, &env_pairs).map(ExternalDispatch::Handled)
+            }
+        })();
+        drop(cwd_guard);
+        match result? {
+            ExternalDispatch::Handled(status) => Ok(status),
+            ExternalDispatch::NotHandled => {
+                let env = env_pairs.into_iter().map(|(name, value)| (name.to_os_string(), value.to_os_string())).collect();
+                self.eval_external_prepared(args, &[], &[], Span::default(), Some(env))
+            }
+        }
     }
 
     fn eval_function(
@@ -1809,6 +2144,13 @@ impl Shell {
         redirs: &[Redir],
         _span: Span,
     ) -> crate::error::Result<ExitStatus> {
+        self.eval_external_prepared(args, assigns, redirs, _span, None)
+    }
+
+    fn eval_external_prepared(
+        &mut self, args: &[String], assigns: &[Assignment], redirs: &[Redir], _span: Span,
+        environment: Option<Vec<(OsString, OsString)>>,
+    ) -> crate::error::Result<ExitStatus> {
         self.check_cancel()?;
         let saved = self.setup_redirections(redirs)?;
         let args_bytes: Vec<ShellBytes> = args.iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
@@ -1818,8 +2160,13 @@ impl Shell {
             assign_bytes.push((assign.name.clone(), ShellBytes::from_str_lossless(&value)));
         }
 
+        let env = environment.unwrap_or_else(|| self.vars.env_for_command_os(&assign_bytes));
         if self.ev_exit {
-            let env = self.vars.env_for_command_os(&assign_bytes);
+            if self.opts.interactive {
+                for signal in [rustix::process::Signal::INT, rustix::process::Signal::QUIT, rustix::process::Signal::TSTP, rustix::process::Signal::TTOU, rustix::process::Signal::TTIN, rustix::process::Signal::PIPE] {
+                    crate::signal::reset_handler(signal)?;
+                }
+            }
             if let Err(error) = std::env::set_current_dir(&self.cwd) {
                 return self.finish_redirections(Err(error.into()), saved);
             }
@@ -1831,10 +2178,27 @@ impl Shell {
         let mut cmd = std::process::Command::new(args_bytes[0].to_os_string());
         cmd.args(args_bytes.iter().skip(1).map(ShellBytes::to_os_string));
         cmd.current_dir(&self.cwd);
+        if self.opts.interactive {
+            let handoff = !self.in_forked_child;
+            let terminal_fd = self.terminal_raw_fd();
+            // SAFETY: the child uses only signal disposition syscalls and a terminal process-group ioctl before exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if handoff {
+                        crate::signal::ignore_signal(rustix::process::Signal::TTOU)?;
+                        sys::set_foreground_group(terminal_fd, rustix::process::getpgrp().as_raw_pid())?;
+                    }
+                    for signal in [rustix::process::Signal::INT, rustix::process::Signal::QUIT, rustix::process::Signal::TSTP, rustix::process::Signal::TTOU, rustix::process::Signal::TTIN, rustix::process::Signal::PIPE] {
+                        crate::signal::reset_handler(signal)?;
+                    }
+                    Ok(())
+                });
+            }
+        }
         if !self.in_forked_child { cmd.process_group(0); }
 
         cmd.env_clear();
-        for (k, v) in self.vars.env_for_command_os(&assign_bytes) {
+        for (k, v) in env {
             cmd.env(k, v);
         }
 
@@ -1888,15 +2252,24 @@ impl Shell {
                 }
                 self.relay_streams(child_id, streams, &[child_id])?;
                 drop(child);
-                self.wait_owned_child(child_id)
+                self.wait_foreground(&[child_id], pgid)
             }
             Err(error) => self.handle_exec_error(&error, &args[0]),
         };
 
+        if self.opts.interactive && !self.in_forked_child {
+            let reclaimed = self.foreground_terminal(rustix::process::getpgrp().as_raw_pid());
+            match (&result, reclaimed) {
+                (Ok(_), Err(error)) => return self.finish_redirections(Err(error), saved),
+                (Err(_), Err(error)) => self.err_msg(&format!("epsh: cannot reclaim terminal: {error}")),
+                _ => {}
+            }
+        }
         self.finish_redirections(result, saved)
     }
 
     fn eval_pipeline(&mut self, commands: &[Command]) -> crate::error::Result<ExitStatus> {
+        self.ensure_terminal_descriptor()?;
         if commands.len() == 1 {
             return self.eval_command(&commands[0]);
         }
@@ -1906,6 +2279,7 @@ impl Shell {
             pipes.push(sys::pipe_owned()?);
         }
         let outputs = self.fork_outputs(true)?;
+        let (gate_reader, gate_writer) = sys::pipe_owned()?;
         let mut children = Vec::new();
         let mut pgid = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
         for (i, cmd) in commands.iter().enumerate() {
@@ -1936,12 +2310,23 @@ impl Shell {
                     sys::exit_child(ExitStatus::FAILURE);
                 }
                 drop(pipes);
+                drop(gate_writer);
+                let mut gate = [0u8];
+                loop {
+                    match rustix::io::read(&gate_reader, &mut gate) {
+                        Ok(0) => break,
+                        Err(rustix::io::Errno::INTR) => continue,
+                        _ => sys::exit_child(ExitStatus::FAILURE),
+                    }
+                }
+                drop(gate_reader);
                 self.ev_exit = true;
                 let status = match self.eval_command(cmd) {
                     Ok(status) | Err(ShellError::Exit(status)) => status,
                     Err(error) => {
+                        self.report_child_refusal(&error);
                         self.err_msg(&format!("epsh: {error}"));
-                        ExitStatus::FAILURE
+                        if matches!(error, ShellError::CallbackProcess { .. } | ShellError::CommandRefused { .. }) { ExitStatus::MISUSE } else { ExitStatus::FAILURE }
                     }
                 };
                 sys::exit_child(status);
@@ -1951,75 +2336,17 @@ impl Shell {
             children.push(pid);
         }
         drop(pipes);
+        drop(gate_reader);
+        if self.opts.interactive && !self.in_forked_child
+            && let Err(error) = self.foreground_terminal(pgid)
+        {
+            self.kill_owned_children(&children);
+            return Err(error);
+        }
+        drop(gate_writer);
         self.relay_fork_outputs(*children.last().unwrap(), outputs, &children)?;
 
-        if self.opts.interactive && pgid > 0 {
-            // SAFETY: descriptor 0 stays open for the life of the process.
-            let _ = rustix::termios::tcsetpgrp(
-                unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
-                rustix::process::Pid::from_raw(pgid).unwrap(),
-            );
-        }
-
-        let mut last_status = ExitStatus::SUCCESS;
-        let mut pipefail_status = ExitStatus::SUCCESS;
-        for (i, &pid) in children.iter().enumerate() {
-            match self.wait_child_pgid(pid, pgid) {
-                Ok(stage_status) => {
-                    if !stage_status.success() {
-                        pipefail_status = stage_status;
-                    }
-                    if i == children.len() - 1 {
-                        last_status = stage_status;
-                    }
-                }
-                Err(ShellError::Stopped { pid: _, pgid: _ }) if self.opts.interactive => {
-                    // SAFETY: descriptor 0 stays open for the life of the process.
-                    let _ = rustix::termios::tcsetpgrp(
-                        unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
-                        rustix::process::getpgrp(),
-                    );
-                    return Err(ShellError::Stopped {
-                        pid: children[children.len() - 1],
-                        pgid,
-                    });
-                }
-                Err(e @ (ShellError::Cancelled | ShellError::TimedOut)) => {
-                    if self.opts.interactive {
-                        let _ = rustix::termios::tcsetpgrp(
-                            unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
-                            rustix::process::getpgrp(),
-                        );
-                    }
-                    self.kill_children();
-                    return Err(e);
-                }
-                Err(e) => {
-                    if self.opts.interactive {
-                        let _ = rustix::termios::tcsetpgrp(
-                            unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
-                            rustix::process::getpgrp(),
-                        );
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        if self.opts.interactive && pgid > 0 {
-            // SAFETY: descriptor 0 stays open for the life of the process.
-            let _ = rustix::termios::tcsetpgrp(
-                unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
-                rustix::process::getpgrp(),
-            );
-        }
-
-        let status = if self.opts.pipefail && !pipefail_status.success() {
-            pipefail_status
-        } else {
-            last_status
-        };
-        Ok(status)
+        self.wait_foreground(&children, pgid)
     }
 
     fn eval_in_subshell(
@@ -2039,6 +2366,7 @@ impl Shell {
             let _saved = match self.setup_redirections(redirs) {
                 Ok(saved) => saved,
                 Err(error) => {
+                    self.report_child_refusal(&error);
                     self.err_msg(&format!("epsh: {error}"));
                     sys::exit_child(ExitStatus::FAILURE);
                 }
@@ -2046,8 +2374,9 @@ impl Shell {
             let status = match self.eval_command(body) {
                 Ok(status) | Err(ShellError::Exit(status)) => status,
                 Err(error) => {
+                    self.report_child_refusal(&error);
                     self.err_msg(&format!("epsh: {error}"));
-                    ExitStatus::FAILURE
+                    if matches!(error, ShellError::CallbackProcess { .. } | ShellError::CommandRefused { .. }) { ExitStatus::MISUSE } else { ExitStatus::FAILURE }
                 }
             };
             self.run_exit_trap();
@@ -2076,6 +2405,7 @@ impl Shell {
             let _saved = match self.setup_redirections(redirs) {
                 Ok(saved) => saved,
                 Err(error) => {
+                    self.report_child_refusal(&error);
                     self.err_msg(&format!("epsh: {error}"));
                     sys::exit_child(ExitStatus::FAILURE);
                 }
@@ -2083,8 +2413,9 @@ impl Shell {
             let status = match self.eval_command(cmd) {
                 Ok(status) | Err(ShellError::Exit(status)) => status,
                 Err(error) => {
+                    self.report_child_refusal(&error);
                     self.err_msg(&format!("epsh: {error}"));
-                    ExitStatus::FAILURE
+                    if matches!(error, ShellError::CallbackProcess { .. } | ShellError::CommandRefused { .. }) { ExitStatus::MISUSE } else { ExitStatus::FAILURE }
                 }
             };
             sys::exit_child(status);
@@ -2116,6 +2447,7 @@ impl Shell {
             let status = match self.eval_in_command_substitution(cmd) {
                 Ok(status) | Err(ShellError::Exit(status)) => status,
                 Err(error) => {
+                    self.report_child_refusal(&error);
                     self.err_msg(&format!("epsh: {error}"));
                     ExitStatus::MISUSE
                 }
@@ -2173,6 +2505,30 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_trap_callback_refusal_reaches_the_parent_without_changing_trap_status() {
+        let mut shell = Shell::new();
+        shell.set_external_handler(Box::new(|_, _| Ok(ExitStatus::SUCCESS)));
+        shell.traps.insert("USR1".to_owned(), "/bin/true".to_owned());
+        shell.exit_status = ExitStatus::from(7);
+        let pid = shell.fork_evaluator().unwrap();
+        assert!(pid >= 0);
+        if pid == 0 {
+            shell.enter_forked_child(&[], 0).unwrap();
+            crate::signal::install_handler(rustix::process::Signal::USR1).unwrap();
+            rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::USR1).unwrap();
+            shell.run_pending_traps();
+            sys::exit_child(shell.exit_status);
+        }
+        shell.track_child(pid, pid);
+        let status = rustix::process::waitid(
+            rustix::process::WaitId::Pid(rustix::process::Pid::from_raw(pid).unwrap()),
+            rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+        ).unwrap().unwrap();
+        assert_eq!(status.exit_status(), Some(7));
+        assert!(matches!(shell.wait_owned_child(pid), Err(ShellError::CallbackProcess { kind: CallbackKind::External })));
+    }
 
     #[test]
     fn run_echo() {

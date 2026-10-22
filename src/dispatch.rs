@@ -20,10 +20,10 @@ pub enum Rejection {
     Background,
     Compound(&'static str),
     FunctionDefinition,
-    Source(String),
+    UnsupportedBuiltin(String),
+    Arguments(String),
     ParameterOperator,
     ShellBuiltinOutsideLine(&'static str),
-    ExpandedShellBuiltin(&'static str),
 }
 
 impl fmt::Display for Rejection {
@@ -39,7 +39,8 @@ impl fmt::Display for Rejection {
             Rejection::FunctionDefinition => {
                 write!(f, "function definitions are not supported")
             }
-            Rejection::Source(name) => write!(f, "`{name}` is not supported"),
+            Rejection::UnsupportedBuiltin(name) => write!(f, "`{name}` is not supported"),
+            Rejection::Arguments(diagnostic) => write!(f, "{diagnostic}"),
             Rejection::ParameterOperator => write!(
                 f,
                 "`${{...}}` parameter operators are not supported; use `$NAME`"
@@ -48,34 +49,16 @@ impl fmt::Display for Rejection {
                 f,
                 "{name} changes shell state or needs the ish process, so it must be the only command on its line"
             ),
-            Rejection::ExpandedShellBuiltin(name) => write!(
-                f,
-                "{name} changes shell state or needs the ish process, so it requires a statically named whole-line command"
-            ),
         }
     }
 }
 
-fn refused_command_name(
-    name: &str,
-    outside_line: fn(&'static str) -> Rejection,
-) -> Option<Rejection> {
-    if matches!(name, "eval" | "source" | ".") {
-        return Some(Rejection::Source(name.to_owned()));
+fn refused_command_name(name: &str) -> Option<Rejection> {
+    if let Some(spec) = builtin::lookup(name).filter(|spec| spec.exec == Exec::InShell) {
+        return Some(Rejection::ShellBuiltinOutsideLine(spec.name));
     }
-    builtin::lookup(name)
-        .filter(|spec| spec.exec == Exec::InShell)
-        .map(|spec| outside_line(spec.name))
-}
-
-pub fn check_expanded_command(target: &ShellBytes) -> Result<(), Rejection> {
-    let Some(name) = target.as_utf8_str() else {
-        return Ok(());
-    };
-    match refused_command_name(name, Rejection::ExpandedShellBuiltin) {
-        Some(rejection) => Err(rejection),
-        None => Ok(()),
-    }
+    (epsh::builtins::is_builtin(name) && !builtin::epsh_builtin_names().any(|allowed| allowed == name))
+        .then(|| Rejection::UnsupportedBuiltin(name.to_owned()))
 }
 
 pub fn plan(line: &str) -> Result<Plan, Rejection> {
@@ -120,12 +103,7 @@ fn check_command(command: &Command) -> Result<(), Rejection> {
             redirs,
             ..
         } => {
-            if let Some(name) = args.first().and_then(static_text)
-                && let Some(rejection) =
-                    refused_command_name(&name, Rejection::ShellBuiltinOutsideLine)
-            {
-                return Err(rejection);
-            }
+            check_static_arguments(args)?;
             for assign in assigns {
                 check_word(&assign.value)?;
             }
@@ -166,6 +144,24 @@ fn check_command(command: &Command) -> Result<(), Rejection> {
         Command::Until { .. } => Err(Rejection::Compound("until")),
         Command::For { .. } => Err(Rejection::Compound("for")),
         Command::Case { .. } => Err(Rejection::Compound("case")),
+    }
+}
+
+fn check_static_arguments(words: &[Word]) -> Result<(), Rejection> {
+    let prefix: Vec<_> = words.iter().map_while(static_text).collect();
+    let mut arguments = prefix.as_slice();
+    loop {
+        let Some(name) = arguments.first() else { return Ok(()); };
+        if let Some(rejection) = refused_command_name(name) { return Err(rejection); }
+        if let Some(rule) = builtin::epsh_argument_rule(name) {
+            let argv: Vec<_> = arguments.iter().map(|argument| ShellBytes::from_str_lossless(argument)).collect();
+            rule.validate_arguments(&argv).map_err(Rejection::Arguments)?;
+        }
+        if name != "command" { return Ok(()); }
+        match epsh::builtins::command_action(arguments) {
+            epsh::builtins::CommandAction::Execute(nested) => arguments = nested,
+            epsh::builtins::CommandAction::Empty | epsh::builtins::CommandAction::Describe { .. } => return Ok(()),
+        }
     }
 }
 
@@ -215,9 +211,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expanded_command_policy_allows_non_utf8_names() {
-        let command = ShellBytes::from_vec(vec![b'c', 0xff]);
-        assert_eq!(check_expanded_command(&command), Ok(()));
+    fn finite_policy_refuses_static_targets_and_set_options_before_the_line_runs() {
+        for line in [
+            "echo earlier; exec echo replaced >target",
+            "'trap' ignored TERM >target",
+            "echo ok | command -p command -- exec echo replaced >target",
+            "echo $(command command trap ignored TERM >target)",
+            "set -e >target", "set +e", "set -o pipefail", "set -o noexec",
+            "set -", "set --", "set 7 value", "set -e NAME value",
+            "command command set '-e' >target",
+        ] {
+            assert!(plan(line).is_err(), "unsupported command was planned: {line}");
+        }
+        for line in ["command -v exit", "command -v exec", "command -V trap", "set NAME -e +e", "set NAME", "set"] {
+            assert!(plan(line).is_ok(), "supported command was refused: {line}");
+        }
     }
 
     fn builtin_name(line: &str) -> Option<&'static str> {
@@ -271,13 +279,9 @@ mod tests {
 
     #[test]
     fn every_epsh_builtin_is_allowed_or_refused() {
-        const ALLOWED: &[&str] = &[
-            ":", "true", "false", "echo", "printf", "cd", "pwd", "return", "break", "continue",
-            "export", "readonly", "unset", "set", "shift", "test", "[", "read", "local", "exec",
-            "command", "wait", "trap", "kill", "umask", "getopts",
-        ];
+        const ALLOWED: &[&str] = &[":", "true", "false", "echo", "printf", "cd", "pwd", "export", "unset", "set", "test", "[", "command", "kill"];
         for name in epsh::builtins::BUILTIN_NAMES {
-            let refused = refused_command_name(name, Rejection::ShellBuiltinOutsideLine);
+            let refused = refused_command_name(name);
             assert_eq!(
                 refused.is_none(),
                 ALLOWED.contains(name),
@@ -343,10 +347,10 @@ mod tests {
         assert_eq!(rejection("(echo x)"), Rejection::Compound("subshell"));
         assert_eq!(rejection("{ echo x; }"), Rejection::Compound("brace group"));
         assert_eq!(rejection("f() { echo x; }; f"), Rejection::FunctionDefinition);
-        assert_eq!(rejection("source /dev/null"), Rejection::Source("source".into()));
-        assert_eq!(rejection("echo a; . ./x"), Rejection::Source(".".into()));
-        assert_eq!(rejection("eval echo x"), Rejection::Source("eval".into()));
-        assert_eq!(rejection("'eval' x"), Rejection::Source("eval".into()));
+        assert_eq!(rejection("source /dev/null"), Rejection::UnsupportedBuiltin("source".into()));
+        assert_eq!(rejection("echo a; . ./x"), Rejection::UnsupportedBuiltin(".".into()));
+        assert_eq!(rejection("eval echo x"), Rejection::UnsupportedBuiltin("eval".into()));
+        assert_eq!(rejection("'eval' x"), Rejection::UnsupportedBuiltin("eval".into()));
         assert_eq!(rejection("echo ${HOME:-x}"), Rejection::ParameterOperator);
         assert_eq!(rejection("echo \"${#HOME}\""), Rejection::ParameterOperator);
     }
@@ -354,7 +358,7 @@ mod tests {
     #[test]
     fn refusals_inside_command_substitution_are_found() {
         assert_eq!(rejection("echo $(sleep 1 &)"), Rejection::Background);
-        assert_eq!(rejection("echo `eval x`"), Rejection::Source("eval".into()));
+        assert_eq!(rejection("echo `eval x`"), Rejection::UnsupportedBuiltin("eval".into()));
     }
 
     #[test]

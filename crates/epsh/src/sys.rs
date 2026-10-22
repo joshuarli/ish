@@ -8,6 +8,11 @@ pub use libc::{execve, fork};
 
 use rustix::fs::Mode;
 
+pub fn set_foreground_group(terminal_fd: RawFd, pgid: i32) -> std::io::Result<()> {
+    // SAFETY: tcsetpgrp accepts a raw descriptor, including a standard input explicitly closed by shell redirection.
+    if unsafe { libc::tcsetpgrp(terminal_fd, pgid) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
 pub fn pipe_owned() -> std::io::Result<(OwnedFd, OwnedFd)> {
     #[cfg(target_vendor = "apple")]
     let (read, write) = {
@@ -23,9 +28,10 @@ pub fn pipe_owned() -> std::io::Result<(OwnedFd, OwnedFd)> {
     Ok((read, write))
 }
 
-pub fn heredoc_file() -> std::io::Result<std::fs::File> {
+pub fn heredoc_file(temporary_directory: &std::path::Path) -> std::io::Result<std::fs::File> {
     #[cfg(target_os = "linux")]
     {
+        let _ = temporary_directory;
         rustix::fs::memfd_create("epsh-heredoc", rustix::fs::MemfdFlags::CLOEXEC)
             .map(std::fs::File::from).map_err(Into::into)
     }
@@ -34,7 +40,7 @@ pub fn heredoc_file() -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
-        let directory = std::env::temp_dir();
+        let directory = temporary_directory;
         for _ in 0..128 {
             let path = directory.join(format!("epsh-heredoc-{}-{}", std::process::id(), NEXT_FILE.fetch_add(1, Ordering::Relaxed)));
             match std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path) {

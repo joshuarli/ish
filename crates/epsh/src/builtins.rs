@@ -8,13 +8,15 @@ use crate::test_cmd::test_eval;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-pub(crate) enum CommandAction<'a> {
+/// Parsed execution or query behavior of the command builtin.
+pub enum CommandAction<'a> {
     Empty,
     Describe { verbose: bool, names: &'a [String] },
     Execute(&'a [String]),
 }
 
-pub(crate) fn command_action(args: &[String]) -> CommandAction<'_> {
+/// Parse lossless shell strings using the same option rules as command dispatch.
+pub fn command_action(args: &[String]) -> CommandAction<'_> {
     let mut mode = None;
     let mut index = 1;
     while index < args.len() {
@@ -659,6 +661,11 @@ impl Shell {
             CommandAction::Describe { verbose, names } => {
                 let mut status = ExitStatus::SUCCESS;
                 for name in names {
+                    if !self.command_lookup_available(name) {
+                        if verbose { self.err_msg(&format!("{name}: not found")); }
+                        status = ExitStatus::FAILURE;
+                        continue;
+                    }
                     if verbose {
                         if self.functions.contains_key(name.as_str()) {
                             self.write_out(&format!("{name} is a function\n"));
@@ -693,7 +700,7 @@ impl Shell {
                 self.check_command_policy_for_dispatch(new_args, span)?;
                 if let Some(status) = self.try_builtin(&new_args[0], new_args, &[], &[], span)? {
                     Ok(status)
-                } else if self.has_external_handler() {
+                } else if self.has_external_handler(&new_args[0]) {
                     self.call_external_handler(new_args, &[])
                 } else {
                     self.eval_external(new_args, &[], &[], span)
@@ -705,7 +712,10 @@ impl Shell {
     fn builtin_type(&self, args: &[String]) -> ExitStatus {
         let mut status = ExitStatus::SUCCESS;
         for name in &args[1..] {
-            if self.functions.contains_key(name.as_str()) {
+            if !self.command_lookup_available(name) {
+                self.err_msg(&format!("{name}: not found"));
+                status = ExitStatus::FAILURE;
+            } else if self.functions.contains_key(name.as_str()) {
                 self.write_out(&format!("{name} is a function\n"));
             } else if is_builtin(name)
                 || self.command_identity(name) == Some(CommandIdentity::Builtin)

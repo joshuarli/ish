@@ -136,6 +136,8 @@ impl Shell {
         &mut self,
         redirs: &[Redir],
     ) -> crate::error::Result<SavedRedirections> {
+        self.preflight_redirects(redirs)?;
+        self.ensure_terminal_descriptor()?;
         let saved_fd_min = redirs
             .iter()
             .map(|redir| redir.fd)
@@ -164,6 +166,13 @@ impl Shell {
         target_fd: RawFd,
         saved_fd_min: RawFd,
     ) -> crate::error::Result<()> {
+        self.private_descriptors.retain(|descriptor| descriptor.strong_count() > 0);
+        for descriptor in self.private_descriptors.iter().filter_map(std::sync::Weak::upgrade) {
+            let mut held = descriptor.lock().unwrap();
+            if held.as_ref().is_some_and(|current| current.as_raw_fd() == target_fd) {
+                *held = Some(sys::duplicate_fd_above(target_fd, saved_fd_min)?);
+            }
+        }
         for descriptor in self.redirection_fds.iter().flatten() {
             let mut held = descriptor.lock().unwrap();
             let Some(current) = held.as_ref() else { continue; };
@@ -206,15 +215,15 @@ impl Shell {
         path: &std::path::Path,
         mode: RedirectOpenMode,
         target_fd: RawFd,
-    ) -> std::io::Result<std::os::fd::OwnedFd> {
+    ) -> crate::error::Result<std::os::fd::OwnedFd> {
         if let Some(handler) = self.redirect_open_handler.as_mut() {
             let request = RedirectOpen {
                 path,
                 mode,
                 fd: target_fd,
             };
-            if let Some(result) = handler(&request) {
-                return result;
+            if let Some(result) = handler.get(crate::eval::CallbackKind::RedirectOpen)?(&request) {
+                return result.map_err(ShellError::Io);
             }
         }
         let mut options = std::fs::OpenOptions::new();
@@ -223,7 +232,7 @@ impl Shell {
             RedirectOpenMode::Append => options.append(true).create(true),
             RedirectOpenMode::ReadWrite => options.read(true).write(true).create(true),
         };
-        options.open(path).map(Into::into)
+        options.open(path).map(Into::into).map_err(ShellError::Io)
     }
 
     fn apply_redirections(
@@ -301,7 +310,7 @@ impl Shell {
                         .open_writable_redirection(&filepath, mode, target_fd)
                         .map_err(|e| {
                             self.err_msg(&format!("{filename}: {e}"));
-                            ShellError::Io(e)
+                            e
                         })?;
                     install_redirection(file, target_fd).map_err(ShellError::Io)?;
                     self.set_output_sink(target_fd, None);
@@ -312,6 +321,9 @@ impl Shell {
                         sys::close(target_fd)?;
                         self.set_output_sink(target_fd, None);
                     } else if let Ok(source_fd) = fd_str.parse::<i32>() {
+                        if self.private_descriptors.iter().filter_map(std::sync::Weak::upgrade).any(|descriptor| descriptor.lock().unwrap().as_ref().is_some_and(|descriptor| descriptor.as_raw_fd() == source_fd)) {
+                            return Err(ShellError::Io(std::io::Error::from_raw_os_error(libc::EBADF)));
+                        }
                         if self.redirection_fds.iter().any(|backup| {
                             backup.as_ref().is_some_and(|fd| fd.lock().unwrap().as_ref().is_some_and(|fd| fd.as_raw_fd() == source_fd))
                         }) {
@@ -340,7 +352,9 @@ impl Shell {
                             )
                         }
                     };
-                    let mut file = sys::heredoc_file()?;
+                    let temporary_directory = self.vars.get_bytes("TMPDIR").map(crate::shell_bytes::ShellBytes::to_path_buf)
+                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+                    let mut file = sys::heredoc_file(&self.cwd.join(temporary_directory))?;
                     file.write_all(expanded.as_bytes())?;
                     std::io::Seek::rewind(&mut file)?;
                     let read_end = OwnedFd::from(file);
