@@ -44,7 +44,7 @@ pub struct FileIdentity {
     pub inode: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum EntryType {
     Root,
     Directory,

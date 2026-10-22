@@ -1,0 +1,13 @@
+[package]
+name = "fdu-posix"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Anchored filesystem identity and journaled quarantine for fdu and ish"
+
+[dependencies]
+fdu-core = { path = "../fdu-core" }
+rustix = { version = "1.1.4", features = ["fs", "process", "std", "linux_latest"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

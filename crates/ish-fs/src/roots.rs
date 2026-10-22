@@ -4,22 +4,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
-use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{self, Mode, OFlags};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum EntryKind {
-    RegularFile,
-    Directory,
-    Symlink,
-    Other,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct Identity {
-    pub device: u64,
-    pub inode: u64,
-    pub kind: EntryKind,
-}
+pub(crate) use fdu_posix::identity::{EntryIdentity as Identity, EntryType as EntryKind};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Timestamp {
@@ -40,32 +27,20 @@ pub(crate) struct Observation {
     pub ctime: Timestamp,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct MountIdentity {
-    pub device: u64,
-    pub mount_id: Option<u64>,
-}
-
 impl Observation {
     #[allow(clippy::unnecessary_cast, reason = "stat field widths differ between Linux and Darwin")]
-    fn from_stat(stat: &fs::Stat) -> Self {
-        let kind = match FileType::from_raw_mode(stat.st_mode) {
-            FileType::RegularFile => EntryKind::RegularFile,
-            FileType::Directory => EntryKind::Directory,
-            FileType::Symlink => EntryKind::Symlink,
-            _ => EntryKind::Other,
-        };
-        Self {
-            identity: Identity { device: stat.st_dev as u64, inode: stat.st_ino as u64, kind },
+    fn from_stat(stat: &fs::Stat) -> io::Result<Self> {
+        Ok(Self {
+            identity: fdu_posix::identity::entry_identity(stat)?,
             size: stat.st_size.max(0) as u64,
             mode: stat.st_mode as u32,
             uid: stat.st_uid,
             gid: stat.st_gid,
-            links: stat.st_nlink as u64,
+            links: fdu_posix::identity::link_count(stat)?,
             atime: Timestamp { seconds: stat.st_atime as i64, nanoseconds: stat.st_atime_nsec as u32 },
             mtime: Timestamp { seconds: stat.st_mtime as i64, nanoseconds: stat.st_mtime_nsec as u32 },
             ctime: Timestamp { seconds: stat.st_ctime as i64, nanoseconds: stat.st_ctime_nsec as u32 },
-        }
+        })
     }
 }
 
@@ -163,10 +138,7 @@ impl Root {
         let directory = self.open_directory()?;
         let mount = mount_identity(directory.as_fd())?;
         let parent = mount_identity(self.parent.as_fd())?;
-        Ok(match (mount.mount_id, parent.mount_id) {
-            (Some(mount), Some(parent)) => mount != parent,
-            _ => mount.device != parent.device,
-        })
+        Ok(mount != parent)
     }
 
     pub fn same_entry(&self, other: &Self) -> io::Result<bool> {
@@ -224,20 +196,11 @@ fn directory_chain_contains(
 }
 
 pub(crate) fn observe(parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<Observation> {
-    fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map(|stat| Observation::from_stat(&stat)).map_err(Into::into)
+    Observation::from_stat(&fdu_posix::identity::stat_at(parent, name)?)
 }
 
 pub(crate) fn observe_fd(fd: BorrowedFd<'_>) -> io::Result<Observation> {
-    fs::fstat(fd).map(|stat| Observation::from_stat(&stat)).map_err(Into::into)
+    Observation::from_stat(&fdu_posix::identity::retry(|| fs::fstat(fd))?)
 }
 
-pub(crate) fn mount_identity(fd: BorrowedFd<'_>) -> io::Result<MountIdentity> {
-    let device = observe_fd(fd)?.identity.device;
-    let mount_id = match crate::platform::mount_id(fd) {
-        Ok(id) => Some(id),
-        Err(error) if error.kind() == io::ErrorKind::Unsupported
-            || matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL | libc::ENOTSUP)) => None,
-        Err(error) => return Err(error),
-    };
-    Ok(MountIdentity { device, mount_id })
-}
+pub(crate) use fdu_posix::identity::mount_identity;

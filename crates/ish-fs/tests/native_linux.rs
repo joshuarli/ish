@@ -530,7 +530,7 @@ fn native_linux_finalization_rejects_unrepresentable_symlink_flags() {
 fn native_linux_mount_identity_comes_from_statx() {
     let root = File::open("/").expect("open root filesystem");
     let mount_id = platform::mount_id(root.as_fd()).expect("read root mount ID");
-    assert_ne!(mount_id, 0);
+    assert_ne!(mount_id.mount_id, 0);
     let shared_memory = match File::open("/dev/shm") {
         Ok(file) => file,
         Err(error) => {
@@ -540,9 +540,9 @@ fn native_linux_mount_identity_comes_from_statx() {
     };
     let other_mount_id = platform::mount_id(shared_memory.as_fd()).expect("read /dev/shm mount ID");
     if mount_id == other_mount_id {
-        eprintln!("no second mount identity available; /dev/shm shares root mount ID {mount_id}");
+        eprintln!("no second mount identity available; /dev/shm shares root mount ID {mount_id:?}");
     } else {
-        eprintln!("native Linux mount IDs distinguish root {mount_id} and /dev/shm {other_mount_id}");
+        eprintln!("native Linux mount IDs distinguish root {mount_id:?} and /dev/shm {other_mount_id:?}");
     }
 }
 

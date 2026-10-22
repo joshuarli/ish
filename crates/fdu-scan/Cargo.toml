@@ -6,6 +6,7 @@ license = "MIT"
 description = "Read-only filesystem scanning for fdu"
 
 [dependencies]
+fdu-posix = { path = "../fdu-posix" }
 fdu-core = { path = "../fdu-core" }
 crossbeam-deque = "0.8"
 hashbrown = { workspace = true }

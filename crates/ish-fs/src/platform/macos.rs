@@ -434,19 +434,6 @@ pub(crate) fn apply_final_metadata(
     with_target_fd(target, |fd| set_flags(fd, metadata.flags))
 }
 
-pub(crate) fn mount_id(fd: BorrowedFd<'_>) -> io::Result<u64> {
-    let mut statfs = MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `fd` is live and `statfs` has the exact writable ABI layout.
-    let result = unsafe { libc::fstatfs(fd.as_raw_fd(), statfs.as_mut_ptr()) };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fstatfs initialized the structure on success.
-    let filesystem = unsafe { statfs.assume_init() };
-    // SAFETY: Darwin defines fsid_t as two i32 values in its public ABI.
-    let parts = unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(filesystem.f_fsid) };
-    Ok((u64::from(parts[0] as u32) << 32) | u64::from(parts[1] as u32))
-}
 
 pub(crate) fn native_data_copy(
     src: BorrowedFd<'_>,
@@ -1186,3 +1173,5 @@ fn cancelled() -> io::Error {
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
+pub(crate) use fdu_posix::identity::mount_identity as mount_id;

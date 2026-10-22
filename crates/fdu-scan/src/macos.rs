@@ -51,12 +51,7 @@ pub(super) fn scan_hints(_root: BorrowedFd<'_>) -> ScanHints {
     ScanHints
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct MountIdentity {
-    device: u64,
-    filesystem_id: [i32; 2],
-    mount_point: Vec<u8>,
-}
+pub(super) use fdu_posix::identity::MountIdentity;
 
 
 pub(super) enum StreamEntry<'a> {
@@ -205,39 +200,7 @@ impl<'buffer> IndexedDirectoryStream<'buffer> {
 }
 
 
-pub(super) fn mount_identity(fd: BorrowedFd<'_>) -> io::Result<MountIdentity> {
-    let device = fsutil::identity_of(fd)?.device;
-    let filesystem = retry(|| fs::fstatfs(fd))?;
-    let mount_point = filesystem
-        .f_mntonname
-        .iter()
-        .take_while(|byte| **byte != 0)
-        .map(|byte| *byte as u8)
-        .collect();
-
-    Ok(MountIdentity {
-        device,
-        filesystem_id: fsid_words(&filesystem),
-        mount_point,
-    })
-}
-
-fn same_mount_on_fd(
-    fd: BorrowedFd<'_>,
-    root_mount: &MountIdentity,
-    device: u64,
-) -> io::Result<bool> {
-    let filesystem = retry(|| fs::fstatfs(fd))?;
-    let mount_point = filesystem
-        .f_mntonname
-        .iter()
-        .take_while(|byte| **byte != 0)
-        .map(|byte| *byte as u8);
-    Ok(device == root_mount.device
-        && fsid_words(&filesystem) == root_mount.filesystem_id
-        && mount_point.eq(root_mount.mount_point.iter().copied()))
-}
-
+pub(super) use fdu_posix::identity::mount_identity;
 
 pub(super) fn describe_directory(
     fd: BorrowedFd<'_>,
@@ -248,13 +211,6 @@ pub(super) fn describe_directory(
         identity,
         modified_time,
         link_count,
-        same_mount: same_mount_on_fd(fd, root_mount, identity.device)?,
+        same_mount: mount_identity(fd)? == *root_mount,
     })
-}
-
-fn fsid_words(filesystem: &rustix::fs::StatFs) -> [i32; 2] {
-    
-    const _: () = assert!(std::mem::size_of::<[i32; 2]>() == 8);
-    // SAFETY: fsid_t is two i32 words, so reading eight bytes from it stays in bounds.
-    unsafe { std::mem::transmute_copy::<_, [i32; 2]>(&filesystem.f_fsid) }
 }

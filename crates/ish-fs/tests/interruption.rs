@@ -86,12 +86,12 @@ fn verify_complete_copy(root: &Path) {
     }
 }
 
-fn staged_copy(root: &Path, child_pid: u32) -> Option<(PathBuf, PathBuf, Vec<u8>)> {
-    let prefix = format!(".ish-fs-stage-{child_pid}-");
+fn staged_copy(root: &Path) -> Option<(PathBuf, PathBuf, Vec<u8>)> {
+    let prefix = ".fdu-quarantine-v2-";
     let stages = fs::read_dir(root).ok()?;
     for entry in stages.flatten() {
-        let stage = entry.path();
-        if !entry.file_name().to_string_lossy().starts_with(&prefix) { continue; }
+        if !entry.file_name().to_string_lossy().starts_with(prefix) { continue; }
+        let stage = entry.path().join("0.entry");
         let stage_entries = fs::read_dir(&stage).ok()?;
         for child in stage_entries.flatten() {
             let metadata = fs::symlink_metadata(child.path()).ok()?;
@@ -122,7 +122,7 @@ fn killing_an_inflight_copy_never_exposes_a_partial_final_file() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut readiness = None;
     while Instant::now() < deadline {
-        if let Some(staged) = staged_copy(&fixture.0, child.id()) {
+        if let Some(staged) = staged_copy(&fixture.0) {
             readiness = Some(staged);
             break;
         }

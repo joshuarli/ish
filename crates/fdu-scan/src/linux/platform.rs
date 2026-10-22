@@ -146,11 +146,7 @@ impl<'a> IndexedDirectoryStream<'a> {
 
 
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MountIdentity {
-    device: u64,
-    mount_id: u64,
-}
+pub(crate) use fdu_posix::identity::MountIdentity;
 
 fn describe(fd: BorrowedFd<'_>) -> io::Result<(FileIdentity, ModifiedTime, u64, u64)> {
     let mask = StatxFlags::INO | StatxFlags::NLINK | StatxFlags::MNT_ID | StatxFlags::MTIME;
@@ -169,11 +165,7 @@ fn describe(fd: BorrowedFd<'_>) -> io::Result<(FileIdentity, ModifiedTime, u64, 
     Ok((identity, modified_time, u64::from(stat.stx_nlink), stat.stx_mnt_id))
 }
 
-pub(crate) fn mount_identity(fd: BorrowedFd<'_>) -> io::Result<MountIdentity> {
-    let (identity, _, _, mount_id) = describe(fd)?;
-    Ok(MountIdentity { device: identity.device, mount_id })
-}
-
+pub(crate) use fdu_posix::identity::mount_identity;
 
 pub(crate) fn describe_directory(
     fd: BorrowedFd<'_>,

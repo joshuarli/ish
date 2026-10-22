@@ -243,6 +243,13 @@ fn child_descriptor_budget_probe() {
     let request = Request { options: Options { jobs: Some(Jobs::new(1).unwrap()), ..Options::default() }, ..request };
     assert_eq!(run(&request), 0, "one worker must fit the exact 16-descriptor budget");
     assert!(root.join("destination").is_dir());
+    let dot_request = Request {
+        context: Context { cwd: root.join("source"), home: None, scratch: root.clone() },
+        operands: Operands::Exact { source: ".".into(), destination: root.join("dot-destination") },
+        ..request
+    };
+    assert_eq!(run(&dot_request), 1, "dot source must retain its parent and refuse a 16-descriptor budget");
+    assert!(!root.join("dot-destination").exists());
 }
 
 #[cfg(target_os = "linux")]

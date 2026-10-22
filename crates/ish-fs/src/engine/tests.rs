@@ -41,6 +41,10 @@ impl Fixture {
 }
 impl Drop for Fixture { fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); } }
 
+fn staged_entry(root: &std::path::Path) -> PathBuf {
+    fs::read_dir(root).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.file_name().unwrap().as_encoded_bytes().starts_with(b".fdu-quarantine-v2-")).flat_map(|path| fs::read_dir(path).unwrap()).map(|entry| entry.unwrap().path()).find(|path| path.extension().is_some_and(|extension| extension == "entry")).unwrap()
+}
+
 fn force_exdev(boundary: &str) -> io::Result<()> { if boundary == "rename" { Err(io::Error::from_raw_os_error(libc::EXDEV)) } else { Ok(()) } }
 
 #[cfg(target_os = "linux")]
@@ -314,7 +318,7 @@ fn staging_name_substitution_retains_ambiguous_object() {
     let substituted = Arc::new(Mutex::new(None::<PathBuf>)); let captured = substituted.clone();
     let (outcome, events) = fixture.run(&request, move |point| {
         if point == "before_publish" {
-            let stage = fs::read_dir(&directory).unwrap().map(|entry| entry.unwrap().path()).find(|entry| entry.file_name().unwrap().as_encoded_bytes().starts_with(b".ish-fs-stage-")).unwrap();
+            let stage = staged_entry(&directory);
             fs::rename(&stage, directory.join("owned-retained")).unwrap(); fs::write(&stage, b"unowned sentinel").unwrap(); *captured.lock().unwrap() = Some(stage);
         }
         Ok(())
@@ -422,14 +426,18 @@ fn capture_restoration_conflict_retains_inspectable_record_and_both_source_names
     let original = fixture.0.join("source/file");
     let (outcome, events) = fixture.run(&fixture.request(), move |point| { force_exdev(point)?; if point == "after_capture" { fs::write(&original, b"new untransferred").unwrap(); return Err(io::Error::other("capture interruption")); } Ok(()) });
     assert_eq!(outcome.status(), 1); assert_eq!(fs::read(fixture.0.join("source/file")).unwrap(), b"new untransferred"); assert_eq!(fs::read(fixture.0.join("destination/file")).unwrap(), b"transferred");
-    let captures: Vec<_> = fs::read_dir(fixture.0.join("source")).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.file_name().unwrap().as_encoded_bytes().starts_with(b".ish-fs-retired-")).collect();
-    let intents: Vec<_> = fs::read_dir(fixture.0.join("source")).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.file_name().unwrap().as_encoded_bytes().starts_with(b".ish-fs-intent-")).collect();
-    assert_eq!(captures.len(), 1); assert_eq!(intents.len(), 1); assert_eq!(fs::read(&captures[0]).unwrap(), b"transferred");
-    let parent = rustix::fs::open(fixture.0.join("source"), anchored::DIRECTORY, rustix::fs::Mode::empty()).unwrap();
-    use rustix::fd::AsFd;
-    let name = intents[0].file_name().unwrap(); let identity = roots::observe(parent.as_fd(), name).unwrap().identity;
-    let record = records::validate_intent(parent.as_fd(), name, identity).unwrap(); assert_eq!(record.source, std::path::Path::new("file"));
-    assert!(events.iter().any(|event| matches!(event, Event::Diagnostic(diagnostic) if diagnostic.message.contains("source/.ish-fs-retired-") && diagnostic.message.contains("source/.ish-fs-intent-"))));
+    let sessions = fs::read_dir(&fixture.0).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.file_name().unwrap().as_encoded_bytes().starts_with(b".fdu-quarantine-v2-")).collect::<Vec<_>>();
+    assert_eq!(sessions.len(), 1);
+    let captures = fs::read_dir(&sessions[0]).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.extension().is_some_and(|extension| extension == "entry")).collect::<Vec<_>>();
+    let intents = fs::read_dir(&sessions[0]).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.extension().is_some_and(|extension| extension == "intent")).collect::<Vec<_>>();
+    assert_eq!(captures.len(), 1);
+    assert_eq!(intents.len(), 1);
+    assert_eq!(fs::read(&captures[0]).unwrap(), b"transferred");
+    assert!(events.iter().any(|event| matches!(event, Event::Diagnostic(diagnostic) if diagnostic.message.contains(".fdu-quarantine-v2-") && diagnostic.message.contains("restoration failed"))));
+    let parent = fs::File::open(&fixture.0).unwrap();
+    assert!(fdu_posix::quarantine::Session::check_recovery(parent.as_fd()).is_err());
+    assert_eq!(fs::read(fixture.0.join("source/file")).unwrap(), b"new untransferred");
+    assert_eq!(fs::read(&captures[0]).unwrap(), b"transferred");
 }
 
 #[test]
@@ -454,28 +462,18 @@ fn worker_panic_stops_discovery_joins_workers_and_cleans_owned_staging() {
 }
 
 #[test]
-fn record_version_length_identity_owner_validation() {
-    use rustix::fd::AsFd;
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = Fixture::new(); fs::write(fixture.0.join("source"), b"source").unwrap();
-    let parent = rustix::fs::open(&fixture.0, anchored::DIRECTORY, rustix::fs::Mode::empty()).unwrap();
-    let observed = roots::observe(parent.as_fd(), std::ffi::OsStr::new("source")).unwrap();
-    let record = Record { source: "source".into(), destination: "captured".into(), observed, published: observed.identity, output: None, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 };
-    let identity = records::write_intent(parent.as_fd(), std::ffi::OsStr::new("intent"), &record).unwrap();
-    assert_eq!(records::validate_intent(parent.as_fd(), std::ffi::OsStr::new("intent"), identity).unwrap(), record);
-    let valid = fs::read(fixture.0.join("intent")).unwrap();
-    for offset in [7, 8, 12, 29] {
-        let mut bytes = valid.clone(); bytes[offset] ^= 0xff; fs::write(fixture.0.join("intent"), bytes).unwrap();
-        assert!(records::validate_intent(parent.as_fd(), std::ffi::OsStr::new("intent"), identity).is_err(), "offset {offset}");
+fn legacy_capture_artifacts_block_new_destructive_work() {
+    for name in [".ish-fs-stage-1-0", ".ish-fs-retired-1-0", ".ish-fs-intent-1-0"] {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("source"), b"source").unwrap();
+        fs::write(fixture.0.join(name), b"unknown ownership").unwrap();
+        let (outcome, events) = fixture.run(&fixture.request(), |_| Ok(()));
+        assert_eq!(outcome.status(), 1);
+        assert_eq!(fs::read(fixture.0.join("source")).unwrap(), b"source");
+        assert_eq!(fs::read(fixture.0.join(name)).unwrap(), b"unknown ownership");
+        assert!(!fixture.0.join("destination").exists());
+        assert!(events.iter().any(|event| matches!(event, Event::Diagnostic(diagnostic) if diagnostic.message.contains(name))));
     }
-    fs::write(fixture.0.join("intent"), &valid).unwrap();
-    let mut different = identity; different.inode += 1;
-    assert!(records::validate_intent(parent.as_fd(), std::ffi::OsStr::new("intent"), different).is_err());
-    fs::set_permissions(fixture.0.join("intent"), fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(records::validate_intent(parent.as_fd(), std::ffi::OsStr::new("intent"), identity).is_err());
-    fs::set_permissions(fixture.0.join("intent"), fs::Permissions::from_mode(0o600)).unwrap();
-    fs::hard_link(fixture.0.join("intent"), fixture.0.join("alias")).unwrap();
-    assert!(records::validate_intent(parent.as_fd(), std::ffi::OsStr::new("intent"), identity).is_err());
 }
 
 #[test]
@@ -648,7 +646,9 @@ fn observed_mutation_immediately_before_removal_retains_source() {
         let (outcome, _) = fixture.run(&fixture.request(), move |point| {
             force_exdev(point)?;
             if point == "before_remove" {
-                let target = if mutate_capture { fs::read_dir(&directory).unwrap().map(|entry| entry.unwrap().path()).find(|path| path.file_name().unwrap().as_encoded_bytes().starts_with(b".ish-fs-retired-")).unwrap() } else { directory.join("destination") };
+                let target = if mutate_capture {
+                    fs::read_dir(&directory).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.file_name().unwrap().as_encoded_bytes().starts_with(b".fdu-quarantine-v2-")).flat_map(|path| fs::read_dir(path).unwrap()).map(|entry| entry.unwrap().path()).find(|path| path.extension().is_some_and(|extension| extension == "entry")).unwrap()
+                } else { directory.join("destination") };
                 fs::write(target, b"edited").unwrap();
             }
             Ok(())
@@ -798,3 +798,6 @@ fn public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks() {
 
 #[path = "repair_tests.rs"]
 mod repair_tests;
+
+#[path = "quarantine_tests.rs"]
+mod quarantine_tests;

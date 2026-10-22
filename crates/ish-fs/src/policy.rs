@@ -223,7 +223,7 @@ fn establish_destination(
     }
 }
 
-fn into_basename(source: &Path) -> io::Result<&OsStr> {
+pub(crate) fn into_basename(source: &Path) -> io::Result<&OsStr> {
     let bytes = source.as_os_str().as_bytes();
     if bytes.is_empty() || bytes.contains(&0) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "--into source has no unambiguous basename"));

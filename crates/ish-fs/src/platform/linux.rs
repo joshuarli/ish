@@ -6,7 +6,7 @@ use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-use rustix::fs::{self, AtFlags, IFlags, SeekFrom, StatxFlags, Timespec, Timestamps};
+use rustix::fs::{self, AtFlags, IFlags, SeekFrom, Timespec, Timestamps};
 use rustix::io::Errno;
 
 #[cfg(test)]
@@ -1044,19 +1044,6 @@ fn capture_flags(fd: BorrowedFd<'_>) -> io::Result<u32> {
     }
 }
 
-pub(crate) fn mount_id(fd: BorrowedFd<'_>) -> io::Result<u64> {
-    let metadata = loop {
-        match fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID) {
-            Err(Errno::INTR) => continue,
-            result => break result?,
-        }
-    };
-    if metadata.stx_mask & StatxFlags::MNT_ID.bits() != 0 {
-        Ok(metadata.stx_mnt_id)
-    } else {
-        Err(unsupported_metadata("kernel did not return a mount ID"))
-    }
-}
 
 fn proc_fd_child(parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<OsString> {
     let bytes = name.as_bytes();
@@ -1387,3 +1374,5 @@ mod staging_directory_tests {
         assert_eq!(observed.mode & 0o7777, 0o700);
     }
 }
+
+pub(crate) use fdu_posix::identity::mount_identity as mount_id;

@@ -228,6 +228,8 @@ pub fn execute(request: &Request, cancellation: &Cancellation, sink: &dyn EventS
         Ok(jobs) => jobs,
         Err(error) => return early_error(request, cancellation, sink, error),
     };
+    if !request.options.dry_run
+        && let Err(error) = check_recovery_roots(request, cwd.as_fd()) { return early_error(request, cancellation, sink, error); }
     let plan = match policy::preflight(request, cwd.as_fd()) {
         Ok(plan) => plan,
         Err(error) => return early_error(request, cancellation, sink, error),
@@ -341,6 +343,29 @@ pub fn execute(request: &Request, cancellation: &Cancellation, sink: &dyn EventS
     Outcome { progress: *invocation.progress.lock().unwrap(), completion, metrics: *invocation.metrics.lock().unwrap() }
 }
 
+fn check_recovery_roots(request: &Request, cwd: BorrowedFd<'_>) -> io::Result<()> {
+    let check = |path: &std::path::Path| -> io::Result<()> {
+        let root = Root::establish(cwd, path, Requirement::MayBeAbsent)?;
+        fdu_posix::quarantine::Session::check_recovery(root.parent.as_fd()).map_err(|error| io::Error::new(error.kind(), format!("recovery root {:?}: {error}", path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new(".")))))?;
+        if root.observed.is_some_and(|entry| entry.identity.kind == EntryKind::Directory) {
+            let directory = root.open_directory()?;
+            fdu_posix::quarantine::Session::check_recovery(directory.as_fd()).map_err(|error| io::Error::new(error.kind(), format!("recovery root {path:?}: {error}")))?;
+        }
+        Ok(())
+    };
+    match &request.operands {
+        crate::Operands::Exact { source, destination } => { check(source)?; check(destination) },
+        crate::Operands::Into { directory, first, rest } => {
+            policy::into_basename(first)?;
+            for source in rest { policy::into_basename(source)?; }
+            check(directory)?;
+            check(first)?;
+            for source in rest { check(source)?; }
+            Ok(())
+        },
+    }
+}
+
 fn early_error(request: &Request, cancellation: &Cancellation, sink: &dyn EventSink, error: io::Error) -> Outcome {
     let mut completion = if error.kind() == io::ErrorKind::InvalidInput { Completion::InvalidRequest } else { Completion::Failed };
     if sink.emit(Event::Diagnostic(Diagnostic { path: request.context.cwd.clone(), message: error.to_string() })).is_err() { cancellation.cancel_for_output(); }
@@ -397,7 +422,7 @@ fn execute_operand(invocation: &Invocation<'_>, operand: &PlannedOperand, into: 
     } else {
         let identity = effective.identity;
         let defer_flags = invocation.hardlink_members_remaining(identity) > 1 || invocation.has_pending_final_flags(identity)?;
-        let receipt = transfer::whole(invocation, &source, &destination, operand.action, defer_flags)?;
+        let receipt = transfer::whole(invocation, source, &destination, operand.action, defer_flags)?;
         match receipt {
             Some(_receipt) if invocation.has_pending_final_flags(identity)? => Err(Failure {
                 state: OperandState::DestinationPublishedSourceRetained,
@@ -421,34 +446,110 @@ fn replace_by_exchange(from_parent: BorrowedFd<'_>, from_name: &OsStr, to_parent
     Err(io::Error::other("destination changed during replacement; previous destination restored"))
 }
 
-fn retire_displaced(invocation: &Invocation<'_>, parent: BorrowedFd<'_>, name: &OsStr, displaced: Observation) -> io::Result<()> {
+fn remember_restoration(invocation: &Invocation<'_>, expected: Observation, parent_before: Observation, parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
+    let restored = roots::observe(parent, name)?;
+    let mut comparable = expected;
+    comparable.ctime = restored.ctime;
+    if !anchored::unchanged(comparable, restored) { return Err(io::Error::other("restored entry version changed")); }
+    invocation.remember_change(restored)?;
+    let actual_parent = roots::observe_fd(parent)?;
+    let mut expected_parent = parent_before;
+    expected_parent.size = actual_parent.size;
+    expected_parent.mtime = actual_parent.mtime;
+    expected_parent.ctime = actual_parent.ctime;
+    if !anchored::unchanged(expected_parent, actual_parent) { return Err(io::Error::other("restored parent metadata changed")); }
+    invocation.remember_change(actual_parent)
+}
+
+fn retire_displaced(invocation: &Invocation<'_>, parent: BorrowedFd<'_>, name: &OsStr, displaced: Observation, existing_session: Option<&fdu_posix::quarantine::Session>) -> io::Result<()> {
+    retire_displaced_with_publication(invocation, parent, name, displaced, existing_session, None)
+}
+
+fn retire_displaced_with_publication(invocation: &Invocation<'_>, parent: BorrowedFd<'_>, name: &OsStr, displaced: Observation, existing_session: Option<&fdu_posix::quarantine::Session>, publication: Option<(&Root, &Root)>) -> io::Result<()> {
+    use fdu_posix::quarantine::{Ancestor, Boundary, Removal, Retirement, Session};
+    let owned_session;
+    let (session, ancestors) = if let Some(session) = existing_session {
+        (session, vec![Ancestor { name: session.name().to_os_string(), identity: roots::observe_fd(parent)?.identity.file }])
+    } else {
+        owned_session = Session::start(parent)?;
+        (&owned_session, Vec::new())
+    };
     let linked = if displaced.links > 1 && matches!(displaced.identity.kind, EntryKind::RegularFile | EntryKind::Symlink) {
-        #[cfg(target_os = "linux")]
-        let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        #[cfg(target_os = "macos")]
-        let flags = if displaced.identity.kind == EntryKind::Symlink {
-            OFlags::from_bits_retain(libc::O_SYMLINK as u32) | OFlags::RDONLY | OFlags::CLOEXEC
-        } else {
-            OFlags::from_bits_retain(libc::O_EVTONLY as u32) | OFlags::CLOEXEC
-        };
-        let fd = fs::openat(parent, name, flags, Mode::empty())?;
+        let (parent, name) = publication.map_or((parent, name), |(_, destination)| (destination.parent.as_fd(), destination.name.as_os_str()));
+        let fd = fdu_posix::identity::open_no_follow(parent, name, displaced.identity.kind)?;
         if !anchored::unchanged(displaced, roots::observe_fd(fd.as_fd())?) { return Err(io::Error::other("displaced destination changed before unlink")); }
         Some(fd)
-    } else {
-        anchored::require_unchanged(parent, name, displaced)?;
-        None
+    } else { None };
+    let request = Retirement::new(ancestors, name.to_os_string(), displaced.identity)?;
+    let mut captured = None;
+    let displaced_version = std::cell::Cell::new(displaced);
+    let parent_before = roots::observe_fd(parent)?;
+    let mut authorize = |boundary, held_parent: BorrowedFd<'_>, held_name: &OsStr| {
+        let displaced = displaced_version.get();
+        if publication.is_some() {
+            match boundary {
+                Boundary::IntentPublished => invocation.fault("replacement_intent_published")?,
+                Boundary::Published => invocation.fault("replacement_published")?,
+                Boundary::Captured => invocation.fault("replacement_captured")?,
+                Boundary::Unlinked => invocation.fault("replacement_unlinked")?,
+                _ => {},
+            }
+        }
+        match boundary {
+            Boundary::BeforeCapture => anchored::require_unchanged(parent, name, displaced),
+            Boundary::Restored => remember_restoration(invocation, captured.unwrap_or(displaced), parent_before, held_parent, held_name),
+            Boundary::Captured => {
+                let actual = roots::observe(held_parent, held_name)?;
+                let mut comparable = displaced;
+                comparable.ctime = actual.ctime;
+                if !anchored::unchanged(comparable, actual) { return Err(io::Error::other("displaced destination changed during capture")); }
+                invocation.remember_change(actual)?;
+                captured = Some(actual);
+                Ok(())
+            },
+            Boundary::BeforeUnlink => {
+                invocation.checkpoint()?;
+                anchored::require_unchanged(held_parent, held_name, captured.ok_or_else(|| io::Error::other("displaced capture observation missing"))?)
+            },
+            Boundary::Unlinked => {
+                if let Some(linked) = &linked {
+                    let actual = roots::observe_fd(linked.as_fd())?;
+                    let mut expected = captured.ok_or_else(|| io::Error::other("displaced capture observation missing"))?;
+                    expected.links = expected.links.checked_sub(1).ok_or_else(|| io::Error::other("destination link count underflow"))?;
+                    expected.ctime = actual.ctime;
+                    if !anchored::unchanged(expected, actual) { return Err(io::Error::other("displaced hardlink changed during unlink")); }
+                    invocation.remember_change(actual)?;
+                }
+                Ok(())
+            },
+            _ => Ok(()),
+        }
     };
-    anchored::identity(parent, name, displaced.identity)?;
-    fs::unlinkat(parent, name, fs::AtFlags::empty())?;
-    if let Some(linked) = linked {
-        let actual = roots::observe_fd(linked.as_fd())?;
-        let mut expected = displaced;
-        expected.links -= 1;
-        expected.ctime = actual.ctime;
-        if !anchored::unchanged(expected, actual) { return Err(io::Error::other("displaced hardlink changed during unlink")); }
-        invocation.remember_change(actual)?;
-    }
-    Ok(())
+    let result = if let Some((source, destination)) = publication {
+        let publication = fdu_posix::quarantine::Publication::new(source.observed.ok_or_else(|| io::Error::other("replacement source absent"))?.identity, destination.parent_identity()?.file, destination.name.clone())?;
+        session.remove_after_publication(parent, request, publication, || {
+            invocation.checkpoint()?;
+            anchored::require_unchanged(source.parent.as_fd(), &source.name, invocation.effective(source.observed.unwrap())?)?;
+            anchored::require_unchanged(destination.parent.as_fd(), &destination.name, displaced)?;
+            let exchanged = replace_by_exchange(source.parent.as_fd(), &source.name, destination.parent.as_fd(), &destination.name, displaced)?;
+            displaced_version.set(exchanged);
+            if exchanged.links > 1 { invocation.remember_change(exchanged)?; }
+            let published = roots::observe(destination.parent.as_fd(), &destination.name)?;
+            let mut expected = invocation.effective(source.observed.unwrap())?;
+            expected.ctime = published.ctime;
+            if !anchored::unchanged(expected, published) { return Err(io::Error::other("replacement source changed during exchange")); }
+            if published.links > 1 { invocation.remember_change(published)?; }
+            Ok(())
+        }, &mut authorize)
+    } else { session.remove(parent, request, &mut authorize) };
+    let result = match result {
+        Ok(Removal::Removed) => Ok(()),
+        Ok(Removal::Changed | Removal::AlreadyAbsent) => Err(io::Error::other("displaced destination changed before retirement")),
+        Err(error) => Err(error.error),
+    };
+    if existing_session.is_none()
+        && let Err(cleanup) = session.finish() { return Err(match result { Err(error) => io::Error::new(error.kind(), format!("{error}; journal cleanup failed: {cleanup}")), Ok(()) => cleanup }); }
+    result
 }
 
 fn rename_object(invocation: &Invocation<'_>, source: &Root, destination: &Root, action: Action) -> Result<OperandState, Failure> {
@@ -460,8 +561,10 @@ fn rename_object(invocation: &Invocation<'_>, source: &Root, destination: &Root,
         Action::Replace => {
             let expected = destination.observed.ok_or_else(|| io::Error::other("replacement target is absent"))?;
             invocation.fault("before_replace")?;
-            let displaced = replace_by_exchange(source.parent.as_fd(), &source.name, destination.parent.as_fd(), &destination.name, expected)?;
-            retire_displaced(invocation, source.parent.as_fd(), &source.name, displaced).map_err(|error| Failure { state: OperandState::SourcePartiallyRetired, error })?;
+            retire_displaced_with_publication(invocation, source.parent.as_fd(), &source.name, expected, None, Some((source, destination))).map_err(|error| {
+                let published = roots::observe(destination.parent.as_fd(), &destination.name).is_ok_and(|actual| actual.identity == source.observed.unwrap().identity);
+                Failure { state: if published { OperandState::SourcePartiallyRetired } else { OperandState::FailedBeforePublication }, error }
+            })?;
             invocation.fault("after_replace").map_err(|error| Failure { state: OperandState::SourcePartiallyRetired, error })?;
         },
         Action::Transfer => crate::platform::rename_noreplace(source.parent.as_fd(), &source.name, destination.parent.as_fd(), &destination.name)?,
@@ -482,7 +585,7 @@ fn rename_object(invocation: &Invocation<'_>, source: &Root, destination: &Root,
     }
     if matches!(actual.identity.kind, EntryKind::RegularFile | EntryKind::Symlink) && actual.links > 1 {
         invocation.remember_change(actual).map_err(|error| Failure { state: OperandState::SourcePartiallyRetired, error })?;
-        invocation.remember_hardlink(&Record { source: destination.path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(), destination: PathBuf::from(&destination.name), observed: actual, published: actual.identity, output: Some(actual), parent: Some(roots::observe_fd(destination.parent.as_fd())?.identity), anchor: Some(roots::observe_fd(destination.parent.as_fd())?.identity), ancestry: Vec::new(), final_flags: 0 })?;
+        invocation.remember_hardlink(&Record { source: destination.path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(), destination: PathBuf::from(&destination.name), observed: actual, published: actual.identity, output: Some(actual), parent: Some(roots::observe_fd(destination.parent.as_fd())?.identity), anchor: Some(roots::observe_fd(destination.parent.as_fd())?.identity), ancestry: Vec::new(), final_flags: 0 })?;
     }
     invocation.update(|progress| { progress.discovered_files += 1; progress.completed_files += 1; });
     if invocation.request.options.durable {

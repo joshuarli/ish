@@ -110,4 +110,11 @@ ISH_FS_TEST_ALIAS_BIND="$bind_mount" \
 else
     failures=1
 fi
+if ISH_FS_TEST_ALIAS_ORIGIN="$bind_source" \
+ISH_FS_TEST_ALIAS_BIND="$bind_mount" \
+    cargo test --locked -p fdu-posix --test recovery recorded_mount_identity_rejects_recovery_through_a_bind_mount -- --ignored --exact --nocapture; then
+    :
+else
+    failures=1
+fi
 exit "$failures"

@@ -11,7 +11,7 @@ use rustix::fs::{self, AtFlags, Mode, OFlags};
 
 use super::anchored::{self, DIRECTORY, READ_FILE};
 use super::records::{Record, Records};
-use super::{Failure, Invocation, rename_object, unique_name};
+use super::{Failure, Invocation, rename_object};
 use crate::platform::{self, CopyMethod, MetadataTarget, Preservation};
 use crate::policy::{self, Action, Target};
 use crate::roots::{self, EntryKind, Identity, Observation, Root};
@@ -33,20 +33,28 @@ pub(super) struct DurableReceipt {
 }
 
 struct Stage<'a> {
-    parent: BorrowedFd<'a>,
+    session: fdu_posix::quarantine::Session,
+    registration: Option<OsString>,
     name: OsString,
     observed: Observation,
     entries: Mutex<Records>,
     directories: Mutex<Records>,
     directory: Option<OwnedFd>,
     published: bool,
+    journal_finished: bool,
     sink: &'a dyn EventSink,
     display: PathBuf,
 }
 
 impl Drop for Stage<'_> {
     fn drop(&mut self) {
-        if self.published { return; }
+        if self.journal_finished { return; }
+        if self.published {
+            if roots::observe(self.session.directory(), &self.name).is_ok() { return; }
+            let result = self.registration.take().map(|record| self.session.clear_stage(&record)).transpose().and_then(|_| self.session.finish());
+            if let Err(error) = result { let _ = self.sink.emit(Event::Diagnostic(Diagnostic { path: self.display.clone(), message: format!("published destination; staging journal cleanup failed: {error}") })); }
+            return;
+        }
         let mut failure = None;
         if let Some(directory) = &self.directory {
             if let Err(error) = fs::fchmod(directory, Mode::RUSR | Mode::WUSR | Mode::XUSR) { failure = Some(io::Error::from(error)); }
@@ -74,10 +82,16 @@ impl Drop for Stage<'_> {
                 if let Err(error) = cleanup { failure.get_or_insert(error); }
             }
         }
-        match cleanup_owned(self.parent, &self.name, self.observed.identity) {
+        match cleanup_owned(self.session.directory(), &self.name, self.observed.identity) {
             Ok(()) => {},
             Err(error) if error.kind() == io::ErrorKind::NotFound && self.observed.identity.inode == 0 => {},
             Err(error) => { failure.get_or_insert(error); },
+        }
+        if failure.is_none() {
+            if let Some(record) = self.registration.take()
+                && let Err(error) = self.session.clear_stage(&record) { failure = Some(error); }
+            if failure.is_none()
+                && let Err(error) = self.session.finish() { failure = Some(error); }
         }
         if let Some(error) = failure {
             let _ = self.sink.emit(Event::Diagnostic(Diagnostic { path: self.display.clone(), message: format!("staging cleanup incomplete; retained location {:?}, expected identity {:?}: {error}", self.display, self.observed.identity) }));
@@ -95,38 +109,42 @@ fn duplicate(parent: BorrowedFd<'_>) -> io::Result<OwnedFd> { fs::openat(parent,
 fn new_stage<'a>(invocation: &Invocation<'a>, destination: &'a Root, source: Observation) -> io::Result<Stage<'a>> {
     let entries = Mutex::new(Records::new(&invocation.request.context.scratch)?);
     let directories = Mutex::new(Records::new(&invocation.request.context.scratch)?);
-    let name = unique_name("stage");
+    let session = fdu_posix::quarantine::Session::start(destination.parent.as_fd())?;
+    let name = session.stage_name();
+    let display = destination.path.parent().unwrap_or_else(|| Path::new(".")).join(session.name()).join(&name);
+    let placeholder = Observation { identity: Identity { file: fdu_posix::identity::FileIdentity { device: 0, inode: 0 }, kind: source.identity.kind }, ..source };
+    let registration = Some(session.register_stage(&name)?);
+    let mut stage = Stage { session, registration, name, observed: placeholder, entries, directories, directory: None, published: false, journal_finished: false, sink: invocation.sink, display };
     if source.identity.kind == EntryKind::Directory {
-        fs::mkdirat(&destination.parent, &name, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
-        let observed = roots::observe(destination.parent.as_fd(), &name).map_err(|error| io::Error::new(error.kind(), format!("staging created but identity unavailable at {:?}: {error}", destination.path.parent().unwrap_or_else(|| Path::new(".")).join(&name))))?;
-        let mut stage = Stage { parent: destination.parent.as_fd(), name: name.clone(), observed, entries, directories, directory: None, published: false, sink: invocation.sink, display: destination.path.parent().unwrap_or_else(|| Path::new(".")).join(&name) };
-        let directory = platform::prepare_directory(stage.parent, &stage.name, observed.identity)?;
-        if roots::observe_fd(directory.as_fd())?.identity != observed.identity { return Err(io::Error::other("staging directory substituted")); }
+        fs::mkdirat(stage.session.directory(), &stage.name, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
+        stage.observed = roots::observe(stage.session.directory(), &stage.name)?;
+        let directory = platform::prepare_directory(stage.session.directory(), &stage.name, stage.observed.identity)?;
+        if roots::observe_fd(directory.as_fd())?.identity != stage.observed.identity { return Err(io::Error::other("staging directory substituted")); }
         stage.directory = Some(directory);
-        Ok(stage)
-    } else {
-        let placeholder = Observation { identity: Identity { device: 0, inode: 0, kind: source.identity.kind }, ..source };
-        Ok(Stage { parent: destination.parent.as_fd(), name: name.clone(), observed: placeholder, entries, directories, directory: None, published: false, sink: invocation.sink, display: destination.path.parent().unwrap_or_else(|| Path::new(".")).join(&name) })
     }
+    Ok(stage)
 }
 
-pub(super) fn whole(invocation: &Invocation<'_>, source: &Root, destination: &Root, action: Action, defer_final_flags: bool) -> Result<Option<DurableReceipt>, Failure> {
+pub(super) fn whole(invocation: &Invocation<'_>, source: Root, destination: &Root, action: Action, defer_final_flags: bool) -> Result<Option<DurableReceipt>, Failure> {
     let _span = super::Span::new(invocation, super::SpanKind::Transfer);
     let observed = source.observed.ok_or_else(|| io::Error::other("source disappeared"))?;
     if observed.identity.kind == EntryKind::Other { return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported source object for transfer").into()); }
     if invocation.request.operation == Operation::Move { invocation.require_descriptors(24)?; }
     let root_discovery_descriptors = if invocation.renamed_trees.lock().unwrap().is_some() { 8 } else { 0 };
-    invocation.require_descriptors((if observed.identity.kind == EntryKind::Directory { 10 + super::WORKER_DESCRIPTORS * invocation.jobs } else { super::WORKER_DESCRIPTORS + 2 }) + invocation.index_descriptors() + root_discovery_descriptors)?;
+    let retain_tree_parent = observed.identity.kind == EntryKind::Directory && matches!(source.name.as_bytes(), b"." | b"..");
+    invocation.require_descriptors((if observed.identity.kind == EntryKind::Directory { 10 + super::WORKER_DESCRIPTORS * invocation.jobs } else { super::WORKER_DESCRIPTORS + 2 }) + invocation.index_descriptors() + root_discovery_descriptors + usize::from(retain_tree_parent))?;
     invocation.update(|progress| progress.discovered_files += 1);
     let mut stage = new_stage(invocation, destination, observed)?;
     let source_directory = if observed.identity.kind == EntryKind::Directory { Some(source.open_directory()?) } else { None };
+    let source_parent_identity = source.parent_identity()?;
+    let source_parent = if source_directory.is_some() && !retain_tree_parent { drop(source.parent); None } else { Some(source.parent) };
     let transferred = if let Some(directory) = &source_directory {
-        copy_tree(invocation, source, destination, directory.as_fd(), &stage)
+        copy_tree(invocation, observed, &source.path, directory.as_fd(), &stage)
     } else {
-        let record = transfer_leaf(invocation, LeafSource { parent: source.parent.as_fd(), name: &source.name, observed, mount: None }, LeafDestination { parent: stage.parent, name: &stage.name, visible: &destination.path, placement: &Placement { root: stage.parent, base: destination.path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf(), relative: PathBuf::from(&stage.name), directories: None } }, &mut vec![0; TRANSFER_BUFFER_BYTES]);
+        let record = transfer_leaf(invocation, LeafSource { parent: source_parent.as_ref().unwrap().as_fd(), name: &source.name, observed, mount: None }, LeafDestination { parent: stage.session.directory(), name: &stage.name, visible: &destination.path, placement: &Placement { root: stage.session.directory(), base: stage.display.parent().unwrap().to_path_buf(), relative: PathBuf::from(&stage.name), directories: None } }, &mut vec![0; TRANSFER_BUFFER_BYTES]);
         match record {
             Ok(record) => {
-                stage.observed = roots::observe(stage.parent, &stage.name)?;
+                stage.observed = roots::observe(stage.session.directory(), &stage.name)?;
                 stage.entries.lock().unwrap().push(&Record { source: PathBuf::new(), destination: PathBuf::new(), ..record })?;
                 Ok(())
             },
@@ -134,38 +152,58 @@ pub(super) fn whole(invocation: &Invocation<'_>, source: &Root, destination: &Ro
         }
     };
     if let Err(error) = transferred { return Err(error.into()); }
+    let parent = match source_parent {
+        Some(parent) => parent,
+        None => fs::openat(source_directory.as_ref().unwrap(), "..", DIRECTORY, Mode::empty())?,
+    };
+    if roots::observe_fd(parent.as_fd())?.identity != source_parent_identity { return Err(io::Error::other("source parent identity changed during transfer").into()); }
+    let source = Root { parent, name: source.name, observed: source.observed, path: source.path };
     invocation.checkpoint()?;
     anchored::require_unchanged(source.parent.as_fd(), &source.name, invocation.effective(observed)?)?;
     invocation.fault("before_publish")?;
-    validate_sources(invocation, source, source_directory.as_ref(), &stage)?;
+    validate_sources(invocation, &source, source_directory.as_ref(), &stage)?;
     validate_final_access(&stage)?;
-    anchored::identity(stage.parent, &stage.name, stage.observed.identity)?;
+    anchored::identity(stage.session.directory(), &stage.name, stage.observed.identity)?;
     let root_output = stage.entries.lock().unwrap().find(Path::new(""))?.and_then(|record| record.output).ok_or_else(|| io::Error::other("successful staging output missing"))?;
-    anchored::require_unchanged(stage.parent, &stage.name, invocation.effective(root_output)?)?;
+    anchored::require_unchanged(stage.session.directory(), &stage.name, invocation.effective(root_output)?)?;
     let publication_failure = |error| Failure { state: OperandState::DestinationPublishedSourceRetained, error };
     match action {
-        Action::Transfer => platform::rename_noreplace(stage.parent, &stage.name, destination.parent.as_fd(), &destination.name)?,
+        Action::Transfer => platform::rename_noreplace(stage.session.directory(), &stage.name, destination.parent.as_fd(), &destination.name)?,
         Action::Replace => {
             let expected = destination.observed.ok_or_else(|| io::Error::other("replacement observation missing"))?;
             invocation.fault("before_replace")?;
-            let displaced = super::replace_by_exchange(stage.parent, &stage.name, destination.parent.as_fd(), &destination.name, expected)?;
+            let displaced = super::replace_by_exchange(stage.session.directory(), &stage.name, destination.parent.as_fd(), &destination.name, expected)?;
             stage.published = true;
-            super::retire_displaced(invocation, stage.parent, &stage.name, displaced).map_err(publication_failure)?;
+            super::retire_displaced(invocation, stage.session.directory(), &stage.name, displaced, Some(&stage.session)).map_err(publication_failure)?;
             invocation.fault("after_replace").map_err(publication_failure)?;
         },
         _ => return Err(io::Error::other("invalid whole-object publication action").into()),
     }
     stage.published = true;
+    if let Some(record) = stage.registration.take() { stage.session.clear_stage(&record).map_err(publication_failure)?; }
     anchored::identity(destination.parent.as_fd(), &destination.name, stage.observed.identity).map_err(publication_failure)?;
     let renamed_output = roots::observe(destination.parent.as_fd(), &destination.name).map_err(publication_failure)?;
     let mut expected_output = invocation.effective(root_output).map_err(publication_failure)?;
     expected_output.ctime = renamed_output.ctime;
     if !anchored::unchanged(expected_output, renamed_output) { return Err(publication_failure(io::Error::other("published object changed during rename"))); }
     invocation.remember_change(renamed_output).map_err(publication_failure)?;
+    if let Some(source_directory) = &source_directory {
+        let metadata = platform::capture_metadata(MetadataTarget::Fd(source_directory.as_fd())).map_err(publication_failure)?;
+        if !anchored::unchanged(invocation.effective(observed).map_err(publication_failure)?, roots::observe_fd(source_directory.as_fd()).map_err(publication_failure)?) { return Err(publication_failure(io::Error::other("source directory changed before published metadata preservation"))); }
+        let target = stage.directory.as_ref().ok_or_else(|| publication_failure(io::Error::other("staging directory descriptor missing")))?;
+        anchored::require_unchanged(destination.parent.as_fd(), &destination.name, renamed_output).map_err(publication_failure)?;
+        platform::apply_metadata(MetadataTarget::Fd(target.as_fd()), &observed, &metadata, preservation(invocation)).map_err(publication_failure)?;
+        if invocation.durable() { invocation.sync_directory(target.as_fd()).map_err(publication_failure)?; }
+        let output = roots::observe_fd(target.as_fd()).map_err(publication_failure)?;
+        invocation.remember_change(output).map_err(publication_failure)?;
+        stage.entries.lock().unwrap().set_output(Path::new(""), output).map_err(publication_failure)?;
+    }
     invocation.fault("after_publish").map_err(publication_failure)?;
     if !defer_final_flags { finalize_published(invocation, destination, &stage).map_err(publication_failure)?; }
     if invocation.durable() { invocation.sync_directory(destination.parent.as_fd()).map_err(publication_failure)?; }
     refresh_hardlinks(invocation, destination, &stage).map_err(publication_failure)?;
+    stage.session.finish().map_err(publication_failure)?;
+    stage.journal_finished = true;
     if defer_final_flags {
         let mut cursor = 0;
         while let Some(record) = stage.entries.lock().unwrap().next(&mut cursor).map_err(publication_failure)? {
@@ -261,7 +299,7 @@ fn validate_final_access(stage: &Stage<'_>) -> io::Result<()> {
     let mut cursor = 0;
     while let Some(record) = stage.entries.lock().unwrap().next(&mut cursor)? {
         if record.final_flags == 0 { continue; }
-        let (parent, name) = if record.source.as_os_str().is_empty() { (duplicate(stage.parent)?, stage.name.clone()) } else { anchored::parent(stage.directory.as_ref().unwrap().as_fd(), &record.source, &stage.directories, true)? };
+        let (parent, name) = if record.source.as_os_str().is_empty() { (duplicate(stage.session.directory())?, stage.name.clone()) } else { anchored::parent(stage.directory.as_ref().unwrap().as_fd(), &record.source, &stage.directories, true)? };
         anchored::identity(parent.as_fd(), &name, record.published)?;
         if record.published.kind != EntryKind::Symlink {
             let fd = fs::openat(&parent, &name, READ_FILE, Mode::empty()).map_err(|error| io::Error::new(io::ErrorKind::Unsupported, format!("deferred flags cannot be finalized through preserved access permissions: {error}")))?;
@@ -279,6 +317,11 @@ fn refresh_hardlinks(invocation: &Invocation<'_>, destination: &Root, stage: &St
         let (base, relative) = if record.source.as_os_str().is_empty() {
             (destination.path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf(), PathBuf::from(&destination.name))
         } else { (destination.path.clone(), record.source.clone()) };
+        if record.source.as_os_str().is_empty() {
+            let parent = roots::observe_fd(destination.parent.as_fd())?.identity;
+            record.parent = Some(parent);
+            record.anchor = Some(parent);
+        }
         record.source = base;
         record.destination = relative;
         record.output = existing.output.map(|output| invocation.effective(output)).transpose()?;
@@ -293,8 +336,7 @@ struct Work {
     observed: Observation,
 }
 
-fn copy_tree(invocation: &Invocation<'_>, source: &Root, destination: &Root, source_fd: BorrowedFd<'_>, stage: &Stage<'_>) -> io::Result<()> {
-    let observed = source.observed.unwrap();
+fn copy_tree(invocation: &Invocation<'_>, observed: Observation, source_path: &Path, source_fd: BorrowedFd<'_>, stage: &Stage<'_>) -> io::Result<()> {
     let root_record = Record { source: PathBuf::new(), destination: PathBuf::new(), observed, published: stage.observed.identity, output: None, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 };
     stage.entries.lock().unwrap().push(&root_record)?;
     stage.directories.lock().unwrap().push(&root_record)?;
@@ -308,6 +350,7 @@ fn copy_tree(invocation: &Invocation<'_>, source: &Root, destination: &Root, sou
         let mut workers = Vec::new();
         for _ in 0..invocation.jobs {
             let receiver = &receiver;
+            let source_mount = &source_mount;
             let failure = &failure;
             let finished = &finished;
             let worker = std::thread::Builder::new().name("ish-fs-transfer".into()).stack_size(super::THREAD_STACK_BYTES).spawn_scoped(scope, move || {
@@ -319,8 +362,8 @@ fn copy_tree(invocation: &Invocation<'_>, source: &Root, destination: &Root, sou
                     let result = (|| {
                         let (source_parent, source_name) = anchored::parent(source_fd, &work.path, &stage.directories, false)?;
                         let (target_parent, target_name) = anchored::parent(target_fd, &work.path, &stage.directories, true)?;
-                        let visible = destination.path.parent().unwrap_or_else(|| Path::new(".")).join(&stage.name).join(&work.path);
-                        let result = transfer_leaf(invocation, LeafSource { parent: source_parent.as_fd(), name: &source_name, observed: work.observed, mount: Some(source_mount) }, LeafDestination { parent: target_parent.as_fd(), name: &target_name, visible: &visible, placement: &Placement { root: target_fd, base: destination.path.parent().unwrap_or_else(|| Path::new(".")).join(&stage.name), relative: work.path.clone(), directories: Some(&stage.directories) } }, &mut buffer)?;
+                        let visible = stage.display.clone().join(&work.path);
+                        let result = transfer_leaf(invocation, LeafSource { parent: source_parent.as_fd(), name: &source_name, observed: work.observed, mount: Some(source_mount) }, LeafDestination { parent: target_parent.as_fd(), name: &target_name, visible: &visible, placement: &Placement { root: target_fd, base: stage.display.clone(), relative: work.path.clone(), directories: Some(&stage.directories) } }, &mut buffer)?;
                         stage.entries.lock().unwrap().push(&Record { source: work.path.clone(), destination: work.path, ..result })
                     })();
                     if let Err(error) = result {
@@ -336,7 +379,7 @@ fn copy_tree(invocation: &Invocation<'_>, source: &Root, destination: &Root, sou
                     invocation.stopped.store(true, Ordering::Release);
                     *failure.lock().unwrap() = Some(error);
                     drop(sender);
-                    for worker in workers { if worker.join().is_err() { invocation.emit(Event::Diagnostic(Diagnostic { path: source.path.clone(), message: "transfer thread panicked while joining failed initialization".into() })); } }
+                    for worker in workers { if worker.join().is_err() { invocation.emit(Event::Diagnostic(Diagnostic { path: source_path.to_path_buf(), message: "transfer thread panicked while joining failed initialization".into() })); } }
                     return;
                 },
             }
@@ -344,6 +387,7 @@ fn copy_tree(invocation: &Invocation<'_>, source: &Root, destination: &Root, sou
         let failure_ref = &failure;
         let finished_ref = &finished;
         let directories = &stage.directories;
+        let producer_mount = source_mount.clone();
         let producer = std::thread::Builder::new().name("ish-fs-discovery".into()).stack_size(super::THREAD_STACK_BYTES).spawn_scoped(scope, move || {
             let _finished = Finished { count: finished_ref, stopped: &invocation.stopped };
             let result = (|| {
@@ -352,7 +396,7 @@ fn copy_tree(invocation: &Invocation<'_>, source: &Root, destination: &Root, sou
                     invocation.checkpoint()?;
                     let next = directories.lock().unwrap().next(&mut cursor)?;
                     let Some(record) = next else { break; };
-                    let source_directory = anchored::open_directory(source_fd, &record.source, directories, false)?;
+                    let source_directory = anchored::open_checked_directory(source_fd, &record.source, directories, false)?;
                     if !anchored::unchanged(record.observed, roots::observe_fd(source_directory.as_fd())?) { return Err(io::Error::other("source directory changed before enumeration")); }
                     let target_directory = anchored::open_directory(target_fd, &record.source, directories, true)?;
                     for entry in fs::Dir::read_from(&source_directory)? {
@@ -368,7 +412,7 @@ fn copy_tree(invocation: &Invocation<'_>, source: &Root, destination: &Root, sou
                         if observed.identity.kind == EntryKind::Directory {
                             let child = fs::openat(&source_directory, name, DIRECTORY, Mode::empty())?;
                             if roots::observe_fd(child.as_fd())?.identity != observed.identity { return Err(io::Error::other("discovered directory substituted")); }
-                            if !invocation.request.options.cross_file_systems && platform::mount_id(child.as_fd())? != source_mount { return Err(io::Error::other("nested source mount requires --cross-file-systems")); }
+                            if !invocation.request.options.cross_file_systems && platform::mount_id(child.as_fd())? != producer_mount { return Err(io::Error::other("nested source mount requires --cross-file-systems")); }
                             drop(child);
                             fs::mkdirat(&target_directory, name, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
                             let published = roots::observe(target_directory.as_fd(), name)?.identity;
@@ -420,12 +464,12 @@ fn finalize_directories(invocation: &Invocation<'_>, source_fd: BorrowedFd<'_>, 
         let record = stage.directories.lock().unwrap().previous(&mut cursor)?;
         let Some(record) = record else { break; };
         invocation.checkpoint()?;
-        let source = anchored::open_directory(source_fd, &record.source, &stage.directories, false)?;
+        let source = anchored::open_checked_directory(source_fd, &record.source, &stage.directories, false)?;
         if !anchored::unchanged(record.observed, roots::observe_fd(source.as_fd())?) { return Err(io::Error::other("source directory changed before metadata preservation")); }
         let target = anchored::open_directory(target_fd, &record.source, &stage.directories, true)?;
         let metadata = platform::capture_metadata(MetadataTarget::Fd(source.as_fd()))?;
         if platform::requires_final_metadata(&metadata) { stage.entries.lock().unwrap().set_final_flags(&record.source, metadata.flags)?; }
-        platform::apply_metadata(MetadataTarget::Fd(target.as_fd()), &record.observed, &metadata, preservation(invocation))?;
+        if !record.source.as_os_str().is_empty() { platform::apply_metadata(MetadataTarget::Fd(target.as_fd()), &record.observed, &metadata, preservation(invocation))?; }
         let output = roots::observe_fd(target.as_fd())?;
         if invocation.durable() { invocation.sync_directory(target.as_fd())?; }
         if !anchored::unchanged(output, roots::observe_fd(target.as_fd())?) { return Err(io::Error::other("destination directory changed during synchronization")); }
@@ -439,7 +483,7 @@ fn preservation(invocation: &Invocation<'_>) -> Preservation {
     if invocation.request.operation == Operation::Move { Preservation::Move } else { Preservation::Copy }
 }
 
-struct LeafSource<'a> { parent: BorrowedFd<'a>, name: &'a OsStr, observed: Observation, mount: Option<u64> }
+struct LeafSource<'a> { parent: BorrowedFd<'a>, name: &'a OsStr, observed: Observation, mount: Option<&'a fdu_posix::identity::MountIdentity> }
 struct LeafDestination<'a> { parent: BorrowedFd<'a>, name: &'a OsStr, visible: &'a Path, placement: &'a Placement<'a> }
 
 fn transfer_leaf(invocation: &Invocation<'_>, source: LeafSource<'_>, target: LeafDestination<'_>, buffer: &mut [u8]) -> io::Result<Record> {
@@ -452,7 +496,7 @@ fn transfer_leaf(invocation: &Invocation<'_>, source: LeafSource<'_>, target: Le
     let source_file = if observed.identity.kind == EntryKind::RegularFile {
         let source = fs::openat(source_parent, source_name, READ_FILE, Mode::empty())?;
         if !anchored::unchanged(observed, roots::observe_fd(source.as_fd())?) { return Err(io::Error::other("source changed while opening")); }
-        if let Some(mount) = source_mount && !invocation.request.options.cross_file_systems && platform::mount_id(source.as_fd())? != mount { return Err(io::Error::other("nested source file mount requires --cross-file-systems")); }
+        if let Some(mount) = source_mount && !invocation.request.options.cross_file_systems && platform::mount_id(source.as_fd())? != *mount { return Err(io::Error::other("nested source file mount requires --cross-file-systems")); }
         Some(source)
     } else { None };
 
@@ -595,8 +639,10 @@ pub(super) fn merge(invocation: &Invocation<'_>, source: &Root, destination: &Ro
         loop {
             invocation.checkpoint()?;
             let Some(record) = pending.next(&mut cursor)? else { break; };
-            let source_parent = anchored::open_directory(source_directory.as_fd(), &record.source, &directories, false)?;
-            let destination_parent = anchored::open_directory(destination_directory.as_fd(), &record.source, &directories, true)?;
+            let source_parent = anchored::open_checked_directory(source_directory.as_fd(), &record.source, &directories, false)?;
+            let destination_parent = anchored::open_checked_directory(destination_directory.as_fd(), &record.source, &directories, true)?;
+            fdu_posix::quarantine::Session::check_recovery(source_parent.as_fd())?;
+            fdu_posix::quarantine::Session::check_recovery(destination_parent.as_fd())?;
             let expected = invocation.effective(record.observed)?;
             if !anchored::unchanged(expected, roots::observe_fd(source_parent.as_fd())?) { return Err(io::Error::other("merge source directory changed").into()); }
             let mut children = Records::new(&invocation.request.context.scratch)?;
@@ -671,13 +717,15 @@ pub(super) fn merge(invocation: &Invocation<'_>, source: &Root, destination: &Ro
                                 Err(failure) if failure.error.raw_os_error() == Some(libc::EXDEV) => {},
                                 Err(mut failure) => {
                                     if matches!(failure.state, OperandState::SourceRemovedSyncFailed | OperandState::SourcePartiallyRetired) { renamed = true; changed = true; }
+                                    if failure.state == OperandState::SourceRemovedSyncFailed { failure.state = OperandState::SourcePartiallyRetired; }
                                     failure.error = io::Error::new(failure.error.kind(), format!("source {:?}, destination {:?}: {}", child_source.path, child_destination.path, failure.error));
                                     return Err(failure);
                                 },
                             }
                         }
-                        let receipt = whole(invocation, &child_source, &child_destination, action, true).map_err(|mut failure| {
-                            failure.error = io::Error::new(failure.error.kind(), format!("source {:?}, destination {:?}: {}", child_source.path, child_destination.path, failure.error));
+                        let source_path = child_source.path.clone();
+                        let receipt = whole(invocation, child_source, &child_destination, action, true).map_err(|mut failure| {
+                            failure.error = io::Error::new(failure.error.kind(), format!("source {:?}, destination {:?}: {}", source_path, child_destination.path, failure.error));
                             failure
                         })?;
                         changed = true;
@@ -780,7 +828,7 @@ fn snapshot_destinations(invocation: &Invocation<'_>, destination: &Root, root: 
 fn validate_sources(invocation: &Invocation<'_>, source: &Root, root: Option<&OwnedFd>, stage: &Stage<'_>) -> io::Result<()> {
     let mut cursor = 0;
     while let Some(record) = stage.entries.lock().unwrap().next(&mut cursor)? {
-        let (parent, name) = if record.source.as_os_str().is_empty() { (duplicate(source.parent.as_fd())?, source.name.clone()) } else { anchored::parent(root.ok_or_else(|| io::Error::other("source directory missing"))?.as_fd(), &record.source, &stage.directories, false).map_err(|error| io::Error::new(error.kind(), format!("source validation traversal {:?}: {error}", record.source)))? };
+        let (parent, name) = if record.source.as_os_str().is_empty() { (duplicate(source.parent.as_fd())?, source.name.clone()) } else { anchored::checked_parent(root.ok_or_else(|| io::Error::other("source directory missing"))?.as_fd(), &record.source, &stage.directories, false).map_err(|error| io::Error::new(error.kind(), format!("source validation traversal {:?}: {error}", record.source)))? };
         anchored::require_unchanged(parent.as_fd(), &name, invocation.effective(record.observed)?)?;
     }
     Ok(())

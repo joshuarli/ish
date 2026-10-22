@@ -137,12 +137,7 @@ fn run_with_foreground(
     let worker = thread::spawn(move || {
         fdu_delete::execute(root_fd, plan, worker_cancelled, sender);
     });
-    let mut deleted = 0usize;
-    let mut already_absent = 0usize;
-    let mut changed = 0usize;
-    let mut failed = 0usize;
-    let mut not_attempted = 0usize;
-    let mut first_problem: Option<String> = None;
+    let mut report = DeletionReport::default();
     let mut receive_error = None;
     let mut finished = false;
     while !finished {
@@ -151,27 +146,9 @@ fn run_with_foreground(
         match received {
             Ok(DeleteEvent::Outcomes(outcomes)) => {
                 for outcome in outcomes {
-                    match outcome.kind {
-                        OutcomeKind::Deleted => deleted += 1,
-                        OutcomeKind::AlreadyAbsent => already_absent += 1,
-                        OutcomeKind::Changed => {
-                            changed += 1;
-                            first_problem.get_or_insert_with(|| {
-                                let detail = outcome.message.unwrap_or_else(|| "entry changed".to_owned());
-                                format!("{}: {detail}", display_name(&tree, outcome.node))
-                            });
-                        }
-                        OutcomeKind::Failed => {
-                            failed += 1;
-                            first_problem.get_or_insert_with(|| {
-                                let detail = outcome.message.unwrap_or_else(|| "entry could not be removed".to_owned());
-                                format!("{}: {detail}", display_name(&tree, outcome.node))
-                            });
-                        }
-                        OutcomeKind::Cancelled => not_attempted += 1,
-                    }
+                    report.record(&tree, outcome);
                 }
-                let completed = deleted + already_absent + changed + failed + not_attempted;
+                let completed = report.completed();
                 let line = deleting_progress(completed, total);
                 if let Err(error) = foreground.report_progress_line(&line) {
                     receive_error.get_or_insert(error);
@@ -196,28 +173,81 @@ fn run_with_foreground(
         .map_err(|_| io::Error::other("deletion worker terminated unexpectedly"));
     match (receive_error, worker_result) {
         (Some(receive_error), Err(worker_error)) => {
-            return Err(io::Error::other(format!("{receive_error}; {worker_error}")));
+            return Err(report.with_operation_error(io::Error::other(format!("{receive_error}; {worker_error}"))));
         }
-        (Some(error), Ok(())) | (None, Err(error)) => return Err(error),
+        (Some(error), Ok(())) | (None, Err(error)) => return Err(report.with_operation_error(error)),
         (None, Ok(())) => {}
     }
     foreground.clear_progress()?;
-    if changed == 0 && failed == 0 && not_attempted == 0 {
-        if deleted + already_absent != total {
-            return Err(io::Error::other(format!(
-                "deletion reported {} outcomes for {total} planned entries",
-                deleted + already_absent
-            )));
+    if !report.has_problems() {
+        if report.completed() != total {
+            return Err(io::Error::other(format!("deletion reported {} outcomes for {total} planned entries", report.completed())));
         }
         return Ok(());
     }
-    let mut summary = format!(
-        "Deleted {deleted} · {already_absent} already absent · {changed} changed · {failed} failed · {not_attempted} not attempted"
-    );
-    if let Some(problem) = first_problem {
-        summary.push_str(&format!("; first problem: {problem}"));
+    Err(io::Error::other(report.failure_summary()))
+}
+
+#[derive(Default)]
+struct DeletionReport {
+    deleted: usize,
+    removed_sync_failed: usize,
+    already_absent: usize,
+    changed: usize,
+    failed: usize,
+    not_attempted: usize,
+    first_problem: Option<String>,
+}
+
+impl DeletionReport {
+    fn record(&mut self, tree: &Tree, outcome: fdu_delete::DeleteOutcome) {
+        match outcome.kind {
+            OutcomeKind::Deleted => self.deleted += 1,
+            OutcomeKind::DeletedSyncFailed => {
+                self.removed_sync_failed += 1;
+                self.first_problem.get_or_insert_with(|| {
+                    let detail = outcome.message.unwrap_or_else(|| "entry removed; synchronization failed".to_owned());
+                    format!("{}: {detail}", display_name(tree, outcome.node))
+                });
+            },
+            OutcomeKind::AlreadyAbsent => self.already_absent += 1,
+            OutcomeKind::Changed => {
+                self.changed += 1;
+                self.first_problem.get_or_insert_with(|| {
+                    let detail = outcome.message.unwrap_or_else(|| "entry changed".to_owned());
+                    format!("{}: {detail}", display_name(tree, outcome.node))
+                });
+            }
+            OutcomeKind::Failed => {
+                self.failed += 1;
+                self.first_problem.get_or_insert_with(|| {
+                    let detail = outcome.message.unwrap_or_else(|| "entry could not be removed".to_owned());
+                    format!("{}: {detail}", display_name(tree, outcome.node))
+                });
+            }
+            OutcomeKind::Cancelled => self.not_attempted += 1,
+        }
     }
-    Err(io::Error::other(summary))
+
+    fn completed(&self) -> usize {
+        self.deleted + self.removed_sync_failed + self.already_absent + self.changed + self.failed + self.not_attempted
+    }
+
+    fn has_problems(&self) -> bool {
+        self.removed_sync_failed != 0 || self.changed != 0 || self.failed != 0 || self.not_attempted != 0
+    }
+
+    fn with_operation_error(&self, error: io::Error) -> io::Error {
+        if self.completed() == 0 { return error; }
+        io::Error::new(error.kind(), format!("{}; {error}", self.failure_summary()))
+    }
+
+    fn failure_summary(&self) -> String {
+        let Self { deleted, removed_sync_failed, already_absent, changed, failed, not_attempted, first_problem } = self;
+        let mut summary = format!("Deleted {deleted} · {removed_sync_failed} removed with synchronization failures · {already_absent} already absent · {changed} changed · {failed} failed · {not_attempted} not attempted");
+        if let Some(problem) = first_problem { summary.push_str(&format!("; first problem: {problem}")); }
+        summary
+    }
 }
 
 fn deleting_progress(completed: usize, total: usize) -> String {
@@ -582,6 +612,25 @@ mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn removed_sync_failure_counts_as_completed_and_reports_the_warning() {
+        let tree = Tree::new(b"selected", fdu_core::FileIdentity { device: 1, inode: 2 }, 2).unwrap();
+        let mut report = DeletionReport::default();
+        report.record(&tree, fdu_delete::DeleteOutcome { node: tree.root(), kind: OutcomeKind::DeletedSyncFailed, message: Some("entry removed; synchronization failed".into()) });
+        assert_eq!(report.completed(), 1);
+        assert_eq!(report.removed_sync_failed, 1);
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.failed, 0);
+        assert!(report.has_problems());
+        let summary = report.failure_summary();
+        assert!(summary.contains("1 removed with synchronization failures"));
+        assert!(summary.contains("0 failed"));
+        assert!(summary.contains("entry removed; synchronization failed"));
+        let terminal_error = report.with_operation_error(io::Error::other("journal cleanup failed"));
+        assert!(terminal_error.to_string().contains("1 removed with synchronization failures"));
+        assert!(terminal_error.to_string().contains("journal cleanup failed"));
+    }
 
     #[test]
     fn assume_yes_deletes_contents_and_keeps_the_selected_directory() {

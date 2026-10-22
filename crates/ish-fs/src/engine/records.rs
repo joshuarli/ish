@@ -4,7 +4,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-use rustix::fd::{AsFd, BorrowedFd};
 use rustix::fs::{self, AtFlags, Mode, OFlags};
 
 use super::unique_name;
@@ -315,7 +314,7 @@ fn read_length(file: &mut File) -> io::Result<usize> {
 fn put_identity(bytes: &mut Vec<u8>, value: Identity) {
     bytes.extend_from_slice(&value.device.to_le_bytes());
     bytes.extend_from_slice(&value.inode.to_le_bytes());
-    bytes.push(match value.kind { EntryKind::RegularFile => 0, EntryKind::Directory => 1, EntryKind::Symlink => 2, EntryKind::Other => 3 });
+    bytes.push(match value.kind { EntryKind::RegularFile => 0, EntryKind::Directory => 1, EntryKind::Symlink => 2, EntryKind::Other | EntryKind::Root => 3 });
 }
 
 fn put_observation_fields(bytes: &mut Vec<u8>, observation: Observation) {
@@ -391,7 +390,7 @@ impl<'a> Decoder<'a> {
         let device = self.u64()?;
         let inode = self.u64()?;
         let kind = match self.take(1)?[0] { 0 => EntryKind::RegularFile, 1 => EntryKind::Directory, 2 => EntryKind::Symlink, 3 => EntryKind::Other, _ => return Err(invalid("unknown identity kind")) };
-        Ok(Identity { device, inode, kind })
+        Ok(Identity { file: fdu_posix::identity::FileIdentity { device, inode }, kind })
     }
     fn timestamp(&mut self) -> io::Result<Timestamp> {
         let seconds = i64::from_le_bytes(self.take(8)?.try_into().unwrap());
@@ -453,26 +452,6 @@ fn decode(bytes: &[u8]) -> io::Result<Record> {
     Ok(Record { source, destination, observed, published, output, parent, anchor, ancestry, final_flags })
 }
 
-pub(super) fn write_intent(parent: BorrowedFd<'_>, name: &std::ffi::OsStr, record: &Record) -> io::Result<Identity> {
-    let fd = fs::openat(parent, name, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::RUSR | Mode::WUSR)?;
-    let identity = crate::roots::observe_fd(fd.as_fd())?.identity;
-    fs::fchmod(&fd, Mode::RUSR | Mode::WUSR)?;
-    let owner = rustix::process::geteuid().as_raw();
-    let mut file = File::from(fd);
-    let bytes = encode(record)?;
-    file.write_all(MAGIC)?;
-    file.write_all(&owner.to_le_bytes())?;
-    let mut encoded_identity = Vec::new();
-    put_identity(&mut encoded_identity, crate::roots::observe_fd(parent)?.identity);
-    file.write_all(&encoded_identity)?;
-    file.write_all(&(bytes.len() as u32).to_le_bytes())?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    crate::platform::sync_directory(parent)?;
-    Ok(identity)
-}
-
-
 pub(super) struct IndexedRecords {
     records: Records,
     chains: Records,
@@ -522,37 +501,6 @@ impl IndexedRecords {
     }
 }
 
-pub(super) fn validate_intent(parent: BorrowedFd<'_>, name: &std::ffi::OsStr, expected: Identity) -> io::Result<Record> {
-    let fd = fs::openat(parent, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;
-    let observed = crate::roots::observe_fd(fd.as_fd())?;
-    let owner = rustix::process::geteuid().as_raw();
-    if observed.identity != expected || observed.identity.kind != EntryKind::RegularFile || observed.uid != owner || observed.links != 1 || observed.mode & 0o077 != 0 || observed.size > (MAX_RECORD + 64) as u64 {
-        return Err(invalid("intent identity, owner, mode, or length is invalid"));
-    }
-    let mut file = File::from(fd);
-    let mut magic = [0; 8];
-    file.read_exact(&mut magic)?;
-    if &magic != MAGIC { return Err(invalid("unknown intent version")); }
-    let mut owner_bytes = [0; 4];
-    file.read_exact(&mut owner_bytes)?;
-    if u32::from_le_bytes(owner_bytes) != owner { return Err(invalid("intent owner does not match record")); }
-    let mut parent_bytes = [0; 17];
-    file.read_exact(&mut parent_bytes)?;
-    if Decoder(&parent_bytes).identity()? != crate::roots::observe_fd(parent)?.identity { return Err(invalid("intent parent identity changed")); }
-    let length = read_length(&mut file)?;
-    let mut bytes = vec![0; length];
-    file.read_exact(&mut bytes)?;
-    let mut extra = [0; 1];
-    if file.read(&mut extra)? != 0 { return Err(invalid("trailing intent bytes")); }
-    let record = decode(&bytes)?;
-    for path in [&record.source, &record.destination] {
-        let bytes = path.as_os_str().as_bytes();
-        if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') { return Err(invalid("intent final name is invalid")); }
-    }
-    if !super::anchored::unchanged(observed, crate::roots::observe_fd(file.as_fd())?) { return Err(invalid("intent changed while reading")); }
-    Ok(record)
-}
-
 impl Records {
     pub fn set_final_flags(&mut self, path: &Path, flags: u32) -> io::Result<()> {
         let (_, end, _) = self.find_entry(path)?.ok_or_else(|| invalid("final metadata record not found"))?;
@@ -576,7 +524,7 @@ mod tests {
         fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
     }
     fn sample() -> Record {
-        let identity = Identity { device: 2, inode: 8, kind: EntryKind::RegularFile };
+        let identity = Identity { file: fdu_posix::identity::FileIdentity { device: 2, inode: 8 }, kind: EntryKind::RegularFile };
         let time = Timestamp { seconds: -1, nanoseconds: 2 };
         Record { source: PathBuf::from(OsString::from_vec(b"bad\xff\n".to_vec())), destination: PathBuf::from("destination"), observed: Observation { identity, size: 7, mode: 0o100644, uid: 1, gid: 2, links: 3, atime: time, mtime: time, ctime: time }, published: identity, output: None, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 }
     }
@@ -630,7 +578,7 @@ mod tests {
         second.observed.size = 22;
         records.push(&second).unwrap();
         let end = records.end();
-        let output = Observation { identity: Identity { device: 4, inode: 9, kind: EntryKind::RegularFile }, size: 30, mode: 0o100600, uid: 5, gid: 6, links: 1, atime: Timestamp { seconds: 3, nanoseconds: 4 }, mtime: Timestamp { seconds: 5, nanoseconds: 6 }, ctime: Timestamp { seconds: 7, nanoseconds: 8 } };
+        let output = Observation { identity: Identity { file: fdu_posix::identity::FileIdentity { device: 4, inode: 9 }, kind: EntryKind::RegularFile }, size: 30, mode: 0o100600, uid: 5, gid: 6, links: 1, atime: Timestamp { seconds: 3, nanoseconds: 4 }, mtime: Timestamp { seconds: 5, nanoseconds: 6 }, ctime: Timestamp { seconds: 7, nanoseconds: 8 } };
         records.set_output(Path::new("duplicate"), output).unwrap();
         records.set_final_flags(Path::new("duplicate"), 0x55aa).unwrap();
         assert_eq!(records.end(), end);

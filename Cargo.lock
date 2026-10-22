@@ -93,8 +93,18 @@ name = "fdu-delete"
 version = "0.1.0"
 dependencies = [
  "fdu-core",
+ "fdu-posix",
  "hashbrown",
  "rayon",
+ "rustix",
+]
+
+[[package]]
+name = "fdu-posix"
+version = "0.1.0"
+dependencies = [
+ "fdu-core",
+ "libc",
  "rustix",
 ]
 
@@ -104,6 +114,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-deque",
  "fdu-core",
+ "fdu-posix",
  "hashbrown",
  "libc",
  "rustix",
@@ -165,6 +176,7 @@ dependencies = [
 name = "ish-fs"
 version = "0.1.0"
 dependencies = [
+ "fdu-posix",
  "libc",
  "rustix",
 ]

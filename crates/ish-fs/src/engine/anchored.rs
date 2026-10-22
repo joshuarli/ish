@@ -4,13 +4,12 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
-use rustix::fs::{self, Mode, OFlags};
+use rustix::fs::{self, Mode};
 
 use super::records::Records;
 use crate::roots::{self, Identity, Observation};
 
-pub(super) const DIRECTORY: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
-pub(super) const READ_FILE: OFlags = OFlags::RDONLY.union(OFlags::NOFOLLOW).union(OFlags::NONBLOCK).union(OFlags::CLOEXEC);
+pub(super) use fdu_posix::identity::{DIRECTORY_FLAGS as DIRECTORY, READ_FILE_FLAGS as READ_FILE};
 
 pub(super) fn unchanged(expected: Observation, actual: Observation) -> bool {
     let mut expected = expected;
@@ -33,7 +32,21 @@ pub(super) fn parent(root: BorrowedFd<'_>, path: &Path, directories: &Mutex<Reco
 }
 
 pub(super) fn open_directory(root: BorrowedFd<'_>, path: &Path, directories: &Mutex<Records>, destination: bool) -> io::Result<OwnedFd> {
+    open_directory_with_recovery(root, path, directories, destination, false)
+}
+
+pub(super) fn checked_parent(root: BorrowedFd<'_>, path: &Path, directories: &Mutex<Records>, destination: bool) -> io::Result<(OwnedFd, OsString)> {
+    let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "entry has no final name"))?.to_os_string();
+    Ok((open_checked_directory(root, path.parent().unwrap_or_else(|| Path::new("")), directories, destination)?, name))
+}
+
+pub(super) fn open_checked_directory(root: BorrowedFd<'_>, path: &Path, directories: &Mutex<Records>, destination: bool) -> io::Result<OwnedFd> {
+    open_directory_with_recovery(root, path, directories, destination, true)
+}
+
+fn open_directory_with_recovery(root: BorrowedFd<'_>, path: &Path, directories: &Mutex<Records>, destination: bool, recover: bool) -> io::Result<OwnedFd> {
     let mut fd = fs::openat(root, ".", DIRECTORY, Mode::empty())?;
+    if recover { fdu_posix::quarantine::Session::check_recovery(fd.as_fd())?; }
     let mut prefix = PathBuf::new();
     for component in path.components() {
         let Component::Normal(name) = component else { return Err(io::Error::new(io::ErrorKind::InvalidData, "non-relative traversal record")); };
@@ -43,6 +56,7 @@ pub(super) fn open_directory(root: BorrowedFd<'_>, path: &Path, directories: &Mu
         let actual = roots::observe_fd(next.as_fd())?.identity;
         let expected = if destination { expected.published } else { expected.observed.identity };
         if actual != expected { return Err(io::Error::other("traversal directory identity changed")); }
+        if recover { fdu_posix::quarantine::Session::check_recovery(next.as_fd())?; }
         fd = next;
     }
     Ok(fd)

@@ -1,4 +1,4 @@
-use fdu_core::{EntryType, ExclusionReason, FileIdentity, NodeId, NodeRecord, NodeState, Tree};
+use fdu_core::{EntryType, ExclusionReason, NodeId, NodeRecord, NodeState, Tree};
 use hashbrown::HashSet;
 use std::fmt;
 use std::io;
@@ -55,6 +55,7 @@ impl std::error::Error for PlanError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutcomeKind {
     Deleted,
+    DeletedSyncFailed,
     AlreadyAbsent,
     Changed,
     Failed,
@@ -255,47 +256,22 @@ pub fn execute(
 }
 
 mod posix {
-    mod quarantine;
+    use fdu_posix::quarantine;
+    use fdu_posix::identity::{DIRECTORY_FLAGS, MountIdentity, directory_state, identity, entry_type, retry_errno};
     use super::*;
-    use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, Stat};
+    use rustix::fs::{self, AtFlags, Mode, Stat};
     use rustix::io::Errno;
     use std::collections::BTreeMap;
     use std::os::fd::{AsFd, BorrowedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::Mutex;
     use std::time::Instant;
 
-    const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
-        .union(OFlags::DIRECTORY)
-        .union(OFlags::NOFOLLOW)
-        .union(OFlags::CLOEXEC);
-    
-    
-    
-    
-    
-    
-    
-    
     const DELETE_THREADS: usize = 16;
 
     
     
-    #[cfg(target_os = "macos")]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct MountIdentity {
-        device: u64,
-        fsid: [i32; 2],
-        mount_point: Vec<u8>,
-    }
-
-    #[cfg(target_os = "linux")]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct MountIdentity {
-        device: u64,
-        mount_id: u64,
-    }
-
     struct DirContext {
         fd: OwnedFd,
         node: NodeId,
@@ -749,68 +725,39 @@ mod posix {
     }
 
     fn capture_and_remove(deletion: &Deletion<'_>, parent_fd: BorrowedFd<'_>, name: &[u8], node: NodeId, flags: AtFlags) {
-        let (kind, message) = deletion.quarantine.remove(deletion, parent_fd, name, node, flags);
+        let _ = flags;
+        let mut parents = Vec::new();
+        let mut current = deletion.tree.record(node).and_then(NodeRecord::parent);
+        while let Some(parent) = current {
+            if parent == deletion.tree.root() { break; }
+            let record = deletion.tree.record(parent).expect("indexed ancestor");
+            parents.push(quarantine::Ancestor { name: std::ffi::OsString::from(std::ffi::OsStr::from_bytes(deletion.tree.name(parent).expect("indexed ancestor name"))), identity: record.identity });
+            current = record.parent();
+        }
+        parents.reverse();
+        let record = deletion.tree.record(node).expect("indexed target");
+        let request = quarantine::Retirement::new(parents, std::ffi::OsString::from(std::ffi::OsStr::from_bytes(name)), fdu_posix::identity::EntryIdentity { file: record.identity, kind: record.entry_type });
+        let result = request.map_err(|error| quarantine::RemovalError { removed: false, error }).and_then(|request| deletion.quarantine.remove(parent_fd, request, |boundary, _, _| {
+            if matches!(boundary, quarantine::Boundary::BeforeCapture | quarantine::Boundary::BeforeUnlink) && deletion.stopped() { return Err(io::Error::new(io::ErrorKind::Interrupted, "deletion cancelled")); }
+            Ok(())
+        }));
+        let (kind, message) = removal_outcome(result);
         deletion.record(node, kind, message);
+    }
+
+    fn removal_outcome(result: Result<quarantine::Removal, quarantine::RemovalError>) -> (OutcomeKind, Option<String>) {
+        match result {
+            Ok(quarantine::Removal::Removed) => (OutcomeKind::Deleted, None),
+            Ok(quarantine::Removal::AlreadyAbsent) => (OutcomeKind::AlreadyAbsent, None),
+            Ok(quarantine::Removal::Changed) => (OutcomeKind::Changed, None),
+            Err(error) => (if error.removed { OutcomeKind::DeletedSyncFailed } else { OutcomeKind::Failed }, Some(error.to_string())),
+        }
     }
 
     fn stat_at(parent: BorrowedFd<'_>, name: &[u8]) -> Result<Stat, Errno> {
         retry_errno(|| fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW))
     }
 
-    
-    
-    #[allow(clippy::useless_conversion)]
-    fn identity(metadata: &Stat) -> io::Result<FileIdentity> {
-        Ok(FileIdentity {
-            device: u64::try_from(metadata.st_dev).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid device number"))?,
-            inode: metadata.st_ino,
-        })
-    }
-
-    fn entry_type(metadata: &Stat) -> EntryType {
-        match FileType::from_raw_mode(metadata.st_mode) {
-            FileType::Directory => EntryType::Directory,
-            FileType::RegularFile => EntryType::RegularFile,
-            FileType::Symlink => EntryType::Symlink,
-            _ => EntryType::Other,
-        }
-    }
-
-    
-    #[cfg(target_os = "macos")]
-    fn directory_state(fd: BorrowedFd<'_>) -> io::Result<(FileIdentity, MountIdentity)> {
-        let metadata = retry(|| fs::fstat(fd))?;
-        let filesystem = retry(|| fs::fstatfs(fd))?;
-        
-        const _: () = assert!(std::mem::size_of::<[i32; 2]>() == 8);
-        // SAFETY: macOS defines fsid_t as two i32 words, and the assertion checks the destination width.
-        let fsid = unsafe { std::mem::transmute_copy::<_, [i32; 2]>(&filesystem.f_fsid) };
-        let mount_point = filesystem
-            .f_mntonname
-            .iter()
-            .take_while(|byte| **byte != 0)
-            .map(|byte| *byte as u8)
-            .collect();
-        let identity = identity(&metadata)?;
-        Ok((identity, MountIdentity { device: identity.device, fsid, mount_point }))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn directory_state(fd: BorrowedFd<'_>) -> io::Result<(FileIdentity, MountIdentity)> {
-        let wanted = fs::StatxFlags::INO | fs::StatxFlags::MNT_ID;
-        let metadata = retry(|| fs::statx(fd, c"", AtFlags::EMPTY_PATH, wanted))?;
-        if !fs::StatxFlags::from_bits_retain(metadata.stx_mask).contains(wanted) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "kernel did not report the directory identity and mount ID",
-            ));
-        }
-        let device = fs::makedev(metadata.stx_dev_major, metadata.stx_dev_minor);
-        Ok((
-            FileIdentity { device, inode: metadata.stx_ino },
-            MountIdentity { device, mount_id: metadata.stx_mnt_id },
-        ))
-    }
 
     fn flush(sender: &SyncSender<DeleteEvent>, outcomes: &mut Vec<DeleteOutcome>) -> bool {
         if outcomes.is_empty() {
@@ -820,24 +767,41 @@ mod posix {
         sender.send(DeleteEvent::Outcomes(values)).is_ok()
     }
 
-    fn retry_errno<T>(mut operation: impl FnMut() -> rustix::io::Result<T>) -> rustix::io::Result<T> {
-        loop {
-            match operation() {
-                Err(Errno::INTR) => continue,
-                result => return result,
-            }
-        }
-    }
-
-    fn retry<T>(operation: impl FnMut() -> rustix::io::Result<T>) -> io::Result<T> {
-        retry_errno(operation).map_err(io::Error::from)
-    }
-
     fn send_failure(sender: &SyncSender<DeleteEvent>, message: &str) {
         let _ = sender.send(DeleteEvent::Failed {
             message: message.to_owned(),
         });
         let _ = sender.send(DeleteEvent::Finished);
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn removed_entry_with_sync_error_is_reported_removed_with_failure() {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join(".work/tmp");
+            std::fs::create_dir_all(&base).unwrap();
+            let path = base.join(format!("fdu-sync-failure-{}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("source"), b"removed bytes").unwrap();
+            let root = std::fs::File::open(&path).unwrap();
+            let expected = fdu_posix::identity::entry_identity(&stat_at(root.as_fd(), b"source").unwrap()).unwrap();
+            let session = quarantine::Session::start(root.as_fd()).unwrap();
+            let request = quarantine::Retirement::new(Vec::new(), "source".into(), expected).unwrap();
+            let result = session.remove(root.as_fd(), request, |boundary, _, _| {
+                if boundary == quarantine::Boundary::Unlinked { return Err(io::Error::other("injected synchronization failure")); }
+                Ok(())
+            });
+            let (kind, message) = removal_outcome(result);
+            assert_eq!(kind, OutcomeKind::DeletedSyncFailed);
+            assert!(message.unwrap().contains("injected synchronization failure"));
+            assert!(!path.join("source").exists());
+            assert!(session.finish().is_err());
+            drop(session);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+
 }
 

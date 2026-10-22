@@ -373,9 +373,9 @@ fn native_boundary_nested_mount_requires_opt_in() {
     assert_ne!(source_mount, bind_mount, "bind fixture must have a distinct mount ID");
     assert_ne!(source_meta.dev(), tmpfs_meta.dev(), "tmpfs fixture must have a distinct device ID");
     assert_eq!(source_meta.dev(), bind_meta.dev(), "bind fixture must retain its source device ID");
-    let source_id = (source_meta.dev(), source_meta.ino(), source_mount);
-    let tmpfs_id_before = (tmpfs_meta.dev(), tmpfs_meta.ino(), tmpfs_mount);
-    let bind_id_before = (bind_meta.dev(), bind_meta.ino(), bind_mount);
+    let source_id = (source_meta.dev(), source_meta.ino(), source_mount.clone());
+    let tmpfs_id_before = (tmpfs_meta.dev(), tmpfs_meta.ino(), tmpfs_mount.clone());
+    let bind_id_before = (bind_meta.dev(), bind_meta.ino(), bind_mount.clone());
     let root_payload = source.join("root-proof");
     let tmpfs_payload = tmpfs.join("tmpfs-proof");
     let bind_payload = bind.join("bind-proof");
@@ -421,13 +421,29 @@ fn native_boundary_nested_mount_requires_opt_in() {
     let source_device = source_meta.dev();
     let cross = cross_root(source_device);
     let move_parent = OwnedDirectory::create(&cross, "nested-move-destination");
+    for (tree, payload, bytes) in [("tmpfs-tree", &tmpfs_payload, b"nested tmpfs payload".as_slice()), ("bind-tree", &bind_payload, b"nested bind payload".as_slice())] {
+        let destination = move_parent.path().join(tree);
+        let mut nested_move = request(Operation::Move, &source, destination_parent.path(), Path::new(tree), &destination);
+        nested_move.options.cross_file_systems = true;
+        let (outcome, events) = run(&nested_move);
+        assert_eq!(outcome.status(), 1, "the mounted root remains");
+        assert!(events.iter().any(|event| matches!(event, Event::Operand(operand) if operand.state == OperandState::SourcePartiallyRetired)), "{events:?}");
+        assert!(!payload.exists(), "mount descendants must retire through a same-mount journal: {events:?}");
+        assert_eq!(fs::read(destination.join(payload.strip_prefix(source.join(tree)).unwrap())).unwrap(), bytes);
+        fs::write(payload, bytes).expect("restore owned mount payload for whole-tree fixture");
+    }
     let move_destination = move_parent.path().join("moved");
     let mut move_request = request(Operation::Move, source.parent().unwrap(), destination_parent.path(), source.file_name().unwrap().as_ref(), &move_destination);
     move_request.options.cross_file_systems = true;
     let (outcome, events) = run(&move_request);
     assert_eq!(outcome.completion, Completion::Failed);
     assert_eq!(outcome.status(), 1);
-    assert!(events.iter().any(|event| matches!(event, Event::Operand(operand) if operand.state == OperandState::SourcePartiallyRetired)));
+    let expected_state = if [&root_payload, &tmpfs_payload, &bind_payload].iter().all(|path| path.exists()) { OperandState::DestinationPublishedSourceRetained } else { OperandState::SourcePartiallyRetired };
+    assert!(events.iter().any(|event| matches!(event, Event::Operand(operand) if operand.state == expected_state)), "{events:?}");
+    assert!(!tmpfs_payload.exists() || !bind_payload.exists(), "a crossed-mount descendant must retire before mountpoint refusal: {events:?}");
+    for (path, bytes) in [(&tmpfs_payload, b"nested tmpfs payload".as_slice()), (&bind_payload, b"nested bind payload".as_slice())] {
+        match fs::read(path) { Ok(actual) => assert_eq!(actual, bytes), Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound) }
+    }
     assert!(move_destination.is_dir(), "durably published destination must remain after partial retirement");
     assert!(source.is_dir(), "the source root must remain when a nested mountpoint cannot be retired");
     assert!(tmpfs.is_dir() && bind.is_dir(), "mounted source names must remain after partial retirement");

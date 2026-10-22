@@ -6,6 +6,7 @@ license = "MIT"
 description = "Descriptor-relative deletion for fdu indexes"
 
 [dependencies]
+fdu-posix = { path = "../fdu-posix" }
 fdu-core = { path = "../fdu-core" }
 hashbrown = { workspace = true }
 rayon = "1.5.1"

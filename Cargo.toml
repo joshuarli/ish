@@ -8,6 +8,7 @@ members = [
     ".",
     "crates/epsh",
     "crates/fdu-core",
+    "crates/fdu-posix",
     "crates/fdu-delete",
     "crates/fdu-scan",
     "crates/ish-fs",

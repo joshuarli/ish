@@ -20,7 +20,7 @@ fn changed_published_version_retains_source(merge: bool, mode: bool) {
     let (outcome, events) = fixture.run(&request, move |point| {
         force_exdev(point)?;
         let path = if !merge && point == "after_publish" { Some(base.join("destination")) }
-            else if merge && point == "before_copy" { fs::read_dir(base.join("destination")).unwrap().next().map(|entry| entry.unwrap().path()) }
+            else if merge && point == "before_copy" { fs::read_dir(base.join("destination")).unwrap().map(|entry| entry.unwrap().path()).find(|path| path.is_file()) }
             else { None };
         if let Some(path) = path {
             if mode {
@@ -613,8 +613,7 @@ fn repair_completed_primitive_mutations_are_not_accepted_as_output() {
         let (outcome, _) = fixture.run(&fixture.request(), move |point| {
             force_exdev(point)?;
             if point == boundary {
-                let stage = fs::read_dir(&base).unwrap().map(|entry| entry.unwrap().path())
-                    .find(|path| path.file_name().unwrap().as_encoded_bytes().starts_with(b".ish-fs-stage-")).unwrap();
+                let stage = staged_entry(&base);
                 fs::write(stage, b"tampered").unwrap();
             }
             Ok(())

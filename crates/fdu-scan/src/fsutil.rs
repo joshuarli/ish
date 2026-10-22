@@ -1,7 +1,7 @@
 
 
 use fdu_core::{EntryType, FileIdentity, ModifiedTime};
-use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, Stat};
+use rustix::fs::{self, Mode, Stat};
 use rustix::io::Errno;
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 use std::ffi::CStr;
@@ -9,52 +9,16 @@ use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::{Mutex, TryLockError};
 
-pub(crate) const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
+pub(crate) use fdu_posix::identity::{DIRECTORY_FLAGS, identity, entry_type, link_count, retry};
 
 static FILE_LIMIT_LOCK: Mutex<()> = Mutex::new(());
 
-
-pub(crate) fn retry<T>(mut operation: impl FnMut() -> rustix::io::Result<T>) -> io::Result<T> {
-    loop {
-        match operation() {
-            Err(Errno::INTR) => continue,
-            result => return result.map_err(io::Error::from),
-        }
-    }
-}
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 
-
-#[allow(clippy::useless_conversion)]
-pub(crate) fn identity(stat: &Stat) -> io::Result<FileIdentity> {
-    Ok(FileIdentity {
-        device: u64::try_from(stat.st_dev).map_err(|_| invalid("device number is outside supported range"))?,
-        inode: stat.st_ino,
-    })
-}
-
-
-
-#[allow(clippy::unnecessary_fallible_conversions, clippy::useless_conversion)]
-pub(crate) fn link_count(stat: &Stat) -> io::Result<u64> {
-    u64::try_from(stat.st_nlink).map_err(|_| invalid("negative link count"))
-}
-
-pub(crate) fn entry_type(stat: &Stat) -> EntryType {
-    match FileType::from_raw_mode(stat.st_mode as _) {
-        FileType::Directory => EntryType::Directory,
-        FileType::RegularFile => EntryType::RegularFile,
-        FileType::Symlink => EntryType::Symlink,
-        _ => EntryType::Other,
-    }
-}
 
 pub(crate) fn file_size(stat: &Stat, apparent: bool) -> io::Result<u64> {
     if apparent {
@@ -85,7 +49,7 @@ pub(crate) struct EntryStat {
 }
 
 pub(crate) fn stat_at(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<Stat> {
-    retry(|| fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW))
+    fdu_posix::identity::stat_at(parent, name).map_err(Into::into)
 }
 
 pub(crate) fn stat_entry_at(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<EntryStat> {
