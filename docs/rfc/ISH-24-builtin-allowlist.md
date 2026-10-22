@@ -114,5 +114,5 @@ lookup, and signaling while refusing scripting state and process replacement.
 Name-only filtering is insufficient because `set` includes both environment
 operations and persistent evaluator options.
 
-The owner decision is complete. ISH-24 stays open until implementation and its
-acceptance checks land; retain this RFC as the decision record.
+The implementation and focused Linux acceptance are complete. Retain this RFC
+as the decision record for the interactive builtin boundary.

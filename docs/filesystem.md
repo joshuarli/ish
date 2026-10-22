@@ -206,8 +206,13 @@ Recursive traversal stops at nested mount points by default and reports an
 operational error. It does not treat an empty-looking mount point as an empty
 directory. `--cross-file-systems` explicitly permits traversal into nested
 mounts; it does not unmount them. A mount point that cannot be retired remains
-and is reported as partial completion. Source and destination roots may be on
-different filesystems.
+and is reported as partial completion. Retirement on each crossed mount requires
+a recovery root outside the entries retired on that mount. A retained mount
+root can hold the journal for its descendants; the mount root remains in place.
+Without a safe root,
+ish retains the affected source entries and reports the completed publication
+and any earlier retirement. Source and destination roots may be on different
+filesystems.
 
 ish anchors paths at open directory descriptors, stages new objects on the
 destination filesystem, and rechecks observed identities and versions. Stable
@@ -218,15 +223,44 @@ protect against a same-account process with authority to modify the same trees.
 
 ## Inspect retained operation state
 
-Normal error and partial-completion diagnostics name retained staging or source
-paths when the engine can identify them. If ish or the machine stops abruptly,
-there may be no diagnostic. Inspect the destination parent for
-`.ish-fs-stage-*` names and the source parent for `.ish-fs-retired-*` and
-`.ish-fs-intent-*` names before retrying. Identify each entry before removing
-or moving it. ish does not promise cleanup after forced termination, sweep
-retained names, or provide an automatic recovery command. Receipt spools use
-unlinked files under the configured scratch directory and disappear when the
-operation closes them.
+Normal error and partial-completion diagnostics identify retained staging and
+captured source paths. `cp`, `mv`, and `t` use versioned
+`.fdu-quarantine-v2-*` session directories. A session has a nonblocking root lock,
+a private mode-0700 directory, and a name with 128 bits of OS randomness.
+A competing operation on the same root fails instead of waiting.
+
+Before planning a new operation, ish checks sessions in participating parents
+and roots. Recovery validates ownership, records, ancestry, mount identity, and
+captured objects. It restores recorded source names without replacing live
+entries. Successful recovery stops the command and requires a fresh plan and
+explicit retry. Recovery never resumes deletion or rolls back a published
+destination. A restored source and a published destination may both remain.
+Existing v1 fdu sessions keep their conservative restoration behavior.
+
+Atomic rename replacement publishes a shared replacement intent before the
+exchange, with the source-root lock held through displaced-entry cleanup.
+The intent records both object identities and the destination parent/name.
+An exchange interrupted before capture retains the intent and identifies the
+displaced source name; recovery never exchanges the operands again. A capture
+can restore the displaced object to that source name without overwriting it.
+
+Recursive transfer and retirement check sessions in each directory reached by
+normal traversal, including crossed mounts. An unknown or interrupted session
+there blocks work before its contents become transfer or retirement inputs.
+
+Unpublished stages, conflicting original names, damaged records, and unknown
+versions remain available for inspection and block new work in that root.
+Identify the reported objects before moving or removing them. Legacy
+`.ish-fs-stage-*`, `.ish-fs-retired-*`, and `.ish-fs-intent-*` entries also block
+new work. Their names alone do not authorize cleanup. Recovery discovery stays
+within operation roots and parents reached by normal traversal.
+
+An entry unlinked before a synchronization error is reported as removed with a
+durability failure. `--dry-run` does not restore sessions or write journal state.
+Receipt spools remain unlinked files under the configured scratch directory.
+The [native tests](filesystem-testing.md) establish process-crash behavior on
+tested filesystems. They do not establish power-loss behavior for every storage
+device.
 
 ## Run native file commands in ish
 
@@ -270,10 +304,12 @@ streamed and logical bytes cloned. These count different transfer methods; do
 not add them to estimate physical I/O. Logical clone size does not report
 physical I/O, and ish makes no universal speed-ratio claim.
 
-## Accepted recovery design awaiting implementation
+## Recovery limits
 
-[ISH-32](rfc/ISH-32-capture-and-retire.md) selects a shared journaled quarantine
-protocol for fdu deletion and ish-fs retirement. Its conservative restart recovery
-is pending implementation; the retained-name and crash limitations above still
-apply. Recovery must preserve published destinations, avoid overwriting live
-names, and require a fresh plan before further destructive work.
+Both fdu deletion and ish-fs retirement use the shared journaled quarantine
+protocol. Recovery restores verified captures without replacing live names and
+stops the operation so the caller must rescan and plan again. ish-fs still
+validates source versions and durable destination receipts before retiring a
+source. SIGKILL tests cover process interruption; they do not establish power
+loss durability or storage-device behavior. Native macOS and the remaining
+Linux capability cases are tracked in [filesystem testing](filesystem-testing.md).

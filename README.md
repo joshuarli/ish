@@ -65,11 +65,11 @@ Control characters in the user, host, directory, and branch appear as `�`.
 | Ctrl+Z | Suspend the foreground job |
 | Ctrl+P | Write a layout dump under `~/.cache/ish/` |
 
-Completion filters as you type or paste and prefers prefix matches. Recent files appear
-first; partial paths and SSH hosts are supported. SSH host completion reads
-`~/.ssh/config` and `~/.ssh/known_hosts`. Use the arrows or Tab to move through
-results, Enter to accept, and Escape to cancel. Pasting while the recent-directory
-picker is open leaves its saved input unchanged.
+Completion filters as you type or paste and prefers prefix matches. Recent
+files appear first; partial paths and SSH hosts are supported. SSH host
+completion reads `~/.ssh/config` and `~/.ssh/known_hosts`. Use the arrows or Tab
+to move through results, Enter to accept, and Escape to cancel. Pasting while
+the recent-directory picker is open leaves its saved input unchanged.
 
 Ctrl+R opens a case-insensitive fuzzy-search pager with matches highlighted.
 Typing or pasting edits the search query and filters the matches.
@@ -105,8 +105,9 @@ including targets selected through expansion or nested `command`. Static
 violations prevent the input line from starting. Expanded targets are checked
 before their redirections, assignments for dispatch, or execution; earlier
 commands and expansions keep their effects. Commands that need shell state,
-including `alias`, `exit`, `fg`, `denv`, and `z`, must be the whole input line. `cd` and `history` can also be
-used in lists. `t` and `trash` must also be the whole input line.
+including `alias`, `exit`, `fg`, `denv`, and `z`, must be the whole input line.
+`cd` and `history` can also be used in lists. `t` and `trash` must also be the
+whole input line.
 
 Native `cp` and `mv` run in the shell process, including lists, redirections,
 and standalone negation. `! cp source copy` performs the copy and inverts its
@@ -165,11 +166,13 @@ symlinks themselves and leaves their targets alone. An incomplete scan or mount
 boundary stops deletion before it starts. By default, the command asks you to
 type `yes`. Pass `--yes` to skip the prompt. Without a terminal, `--yes` is
 required. A terminal shows scan progress and a deletion progress bar.
-If deletion is interrupted, entries may remain in a `.fdu-quarantine-v1-*`
-directory inside `PATH`. The next `t PATH` restores them and reports
-"interrupted deletion recovered; rescan before deleting"; run it again to
-delete. A damaged or unrelated directory with that prefix blocks deletion until
-you move it away.
+If deletion is interrupted, entries may remain in a `.fdu-quarantine-v2-*`
+directory inside `PATH`. The next `t PATH` restores verified captures without
+overwriting live names and requires a fresh scan and retry. Existing v1 sessions
+retain their restoration behavior. Damaged records, conflicting names, and
+unrelated quarantine lookalikes block deletion and identify the retained paths.
+An entry removed before a synchronization error is reported as removed with a
+durability failure.
 
 ish's `cp` and `mv` use an exact-target form: the source object maps to the
 destination path. For example, `cp report.txt .` reports a type conflict when
@@ -180,7 +183,11 @@ flags. Read the [file operation reference](docs/filesystem.md) for collision,
 preservation, mount, durability, cancellation, and partial-completion rules.
 Unsupported required metadata is reported as a failure and the source is
 retained. Explicit paths such as `/bin/cp` and `/bin/mv` still run external
-utilities.
+utilities. Interrupted copies and moves use the same quarantine protocol.
+Unpublished stages remain available for inspection. Recovery preserves published
+destinations and never resumes deleting sources. Read the
+[recovery reference](docs/filesystem.md#inspect-retained-operation-state) before
+retrying an interrupted operation.
 
 The exposed epsh builtins are `echo`, `printf`, `pwd`, `true`, `false`, `:`,
 `test`, `[`, `kill`, `export`, `unset`, `set`, and `command`; `cd` also retains
@@ -188,10 +195,11 @@ its hybrid form. Other epsh builtins, including `exec`, `trap`, `read`, `wait`,
 `umask`, and `getopts`, are unavailable. This boundary does not restrict programs
 run through explicit paths.
 
-`set` lists exported variables. `set NAME [value...]` sets and exports a variable,
-joining values with spaces; no values gives an empty value. The name must match
-`[A-Za-z_][A-Za-z0-9_]*`. Values may start with `-` or `+`. Option and positional
-forms, including `set -e`, `set +e`, `set -o pipefail`, and `set --`, are refused.
+`set` lists exported variables. `set NAME [value...]` sets and exports a
+variable, joining values with spaces; no values gives an empty value. The name
+must match `[A-Za-z_][A-Za-z0-9_]*`. Values may start with `-` or `+`. Option
+and positional forms, including `set -e`, `set +e`, `set -o pipefail`, and
+`set --`, are refused.
 Aliases can be defined at the prompt or in config and expand as you type.
 
 ### Copying command output
@@ -274,8 +282,9 @@ its assignments; denv restores the prior layer and marks the project dirty.
 
 `denv` fixes its trust and restoration storage directory when the shell starts,
 using `DENV_DATA_DIR` or `$HOME/.local/share/denv`. Project changes to `HOME` or
-`DENV_DATA_DIR` do not move that storage. Leaving a project restores its variables, including raw values, empty versus
-unset bindings, and whether each binding was exported.
+`DENV_DATA_DIR` do not move that storage. Leaving a project restores its
+variables, including raw values, empty versus unset bindings, and whether each
+binding was exported.
 Each shell keeps its restoration record in that directory under a name made of
 its pid, on Linux its pid namespace, and a random token, exported as `__DENV_PID`, and removes the record
 when it exits. A shell killed without cleanup leaves its record behind; no later

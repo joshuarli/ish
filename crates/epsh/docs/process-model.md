@@ -127,10 +127,37 @@ Interactive mode enables foreground terminal handoff and stopped-child
 detection for pipelines. epsh does not implement prompts, line editing, job
 tables, or fg/bg/jobs builtins.
 
-At the lower level, eval_command can return ShellError::Stopped with the
-stopped PID and pipeline process-group ID. run_program converts that error to
-exit status 148, so callers that need the IDs must handle commands through
-eval_command. This distinction is part of the current implementation.
+`run_program_outcome` returns `ProgramOutcome::Completed(status)` or
+`ProgramOutcome::Stopped(job)`. A stopped job owns every tracked direct child,
+completed member statuses, pipeline status rules, and its output relays.
+The group is stable before transfer: every live member has stopped.
+No remainder of the original command list is retained.
+
+`resume_foreground(&mut job)` returns `None` on another stop and `Some(status)`
+when all members complete. Status calculation retains the final stage,
+`pipefail`, and negation. The method rejects handles from another shell or
+process. `terminate_foreground(&mut job)` and dropping the handle terminate and reap
+owned children. Child-side drops do not signal the original process's job.
+Output relays stay alive across stops and finish after group completion.
+
+The embedder owns saved terminal modes and restores job modes before resuming.
+epsh owns foreground process-group handoff and reclamation. A numeric
+`run_program` or `run_script` call cannot transfer ownership. It terminates a
+stopped job, prints a diagnostic, and returns 148. Status-only callbacks remain
+numeric and cannot create an epsh-owned job from raw process identifiers.
+
+`set_external_dispatcher` registers a callback for an owned set of raw names.
+Its `NotHandled` result delegates to the default executor. Prefix assignments
+and the command environment are expanded once before that decision.
+`set_command_rule` installs owned command refusals or a variable-assignment
+argument rule. `set_builtin_allowlist` optionally restricts epsh builtin names.
+Neither installs a host callback. The allowlist also hides unavailable builtin
+names from `command -v`/`-V` and `type` lookup, preventing PATH fallback for
+those names. Registered command identities remain separately queryable without
+granting execution permission. Defaults remain unrestricted.
+`CommandRule::validate_arguments` validates raw argv for embedders that also
+check commands before evaluation. `builtins::command_action` exposes the same
+nested execution/query option parsing used by dispatch.
 
 See [eval.rs](../src/eval.rs) for execution and wait paths and [sys.rs](../src/sys.rs)
 for the syscall wrappers.

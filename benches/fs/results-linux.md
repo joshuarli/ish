@@ -262,3 +262,46 @@ This is a descriptive sample of ordinary hardlink-group copying. It does not
 measure replacement of aliased destinations or deferred blocking flags, and it
 has no interleaved pre-repair baseline. The interface scopes and BusyBox
 preservation/durability policy differ, so it supports no speedup claim.
+
+## Journaled retirement follow-up
+
+The measured engine source revision is `0494a1e8c457ee69a2281a9f2fbb02e85036d4e6`.
+It includes the shared journaled quarantine and the replacement, merge-state,
+and blocking-flag repairs. Later commits changed tests and documentation only.
+The run used Linux x86_64, Alpine musl, kernel `7.2.9-2-stable`, host `threadripper`,
+ext4 device 66307, and a tmpfs cross-device root on device 35 in a private user
+and mount namespace. The fixture verifier warmed the cache and verified all
+outputs. Each of five alternating samples for the 1k and 4k EXDEV workloads
+passed `perf-gate-ready` before and `perf-gate-ready -1` after. The single 16k
+engine sample also completed output verification; additional samples were
+stopped after its 301 second runtime. Other workloads below had five accepted
+samples per side. The harness was `benches/fs/bench.sh measure`, using the
+`tiny-copy`, `hardlinks`, `merge`, `dry-run-wide`, `rename`, `cross-flat-1k`,
+`cross-flat-4k`, and `cross-flat-16k` workloads with the feature gate enabled.
+
+Each cell is wall seconds / process CPU seconds, median `[minimum, maximum]`.
+The `cross-flat-16k` row is one engine sample, not a median. BusyBox timings are
+context only: its move durability is unverified and its interface differs from
+the engine request and interactive shell.
+
+| Workload | Engine | Interactive builtin | BusyBox utility |
+| --- | --- | --- | --- |
+| Tiny copy | 0.153 [0.150, 0.175] / 0.0110 [0.0088, 0.0120] | 1.860 [1.811, 1.888] / 0.1852 [0.1780, 0.1875] | cp 0.00412 [0.00400, 0.00457] / 0.00420 [0.00408, 0.00464] |
+| Hardlinks | 0.0473 [0.0470, 0.0480] / 0.0287 [0.0281, 0.0290] | 0.0999 [0.0992, 0.1009] / 0.0385 [0.0365, 0.0395] | cp 0.00236 [0.00234, 0.00245] / 0.00236 [0.00234, 0.00245] |
+| Merge | 11.857 [2.381, 16.102] / 0.1277 [0.0896, 0.1687] | 10.069 [2.484, 13.734] / 0.2268 [0.1158, 0.2551] | cp 0.00900 [0.00848, 0.00920] / 0.00876 [0.00829, 0.00918] |
+| Dry-run wide | 0.0439 [0.0437, 0.0457] / 0.0438 [0.0436, 0.0456] | 0.0518 [0.0499, 0.0612] / 0.1417 [0.1359, 0.1700] | not applicable |
+| Whole-directory rename | 0.000826 [0.000773, 0.001255] / 0.000109 [0.000102, 0.000126] | 0.00368 [0.00352, 0.00406] / 0.00695 [0.00684, 0.00719] | mv 0.000161 [0.000153, 0.000234] / 0.000167 [0.000154, 0.000229] |
+| Cross flat, 1,024 files / 4 MiB | 4.399 [4.247, 19.459] / 1.000 [0.957, 1.200] | 4.509 [4.384, 21.014] / 1.010 [1.005, 1.348] | mv 0.0113 [0.0111, 0.0124] / 0.0113 [0.0110, 0.0123] |
+| Cross flat, 4,096 files / 16 MiB | 43.331 [26.520, 60.074] / 13.009 [12.337, 13.646] | 26.736 [25.947, 44.408] / 12.628 [12.306, 13.681] | mv 0.0452 [0.0421, 0.0492] / 0.0445 [0.0416, 0.0489] |
+| Cross flat, 16,384 files / 64 MiB | 300.993 s / 199.162 s | not run | mv not run |
+
+The 16k engine request discovered and completed all 16,385 entries, streamed
+64 MiB, and reported 36.916 s transfer time plus 264.073 s source-retirement
+time. Destination sync-call work summed to 1.35 ms and can overlap transfer.
+That sample reported a 1,945,600-byte process high-water RSS and a 2,413,752-byte
+`ish` binary. These are single-run resource observations, not threshold passes.
+The retirement phase and per-entry journal/capture/unlink path are the likely
+cost center; this run did not include a syscall profile. The older before/after
+matrix predates this durable journal protocol, so its faster cross-flat samples
+are not a matched baseline. No speedup claim follows from this run. The result
+is a reproducible performance concern recorded as ISH-60 in [TODO](../../TODO.md).
