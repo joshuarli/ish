@@ -1,6 +1,7 @@
 # ISH-5: Foreground job outcomes
 
-Status: accepted; implementation pending (2026-10-22)
+Status: accepted; implemented with Linux acceptance (2026-10-22); native
+macOS acceptance remains under ISH-45.
 
 ## Decision
 
@@ -10,9 +11,8 @@ compatibility adapters. epsh owns child tracking, waits and cleanup; ish owns
 the prompt, saved terminal modes, output capture and one suspended-job slot.
 Resuming a job never resumes the remainder of its original command list.
 
-This is the implementation contract for ISH-5 in [TODO](../../TODO.md), not a
-claim that the current code implements it. Keep this decision after
-implementation and describe the shipped API in epsh's process model.
+This remains the implementation contract for ISH-5 in [TODO](../../TODO.md).
+The shipped API and process ownership are described in epsh's process model.
 
 ## Why
 

@@ -15,7 +15,7 @@ verification limits. Open implementation and acceptance work is listed below.
 | [ISH-24](docs/rfc/ISH-24-builtin-allowlist.md) | Finite builtin policy; environment-only `set`; shared dispatch/lookup/completion rules | Implemented; focused Linux acceptance passed |
 | [ISH-26](docs/rfc/ISH-26-denv-sourced-file-trust.md) | Retire implicit sourcing helpers; keep trusted `.env` assignment parsing | Ready; preserve semantics through ISH-15 |
 | [ISH-15, ISH-52](docs/rfc/ISH-15-environment-and-shell-ownership.md) | Explicit environments; remove host environment mutation and unsupported safety comments | Implemented; focused Linux acceptance passed; macOS remains under ISH-45 |
-| [ISH-5](docs/rfc/ISH-5-foreground-job-outcomes.md) | Structured stopped-job handles; epsh owns every child wait | Ready; coordinate with ISH-8 |
+| [ISH-5](docs/rfc/ISH-5-foreground-job-outcomes.md) | Structured stopped-job handles; epsh owns every child wait | Implemented; Linux PTY and process tests passed; macOS is tracked under ISH-45 |
 | [ISH-8](docs/rfc/ISH-8-callback-process-boundary.md) | Creator-process callbacks by default; explicit unsafe child opt-in | Coordinate external dispatch with ISH-5 and policy with ISH-24 |
 | [ISH-32](docs/rfc/ISH-32-capture-and-retire.md) | Shared journaled fdu quarantine and identity primitives | Native recovery validation; account for ISH-45 |
 | [ISH-42](docs/rfc/ISH-42-release-delivery.md) | Default-branch releases, verified bytes, diagnostic panic aborts | Linux implementation verified; native macOS panic probe is tracked under ISH-45 |
@@ -33,17 +33,6 @@ verification limits. Open implementation and acceptance work is listed below.
 - **Fix with:** os-boundaries
 - **Effort:** M (days)
 - **Design:** [Trust for sourced denv files](docs/rfc/ISH-26-denv-sourced-file-trust.md)
-
-### ISH-5 · P2 · Stopped pipelines disappear from foreground job control
-
-- **Status:** Decision accepted; implementation pending.
-- **Area:** Concurrency
-- **Where:** `src/main.rs`, `src/external.rs`, `crates/epsh/src/eval.rs`, `src/job.rs`
-- **Problem:** epsh reports a stopped pipeline with PID and PGID, then `run_program` discards those IDs and returns 148. ish records a suspended job only through its external-handler `STOPPED_JOB` slot. The earlier PTY reproduction returned the prompt after stopping a pipeline, but `fg` reported no suspended job while children remained stopped. Resume still waits for only one group member. Current `job::resume_job` retains its slot on non-ECHILD wait errors; the earlier unconditional-drop claim is stale. Numeric status, a thread-local stop, and a slot flag still obscure ownership and can confuse a real exit 148 with a stop.
-- **Recommendation:** Implement the accepted structured execution outcome and opaque job handle. epsh owns all tracked child waits and cleanup; ish owns its one suspended slot and terminal/capture UI. Delegate normal external spawning to epsh, remove numeric/TLS stop transport, and test all pipeline members through repeated stop/resume and errors.
-- **Fix with:** lifecycle-concurrency, error-model
-- **Effort:** M (days)
-- **Design:** [Foreground job outcomes](docs/rfc/ISH-5-foreground-job-outcomes.md)
 
 ### ISH-8 · P2 · Forked external callbacks can deadlock on captured host locks
 

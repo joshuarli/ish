@@ -224,6 +224,9 @@ saving its output.
 Ctrl+C interrupts foreground commands, including pipelines.
 Ctrl+Z suspends a foreground job and `fg` resumes it. ish keeps one suspended
 job. If a command in a list suspends, the rest of that list is discarded.
+The suspended job retains every pipeline member and its output capture.
+`fg` waits for the whole group and uses the pipeline's final-stage status.
+An external command that exits with status 148 does not create a suspended job.
 During native `cp` and `mv`, ish ignores Ctrl+Z and continues the operation.
 
 ### denv
