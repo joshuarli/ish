@@ -170,6 +170,28 @@ handoff. [diagnostics.rs](../src/diagnostics.rs) owns the layout dump,
 [mode.rs](../src/mode.rs) holds the editor mode state. Parser and evaluator
 internals belong to [epsh's architecture](../crates/epsh/docs/architecture.md).
 
+## Accepted boundary changes awaiting implementation
+
+The implementation above still has the open gaps tracked in [TODO](../TODO.md).
+The following owner decisions are accepted; they describe the target boundaries,
+not already-shipped behavior:
+
+- [ISH-24](rfc/ISH-24-builtin-allowlist.md): one finite interactive builtin
+  policy for planning, expanded argv, completion, and lookup.
+- [ISH-26](rfc/ISH-26-denv-sourced-file-trust.md): retire implicit file-loading
+  helpers; preserve automatically discovered, approved `.env` assignment data.
+- [ISH-15, ISH-52 and ISH-48](rfc/ISH-15-environment-and-shell-ownership.md):
+  explicit environments, a private binary `Shell` in `src/shell.rs`, and a
+  library editor seam in `src/editor.rs`. These two modules do not exist yet.
+- [ISH-5](rfc/ISH-5-foreground-job-outcomes.md) and
+  [ISH-8](rfc/ISH-8-callback-process-boundary.md): epsh-owned tracked jobs and
+  explicit callback process boundaries.
+- [ISH-32](rfc/ISH-32-capture-and-retire.md): shared journaled quarantine and
+  identity primitives, with conservative recovery rather than resumed deletion.
+
+Update the current-behavior sections as each implementation lands. The pending
+[release policy](rfc/ISH-42-release-delivery.md) is tracked separately.
+
 ## Semantic verification
 
 See the [formal guide](../formal/README.md) for semantic checks and their

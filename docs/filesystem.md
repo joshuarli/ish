@@ -259,3 +259,11 @@ operations, and `--dry-run` reports planned actions. Progress reports bytes
 streamed and logical bytes cloned. These count different transfer methods; do
 not add them to estimate physical I/O. Logical clone size does not report
 physical I/O, and ish makes no universal speed-ratio claim.
+
+## Accepted recovery design awaiting implementation
+
+[ISH-32](rfc/ISH-32-capture-and-retire.md) selects a shared journaled quarantine
+protocol for fdu deletion and ish-fs retirement. Its conservative restart recovery
+is pending implementation; the retained-name and crash limitations above still
+apply. Recovery must preserve published destinations, avoid overwriting live
+names, and require a fresh plan before further destructive work.

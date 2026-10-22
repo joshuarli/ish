@@ -33,9 +33,9 @@ behavior contract.
 
 ## Topic map
 
-- Open defects: [TODO](TODO.md). Pending designs: [foreground job
-  outcomes](docs/rfc/ISH-5-foreground-job-outcomes.md) and [callback process
-  boundaries](docs/rfc/ISH-8-callback-process-boundary.md).
+- Open implementation tickets, accepted owner decisions, and next work:
+  [TODO](TODO.md). Accepted RFCs are implementation contracts; their status
+  does not claim the code is fixed. Keep the decision records after delivery.
 
 - Build, test, installation, and release commands: [Development](docs/development.md).
 - File operation behavior: [Filesystem](docs/filesystem.md). Native fixtures, required runs, and evidence limits: [Filesystem testing](docs/filesystem-testing.md).

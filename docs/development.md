@@ -35,3 +35,10 @@ and require the pinned toolchain's rust-src component.
 `make install-login-shell` also edits `/etc/shells` and changes the account's
 login shell, using sudo or doas when needed. Run that target only when you
 intend to change account state.
+
+## Accepted release policy awaiting implementation
+
+[ISH-42](rfc/ISH-42-release-delivery.md) records the accepted decisions for
+release dispatch, final-archive checksums, verified build-tool downloads, and
+panic diagnostics. The existing workflow and build flags still need that work;
+the RFC includes its validation and rollback requirements.
