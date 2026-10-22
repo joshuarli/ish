@@ -1,15 +1,14 @@
 # ISH-15, ISH-52 and ISH-48: Environment and shell ownership
 
-Status: accepted. ISH-15 and ISH-52 implemented with focused Linux acceptance
-(2026-10-22); native macOS was not exercised.
+Status: accepted. ISH-15, ISH-52 and ISH-48 implemented with focused Linux
+acceptance (2026-10-22); native macOS was not exercised.
 
 ## Decision
 
 Remove process-environment mutation from ish, including its public library
 interface. Keep the interactive `Shell` private to the binary in `src/shell.rs`;
 extract editor state and event handling into the library's `src/editor.rs`.
-The environment ownership change is implemented. ISH-48 tracks the shell and
-editor module extraction.
+The environment ownership change and module extraction are implemented.
 
 ## ISH-15: One environment owner
 

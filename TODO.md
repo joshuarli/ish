@@ -19,7 +19,7 @@ verification limits. Open implementation and acceptance work is listed below.
 | [ISH-8](docs/rfc/ISH-8-callback-process-boundary.md) | Creator-process callbacks by default; explicit unsafe child opt-in | Implemented after ISH-5; Linux callback boundary tests passed; macOS is tracked under ISH-45 |
 | [ISH-32](docs/rfc/ISH-32-capture-and-retire.md) | Shared journaled fdu quarantine and identity primitives | Native recovery validation; account for ISH-45 |
 | [ISH-42](docs/rfc/ISH-42-release-delivery.md) | Default-branch releases, verified bytes, diagnostic panic aborts | Linux implementation verified; native macOS panic probe is tracked under ISH-45 |
-| [ISH-48](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor) | Private binary `Shell`; reusable library editor | Extraction can proceed; final integration follows ISH-15's environment contract |
+| [ISH-48](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor) | Private binary `Shell`; reusable library editor | Implemented; focused Linux editor and PTY acceptance passed |
 
 ## Open implementation tickets
 
@@ -42,14 +42,3 @@ verification limits. Open implementation and acceptance work is listed below.
 - **Recommendation:** On a native macOS host, first run workspace check, strict all-target Clippy, workspace tests, and `make test` as an ordinary user; repair unsupported calls with platform-supported APIs while preserving descriptor ownership, close-on-exec, cleanup, secure randomness, and FIFO setup. Fix the read-only destination test using a descriptor opened before chmod or restore access only for fixture verification. Run native clone/access normalization, ACL, foreign-owner, blocking-flag, cancellation, sparse fallback, and resource-fork cases, with privileged cases separately. Compare clone-capable Apple `cp`/`cp -c` and GNU `cp --reflink=auto` on supported native filesystems, recording selected methods and preservation/durability differences. Build a panic probe with the actual release flags and verify its diagnostic on macOS; record binary size as informational evidence.
 - **Fix with:** none
 - **Effort:** S (hours)
-
-### ISH-48 · P3 · `main.rs` still holds the editor and `Shell`, and the keystroke path has no unit seam
-
-- **Status:** Decision accepted; implementation pending.
-- **Area:** Architecture
-- **Where:** `src/main.rs`, `docs/architecture.md`
-- **Problem:** ISH-34 moved the external handler, diagnostics, `cd` rewriting and mode state out and split `read_line_with_reader` per event and mode, but `main.rs` still holds the interactive `Shell` and editor. Per-mode handlers take runtime state and terminal-facing collaborators instead of a narrow event-transition seam. Binary modules can have unit tests; the missing separation of state from effects is the testing obstacle. `write_layout_dump_file` also retries every `open` error and eventually reports "could not choose a unique dump filename", hiding non-collision failures.
-- **Recommendation:** Keep interactive `Shell` private in binary module `src/shell.rs`; extract reusable editor state and mode/key handlers into library `src/editor.rs` with narrow context and typed actions. Keep process/terminal/job ownership in the binary, preserve buffer reuse, add handler unit coverage, and return the dump writer's real non-collision open errors.
-- **Fix with:** api-surface-and-module-boundaries
-- **Effort:** L (weeks)
-- **Design:** [Private session, testable editor](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor)

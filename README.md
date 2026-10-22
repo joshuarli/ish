@@ -65,10 +65,11 @@ Control characters in the user, host, directory, and branch appear as `�`.
 | Ctrl+Z | Suspend the foreground job |
 | Ctrl+P | Write a layout dump under `~/.cache/ish/` |
 
-Completion filters as you type and prefers prefix matches. Recent files appear
+Completion filters as you type or paste and prefers prefix matches. Recent files appear
 first; partial paths and SSH hosts are supported. SSH host completion reads
 `~/.ssh/config` and `~/.ssh/known_hosts`. Use the arrows or Tab to move through
-results, Enter to accept, and Escape to cancel.
+results, Enter to accept, and Escape to cancel. Pasting while the recent-directory
+picker is open leaves its saved input unchanged.
 
 Ctrl+R opens a case-insensitive fuzzy-search pager with matches highlighted.
 Typing or pasting edits the search query and filters the matches.

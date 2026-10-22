@@ -21,7 +21,8 @@ behavior contract.
 - Use epsh for parsing and evaluation, but expose only syntax accepted by the README and `dispatch::plan()`.
 - Refuse unsupported syntax before evaluation; do not pass background jobs, compound commands, functions, `source`, `eval`, or parameter operators to epsh.
 - Run shell-state builtins in ish only as a whole input line; `cd` and `history` also have list forms.
-- Register each ish-owned builtin once in `src/builtin.rs` with its execution class; route shell-state handlers through `src/main.rs`.
+- Register each ish-owned builtin once in `src/builtin.rs` with its execution class; route shell-state handlers through the private binary runtime in `src/shell.rs`.
+- Keep interactive `Shell` private in binary `src/shell.rs`. Library `src/editor.rs` owns private editor state and returns typed actions from borrowed shell context; terminal, process, job and persistence effects stay in the binary.
 - Keep at most one suspended foreground job.
 - Prefer rustix for Unix and system calls; keep any libc exception narrow and explain it where it is used.
 - Localize unsafe code at platform boundaries and preserve descriptor ownership and error handling.
