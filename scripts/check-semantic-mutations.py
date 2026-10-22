@@ -72,11 +72,11 @@ MUTATIONS = (
             ),
             (
                 "crates/epsh/src/eval.rs",
-                "        // Setup redirections before executing (applies to builtins, functions, externals)\n"
-                "        let saved_fds = self.setup_redirections(redirs)?;\n",
-                "        // Setup redirections before executing (applies to builtins, functions, externals)\n"
+                "        let saved_fds = self.setup_redirections(redirs)?;\n\n"
+                "        let result = match self.try_builtin(cmd_name, &expanded_args, assigns, &[], span) {\n",
                 "        let saved_fds = self.setup_redirections(redirs)?;\n"
-                "        self.check_command_policy_for_dispatch(&expanded_args, span)?;\n",
+                "        self.check_command_policy_for_dispatch(&expanded_args, span)?;\n\n"
+                "        let result = match self.try_builtin(cmd_name, &expanded_args, assigns, &[], span) {\n",
             ),
         ),
     ),

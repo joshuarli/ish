@@ -17,7 +17,7 @@ fn changed_published_version_retains_source(merge: bool, mode: bool) {
     let base = fixture.0.clone();
     let altered = Arc::new(Mutex::new(None));
     let changed = altered.clone();
-    let (outcome, _) = fixture.run(&request, move |point| {
+    let (outcome, events) = fixture.run(&request, move |point| {
         force_exdev(point)?;
         let path = if !merge && point == "after_publish" { Some(base.join("destination")) }
             else if merge && point == "before_copy" { fs::read_dir(base.join("destination")).unwrap().next().map(|entry| entry.unwrap().path()) }
@@ -32,9 +32,32 @@ fn changed_published_version_retains_source(merge: bool, mode: bool) {
     });
     assert!(altered.lock().unwrap().is_some());
     assert_eq!(outcome.status(), 1, "merge={merge}, mode={mode}");
+    let state = events.iter().find_map(|event| match event {
+        Event::Operand(outcome) => Some(outcome.state),
+        _ => None,
+    }).unwrap();
+    assert_eq!(state, if merge { OperandState::DestinationPartiallyPublished } else { OperandState::DestinationPublishedSourceRetained });
     if merge {
         assert_eq!(fs::read_dir(fixture.0.join("source")).unwrap().count(), 2);
-    } else { assert_eq!(fs::read(fixture.0.join("source")).unwrap(), b"original"); }
+        assert_eq!(fs::read(fixture.0.join("source/first")).unwrap(), b"original");
+        assert_eq!(fs::read(fixture.0.join("source/second")).unwrap(), b"original");
+        let changed_path = altered.lock().unwrap().clone().unwrap();
+        if mode {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&changed_path).unwrap().permissions().mode() & 0o777, 0o600);
+        } else {
+            assert_eq!(fs::read(&changed_path).unwrap(), b"tampered-longer");
+        }
+        let first_destination = fixture.0.join("destination/first");
+        let second_destination = fixture.0.join("destination/second");
+        assert!(changed_path == first_destination || changed_path == second_destination);
+        let unchanged_destination = if changed_path == first_destination { second_destination } else { first_destination };
+        assert_eq!(fs::read(unchanged_destination).unwrap(), b"original");
+    } else {
+        assert_eq!(fs::read(fixture.0.join("source")).unwrap(), b"original");
+        if mode { assert_eq!(fs::metadata(fixture.0.join("destination")).unwrap().permissions().mode() & 0o777, 0o600); }
+        else { assert_eq!(fs::read(fixture.0.join("destination")).unwrap(), b"tampered-longer"); }
+    }
 }
 
 #[test]
@@ -45,6 +68,202 @@ fn repair_after_publish_mode_mutation_retains_source() { changed_published_versi
 fn repair_earlier_merge_child_content_mutation_retains_source() { changed_published_version_retains_source(true, false); }
 #[test]
 fn repair_earlier_merge_child_mode_mutation_retains_source() { changed_published_version_retains_source(true, true); }
+
+#[test]
+fn repair_replace_tracks_displaced_destination_hardlink_versions() {
+    use std::os::unix::fs::MetadataExt;
+    for operation in [Operation::Copy, Operation::Move] {
+        for force_cross_device in [false, true] {
+            for aliases in [2, 3] {
+                let fixture = Fixture::new();
+                fs::create_dir(fixture.0.join("source")).unwrap();
+                fs::create_dir(fixture.0.join("out")).unwrap();
+                fs::write(fixture.0.join("out/a"), b"old destination").unwrap();
+                for index in 1..aliases {
+                    let name = format!("out/{}", char::from(b'a' + index as u8));
+                    fs::hard_link(fixture.0.join("out/a"), fixture.0.join(name)).unwrap();
+                }
+                fs::hard_link(fixture.0.join("out/a"), fixture.0.join("out/retained")).unwrap();
+                let mut sources = Vec::new();
+                let mut names = Vec::new();
+                for index in 0..aliases {
+                    let name = char::from(b'a' + index as u8).to_string();
+                    fs::write(fixture.0.join("source").join(&name), format!("new source {name}")).unwrap();
+                    sources.push(PathBuf::from("source").join(&name));
+                    names.push(name);
+                }
+                let mut request = fixture.request();
+                request.operation = operation;
+                request.options.collision = crate::Collision::Replace;
+                request.operands = crate::Operands::Into { directory: "out".into(), first: sources[0].clone(), rest: sources[1..].to_vec() };
+                let (outcome, events) = fixture.run(&request, move |point| if force_cross_device { force_exdev(point) } else { Ok(()) });
+                assert_eq!(outcome.status(), 0, "operation={operation:?}, exdev={force_cross_device}, aliases={aliases}");
+                let mut output_inodes = Vec::new();
+                for name in &names {
+                    assert_eq!(fs::read(fixture.0.join("out").join(name)).unwrap(), format!("new source {name}").as_bytes());
+                    output_inodes.push(fs::metadata(fixture.0.join("out").join(name)).unwrap().ino());
+                }
+                assert_eq!(output_inodes.iter().collect::<std::collections::HashSet<_>>().len(), aliases);
+                assert_eq!(fs::read(fixture.0.join("out/retained")).unwrap(), b"old destination");
+                let expected_state = if operation == Operation::Copy { OperandState::Copied } else { OperandState::Moved };
+                assert_eq!(events.iter().filter_map(|event| match event {
+                    Event::Operand(outcome) => Some(outcome.state),
+                    _ => None,
+                }).collect::<Vec<_>>(), vec![expected_state; aliases]);
+                for source in sources { assert_eq!(fixture.0.join(source).exists(), operation == Operation::Copy); }
+                let retained = fs::metadata(fixture.0.join("out/retained")).unwrap();
+                assert_eq!(retained.nlink(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn repair_replace_revalidates_later_source_alias_of_displaced_inode() {
+    use std::os::unix::fs::MetadataExt;
+    for operation in [Operation::Copy, Operation::Move] {
+        for force_cross_device in [false, true] {
+            let fixture = Fixture::new();
+            fs::create_dir(fixture.0.join("source")).unwrap();
+            fs::create_dir(fixture.0.join("out")).unwrap();
+            fs::write(fixture.0.join("source/a"), b"new first").unwrap();
+            fs::write(fixture.0.join("out/a"), b"old shared inode").unwrap();
+            fs::hard_link(fixture.0.join("out/a"), fixture.0.join("source/b")).unwrap();
+            fs::hard_link(fixture.0.join("out/a"), fixture.0.join("out/retained")).unwrap();
+            fs::write(fixture.0.join("out/b"), b"old second destination").unwrap();
+            let mut request = fixture.request();
+            request.operation = operation;
+            request.options.collision = crate::Collision::Replace;
+            request.operands = crate::Operands::Into { directory: "out".into(), first: "source/a".into(), rest: vec!["source/b".into()] };
+            let (outcome, events) = fixture.run(&request, move |point| if force_cross_device { force_exdev(point) } else { Ok(()) });
+            assert_eq!(outcome.status(), 0, "operation={operation:?}, exdev={force_cross_device}");
+            let expected_state = if operation == Operation::Copy { OperandState::Copied } else { OperandState::Moved };
+            assert_eq!(events.iter().filter_map(|event| match event { Event::Operand(outcome) => Some(outcome.state), _ => None }).collect::<Vec<_>>(), [expected_state; 2]);
+            assert_eq!(fs::read(fixture.0.join("out/a")).unwrap(), b"new first");
+            assert_eq!(fs::read(fixture.0.join("out/b")).unwrap(), b"old shared inode");
+            assert_eq!(fs::read(fixture.0.join("out/retained")).unwrap(), b"old shared inode");
+            assert_eq!(fixture.0.join("source/a").exists(), operation == Operation::Copy);
+            assert_eq!(fixture.0.join("source/b").exists(), operation == Operation::Copy);
+            let retained = fs::metadata(fixture.0.join("out/retained")).unwrap();
+            let second = fs::metadata(fixture.0.join("out/b")).unwrap();
+            if operation == Operation::Copy {
+                assert_eq!(retained.ino(), fs::metadata(fixture.0.join("source/b")).unwrap().ino());
+            } else if force_cross_device {
+                assert_ne!(retained.ino(), second.ino());
+            } else {
+                assert_eq!(retained.ino(), second.ino());
+            }
+        }
+    }
+}
+
+#[test]
+fn repair_replace_rejects_external_change_to_remaining_destination_alias() {
+    use std::sync::atomic::AtomicUsize;
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.0.join("source")).unwrap();
+    fs::create_dir(fixture.0.join("out")).unwrap();
+    fs::write(fixture.0.join("out/a"), b"old shared inode").unwrap();
+    fs::hard_link(fixture.0.join("out/a"), fixture.0.join("out/b")).unwrap();
+    fs::hard_link(fixture.0.join("out/a"), fixture.0.join("out/retained")).unwrap();
+    fs::write(fixture.0.join("source/a"), b"new first").unwrap();
+    fs::write(fixture.0.join("source/b"), b"new second").unwrap();
+    let mut request = fixture.request();
+    request.operation = Operation::Copy;
+    request.options.collision = crate::Collision::Replace;
+    request.operands = crate::Operands::Into { directory: "out".into(), first: "source/a".into(), rest: vec!["source/b".into()] };
+    let base = fixture.0.clone();
+    let replaced = AtomicUsize::new(0);
+    let (outcome, events) = fixture.run(&request, move |point| {
+        if point == "after_replace" && replaced.fetch_add(1, Ordering::Relaxed) == 0 {
+            fs::write(base.join("out/b"), b"external mutation").unwrap();
+        }
+        Ok(())
+    });
+    assert_eq!(outcome.status(), 1);
+    let states = events.iter().filter_map(|event| match event { Event::Operand(outcome) => Some(outcome.state), _ => None }).collect::<Vec<_>>();
+    assert_eq!(states, [OperandState::Copied, OperandState::FailedBeforePublication]);
+    assert_eq!(fs::read(fixture.0.join("out/a")).unwrap(), b"new first");
+    assert_eq!(fs::read(fixture.0.join("out/b")).unwrap(), b"external mutation");
+    assert_eq!(fs::read(fixture.0.join("out/retained")).unwrap(), b"external mutation");
+    assert_eq!(fs::read(fixture.0.join("source/b")).unwrap(), b"new second");
+}
+
+#[test]
+fn repair_replace_tracks_hardlinked_symlink_destination_versions() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+    for operation in [Operation::Copy, Operation::Move] {
+        for force_cross_device in [false, true] {
+            let fixture = Fixture::new();
+            fs::create_dir(fixture.0.join("source")).unwrap();
+            fs::create_dir(fixture.0.join("out")).unwrap();
+            symlink("old-target", fixture.0.join("out/a")).unwrap();
+            fs::hard_link(fixture.0.join("out/a"), fixture.0.join("out/b")).unwrap();
+            fs::hard_link(fixture.0.join("out/a"), fixture.0.join("out/retained")).unwrap();
+            symlink("new-target-a", fixture.0.join("source/a")).unwrap();
+            symlink("new-target-b", fixture.0.join("source/b")).unwrap();
+            let mut request = fixture.request();
+            request.operation = operation;
+            request.options.collision = crate::Collision::Replace;
+            request.operands = crate::Operands::Into { directory: "out".into(), first: "source/a".into(), rest: vec!["source/b".into()] };
+            let (outcome, events) = fixture.run(&request, move |point| if force_cross_device { force_exdev(point) } else { Ok(()) });
+            assert_eq!(outcome.status(), 0, "operation={operation:?}, exdev={force_cross_device}");
+            let expected_state = if operation == Operation::Copy { OperandState::Copied } else { OperandState::Moved };
+            assert_eq!(events.iter().filter_map(|event| match event { Event::Operand(outcome) => Some(outcome.state), _ => None }).collect::<Vec<_>>(), [expected_state; 2]);
+            assert_eq!(fs::read_link(fixture.0.join("out/a")).unwrap(), PathBuf::from("new-target-a"));
+            assert_eq!(fs::read_link(fixture.0.join("out/b")).unwrap(), PathBuf::from("new-target-b"));
+            assert_eq!(fs::read_link(fixture.0.join("out/retained")).unwrap(), PathBuf::from("old-target"));
+            for name in ["a", "b"] {
+                let source_path = fixture.0.join("source").join(name);
+                if operation == Operation::Copy {
+                    assert!(fs::symlink_metadata(&source_path).unwrap().file_type().is_symlink());
+                } else {
+                    assert_eq!(fs::symlink_metadata(&source_path).unwrap_err().kind(), io::ErrorKind::NotFound);
+                }
+            }
+            assert_ne!(fs::symlink_metadata(fixture.0.join("out/a")).unwrap().ino(), fs::symlink_metadata(fixture.0.join("out/b")).unwrap().ino());
+            assert_eq!(fs::symlink_metadata(fixture.0.join("out/retained")).unwrap().nlink(), 1);
+        }
+    }
+}
+
+#[test]
+fn repair_merge_finalization_failures_preserve_partial_retirement_state() {
+    use std::sync::atomic::AtomicUsize;
+    for boundary in [
+        "merge_receipt_records",
+        "merge_receipt_filter",
+        "merge_destination_snapshot",
+        "merge_descriptor_budget",
+        "merge_descriptor_duplication",
+        "merge_retirement",
+        "before_retire",
+    ] {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.0.join("source")).unwrap();
+        fs::create_dir(fixture.0.join("out")).unwrap();
+        fs::write(fixture.0.join("source/a"), b"first child").unwrap();
+        fs::write(fixture.0.join("source/b"), b"second child").unwrap();
+        let mut request = fixture.request();
+        request.operation = Operation::Move;
+        request.options.merge = true;
+        request.operands = crate::Operands::Exact { source: "source".into(), destination: "out".into() };
+        let renames = AtomicUsize::new(0);
+        let (outcome, events) = fixture.run(&request, move |point| {
+            if point == "rename" && renames.fetch_add(1, Ordering::Relaxed) > 0 { return force_exdev(point); }
+            if point == boundary { return Err(io::Error::other(format!("injected {boundary}"))); }
+            Ok(())
+        });
+        assert_eq!(outcome.status(), 1, "{boundary}");
+        assert!(events.iter().any(|event| matches!(event, Event::Operand(operand) if operand.state == OperandState::SourcePartiallyRetired)), "{boundary}: {events:?}");
+        assert_eq!(fs::read(fixture.0.join("out/a")).unwrap(), b"first child", "{boundary}");
+        assert_eq!(fs::read(fixture.0.join("out/b")).unwrap(), b"second child", "{boundary}");
+        let removed = ["a", "b"].into_iter().filter(|name| !fixture.0.join("source").join(name).exists()).collect::<Vec<_>>();
+        assert_eq!(removed.len(), 1, "{boundary}");
+        let retained = if removed[0] == "a" { "b" } else { "a" };
+        assert_eq!(fs::read(fixture.0.join("source").join(retained)).unwrap().as_slice(), if retained == "a" { &b"first child"[..] } else { &b"second child"[..] }, "{boundary}");
+    }
+}
 
 #[test]
 fn repair_symlink_hardlinks_preserve_invocation_topology() {
@@ -244,7 +463,10 @@ fn repair_deferred_metadata_validates_successful_output() {
     impl Drop for ResetFlags {
         fn drop(&mut self) {
             for path in &self.0 {
-                if let Ok(file) = File::open(path) { ioctl_setflags(&file, IFlags::empty()).unwrap(); }
+                if let Ok(file) = File::open(path) && let Ok(flags) = ioctl_getflags(&file) {
+                    let reset = IFlags::from_bits_retain(flags.bits() & !(IFlags::IMMUTABLE | IFlags::APPEND).bits());
+                    if reset != flags { ioctl_setflags(&file, reset).unwrap_or_else(|error| panic!("clear inode flags from {path:?} ({flags:?}): {error}")); }
+                }
             }
         }
     }
@@ -275,6 +497,110 @@ fn repair_deferred_metadata_validates_successful_output() {
         assert_eq!(outcome.status(), i32::from(mutate));
         if !mutate { assert!(ioctl_getflags(File::open(destination).unwrap()).unwrap().contains(IFlags::IMMUTABLE)); }
         assert_eq!(fs::read(source).unwrap(), b"original");
+    }
+    for flag in [IFlags::IMMUTABLE, IFlags::APPEND] {
+        for merge in [false, true] {
+            let fixture = Fixture::new();
+            let source = fixture.0.join("source");
+            let destination = fixture.0.join("out");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&destination).unwrap();
+            fs::write(source.join("a"), b"linked source").unwrap();
+            fs::hard_link(source.join("a"), source.join("b")).unwrap();
+            let file = File::open(source.join("a")).unwrap();
+            let original = ioctl_getflags(&file).unwrap();
+            if let Err(error) = ioctl_setflags(&file, original | flag) {
+                panic!("cannot set deferred metadata fixture flag {flag:?}: {error}");
+            }
+            let _reset = ResetFlags(vec![source.join("a"), destination.join("a"), destination.join("b")]);
+            let mut request = fixture.request();
+            request.operation = Operation::Copy;
+            if merge {
+                request.options.merge = true;
+                request.operands = crate::Operands::Exact { source: "source".into(), destination: "out".into() };
+            } else {
+                request.operands = crate::Operands::Into { directory: "out".into(), first: "source/a".into(), rest: vec!["source/b".into()] };
+            }
+            let (outcome, events) = fixture.run(&request, |_| Ok(()));
+            assert_eq!(outcome.status(), 0, "flag={flag:?}, merge={merge}");
+            assert_eq!(fs::read(destination.join("a")).unwrap(), b"linked source");
+            assert_eq!(fs::read(destination.join("b")).unwrap(), b"linked source");
+            assert_eq!(fs::metadata(destination.join("a")).unwrap().ino(), fs::metadata(destination.join("b")).unwrap().ino());
+            assert!(ioctl_getflags(File::open(destination.join("a")).unwrap()).unwrap().contains(flag));
+            assert!(events.iter().filter_map(|event| match event {
+                Event::Operand(outcome) => Some(outcome.state),
+                _ => None,
+            }).all(|state| state == OperandState::Copied));
+            assert_eq!(fs::metadata(source.join("a")).unwrap().ino(), fs::metadata(source.join("b")).unwrap().ino());
+        }
+        for merge in [false, true] {
+            let fixture = Fixture::new();
+            let source = fixture.0.join("source");
+            let destination = fixture.0.join("out");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&destination).unwrap();
+            fs::write(source.join("a"), b"linked source").unwrap();
+            fs::hard_link(source.join("a"), source.join("b")).unwrap();
+            let file = File::open(source.join("a")).unwrap();
+            let original = ioctl_getflags(&file).unwrap();
+            ioctl_setflags(&file, original | flag).unwrap();
+            let _reset = ResetFlags(vec![source.join("a"), destination.join("a"), destination.join("b")]);
+            let mut request = fixture.request();
+            request.operation = Operation::Move;
+            if merge {
+                request.options.merge = true;
+                request.operands = crate::Operands::Exact { source: "source".into(), destination: "out".into() };
+            } else {
+                request.operands = crate::Operands::Into { directory: "out".into(), first: "source/a".into(), rest: vec!["source/b".into()] };
+            }
+            let (outcome, events) = fixture.run(&request, force_exdev);
+            assert_eq!(outcome.status(), 1, "flag={flag:?}, merge={merge}");
+            assert_eq!(fs::read(destination.join("a")).unwrap(), b"linked source");
+            assert_eq!(fs::read(destination.join("b")).unwrap(), b"linked source");
+            assert_eq!(fs::metadata(destination.join("a")).unwrap().ino(), fs::metadata(destination.join("b")).unwrap().ino());
+            assert!(ioctl_getflags(File::open(destination.join("a")).unwrap()).unwrap().contains(flag));
+            assert_eq!(fs::read(source.join("a")).unwrap(), b"linked source");
+            assert_eq!(fs::read(source.join("b")).unwrap(), b"linked source");
+            assert_eq!(fs::metadata(source.join("a")).unwrap().ino(), fs::metadata(source.join("b")).unwrap().ino());
+            let states = events.iter().filter_map(|event| match event { Event::Operand(outcome) => Some(outcome.state), _ => None }).collect::<Vec<_>>();
+            assert_eq!(states.len(), if merge { 1 } else { 2 });
+            assert!(states.iter().all(|state| matches!(state, OperandState::DestinationPublishedSourceRetained | OperandState::DestinationPartiallyPublished)), "flag={flag:?}, merge={merge}: {states:?}");
+        }
+    }
+    for cancel in [false, true] {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        let destination = fixture.0.join("out");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(source.join("a"), b"linked source").unwrap();
+        fs::hard_link(source.join("a"), source.join("b")).unwrap();
+        let file = File::open(source.join("a")).unwrap();
+        let original = ioctl_getflags(&file).unwrap();
+        ioctl_setflags(&file, original | IFlags::IMMUTABLE).unwrap();
+        let _reset = ResetFlags(vec![source.join("a"), destination.join("a"), destination.join("b")]);
+        let mut request = fixture.request();
+        request.operation = Operation::Copy;
+        request.operands = crate::Operands::Into { directory: "out".into(), first: "source/a".into(), rest: vec!["source/b".into()] };
+        let cancellation = Arc::new(Cancellation::default());
+        let selected = cancellation.clone();
+        HOOK.with(|hook| *hook.borrow_mut() = Some(Arc::new(move |point| {
+            if point == "before_final_metadata" {
+                if cancel { selected.cancel(); }
+                return Err(io::Error::other("injected final metadata boundary"));
+            }
+            Ok(())
+        })));
+        let events = Mutex::new(Vec::new());
+        let outcome = execute(&request, &cancellation, &|event| { events.lock().unwrap().push(event); Ok(()) });
+        HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(outcome.status(), if cancel { 130 } else { 1 });
+        let states = events.into_inner().unwrap().into_iter().filter_map(|event| match event { Event::Operand(outcome) => Some(outcome.state), _ => None }).collect::<Vec<_>>();
+        assert_eq!(states, [OperandState::DestinationPartiallyPublished; 2]);
+        assert_eq!(fs::read(destination.join("a")).unwrap(), b"linked source");
+        assert_eq!(fs::read(destination.join("b")).unwrap(), b"linked source");
+        assert_eq!(fs::metadata(destination.join("a")).unwrap().ino(), fs::metadata(destination.join("b")).unwrap().ino());
+        assert_eq!(fs::metadata(source.join("a")).unwrap().ino(), fs::metadata(source.join("b")).unwrap().ino());
     }
 }
 

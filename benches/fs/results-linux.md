@@ -227,3 +227,38 @@ make these single-build figures noncomparative.
 BusyBox `cp` and `mv` are context only: `cp` is not clone-aware, and these
 utility samples do not verify the engine's durability guarantee. No comparison
 across engine, PTY builtin, and native utility timings is claimed.
+
+## Follow-up hardlink sample
+
+This five-sample run measured the repaired working tree on Linux x86_64,
+kernel 7.2.9-2-stable, Alpine musl, and ext4 (device 66307). The runtime source
+identity is base `dfb615457ad4828216d9d8b8ea44711e8806b633` plus the binary diff
+for `engine/mod.rs`, `engine/transfer.rs`, and `engine/dry_run.rs` with Git blob
+ID `412adb0b15fad3b4f1d891db661e859d8664427b`. This identifies the measured
+runtime patch; test and documentation edits do not affect the measurement.
+
+The command was:
+
+```sh
+ISH_FS_BENCH_FEATURES_READY=1 benches/fs/bench.sh measure \
+    "$PWD/.work/tmp/ish-fs-hardlink-final" 66307:66201313 hardlinks
+```
+
+All five samples per side passed `perf-gate-ready` immediately before and
+`perf-gate-ready -1` immediately after, had no overlapping load, and passed
+output verification. The fixture verifier had warmed the file cache. It held
+18 names for one 4 KiB inode and 256 ordinary 4 KiB files (275 entries
+including the root), totaling 1,052,672 logical bytes. The engine selected
+Native for 257 data copies and preserved the hardlink group. The owned fixture
+was removed after verifying its device and inode identity.
+
+| Side and timing scope | Elapsed median [min, max] | Process CPU median [min, max] |
+| --- | ---: | ---: |
+| Direct engine request | 0.034146371 [0.033148481, 0.034698773] s | 0.021480 [0.020226, 0.021672] s |
+| Interactive builtin command responses | 0.087715206 [0.085480991, 0.116500481] s | 0.030228 [0.029567, 0.033840] s |
+| BusyBox `cp` utility calls | 0.002816974 [0.002203926, 0.003315274] s | 0.002719 [0.002187, 0.003317] s |
+
+This is a descriptive sample of ordinary hardlink-group copying. It does not
+measure replacement of aliased destinations or deferred blocking flags, and it
+has no interleaved pre-repair baseline. The interface scopes and BusyBox
+preservation/durability policy differ, so it supports no speedup claim.

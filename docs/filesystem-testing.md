@@ -52,9 +52,9 @@ data. For manual fixtures, follow ownership and path checks in
 
 Every `native_boundaries` case that needs a fixture is `#[ignore]`, so
 `cargo test -p ish-fs --test native_boundaries` and `make test` report those
-cases as ignored rather than passed. The script runs the EXDEV move, nested
-mount, and bind-alias cases with `-- --ignored` and the `ISH_FS_TEST_*`
-variables set. An ignored case run without its variables, or on a fixture that
+cases as ignored rather than passed. The script runs the EXDEV move, EXDEV
+replacement-alias, nested mount, and bind-alias cases with `-- --ignored` and
+the `ISH_FS_TEST_*` variables set. An ignored case run without its variables, or on a fixture that
 does not satisfy it, panics. The `native_macos` case that needs uid 0 is ignored
 the same way; the other macOS cases fail instead of returning early on a
 filesystem without APFS clones or resource forks.
@@ -70,22 +70,42 @@ The foreign-owner cases need uid 0 with CAP_CHOWN. The script's single-ID user
 namespace cannot assign uid 65534, so it does not run them; see the
 foreign-owner row below.
 
-The recorded x86_64 Alpine musl run on Linux 7.2.9 exercised ext4-to-tmpfs EXDEV,
-nested mount refusal and explicit traversal, mountpoint EBUSY retirement, and
-eight mixed rename/transfer hardlink combinations. Foreign-owner setup was not
-exercised there. A run that reports ignored cases does not establish those
-guarantees.
+## Completed Linux x86_64 evidence
+
+The local acceptance run used the `dfb615457ad4828216d9d8b8ea44711e8806b633`
+base plus the working-tree patch identified in the completion report. The host
+was Linux x86_64, kernel 7.2.9-2-stable, Alpine musl, on ext4. The workspace
+filesystem was device 66307. The candidate was not pushed, so no hosted CI run
+tested this patch.
+
+| Acceptance | Command and observed result |
+| --- | --- |
+| Workspace check | `cargo check --workspace` passed. |
+| Strict Clippy | `cargo clippy --workspace --all-targets -- -D warnings` passed. |
+| Workspace tests | `cargo test --workspace` passed after the replacement-alias, merge-progress, blocking-flag, and shell-rendering regressions were added. |
+| Integrated shell tests | `make test TARGET=x86_64-unknown-linux-musl` passed in `ish-builder:gate-repairs`; runtime-compiled epsh byte fixtures passed with the image's configured clang linker. |
+| Conformance | `make conformance` passed: 168 passed, 7 declared feature exclusions, 0 failed, out of 175 retained cases. |
+| Semantic verification | `make verify` passed: Lean checks and bridge passed, and all four compiled production mutations were behaviorally killed, including dynamic command checking after redirection setup. |
+| Shift refinement | `make verify-refinement` passed with the pinned Lean 4.35.0 toolchain. |
+| Owned mount fixtures | `benches/fs/native-fixtures.sh` passed real ext4-to-tmpfs move and replacement-alias tests, nested mount refusal and explicit traversal, mountpoint EBUSY retirement, and bind-mount hardlink topology cases. The script's private namespace supplied its disposable mount fixtures. |
+| Foreign-owner EXDEV | In `ish-builder:gate-repairs`, a private tmpfs cross root was mounted with `CAP_SYS_ADMIN`; the runner had uid 0 and `CAP_CHOWN`, `CAP_SETUID`, and `CAP_SETGID`. `cargo test -p ish-fs --test native_boundaries native_boundary_foreign -- --ignored --nocapture` passed both the readable foreign-owner move and privilege-dropped refusal tests. The refusal preserved source identity and bytes and published no destination. |
+| Deferred inode flags | With `CAP_LINUX_IMMUTABLE` on host ext4, `cargo test -p ish-fs --lib repair_deferred_metadata_validates_successful_output -- --ignored --nocapture` passed immutable and append-only hardlink-group, merge, EXDEV move, injected failure, and cancellation cases. |
+| FICLONE | The required named ignored test was executed with `cargo test -p ish-fs --lib public_copy_selects_reflink_when_ficlone_works -- --ignored --nocapture`. It failed because host ext4 returned `EOPNOTSUPP` (error 95). No clone-capable fixture was available, so successful clone acceptance remains pending. |
+
+The final source patch is local and uncommitted. The completed GitHub run
+[39792421234](https://github.com/joshuarli/ish/actions/runs/39792421234) tested
+the unchanged base revision before these repairs and failed all four jobs. The
+local x86_64 musl and semantic gates above pass on the candidate; that does not
+establish hosted ARM64 or macOS results.
 
 ## Required native evidence still missing
 
 | Required run | Setup and acceptance condition |
 | --- | --- |
-| Successful Linux reflink | Use a FICLONE-capable owned filesystem. Run the native Linux target above and `cargo test -p ish-fs --lib public_copy_selects_reflink_when_ficlone_works -- --ignored --nocapture`. The ignored case panics when FICLONE is unavailable. The recorded ext4 host returns EOPNOTSUPP. |
-| Foreign-owner success and safe refusal | As effective uid 0 with CAP_CHOWN, set `ISH_FS_TEST_CROSS_ROOT` to an owned writable distinct-device directory and run `cargo test -p ish-fs --test native_boundaries native_boundary_foreign -- --ignored --nocapture`. Both the success and privilege-dropped denial cases must execute. The denial case checks unchanged source bytes/identity and no publication. |
-| Deferred immutable metadata | Run `cargo test -p ish-fs --lib repair_deferred_metadata_validates_successful_output -- --ignored --nocapture` with CAP_LINUX_IMMUTABLE on a filesystem with inode flags. The ignored case panics on EPERM, as on the recorded host. |
-| Native ARM64 musl | On ARM64 Linux musl, run workspace check, strict all-target Clippy, workspace library/integration tests, `make test`, and the mount fixture script. Cross-build and QEMU execution are not native hardware evidence. |
-| Native macOS | Run workspace check, strict all-target Clippy, workspace tests, `make test`, and `cargo test -p ish-fs --test native_macos -- --include-ignored --nocapture` as uid 0 (the foreign-owner staging case is ignored otherwise). Require clone, ACL/access, foreign-owner, immutable-flag, cancellation, sparse, and resource-fork cases to execute with appropriate privileges. Large resource forks above 4 GiB particularly need native identity-gate validation; unsupported identity must fail safely. |
-| Native comparisons | Follow the [benchmark harness](../benches/fs/README.md) on clone-capable Linux and macOS. Record selected methods and preservation/durability differences for GNU cp and Apple cp/cp -c. |
+| Successful Linux reflink | Use an owned FICLONE-capable filesystem, then run the named test above and confirm the public engine selects `Clone` while preserving required logical metadata. The available ext4 host returned `EOPNOTSUPP`; the test did not pass. |
+| Native ARM64 musl | On ARM64 Linux musl hardware, run workspace check, strict all-target Clippy, workspace library/integration tests, `make test`, and `benches/fs/native-fixtures.sh`. Cross-build and QEMU execution are supporting checks, not native hardware evidence. |
+| Native macOS | macOS acceptance is tracked in [TODO.md, ISH-45](../TODO.md). Run workspace check, strict all-target Clippy, workspace tests, `make test`, and the native suite as an ordinary user; run privileged cases separately with suitable ownership and capabilities. Require clone/access normalization, ACLs, foreign ownership, flags, cancellation, sparse fallback, and resource forks to execute. Validate large resource forks above 4 GiB and unsupported identity failure. |
+| Native comparisons | On clone-capable Linux and macOS, follow the [benchmark harness](../benches/fs/README.md). Record selected methods and preservation/durability differences for GNU `cp` and Apple `cp`/`cp -c`. The available host provides BusyBox `cp`, not GNU clone-aware `cp`, and no Apple utility. |
 
 The repair run passed native x86_64 musl workspace checks, strict Clippy, Rust
 and PTY tests, conformance, semantic verification, and shift refinement.

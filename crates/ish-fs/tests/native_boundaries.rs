@@ -146,6 +146,68 @@ fn native_boundary_real_exdev_move_preserves_and_syncs() {
 }
 
 #[test]
+#[ignore = "needs a distinct-device directory in ISH_FS_TEST_CROSS_ROOT; run benches/fs/native-fixtures.sh"]
+fn native_boundary_real_exdev_replacement_accounts_for_destination_aliases() {
+    let fixture = local("exdev-replacement-source");
+    let source_device = fs::metadata(fixture.path()).expect("stat source fixture").dev();
+    let cross = cross_root(source_device);
+    let destination_parent = OwnedDirectory::create(&cross, "exdev-replacement-destination");
+    let source = fixture.path().join("source");
+    let output = destination_parent.path().join("out");
+    fs::create_dir(&source).expect("create source directory");
+    fs::create_dir(&output).expect("create replacement directory");
+    fs::write(source.join("a"), b"new first").expect("write first source");
+    fs::write(source.join("b"), b"new second").expect("write second source");
+    fs::write(output.join("a"), b"old shared destination").expect("write old destination");
+    fs::hard_link(output.join("a"), output.join("b")).expect("hardlink second old destination");
+    fs::hard_link(output.join("a"), output.join("retained")).expect("hardlink retained old destination");
+    let mut regular_request = request(Operation::Move, fixture.path(), fixture.path(), Path::new("source/a"), &output);
+    regular_request.options.collision = ish_fs::Collision::Replace;
+    regular_request.operands = Operands::Into { directory: output.clone(), first: PathBuf::from("source/a"), rest: vec![PathBuf::from("source/b")] };
+    let probe = fixture.path().join("rename-probe");
+    fs::write(&probe, b"probe").expect("write rename probe");
+    let error = fs::rename(&probe, output.join("rename-probe")).expect_err("replacement destination must be on another device");
+    assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+
+    let (outcome, events) = run(&regular_request);
+    assert_eq!(outcome.completion, Completion::Complete, "events: {events:?}");
+    assert_eq!(outcome.status(), 0);
+    assert!(events.iter().filter_map(|event| match event { Event::Operand(outcome) => Some(outcome.state), _ => None }).all(|state| state == OperandState::Moved));
+    assert!(!source.join("a").exists());
+    assert!(!source.join("b").exists());
+    assert_eq!(fs::read(output.join("a")).expect("read first replacement"), b"new first");
+    assert_eq!(fs::read(output.join("b")).expect("read second replacement"), b"new second");
+    assert_eq!(fs::read(output.join("retained")).expect("read retained alias"), b"old shared destination");
+    assert_eq!(fs::metadata(output.join("retained")).expect("stat retained alias").nlink(), 1);
+    assert!(outcome.metrics.destination_sync_work > std::time::Duration::ZERO);
+    assert!(outcome.metrics.source_retirement_elapsed > std::time::Duration::ZERO);
+
+    let symlink_sources = [source.join("link-a"), source.join("link-b")];
+    let symlink_destinations = [output.join("link-a"), output.join("link-b")];
+    symlink("new-target-a", &symlink_sources[0]).expect("create first symlink source");
+    symlink("new-target-b", &symlink_sources[1]).expect("create second symlink source");
+    symlink("old-target", &symlink_destinations[0]).expect("create old symlink destination");
+    fs::hard_link(&symlink_destinations[0], &symlink_destinations[1]).expect("hardlink second symlink destination");
+    let retained_symlink = output.join("link-retained");
+    fs::hard_link(&symlink_destinations[0], &retained_symlink).expect("hardlink retained symlink destination");
+    let mut symlink_request = request(Operation::Move, fixture.path(), fixture.path(), Path::new("source/link-a"), &output);
+    symlink_request.options.collision = ish_fs::Collision::Replace;
+    symlink_request.operands = Operands::Into { directory: output.clone(), first: PathBuf::from("source/link-a"), rest: vec![PathBuf::from("source/link-b")] };
+    let (outcome, events) = run(&symlink_request);
+    assert_eq!(outcome.completion, Completion::Complete, "events: {events:?}");
+    assert_eq!(outcome.status(), 0);
+    assert_eq!(events.iter().filter_map(|event| match event { Event::Operand(outcome) => Some(outcome.state), _ => None }).collect::<Vec<_>>(), [OperandState::Moved; 2]);
+    for path in &symlink_sources {
+        assert_eq!(fs::symlink_metadata(path).unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+    assert_eq!(fs::read_link(&symlink_destinations[0]).expect("read first symlink destination"), Path::new("new-target-a"));
+    assert_eq!(fs::read_link(&symlink_destinations[1]).expect("read second symlink destination"), Path::new("new-target-b"));
+    assert_eq!(fs::read_link(&retained_symlink).expect("read retained symlink destination"), Path::new("old-target"));
+    assert_eq!(fs::symlink_metadata(&retained_symlink).expect("stat retained symlink destination").nlink(), 1);
+    assert_ne!(fs::symlink_metadata(&symlink_destinations[0]).expect("stat first symlink destination").ino(), fs::symlink_metadata(&symlink_destinations[1]).expect("stat second symlink destination").ino());
+}
+
+#[test]
 #[ignore = "needs uid 0 with CAP_CHOWN and a distinct-device ISH_FS_TEST_CROSS_ROOT; see docs/filesystem-testing.md"]
 fn native_boundary_foreign_readable_file_survives_real_exdev_move() {
     let foreign_uid = 65_534;

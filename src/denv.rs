@@ -2683,12 +2683,18 @@ mod tests {
             .join("ordinary-project")
             .join("nested-directory")
             .join("another-directory")
+            .join("extended-trust-project-directory")
             .join("project-workspace");
         fs::create_dir_all(&project).unwrap();
         let path = project.join(".env");
         fs::write(&path, "A=1\n").unwrap();
         let file = read_trusted_candidate(&path).unwrap();
-        assert!(file.path.as_os_str().as_bytes().len() > 127);
+        assert!(
+            file.path.as_os_str().as_bytes().len() > 127,
+            "path has {} bytes: {}",
+            file.path.as_os_str().as_bytes().len(),
+            file.path.display()
+        );
         let allow = data.join("allow");
 
         allow_file_in(&allow, &file).unwrap();

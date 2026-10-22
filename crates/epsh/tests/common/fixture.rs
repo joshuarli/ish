@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,6 +12,11 @@ pub fn compile(directory: &Path, name: &str) -> PathBuf {
         }
         None => Command::new(compiler),
     };
+    if let Some(linker) = std::env::var_os("CC").filter(|value| !value.is_empty()) {
+        let mut linker_option = OsString::from("linker=");
+        linker_option.push(linker);
+        command.arg("-C").arg(linker_option);
+    }
     let executable = directory.join(name);
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")

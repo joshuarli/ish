@@ -122,6 +122,10 @@ it back and fails, so an unobserved destination is never destroyed. ish does not
 hash to copy a file. Clone, native-copy, and buffered paths follow the same
 logical metadata policy.
 
+Removing a displaced name can change the link count and version of its remaining
+hardlink aliases. Later operands accept only the transition verified during that
+unlink; an unrelated change to a remaining alias still stops the operation.
+
 Sparse regions are preserved where the destination supports them. Physical
 extent layout may differ. A destination without sparse support may require
 dense storage. ish warns when the source reports allocation below its logical
@@ -135,6 +139,10 @@ couple renamed directories to later hardlink aliases. ish indexes completed
 renames when a later alias needs them. When an earlier copied group could
 split, ish inspects the next directory and transfers a coupled tree instead
 of renaming it. Regular files and hardlinked symlinks keep their group topology.
+For groups with blocking inode flags, ish creates the destination links before
+applying those flags. A move synchronizes that final metadata before source
+retirement; source flags that prevent removal leave sources retained and report
+the published destination.
 
 A cross-filesystem move copies transferable
 objects and applies required metadata. It synchronizes destination data and
@@ -149,6 +157,8 @@ partially. Diagnostics for reported partial outcomes identify the source and
 destination paths or retained source entries. Inspect both trees before
 retrying or removing either one. ish does not roll back completed destination
 entries to make a partial move look atomic.
+If a later merge phase fails after children were published or a source entry
+was retired, the shell reports that partial progress even without `--verbose`.
 
 Cross-filesystem moves preserve source ownership when the destination permits
 it. If a move cannot reproduce meaningful ownership, ACL, extended attribute,

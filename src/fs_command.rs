@@ -580,15 +580,31 @@ mod tests {
     }
 
     #[test]
-    fn partial_move_outcomes_name_retained_source_data() {
-        let outcome = OperandOutcome {
-            source: PathBuf::from("source/tree"),
-            destination: PathBuf::from("target/tree"),
-            state: OperandState::DestinationPublishedSourceRetained,
-        };
-        assert_eq!(
-            render_partial(&outcome),
-            "published target/tree; retained source source/tree"
-        );
+    fn partial_move_outcomes_name_published_destinations_and_retired_sources() {
+        for (state, expected) in [
+            (
+                OperandState::DestinationPublishedSourceRetained,
+                "published target/tree; retained source source/tree",
+            ),
+            (
+                OperandState::DestinationPartiallyPublished,
+                "partially published target/tree; retained source source/tree",
+            ),
+            (
+                OperandState::SourcePartiallyRetired,
+                "partially retired source source/tree; inspect retained entries",
+            ),
+            (
+                OperandState::SourceRemovedSyncFailed,
+                "removed source source/tree; source parent sync failed",
+            ),
+        ] {
+            let outcome = OperandOutcome {
+                source: PathBuf::from("source/tree"),
+                destination: PathBuf::from("target/tree"),
+                state,
+            };
+            assert_eq!(render_partial(&outcome), expected);
+        }
     }
 }

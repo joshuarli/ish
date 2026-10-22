@@ -44,6 +44,8 @@ struct Invocation<'a> {
     progress: Mutex<Progress>,
     hardlinks: Mutex<Option<IndexedRecords>>,
     self_changes: Mutex<Option<IndexedRecords>>,
+    hardlink_members: Mutex<std::collections::HashMap<roots::Identity, usize>>,
+    deferred_flags: Mutex<Option<Records>>,
     active_hardlinks: Mutex<std::collections::HashSet<roots::Identity>>,
     hardlink_ready: Condvar,
     renamed_trees: Mutex<Option<Records>>,
@@ -132,6 +134,31 @@ impl Invocation<'_> {
         }
     }
 
+    fn hardlink_members_remaining(&self, identity: roots::Identity) -> usize {
+        self.hardlink_members.lock().unwrap().get(&identity).copied().unwrap_or(0)
+    }
+
+    fn consume_hardlink_member(&self, identity: roots::Identity) -> usize {
+        let mut members = self.hardlink_members.lock().unwrap();
+        let Some(remaining) = members.get_mut(&identity) else { return 0; };
+        *remaining = remaining.saturating_sub(1);
+        *remaining
+    }
+
+    fn has_pending_final_flags(&self, identity: roots::Identity) -> io::Result<bool> {
+        Ok(self.hardlink_record(identity)?.is_some_and(|record| record.final_flags != 0))
+    }
+
+    fn remember_deferred_flags(&self, record: &Record) -> io::Result<()> {
+        let mut deferred = self.deferred_flags.lock().unwrap();
+        if deferred.is_none() { *deferred = Some(Records::new(&self.request.context.scratch)?); }
+        deferred.as_mut().unwrap().push(record)
+    }
+
+    fn deferred_flags_end(&self) -> u64 {
+        self.deferred_flags.lock().unwrap().as_ref().map_or(0, Records::end)
+    }
+
     fn rename_preserves_hardlinks(&self, source: &Root) -> io::Result<bool> {
         let observed = source.observed.ok_or_else(|| io::Error::other("rename source missing"))?;
         if observed.identity.kind == EntryKind::Directory {
@@ -206,10 +233,50 @@ pub fn execute(request: &Request, cancellation: &Cancellation, sink: &dyn EventS
         Err(error) => return early_error(request, cancellation, sink, error),
     };
     if let Err(error) = validate_hardlink_devices(&plan.operands) { return early_error(request, cancellation, sink, error); }
-    let invocation = Invocation { request, cancellation, sink, cwd: cwd.as_fd(), progress: Mutex::new(Progress::default()), hardlinks: Mutex::new(None), self_changes: Mutex::new(None), active_hardlinks: Mutex::new(std::collections::HashSet::new()), hardlink_ready: Condvar::new(), renamed_trees: Mutex::new(None), track_renamed_trees: request.options.merge || matches!(&request.operands, crate::Operands::Into { rest, .. } if !rest.is_empty()), renamed_tree_cursor: AtomicU64::new(0), copied_hardlinks: AtomicBool::new(false), unverified_directory_rename: AtomicBool::new(false), root_discovery_active: Mutex::new(false), root_discovery_ready: Condvar::new(), stopped: AtomicBool::new(false), jobs, metrics: Mutex::new(crate::Metrics::default()), descriptor_reservation: std::sync::atomic::AtomicUsize::new(0), #[cfg(test)] hook: HOOK.with(|hook| hook.borrow().clone()) };
+    let mut hardlink_members = std::collections::HashMap::new();
     for operand in &plan.operands {
+        if !matches!(operand.action, Action::Skip | Action::SameEntry)
+            && matches!(operand.source_observed.identity.kind, EntryKind::RegularFile | EntryKind::Symlink)
+            && operand.source_observed.links > 1
+        {
+            *hardlink_members.entry(operand.source_observed.identity).or_insert(0) += 1;
+        }
+    }
+    let invocation = Invocation { request, cancellation, sink, cwd: cwd.as_fd(), progress: Mutex::new(Progress::default()), hardlinks: Mutex::new(None), self_changes: Mutex::new(None), hardlink_members: Mutex::new(hardlink_members), deferred_flags: Mutex::new(None), active_hardlinks: Mutex::new(std::collections::HashSet::new()), hardlink_ready: Condvar::new(), renamed_trees: Mutex::new(None), track_renamed_trees: request.options.merge || matches!(&request.operands, crate::Operands::Into { rest, .. } if !rest.is_empty()), renamed_tree_cursor: AtomicU64::new(0), copied_hardlinks: AtomicBool::new(false), unverified_directory_rename: AtomicBool::new(false), root_discovery_active: Mutex::new(false), root_discovery_ready: Condvar::new(), stopped: AtomicBool::new(false), jobs, metrics: Mutex::new(crate::Metrics::default()), descriptor_reservation: std::sync::atomic::AtomicUsize::new(0), #[cfg(test)] hook: HOOK.with(|hook| hook.borrow().clone()) };
+    let mut outcomes = vec![None; plan.operands.len()];
+    let mut ready = vec![false; plan.operands.len()];
+    let mut next_outcome = 0;
+    for (index, operand) in plan.operands.iter().enumerate() {
+        let identity = operand.source_observed.identity;
         if cancellation.is_cancelled() {
-            invocation.emit(Event::Operand(OperandOutcome { source: operand.source.clone(), destination: operand.destination.clone(), state: OperandState::Cancelled }));
+            outcomes[index] = Some(OperandState::Cancelled);
+            ready[index] = true;
+            let remaining = invocation.consume_hardlink_member(identity);
+            let pending_flags = match invocation.has_pending_final_flags(identity) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    completion = Completion::Failed;
+                    invocation.emit(Event::Diagnostic(Diagnostic { path: operand.source.clone(), message: error.to_string() }));
+                    true
+                },
+            };
+            if remaining == 0 && pending_flags {
+                for (member, prior) in plan.operands.iter().enumerate().take(index + 1) {
+                    if prior.source_observed.identity == identity && outcomes[member].is_some() {
+                        outcomes[member] = Some(match outcomes[member].unwrap() {
+                            OperandState::Copied | OperandState::Moved | OperandState::DestinationPublishedSourceRetained => OperandState::DestinationPartiallyPublished,
+                            state => state,
+                        });
+                        ready[member] = true;
+                    }
+                }
+            }
+            while next_outcome < outcomes.len() && ready[next_outcome] {
+                let state = outcomes[next_outcome].unwrap();
+                let operand = &plan.operands[next_outcome];
+                invocation.emit(Event::Operand(OperandOutcome { source: operand.source.clone(), destination: operand.destination.clone(), state }));
+                next_outcome += 1;
+            }
             continue;
         }
         let result = execute_operand(&invocation, operand, plan.into_directory.as_ref().map(AsFd::as_fd));
@@ -222,7 +289,47 @@ pub fn execute(request: &Request, cancellation: &Cancellation, sink: &dyn EventS
                 if cancellation.is_cancelled() && failure.state == OperandState::FailedBeforePublication { OperandState::Cancelled } else { failure.state }
             }
         };
-        invocation.emit(Event::Operand(OperandOutcome { source: operand.source.clone(), destination: operand.destination.clone(), state }));
+        outcomes[index] = Some(state);
+        let remaining = invocation.consume_hardlink_member(identity);
+        let pending_flags = match invocation.has_pending_final_flags(identity) {
+            Ok(pending) => pending,
+            Err(error) => {
+                completion = Completion::Failed;
+                invocation.emit(Event::Diagnostic(Diagnostic { path: operand.source.clone(), message: error.to_string() }));
+                true
+            },
+        };
+        if pending_flags {
+            if remaining == 0 {
+                match transfer::finalize_hardlink_group(&invocation, identity) {
+                    Ok(()) => {},
+                    Err(error) => {
+                        completion = Completion::Failed;
+                        invocation.emit(Event::Diagnostic(Diagnostic { path: operand.source.clone(), message: error.to_string() }));
+                        for (member, prior) in plan.operands.iter().enumerate().take(index + 1) {
+                            if prior.source_observed.identity == identity && outcomes[member].is_some() {
+                                outcomes[member] = Some(match outcomes[member].unwrap() {
+                                    OperandState::SourcePartiallyRetired | OperandState::SourceRemovedSyncFailed => OperandState::SourcePartiallyRetired,
+                                    _ => OperandState::DestinationPartiallyPublished,
+                                });
+                                ready[member] = true;
+                            }
+                        }
+                    },
+                }
+                for (member, prior) in plan.operands.iter().enumerate().take(index + 1) {
+                    if prior.source_observed.identity == identity && outcomes[member].is_some() { ready[member] = true; }
+                }
+            }
+        } else {
+            ready[index] = true;
+        }
+        while next_outcome < outcomes.len() && ready[next_outcome] {
+            let state = outcomes[next_outcome].unwrap();
+            let operand = &plan.operands[next_outcome];
+            invocation.emit(Event::Operand(OperandOutcome { source: operand.source.clone(), destination: operand.destination.clone(), state }));
+            next_outcome += 1;
+        }
         invocation.emit(Event::Progress(*invocation.progress.lock().unwrap()));
         invocation.stopped.store(false, Ordering::Release);
     }
@@ -268,7 +375,12 @@ fn execute_operand(invocation: &Invocation<'_>, operand: &PlannedOperand, into: 
         return Err(io::Error::other("operand parent identity changed after preflight").into());
     }
     let effective = invocation.effective(operand.source_observed)?;
-    if !source.observed.is_some_and(|observed| anchored::unchanged(effective, observed)) || destination.observed != operand.destination_observed {
+    let expected_destination = operand.destination_observed.map(|expected| invocation.effective(expected)).transpose()?;
+    let destination_matches = match expected_destination {
+        Some(expected) => destination.observed.is_some_and(|observed| anchored::unchanged(expected, observed)),
+        None => destination.observed.is_none(),
+    };
+    if !source.observed.is_some_and(|observed| anchored::unchanged(effective, observed)) || !destination_matches {
         return Err(io::Error::other("operand changed after preflight").into());
     }
     source.observed = Some(effective);
@@ -283,22 +395,60 @@ fn execute_operand(invocation: &Invocation<'_>, operand: &PlannedOperand, into: 
     if operand.action == Action::Merge {
         transfer::merge(invocation, &source, &destination)
     } else {
-        let receipt = transfer::whole(invocation, &source, &destination, operand.action)?;
-        match receipt { Some(receipt) => retirement::retire(invocation, receipt), None => Ok(OperandState::Copied) }
+        let identity = effective.identity;
+        let defer_flags = invocation.hardlink_members_remaining(identity) > 1 || invocation.has_pending_final_flags(identity)?;
+        let receipt = transfer::whole(invocation, &source, &destination, operand.action, defer_flags)?;
+        match receipt {
+            Some(_receipt) if invocation.has_pending_final_flags(identity)? => Err(Failure {
+                state: OperandState::DestinationPublishedSourceRetained,
+                error: io::Error::other("blocking metadata awaits completion of the hardlink group; source retained"),
+            }),
+            Some(receipt) => retirement::retire(invocation, receipt),
+            None => Ok(OperandState::Copied),
+        }
     }
 }
 
-fn replace_by_exchange(from_parent: BorrowedFd<'_>, from_name: &OsStr, to_parent: BorrowedFd<'_>, to_name: &OsStr, expected: Observation) -> io::Result<()> {
+fn replace_by_exchange(from_parent: BorrowedFd<'_>, from_name: &OsStr, to_parent: BorrowedFd<'_>, to_name: &OsStr, expected: Observation) -> io::Result<Observation> {
     crate::platform::rename_exchange(from_parent, from_name, to_parent, to_name)?;
     let displaced = roots::observe(from_parent, from_name);
-    if displaced.as_ref().is_ok_and(|displaced| { let mut expected = expected; expected.ctime = displaced.ctime; anchored::unchanged(expected, *displaced) }) { return Ok(()); }
+    if let Ok(displaced) = displaced {
+        let mut compared = expected;
+        compared.ctime = displaced.ctime;
+        if anchored::unchanged(compared, displaced) { return Ok(displaced); }
+    }
     crate::platform::rename_exchange(from_parent, from_name, to_parent, to_name).map_err(|error| io::Error::new(error.kind(), format!("replacement displaced an unobserved destination and could not restore it; it remains at the source name: {error}")))?;
     Err(io::Error::other("destination changed during replacement; previous destination restored"))
 }
 
-fn retire_displaced(parent: BorrowedFd<'_>, name: &OsStr, displaced: Observation) -> io::Result<()> {
+fn retire_displaced(invocation: &Invocation<'_>, parent: BorrowedFd<'_>, name: &OsStr, displaced: Observation) -> io::Result<()> {
+    let linked = if displaced.links > 1 && matches!(displaced.identity.kind, EntryKind::RegularFile | EntryKind::Symlink) {
+        #[cfg(target_os = "linux")]
+        let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        #[cfg(target_os = "macos")]
+        let flags = if displaced.identity.kind == EntryKind::Symlink {
+            OFlags::from_bits_retain(libc::O_SYMLINK as u32) | OFlags::RDONLY | OFlags::CLOEXEC
+        } else {
+            OFlags::from_bits_retain(libc::O_EVTONLY as u32) | OFlags::CLOEXEC
+        };
+        let fd = fs::openat(parent, name, flags, Mode::empty())?;
+        if !anchored::unchanged(displaced, roots::observe_fd(fd.as_fd())?) { return Err(io::Error::other("displaced destination changed before unlink")); }
+        Some(fd)
+    } else {
+        anchored::require_unchanged(parent, name, displaced)?;
+        None
+    };
     anchored::identity(parent, name, displaced.identity)?;
-    fs::unlinkat(parent, name, fs::AtFlags::empty()).map_err(Into::into)
+    fs::unlinkat(parent, name, fs::AtFlags::empty())?;
+    if let Some(linked) = linked {
+        let actual = roots::observe_fd(linked.as_fd())?;
+        let mut expected = displaced;
+        expected.links -= 1;
+        expected.ctime = actual.ctime;
+        if !anchored::unchanged(expected, actual) { return Err(io::Error::other("displaced hardlink changed during unlink")); }
+        invocation.remember_change(actual)?;
+    }
+    Ok(())
 }
 
 fn rename_object(invocation: &Invocation<'_>, source: &Root, destination: &Root, action: Action) -> Result<OperandState, Failure> {
@@ -310,8 +460,9 @@ fn rename_object(invocation: &Invocation<'_>, source: &Root, destination: &Root,
         Action::Replace => {
             let expected = destination.observed.ok_or_else(|| io::Error::other("replacement target is absent"))?;
             invocation.fault("before_replace")?;
-            replace_by_exchange(source.parent.as_fd(), &source.name, destination.parent.as_fd(), &destination.name, expected)?;
-            retire_displaced(source.parent.as_fd(), &source.name, expected).map_err(|error| Failure { state: OperandState::SourcePartiallyRetired, error })?;
+            let displaced = replace_by_exchange(source.parent.as_fd(), &source.name, destination.parent.as_fd(), &destination.name, expected)?;
+            retire_displaced(invocation, source.parent.as_fd(), &source.name, displaced).map_err(|error| Failure { state: OperandState::SourcePartiallyRetired, error })?;
+            invocation.fault("after_replace").map_err(|error| Failure { state: OperandState::SourcePartiallyRetired, error })?;
         },
         Action::Transfer => crate::platform::rename_noreplace(source.parent.as_fd(), &source.name, destination.parent.as_fd(), &destination.name)?,
         _ => return Err(io::Error::other("invalid rename action").into()),

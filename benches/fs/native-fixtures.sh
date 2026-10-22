@@ -89,6 +89,12 @@ else
     failures=1
 fi
 if ISH_FS_TEST_CROSS_ROOT="$cross_root" \
+    cargo test --locked -p ish-fs --test native_boundaries native_boundary_real_exdev_replacement_accounts_for_destination_aliases -- --ignored --exact --nocapture; then
+    :
+else
+    failures=1
+fi
+if ISH_FS_TEST_CROSS_ROOT="$cross_root" \
 ISH_FS_TEST_NESTED_SOURCE="$source_root" \
 ISH_FS_TEST_NESTED_MOUNT="$tmpfs_mount" \
 ISH_FS_TEST_NESTED_BIND="$bind_mount" \

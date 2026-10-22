@@ -333,6 +333,8 @@ mod tests {
                 progress: Mutex::new(Progress::default()),
                 hardlinks: Mutex::new(None::<IndexedRecords>),
                 self_changes: Mutex::new(None),
+                hardlink_members: Mutex::new(std::collections::HashMap::new()),
+                deferred_flags: Mutex::new(None),
                 active_hardlinks: Mutex::new(std::collections::HashSet::new()),
                 hardlink_ready: std::sync::Condvar::new(),
                 renamed_trees: Mutex::new(None),

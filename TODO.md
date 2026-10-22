@@ -106,12 +106,12 @@ whose closure requires native Linux and macOS evidence.
 - **Effort:** S (hours)
 - **Design:** [Release delivery](docs/rfc/ISH-42-release-delivery.md)
 
-### ISH-45 · P3 · macOS-only edits from the backlog run were never compiled
+### ISH-45 · P3 · macOS platform build and native acceptance remain unverified
 
 - **Area:** Tests
-- **Where:** `crates/ish-fs/tests/native_macos.rs`, `crates/ish-fs/src/engine/mod.rs` (`replace_by_exchange`), `crates/fdu-scan/src/macos.rs`, `src/signal.rs` (`errno_slot`), `crates/ish-fs/src/platform/mod.rs` (`rename_exchange`), `crates/fdu-scan/src/fsutil.rs` (`identity_link_count_and_modified_time` is now `cfg(target_os = "macos")`)
-- **Problem:** ISH-29, ISH-31, ISH-33 and ISH-38 changed macOS code paths on a Linux host. `native_macos.rs` now panics instead of skipping, `rename_exchange` relies on rustix mapping `RenameFlags::EXCHANGE` to `RENAME_SWAP`, `fdu-scan/src/macos.rs` lost its one-shot scanner, and the signal handler uses `libc::__error`. None of it was compiled or run.
-- **Recommendation:** On a macOS host run workspace check, strict clippy, `make test`, and `cargo test -p ish-fs --test native_macos -- --include-ignored` as uid 0, and fix what fails.
+- **Where:** `src/capture.rs:202,227`, `src/denv.rs:96`, `src/diagnostics.rs:175`, `src/prompt.rs:475`, `crates/ish-fs/tests/native_macos.rs`, `crates/ish-fs/src/engine/mod.rs` (`replace_by_exchange`), `crates/fdu-scan/src/macos.rs`, `src/signal.rs` (`errno_slot`), `crates/ish-fs/src/platform/mod.rs` (`rename_exchange`), `crates/fdu-scan/src/fsutil.rs` (`identity_link_count_and_modified_time` is now `cfg(target_os = "macos")`)
+- **Problem:** ISH-29, ISH-31, ISH-33 and ISH-38 changed macOS code paths on a Linux host. The latest macOS CI run fails to compile because the pinned rustix lacks `OpenptFlags::CLOEXEC`, `pipe_with`/`PipeFlags`, `rand::getrandom`/`GetRandomFlags`, and `fs::mknodat` at the listed call sites. `native_macos.rs` also changes a caller-owned destination to mode `0044` and then reopens its path, which fails for an unprivileged owner. Existing paths still need compilation and native validation.
+- **Recommendation:** On a native macOS host, first run workspace check, strict all-target Clippy, workspace tests, and `make test` as an ordinary user; repair unsupported calls with platform-supported APIs while preserving descriptor ownership, close-on-exec, cleanup, secure randomness, and FIFO setup. Fix the read-only destination test using a descriptor opened before chmod or restore access only for fixture verification. Run native clone/access normalization, ACL, foreign-owner, blocking-flag, cancellation, sparse fallback, and resource-fork cases, with privileged cases separately. Compare clone-capable Apple `cp`/`cp -c` and GNU `cp --reflink=auto` on supported native filesystems, recording selected methods and preservation/durability differences.
 - **Fix with:** none
 - **Effort:** S (hours)
 

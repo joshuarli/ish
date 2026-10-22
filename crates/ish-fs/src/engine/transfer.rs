@@ -110,7 +110,7 @@ fn new_stage<'a>(invocation: &Invocation<'a>, destination: &'a Root, source: Obs
     }
 }
 
-pub(super) fn whole(invocation: &Invocation<'_>, source: &Root, destination: &Root, action: Action) -> Result<Option<DurableReceipt>, Failure> {
+pub(super) fn whole(invocation: &Invocation<'_>, source: &Root, destination: &Root, action: Action, defer_final_flags: bool) -> Result<Option<DurableReceipt>, Failure> {
     let _span = super::Span::new(invocation, super::SpanKind::Transfer);
     let observed = source.observed.ok_or_else(|| io::Error::other("source disappeared"))?;
     if observed.identity.kind == EntryKind::Other { return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported source object for transfer").into()); }
@@ -148,9 +148,10 @@ pub(super) fn whole(invocation: &Invocation<'_>, source: &Root, destination: &Ro
         Action::Replace => {
             let expected = destination.observed.ok_or_else(|| io::Error::other("replacement observation missing"))?;
             invocation.fault("before_replace")?;
-            super::replace_by_exchange(stage.parent, &stage.name, destination.parent.as_fd(), &destination.name, expected)?;
+            let displaced = super::replace_by_exchange(stage.parent, &stage.name, destination.parent.as_fd(), &destination.name, expected)?;
             stage.published = true;
-            super::retire_displaced(stage.parent, &stage.name, expected).map_err(publication_failure)?;
+            super::retire_displaced(invocation, stage.parent, &stage.name, displaced).map_err(publication_failure)?;
+            invocation.fault("after_replace").map_err(publication_failure)?;
         },
         _ => return Err(io::Error::other("invalid whole-object publication action").into()),
     }
@@ -162,9 +163,15 @@ pub(super) fn whole(invocation: &Invocation<'_>, source: &Root, destination: &Ro
     if !anchored::unchanged(expected_output, renamed_output) { return Err(publication_failure(io::Error::other("published object changed during rename"))); }
     invocation.remember_change(renamed_output).map_err(publication_failure)?;
     invocation.fault("after_publish").map_err(publication_failure)?;
-    finalize_published(invocation, destination, &stage).map_err(publication_failure)?;
+    if !defer_final_flags { finalize_published(invocation, destination, &stage).map_err(publication_failure)?; }
     if invocation.durable() { invocation.sync_directory(destination.parent.as_fd()).map_err(publication_failure)?; }
     refresh_hardlinks(invocation, destination, &stage).map_err(publication_failure)?;
+    if defer_final_flags {
+        let mut cursor = 0;
+        while let Some(record) = stage.entries.lock().unwrap().next(&mut cursor).map_err(publication_failure)? {
+            if record.final_flags != 0 { invocation.remember_deferred_flags(&record).map_err(publication_failure)?; }
+        }
+    }
     if invocation.request.operation == Operation::Copy { return Ok(None); }
     invocation.require_descriptors(24).map_err(publication_failure)?;
     let source_parent = duplicate(source.parent.as_fd()).map_err(publication_failure)?;
@@ -212,6 +219,44 @@ fn finalize_published(invocation: &Invocation<'_>, destination: &Root, stage: &S
     Ok(())
 }
 
+pub(super) fn finalize_hardlink_group(invocation: &Invocation<'_>, identity: Identity) -> io::Result<()> {
+    let Some(mut record) = invocation.hardlink_record(identity)? else { return Ok(()); };
+    if record.final_flags == 0 { return Ok(()); }
+    invocation.checkpoint()?;
+    let base = Root::establish(invocation.cwd, &record.source, roots::Requirement::Existing)?;
+    let base_directory = base.open_directory()?;
+    let placement = Placement { root: base_directory.as_fd(), base: record.source.clone(), relative: record.destination.clone(), directories: None };
+    let root = representative_root(invocation, &record, base_directory.as_fd(), &placement)?;
+    let name = root.name.clone();
+    let expected = invocation.effective(record.output.ok_or_else(|| io::Error::other("hardlink representative output missing"))?)?;
+    anchored::require_unchanged(root.parent.as_fd(), &name, expected)?;
+    invocation.fault("before_final_metadata")?;
+    let metadata = platform::ExtendedMetadata { flags: record.final_flags, ..platform::ExtendedMetadata::default() };
+    let actual = if identity.kind == EntryKind::Symlink {
+        platform::apply_final_metadata(MetadataTarget::Symlink { parent: root.parent.as_fd(), name: &name }, &metadata)?;
+        let actual = roots::observe(root.parent.as_fd(), &name)?;
+        if invocation.durable() { invocation.sync_directory(root.parent.as_fd())?; }
+        actual
+    } else {
+        let fd = fs::openat(&root.parent, &name, READ_FILE, Mode::empty())?;
+        if !anchored::unchanged(expected, roots::observe_fd(fd.as_fd())?) { return Err(io::Error::other("hardlink representative changed before final metadata")); }
+        platform::apply_final_metadata(MetadataTarget::Fd(fd.as_fd()), &metadata)?;
+        let actual = roots::observe_fd(fd.as_fd())?;
+        if invocation.durable() {
+            if identity.kind == EntryKind::Directory { invocation.sync_directory(fd.as_fd())?; } else { invocation.sync_file(fd.as_fd())?; }
+        }
+        actual
+    };
+    let mut comparable = expected;
+    comparable.ctime = actual.ctime;
+    if !anchored::unchanged(comparable, actual) { return Err(io::Error::other("hardlink representative changed during final metadata")); }
+    anchored::require_unchanged(root.parent.as_fd(), &name, actual)?;
+    invocation.remember_change(actual)?;
+    record.output = Some(actual);
+    record.final_flags = 0;
+    invocation.remember_hardlink(&record)
+}
+
 fn validate_final_access(stage: &Stage<'_>) -> io::Result<()> {
     let mut cursor = 0;
     while let Some(record) = stage.entries.lock().unwrap().next(&mut cursor)? {
@@ -237,6 +282,7 @@ fn refresh_hardlinks(invocation: &Invocation<'_>, destination: &Root, stage: &St
         record.source = base;
         record.destination = relative;
         record.output = existing.output.map(|output| invocation.effective(output)).transpose()?;
+        record.final_flags = existing.final_flags;
         invocation.remember_hardlink(&record)?;
     }
     Ok(())
@@ -537,6 +583,7 @@ pub(super) fn merge(invocation: &Invocation<'_>, source: &Root, destination: &Ro
     let records = Mutex::new(Records::new(&invocation.request.context.scratch)?);
     let mut skipped = Records::new(&invocation.request.context.scratch)?;
     let mut pending = Records::new(&invocation.request.context.scratch)?;
+    let deferred_flags_start = invocation.deferred_flags_end();
     let root_record = Record { source: PathBuf::new(), destination: PathBuf::new(), observed: source.observed.unwrap(), published: destination.observed.unwrap().identity, output: destination.observed, parent: None, anchor: None, ancestry: Vec::new(), final_flags: 0 };
     directories.lock().unwrap().push(&root_record)?;
     records.lock().unwrap().push(&root_record)?;
@@ -629,7 +676,7 @@ pub(super) fn merge(invocation: &Invocation<'_>, source: &Root, destination: &Ro
                                 },
                             }
                         }
-                        let receipt = whole(invocation, &child_source, &child_destination, action).map_err(|mut failure| {
+                        let receipt = whole(invocation, &child_source, &child_destination, action, true).map_err(|mut failure| {
                             failure.error = io::Error::new(failure.error.kind(), format!("source {:?}, destination {:?}: {}", child_source.path, child_destination.path, failure.error));
                             failure
                         })?;
@@ -657,23 +704,58 @@ pub(super) fn merge(invocation: &Invocation<'_>, source: &Root, destination: &Ro
         Ok(())
     })();
     if let Err(mut failure) = result {
-        if renamed { failure.state = OperandState::SourcePartiallyRetired; }
-        else if changed || failure.state == OperandState::DestinationPublishedSourceRetained { failure.state = OperandState::DestinationPartiallyPublished; }
-        return Err(failure);
+        if let Err(finalize_error) = finalize_deferred_flags_since(invocation, deferred_flags_start) {
+            failure.error = io::Error::new(failure.error.kind(), format!("{}; published hardlink metadata finalization failed: {finalize_error}", failure.error));
+        }
+        return Err(merge_failure(failure, changed, renamed));
     }
-    if invocation.request.operation == Operation::Copy { return Ok(OperandState::Copied); }
-    let mut transferable = Records::new(&invocation.request.context.scratch)?;
-    let mut cursor = 0;
-    while let Some(record) = records.lock().unwrap().next(&mut cursor)? {
-        let retain = record.observed.identity.kind == EntryKind::Directory && skipped.find(&record.source)?.is_some();
-        if !retain { transferable.push(&record)?; }
+    if let Err(error) = finalize_deferred_flags_since(invocation, deferred_flags_start) {
+        return Err(merge_failure(error.into(), changed, renamed));
     }
-    if transferable.end() == 0 { return Ok(if changed { OperandState::Moved } else { OperandState::Skipped }); }
-    let transferable = Mutex::new(transferable);
-    let destinations = snapshot_destinations(invocation, destination, Some(&destination_directory), &transferable, &directories)?;
-    invocation.require_descriptors(24).map_err(|error| Failure { state: if renamed { OperandState::SourcePartiallyRetired } else if changed { OperandState::DestinationPartiallyPublished } else { OperandState::FailedBeforePublication }, error })?;
-    let receipt = DurableReceipt { source_parent: duplicate(source.parent.as_fd())?, source_name: source.name.clone(), source_path: source.path.clone(), source_directory: Some(source_directory), records: transferable, directories, destination_parent: duplicate(destination.parent.as_fd())?, destination_name: destination.name.clone(), destination_directory: Some(destination_directory), destinations: Mutex::new(destinations) };
-    super::retirement::retire(invocation, receipt)
+    let finish = (|| {
+        if invocation.request.operation == Operation::Copy { return Ok(OperandState::Copied); }
+        invocation.fault("merge_receipt_records")?;
+        let mut transferable = Records::new(&invocation.request.context.scratch)?;
+        let mut cursor = 0;
+        invocation.fault("merge_receipt_filter")?;
+        while let Some(record) = records.lock().unwrap().next(&mut cursor)? {
+            let retain = record.observed.identity.kind == EntryKind::Directory && skipped.find(&record.source)?.is_some();
+            if !retain { transferable.push(&record)?; }
+        }
+        if transferable.end() == 0 { return Ok(if changed { OperandState::Moved } else { OperandState::Skipped }); }
+        let transferable = Mutex::new(transferable);
+        invocation.fault("merge_destination_snapshot")?;
+        let destinations = snapshot_destinations(invocation, destination, Some(&destination_directory), &transferable, &directories)?;
+        invocation.fault("merge_descriptor_budget")?;
+        invocation.require_descriptors(24)?;
+        invocation.fault("merge_descriptor_duplication")?;
+        let receipt = DurableReceipt { source_parent: duplicate(source.parent.as_fd())?, source_name: source.name.clone(), source_path: source.path.clone(), source_directory: Some(source_directory), records: transferable, directories, destination_parent: duplicate(destination.parent.as_fd())?, destination_name: destination.name.clone(), destination_directory: Some(destination_directory), destinations: Mutex::new(destinations) };
+        invocation.fault("merge_retirement")?;
+        super::retirement::retire(invocation, receipt)
+    })();
+    finish.map_err(|failure| merge_failure(failure, changed, renamed))
+}
+
+fn merge_failure(mut failure: Failure, changed: bool, renamed: bool) -> Failure {
+    if failure.state == OperandState::SourceRemovedSyncFailed { return failure; }
+    if renamed || failure.state == OperandState::SourcePartiallyRetired {
+        failure.state = OperandState::SourcePartiallyRetired;
+    } else if changed || matches!(failure.state, OperandState::DestinationPublishedSourceRetained | OperandState::DestinationPartiallyPublished) {
+        failure.state = OperandState::DestinationPartiallyPublished;
+    }
+    failure
+}
+
+fn finalize_deferred_flags_since(invocation: &Invocation<'_>, start: u64) -> io::Result<()> {
+    let mut cursor = start;
+    loop {
+        let record = {
+            let mut deferred = invocation.deferred_flags.lock().unwrap();
+            deferred.as_mut().map(|records| records.next(&mut cursor)).transpose()?.flatten()
+        };
+        let Some(record) = record else { return Ok(()); };
+        finalize_hardlink_group(invocation, record.observed.identity)?;
+    }
 }
 
 fn open_published_directory(destination: &Root, identity: Identity) -> io::Result<OwnedFd> {
