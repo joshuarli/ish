@@ -7,16 +7,16 @@ The decisions below are accepted. Their RFCs remain the implementation
 contracts, with acceptance criteria. Retain accepted decisions after delivery
 and update the shipped behavior references when implementation lands.
 
-**Next implementation: ISH-24.** Close the interactive builtin boundary first,
-including argument checks for `set` and nested `command` dispatch. ISH-26 can
-proceed independently. Implement ISH-15 and ISH-52 together; coordinate ISH-5/8
-on epsh dispatch and child ownership, and use the resulting boundaries when
-extracting the editor for ISH-48. ISH-32 is a separate filesystem change whose
-closure requires native Linux and macOS evidence.
+ISH-24 is implemented on Linux with a finite interactive builtin policy and
+argument validation before target effects. ISH-26 can proceed independently.
+Implement ISH-15 and ISH-52 together; coordinate ISH-5/8 on epsh dispatch and
+child ownership, and use those boundaries when extracting the editor for
+ISH-48. ISH-32 is a separate filesystem change whose closure requires native
+Linux and macOS evidence.
 
 | Tickets | Accepted direction | Implementation dependency |
 |---|---|---|
-| [ISH-24](docs/rfc/ISH-24-builtin-allowlist.md) | Finite builtin policy; environment-only `set`; shared dispatch/lookup/completion rules | Ready; coordinate argv policy with ISH-8 |
+| [ISH-24](docs/rfc/ISH-24-builtin-allowlist.md) | Finite builtin policy; environment-only `set`; shared dispatch/lookup/completion rules | Implemented; focused Linux acceptance passed |
 | [ISH-26](docs/rfc/ISH-26-denv-sourced-file-trust.md) | Retire implicit sourcing helpers; keep trusted `.env` assignment parsing | Ready; preserve semantics through ISH-15 |
 | [ISH-15, ISH-52](docs/rfc/ISH-15-environment-and-shell-ownership.md) | Explicit environments; remove host environment mutation and unsupported safety comments | One implementation and closure |
 | [ISH-5](docs/rfc/ISH-5-foreground-job-outcomes.md) | Structured stopped-job handles; epsh owns every child wait | Ready; coordinate with ISH-8 |
@@ -37,17 +37,6 @@ closure requires native Linux and macOS evidence.
 - **Fix with:** os-boundaries
 - **Effort:** M (days)
 - **Design:** [Trust for sourced denv files](docs/rfc/ISH-26-denv-sourced-file-trust.md)
-
-### ISH-24 · P2 · plan() admits epsh builtins the contract never lists; `exec` ends the shell and `trap` disables signal handling
-
-- **Status:** Decision accepted; implementation pending.
-- **Area:** Security
-- **Where:** `src/dispatch.rs:79-93`, `src/dispatch.rs:142-151`, `crates/epsh/src/builtins.rs:165-177`, `crates/epsh/src/builtins.rs:617-654`, `crates/epsh/src/builtins.rs:783-838`, `crates/epsh/src/signal.rs:77-95`, `src/signal.rs:29-37`
-- **Problem:** `plan()` and the dynamic target check refuse only `eval`, `source`, `.` and ish shell-state builtins. Every other name in epsh's `BUILTIN_NAMES` runs inside ish. Reproduced in a PTY on the debug build: `exec echo replaced` prints `replaced` and the session ends without restoring raw mode or flushing state. Per the epsh lane's PTY run, `trap x TERM` replaces ish's SIGTERM handler with one that sets a flag nothing reads, so SIGTERM no longer stops ish; trap actions never run because ish does not call `run_pending_traps`. `set -e`, `set -o noexec`, `wait`, `local`, `umask`, `getopts` and `read` also pass; those were not exercised. README and AGENTS.md list none of them.
-- **Recommendation:** Implement the accepted finite policy in `builtin.rs`, shared by planning, expanded argv checks, completion, and lookup. Restrict `set` to listing and named-variable assignment; validate nested `command` before target redirections. Preserve approved interactive commands and standalone epsh/denv behavior. Replace the permissive `set` option PTY expectation.
-- **Fix with:** api-surface-and-module-boundaries
-- **Effort:** M (days)
-- **Design:** [Builtin allowlist](docs/rfc/ISH-24-builtin-allowlist.md)
 
 ### ISH-5 · P2 · Stopped pipelines disappear from foreground job control
 

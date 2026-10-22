@@ -99,11 +99,12 @@ echo $((1 + 2))
 `${NAME:-default}` are refused. Background `&`, scripts, conditionals (`if`,
 `for`, `while`, `case`), subshells, brace groups, functions, `source`, `.`, and
 `eval` are not supported. ish checks the command target after expansion too.
-If expansion selects `eval`, `source`, `.`, or a shell-state builtin outside
-its allowed whole-line form, ish refuses the command with status 2 before that
-target runs or opens its redirections. Earlier commands in the input line keep
-their effects. Commands that need shell state, including `alias`, `exit`, `fg`,
-`denv`, and `z`, must be the whole input line. `cd` and `history` can also be
+Unavailable builtin names and invalid `set` forms are refused with status 2,
+including targets selected through expansion or nested `command`. Static
+violations prevent the input line from starting. Expanded targets are checked
+before their redirections, assignments for dispatch, or execution; earlier
+commands and expansions keep their effects. Commands that need shell state,
+including `alias`, `exit`, `fg`, `denv`, and `z`, must be the whole input line. `cd` and `history` can also be
 used in lists. `t` and `trash` must also be the whole input line.
 
 Native `cp` and `mv` run in the shell process, including lists, redirections,
@@ -144,7 +145,10 @@ ish-specific commands include:
 
 `command -v` and `command -V` identify registered ish commands as builtins even
 when `PATH` is empty. A command path such as `/bin/cp` is reported and run as
-the external program.
+the external program. Unavailable epsh builtin names are absent from command
+completion and lookup, even if a same-named executable exists on `PATH`. Use
+an explicit path to run that executable. `command -v exit` can identify the
+whole-line ish command; `command exit` refuses its execution.
 
 `t PATH` and `trash PATH` scan the directory tree before deleting anything.
 They permanently delete its entries and keep `PATH` itself. The last component
@@ -171,9 +175,17 @@ Unsupported required metadata is reported as a failure and the source is
 retained. Explicit paths such as `/bin/cp` and `/bin/mv` still run external
 utilities.
 
-The shell also provides epsh's environment and output builtins, including
-`set`, `export`, `unset`, `echo`, `pwd`, `true`, and `false`. Aliases can be
-defined at the prompt or in config and expand as you type.
+The exposed epsh builtins are `echo`, `printf`, `pwd`, `true`, `false`, `:`,
+`test`, `[`, `kill`, `export`, `unset`, `set`, and `command`; `cd` also retains
+its hybrid form. Other epsh builtins, including `exec`, `trap`, `read`, `wait`,
+`umask`, and `getopts`, are unavailable. This boundary does not restrict programs
+run through explicit paths.
+
+`set` lists exported variables. `set NAME [value...]` sets and exports a variable,
+joining values with spaces; no values gives an empty value. The name must match
+`[A-Za-z_][A-Za-z0-9_]*`. Values may start with `-` or `+`. Option and positional
+forms, including `set -e`, `set +e`, `set -o pipefail`, and `set --`, are refused.
+Aliases can be defined at the prompt or in config and expand as you type.
 
 ### Copying command output
 

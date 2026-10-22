@@ -1,6 +1,7 @@
 # ISH-24: Builtin allowlist
 
-Status: accepted; implementation pending (2026-10-22)
+Status: accepted; implemented with focused Linux acceptance (2026-10-22).
+Native macOS was not exercised.
 
 ## Decision
 
