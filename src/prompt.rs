@@ -529,6 +529,35 @@ mod tests {
     }
 
     #[test]
+    fn no_repo_cache_reuses_same_directory_until_invalidated() {
+        let dir = scratch_dir("no-repo-cache");
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut prompt = Prompt::with_identity("u", "/home/u");
+        prompt.git = GitCache::NoRepo {
+            from: cwd.clone(),
+            checked_markers: Vec::new(),
+        };
+        let mut out = String::new();
+        prompt.render_into(&mut out, 0, cwd.to_str().unwrap(), false);
+        assert!(!out.contains(" main $ "));
+
+        let git_dir = dir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        prompt.render_into(&mut out, 0, cwd.to_str().unwrap(), false);
+        assert!(!out.contains(" main $ "));
+
+        prompt.invalidate_git();
+        prompt.render_into(&mut out, 0, cwd.to_str().unwrap(), false);
+        assert!(out.contains(" main $ "));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn osc7_path_is_percent_encoded_bytewise() {
         let mut out = String::new();
         push_percent_encoded(&mut out, "/a b\x07\u{e9}".as_bytes(), true);
