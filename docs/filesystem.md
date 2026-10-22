@@ -311,5 +311,5 @@ protocol. Recovery restores verified captures without replacing live names and
 stops the operation so the caller must rescan and plan again. ish-fs still
 validates source versions and durable destination receipts before retiring a
 source. SIGKILL tests cover process interruption; they do not establish power
-loss durability or storage-device behavior. Native macOS and the remaining
-Linux capability cases are tracked in [filesystem testing](filesystem-testing.md).
+loss durability or storage-device behavior. Native ARM64 and macOS acceptance
+are tracked in [filesystem testing](filesystem-testing.md).

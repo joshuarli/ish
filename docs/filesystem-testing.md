@@ -76,8 +76,8 @@ foreign-owner row below.
 
 The completion branch extracts the shared identity and quarantine
 implementation into `fdu-posix`. Linux engine and fdu callers use it. ISH-32
-remains open because successful clone acceptance and native ARM64 evidence are
-still missing, and its native macOS acceptance belongs to ISH-45.
+remains open because native ARM64 evidence is still missing. Its native macOS
+acceptance belongs to ISH-45.
 
 `cargo test -p fdu-posix -p fdu-delete --lib --test recovery --test quarantine`
 passed the shared journal tests (two unit tests, seven recovery tests, two
@@ -111,11 +111,11 @@ that extra descriptor before mutation.
 
 The shell trash tests passed all three cases, including a removed entry whose
 later directory sync fails: the summary counts the removal and reports a
-warning. Foreign-owner and deferred-flag acceptance ran in a Linux container
-with the required capabilities and is recorded below. The named FICLONE case
-ran on ext4 and received `EOPNOTSUPP`; successful clone acceptance remains
-pending. No native ARM64 or macOS result is claimed. SIGKILL recovery does not
-establish power-loss durability.
+warning. Foreign-owner, deferred-flag, and Btrfs clone acceptance ran in Linux
+containers with the required capabilities and are recorded below. The ext4
+FICLONE probe returned `EOPNOTSUPP`; the loop-backed Btrfs case passed. No
+native ARM64 or macOS result is claimed. SIGKILL recovery does not establish
+power-loss durability.
 
 The Linux x86_64 acceptance worktree started from
 `943fe4687d48534ff2004e52c32ba3d220ead2e2`. Shell runtime changes are in
@@ -141,7 +141,52 @@ mutation matcher; its macOS job still failed on unavailable rustix APIs.
 | Owned mount fixtures | `benches/fs/native-fixtures.sh` passed real ext4-to-tmpfs move and replacement-alias tests, nested mount refusal and explicit traversal, mountpoint EBUSY retirement, and bind-mount hardlink topology cases. The script's private namespace supplied its disposable mount fixtures. |
 | Foreign-owner EXDEV | In `ish-builder:gate-repairs`, `ISH_FS_TEST_CROSS_ROOT` pointed to an owned tmpfs on a distinct device mounted with `CAP_SYS_ADMIN`; the runner had uid 0 and `CAP_CHOWN`, `CAP_SETUID`, and `CAP_SETGID`. `cargo test -p ish-fs --test native_boundaries native_boundary_foreign -- --ignored --nocapture` passed both the readable foreign-owner move and privilege-dropped refusal tests. The refusal preserved source identity and bytes and published no destination. |
 | Deferred inode flags | With `CAP_LINUX_IMMUTABLE` on host ext4, `cargo test -p ish-fs --lib repair_deferred_metadata_validates_successful_output -- --ignored --nocapture` passed immutable and append-only hardlink-group, merge, EXDEV move, injected failure, and cancellation cases. |
-| FICLONE | `cargo test -p ish-fs --lib public_copy_selects_reflink_when_ficlone_works -- --ignored --nocapture` executed on ext4 and failed because `FICLONE` returned `EOPNOTSUPP` (error 95). No clone-capable fixture was available, so successful clone acceptance remains pending. |
+| FICLONE and GNU comparison | Passed on a loop image formatted as Btrfs using the host x86_64 Linux kernel. The tests, method selection, metadata comparison, and sync trace are detailed in [Btrfs clone and GNU `cp` comparison](#btrfs-clone-and-gnu-cp-comparison). |
+
+### Btrfs clone and GNU `cp` comparison
+
+The source revision was `5ef8940d858e6f85e298dd98e88f745948a20caf`. The host
+was Linux x86_64 with kernel `7.2.9-2-stable`. The test runner used the Alpine
+3.24.1 `ish-builder:gate-repairs` image. A privileged container loaded the
+host's Btrfs module, formatted a 1 GiB loop image with Btrfs 6.17.1, and
+mounted it at the archived checkout's `.work/tmp`. The image file was under
+`.work/tmp/acceptance-clone` on host ext4. The container had root,
+`CAP_SYS_MODULE`, and `CAP_SYS_ADMIN`. It unloaded the module and detached the
+loop device after the run.
+
+The named FICLONE case passed:
+
+```sh
+cargo test -p ish-fs --lib public_copy_selects_reflink_when_ficlone_works -- --ignored --nocapture
+```
+
+The case asserted two cloned files and `786432` logical bytes. The metadata
+parity case also passed on Btrfs:
+
+```sh
+cargo test -p ish-fs --lib public_into_copy_methods_preserve_identical_bytes_metadata_and_hardlinks -- --nocapture
+```
+
+It checks bytes, uid/gid, mode, mtime, ACLs, xattrs, symlink target bytes, and
+hardlink identity across automatic, native, and buffered copy methods. On
+Btrfs, it also requires the automatic method to select Clone.
+
+GNU Coreutils 9.11 `cp --archive --reflink=always` copied the same fixture:
+
+```sh
+strace -f -e trace=ioctl,fsync,fdatasync,syncfs,sync_file_range \
+  cp --archive --reflink=always \
+  "$fixture/left/alpha" "$fixture/right/beta" \
+  "$fixture/readonly" "$fixture/raw-link" "$fixture/out-gnu/"
+```
+
+`strace` recorded two successful `FICLONE` ioctls. The GNU output matched the
+source and public-engine outputs for bytes, ownership, mode, mtime, ACL, xattr,
+symlink target bytes, and hardlink identity. The trace had no `fsync`,
+`fdatasync`, `syncfs`, or `sync_file_range` calls. A public-engine copy with
+`Options::durable = true` also selected Clone and issued `fsync` calls. ish
+documents the durable guarantee under `--durable`; the GNU command above made
+no sync request.
 
 The source patch was not pushed. Run `39792421234` tested the unchanged `dfb6154`
 base before these repairs: x86_64 and ARM64 musl failed the runtime-compiled
@@ -155,10 +200,9 @@ tested that branch.
 
 | Required run | Setup and acceptance condition |
 | --- | --- |
-| Successful Linux reflink | Use an owned FICLONE-capable filesystem, then run the named test above and confirm the public engine selects `Clone` while preserving required logical metadata. The available ext4 host returned `EOPNOTSUPP`; the test did not pass. |
 | Native ARM64 musl | On ARM64 Linux musl hardware, run workspace check, strict all-target Clippy, workspace library/integration tests, `make test`, and `benches/fs/native-fixtures.sh`. Cross-build and QEMU execution are supporting checks, not native hardware evidence. |
 | Native macOS | Deferred to [TODO.md, ISH-45](../TODO.md), per the Linux-host scope. No macOS build or native acceptance is claimed. The pending run requires ordinary-user workspace checks and tests, separate privileged cases, clone/access normalization, ACLs, foreign ownership, blocking flags, cancellation, sparse fallback, resource forks above 4 GiB, unsupported identity failure, and a release panic probe. |
-| Clone-aware utility comparisons | A clone-capable filesystem was unavailable, and the host provides BusyBox `cp`, not GNU clone-aware `cp`. Apple `cp`/`cp -c` requires macOS and is deferred under ISH-45. The comparison remains pending; record selected methods and preservation/durability differences when the required hosts and filesystems are available. |
+| Apple clone-aware utility comparison | Compare Apple `cp` and `cp -c` on native macOS with a clone-capable filesystem. GNU Coreutils 9.11 `cp --archive --reflink=always` passed on Linux Btrfs; the method and preservation/durability results are recorded above. |
 
 The repair run passed native x86_64 musl workspace checks, strict Clippy, Rust
 and PTY tests, conformance, semantic verification, and shift refinement.
