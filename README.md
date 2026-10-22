@@ -233,12 +233,39 @@ When the directory changes, ish looks for `.envrc` and `.env`. Run
 trust, and `denv reload` to reevaluate them. Editing a trusted file revokes its
 trust. If either discovered file is untrusted, neither is loaded. `.envrc`
 files whose first line mentions `bash` run in a `bash` child; other `.envrc`
-files are evaluated by epsh. `.env` files are read as variable assignments.
+files are evaluated by epsh. `.env` files are read as variable assignments
+after `.envrc`, so `.env` values take precedence. Shell syntax in `.env`
+values remains data.
 Evaluation stops after 60 seconds.
+
+Trust covers the exact bytes of the discovered files. An approved `.envrc`
+runs arbitrary code with your authority. Explicit sourcing and newly executed
+interpreters can load other files without denv approval or per-file revocation.
+
+`source_env`, `source_env_if_exists`, `source_up`, `source_up_if_exists`,
+`dotenv`, and `dotenv_if_exists` are removed. Calling any of them rejects the
+whole candidate environment, including inside substitutions, pipelines, or
+subshells, even if a later command succeeds. Remove redundant `dotenv` calls
+and approve the automatically discovered `.env` with `denv allow`. Put shared
+setup in the discovered `.envrc` and approve its updated contents. Rejection
+prevents candidate variables from entering ish. External effects already
+performed by trusted code cannot be undone.
+
+Shell variables and exported child environments belong to epsh's variable store.
+ish imports its inherited environment at startup and never writes changes back
+to its own process environment. Evaluators and commands receive explicit
+byte-preserving environments; denv locates projects from the shell's actual cwd,
+independently of the value assigned to `PWD`.
+
+Denv validates a complete candidate, including readonly bindings, and persists
+its restoration record before publishing the candidate. Assignment or storage
+errors leave the current layer installed. A rejected script installs none of
+its assignments; denv restores the prior layer and marks the project dirty.
 
 `denv` fixes its trust and restoration storage directory when the shell starts,
 using `DENV_DATA_DIR` or `$HOME/.local/share/denv`. Project changes to `HOME` or
-`DENV_DATA_DIR` do not move that storage. Leaving a project restores its variables.
+`DENV_DATA_DIR` do not move that storage. Leaving a project restores its variables, including raw values, empty versus
+unset bindings, and whether each binding was exported.
 Each shell keeps its restoration record in that directory under a name made of
 its pid, on Linux its pid namespace, and a random token, exported as `__DENV_PID`, and removes the record
 when it exits. A shell killed without cleanup leaves its record behind; no later
@@ -247,8 +274,8 @@ running in the new shell's pid namespace. A record whose pid has been reused by
 a running process stays, and so does a record written from another pid
 namespace, such as another container sharing the directory.
 If the shell's active restoration record is malformed or
-uses an unsupported version, `denv` reports an error and leaves the process
-environment unchanged. `denv reload`, `denv allow`, and `denv deny` then
+uses an unsupported version, `denv` reports an error and leaves shell variables
+unchanged. `denv reload`, `denv allow`, and `denv deny` then
 discard the record and report that the variables it saved cannot be restored.
 
 ## Help and license

@@ -7,18 +7,14 @@ The decisions below are accepted. Their RFCs remain the implementation
 contracts, with acceptance criteria. Retain accepted decisions after delivery
 and update the shipped behavior references when implementation lands.
 
-ISH-24 is implemented on Linux with a finite interactive builtin policy and
-argument validation before target effects. ISH-26 can proceed independently.
-Implement ISH-15 and ISH-52 together; coordinate ISH-5/8 on epsh dispatch and
-child ownership, and use those boundaries when extracting the editor for
-ISH-48. ISH-32 is a separate filesystem change whose closure requires native
-Linux and macOS evidence.
+This table records accepted decisions, implementation dependencies, and
+verification limits. Open implementation and acceptance work is listed below.
 
 | Tickets | Accepted direction | Implementation dependency |
 |---|---|---|
 | [ISH-24](docs/rfc/ISH-24-builtin-allowlist.md) | Finite builtin policy; environment-only `set`; shared dispatch/lookup/completion rules | Implemented; focused Linux acceptance passed |
 | [ISH-26](docs/rfc/ISH-26-denv-sourced-file-trust.md) | Retire implicit sourcing helpers; keep trusted `.env` assignment parsing | Ready; preserve semantics through ISH-15 |
-| [ISH-15, ISH-52](docs/rfc/ISH-15-environment-and-shell-ownership.md) | Explicit environments; remove host environment mutation and unsupported safety comments | One implementation and closure |
+| [ISH-15, ISH-52](docs/rfc/ISH-15-environment-and-shell-ownership.md) | Explicit environments; remove host environment mutation and unsupported safety comments | Implemented; focused Linux acceptance passed; macOS remains under ISH-45 |
 | [ISH-5](docs/rfc/ISH-5-foreground-job-outcomes.md) | Structured stopped-job handles; epsh owns every child wait | Ready; coordinate with ISH-8 |
 | [ISH-8](docs/rfc/ISH-8-callback-process-boundary.md) | Creator-process callbacks by default; explicit unsafe child opt-in | Coordinate external dispatch with ISH-5 and policy with ISH-24 |
 | [ISH-32](docs/rfc/ISH-32-capture-and-retire.md) | Shared journaled fdu quarantine and identity primitives | Native recovery validation; account for ISH-45 |
@@ -60,17 +56,6 @@ Linux and macOS evidence.
 - **Effort:** L (weeks)
 - **Design:** [Callback process boundary](docs/rfc/ISH-8-callback-process-boundary.md)
 
-### ISH-15 · P2 · Safe library APIs conceal environment mutation preconditions
-
-- **Status:** Decision accepted; implementation pending.
-- **Area:** Security
-- **Where:** `src/lib.rs`, `src/denv.rs`
-- **Problem:** Public safe wrappers call unsafe std environment mutation without enforcing its Unix process-wide concurrency preconditions. Public denv operations also reach those mutations. Safe library callers can invoke them while another thread uses libc environment readers. The pinned standard-library safety contract explicitly names such readers, including DNS resolution. This is a source-proven missing safety boundary; a concrete undefined-behavior manifestation is unproven and was not attempted. Normal ish foreground execution and joined relay threads do not establish an observed incident.
-- **Recommendation:** Remove all production process-environment mutation, including the public wrappers, denv temporary environment swaps, and binary startup/PWD mirrors. Use epsh-owned values, explicit byte-preserving evaluator/child environments, and a validated denv delta. Audit ambient readers and restoration semantics; implement ISH-52 in the same change.
-- **Fix with:** os-boundaries, api-surface-and-module-boundaries
-- **Effort:** M (days)
-- **Design:** [Environment and shell ownership](docs/rfc/ISH-15-environment-and-shell-ownership.md)
-
 ### ISH-32 · P3 · Two capture-and-retire protocols and duplicated identity code across `fdu-*` and `ish-fs`
 
 - **Status:** Decision accepted; implementation pending.
@@ -101,14 +86,3 @@ Linux and macOS evidence.
 - **Fix with:** api-surface-and-module-boundaries
 - **Effort:** L (weeks)
 - **Design:** [Private session, testable editor](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor)
-
-### ISH-52 · P4 · Two SAFETY claims in `denv.rs` say ish is single-threaded without proof
-
-- **Status:** Decision accepted; blocked on the ISH-15 implementation and closed with it.
-- **Area:** Security
-- **Where:** `src/denv.rs` (`env::set_var` and `env::remove_var` call sites)
-- **Problem:** The comments claim a single-threaded process, but `foreground.rs` spawns worker threads. This overlaps ISH-15 and was left unverified by the comment cleanup.
-- **Recommendation:** Implement and close with ISH-15 by deleting environment mutation and the unsupported single-threaded claims, then audit remaining unsafe boundaries for their actual preconditions. Do not replace the comments with an unproven worker-lifetime assertion.
-- **Fix with:** os-boundaries
-- **Effort:** S (hours)
-- **Design:** [Remove the unsupported safety claims](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-52-remove-the-unsupported-safety-claims)
