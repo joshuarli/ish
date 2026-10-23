@@ -25,21 +25,20 @@ RUN apk add --no-cache \
 # glibc runtime dependency.
 RUN ar rcs /usr/lib/libutil.a
 
-# Use a prebuilt LLVM toolchain. The archive is
-# musl-linked so clang, lld, and the LLVM tools run inside Alpine.
-ADD https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}-${LLVM_RELEASE_SHA}/clang+llvm-${LLVM_VERSION}-x86_64-linux-musl.tar.xz /tmp/llvm-x86_64.tar.xz
-ADD https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}-${LLVM_RELEASE_SHA}/clang+llvm-${LLVM_VERSION}-aarch64-linux-musl.tar.xz /tmp/llvm-aarch64.tar.xz
+# LLVM tools must be musl-linked to run in this Alpine image.
 RUN case "$TARGETARCH" in \
-        amd64) archive=/tmp/llvm-x86_64.tar.xz ;; \
-        arm64) archive=/tmp/llvm-aarch64.tar.xz ;; \
+        amd64) arch=x86_64; sum=36647cca0bf57d206a6ce757d07a9d8489ef6ccf283a2cc7f740d1cba99a088b ;; \
+        arm64) arch=aarch64; sum=0c9bd6f0fefa26dbdb7d6ed568f3799b558428b1ce1264656aa328fc6fd9e32d ;; \
         *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac \
-    && echo '36647cca0bf57d206a6ce757d07a9d8489ef6ccf283a2cc7f740d1cba99a088b  /tmp/llvm-x86_64.tar.xz' | sha256sum -c - \
-    && echo '0c9bd6f0fefa26dbdb7d6ed568f3799b558428b1ce1264656aa328fc6fd9e32d  /tmp/llvm-aarch64.tar.xz' | sha256sum -c - \
+    && archive=/ish/.work/tmp/llvm.tar.xz \
+    && mkdir -p /ish/.work/tmp \
+    && wget -O "$archive" "https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}-${LLVM_RELEASE_SHA}/clang+llvm-${LLVM_VERSION}-${arch}-linux-musl.tar.xz" \
+    && echo "$sum  $archive" | sha256sum -c - \
     && mkdir -p /opt/llvm-musl \
     && tar xf "$archive" -C /opt/llvm-musl --strip-components=1 \
     && test -f /opt/llvm-musl/lib/libclang.so \
-    && rm /tmp/llvm-x86_64.tar.xz /tmp/llvm-aarch64.tar.xz
+    && rm "$archive"
 
 RUN for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do \
         stub_dir="/usr/lib/e-crt/$target"; \
@@ -49,18 +48,17 @@ RUN for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do \
         done; \
     done
 
-ADD https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-musl/rustup-init /rustup-init-x86_64
-ADD https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/aarch64-unknown-linux-musl/rustup-init /rustup-init-aarch64
 RUN case "$TARGETARCH" in \
-        amd64) init=/rustup-init-x86_64; sum=$RUSTUP_X86_64_SHA256 ;; \
-        arm64) init=/rustup-init-aarch64; sum=$RUSTUP_AARCH64_SHA256 ;; \
+        amd64) arch=x86_64; sum=$RUSTUP_X86_64_SHA256 ;; \
+        arm64) arch=aarch64; sum=$RUSTUP_AARCH64_SHA256 ;; \
         *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac \
+    && init=/ish/.work/tmp/rustup-init \
+    && wget -O "$init" "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${arch}-unknown-linux-musl/rustup-init" \
     && echo "$sum  $init" | sha256sum -c - \
-    && cp "$init" /rustup-init \
-    && chmod +x /rustup-init \
-    && /rustup-init -y --default-toolchain none \
-    && rm /rustup-init /rustup-init-x86_64 /rustup-init-aarch64
+    && chmod +x "$init" \
+    && "$init" -y --default-toolchain none \
+    && rm "$init"
 
 ENV PATH="/opt/llvm-musl/bin:/root/.cargo/bin:$PATH" \
     CC="/opt/llvm-musl/bin/clang" \

@@ -55,27 +55,6 @@ example : (match evalRequest (request (.mkObj [
     ("permanent", toJson false)])) with
     | .semanticError (.restoration 1 _) _ _ => true | _ => false) = true := by decide
 
-#print axioms child_environment_entry
-#print axioms prefix_shadows
-#print axioms export_shadows
-#print axioms inherited_preserved
-#print axioms environment_name_noninterference
-#print axioms unexported_variables_do_not_escape
-#print axioms raw_byte_roundtrip
-#print axioms cstring_rejects_nul
-#print axioms cstring_preserves_bytes
-#print axioms escaped_octets_roundtrip
-#print axioms cwd_selected
-#print axioms cwd_other_shell
-#print axioms cwd_process_unchanged
-#print axioms cwd_failure_unchanged
-#print axioms owned_copy_restores
-#print axioms saved_unchanged_restores
-#print axioms restoration_failure_explicit
-#print axioms temporary_restores_original
-#print axioms example_nonfresh_copy_loses_original
-#print axioms example_permanent_is_not_restored
-
 end IshSemantics.Effects.Tests
 
 def main : IO Unit := do

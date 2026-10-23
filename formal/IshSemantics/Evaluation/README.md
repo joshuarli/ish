@@ -122,14 +122,14 @@ The error-composition theorem does not establish that every production failure i
 `Evaluation.lean` proves general skipping, composition, status selection, tested-context,
 assignment-scope, and state-isolation properties, including bare-assignment status
 selection. `Tests.lean` checks concrete boundaries.
-`Audit.lean` prints the dependencies of every named theorem.
+The shared [axiom audit](../Audit.lean) checks every model theorem.
 The audit permits only Lean's standard axioms: `propext`, `Quot.sound`, and `Classical.choice`.
 No theorem uses `sorry`, `admit`, custom axioms, mathlib, or `native_decide`.
 
-Run the focused checks from `formal`:
+Run the shared audit from `formal`:
 
 ```text
-lake build IshSemantics.Evaluation.Tests IshSemantics.Evaluation.Audit
+lake build IshSemantics.Audit
 ```
 
 These checks establish properties of the model. Production correspondence additionally

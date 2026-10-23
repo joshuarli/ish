@@ -290,7 +290,6 @@ mod posix {
         root_mount: MountIdentity,
         cancelled: &'a AtomicBool,
         sender: &'a SyncSender<DeleteEvent>,
-        after_operation: &'a (dyn Fn(usize) + Sync),
         recorded: Vec<AtomicBool>,
         outcomes: Mutex<Vec<DeleteOutcome>>,
         completed: AtomicUsize,
@@ -305,28 +304,6 @@ mod posix {
         plan: DeletionPlan,
         cancelled: Arc<AtomicBool>,
         sender: SyncSender<DeleteEvent>,
-    ) {
-        run_with(root, plan, cancelled, sender, DELETE_THREADS, |_| {});
-    }
-
-    pub(super) fn run_with(
-        root: OwnedFd,
-        plan: DeletionPlan,
-        cancelled: Arc<AtomicBool>,
-        sender: SyncSender<DeleteEvent>,
-        threads: usize,
-        after_operation: impl Fn(usize) + Sync,
-    ) {
-        run_inner(root, plan, cancelled, sender, threads, after_operation);
-    }
-
-    fn run_inner(
-        root: OwnedFd,
-        plan: DeletionPlan,
-        cancelled: Arc<AtomicBool>,
-        sender: SyncSender<DeleteEvent>,
-        threads: usize,
-        after_operation: impl Fn(usize) + Sync,
     ) {
         let tree: &Tree = &plan.tree;
         let root_record = tree.record(tree.root()).expect("tree has root");
@@ -352,7 +329,6 @@ mod posix {
             root_mount,
             cancelled: &cancelled,
             sender: &sender,
-            after_operation: &after_operation,
             recorded: (0..tree.len()).map(|_| AtomicBool::new(false)).collect(),
             outcomes: Mutex::new(Vec::with_capacity(OUTCOME_BATCH_SIZE)),
             completed: AtomicUsize::new(0),
@@ -380,7 +356,7 @@ mod posix {
             }
         };
         let pool = match rayon::ThreadPoolBuilder::new()
-            .num_threads(threads.max(1))
+            .num_threads(DELETE_THREADS)
             .thread_name(|index| format!("fdu-delete-{index}"))
             .build()
         {
@@ -435,7 +411,6 @@ mod posix {
                 return;
             }
             let completed = self.completed.fetch_add(1, Ordering::Relaxed) + 1;
-            (self.after_operation)(completed);
             let batch = {
                 let mut outcomes = self.outcomes.lock().expect("outcomes are not poisoned");
                 outcomes.push(DeleteOutcome { node, kind, message });
@@ -699,7 +674,7 @@ mod posix {
             }
             Err(error) => return deletion.record(node, OutcomeKind::Failed, Some(error.to_string())),
         }
-        capture_and_remove(deletion, parent_fd, name, node, AtFlags::REMOVEDIR);
+        capture_and_remove(deletion, parent_fd, name, node);
     }
 
     fn delete_file(deletion: &Deletion<'_>, parent_fd: BorrowedFd<'_>, node: NodeId) {
@@ -721,11 +696,10 @@ mod posix {
             }
             Err(error) => return deletion.record(node, OutcomeKind::Failed, Some(error.to_string())),
         }
-        capture_and_remove(deletion, parent_fd, name, node, AtFlags::empty());
+        capture_and_remove(deletion, parent_fd, name, node);
     }
 
-    fn capture_and_remove(deletion: &Deletion<'_>, parent_fd: BorrowedFd<'_>, name: &[u8], node: NodeId, flags: AtFlags) {
-        let _ = flags;
+    fn capture_and_remove(deletion: &Deletion<'_>, parent_fd: BorrowedFd<'_>, name: &[u8], node: NodeId) {
         let mut parents = Vec::new();
         let mut current = deletion.tree.record(node).and_then(NodeRecord::parent);
         while let Some(parent) = current {
