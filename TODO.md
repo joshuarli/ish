@@ -1,5 +1,5 @@
 Prefix: ISH
-Next: 61
+Next: 62
 
 ## Accepted owner decisions — 2026-10-22
 
@@ -29,7 +29,7 @@ verification limits. Open implementation and acceptance work is listed below.
 - **Area:** Tests
 - **Where:** `crates/fdu-posix/src/quarantine.rs` (`open_created_directory`), `crates/fdu-posix/tests/recovery.rs`, `crates/ish-fs/src/platform/macos.rs` (`prepare_directory`), `crates/ish-fs/tests/native_macos.rs`, `crates/ish-fs/tests/transfer.rs`, `docs/filesystem-testing.md`
 - **Problem:** A process umask of `0777` creates mode-000 staging directories. Darwin refuses the current `O_EVTONLY` open with EACCES, so the code cannot acquire a descriptor for safe permission normalization. The workspace run fails the restrictive-umask recovery, native directory, and transfer cases. Path-based chmod with before/after identity checks would introduce a substitution race; process-global umask changes or filesystem helper children would change existing boundaries. Privileged macOS ownership cases remain unrun because noninteractive sudo requires a password. `make test` also encountered one unexplained retained conformance mismatch, although focused and full conformance reruns passed.
-- **Recommendation:** Resolve secure native creation/access under a restrictive umask, or obtain an owner decision about that support boundary; preserve the failing tests and fail-closed behavior meanwhile. Run the remaining foreign-owner cases with native root access. Complete ordinary-user workspace tests and `make test`, including explaining the intermittent conformance failure. Reuse the native compilation, PTY, filesystem, release, and Apple utility evidence while its inputs remain unchanged; exact commands and limits are in the filesystem testing guide.
+- **Recommendation:** Resolve secure native creation/access under a restrictive umask, or obtain an owner decision about that support boundary; preserve the failing tests and fail-closed behavior meanwhile. Run the remaining foreign-owner cases with native root access. Complete ordinary-user workspace tests and `make test`, including explaining the intermittent conformance failure tracked under ISH-61. Reuse the native compilation, PTY, filesystem, release, and Apple utility evidence while its inputs remain unchanged; exact commands and limits are in the filesystem testing guide.
 - **Fix with:** none
 - **Effort:** S (hours)
 
@@ -42,3 +42,14 @@ verification limits. Open implementation and acceptance work is listed below.
 - **Recommendation:** On a quiet host, collect five interleaved baseline/candidate 4,096-file samples with the same durable journal guarantees, readiness checks before and immediately after each sample, and full output/source-retirement verification. Reuse the retained correctness and resource evidence where applicable, and qualify the 1k and 16k observations separately. Integrate the candidate only if its measured benefit exceeds observed spread without weakening intent durability, source-version validation, recovery behavior, or destination receipts. Current result: `perf gate deferred: host busy`.
 - **Fix with:** make-it-fast
 - **Effort:** L (weeks)
+
+## Next
+
+### ISH-61 · P3 · Native macOS conformance intermittently takes a subshell error branch
+
+- **Area:** Tests
+- **Where:** `crates/epsh/check-epsh.t:583` (`expand-unglob-unq`), `crates/epsh/tests/conformance/executor.rs:423`
+- **Problem:** During ordinary-user `make test` on macOS 27.0.1 ARM64, the retained case exited 0 but printed `9 qstn brac -> error` where `9 qstn brac foo x c x} baz` was required. Every other output line matched. The expected-success subshell redirects stderr to `/dev/null`, so its failure reason was not retained. The targeted case and the complete 175-case corpus passed afterward (167 passed, 8 declared exclusions). The cause is unproven; reruns do not establish that the intermittent failure is fixed. epsh production evaluation code was unchanged in this backlog pass.
+- **Recommendation:** Reproduce the retained case with `EPSH_CONFORMANCE_ID=expand-unglob-unq cargo test -p epsh --test conformance -- --nocapture`, including the original parallel-build conditions where useful. Observe the failing subshell's spawn, wait, and error path without changing the retained input or expected bytes. Fix only an established cause and retain the behavioral regression; keep the case required to pass.
+- **Fix with:** root-cause
+- **Effort:** M (days)
