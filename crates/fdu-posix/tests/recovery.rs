@@ -51,6 +51,7 @@ fn crash_child() {
     panic!("crash boundary was not reached");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn killed_retirement_under_restrictive_umask_recovers_records() {
     let fixture = Fixture::new();
@@ -86,6 +87,58 @@ fn killed_retirement_under_restrictive_umask_recovers_records() {
     assert_eq!(fs::read(fixture.0.join("source")).unwrap(), b"data");
     assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
     Session::check_recovery(root.as_fd()).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn restrictive_umask_rejects_retirement_without_changing_source() {
+    const CHILD: &str = "ISH45_UMASK_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        for mask in [0o400, 0o100, 0o777] {
+            let fixture = Fixture::new();
+            fs::write(fixture.0.join("source"), b"data").unwrap();
+            fs::write(fixture.0.join("destination"), b"published").unwrap();
+            fs::write(fixture.0.join("foreign"), b"untouched").unwrap();
+            let foreign = expected(&fixture.0.join("foreign"));
+            let source = expected(&fixture.0.join("source"));
+            let destination = expected(&fixture.0.join("destination"));
+            let root = fixture.root();
+            let previous = rustix::process::umask(rustix::fs::Mode::from_raw_mode(mask));
+            let error = Session::start(root.as_fd()).err().expect("restrictive mask must be rejected");
+            rustix::process::umask(previous);
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("restrictive umask"));
+            assert_eq!(expected(&fixture.0.join("source")), source);
+            assert_eq!(expected(&fixture.0.join("destination")), destination);
+            assert_eq!(fs::read(fixture.0.join("source")).unwrap(), b"data");
+            assert_eq!(fs::read(fixture.0.join("destination")).unwrap(), b"published");
+            assert_eq!(expected(&fixture.0.join("foreign")), foreign);
+            assert_eq!(fs::read(fixture.0.join("foreign")).unwrap(), b"untouched");
+            // SAFETY: dlsym only checks whether this host exposes the public read-only mask API.
+            let has_getumask = !unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getumask".as_ptr()) }.is_null();
+            if has_getumask { assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 3); }
+            for entry in fs::read_dir(&fixture.0).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name().to_string_lossy().starts_with(".fdu-quarantine-v2-") {
+                    assert!(error.to_string().contains("retained at scan root"));
+                    assert_eq!(fs::metadata(entry.path()).unwrap().mode() & 0o777, u32::from(0o700 & !mask));
+                    fs::remove_dir(entry.path()).unwrap();
+                }
+            }
+        }
+        let fixture = Fixture::new();
+        let root = fixture.root();
+        let previous = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o200));
+        let session = Session::start(root.as_fd()).expect("owner write mask permits descriptor normalization");
+        rustix::process::umask(previous);
+        session.finish().unwrap();
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
+        return;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "restrictive_umask_rejects_retirement_without_changing_source", "--nocapture"])
+        .env(CHILD, "1").output().unwrap();
+    assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
 }
 
 #[test]

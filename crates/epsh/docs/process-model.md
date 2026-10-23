@@ -89,7 +89,11 @@ Inherited host locks, runtime services, environment mutation, and dependencies
 on vanished threads violate that contract. Immutable captures and `Send` do
 not prove safety. Child mutations remain local to the child.
 
-Each evaluator fork has a private close-on-exec control pipe. Callback and
+Each evaluator fork has a private close-on-exec control pipe. The child alone
+sets its process group and reports the startup result before the parent starts
+another evaluator. Startup waits honor cancellation and deadlines; startup
+failure reaps the child. Pipeline children wait for a socket shutdown before running;
+inherited descriptor copies cannot delay that release. Callback and
 command-policy refusals remain typed across waits and command substitutions.
 A refusal during substitution suppresses the enclosing target's effects.
 Numeric entry points report status 2. Ordinary exit 2 does not use this channel

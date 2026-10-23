@@ -184,6 +184,9 @@ preservation, mount, durability, cancellation, and partial-completion rules.
 Unsupported required metadata is reported as a failure and the source is
 retained. Explicit paths such as `/bin/cp` and `/bin/mv` still run external
 utilities. Interrupted copies and moves use the same quarantine protocol.
+On macOS, filesystem staging does not support an inherited umask that removes
+owner read or search permission (mask bits `0500`); for example, `0777` is
+unsupported. ish reports a failure and keeps filesystem operations in-process.
 Unpublished stages remain available for inspection. Recovery preserves published
 destinations and never resumes deleting sources. Read the
 [recovery reference](docs/filesystem.md#inspect-retained-operation-state) before

@@ -404,7 +404,7 @@ fn add_acl(path: &Path, acl: &str) {
 }
 
 #[test]
-fn private_directory_opens_under_umask_0777() {
+fn private_directory_rejects_umask_0777_without_changing_mode() {
     const CHILD_ENV: &str = "ISH_PRIVATE_DIRECTORY_UMASK_CHILD";
     if std::env::var_os(CHILD_ENV).is_some() {
         let fixture = Fixture::new();
@@ -419,23 +419,28 @@ fn private_directory_opens_under_umask_0777() {
             )?;
             let created = roots::observe(parent.as_fd(), OsStr::new("stage"))?;
             assert_eq!(created.mode & 0o777, 0);
-            let directory = platform::prepare_directory(
+            let error = platform::prepare_directory(
                 parent.as_fd(),
                 OsStr::new("stage"),
                 created.identity,
-            )?;
-            assert_eq!(roots::observe_fd(directory.as_fd())?.mode & 0o777, 0o700);
+            ).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("owner read and search"));
+            let unchanged = roots::observe(parent.as_fd(), OsStr::new("stage"))?;
+            assert_eq!(unchanged.identity, created.identity);
+            assert_eq!(unchanged.mode & 0o777, 0);
+            fs::unlinkat(parent.as_fd(), OsStr::new("stage"), AtFlags::REMOVEDIR)?;
             Ok::<_, io::Error>(())
         })();
         // SAFETY: restore the umask captured from this subprocess before returning.
         unsafe { libc::umask(previous_umask) };
-        result.expect("open staged directory after mode was masked to 000");
+        result.expect("reject mode-000 staging directory without changing it");
         return;
     }
 
     let status = Command::new(std::env::current_exe().expect("test executable path"))
         .arg("--exact")
-        .arg("private_directory_opens_under_umask_0777")
+        .arg("private_directory_rejects_umask_0777_without_changing_mode")
         .env(CHILD_ENV, "1")
         .status()
         .expect("run umask subprocess");

@@ -205,3 +205,16 @@ fn background_relay_descriptors_move_with_user_redirections() {
         assert_eq!(*out.lock().unwrap(), b"released");
     });
 }
+
+#[test]
+fn sequential_subshells_preserve_every_body_and_success_status() {
+    let count = 4096;
+    let script = format!("i=0; while test $i -lt {count}; do (printf x) || exit 7; i=$((i+1)); done");
+    let output = Command::new(env!("CARGO_BIN_EXE_epsh"))
+        .args(["-c", &script])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "subshell failed: {:?}", output);
+    assert_eq!(output.stdout, vec![b'x'; count]);
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+}

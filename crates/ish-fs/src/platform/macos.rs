@@ -122,6 +122,16 @@ pub(crate) fn prepare_directory(
             "staging directory identity or name is invalid",
         ));
     }
+    let observation = crate::roots::observe(parent, name)?;
+    if observation.identity != expected {
+        return Err(io::Error::other("staging directory identity changed"));
+    }
+    if observation.mode & 0o500 != 0o500 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "macOS filesystem staging requires owner read and search permission; a restrictive umask removing either is unsupported",
+        ));
+    }
     let name = CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "staging directory name contains NUL"))?;
     // SAFETY: `parent` remains live and `name` is NUL-terminated for openat.

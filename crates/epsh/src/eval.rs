@@ -771,8 +771,7 @@ impl Shell {
         Ok(outputs)
     }
 
-    fn enter_forked_child(&mut self, outputs: &[ForkOutput], pgid: i32) -> std::io::Result<()> {
-        rustix::process::setpgid(None, rustix::process::Pid::from_raw(pgid))?;
+    fn enter_forked_child(&mut self, outputs: &[ForkOutput]) -> std::io::Result<()> {
         self.in_forked_child = true;
         self.terminal_descriptor = None;
         self.child_pids.clear();
@@ -835,7 +834,7 @@ impl Shell {
         Ok(())
     }
 
-    fn fork_evaluator(&mut self) -> crate::error::Result<i32> {
+    fn fork_evaluator(&mut self, pgid: i32) -> crate::error::Result<i32> {
         let (control_read, control_write) = sys::pipe_owned()?;
         let stdout = std::io::stdout();
         let mut stdout_guard = stdout.lock();
@@ -851,18 +850,69 @@ impl Shell {
         drop(private);
         drop(stdout_guard);
         if pid == 0 {
+            let status = rustix::process::setpgid(None, rustix::process::Pid::from_raw(pgid))
+                .map_or_else(|error| error.raw_os_error(), |_| 0);
+            let mut writer = std::fs::File::from(control_write);
+            if writer.write_all(&status.to_ne_bytes()).is_err() || status != 0 {
+                sys::exit_child(ExitStatus::FAILURE);
+            }
             self.private_descriptors.clear();
-            let reporter = Arc::new(Mutex::new(Some(control_write)));
+            let reporter = Arc::new(Mutex::new(Some(OwnedFd::from(writer))));
             self.private_descriptors.push(Arc::downgrade(&reporter));
             self.callback_reporter = Some(reporter);
             self.child_controls.clear();
             drop(control_read);
         } else if pid > 0 {
-            let reader = Arc::new(Mutex::new(Some(control_read)));
+            drop(control_write);
+            self.track_child(pid, if pgid == 0 { pid } else { pgid });
+            let reader = std::fs::File::from(control_read);
+            let status = match self.read_child_startup(&reader) {
+                Ok(status) => status,
+                Err(error) => {
+                    self.kill_owned_children(&[pid]);
+                    return Err(error);
+                }
+            };
+            if status != 0 {
+                self.kill_owned_children(&[pid]);
+                return Err(std::io::Error::from_raw_os_error(status).into());
+            }
+            let reader = Arc::new(Mutex::new(Some(OwnedFd::from(reader))));
             self.private_descriptors.push(Arc::downgrade(&reader));
             self.child_controls.insert(pid, reader);
         }
         Ok(pid)
+    }
+
+    fn read_child_startup(&self, reader: &std::fs::File) -> crate::error::Result<i32> {
+        let flags = rustix::fs::fcntl_getfl(reader).map_err(std::io::Error::from)?;
+        rustix::fs::fcntl_setfl(reader, flags | rustix::fs::OFlags::NONBLOCK).map_err(std::io::Error::from)?;
+        let result = (|| {
+            let mut status = [0; 4];
+            let mut offset = 0;
+            while offset < status.len() {
+                self.check_cancel()?;
+                match rustix::io::read(reader, &mut status[offset..]) {
+                    Ok(0) => return Err(ShellError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "evaluator exited before reporting startup"))),
+                    Ok(length) => offset += length,
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(rustix::io::Errno::AGAIN) => {
+                        let mut events = [rustix::event::PollFd::new(reader, rustix::event::PollFlags::IN)];
+                        let timeout = rustix::event::Timespec { tv_sec: 0, tv_nsec: 5_000_000 };
+                        match rustix::event::poll(&mut events, Some(&timeout)) {
+                            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                            Err(error) => return Err(ShellError::Io(error.into())),
+                        }
+                    }
+                    Err(error) => return Err(ShellError::Io(error.into())),
+                }
+            }
+            Ok(i32::from_ne_bytes(status))
+        })();
+        let restored = rustix::fs::fcntl_setfl(reader, flags).map_err(std::io::Error::from);
+        let status = result?;
+        restored?;
+        Ok(status)
     }
 
     fn report_child_refusal(&self, error: &ShellError) {
@@ -907,7 +957,6 @@ impl Shell {
     }
 
     fn track_child(&mut self, pid: i32, pgid: i32) {
-        let _ = rustix::process::setpgid(rustix::process::Pid::from_raw(pid), rustix::process::Pid::from_raw(pgid));
         self.child_pids.push(pid);
         self.child_groups.insert(pid, pgid);
     }
@@ -2279,11 +2328,17 @@ impl Shell {
             pipes.push(sys::pipe_owned()?);
         }
         let outputs = self.fork_outputs(true)?;
-        let (gate_reader, gate_writer) = sys::pipe_owned()?;
+        let (gate_reader, gate_writer) = std::os::unix::net::UnixStream::pair()?;
+        let gate_reader = if gate_reader.as_raw_fd() < 3 {
+            std::os::unix::net::UnixStream::from(sys::duplicate_fd_above(gate_reader.as_raw_fd(), 3)?)
+        } else { gate_reader };
+        let gate_writer = if gate_writer.as_raw_fd() < 3 {
+            std::os::unix::net::UnixStream::from(sys::duplicate_fd_above(gate_writer.as_raw_fd(), 3)?)
+        } else { gate_writer };
         let mut children = Vec::new();
         let mut pgid = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
         for (i, cmd) in commands.iter().enumerate() {
-            let pid = match self.fork_evaluator() {
+            let pid = match self.fork_evaluator(pgid) {
                 Ok(pid) => pid,
                 Err(error) => {
                     drop(pipes);
@@ -2300,7 +2355,7 @@ impl Shell {
                 return Err(ShellError::Io(error));
             }
             if pid == 0 {
-                if self.enter_forked_child(&outputs, pgid).is_err() {
+                if self.enter_forked_child(&outputs).is_err() {
                     sys::exit_child(ExitStatus::FAILURE);
                 }
                 if i > 0 && sys::dup2_result(pipes[i - 1].0.as_raw_fd(), 0).is_err() {
@@ -2332,7 +2387,6 @@ impl Shell {
                 sys::exit_child(status);
             }
             if pgid == 0 { pgid = pid; }
-            self.track_child(pid, pgid);
             children.push(pid);
         }
         drop(pipes);
@@ -2342,6 +2396,10 @@ impl Shell {
         {
             self.kill_owned_children(&children);
             return Err(error);
+        }
+        if let Err(error) = gate_writer.shutdown(std::net::Shutdown::Write) {
+            self.kill_owned_children(&children);
+            return Err(error.into());
         }
         drop(gate_writer);
         self.relay_fork_outputs(*children.last().unwrap(), outputs, &children)?;
@@ -2356,10 +2414,10 @@ impl Shell {
     ) -> crate::error::Result<ExitStatus> {
         let outputs = self.fork_outputs(true)?;
         let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
-        let pid = self.fork_evaluator()?;
+        let pid = self.fork_evaluator(parent_group)?;
         if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
         if pid == 0 {
-            if self.enter_forked_child(&outputs, parent_group).is_err() {
+            if self.enter_forked_child(&outputs).is_err() {
                 sys::exit_child(ExitStatus::FAILURE);
             }
             self.traps.remove("EXIT");
@@ -2382,8 +2440,6 @@ impl Shell {
             self.run_exit_trap();
             sys::exit_child(status);
         }
-        let pgid = if parent_group == 0 { pid } else { parent_group };
-        self.track_child(pid, pgid);
         self.relay_fork_outputs(pid, outputs, &[pid])?;
         self.wait_child(pid)
     }
@@ -2395,10 +2451,10 @@ impl Shell {
     ) -> crate::error::Result<ExitStatus> {
         let outputs = self.fork_outputs(true)?;
         let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
-        let pid = self.fork_evaluator()?;
+        let pid = self.fork_evaluator(parent_group)?;
         if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
         if pid == 0 {
-            if self.enter_forked_child(&outputs, parent_group).is_err() {
+            if self.enter_forked_child(&outputs).is_err() {
                 sys::exit_child(ExitStatus::FAILURE);
             }
             self.traps.remove("EXIT");
@@ -2420,8 +2476,6 @@ impl Shell {
             };
             sys::exit_child(status);
         }
-        let pgid = if parent_group == 0 { pid } else { parent_group };
-        self.track_child(pid, pgid);
         self.relay_fork_outputs(pid, outputs, &[pid])?;
         self.last_bg_pid = Some(pid as u32);
         Ok(ExitStatus::SUCCESS)
@@ -2434,10 +2488,10 @@ impl Shell {
         let flags = rustix::fs::fcntl_getfl(&read_end).map_err(std::io::Error::from)?;
         rustix::fs::fcntl_setfl(&read_end, flags | rustix::fs::OFlags::NONBLOCK).map_err(std::io::Error::from)?;
         let parent_group = if self.in_forked_child { rustix::process::getpgrp().as_raw_pid() } else { 0 };
-        let pid = self.fork_evaluator()?;
+        let pid = self.fork_evaluator(parent_group)?;
         if pid < 0 { return Err(ShellError::Io(std::io::Error::last_os_error())); }
         if pid == 0 {
-            if self.enter_forked_child(&outputs, parent_group).is_err()
+            if self.enter_forked_child(&outputs).is_err()
                 || sys::dup2_result(write_end.as_raw_fd(), 1).is_err() {
                 sys::exit_child(ExitStatus::FAILURE);
             }
@@ -2457,7 +2511,6 @@ impl Shell {
         }
         drop(write_end);
         let pgid = if parent_group == 0 { pid } else { parent_group };
-        self.track_child(pid, pgid);
         self.relay_fork_outputs(pid, outputs, &[pid])?;
 
         let mut raw_output = Vec::new();
@@ -2507,21 +2560,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn evaluator_startup_timeout_does_not_wait_for_the_child_to_write() {
+        let shell = Shell::builder().timeout(std::time::Duration::from_millis(20)).build();
+        let (reader, writer) = sys::pipe_owned().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(shell.read_child_startup(&std::fs::File::from(reader))).unwrap();
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(1));
+        drop(writer);
+        worker.join().unwrap();
+        assert!(matches!(result, Ok(Err(ShellError::TimedOut))), "{result:?}");
+    }
+
+    #[test]
     fn signal_trap_callback_refusal_reaches_the_parent_without_changing_trap_status() {
         let mut shell = Shell::new();
         shell.set_external_handler(Box::new(|_, _| Ok(ExitStatus::SUCCESS)));
         shell.traps.insert("USR1".to_owned(), "/bin/true".to_owned());
         shell.exit_status = ExitStatus::from(7);
-        let pid = shell.fork_evaluator().unwrap();
+        let pid = shell.fork_evaluator(0).unwrap();
         assert!(pid >= 0);
         if pid == 0 {
-            shell.enter_forked_child(&[], 0).unwrap();
+            shell.enter_forked_child(&[]).unwrap();
             crate::signal::install_handler(rustix::process::Signal::USR1).unwrap();
             rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::USR1).unwrap();
             shell.run_pending_traps();
             sys::exit_child(shell.exit_status);
         }
-        shell.track_child(pid, pid);
         let status = rustix::process::waitid(
             rustix::process::WaitId::Pid(rustix::process::Pid::from_raw(pid).unwrap()),
             rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,

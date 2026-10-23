@@ -5,6 +5,27 @@ raw Unix path bytes and take precedence over bare `cp` and `mv` entries on
 `PATH`. Use an explicit executable path, such as `/bin/cp`, when you want the
 system utility.
 
+## macOS staging permissions
+
+On macOS, operations that create private staging or deletion quarantine
+require an inherited umask that preserves owner read and search permission.
+Mask bits `0500` must be clear. A mask such as `0777` is unsupported.
+Rejected staging initialization does not capture sources or publish destinations.
+A mask that removes only owner write permission remains supported.
+ish normalizes permissions through an opened descriptor. Linux retains
+restrictive-umask support.
+
+On macOS 27 and later, ish reads the mask without changing it and rejects an
+unsupported mask before creating quarantine state. On older macOS versions,
+or if another thread changes the mask during creation, an inaccessible
+quarantine directory (including mode `000`) can remain. Its diagnostic
+identifies the retained directory. ish leaves it untouched because changing
+permissions by pathname would permit a
+substitution race. Inspect the retained directory before repairing permissions
+or removing an empty directory yourself. Recovery remains blocked until the
+retained directory is accessible and its state is resolved. ish does not change the process umask or working
+directory, or launch a filesystem helper.
+
 ## Choose a destination form
 
 Use one of these forms:

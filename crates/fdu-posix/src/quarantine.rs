@@ -442,11 +442,33 @@ fn create_session_directory(root: BorrowedFd<'_>, mut random: impl FnMut() -> io
     Err(io::Error::new(io::ErrorKind::AlreadyExists, "quarantine random name collision limit reached"))
 }
 
+#[cfg(target_os = "macos")]
+fn check_creation_mask() -> io::Result<()> {
+    // SAFETY: getumask is a public no-argument mode_t function on macOS 27 and later; lookup preserves support for older hosts.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getumask".as_ptr()) };
+    if !symbol.is_null() {
+        // SAFETY: the non-null symbol names getumask with its documented C signature.
+        let getumask: unsafe extern "C" fn() -> libc::mode_t = unsafe { std::mem::transmute(symbol) };
+        // SAFETY: getumask reads the process mask without changing process state.
+        if unsafe { getumask() } & 0o500 != 0 {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "macOS filesystem staging does not support a restrictive umask that removes owner read or search permission"));
+        }
+    }
+    Ok(())
+}
+
 fn open_created_directory(root: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
     #[cfg(target_os = "linux")]
     let held = retry(|| fs::openat(root, name, OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()))?;
     #[cfg(target_os = "macos")]
     let held = {
+        let stat = identity::stat_at(root, name)?;
+        if identity::entry_type(&stat) != EntryType::Directory || stat.st_uid != rustix::process::geteuid().as_raw() {
+            return Err(invalid("quarantine directory owner or type is invalid"));
+        }
+        if stat.st_mode & 0o500 != 0o500 {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "macOS filesystem staging does not support a restrictive umask that removes owner read or search permission"));
+        }
         use rustix::fd::{AsRawFd, FromRawFd};
         let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid("invalid session name"))?;
         // SAFETY: the borrowed descriptor is live and the name is NUL-terminated.
@@ -471,11 +493,13 @@ fn open_created_directory(root: BorrowedFd<'_>, name: &OsStr) -> io::Result<Owne
 
 impl Session {
     pub fn start(root: BorrowedFd<'_>) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        check_creation_mask()?;
         let mut root = lock(root)?;
         if recover(&mut root)? { return Err(io::Error::other("interrupted deletion recovered; rescan before deleting")); }
         let mount = identity::mount_identity(root.as_fd())?;
         let name = create_session_directory(root.as_fd(), random_bytes)?;
-        let directory = open_created_directory(root.as_fd(), &name)?;
+        let directory = open_created_directory(root.as_fd(), &name).map_err(|error| retained(&name, None, error))?;
         let initialized = (|| {
             fs::fchmod(&directory, Mode::RWXU)?;
             validate_directory(directory.as_fd(), false)?;
@@ -648,6 +672,27 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inaccessible_created_directory_is_rejected_without_changing_permissions() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join(".work/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join(format!("ish45-inaccessible-directory-{}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        let root = std::fs::File::open(&path).unwrap();
+        for mode in [0o300, 0o600, 0] {
+            fs::mkdirat(&root, c"stage", Mode::from_raw_mode(mode)).unwrap();
+            let before = identity::stat_at(root.as_fd(), OsStr::new("stage")).unwrap();
+            let error = open_created_directory(root.as_fd(), OsStr::new("stage")).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            let after = identity::stat_at(root.as_fd(), OsStr::new("stage")).unwrap();
+            assert_eq!(identity::entry_identity(&before).unwrap(), identity::entry_identity(&after).unwrap());
+            assert_eq!(after.st_mode, before.st_mode);
+            fs::unlinkat(&root, c"stage", AtFlags::REMOVEDIR).unwrap();
+        }
+        std::fs::remove_dir(path).unwrap();
+    }
 
     #[test]
     fn random_name_collisions_are_bounded_and_never_replace_existing_entries() {

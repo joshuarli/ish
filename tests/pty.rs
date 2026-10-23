@@ -2317,6 +2317,7 @@ fn tab_completion_first_tab_has_no_selection_second_tab_selects_first() {
     let sh = PtyShell::spawn_with_opts(&[("aaa.txt", ""), ("aab.txt", ""), ("aac.txt", "")], &[]);
     sh.type_str("echo aa");
     sh.tab();
+    sh.wait_for_screen("completion grid", 2000, |screen| screen.contains("aaa.txt"));
     sh.wait_for_quiescence(150);
     let first = snapshot_text(&sh.screen());
     assert_eq!(
@@ -2326,6 +2327,7 @@ fn tab_completion_first_tab_has_no_selection_second_tab_selects_first() {
     );
 
     sh.tab();
+    sh.wait_for_screen("completion preview", 2000, |screen| active_prompt_text(screen).contains("aaa.txt"));
     sh.wait_for_quiescence(150);
     let second = snapshot_text(&sh.screen());
     assert_eq!(

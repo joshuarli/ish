@@ -256,14 +256,14 @@ it does not use a pathname permission mutation after an identity check.
 | --- | --- |
 | Workspace check | `cargo check --workspace` passed. |
 | Strict Clippy | `cargo clippy --workspace --all-targets -- -D warnings` passed. |
-| Workspace tests | `cargo test --workspace --lib --tests --no-fail-fast` remained red. The restrictive-umask cases in fdu-posix recovery, ish-fs native macOS, and ish-fs transfer failed with EACCES. The run was interrupted after recovery children remained waiting; it is not a completed workspace pass. |
+| Workspace tests | `cargo test --workspace --lib --tests --no-fail-fast` passed after the startup repairs and accepted macOS umask boundary described below. Required privileged and fixture-only exclusions remain explicit. |
 | Interactive PTY tests | `cargo test -p ish --test pty` passed all 178 cases, including copy cancellation and foreground terminal restoration. Staging polling drains PTY output so progress cannot backpressure the test's shell. |
-| Filesystem targets | Native ish-fs library, policy, and preservation targets passed. Transfer passed 11 cases and failed its restrictive-umask case. Native clone eligibility, inherited ACL cleanup, blocking flags, sparse copy/fallback, and cancellation cases passed; the mode-000 directory case remains failing. |
+| Filesystem targets | Native ish-fs library, policy, and preservation targets passed. Transfer passed all 12 cases. Native macOS passed 24 cases, with the foreign-owned staging case explicitly ignored pending root access. Restrictive masks now assert the accepted rejection behavior. |
 | Large resource fork | A complete 4,294,971,392-byte named-fork copy passed with a 1 MiB buffer. Assertions checked the length, bytes above `u32::MAX`, and zero content in an interior hole. This does not assert physical resource-fork sparsity. |
 | Required identity failure | A live Unix socket descriptor passed `fstat` but its filesystem query returned EINVAL. The native identity boundary propagated the error instead of substituting a device-only identity. |
 | Raw path names | APFS returned EILSEQ while creating malformed UTF-8 names. Those fixture legs report exclusion only for that error; valid control-name, symlink, hardlink, and canonical trust-path assertions still execute. Linux raw-name acceptance is recorded above. |
-| Integrated shell tests | Ordinary-user `make test` stopped at one `expand-unglob-unq` stdout mismatch. Its final `9 qstn brac` subshell printed the error branch. A focused rerun and the full conformance target then passed: 175 selected, 167 passed, 8 declared exclusions. The initial failure remains unexplained; rerunning does not establish a green integrated gate. |
-| Release build | `make release TARGET=aarch64-apple-darwin` passed with build-std and the actual release profile and flags. The arm64 Mach-O `ish` binary was 1,549,696 bytes. |
+| Integrated shell tests | Ordinary-user `make test` passed after ISH-61's evaluator startup repair. The retained native conformance corpus remains required, with its existing host exclusions. |
+| Release build | The earlier `make release TARGET=aarch64-apple-darwin` run passed with build-std and the actual release profile and flags. That arm64 Mach-O binary was 1,549,696 bytes; the later startup repairs were not rebuilt in release mode. |
 | Panic diagnostic | A scratch probe built with the same release profile, target, and build-std flags aborted with status 134 and printed `ISH45_RELEASE_PANIC_PROBE` and `src/main.rs:2:5`. Only the probe shell disabled core dumps. No build-time or runtime performance claim is made. |
 
 Integration reuses these native results. Focused ARM64 Linux checks cover the
@@ -271,6 +271,39 @@ shared version predicate, environment/history tests, prompt fixture, and
 foreground-job fixture. The final foreground fixture uses rustix's typed
 controlling-terminal operation because Darwin and musl declare different ioctl
 request integer types.
+
+### Startup and staging follow-up
+
+ISH-61 reproduced as a concurrent parent/child `setpgid` failure: Darwin returned
+EPERM in the child even when the requested group had already been assigned.
+Checking the resulting group did not eliminate every failure. The child now
+owns group assignment and reports startup before the parent starts another
+evaluator. A 4,096-subshell regression failed before the repair and passes
+afterward. Startup acknowledgement waits also honor cancellation and deadlines;
+a pending-writer timeout regression failed before that correction and passes now.
+
+Parallel evaluator tests exposed an EOF launch gate kept open by unrelated
+fork-inherited descriptors. Pipeline launch now uses socket shutdown to release
+readers. The complete epsh library and integration suite passes. The PTY
+completion assertion now waits for grid and preview states before checking its
+unchanged selection requirements; all 178 PTY tests pass.
+
+The owner chose to keep filesystem operations in-process and reject macOS masks
+that remove owner read or search permission (`0500`). The earlier macOS
+restrictive-umask success expectations changed to require an `Unsupported`
+error, unchanged source and existing entries, and no destination publication.
+Masks `0400`, `0100`, and `0777` are rejected; `0200` remains supported. On this
+macOS 27 host, the public read-only `getumask` preflight rejects before creating
+quarantine state. Actual-mode checks also reject inaccessible directories
+without changing their identity or permissions. Older hosts or concurrent mask
+changes can leave an inaccessible session identified by its diagnostic; see
+[staging permissions](filesystem.md#macos-staging-permissions).
+
+Focused Linux ARM64 musl evaluator, conformance, foreground-job, and lifecycle
+tests passed. The Linux restrictive-umask recovery and transfer cases passed on
+the native ext4 fixture. The transfer case returned EACCES on the macOS-shared
+mount, so that shared-filesystem result is not native Linux acceptance. Linux
+retains its existing restrictive-umask success contract.
 
 ### Apple copy comparison
 
@@ -293,18 +326,29 @@ speed comparison or power-loss test.
 
 ### Remaining macOS acceptance
 
-Umask `0777` creates mode-000 directories that Darwin refuses to open through
-the current event-only handle path. The three restrictive-umask tests remain
-failing. A safe creation/access design must precede changing that behavior;
-before/after identity checks do not make a pathname chmod atomic. Global
-umask mutation and filesystem helper children would change existing ownership
-or process boundaries. Foreign-owner cases still need a native privileged run.
+Only the native privileged ownership branches remain unrun. Noninteractive sudo
+requires a password on this host. Build the test executable as the ordinary user,
+then run the two foreign-owner clone branches and the explicit staging case as
+root from the repository root:
+
+```sh
+ish_native_test=$(
+    TMPDIR="$PWD/.work/tmp" CARGO_TARGET_DIR="$PWD/.work/macos-target" \
+        cargo test -p ish-fs --test native_macos --no-run --message-format=json |
+        jaq -r 'select(.reason == "compiler-artifact" and .target.name == "native_macos") | .executable // empty'
+)
+sudo "$ish_native_test" clone_declines --nocapture
+sudo "$ish_native_test" --exact private_directory_prepares_foreign_owned_staging_directory --ignored --nocapture
+```
+
+The clone cases exercise foreign ownership by dropping credentials in isolated
+children. An ordinary-user run cannot establish those root-only branches.
 
 ## Remaining native evidence
 
 | Deferred run | Setup and acceptance condition |
 | --- | --- |
-| Native macOS | [ISH-45](../TODO.md) retains the restrictive-umask, privileged ownership, and complete workspace/integrated gate requirements. The completed native cases and utility comparison are recorded above. |
+| Native macOS | [ISH-45](../TODO.md) retains only privileged ownership acceptance. The accepted restrictive-umask boundary, complete ordinary-user workspace/integrated gates, native cases, and utility comparison are recorded above. |
 
 The repair run passed native x86_64 musl workspace checks, strict Clippy, Rust
 and PTY tests, conformance, semantic verification, and shift refinement.

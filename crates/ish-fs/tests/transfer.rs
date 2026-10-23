@@ -209,14 +209,42 @@ fn merge_publishes_absent_subtree_once_and_preserves_existing_container_mode() {
 }
 
 #[test]
-fn restrictive_umask_does_not_prevent_private_staging_directory_access() {
+fn restrictive_umask_obeys_platform_staging_boundary() {
     if std::env::var_os("ISH_FS_TRANSFER_UMASK_CHILD").is_some() {
         let fixture = Fixture::new(); fs::create_dir_all(fixture.0.join("source/d")).unwrap(); fs::write(fixture.0.join("source/d/file"), b"preserved").unwrap();
+        fs::write(fixture.0.join("foreign"), b"untouched").unwrap();
+        let source_inode = fs::metadata(fixture.0.join("source")).unwrap().ino();
+        let foreign_inode = fs::metadata(fixture.0.join("foreign")).unwrap().ino();
         rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o777));
-        assert_eq!(fixture.run(&fixture.request("source", "destination")), 0);
-        assert_eq!(fs::read(fixture.0.join("destination/d/file")).unwrap(), b"preserved");
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(fixture.run(&fixture.request("source", "destination")), 0);
+            assert_eq!(fs::read(fixture.0.join("destination/d/file")).unwrap(), b"preserved");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let diagnostics = std::sync::Mutex::new(Vec::new());
+            let result = execute(&fixture.request("source", "destination"), &Cancellation::default(), &|event| {
+                if let Event::Diagnostic(diagnostic) = event { diagnostics.lock().unwrap().push(diagnostic.message); }
+                Ok(())
+            });
+            assert_ne!(result.status(), 0);
+            assert!(diagnostics.lock().unwrap().iter().any(|message| message.contains("restrictive umask")));
+            assert!(!fixture.0.join("destination").exists());
+            assert_eq!(fs::read(fixture.0.join("source/d/file")).unwrap(), b"preserved");
+        }
+        assert_eq!(fs::metadata(fixture.0.join("source")).unwrap().ino(), source_inode);
+        assert_eq!(fs::metadata(fixture.0.join("foreign")).unwrap().ino(), foreign_inode);
+        assert_eq!(fs::read(fixture.0.join("foreign")).unwrap(), b"untouched");
+        #[cfg(target_os = "macos")]
+        for entry in fs::read_dir(&fixture.0).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with(".fdu-quarantine-v2-") {
+                fs::remove_dir(entry.path()).unwrap();
+            }
+        }
         return;
     }
-    let output = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "restrictive_umask_does_not_prevent_private_staging_directory_access", "--nocapture"]).env("ISH_FS_TRANSFER_UMASK_CHILD", "1").output().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "restrictive_umask_obeys_platform_staging_boundary", "--nocapture"]).env("ISH_FS_TRANSFER_UMASK_CHILD", "1").output().unwrap();
     assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
 }
