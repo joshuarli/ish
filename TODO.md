@@ -17,22 +17,11 @@ verification limits. Open implementation and acceptance work is listed below.
 | [ISH-15, ISH-52](docs/rfc/ISH-15-environment-and-shell-ownership.md) | Explicit environments; remove host environment mutation and unsupported safety comments | Implemented; focused Linux acceptance passed; macOS remains under ISH-45 |
 | [ISH-5](docs/rfc/ISH-5-foreground-job-outcomes.md) | Structured stopped-job handles; epsh owns every child wait | Implemented; Linux PTY and process tests passed; macOS is tracked under ISH-45 |
 | [ISH-8](docs/rfc/ISH-8-callback-process-boundary.md) | Creator-process callbacks by default; explicit unsafe child opt-in | Implemented after ISH-5; Linux callback boundary tests passed; macOS is tracked under ISH-45 |
-| [ISH-32](docs/rfc/ISH-32-capture-and-retire.md) | Shared journaled fdu quarantine and identity primitives | Linux x86_64 acceptance and Btrfs FICLONE passed; native ARM64 acceptance is deferred; macOS under ISH-45 |
+| [ISH-32](docs/rfc/ISH-32-capture-and-retire.md) | Shared journaled fdu quarantine and identity primitives | Linux x86_64 and ARM64 musl acceptance passed, including Btrfs FICLONE; ARM64 ran in an OrbStack VM; macOS under ISH-45 |
 | [ISH-42](docs/rfc/ISH-42-release-delivery.md) | Default-branch releases, verified bytes, diagnostic panic aborts | Linux implementation verified; native macOS panic probe is tracked under ISH-45 |
 | [ISH-48](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor) | Private binary `Shell`; reusable library editor | Implemented; focused Linux editor and PTY acceptance passed |
 
 ## Open implementation tickets
-
-### ISH-32 · P3 · Native ARM64 acceptance for shared quarantine is deferred
-
-- **Status:** Linux x86_64 implementation and owned acceptance fixtures passed; native ARM64 acceptance is outside the current host scope.
-- **Area:** Tests
-- **Where:** `crates/fdu-posix`, `crates/fdu-delete`, `crates/fdu-scan`, `crates/ish-fs`, `docs/filesystem-testing.md`
-- **Problem:** Both callers now use shared journaled quarantine and identity primitives. Linux x86_64 mount recovery, foreign-owner behavior, deferred blocking flags, and FICLONE on a loop-backed Btrfs filesystem passed. Native ARM64 musl hardware is unavailable here. Native macOS acceptance remains tracked under ISH-45.
-- **Recommendation:** On a native ARM64 host, complete workspace, musl, mount, and filesystem acceptance. Keep this ticket open until those cases execute and pass; use the evidence ledger for exact commands and limits.
-- **Fix with:** none
-- **Effort:** S (hours)
-- **Design:** [Shared capture and retirement](docs/rfc/ISH-32-capture-and-retire.md)
 
 ### ISH-45 · P3 · macOS platform build and native acceptance remain unverified
 

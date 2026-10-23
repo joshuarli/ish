@@ -1,8 +1,8 @@
 # ISH-32: Shared capture and retirement
 
-Status: accepted; Linux x86_64 implementation, owned recovery acceptance, and
-Btrfs FICLONE acceptance passed (2026-10-22); native ARM64 and macOS acceptance
-remain pending.
+Status: accepted; Linux x86_64 implementation and acceptance passed (2026-10-22).
+ARM64 musl acceptance, including Btrfs FICLONE, passed in an OrbStack Linux VM
+(2026-10-23). Native macOS acceptance remains under ISH-45.
 
 ## Decision
 

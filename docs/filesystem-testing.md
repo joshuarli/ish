@@ -75,9 +75,9 @@ foreign-owner row below.
 ### Shared quarantine implementation
 
 The completion branch extracts the shared identity and quarantine
-implementation into `fdu-posix`. Linux engine and fdu callers use it. ISH-32
-remains open for native ARM64 acceptance, which is outside this Linux x86_64
-host's scope. Its native macOS acceptance belongs to ISH-45.
+implementation into `fdu-posix`. Linux engine and fdu callers use it. ARM64
+musl acceptance subsequently passed in the Linux VM run below. Native macOS
+acceptance belongs to ISH-45.
 
 `cargo test -p fdu-posix -p fdu-delete --lib --test recovery --test quarantine`
 passed the shared journal tests (two unit tests, seven recovery tests, two
@@ -196,11 +196,45 @@ macOS failed to compile against unavailable rustix APIs. The local x86_64 musl
 and semantic gates above pass on the completion branch, but no hosted run has
 tested that branch.
 
-## Native evidence deferred beyond Linux x86_64
+## ARM64 Linux musl acceptance — 2026-10-23
+
+The unchanged runtime at `d9c33ef` passed on ARM64 through OrbStack's Linux VM
+on an Apple silicon macOS host. The guest kernel was
+`7.2.9-orbstack-00391-g2b298d05fbd4`, running aarch64 instructions without
+cross-architecture emulation. This is VM evidence, not a bare-metal Linux run.
+The Alpine 3.24.1 builder used the pinned `nightly-2026-09-15` musl toolchain,
+kache 1.0.0, and mold 2.39.1. No runtime changes were needed for this run.
+Cargo used `RUSTC_WRAPPER=kache`,
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=clang`, and
+`RUSTFLAGS='-L native=/usr/lib -Clink-arg=-B/usr/lib/e-crt/aarch64-unknown-linux-musl -Clink-arg=-B/usr/local/libexec/mold'`.
+
+The workspace check and strict all-target Clippy passed. The initial tests on
+the macOS shared-directory projection failed raw-name, ACL, ownership, and
+sparse-allocation assertions. Those results do not establish Linux behavior.
+The successful rerun mounted an owned loop-backed ext4 image over `.work/tmp`
+inside the container. All backing files and mountpoints stayed under `.work/`.
+The ext4 and Btrfs mounts and the script's temporary mounts were unmounted
+after their checks.
+
+| Acceptance | Command and observed result |
+| --- | --- |
+| Workspace check | `cargo check --workspace` passed. |
+| Strict Clippy | `cargo clippy --workspace --all-targets -- -D warnings` passed. |
+| Workspace tests | `cargo test --workspace --lib --tests --no-fail-fast` passed with ext4 fixtures and an absolute `TMPDIR`. |
+| Integrated shell tests | `make test TARGET=aarch64-unknown-linux-musl CARGO_CMD=cargo` passed with the same musl linker flags. |
+| Owned mount fixtures | `benches/fs/native-fixtures.sh` passed all five cases: EXDEV move, replacement aliases, nested mounts, bind aliases, and bind-mount recovery refusal. |
+| Foreign-owner EXDEV | With uid 0 and an owned tmpfs destination, `cargo test -p ish-fs --test native_boundaries native_boundary_foreign -- --ignored --nocapture` passed both cases, including the privilege-dropped refusal. |
+| Deferred inode flags | With `CAP_LINUX_IMMUTABLE` on ext4, `cargo test -p ish-fs --lib repair_deferred_metadata_validates_successful_output -- --ignored --nocapture` passed. |
+| Btrfs clone | On an owned loop-backed Btrfs image, `cargo test -p ish-fs --lib public_copy_selects_reflink_when_ficlone_works -- --ignored --nocapture` passed. The copy-method bytes, metadata, and hardlink parity test also passed on Btrfs. |
+
+These checks close ISH-32's remaining ARM64 musl acceptance. They establish
+process-crash recovery on the tested filesystems, not power-loss durability.
+macOS acceptance remains separately tracked under ISH-45.
+
+## Remaining native evidence
 
 | Deferred run | Setup and acceptance condition |
 | --- | --- |
-| Native ARM64 musl | Outside this Linux x86_64 host's scope. Keep this acceptance under ISH-32. On native ARM64 Linux musl hardware, run workspace check, strict all-target Clippy, workspace library/integration tests, `make test`, and `benches/fs/native-fixtures.sh`. Cross-build and QEMU execution are supporting checks, not native hardware evidence. |
 | Native macOS | Deferred to [TODO.md, ISH-45](../TODO.md), per the Linux-host scope. No macOS build or native acceptance is claimed. The pending run requires ordinary-user workspace checks and tests, separate privileged cases, clone/access normalization, ACLs, foreign ownership, blocking flags, cancellation, sparse fallback, resource forks above 4 GiB, unsupported identity failure, and a release panic probe. |
 | Apple clone-aware utility comparison | Deferred with ISH-45. Compare Apple `cp` and `cp -c` on native macOS with a clone-capable filesystem. GNU Coreutils 9.11 `cp --archive --reflink=always` passed on Linux Btrfs; the method and preservation/durability results are recorded above. |
 
@@ -209,7 +243,8 @@ and PTY tests, conformance, semantic verification, and shift refinement.
 ARM64 musl and ARM64 macOS passed full workspace strict all-target cross-Clippy.
 Selected ARM64 ish-fs tests ran under QEMU. Self-spawning umask/descriptor-limit
 fixtures ran directly as isolated emulated children because binfmt was absent.
-These results do not satisfy the native runs above.
+Those earlier cross-checks did not satisfy native acceptance; the later ARM64
+Linux VM run is recorded above.
 
 Real full/quota-limited destinations, filesystems without sparse support, and
 power-loss durability remain unproven. Injected storage errors, allocation
