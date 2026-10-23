@@ -753,6 +753,13 @@ mod tests {
         }
         // SAFETY: slave_raw is a newly opened descriptor owned by this function.
         let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+        let mut terminal_settings = rustix::termios::tcgetattr(&slave)?;
+        terminal_settings.local_modes.remove(rustix::termios::LocalModes::ECHO);
+        rustix::termios::tcsetattr(
+            &slave,
+            rustix::termios::OptionalActions::Now,
+            &terminal_settings,
+        )?;
         // SAFETY: dup returns a new descriptor for stdin on success.
         let original_raw = unsafe { libc::dup(0) };
         if original_raw < 0 {

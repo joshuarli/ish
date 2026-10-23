@@ -12,12 +12,12 @@ fn isolated(name: &str, probe: impl FnOnce()) {
         let mut master = -1;
         let mut slave = -1;
         // SAFETY: openpty initializes both descriptor outputs; no name or terminal settings are requested.
-        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) }, 0);
+        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
         // SAFETY: openpty returned two owned descriptors and they are wrapped once.
         let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        rustix::process::ioctl_tiocsctty(&slave).unwrap();
         // SAFETY: the isolated session owns these terminal and standard-input descriptors and signal dispositions.
         unsafe {
-            assert_eq!(libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0), 0);
             assert_eq!(libc::dup2(slave.as_raw_fd(), 0), 0);
             libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             libc::signal(libc::SIGHUP, libc::SIG_IGN);
@@ -145,7 +145,7 @@ fn foreground_partial_ownership_loss_is_reported_after_remaining_members_finish(
     isolated("foreground_partial_ownership_loss_is_reported_after_remaining_members_finish", || {
         let output = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut shell = Shell::builder().interactive(true).stdout_sink(output.clone()).build();
-        let program = Parser::new("/bin/sh -c 'kill -STOP $$; exit 7' | /bin/sh -c 'kill -STOP $$; printf remaining'").parse().unwrap();
+        let program = Parser::new("/bin/sh -c 'kill -STOP $$; exit 7' | /bin/sh -c '/bin/cat >/dev/null; printf remaining'").parse().unwrap();
         let ProgramOutcome::Stopped(mut job) = shell.run_program_outcome(&program) else { panic!("pipeline did not stop"); };
         let child = rustix::process::Pid::from_raw(job.process_group()).unwrap();
         rustix::process::kill_process(child, rustix::process::Signal::KILL).unwrap();

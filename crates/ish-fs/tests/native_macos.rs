@@ -1,9 +1,10 @@
 #![cfg(target_os = "macos")]
 
-use std::ffi::{CString, OsStr};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self as std_fs, File};
 use std::io::{self, Read};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,7 +44,7 @@ mod platform {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/platform/metadata.rs"));
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, unused_imports)]
     pub(crate) mod macos {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/platform/macos.rs"));
     }
@@ -92,6 +93,26 @@ impl Drop for Fixture {
     }
 }
 
+fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    let mut hole = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: libc::off_t::try_from(offset).expect("hole offset fits off_t"),
+        fp_length: libc::off_t::try_from(length).expect("hole length fits off_t"),
+    };
+    // SAFETY: The file descriptor is live and `hole` has the layout required by F_PUNCHHOLE.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &mut hole) } == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn try_clone(source: BorrowedFd<'_>, parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<platform::macos::ClonedFile>> {
+    let metadata = platform::macos::capture_metadata(platform::MetadataTarget::Fd(source))?;
+    platform::macos::try_clone_to_dir(source, parent, name, &metadata)
+}
+
 struct FlagReset([i32; 2]);
 
 impl Drop for FlagReset {
@@ -114,7 +135,7 @@ fn clone_uses_read_only_source_descriptor_and_preserves_0444_mode() {
         .expect("open read-only source descriptor");
     let parent = fixture.parent_fd();
 
-    let clone = match platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
+    let clone = match try_clone(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
         Ok(Some(clone)) => clone,
         Ok(None) => panic!("filesystem does not support APFS clones"),
         Err(error) => panic!("clone failed: {error}"),
@@ -130,7 +151,7 @@ fn clone_uses_read_only_source_descriptor_and_preserves_0444_mode() {
     assert_eq!(metadata.flags & libc::UF_IMMUTABLE, 0);
 
     assert!(matches!(
-        platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("../escape")),
+        try_clone(source.as_fd(), parent.as_fd(), OsStr::new("../escape")),
         Err(error) if error.kind() == io::ErrorKind::InvalidInput
     ));
 }
@@ -146,7 +167,7 @@ fn clone_clears_inherited_blocking_flags_from_private_clone() {
     // SAFETY: `source` is a live descriptor accepted by fchflags.
     assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), libc::UF_IMMUTABLE) }, 0);
     let parent = fixture.parent_fd();
-    let clone = match platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
+    let clone = match try_clone(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
         Ok(Some(clone)) => clone,
         Ok(None) => panic!("filesystem does not support APFS clones"),
         Err(error) => panic!("clone failed: {error}"),
@@ -167,23 +188,26 @@ fn clone_does_not_normalize_an_existing_read_only_destination() {
     let destination_path = fixture.path("destination");
     std_fs::write(&source_path, b"source bytes").expect("write source");
     std_fs::write(&destination_path, b"destination bytes").expect("write destination");
+    let mut destination = File::open(&destination_path).expect("open destination before chmod");
     std_fs::set_permissions(&destination_path, std_fs::Permissions::from_mode(0o044))
         .expect("make destination readable by group and others only");
     let source = fs::open(&source_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
         .expect("open source");
     let parent = fixture.parent_fd();
-    let result = platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("destination"));
+    let result = try_clone(source.as_fd(), parent.as_fd(), OsStr::new("destination"));
     match result {
         Ok(None) => panic!("filesystem does not support APFS clones"),
         Ok(Some(_)) => panic!("clone replaced an existing destination"),
         Err(error) => assert_eq!(error.kind(), io::ErrorKind::AlreadyExists),
     }
-    assert_eq!(std_fs::read(&destination_path).expect("read destination bytes"), b"destination bytes");
+    let mut destination_bytes = Vec::new();
+    destination.read_to_end(&mut destination_bytes).expect("read destination through its open descriptor");
+    assert_eq!(destination_bytes, b"destination bytes");
     assert_eq!(std_fs::metadata(&destination_path).unwrap().permissions().mode() & 0o7777, 0o044);
 }
 
 #[test]
-fn clone_normalizes_foreign_0044_and_inherited_deny_read_before_open() {
+fn clone_declines_inherited_read_denial_before_creation() {
     const CHILD_ENV: &str = "ISH_CLONE_ACCESS_CHILD";
     const SOURCE_ENV: &str = "ISH_CLONE_ACCESS_SOURCE";
     const STAGING_ENV: &str = "ISH_CLONE_ACCESS_STAGING";
@@ -195,7 +219,27 @@ fn clone_normalizes_foreign_0044_and_inherited_deny_read_before_open() {
             assert_eq!(unsafe { libc::setgid(501) }, 0);
             assert_eq!(unsafe { libc::setuid(501) }, 0);
         }
-        assert_clone_opens_after_normalization(Path::new(&source_path), Path::new(&staging_path));
+        let source = fs::open(&source_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+            .expect("open source readable by other users");
+        if std::env::var_os(CHILD_ENV).is_some() {
+            assert_ne!(unsafe { libc::geteuid() }, 0);
+            assert_ne!(roots::observe_fd(source.as_fd()).unwrap().uid, unsafe { libc::geteuid() as u32 });
+        }
+        let parent = fs::open(
+            &staging_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open staging directory");
+        assert!(try_clone(source.as_fd(), parent.as_fd(), OsStr::new("clone"))
+            .expect("decline clone with inherited restrictive ACL")
+            .is_none());
+        assert_eq!(
+            std_fs::symlink_metadata(Path::new(&staging_path).join("clone"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
         return;
     }
 
@@ -203,24 +247,13 @@ fn clone_normalizes_foreign_0044_and_inherited_deny_read_before_open() {
     let source_path = fixture.path("source");
     let staging_path = fixture.path("stage");
     std_fs::write(&source_path, b"foreign readable source").expect("write source");
-    std_fs::set_permissions(&source_path, std_fs::Permissions::from_mode(0o044))
-        .expect("make source readable by group and others only");
+    std_fs::set_permissions(&source_path, std_fs::Permissions::from_mode(0o444))
+        .expect("make source readable by every class");
     std_fs::create_dir(&staging_path).expect("create staging directory");
     std_fs::set_permissions(&staging_path, std_fs::Permissions::from_mode(0o700))
         .expect("make staging directory private");
 
-    for (path, acl) in [
-        (&source_path, "everyone allow read,readattr"),
-        (&staging_path, "everyone deny read,file_inherit,only_inherit"),
-    ] {
-        let output = Command::new("/bin/chmod")
-            .arg("+a")
-            .arg(acl)
-            .arg(path)
-            .output()
-            .expect("run macOS chmod ACL command");
-        assert!(output.status.success(), "chmod ACL failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
+    add_acl(&staging_path, "everyone deny read,file_inherit,only_inherit");
 
     if unsafe { libc::geteuid() } == 0 {
         let source = fs::open(&source_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
@@ -238,7 +271,7 @@ fn clone_normalizes_foreign_0044_and_inherited_deny_read_before_open() {
         fs::fchmod(&staging, Mode::from_bits_truncate(0o700)).expect("keep staging directory private");
         let output = Command::new(std::env::current_exe().expect("test executable path"))
             .arg("--exact")
-            .arg("clone_normalizes_foreign_0044_and_inherited_deny_read_before_open")
+            .arg("clone_declines_inherited_read_denial_before_creation")
             .arg("--nocapture")
             .env(CHILD_ENV, "1")
             .env(SOURCE_ENV, &source_path)
@@ -247,12 +280,28 @@ fn clone_normalizes_foreign_0044_and_inherited_deny_read_before_open() {
             .expect("run clone permissions subprocess without root privileges");
         assert!(output.status.success(), "clone permissions subprocess failed: {}", String::from_utf8_lossy(&output.stderr));
     } else {
-        assert_clone_opens_after_normalization(&source_path, &staging_path);
+        let source = fs::open(&source_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+            .expect("open source readable by other users");
+        let parent = fs::open(
+            &staging_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open staging directory");
+        assert!(try_clone(source.as_fd(), parent.as_fd(), OsStr::new("clone"))
+            .expect("decline clone with inherited restrictive ACL")
+            .is_none());
+        assert_eq!(
+            std_fs::symlink_metadata(staging_path.join("clone"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
     }
 }
 
 #[test]
-fn clone_uses_acl_read_grant_when_source_mode_denies_owner() {
+fn clone_declines_before_creation_when_owner_read_is_absent() {
     const CHILD_ENV: &str = "ISH_CLONE_ACL_CHILD";
     const SOURCE_ENV: &str = "ISH_CLONE_ACL_SOURCE";
     const STAGING_ENV: &str = "ISH_CLONE_ACL_STAGING";
@@ -280,15 +329,15 @@ fn clone_uses_acl_read_grant_when_source_mode_denies_owner() {
             Mode::empty(),
         )
         .expect("open staging directory");
-        let clone = match platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
-            Ok(Some(clone)) => clone,
-            Ok(None) => panic!("filesystem does not support APFS clones"),
-            Err(error) => panic!("clone failed using source ACL read grant: {error}"),
-        };
-        let mut received = [0_u8; 20];
-        let read = rustix::io::pread(clone.descriptor.as_fd(), &mut received, 0)
-            .expect("read clone opened after normalization");
-        assert_eq!(&received[..read], b"ACL readable source");
+        assert!(try_clone(source.as_fd(), parent.as_fd(), OsStr::new("clone"))
+            .expect("decline clone without owner read permission")
+            .is_none());
+        assert_eq!(
+            std_fs::symlink_metadata(staging_path.join("clone"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
         return;
     }
 
@@ -298,7 +347,7 @@ fn clone_uses_acl_read_grant_when_source_mode_denies_owner() {
     std_fs::write(&source_path, b"ACL readable source").expect("write source");
     std_fs::set_permissions(&source_path, std_fs::Permissions::from_mode(0o000))
         .expect("remove all mode read permissions");
-    add_acl(&source_path, "everyone allow read,readattr");
+    add_acl(&source_path, "everyone allow read,readattr,readextattr,readsecurity");
     std_fs::create_dir(&staging_path).expect("create staging directory");
     std_fs::set_permissions(&staging_path, std_fs::Permissions::from_mode(0o700))
         .expect("make staging directory private");
@@ -319,7 +368,7 @@ fn clone_uses_acl_read_grant_when_source_mode_denies_owner() {
         fs::fchmod(&staging, Mode::from_bits_truncate(0o700)).expect("keep staging directory private");
         let output = Command::new(std::env::current_exe().expect("test executable path"))
             .arg("--exact")
-            .arg("clone_uses_acl_read_grant_when_source_mode_denies_owner")
+            .arg("clone_declines_before_creation_when_owner_read_is_absent")
             .arg("--nocapture")
             .env(CHILD_ENV, "1")
             .env(SOURCE_ENV, &source_path)
@@ -332,42 +381,16 @@ fn clone_uses_acl_read_grant_when_source_mode_denies_owner() {
             .expect("open source using its ACL read grant");
         assert_eq!(fs::fstat(source.as_fd()).unwrap().st_mode as u32 & 0o777, 0);
         let parent = fixture.parent_fd();
-        let clone = match platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
-            Ok(Some(clone)) => clone,
-            Ok(None) => panic!("filesystem does not support APFS clones"),
-            Err(error) => panic!("clone failed using source ACL read grant: {error}"),
-        };
-        let mut received = [0_u8; 20];
-        let read = rustix::io::pread(clone.descriptor.as_fd(), &mut received, 0)
-            .expect("read clone opened after normalization");
-        assert_eq!(&received[..read], b"ACL readable source");
+        assert!(try_clone(source.as_fd(), parent.as_fd(), OsStr::new("clone"))
+            .expect("decline clone without owner read permission")
+            .is_none());
+        assert_eq!(
+            std_fs::symlink_metadata(fixture.path("stage/clone"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
     }
-}
-
-fn assert_clone_opens_after_normalization(source_path: &Path, staging_path: &Path) {
-    let source = fs::open(source_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-        .expect("open ACL-readable source");
-    if std::env::var_os("ISH_CLONE_ACCESS_CHILD").is_some() {
-        assert_ne!(unsafe { libc::geteuid() }, 0, "clone access must be checked without root privileges");
-        assert_ne!(roots::observe_fd(source.as_fd()).unwrap().uid, unsafe { libc::geteuid() as u32 });
-    }
-    let parent = fs::open(
-        staging_path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .expect("open staging directory");
-    let clone = match platform::macos::try_clone_to_dir(source.as_fd(), parent.as_fd(), OsStr::new("clone")) {
-        Ok(Some(clone)) => clone,
-        Ok(None) => panic!("filesystem does not support APFS clones"),
-        Err(error) => panic!("clone failed before read-only open: {error}"),
-    };
-    assert_eq!(clone.identity, roots::observe_fd(clone.descriptor.as_fd()).unwrap().identity);
-    assert_eq!(roots::observe_fd(clone.descriptor.as_fd()).unwrap().mode & 0o700, 0o700);
-    let mut bytes = [0_u8; 32];
-    let read = rustix::io::pread(clone.descriptor.as_fd(), &mut bytes, 0).expect("read normalized clone");
-    assert_eq!(&bytes[..read], b"foreign readable source");
-    assert_eq!(std_fs::metadata(source_path).unwrap().permissions().mode() & 0o777, 0o044);
 }
 
 fn add_acl(path: &Path, acl: &str) {
@@ -522,6 +545,15 @@ fn private_directory_clears_deny_acl_before_child_cleanup() {
 }
 
 #[test]
+fn unsupported_mount_identity_error_propagates_for_socket_descriptor() {
+    let (reader, _writer) = std::os::unix::net::UnixStream::pair().expect("create socket descriptor");
+    let stat = fs::fstat(reader.as_fd()).expect("stat socket descriptor");
+    assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFSOCK);
+    let error = fdu_posix::identity::directory_state(reader.as_fd()).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+}
+
+#[test]
 #[ignore = "needs uid 0 to change ownership; run as root with --ignored"]
 fn private_directory_prepares_foreign_owned_staging_directory() {
     assert_eq!(rustix::process::geteuid().as_raw(), 0, "changing ownership requires uid 0");
@@ -577,6 +609,16 @@ fn sparse_native_copy_preserves_logical_bytes_and_trailing_hole() {
     source_file
         .write_at(b"last bytes", length - 4096)
         .expect("write final extent");
+    punch_hole(&source_file, 8192, 16 * 1024 * 1024 - 8192)
+        .expect("deallocate sparse gap before middle extent");
+    punch_hole(
+        &source_file,
+        16 * 1024 * 1024 + 4096,
+        length - 8192 - 16 * 1024 * 1024,
+    )
+    .expect("deallocate sparse gap before final extent");
+    let source_metadata = std_fs::metadata(&source_path).expect("stat sparse source before copy");
+    assert!(source_metadata.blocks() * 512 < length / 4);
     drop(source_file);
 
     let source = fs::open(&source_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
@@ -643,7 +685,15 @@ fn sparse_buffered_fallback_reports_read_bytes_and_preserves_exact_layout() {
     let source_file = File::create(&source_path).expect("create sparse source");
     source_file.set_len(length).expect("set sparse source length");
     source_file.write_at(b"first extent", 4096).expect("write first extent");
-    source_file.write_at(b"last extent", length - 2048).expect("write trailing extent");
+    source_file.write_at(b"last extent", length - 4096).expect("write trailing extent");
+    punch_hole(
+        &source_file,
+        8192,
+        length - 12_288,
+    )
+    .expect("deallocate sparse gap between extents");
+    let source_metadata = std_fs::metadata(&source_path).expect("stat sparse source before fallback copy");
+    assert!(source_metadata.blocks() * 512 < length / 4);
     drop(source_file);
 
     let source = fs::open(&source_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
@@ -688,7 +738,12 @@ fn sparse_buffered_fallback_reports_read_bytes_and_preserves_exact_layout() {
     assert_eq!(source_metadata.len(), length);
     assert_eq!(destination_metadata.len(), length);
     assert!(source_metadata.blocks() * 512 < length / 4);
-    assert!(destination_metadata.blocks() * 512 < length / 4);
+    assert!(
+        destination_metadata.blocks() * 512 < length / 4,
+        "source allocation {} bytes, destination allocation {} bytes, logical length {length}",
+        source_metadata.blocks() * 512,
+        destination_metadata.blocks() * 512,
+    );
 }
 
 #[test]
@@ -833,6 +888,80 @@ fn resource_fork_stream_copies_fork_without_materializing_it() {
         .expect("read copied resource fork");
     assert_eq!(received_length, fork.len());
     assert_eq!(received, fork);
+}
+
+#[test]
+fn sparse_resource_fork_size_and_high_offset_cross_u32_boundary() {
+    let fixture = Fixture::new();
+    let source_path = fixture.path("source");
+    std_fs::write(&source_path, b"data fork").expect("write source data fork");
+    let source = fs::open(&source_path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+        .expect("open source");
+    let fork_name = CString::new("com.apple.ResourceFork").unwrap();
+    fs::fsetxattr(source.as_fd(), fork_name.as_c_str(), &[0], fs::XattrFlags::empty())
+        .expect("create source resource fork");
+
+    let mut fork_path = source_path.as_os_str().as_bytes().to_vec();
+    fork_path.extend_from_slice(b"/..namedfork/rsrc");
+    let fork_path = PathBuf::from(OsString::from_vec(fork_path));
+    let source_fork = File::options()
+        .read(true)
+        .write(true)
+        .open(&fork_path)
+        .expect("open source resource fork stream");
+    let fork_size = u64::from(u32::MAX) + 1 + 4096;
+    source_fork.set_len(fork_size).expect("set sparse resource fork length above 4 GiB");
+    assert_eq!(source_fork.metadata().expect("stat sparse resource fork").len(), fork_size);
+    let high_offset = u64::from(u32::MAX) + 17;
+    assert_eq!(source_fork.write_at(b"high!", high_offset).expect("write high-offset resource bytes"), 5);
+    source_fork.sync_all().expect("flush sparse resource fork");
+    let source_file_metadata = std_fs::metadata(&source_path).expect("stat source data fork");
+    let source_fork_metadata = source_fork.metadata().expect("stat named resource fork");
+    assert_eq!(source_fork_metadata.dev(), source_file_metadata.dev());
+    assert_eq!(source_fork_metadata.ino(), source_file_metadata.ino());
+    drop(source_fork);
+
+    let source_metadata = platform::macos::capture_metadata(platform::MetadataTarget::Fd(source.as_fd()))
+        .expect("capture sparse source resource-fork length");
+    assert_eq!(source_metadata.resource_fork_size, Some(fork_size));
+    let mut high_bytes = [0_u8; 5];
+    let source_fork = File::open(&fork_path).expect("reopen source resource fork stream");
+    assert_eq!(source_fork.read_at(&mut high_bytes, high_offset).expect("read high-offset resource bytes"), 5);
+    assert_eq!(&high_bytes, b"high!");
+    let mut hole = [0xff; 32];
+    let hole_offset = u64::from(u32::MAX) / 2;
+    assert_eq!(source_fork.read_at(&mut hole, hole_offset).expect("read sparse resource-fork hole"), hole.len());
+    assert_eq!(hole, [0; 32]);
+
+    let destination_path = fixture.path("destination");
+    std_fs::write(&destination_path, b"destination data fork").expect("write destination data fork");
+    let destination = fs::open(&destination_path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+        .expect("open destination");
+    let mut scratch = vec![0_u8; 1024 * 1024];
+    platform::macos::copy_resource_fork(
+        source.as_fd(),
+        destination.as_fd(),
+        &mut scratch,
+        &Cancellation::default(),
+    )
+    .expect("copy complete resource fork above the 32-bit offset boundary");
+    let mut destination_fork_path = destination_path.as_os_str().as_bytes().to_vec();
+    destination_fork_path.extend_from_slice(b"/..namedfork/rsrc");
+    let destination_fork_path = PathBuf::from(OsString::from_vec(destination_fork_path));
+    let destination_fork = File::open(&destination_fork_path).expect("open copied resource fork stream");
+    assert_eq!(destination_fork.metadata().expect("stat copied resource fork").len(), fork_size);
+    let mut copied_high_bytes = [0_u8; 5];
+    assert_eq!(
+        destination_fork.read_at(&mut copied_high_bytes, high_offset).expect("read copied high-offset bytes"),
+        copied_high_bytes.len(),
+    );
+    assert_eq!(&copied_high_bytes, b"high!");
+    let mut copied_hole = [0xff; 32];
+    assert_eq!(
+        destination_fork.read_at(&mut copied_hole, hole_offset).expect("read copied resource-fork hole"),
+        copied_hole.len(),
+    );
+    assert_eq!(copied_hole, [0; 32]);
 }
 
 #[test]

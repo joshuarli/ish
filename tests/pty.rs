@@ -375,6 +375,12 @@ impl PtyShell {
             .expect("wait for shell output quiescence");
     }
 
+    fn drain_available_output(&self) {
+        let mut terminal = self.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::ZERO);
+        terminal.drain(deadline).expect("drain shell output");
+    }
+
     fn screen(&self) -> ptytest::ScreenSnapshot {
         self.terminal.borrow().screen()
     }
@@ -739,6 +745,7 @@ fn native_fs_wait_for_staging(sh: &PtyShell, command: &str) -> PathBuf {
     sh.enter();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
+        sh.drain_available_output();
         let mut stage = None;
         for session in std::fs::read_dir(sh.home_path()).unwrap().flatten() {
             if !session.file_name().to_string_lossy().starts_with(".fdu-quarantine-v2-") {
@@ -4175,7 +4182,7 @@ fn external_input_redirections_preserve_foreground_terminal_ownership() {
     let sh = PtyShell::spawn_with_opts(&[("input", "redirected-input\n")], &[]);
     let output = PtyShell::strip_ansi(&sh.run_command("/bin/cat <input"));
     assert!(output.contains("redirected-input"), "input redirection broke terminal handoff: {output:?}");
-    sh.run_command("/bin/true 0<&-");
+    sh.run_command("/bin/sh -c 'exit 0' 0<&-");
     let output = PtyShell::strip_ansi(&sh.run_command("echo $?"));
     assert!(output.lines().any(|line| line.trim() == "0"), "closed input broke command execution: {output:?}");
 }
@@ -4295,6 +4302,13 @@ fn pipeline_suspend_and_resume_keeps_job_owned() {
 }
 
 fn stty_state(output: &str) -> String {
+    if let Some(start) = output.find("gfmt1:") {
+        return output[start..]
+            .split_whitespace()
+            .next()
+            .expect("stty state follows gfmt1 marker")
+            .to_string();
+    }
     output
         .split(|c: char| !(c.is_ascii_hexdigit() || c == ':'))
         .find(|token| token.matches(':').count() >= 8)

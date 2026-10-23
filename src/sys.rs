@@ -1,24 +1,25 @@
 //! Platform-specific syscall wrappers.
 
-use std::os::fd::{IntoRawFd, RawFd};
+use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
 
 /// Create a pipe with O_CLOEXEC on both ends.
-/// 3 syscalls: pipe + 2x fcntl (not atomic with respect to fork).
+/// Descriptor flags are set after creation and are not atomic with fork.
 pub fn pipe_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
-    let (read, write) = rustix::pipe::pipe()?;
-    rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;
-    rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC)?;
+    let (read, write) = pipe_cloexec_owned()?;
     Ok((read.into_raw_fd(), write.into_raw_fd()))
 }
 
-/// Create a pipe with O_CLOEXEC | O_NONBLOCK on both ends.
-/// Used for the signal self-pipe. The flags are set with `fcntl` after
-/// `pipe`, so they are not atomic with respect to fork; the shell creates
-/// the pipe once at startup, before any child exists.
-pub fn pipe_nonblock_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
+pub(crate) fn pipe_cloexec_owned() -> Result<(OwnedFd, OwnedFd), std::io::Error> {
     let (read, write) = rustix::pipe::pipe()?;
     rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;
     rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC)?;
+    Ok((read, write))
+}
+
+/// Create a pipe with O_CLOEXEC | O_NONBLOCK on both ends.
+/// Descriptor flags are set after creation and are not atomic with fork.
+pub fn pipe_nonblock_cloexec() -> Result<(RawFd, RawFd), std::io::Error> {
+    let (read, write) = pipe_cloexec_owned()?;
     rustix::fs::fcntl_setfl(&read, rustix::fs::OFlags::NONBLOCK)?;
     rustix::fs::fcntl_setfl(&write, rustix::fs::OFlags::NONBLOCK)?;
     Ok((read.into_raw_fd(), write.into_raw_fd()))

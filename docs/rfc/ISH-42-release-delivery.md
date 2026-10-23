@@ -101,5 +101,6 @@ or recovery from a panic. Expected operational failures still use errors.
   bytes. Fixes get a new commit and therefore a new release tag.
 
 The release workflow, downloader, build flags, and documentation changes are
-implemented and locally validated on Linux. The native macOS panic probe remains
-in ISH-45 because it requires a macOS host.
+implemented and locally validated on Linux. The native macOS release build and
+panic probe passed on 2026-10-23; the diagnostic and size observations are in
+[filesystem testing](../filesystem-testing.md#native-macos-arm64-acceptance-2026-10-23).

@@ -1,6 +1,5 @@
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io;
-use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -35,9 +34,9 @@ pub(crate) struct ClonedFile {
 }
 
 unsafe extern "C" {
+    fn acl_init(count: libc::c_int) -> *mut libc::c_void;
     fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
     fn acl_set_fd_np(fd: libc::c_int, acl: *mut libc::c_void, kind: libc::c_int) -> libc::c_int;
-    fn acl_delete_fd_np(fd: libc::c_int, kind: libc::c_int) -> libc::c_int;
     fn acl_to_text(acl: *mut libc::c_void, length: *mut libc::ssize_t) -> *mut libc::c_char;
     fn acl_from_text(text: *const libc::c_char) -> *mut libc::c_void;
     fn acl_free(object: *mut libc::c_void) -> libc::c_int;
@@ -47,9 +46,13 @@ pub(crate) fn try_clone_to_dir(
     src: BorrowedFd<'_>,
     parent: BorrowedFd<'_>,
     name: &OsStr,
+    source_metadata: &ExtendedMetadata,
 ) -> io::Result<Option<ClonedFile>> {
     if !is_single_component(name) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "clone name is not one path component"));
+    }
+    if !clone_metadata_is_accessible(src, parent, source_metadata)? {
+        return Ok(None);
     }
     match fs::fclonefileat(src, parent, name, fs::CloneFlags::NOOWNERCOPY) {
         Ok(()) => {}
@@ -96,6 +99,18 @@ pub(crate) fn try_clone_to_dir(
     }
 }
 
+fn clone_metadata_is_accessible(
+    src: BorrowedFd<'_>,
+    parent: BorrowedFd<'_>,
+    source_metadata: &ExtendedMetadata,
+) -> io::Result<bool> {
+    if fs::fstat(src)?.st_mode as u32 & 0o400 == 0 || source_metadata.acl.is_some() {
+        return Ok(false);
+    }
+    let mut budget = CaptureBudget::new(XATTR_BUFFER_LIMIT);
+    Ok(capture_acl(parent, &mut budget)?.is_none())
+}
+
 pub(crate) fn prepare_directory(
     parent: BorrowedFd<'_>,
     name: &OsStr,
@@ -109,7 +124,7 @@ pub(crate) fn prepare_directory(
     }
     let name = CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "staging directory name contains NUL"))?;
-    // SAFETY: `parent` is live and `name` is NUL-terminated; O_EVTONLY opens only the entry for metadata and event access.
+    // SAFETY: `parent` remains live and `name` is NUL-terminated for openat.
     let raw = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -186,6 +201,7 @@ pub(crate) fn copy_data_with_native_copy(
         Err(_error) if cancel.is_cancelled() => Err(cancelled()),
         Err(error) if is_acceleration_unsupported_io(&error) => {
             fs::ftruncate(dst, 0)?;
+            fs::ftruncate(dst, length)?;
             let streamed = super::buffered_copy(src, dst, length, scratch, cancel)?;
             Ok(CopyStats {
                 method: CopyMethod::Buffered,
@@ -334,6 +350,8 @@ pub(crate) fn copy_resource_fork_inner(
     if cancel.is_cancelled() {
         return Err(cancelled());
     }
+    drop(destination_stream);
+    drop(source_stream);
     let actual_size = capture_resource_fork_size(dst)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "destination resource fork is missing after copy")
     })?;
@@ -610,7 +628,7 @@ extern "C" fn copyfile_cancel_callback(
 fn open_metadata_handle(parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
     let name = CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "clone name contains NUL"))?;
-    // SAFETY: `parent` is live and `name` is NUL-terminated; O_EVTONLY opens the entry for metadata access without requiring file read permission.
+    // SAFETY: `parent` remains live and `name` is NUL-terminated for openat.
     let raw = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -1011,17 +1029,23 @@ fn apply_acl(fd: BorrowedFd<'_>, desired: Option<&[u8]>) -> io::Result<()> {
             Ok(())
         }
         None => {
-            // SAFETY: `fd` remains live and ACL_TYPE_EXTENDED is the Darwin ACL type.
-            let result = unsafe { acl_delete_fd_np(fd.as_raw_fd(), ACL_TYPE_EXTENDED) };
-            if result == 0 {
-                return Ok(());
+            // SAFETY: acl_init allocates an empty ACL structure with no external references.
+            let acl = unsafe { acl_init(0) };
+            if acl.is_null() {
+                return Err(io::Error::last_os_error());
             }
-            let error = io::Error::last_os_error();
-            if is_absent_acl(error.raw_os_error()) || is_unsupported_errno(error.raw_os_error()) {
-                Ok(())
-            } else {
-                Err(error)
+            // SAFETY: `acl` is initialized and `fd` remains live for acl_set_fd_np.
+            let set_result = unsafe { acl_set_fd_np(fd.as_raw_fd(), acl, ACL_TYPE_EXTENDED) };
+            let set_error = (set_result == -1).then(io::Error::last_os_error);
+            // SAFETY: `acl` is a releasable pointer returned by acl_init.
+            let free_result = unsafe { acl_free(acl) };
+            if let Some(error) = set_error {
+                return Err(error);
             }
+            if free_result == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
     }
 }

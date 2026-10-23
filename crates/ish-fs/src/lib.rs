@@ -244,9 +244,18 @@ mod tests {
         let path = directory();
         std::fs::create_dir(path.join("real")).unwrap();
         symlink("real", path.join("alias")).unwrap();
-        let name = OsStr::from_bytes(b"payload-\xff\n");
         let bytes = b"captured bytes\0remain exact\xff";
-        std::fs::write(path.join("real").join(name), bytes).unwrap();
+        let raw_name = OsStr::from_bytes(b"payload-\xff\n");
+        let raw_name_supported = match std::fs::write(path.join("real").join(raw_name), bytes) {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                eprintln!("raw-name path leg excluded: filesystem rejected malformed UTF-8");
+                std::fs::write(path.join("real/payload"), bytes).unwrap();
+                false
+            }
+            Err(error) => panic!("create path fixture: {error}"),
+        };
+        let name = if raw_name_supported { raw_name } else { OsStr::new("payload") };
         let cwd = fs::open(&path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).unwrap();
         let relative = Path::new("alias").join(name);
         let root = roots::Root::establish(cwd.as_fd(), &relative, roots::Requirement::Existing).unwrap();

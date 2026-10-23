@@ -12,9 +12,7 @@ use crate::roots::{self, Identity, Observation};
 pub(super) use fdu_posix::identity::{DIRECTORY_FLAGS as DIRECTORY, READ_FILE_FLAGS as READ_FILE};
 
 pub(super) fn unchanged(expected: Observation, actual: Observation) -> bool {
-    let mut expected = expected;
-    expected.atime = actual.atime;
-    expected == actual
+    expected.same_version(actual)
 }
 
 pub(super) fn require_unchanged(parent: BorrowedFd<'_>, name: &OsStr, expected: Observation) -> io::Result<()> {

@@ -472,6 +472,15 @@ mod tests {
     fn fifo_head_returns_without_branch() {
         let dir = scratch_dir("head-fifo");
         let head = dir.join("HEAD");
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(head.as_os_str().as_bytes()).unwrap();
+            // rustix excludes mknodat on Apple, so this fixture uses the system FIFO API.
+            // SAFETY: path is a valid NUL-terminated path and remains live for the call.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "{}", std::io::Error::last_os_error());
+        }
+        #[cfg(not(target_os = "macos"))]
         rustix::fs::mknodat(
             rustix::fs::CWD,
             &head,

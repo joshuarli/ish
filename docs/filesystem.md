@@ -122,6 +122,16 @@ it back and fails, so an unobserved destination is never destroyed. ish does not
 hash to copy a file. Clone, native-copy, and buffered paths follow the same
 logical metadata policy.
 
+Version checks exclude access-time changes caused by reads. Identity, size,
+mode, ownership, link count, modification time, and change time still protect
+preflight and retirement. The captured access time remains part of metadata
+preservation.
+
+On macOS, automatic copying declines cloning before creating a clone when the
+source lacks owner-read permission, the source has an ACL, or the staging
+parent has an ACL. The ordinary copy path preserves the same bytes and
+metadata. Darwin's event-only opens do not bypass those access restrictions.
+
 Removing a displaced name can change the link count and version of its remaining
 hardlink aliases. Later operands accept only the transition verified during that
 unlink; an unrelated change to a remaining alias still stops the operation.
@@ -311,5 +321,5 @@ protocol. Recovery restores verified captures without replacing live names and
 stops the operation so the caller must rescan and plan again. ish-fs still
 validates source versions and durable destination receipts before retiring a
 source. SIGKILL tests cover process interruption; they do not establish power
-loss durability or storage-device behavior. Native ARM64 and macOS acceptance
-are tracked in [filesystem testing](filesystem-testing.md).
+loss durability or storage-device behavior. ARM64 Linux acceptance and the
+remaining macOS limits are recorded in [filesystem testing](filesystem-testing.md).

@@ -546,7 +546,7 @@ fn transfer_leaf(invocation: &Invocation<'_>, source: LeafSource<'_>, target: Le
             invocation.fault("during_copy")?;
             invocation.checkpoint()?;
             #[cfg(target_os = "macos")]
-            let cloned_file = platform::try_clone_to_dir(source.as_fd(), target_parent, target_name)?;
+            let cloned_file = platform::try_clone_to_dir(source.as_fd(), target_parent, target_name, &metadata)?;
             #[cfg(target_os = "macos")]
             let cloned_identity = cloned_file.as_ref().map(|file| file.identity);
             #[cfg(not(target_os = "macos"))]

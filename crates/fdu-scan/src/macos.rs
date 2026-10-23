@@ -1,7 +1,7 @@
-use crate::fsutil::{self, retry};
+use crate::fsutil;
 use crate::indexed::{BulkMetadata, DirectoryFacts, EntryHint, IndexedScanLimits};
 use fdu_core::EntryType;
-use rustix::fs::{self, Dir, DirEntry, FileType};
+use rustix::fs::{Dir, DirEntry, FileType};
 use std::cell::RefCell;
 use std::ffi::CStr;
 use std::io;

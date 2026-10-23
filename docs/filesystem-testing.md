@@ -231,12 +231,80 @@ These checks close ISH-32's remaining ARM64 musl acceptance. They establish
 process-crash recovery on the tested filesystems, not power-loss durability.
 macOS acceptance remains separately tracked under ISH-45.
 
+## Native macOS ARM64 acceptance (2026-10-23)
+
+The native run used macOS 27.0.1, Darwin 27.0.0, ARM64, and APFS on
+`/System/Volumes/Data`. Tests ran as uid 502 with an absolute `.work/tmp`
+`TMPDIR`, the pinned Rust nightly, and kache. Noninteractive sudo required a
+password, so privileged ownership acceptance did not run.
+
+The repairs use supported entropy, PTY, pipe, FIFO, and ACL APIs. Preflight
+now shares the engine's version comparison, which excludes access time while
+retaining every other observed field. Resource-fork streams close before the
+final xattr size query. The buffered fallback pre-sizes its output before
+sparse writes. ACL clearing uses an empty ACL through `acl_set_fd_np`;
+`acl_delete_fd_np` returned ENOTSUP and left the old ACL installed on this host.
+
+The private clone tests previously assumed `O_EVTONLY` bypassed read
+permissions. Native probes disproved that assumption. Automatic copying now
+declines cloning before creation for owner-unreadable sources or source/parent
+ACLs. A public-copy regression preserves bytes, mode 000, and the source ACL
+through the ordinary path. This trades clone eligibility for safe access;
+it does not use a pathname permission mutation after an identity check.
+
+| Acceptance | Command and observed result |
+| --- | --- |
+| Workspace check | `cargo check --workspace` passed. |
+| Strict Clippy | `cargo clippy --workspace --all-targets -- -D warnings` passed. |
+| Workspace tests | `cargo test --workspace --lib --tests --no-fail-fast` remained red. The restrictive-umask cases in fdu-posix recovery, ish-fs native macOS, and ish-fs transfer failed with EACCES. The run was interrupted after recovery children remained waiting; it is not a completed workspace pass. |
+| Interactive PTY tests | `cargo test -p ish --test pty` passed all 178 cases, including copy cancellation and foreground terminal restoration. Staging polling drains PTY output so progress cannot backpressure the test's shell. |
+| Filesystem targets | Native ish-fs library, policy, and preservation targets passed. Transfer passed 11 cases and failed its restrictive-umask case. Native clone eligibility, inherited ACL cleanup, blocking flags, sparse copy/fallback, and cancellation cases passed; the mode-000 directory case remains failing. |
+| Large resource fork | A complete 4,294,971,392-byte named-fork copy passed with a 1 MiB buffer. Assertions checked the length, bytes above `u32::MAX`, and zero content in an interior hole. This does not assert physical resource-fork sparsity. |
+| Required identity failure | A live Unix socket descriptor passed `fstat` but its filesystem query returned EINVAL. The native identity boundary propagated the error instead of substituting a device-only identity. |
+| Raw path names | APFS returned EILSEQ while creating malformed UTF-8 names. Those fixture legs report exclusion only for that error; valid control-name, symlink, hardlink, and canonical trust-path assertions still execute. Linux raw-name acceptance is recorded above. |
+| Integrated shell tests | Ordinary-user `make test` stopped at one `expand-unglob-unq` stdout mismatch. Its final `9 qstn brac` subshell printed the error branch. A focused rerun and the full conformance target then passed: 175 selected, 167 passed, 8 declared exclusions. The initial failure remains unexplained; rerunning does not establish a green integrated gate. |
+| Release build | `make release TARGET=aarch64-apple-darwin` passed with build-std and the actual release profile and flags. The arm64 Mach-O `ish` binary was 1,549,696 bytes. |
+| Panic diagnostic | A scratch probe built with the same release profile, target, and build-std flags aborted with status 134 and printed `ISH45_RELEASE_PANIC_PROBE` and `src/main.rs:2:5`. Only the probe shell disabled core dumps. No build-time or runtime performance claim is made. |
+
+Integration reuses these native results. Focused ARM64 Linux checks cover the
+shared version predicate, environment/history tests, prompt fixture, and
+foreground-job fixture. The final foreground fixture uses rustix's typed
+controlling-terminal operation because Darwin and musl declare different ioctl
+request integer types.
+
+### Apple copy comparison
+
+The fixture was a 64 MiB APFS file with two 4 KiB sentinels, mode 0440, an
+explicit staff-read ACL, a custom extended attribute, and a 22-byte resource
+fork. Native hole punching created the sparse fixture before copying.
+
+| Side | Observed result |
+| --- | --- |
+| Public ish-fs engine | Complete with durability enabled; 0 Clone, 1 Native, and 0 Buffered files. Bytes, mode, mtime, ACL, EA, resource fork, and sparse allocation matched the source. `bytes_streamed` was 67,108,864 and logical cloned bytes were zero; streamed bytes do not measure physical I/O. |
+| `/bin/cp -p` | Exit 0; exact bytes, mode, mtime, ACL, EA, resource fork, and sparse allocation matched. |
+| `/bin/cp -p -c` | Exit 0; exact bytes, mode, mtime, EA, resource fork, and sparse allocation matched, but the source ACL was absent. |
+
+The source and each output reported 72 blocks of 512 bytes. The engine declined
+cloning because the source had an ACL. Apple's `-c` requests cloning and can
+fall back; the utility's actual selected syscall was not traced because native
+tracing required root. Neither utility command requested or established the
+engine's durability guarantee. These are preservation observations, not a
+speed comparison or power-loss test.
+
+### Remaining macOS acceptance
+
+Umask `0777` creates mode-000 directories that Darwin refuses to open through
+the current event-only handle path. The three restrictive-umask tests remain
+failing. A safe creation/access design must precede changing that behavior;
+before/after identity checks do not make a pathname chmod atomic. Global
+umask mutation and filesystem helper children would change existing ownership
+or process boundaries. Foreign-owner cases still need a native privileged run.
+
 ## Remaining native evidence
 
 | Deferred run | Setup and acceptance condition |
 | --- | --- |
-| Native macOS | Deferred to [TODO.md, ISH-45](../TODO.md), per the Linux-host scope. No macOS build or native acceptance is claimed. The pending run requires ordinary-user workspace checks and tests, separate privileged cases, clone/access normalization, ACLs, foreign ownership, blocking flags, cancellation, sparse fallback, resource forks above 4 GiB, unsupported identity failure, and a release panic probe. |
-| Apple clone-aware utility comparison | Deferred with ISH-45. Compare Apple `cp` and `cp -c` on native macOS with a clone-capable filesystem. GNU Coreutils 9.11 `cp --archive --reflink=always` passed on Linux Btrfs; the method and preservation/durability results are recorded above. |
+| Native macOS | [ISH-45](../TODO.md) retains the restrictive-umask, privileged ownership, and complete workspace/integrated gate requirements. The completed native cases and utility comparison are recorded above. |
 
 The repair run passed native x86_64 musl workspace checks, strict Clippy, Rust
 and PTY tests, conformance, semantic verification, and shift refinement.

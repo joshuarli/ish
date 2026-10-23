@@ -28,6 +28,12 @@ pub(crate) struct Observation {
 }
 
 impl Observation {
+    pub fn same_version(self, actual: Self) -> bool {
+        let mut expected = self;
+        expected.atime = actual.atime;
+        expected == actual
+    }
+
     #[allow(clippy::unnecessary_cast, reason = "stat field widths differ between Linux and Darwin")]
     fn from_stat(stat: &fs::Stat) -> io::Result<Self> {
         Ok(Self {

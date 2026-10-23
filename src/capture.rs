@@ -15,7 +15,9 @@ use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::fs::{Mode, OFlags, fcntl_setfl, open};
 use rustix::io::Errno;
-use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+use rustix::pty::{grantpt, ptsname, unlockpt};
+#[cfg(not(target_os = "macos"))]
+use rustix::pty::{OpenptFlags, openpt};
 use rustix::termios::{OptionalActions, Winsize, tcgetattr, tcgetpgrp, tcgetwinsize, tcsetattr, tcsetwinsize};
 use rustix::time::Timespec;
 use std::collections::VecDeque;
@@ -199,7 +201,7 @@ impl Capture {
         let stderr = io::stderr();
         let captures_stderr = shares_terminal(terminal, stderr.as_fd());
 
-        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
+        let master = openpt_cloexec()?;
         grantpt(&master)?;
         unlockpt(&master)?;
         let slave_name = ptsname(&master, Vec::new())?;
@@ -224,6 +226,9 @@ impl Capture {
         } else {
             None
         };
+        #[cfg(target_os = "macos")]
+        let (stop_read, stop_write) = crate::sys::pipe_cloexec_owned()?;
+        #[cfg(not(target_os = "macos"))]
         let (stop_read, stop_write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
         let thread = std::thread::Builder::new()
             .name("ish-output-relay".into())
@@ -250,6 +255,24 @@ impl Capture {
         }
         self.session.take().expect("a capture holds its session until it ends")
     }
+}
+
+#[cfg(target_os = "macos")]
+fn openpt_cloexec() -> io::Result<OwnedFd> {
+    use std::os::fd::FromRawFd;
+
+    // macOS posix_openpt supports O_CLOEXEC, which rustix omits from its Apple flags.
+    let descriptor = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: posix_openpt returned a newly allocated descriptor owned by this function.
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn openpt_cloexec() -> io::Result<OwnedFd> {
+    openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC).map_err(Into::into)
 }
 
 impl Drop for Capture {
@@ -382,6 +405,17 @@ fn follow_resize(terminal: &OwnedFd, master: &OwnedFd, applied: &mut Option<Wins
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_pty_and_stop_pipe_descriptors_are_close_on_exec() {
+        let master = openpt_cloexec().expect("open close-on-exec PTY master");
+        let (stop_read, stop_write) = crate::sys::pipe_cloexec_owned().expect("create close-on-exec stop pipe");
+        for descriptor in [&master, &stop_read, &stop_write] {
+            let flags = rustix::io::fcntl_getfd(descriptor).expect("read descriptor flags");
+            assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+        }
+    }
 
     fn plain(input: &[u8]) -> Vec<u8> {
         strip_controls(input.iter().copied())

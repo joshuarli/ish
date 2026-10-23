@@ -383,7 +383,7 @@ fn reestablish(
     expected_observed: Option<Observation>,
 ) -> io::Result<Root> {
     let root = Root::establish(cwd, path, requirement)?;
-    if root.parent_identity()? != expected_parent || root.observed != expected_observed {
+    if root.parent_identity()? != expected_parent || !same_observation(expected_observed, root.observed) {
         return Err(io::Error::other("path identity changed during preflight"));
     }
     Ok(root)
@@ -401,8 +401,18 @@ fn reestablish_destination(cwd: BorrowedFd<'_>, into_directory: Option<&OwnedFd>
         into_directory.map(|_| operand.destination_name.as_os_str()),
         Requirement::MayBeAbsent,
     )?;
-    if root.parent_identity()? != operand.destination_parent || root.observed != operand.destination_observed {
+    if root.parent_identity()? != operand.destination_parent
+        || !same_observation(operand.destination_observed, root.observed)
+    {
         return Err(io::Error::other("destination identity changed during preflight"));
     }
     Ok(root)
+}
+
+fn same_observation(expected: Option<Observation>, actual: Option<Observation>) -> bool {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => expected.same_version(actual),
+        (None, None) => true,
+        _ => false,
+    }
 }

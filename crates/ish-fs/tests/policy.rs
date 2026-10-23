@@ -126,8 +126,17 @@ fn generated_top_level_policy_matrix_matches_the_logical_model() {
 fn into_maps_multiple_sources_with_raw_names_and_trailing_slashes() {
     let fixture = Fixture::new();
     std::fs::write(fixture.cwd.join("first"), b"one").expect("write first source");
-    let raw_name = OsString::from_vec(b"raw-\xff-name".to_vec());
-    std::fs::write(fixture.cwd.join(&raw_name), b"two").expect("write raw source");
+    let proposed_name = OsString::from_vec(b"raw-\xff-name".to_vec());
+    let raw_name = match std::fs::write(fixture.cwd.join(&proposed_name), b"two") {
+        Ok(()) => proposed_name,
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+            eprintln!("raw-name path leg excluded: filesystem rejected malformed UTF-8");
+            let fallback = OsString::from("raw-fallback");
+            std::fs::write(fixture.cwd.join(&fallback), b"two").expect("write fallback source");
+            fallback
+        }
+        Err(error) => panic!("write second source: {error}"),
+    };
     std::fs::write(fixture.cwd.join("-leading"), b"three").expect("write leading dash source");
     std::fs::create_dir(fixture.cwd.join("out")).expect("create output directory");
 

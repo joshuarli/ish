@@ -3,6 +3,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use ish_fs::{Cancellation, Collision, Context, Event, Jobs, Operands, Operation, Options, Request, execute};
 
@@ -51,14 +53,61 @@ fn copy_always_transfers_even_same_size_same_mtime() {
 fn byte_paths_symlinks_and_hardlinks_are_preserved() {
     let fixture = Fixture::new();
     fs::create_dir(fixture.0.join("source")).unwrap();
-    let name = std::ffi::OsStr::from_bytes(b"raw\xff\n");
-    fs::write(fixture.0.join("source").join(name), b"bytes\0\xff").unwrap();
-    fs::hard_link(fixture.0.join("source").join(name), fixture.0.join("source/alias")).unwrap();
-    symlink(name, fixture.0.join("source/link")).unwrap();
+    fs::write(fixture.0.join("source/file"), b"ordinary bytes\0\xff").unwrap();
+    fs::hard_link(fixture.0.join("source/file"), fixture.0.join("source/alias")).unwrap();
+    symlink("file", fixture.0.join("source/link")).unwrap();
+    let raw_name = std::ffi::OsStr::from_bytes(b"raw\xff\n");
+    let raw_name_supported = match fs::write(fixture.0.join("source").join(raw_name), b"raw bytes\0\xff") {
+        Ok(()) => {
+            fs::hard_link(fixture.0.join("source").join(raw_name), fixture.0.join("source/raw-alias")).unwrap();
+            symlink(raw_name, fixture.0.join("source/raw-link")).unwrap();
+            true
+        }
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+            eprintln!("raw-name path leg excluded: filesystem rejected malformed UTF-8");
+            false
+        }
+        Err(error) => panic!("create raw-name source: {error}"),
+    };
     assert_eq!(fixture.run(&fixture.request("source", "destination")), 0);
-    assert_eq!(fs::read(fixture.0.join("destination").join(name)).unwrap(), b"bytes\0\xff");
-    assert_eq!(fs::read_link(fixture.0.join("destination/link")).unwrap(), Path::new(name));
-    assert_eq!(fs::metadata(fixture.0.join("destination").join(name)).unwrap().ino(), fs::metadata(fixture.0.join("destination/alias")).unwrap().ino());
+    assert_eq!(fs::read(fixture.0.join("destination/file")).unwrap(), b"ordinary bytes\0\xff");
+    assert_eq!(fs::read_link(fixture.0.join("destination/link")).unwrap(), Path::new("file"));
+    assert_eq!(fs::metadata(fixture.0.join("destination/file")).unwrap().ino(), fs::metadata(fixture.0.join("destination/alias")).unwrap().ino());
+    if raw_name_supported {
+        assert_eq!(fs::read(fixture.0.join("destination").join(raw_name)).unwrap(), b"raw bytes\0\xff");
+        assert_eq!(fs::read_link(fixture.0.join("destination/raw-link")).unwrap(), Path::new(raw_name));
+        assert_eq!(fs::metadata(fixture.0.join("destination").join(raw_name)).unwrap().ino(), fs::metadata(fixture.0.join("destination/raw-alias")).unwrap().ino());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn acl_readable_mode_zero_source_copies_with_its_mode_and_acl() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("source");
+    let destination = fixture.0.join("destination");
+    fs::write(&source, b"readable only by ACL").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
+    let acl = Command::new("/bin/chmod")
+        .arg("+a")
+        .arg("everyone allow read,readattr,readextattr,readsecurity")
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(acl.status.success(), "chmod ACL failed: {}", String::from_utf8_lossy(&acl.stderr));
+    assert_eq!(fs::read(&source).unwrap(), b"readable only by ACL");
+
+    assert_eq!(fixture.run(&fixture.request("source", "destination")), 0);
+    assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0);
+    assert_eq!(fs::read(&destination).unwrap(), b"readable only by ACL");
+
+    let source_acl = Command::new("/bin/ls").arg("-lde").arg(&source).output().unwrap();
+    let destination_acl = Command::new("/bin/ls").arg("-lde").arg(&destination).output().unwrap();
+    assert!(source_acl.status.success());
+    assert!(destination_acl.status.success());
+    let source_acl = String::from_utf8(source_acl.stdout).unwrap();
+    let destination_acl = String::from_utf8(destination_acl.stdout).unwrap();
+    assert_eq!(source_acl.lines().skip(1).collect::<Vec<_>>(), destination_acl.lines().skip(1).collect::<Vec<_>>());
 }
 
 #[test]

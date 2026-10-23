@@ -121,7 +121,25 @@ fn access_acl(owner: u16, named_user: u16, group: u16, mask: u16, other: u16) ->
 }
 
 #[test]
-fn tree_entry_names_retain_printable_control_and_non_utf8_bytes() {
+fn tree_entry_names_retain_printable_control_bytes() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.cwd.join("source")).unwrap();
+    let printable = ["space name", "tab\tname", "line\nname", "-leading-dash", "back\\slash", "unicøde"];
+    for (index, name) in printable.iter().enumerate() {
+        fs::write(fixture.cwd.join("source").join(name), format!("payload-{index}")).unwrap();
+    }
+    let request = fixture.request(
+        Operands::Exact { source: "source".into(), destination: "destination".into() },
+        Options::default(),
+    );
+    assert_eq!(fixture.run(&request).status(), 0);
+    for (index, name) in printable.iter().enumerate() {
+        assert_eq!(fs::read(fixture.cwd.join("destination").join(name)).unwrap(), format!("payload-{index}").as_bytes());
+    }
+}
+
+#[test]
+fn tree_entry_names_retain_non_utf8_bytes() {
     let fixture = Fixture::new();
     let source_name = OsString::from_vec(b"source-\xff".to_vec());
     let destination_name = OsString::from_vec(b"destination-\xfe".to_vec());
@@ -130,34 +148,29 @@ fn tree_entry_names_retain_printable_control_and_non_utf8_bytes() {
     match fs::create_dir(&source) {
         Ok(()) => {}
         Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
-            eprintln!("raw-byte filename fixture unavailable: filesystem rejected a malformed UTF-8 root name");
+            eprintln!("raw-name path leg excluded: filesystem rejected malformed UTF-8");
             return;
         }
-        Err(error) => panic!("create raw-byte source directory: {error}"),
-    }
-    let printable = ["space name", "tab\tname", "line\nname", "-leading-dash", "back\\slash", "unicøde"];
-    for (index, name) in printable.iter().enumerate() {
-        fs::write(source.join(name), format!("payload-{index}")).unwrap();
+        Err(error) => panic!("create raw-name source: {error}"),
     }
     let raw_child = OsString::from_vec(b"child\n\t-\x80".to_vec());
-    match fs::write(source.join(&raw_child), b"raw payload") {
-        Ok(()) => {}
+    let raw_child_supported = match fs::write(source.join(&raw_child), b"raw payload") {
+        Ok(()) => true,
         Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
-            eprintln!("raw-byte filename fixture unavailable: filesystem rejected a malformed UTF-8 child name");
-            return;
+            eprintln!("raw-name child leg excluded: filesystem rejected malformed UTF-8");
+            false
         }
-        Err(error) => panic!("create raw-byte source child: {error}"),
-    }
+        Err(error) => panic!("create raw-name child: {error}"),
+    };
 
     let request = fixture.request(
         Operands::Exact { source: source_name.into(), destination: destination_name.into() },
         Options::default(),
     );
     assert_eq!(fixture.run(&request).status(), 0);
-    for (index, name) in printable.iter().enumerate() {
-        assert_eq!(fs::read(destination.join(name)).unwrap(), format!("payload-{index}").as_bytes());
+    if raw_child_supported {
+        assert_eq!(fs::read(destination.join(raw_child)).unwrap(), b"raw payload");
     }
-    assert_eq!(fs::read(destination.join(raw_child)).unwrap(), b"raw payload");
 }
 
 #[test]

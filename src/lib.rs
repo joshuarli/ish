@@ -17,6 +17,7 @@ pub mod input;
 pub mod job;
 pub mod line;
 mod mode;
+mod secure_random;
 pub mod ls;
 pub mod path;
 pub mod prompt;

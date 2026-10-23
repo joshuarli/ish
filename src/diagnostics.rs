@@ -133,7 +133,7 @@ pub fn write_layout_dump_file(home: &OsStr, dump: &str) -> Result<String, String
     write_layout_dump_with_names(home, dump, random_dump_hex)
 }
 
-fn write_layout_dump_with_names(home: &OsStr, dump: &str, mut next_name: impl FnMut() -> rustix::io::Result<String>) -> Result<String, String> {
+fn write_layout_dump_with_names(home: &OsStr, dump: &str, mut next_name: impl FnMut() -> std::io::Result<String>) -> Result<String, String> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     if home.is_empty() {
@@ -173,16 +173,9 @@ fn write_layout_dump_with_names(home: &OsStr, dump: &str, mut next_name: impl Fn
     ))
 }
 
-fn random_dump_hex() -> rustix::io::Result<String> {
+fn random_dump_hex() -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
-    let mut filled = 0;
-    while filled < bytes.len() {
-        match rustix::rand::getrandom(&mut bytes[filled..], rustix::rand::GetRandomFlags::empty()) {
-            Ok(count) => filled += count,
-            Err(rustix::io::Errno::INTR) => {}
-            Err(error) => return Err(error),
-        }
-    }
+    crate::secure_random::fill_bytes(&mut bytes)?;
 
     let mut hex = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

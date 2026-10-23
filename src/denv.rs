@@ -95,16 +95,8 @@ fn current_pid_namespace() -> Result<Option<u64>, String> {
 
 fn new_record_id(pid_namespace: Option<u64>) -> Result<String, String> {
     let mut token = [0u8; 16];
-    loop {
-        match rustix::rand::getrandom(&mut token, rustix::rand::GetRandomFlags::empty()) {
-            Ok(filled) if filled == token.len() => break,
-            Ok(filled) => {
-                return Err(format!("getrandom returned {filled} of {} bytes", token.len()));
-            }
-            Err(rustix::io::Errno::INTR) => {}
-            Err(err) => return Err(format!("getrandom failed: {err}")),
-        }
-    }
+    crate::secure_random::fill_bytes(&mut token)
+        .map_err(|error| format!("operating system random source failed: {error}"))?;
     let mut id = std::process::id().to_string();
     id.push('-');
     if let Some(namespace) = pid_namespace {
@@ -2846,13 +2838,41 @@ mod tests {
     }
 
     #[test]
-    fn trust_preserves_non_utf8_identity_and_canonical_aliases() {
+    fn trust_preserves_non_utf8_identity() {
         let tmp = TempDir::new("t14");
         let data = tmp.path().join("data");
         let project = tmp.path().join("ordinary-project").join("nested-directory");
         fs::create_dir_all(&project).unwrap();
-        let first = project.join(OsString::from_vec(vec![b'.', b'e', b'n', b'v', 0xfe]));
-        let second = project.join(OsString::from_vec(vec![b'.', b'e', b'n', b'v', 0xff]));
+        let raw_first = project.join(OsString::from_vec(vec![b'.', b'e', b'n', b'v', 0xfe]));
+        let raw_second = project.join(OsString::from_vec(vec![b'.', b'e', b'n', b'v', 0xff]));
+        match fs::write(&raw_first, "A=1\n").and_then(|()| fs::write(&raw_second, "A=1\n")) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                eprintln!("raw-name trust leg excluded: filesystem rejected malformed UTF-8");
+                return;
+            }
+            Err(error) => panic!("create raw-name trust fixture: {error}"),
+        }
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&raw_first, &alias).unwrap();
+        let allow = data.join("allow");
+        let file = read_trusted_candidate(&raw_first).unwrap();
+
+        allow_file_in(&allow, &file).unwrap();
+        assert!(is_allowed_in(&allow, &read_trusted_candidate(&alias).unwrap()));
+        assert!(!is_allowed_in(&allow, &read_trusted_candidate(&raw_second).unwrap()));
+        deny_file(&data, &file.path).unwrap();
+        assert!(!is_allowed_in(&allow, &read_trusted_candidate(&alias).unwrap()));
+    }
+
+    #[test]
+    fn trust_resolves_symlink_alias_to_canonical_path() {
+        let tmp = TempDir::new("t14");
+        let data = tmp.path().join("data");
+        let project = tmp.path().join("ordinary-project").join("nested-directory");
+        fs::create_dir_all(&project).unwrap();
+        let first = project.join("first.env");
+        let second = project.join("second.env");
         fs::write(&first, "A=1\n").unwrap();
         fs::write(&second, "A=1\n").unwrap();
         let alias = tmp.path().join("alias");
