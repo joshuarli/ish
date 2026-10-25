@@ -4728,14 +4728,18 @@ fn sigterm_and_sighup_restore_the_terminal_and_exit_with_the_signal_status() {
 
 #[test]
 fn fatal_crash_signals_restore_the_terminal_and_exit_with_the_signal_status() {
-    for (signal, status) in [
-        (libc::SIGABRT, 134),
-        (libc::SIGFPE, 136),
-        (libc::SIGILL, 132),
-        (libc::SIGTRAP, 133),
-        (libc::SIGSEGV, 139),
-        (libc::SIGBUS, 138),
+    // Expect 128+signo computed from the platform's own signal numbers:
+    // SIGBUS is 10 on Darwin but 7 on Linux, so a hardcoded table would
+    // assert the wrong status on one of them.
+    for signal in [
+        libc::SIGABRT,
+        libc::SIGFPE,
+        libc::SIGILL,
+        libc::SIGTRAP,
+        libc::SIGSEGV,
+        libc::SIGBUS,
     ] {
+        let status = 128 + signal;
         let sh = PtyShell::spawn();
         // Type a partial line so the shell sits in raw mode with bracketed
         // paste enabled when the signal lands.
