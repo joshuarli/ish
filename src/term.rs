@@ -19,9 +19,7 @@ pub type Termios = rustix::termios::Termios;
 static STARTUP_TERMIOS: std::sync::OnceLock<Termios> = std::sync::OnceLock::new();
 
 pub fn install_panic_hook() {
-    if let Ok(termios) = save_termios() {
-        let _ = STARTUP_TERMIOS.set(termios);
-    }
+    capture_startup_termios();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if STARTUP_TERMIOS.get().is_some() {
@@ -37,6 +35,19 @@ pub fn restore_startup_termios() {
     if let Some(termios) = STARTUP_TERMIOS.get() {
         let _ = rustix::termios::tcsetattr(stdin(), rustix::termios::OptionalActions::Now, termios);
     }
+}
+
+/// Capture the login terminal modes once; later captures are no-ops. The
+/// fatal crash handlers read this back, so capture it before installing them.
+pub fn capture_startup_termios() {
+    if let Ok(termios) = save_termios() {
+        let _ = STARTUP_TERMIOS.set(termios);
+    }
+}
+
+/// A copy of the captured login modes, if capture succeeded.
+pub fn startup_termios() -> Option<Termios> {
+    STARTUP_TERMIOS.get().cloned()
 }
 
 pub struct RawMode {

@@ -12,6 +12,9 @@ static PENDING_TERMINATION: std::sync::atomic::AtomicI32 =
 static FOREGROUND_SIGNALS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn init() -> RawFd {
+    // Capture the login terminal modes before any handler can need them; a
+    // crash during startup must still restore what was there.
+    crate::term::capture_startup_termios();
     let (read_fd, write_fd) =
         sys::pipe_nonblock_cloexec().expect("pipe() failed for signal self-pipe");
 
@@ -32,6 +35,8 @@ pub fn init() -> RawFd {
     ignore(rustix::process::Signal::QUIT).expect("signal ignore failed");
     ignore(rustix::process::Signal::PIPE).expect("signal ignore failed");
     ignore(rustix::process::Signal::INT).expect("signal ignore failed");
+
+    install_fatal_handlers();
 
     read_fd
 }
@@ -196,8 +201,99 @@ fn ignore(sig: rustix::process::Signal) -> std::io::Result<()> {
     }
 }
 
+/// Install one-shot terminal cleanup for crash signals. A crash while line
+/// editing would otherwise leave raw mode, bracketed paste, and a hidden
+/// cursor behind in the user's terminal.
+fn install_fatal_handlers() {
+    for sig in [
+        rustix::process::Signal::ABORT,
+        rustix::process::Signal::ILL,
+        rustix::process::Signal::TRAP,
+        rustix::process::Signal::SEGV,
+        rustix::process::Signal::BUS,
+        rustix::process::Signal::FPE,
+    ] {
+        install_oneshot_handler(sig, fatal_handler as *const () as usize)
+            .expect("fatal signal handler install failed");
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn set_linux_disposition(sig: rustix::process::Signal, handler: libc::sighandler_t) {
+fn install_oneshot_handler(
+    sig: rustix::process::Signal,
+    handler: usize,
+) -> std::io::Result<()> {
+    // SAFETY: zero initializes the libc action fields before the mask is initialized below.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler;
+    // One-shot: if the handler itself faults, the second fault dies by the
+    // default disposition instead of recursing. The handler exits directly
+    // and never depends on the signal mask.
+    action.sa_flags = libc::SA_RESETHAND;
+    // SAFETY: the mask is a valid mutable libc sigset_t.
+    if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the signal and handler use libc's Linux ABI, and sigaction copies the initialized action.
+    if unsafe { libc::sigaction(sig.as_raw(), &action, std::ptr::null_mut()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_oneshot_handler(
+    sig: rustix::process::Signal,
+    handler: usize,
+) -> std::io::Result<()> {
+    // 0x0004 is SA_RESETHAND on Darwin: one-shot, matching the Linux
+    // install, so a fault inside the handler dies instead of recursing.
+    unsafe { darwin_sigaction(sig.as_raw(), handler, 0x0004) }
+}
+
+/// Runs on the way to a crash. Restores the terminal, then exits with the
+/// conventional 128+signal status, matching the graceful termination path.
+/// Exiting directly (instead of re-raising) keeps death deterministic on
+/// every platform: re-raising trap- and fault-class signals can wedge the
+/// process in the OS crash pipeline instead of terminating it.
+unsafe extern "C" fn fatal_handler(sig: i32) {
+    unsafe {
+        restore_terminal_for_crash();
+        libc::_exit(128 + sig);
+    }
+}
+
+unsafe fn restore_terminal_for_crash() {
+    // Best effort and async-signal-safe only: raw descriptor writes, no
+    // locks, no allocation.
+    // SAFETY: descriptors 0 and 1 stay open for the life of the shell.
+    unsafe {
+        let stdout = std::os::fd::BorrowedFd::borrow_raw(1);
+        let mut remaining = &b"\x1b[?2004l\x1b[?25h"[..];
+        while !remaining.is_empty() {
+            match rustix::io::write(stdout, remaining) {
+                Ok(0) => break,
+                Ok(n) => remaining = &remaining[n..],
+                Err(rustix::io::Errno::INTR) => {}
+                Err(_) => break,
+            }
+        }
+        if let Some(termios) = crate::term::startup_termios() {
+            let stdin = std::os::fd::BorrowedFd::borrow_raw(0);
+            let _ = rustix::termios::tcsetattr(
+                stdin,
+                rustix::termios::OptionalActions::Now,
+                &termios,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_linux_disposition(
+    sig: rustix::process::Signal,
+    handler: libc::sighandler_t,
+) -> std::io::Result<()> {
     // SAFETY: `sig` is a valid rustix signal and callers pass libc disposition constants.
     let previous = unsafe { libc::signal(sig.as_raw(), handler) };
     if previous == libc::SIG_ERR {

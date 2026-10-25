@@ -4703,6 +4703,33 @@ fn sigterm_and_sighup_restore_the_terminal_and_exit_with_the_signal_status() {
 }
 
 #[test]
+fn fatal_crash_signals_restore_the_terminal_and_exit_with_the_signal_status() {
+    for (signal, status) in [
+        (libc::SIGABRT, 134),
+        (libc::SIGFPE, 136),
+        (libc::SIGILL, 132),
+        (libc::SIGTRAP, 133),
+        (libc::SIGSEGV, 139),
+        (libc::SIGBUS, 138),
+    ] {
+        let sh = PtyShell::spawn();
+        // Type a partial line so the shell sits in raw mode with bracketed
+        // paste enabled when the signal lands.
+        sh.type_str("echo about-to-crash");
+        let mut terminal = sh.terminal.borrow_mut();
+        terminal.signal(signal).unwrap();
+        let deadline = terminal.deadline(std::time::Duration::from_secs(5));
+        let exit = terminal
+            .wait_for_exit(deadline)
+            .expect("ish exits on fatal signal");
+        assert_eq!(exit, ExitStatus::Code(status), "signal {signal}");
+        terminal
+            .assert_terminal_restored(&sh.terminal_baseline)
+            .unwrap_or_else(|e| panic!("terminal not restored after signal {signal}: {e:?}"));
+    }
+}
+
+#[test]
 fn second_ctrl_z_is_refused_and_the_first_job_stays_resumable() {
     let sh = PtyShell::spawn_with_opts(&[("bin/sleep", READY_SLEEP_SCRIPT)], &[]);
     sh.type_str("./bin/sleep");
