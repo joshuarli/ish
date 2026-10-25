@@ -26,10 +26,10 @@ Use a named crate, test target, or test filter during iteration. See
 `make check` runs workspace Clippy, Rust tests, and `make verify`.
 [The formal guide](../formal/README.md) covers semantic checks and refinement.
 
-`make release` builds a static release; `make release-dynamic` builds its dynamic
-variant. `TARGET` selects the target triple. Use the corresponding
-`verify-release` target to inspect Linux linking. These commands use build-std
-and require the pinned toolchain's rust-src component.
+`make release` builds the release binary. Linux targets produce static musl
+binaries, and `make verify-release` checks their ELF linking. `TARGET` selects
+the target triple. These commands use build-std and require the pinned
+toolchain's rust-src component.
 
 Releases include a `SHA256SUMS` asset alongside the archives. Verify an archive
 after downloading it:

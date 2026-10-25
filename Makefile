@@ -5,15 +5,12 @@ HOST       := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 TARGET     ?= $(subst -unknown-linux-gnu,-unknown-linux-musl,$(HOST))
 TARGET_ENV := $(shell printf '%s' "$(TARGET)" | tr '[:lower:]-' '[:upper:]_')
 CARGO_CMD  := $(if $(findstring -linux-musl,$(TARGET)),$(shell command -v musl-cargo 2>/dev/null || printf cargo),cargo)
-# Docker's musl-cargo wrapper owns linker, CRT, and loader flags. The Makefile
-# selects only the build mode and keeps Cargo invocations readable on macOS as
-# well as in the Linux release image.
-cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static release-dynamic test,$(1)),CARGO_TARGET_$(TARGET_ENV)_LINKER=clang ,)$(if $(filter release-static release-dynamic,$(1)),RUSTFLAGS="-Cpanic=abort")) MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" $(CARGO_CMD)
+cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static test,$(1)),CARGO_TARGET_$(TARGET_ENV)_LINKER=clang ,)$(if $(filter release-static,$(1)),RUSTFLAGS="-Cpanic=abort")) MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" $(CARGO_CMD)
 
 RUSTYBENCH_DEFAULT := $(CURDIR)/.work/tools/bin/rustybench
 RUSTYBENCH ?= "$(RUSTYBENCH_DEFAULT)"
 
-.PHONY: build test test-epsh conformance verify verify-mutations verify-refinement check test-ci release release-dynamic verify-release verify-release-dynamic bench bench-fs bench-syscalls rustybench install install-login-shell lint fix
+.PHONY: build test test-epsh conformance verify verify-mutations verify-refinement check test-ci release verify-release bench bench-fs bench-syscalls rustybench install install-login-shell lint fix
 
 build:
 	$(call cargo,dev) build
@@ -79,18 +76,6 @@ verify-release:
 		echo "Skipping ELF checks for $(TARGET)"; \
 	fi
 
-verify-release-dynamic:
-	@test -f "target/$(TARGET)/dist/$(NAME)"
-	@if echo "$(TARGET)" | grep -q -- '-linux-musl$$'; then \
-		command -v readelf >/dev/null || { echo 'readelf is required for release verification'; exit 1; }; \
-		file "target/$(TARGET)/dist/$(NAME)" | grep -q 'dynamically linked' || { echo 'release is not dynamically linked'; exit 1; }; \
-		file "target/$(TARGET)/dist/$(NAME)" | grep -q 'stripped' || { echo 'release is not stripped'; exit 1; }; \
-		readelf -l "target/$(TARGET)/dist/$(NAME)" | grep -q '/lib/ld-musl-' || { echo 'release does not use the musl loader'; exit 1; }; \
-		readelf -d "target/$(TARGET)/dist/$(NAME)" | grep -q NEEDED || { echo 'release has no dynamic dependencies'; exit 1; }; \
-	else \
-		echo "Skipping ELF checks for $(TARGET)"; \
-	fi
-
 lint:
 	cargo clippy --workspace --fix --allow-dirty --all-targets -- -D warnings
 
@@ -107,13 +92,6 @@ bench:
 
 bench-syscalls:
 	@$(RUSTYBENCH) syscalls --root "$(CURDIR)"
-
-release-dynamic:
-	$(call cargo,release-dynamic) clean -p $(NAME) --profile dist --target $(TARGET)
-	$(call cargo,release-dynamic) build --profile dist -p $(NAME) \
-	  -Z build-std=std \
-	  -Z build-std-features= \
-	  --target $(TARGET)
 
 install: release
 	@set -eu; \

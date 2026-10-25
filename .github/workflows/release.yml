@@ -109,10 +109,6 @@ jobs:
             -w /ish \
             ish-builder:${{ matrix.target }} \
             sh -ec '
-              make release-dynamic TARGET=${{ matrix.target }}
-              make verify-release-dynamic TARGET=${{ matrix.target }}
-              make test-ci TARGET=${{ matrix.target }}
-              cp target/${{ matrix.target }}/dist/ish ish-${{ matrix.target }}
               make release TARGET=${{ matrix.target }}
               make verify-release TARGET=${{ matrix.target }}
               make test-ci TARGET=${{ matrix.target }}
@@ -159,6 +155,41 @@ jobs:
         with:
           pattern: ish-*
           path: dist
+
+      - name: Verify Linux ELF artifacts are fully static
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          command -v readelf >/dev/null
+          X86_64_COUNT=0
+          AARCH64_COUNT=0
+          for binary in dist/**/*; do
+            [[ -f "$binary" ]] || continue
+            if ! readelf -h "$binary" >/dev/null 2>&1; then
+              continue
+            fi
+            machine=$(readelf -h "$binary" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')
+            case "$machine" in
+              "Advanced Micro Devices X86-64") X86_64_COUNT=$((X86_64_COUNT + 1)) ;;
+              AArch64) AARCH64_COUNT=$((AARCH64_COUNT + 1)) ;;
+              *) printf '%s has unsupported ELF machine %s\n' "$binary" "$machine" >&2; exit 1 ;;
+            esac
+            program_headers=$(readelf -lW "$binary")
+            if [[ "$program_headers" == *INTERP* ]]; then
+              printf '%s has a dynamic ELF interpreter\n' "$binary" >&2
+              exit 1
+            fi
+            dynamic_section=$(readelf -dW "$binary")
+            if [[ "$dynamic_section" == *NEEDED* ]]; then
+              printf '%s has a dynamic library dependency\n' "$binary" >&2
+              exit 1
+            fi
+          done
+          if [[ "$X86_64_COUNT" -ne 1 || "$AARCH64_COUNT" -ne 1 ]]; then
+            printf 'Expected one x86_64 and one aarch64 Linux ELF artifact, found x86_64=%s aarch64=%s\n' "$X86_64_COUNT" "$AARCH64_COUNT" >&2
+            exit 1
+          fi
+
       - name: Validate and package release artifacts
         run: |
           expected_artifacts=$'ish-aarch64-apple-darwin\nish-aarch64-unknown-linux-musl\nish-x86_64-unknown-linux-musl'
@@ -169,8 +200,8 @@ jobs:
             exit 1
           fi
           expected_mac='ish-aarch64-apple-darwin'
-          expected_arm=$'ish-aarch64-unknown-linux-musl\nish-aarch64-unknown-linux-musl-static'
-          expected_x86=$'ish-x86_64-unknown-linux-musl\nish-x86_64-unknown-linux-musl-static'
+          expected_arm='ish-aarch64-unknown-linux-musl-static'
+          expected_x86='ish-x86_64-unknown-linux-musl-static'
           for spec in \
             "$expected_mac:ish-aarch64-apple-darwin" \
             "$expected_arm:ish-aarch64-unknown-linux-musl" \
@@ -186,10 +217,7 @@ jobs:
           done
           mkdir dist/zips
           for file in \
-            dist/ish-aarch64-apple-darwin/ish-aarch64-apple-darwin \
-            dist/ish-aarch64-unknown-linux-musl/ish-aarch64-unknown-linux-musl \
             dist/ish-aarch64-unknown-linux-musl/ish-aarch64-unknown-linux-musl-static \
-            dist/ish-x86_64-unknown-linux-musl/ish-x86_64-unknown-linux-musl \
             dist/ish-x86_64-unknown-linux-musl/ish-x86_64-unknown-linux-musl-static; do
             zip -9 --junk-paths "dist/zips/$(basename "$file").zip" "$file"
           done
