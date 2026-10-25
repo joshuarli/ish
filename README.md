@@ -9,8 +9,8 @@ command-string mode.
 
 Download a pre-release archive for your platform from
 [GitHub Releases](https://github.com/joshuarli/ish/releases). The release
-workflow provides macOS Apple silicon and Linux x86_64 and ARM64 builds; Linux
-has static and dynamic variants. Extract the archive, rename its `ish-*`
+workflow provides macOS Apple silicon and statically linked Linux x86_64 and
+ARM64 builds. Extract the archive, rename its `ish-*`
 executable to `ish`, and place it in a directory on your `PATH`, such as
 `~/.local/bin`.
 
