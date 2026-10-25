@@ -1,7 +1,7 @@
 use ish::alias::AliasMap;
 use ish::cd_rewrite::{maybe_rewrite_cd, resolve_cd_for_history};
 use ish::diagnostics::{self, base64_encode};
-use ish::input::{InputEvent, InputReader};
+use ish::input::{InputEvent, InputReader, KeyEvent};
 use ish::job::{self, Job};
 use ish::external;
 use ish::{builtin, capture, config, denv, dispatch, frecency, history, prompt, signal, term};
@@ -762,6 +762,12 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
         Ok(raw) => raw,
         Err(error) => { eprintln!("ish: raw mode: {error}"); return ReadResult::Exit; }
     };
+    // Catch SIGINT while editing (the top-level disposition ignores it) so
+    // kill -INT cancels the line instead of doing nothing. Restored on drop.
+    let _foreground_signals = match signal::ForegroundSignals::install() {
+        Ok(guard) => guard,
+        Err(error) => { eprintln!("ish: foreground signals: {error}"); return ReadResult::Exit; }
+    };
     emit_working_directory(shell);
     if shell.prompt_needs_line_start { print!("\r\n"); shell.prompt_needs_line_start = false; }
     let pwd = shell.epsh.vars().get("PWD").unwrap_or("");
@@ -778,6 +784,10 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
             InputEvent::Signal(signal) if *signal == rustix::process::Signal::TERM.as_raw() || *signal == rustix::process::Signal::HUP.as_raw() => return ReadResult::Terminated(*signal),
             InputEvent::Signal(signal) if *signal == rustix::process::Signal::WINCH.as_raw() => {
                 let (rows, cols) = term::term_size(); EditorEvent::Resize { rows, cols }
+            }
+            // A kill -INT during editing cancels the line exactly like Ctrl+C.
+            InputEvent::Signal(signal) if *signal == rustix::process::Signal::INT.as_raw() => {
+                EditorEvent::Key(KeyEvent::ctrl('c'))
             }
             InputEvent::Signal(_) => continue,
             InputEvent::Key(key) => EditorEvent::Key(*key),

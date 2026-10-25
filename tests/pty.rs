@@ -1185,6 +1185,30 @@ fn ctrl_c_cancels_input() {
 }
 
 #[test]
+fn sigint_during_editing_cancels_the_line() {
+    let sh = PtyShell::spawn();
+    sh.type_str("echo this-line-is-cancelled");
+    sh.terminal.borrow_mut().signal(libc::SIGINT).unwrap();
+    // A fresh prompt must appear without submitting anything: the partial
+    // line is discarded with ^C, exactly like Ctrl+C.
+    let out = sh.wait_for_prompt_after_line_advance(4000);
+    assert!(
+        PtyShell::strip_ansi(&out).contains("^C"),
+        "expected ^C after SIGINT: {out:?}"
+    );
+    let out = sh.run_command("echo sigint-cancel-marker");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("sigint-cancel-marker"),
+        "shell did not recover after SIGINT: {text:?}"
+    );
+    assert!(
+        !text.contains("this-line-is-cancelled"),
+        "SIGINT did not discard the partial line: {text:?}"
+    );
+}
+
+#[test]
 fn line_editing_backspace() {
     let sh = PtyShell::spawn();
     sh.type_str("echo helloo");

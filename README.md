@@ -239,7 +239,8 @@ saving its output.
 
 ### Job control
 
-Ctrl+C interrupts foreground commands, including pipelines.
+Ctrl+C interrupts foreground commands, including pipelines. A SIGINT sent
+to the shell (for example `kill -INT`) cancels the line being edited.
 Ctrl+Z suspends a foreground job and `fg` resumes it. ish keeps one suspended
 job. If a command in a list suspends, the rest of that list is discarded.
 The suspended job retains every pipeline member and its output capture.

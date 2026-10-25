@@ -91,14 +91,17 @@ pub fn read_signal() -> Option<i32> {
         .map(|_| byte as i32)
 }
 
-pub(crate) struct ForegroundSignals {
+/// Catches SIGINT for interactive foreground activity (line editing and
+/// in-process foreground operations) and ignores SIGTSTP for its lifetime,
+/// restoring both dispositions on drop.
+pub struct ForegroundSignals {
     original_int: libc::sigaction,
     original_tstp: libc::sigaction,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl ForegroundSignals {
-    pub(crate) fn install() -> std::io::Result<Self> {
+    pub fn install() -> std::io::Result<Self> {
         let lock = FOREGROUND_SIGNALS_LOCK
             .lock()
             .map_err(|_| std::io::Error::other("foreground signal state was poisoned"))?;
