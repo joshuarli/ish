@@ -144,7 +144,6 @@ pub struct Foreground {
     last_progress: Option<Instant>,
     progress_replay: ProgressReplay,
     progress_drawn: bool,
-    exit_signal: Option<i32>,
     output_error: Option<io::Error>,
 }
 
@@ -162,17 +161,12 @@ impl Foreground {
             last_progress: None,
             progress_replay: ProgressReplay::default(),
             progress_drawn: false,
-            exit_signal: None,
             output_error: None,
         })
     }
 
     pub fn cancellation(&self) -> Cancellation {
         self.cancellation.clone()
-    }
-
-    pub fn exit_signal(&self) -> Option<i32> {
-        self.exit_signal
     }
 
     pub fn poll(&mut self) {
@@ -459,7 +453,6 @@ impl Foreground {
             || sig == rustix::process::Signal::HUP.as_raw()
         {
             self.cancellation.cancel();
-            self.exit_signal.get_or_insert(sig);
             signal::note_termination(sig);
         }
     }
