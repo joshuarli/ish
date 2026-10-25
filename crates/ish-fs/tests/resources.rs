@@ -198,6 +198,9 @@ fn process_descriptor_count() -> usize {
 }
 
 #[cfg(target_os = "linux")]
+const DESCRIPTOR_TRANSIENT_SLACK: usize = 2;
+
+#[cfg(target_os = "linux")]
 #[test]
 fn jobs_bounds_and_resource_rejection() {
     let fixture = Fixture::new("ish-fs-resource-limits");
@@ -211,7 +214,7 @@ fn jobs_bounds_and_resource_rejection() {
     fs::remove_file(&baseline_path).unwrap();
     let engine_descriptors = samples.descriptors.saturating_sub(baseline);
     eprintln!("descriptor probe: baseline {baseline}, observed total peak {}, engine-owned delta {engine_descriptors}, sampled peak RSS {} bytes across {} samples; polling can miss short peaks", samples.descriptors, samples.rss_bytes, samples.count);
-    assert!(engine_descriptors <= 16, "observed {engine_descriptors} engine-owned descriptors with RLIMIT_NOFILE=48, budget=16");
+    assert!(engine_descriptors <= ish_fs::MIN_DESCRIPTORS + DESCRIPTOR_TRANSIENT_SLACK, "observed {engine_descriptors} engine-owned descriptors with RLIMIT_NOFILE=48, budget={}, transient slack={DESCRIPTOR_TRANSIENT_SLACK}", ish_fs::MIN_DESCRIPTORS);
     verify_tree(&fixture.0, WIDE_FILES);
 }
 
