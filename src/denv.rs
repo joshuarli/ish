@@ -1163,7 +1163,7 @@ fn eval_env_bash(
     // SAFETY: the hook only resets signals, remaps owned snapshot descriptors and clears close-on-exec on owned reporters.
     unsafe {
         cmd.pre_exec(move || {
-            crate::signal::restore_defaults();
+            crate::signal::restore_defaults()?;
             remap_snapshot_writers(&before_src, &after_src)?;
             rustix::io::fcntl_setfd(&failure_write, rustix::io::FdFlags::empty())?;
             rustix::io::fcntl_setfd(&failure_backup, rustix::io::FdFlags::empty())?;

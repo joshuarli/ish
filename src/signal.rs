@@ -18,25 +18,25 @@ pub fn init() -> RawFd {
     PIPE_READ.store(read_fd, std::sync::atomic::Ordering::Release);
     PIPE_WRITE.store(write_fd, std::sync::atomic::Ordering::Release);
 
-    install_handler(rustix::process::Signal::WINCH);
+    install_handler(rustix::process::Signal::WINCH).expect("signal handler install failed");
     SHELL_PID.store(
         rustix::process::getpid().as_raw_pid(),
         std::sync::atomic::Ordering::Relaxed,
     );
-    install_handler(rustix::process::Signal::TERM);
-    install_handler(rustix::process::Signal::HUP);
+    install_handler(rustix::process::Signal::TERM).expect("signal handler install failed");
+    install_handler(rustix::process::Signal::HUP).expect("signal handler install failed");
 
-    ignore(rustix::process::Signal::TSTP);
-    ignore(rustix::process::Signal::TTOU);
-    ignore(rustix::process::Signal::TTIN);
-    ignore(rustix::process::Signal::QUIT);
-    ignore(rustix::process::Signal::PIPE);
-    ignore(rustix::process::Signal::INT);
+    ignore(rustix::process::Signal::TSTP).expect("signal ignore failed");
+    ignore(rustix::process::Signal::TTOU).expect("signal ignore failed");
+    ignore(rustix::process::Signal::TTIN).expect("signal ignore failed");
+    ignore(rustix::process::Signal::QUIT).expect("signal ignore failed");
+    ignore(rustix::process::Signal::PIPE).expect("signal ignore failed");
+    ignore(rustix::process::Signal::INT).expect("signal ignore failed");
 
     read_fd
 }
 
-pub fn restore_defaults() {
+pub fn restore_defaults() -> std::io::Result<()> {
     for &sig in &[
         rustix::process::Signal::INT,
         rustix::process::Signal::QUIT,
@@ -47,19 +47,20 @@ pub fn restore_defaults() {
         rustix::process::Signal::CHILD,
         rustix::process::Signal::WINCH,
     ] {
-        set_default(sig);
+        set_default(sig)?;
     }
+    Ok(())
 }
 
-fn set_default(sig: rustix::process::Signal) {
+fn set_default(sig: rustix::process::Signal) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        set_linux_disposition(sig, libc::SIG_DFL);
+        set_linux_disposition(sig, libc::SIG_DFL)
     }
 
     #[cfg(target_os = "macos")]
     unsafe {
-        darwin_sigaction(sig.as_raw(), 0, 0);
+        darwin_sigaction(sig.as_raw(), 0, 0)
     }
 }
 
@@ -168,27 +169,30 @@ pub fn take_pending_termination() -> Option<i32> {
     }
 }
 
-fn install_handler(sig: rustix::process::Signal) {
+fn install_handler(sig: rustix::process::Signal) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     unsafe {
-        let _ = libc::signal(sig.as_raw(), handler as *const () as usize);
+        if libc::signal(sig.as_raw(), handler as *const () as usize) == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
     unsafe {
-        darwin_sigaction(sig.as_raw(), handler as *const () as usize, 0x0002);
+        darwin_sigaction(sig.as_raw(), handler as *const () as usize, 0x0002)
     }
 }
 
-fn ignore(sig: rustix::process::Signal) {
+fn ignore(sig: rustix::process::Signal) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        set_linux_disposition(sig, libc::SIG_IGN);
+        set_linux_disposition(sig, libc::SIG_IGN)
     }
 
     #[cfg(target_os = "macos")]
     unsafe {
-        darwin_sigaction(sig.as_raw(), 1, 0);
+        darwin_sigaction(sig.as_raw(), 1, 0)
     }
 }
 
@@ -197,9 +201,9 @@ fn set_linux_disposition(sig: rustix::process::Signal, handler: libc::sighandler
     // SAFETY: `sig` is a valid rustix signal and callers pass libc disposition constants.
     let previous = unsafe { libc::signal(sig.as_raw(), handler) };
     if previous == libc::SIG_ERR {
-        let error = std::io::Error::last_os_error();
-        panic!("failed to set signal {} disposition: {error}", sig.as_raw());
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -262,7 +266,11 @@ struct DarwinSigaction {
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn darwin_sigaction(signal: i32, handler: usize, flags: core::ffi::c_int) {
+unsafe fn darwin_sigaction(
+    signal: i32,
+    handler: usize,
+    flags: core::ffi::c_int,
+) -> std::io::Result<()> {
     unsafe extern "C" {
         fn sigaction(
             signal: core::ffi::c_int,
@@ -275,7 +283,12 @@ unsafe fn darwin_sigaction(signal: i32, handler: usize, flags: core::ffi::c_int)
         sa_mask: 0,
         sa_flags: flags,
     };
-    let _ = unsafe { sigaction(signal, &action, std::ptr::null_mut()) };
+    // SAFETY: the action has the Darwin ABI layout and the API copies it before returning.
+    let result = unsafe { sigaction(signal, &action, std::ptr::null_mut()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
