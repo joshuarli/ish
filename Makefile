@@ -53,8 +53,8 @@ check:
 	$(MAKE) verify
 
 test-ci:
-	@test -x "target/$(TARGET)/release/$(NAME)"
-	$(TEST_BINARY_ENV)="$(CURDIR)/target/$(TARGET)/release/$(NAME)" \
+	@test -x "target/$(TARGET)/dist/$(NAME)"
+	$(TEST_BINARY_ENV)="$(CURDIR)/target/$(TARGET)/dist/$(NAME)" \
 	$(call cargo,test) test --quiet --release $(TEST_TARGETS)
 
 release:
