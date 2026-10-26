@@ -228,6 +228,7 @@ fn completion_path_benchmark(bencher: Bencher, file_count: usize, render_grid: b
         rows: 0,
         scroll: 0,
         term_cols: 80,
+        term_rows: 24,
         dir_prefix: fixture.path().to_string_lossy().into_owned(),
         in_quote: false,
     };
