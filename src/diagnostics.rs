@@ -67,6 +67,7 @@ pub(crate) fn render_layout_dump(out: &mut String, snapshot: LayoutSnapshot<'_>)
             let _ = writeln!(out, "completion.rows: {}", state.rows);
             let _ = writeln!(out, "completion.scroll: {}", state.scroll);
             let _ = writeln!(out, "completion.term_cols: {}", state.term_cols);
+            let _ = writeln!(out, "completion.term_rows: {}", state.term_rows);
             let _ = writeln!(out, "completion.dir_prefix_bytes: {}", state.dir_prefix.len());
             let _ = writeln!(out, "completion.in_quote: {}", state.in_quote);
             let _ = writeln!(out, "completion.entries: {:?}", state.comp.entries);

@@ -37,10 +37,14 @@ cp [OPTIONS] --into DIRECTORY SOURCE...
 mv [OPTIONS] --into DIRECTORY SOURCE...
 ```
 
-The two-operand form maps the source object to exactly `DESTINATION`. It never
-adds the source basename because the destination happens to be a directory.
-Thus `cp report.txt .` reports a file-to-directory type conflict. To put the
-file inside the current directory, use `cp --into . report.txt`.
+The two-operand form maps the source object to exactly `DESTINATION`,
+unless `DESTINATION` is an existing directory. When it is a directory,
+the source moves inside it under its basename, so `mv a ~/b` becomes
+`~/b/a` when `~/b` exists as a directory. The appended target still
+respects the collision policy: it errors without `--replace` or `-n`,
+skips with `-n`, and replaces supported leaves with `--replace`.
+`--merge` keeps directory-merge behavior for two directories.
+`--into DIRECTORY` remains the explicit multi-source form.
 
 `--into DIRECTORY` requires an existing directory and one or more sources. Each
 source maps to a child named after its basename. The directory may resolve

@@ -621,7 +621,8 @@ pub fn grid_visible_rows(state: &CompletionState) -> usize {
     if state.comp.is_empty() || state.rows == 0 {
         return 0;
     }
-    state.rows.min(10)
+    let max = (state.term_rows as usize).saturating_sub(1).max(1);
+    state.rows.min(max)
 }
 
 fn draw_grid(tw: &mut TermWriter, state: &CompletionState, layout: &CompletionGridLayout) {
@@ -1068,6 +1069,7 @@ mod tests {
             rows,
             scroll: 0,
             term_cols,
+            term_rows: 24,
             dir_prefix: String::new(),
             in_quote: false,
         }
@@ -1318,5 +1320,16 @@ mod tests {
         let layout = layout_completion_grid(&state);
         draw_grid(&mut tw, &state, &layout);
         assert_eq!(tw.as_bytes(), b"\r\x1b[K1234567");
+    }
+
+    #[test]
+    fn completion_grid_fills_terminal_height() {
+        let entries: Vec<String> = (0..30).map(|i| format!("file{i:02}")).collect();
+        let refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
+        let mut state = completion_state(&refs, 1, 30, 80);
+        state.term_rows = 24;
+        assert_eq!(super::grid_visible_rows(&state), 23);
+        state.term_rows = 12;
+        assert_eq!(super::grid_visible_rows(&state), 11);
     }
 }

@@ -322,6 +322,7 @@ fn start_completion_mode(view: &mut EditView, mode: &mut Mode, shell: &mut Editi
     let mut cs = start_completion(
         &base_line,
         shell.cols,
+        shell.rows,
         shell.home,
         shell.aliases,
         shell.path,
@@ -380,6 +381,7 @@ fn apply_completion_action(view: &mut EditView, shell: &mut Editing<'_>, complet
             let mut cs = start_completion(
                 base_line,
                 shell.cols,
+                shell.rows,
                 shell.home,
                 shell.aliases,
                 shell.path,
@@ -637,6 +639,7 @@ fn update_mode_layout_for_resize(mode: &mut Mode, shell: &Editing<'_>) {
         state.cols = cols;
         state.rows = rows;
         state.term_cols = shell.cols;
+        state.term_rows = shell.rows;
         if state.selected != usize::MAX { state.selected = state.selected.min(state.comp.len().saturating_sub(1)); }
         state.scroll = state.scroll.min(rows.saturating_sub(1));
     }
@@ -949,7 +952,7 @@ fn is_command_position(before_cursor: &str, word_start: usize) -> bool {
     matches!(prev_word, "sudo" | "doas" | "su")
 }
 
-fn find_comp_word_start(s: &str) -> (usize, bool) {
+fn find_comp_word_start(s: &str) -> (usize, bool, bool) {
     let mut in_single = false;
     let mut in_double = false;
     let mut word_start = 0;
@@ -977,13 +980,40 @@ fn find_comp_word_start(s: &str) -> (usize, bool) {
             }
         }
     }
-    (word_start, in_single)
+    (word_start, in_single, in_double)
+}
+
+fn parse_completion_word(raw_word: &str, in_single: bool, in_double: bool) -> (String, bool) {
+    if let Some(rest) = raw_word.strip_prefix("~/'") {
+        let unquoted = rest.strip_suffix('\'').unwrap_or(rest);
+        return (format!("~/{unquoted}"), true);
+    }
+    if let Some(rest) = raw_word.strip_prefix("~/\"") {
+        let unquoted = rest.strip_suffix('"').unwrap_or(rest);
+        return (format!("~/{unquoted}"), true);
+    }
+    if let Some(inner) = raw_word.strip_prefix('\'') {
+        let unquoted = inner.strip_suffix('\'').unwrap_or(inner);
+        return (unquoted.into(), true);
+    }
+    if let Some(inner) = raw_word.strip_prefix('"') {
+        let unquoted = inner.strip_suffix('"').unwrap_or(inner);
+        return (unquoted.into(), true);
+    }
+    if in_single {
+        return (raw_word.replace('\'', ""), true);
+    }
+    if in_double {
+        return (raw_word.replace('"', ""), true);
+    }
+    (raw_word.into(), false)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn start_completion(
     line: &LineBuffer,
     term_cols: u16,
+    term_rows: u16,
     home: Option<&str>,
     aliases: &AliasMap,
     path_env: &[u8],
@@ -995,20 +1025,11 @@ fn start_completion(
 
     let text = line.text();
     let before_cursor = &text[..line.cursor()];
-    let (word_start, in_single) = find_comp_word_start(before_cursor);
+    let (word_start, in_single, in_double) = find_comp_word_start(before_cursor);
     let existing = existing_cmd_args(before_cursor, word_start);
     let raw_word = &before_cursor[word_start..];
 
-    let (partial, in_quote): (String, bool) = if in_single {
-        (raw_word.strip_prefix('\'').unwrap_or(raw_word).into(), true)
-    } else if let Some(rest) = raw_word.strip_prefix("~/'") {
-        let unquoted = rest.strip_suffix('\'').unwrap_or(rest);
-        (format!("~/{unquoted}"), true)
-    } else if let Some(inner) = raw_word.strip_prefix('\'') {
-        (inner.strip_suffix('\'').unwrap_or(inner).into(), true)
-    } else {
-        (raw_word.into(), false)
-    };
+    let (partial, in_quote): (String, bool) = parse_completion_word(raw_word, in_single, in_double);
 
     let first_command_word = text.split_whitespace().next().unwrap_or("");
     const SSH_CMDS: &[&str] = &["ssh", "scp", "rsync", "sftp", "mosh"];
@@ -1025,6 +1046,7 @@ fn start_completion(
                 rows: 0,
                 scroll: 0,
                 term_cols,
+                term_rows,
                 dir_prefix: String::new(),
                 in_quote,
             };
@@ -1059,6 +1081,7 @@ fn start_completion(
             rows,
             scroll: 0,
             term_cols,
+            term_rows,
             dir_prefix: String::new(),
             in_quote: false,
         };
@@ -1081,6 +1104,7 @@ fn start_completion(
                 rows,
                 scroll: 0,
                 term_cols,
+                term_rows,
                 dir_prefix: String::new(),
                 in_quote,
             };
@@ -1112,6 +1136,7 @@ fn start_completion(
             rows,
             scroll: 0,
             term_cols,
+            term_rows,
             dir_prefix,
             in_quote,
         };
@@ -1154,6 +1179,7 @@ fn start_completion(
             rows,
             scroll: 0,
             term_cols,
+            term_rows,
             dir_prefix: user_root,
             in_quote,
         };
@@ -1166,6 +1192,7 @@ fn start_completion(
         rows: 0,
         scroll: 0,
         term_cols,
+        term_rows,
         dir_prefix: String::new(),
         in_quote,
     }
@@ -1230,7 +1257,7 @@ fn preview_completion(line: &mut LineBuffer, state: &CompletionState, base_line:
 
     let text = base_line.text().to_string();
     let before_cursor = &text[..base_line.cursor()];
-    let (word_start, _) = find_comp_word_start(before_cursor);
+    let (word_start, _, _) = find_comp_word_start(before_cursor);
     let after_cursor = &text[base_line.cursor()..];
 
     let mut inner = state.dir_prefix.clone();

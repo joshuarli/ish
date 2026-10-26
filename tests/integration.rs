@@ -625,6 +625,7 @@ fn completion_state_navigation_wraps() {
         rows,
         scroll: 0,
         term_cols: 80,
+        term_rows: 24,
         dir_prefix: String::new(),
         in_quote: false,
     };
@@ -654,6 +655,7 @@ fn completion_state_left_right_wrap() {
         rows,
         scroll: 0,
         term_cols: 80,
+        term_rows: 24,
         dir_prefix: String::new(),
         in_quote: false,
     };
@@ -1285,6 +1287,7 @@ fn completion_state_selected_entry() {
         rows,
         scroll: 0,
         term_cols: 80,
+        term_rows: 24,
         dir_prefix: String::new(),
         in_quote: false,
     };
@@ -1302,6 +1305,7 @@ fn completion_state_selected_entry_out_of_bounds() {
         rows,
         scroll: 0,
         term_cols: 80,
+        term_rows: 24,
         dir_prefix: String::new(),
         in_quote: false,
     };
@@ -1317,6 +1321,7 @@ fn completion_move_with_zero_rows() {
         rows: 0,
         scroll: 0,
         term_cols: 80,
+        term_rows: 24,
         dir_prefix: String::new(),
         in_quote: false,
     };
@@ -1339,6 +1344,7 @@ fn completion_navigation_single_entry() {
         rows,
         scroll: 0,
         term_cols: 80,
+        term_rows: 24,
         dir_prefix: String::new(),
         in_quote: false,
     };
@@ -1363,6 +1369,7 @@ fn completion_move_right_wraps_to_first_col() {
         rows,
         scroll: 0,
         term_cols: 80,
+        term_rows: 24,
         dir_prefix: String::new(),
         in_quote: false,
     };
@@ -1384,6 +1391,7 @@ fn completion_move_left_wraps_to_last_col() {
         rows,
         scroll: 0,
         term_cols: 80,
+        term_rows: 24,
         dir_prefix: String::new(),
         in_quote: false,
     };

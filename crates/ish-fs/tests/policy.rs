@@ -234,7 +234,7 @@ fn into_rejects_ambiguous_basenames_before_mutation() {
 }
 
 #[test]
-fn exact_target_does_not_append_into_an_existing_directory() {
+fn exact_target_appends_into_an_existing_directory() {
     let fixture = Fixture::new();
     std::fs::write(fixture.cwd.join("source"), b"data").expect("write source");
     std::fs::create_dir(fixture.cwd.join("destination")).expect("create destination directory");
@@ -245,8 +245,11 @@ fn exact_target_does_not_append_into_an_existing_directory() {
         Options::default(),
     );
 
-    assert_eq!(fixture.run(&request).status(), 1);
-    assert!(!fixture.cwd.join("destination/source").exists());
+    assert_eq!(fixture.run(&request).status(), 0);
+    assert_eq!(
+        std::fs::read(fixture.cwd.join("destination/source")).expect("read appended output"),
+        b"data"
+    );
     assert_eq!(std::fs::read(fixture.cwd.join("source")).expect("read source"), b"data");
 }
 
@@ -504,6 +507,9 @@ fn policy_model(source: Kind, destination: Option<Kind>, collision: Collision, m
     let Some(destination) = destination else {
         return Decision::Transfer;
     };
+    if destination == Kind::Directory && !(source == Kind::Directory && merge) {
+        return Decision::Transfer;
+    }
     if source == Kind::Directory && destination == Kind::Directory && merge {
         return Decision::Merge;
     }
@@ -531,6 +537,14 @@ fn assert_successful_model_result(
     if decision == Decision::Merge {
         assert_eq!(std::fs::read(cwd.join("destination/source-child")).expect("read merged child"), b"source");
         assert_eq!(std::fs::read(cwd.join("destination/destination-child")).expect("read preserved merged child"), b"destination");
+        return;
+    }
+    if destination == Some(Kind::Directory) && decision == Decision::Transfer {
+        assert_model_entry(cwd, "destination/source", source, "source");
+        assert_eq!(
+            std::fs::read(cwd.join("destination/destination-child")).expect("read preserved destination child"),
+            b"destination"
+        );
         return;
     }
     if decision == Decision::Replace {
@@ -647,4 +661,31 @@ fn entry_names(directory: &Path) -> io::Result<Vec<OsString>> {
     let mut names = std::fs::read_dir(directory)?.map(|entry| entry.map(|entry| entry.file_name())).collect::<Result<Vec<_>, _>>()?;
     names.sort();
     Ok(names)
+}
+
+#[test]
+fn exact_into_existing_directory_respects_collision_policy() {
+    for (collision, expected_status, should_move) in [
+        (Collision::Error, 1, false),
+        (Collision::Skip, 0, false),
+        (Collision::Replace, 0, true),
+    ] {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.cwd.join("a"), b"new").expect("write source");
+        std::fs::create_dir(fixture.cwd.join("b")).expect("create destination directory");
+        std::fs::write(fixture.cwd.join("b/a"), b"existing").expect("write conflicting child");
+        let request = fixture.request(
+            Operation::Move,
+            Operands::Exact { source: "a".into(), destination: "b".into() },
+            Options { collision, ..Options::default() },
+        );
+        assert_eq!(fixture.run(&request).status(), expected_status, "{collision:?}");
+        if should_move {
+            assert_eq!(std::fs::read(fixture.cwd.join("b/a")).expect("read replaced"), b"new");
+            assert!(!fixture.cwd.join("a").exists());
+        } else {
+            assert_eq!(std::fs::read(fixture.cwd.join("b/a")).expect("read preserved"), b"existing");
+            assert!(fixture.cwd.join("a").exists());
+        }
+    }
 }

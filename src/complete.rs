@@ -246,6 +246,7 @@ pub struct CompletionState {
     pub rows: usize,
     pub scroll: usize,
     pub term_cols: u16,
+    pub term_rows: u16,
     /// The prefix that was used to generate completions (directory portion).
     pub dir_prefix: String,
     /// Whether the user was inside a single-quote when completion started.

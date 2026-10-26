@@ -163,7 +163,8 @@ fn mappings(request: &Request, cwd: BorrowedFd<'_>) -> io::Result<(Vec<Mapping>,
         Operands::Exact { source, destination } => {
             let mut mappings = Vec::with_capacity(1);
             let mut memory_bytes = 0;
-            push_mapping(&mut mappings, &mut memory_bytes, source.clone(), destination.clone(), None)?;
+            let destination = exact_destination(request, cwd, source, destination);
+            push_mapping(&mut mappings, &mut memory_bytes, source.clone(), destination, None)?;
             Ok((mappings, None))
         }
         Operands::Into { directory, first, rest } => {
@@ -181,6 +182,40 @@ fn mappings(request: &Request, cwd: BorrowedFd<'_>) -> io::Result<(Vec<Mapping>,
             Ok((mappings, Some(into_directory)))
         }
     }
+}
+
+fn exact_destination(
+    request: &Request,
+    cwd: BorrowedFd<'_>,
+    source: &Path,
+    destination: &Path,
+) -> PathBuf {
+    let Ok(destination_root) = Root::establish(cwd, destination, Requirement::Existing) else {
+        return destination.to_path_buf();
+    };
+    if !destination_root
+        .observed
+        .is_some_and(|observed| observed.identity.kind == EntryKind::Directory)
+    {
+        return destination.to_path_buf();
+    }
+    let Ok(name) = into_basename(source) else {
+        return destination.to_path_buf();
+    };
+    if request.options.merge {
+        let Ok(source_root) = Root::establish(cwd, source, Requirement::Existing) else {
+            return destination.to_path_buf();
+        };
+        if source_root
+            .observed
+            .is_some_and(|observed| observed.identity.kind == EntryKind::Directory)
+        {
+            return destination.to_path_buf();
+        }
+    }
+    let mut rewritten = destination.to_path_buf();
+    rewritten.push(name);
+    rewritten
 }
 
 fn push_mapping(
