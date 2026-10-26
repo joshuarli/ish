@@ -860,20 +860,28 @@ enum CompletionAction {
 
 fn current_cmd_start(s: &str) -> usize {
     let mut in_single = false;
+    let mut in_double = false;
     let bytes = s.as_bytes();
     let mut start = 0;
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' => {
+            b'\\' if !in_single && i + 1 < bytes.len() => {
+                i += 2;
+            }
+            b'\'' if !in_double => {
                 in_single = !in_single;
                 i += 1;
             }
-            b'|' | b';' if !in_single => {
+            b'"' if !in_single => {
+                in_double = !in_double;
+                i += 1;
+            }
+            b'|' | b';' if !in_single && !in_double => {
                 i += 1;
                 start = i;
             }
-            b'&' if !in_single && i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+            b'&' if !in_single && !in_double && i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
                 i += 2;
                 start = i;
             }
@@ -887,10 +895,20 @@ fn shell_tokens(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut in_single = false;
-    for c in s.chars() {
+    let mut in_double = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
         match c {
-            '\'' => in_single = !in_single,
-            ' ' | '\t' if !in_single => {
+            '\\' if !in_single => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                } else {
+                    cur.push('\\');
+                }
+            }
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            ' ' | '\t' if !in_single && !in_double => {
                 if !cur.is_empty() {
                     tokens.push(std::mem::take(&mut cur));
                 }
@@ -983,6 +1001,21 @@ fn find_comp_word_start(s: &str) -> (usize, bool, bool) {
     (word_start, in_single, in_double)
 }
 
+fn unescape_outside_single(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(next) = chars.next()
+        {
+            out.push(next);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn parse_completion_word(raw_word: &str, in_single: bool, in_double: bool) -> (String, bool) {
     if let Some(rest) = raw_word.strip_prefix("~/'") {
         let unquoted = rest.strip_suffix('\'').unwrap_or(rest);
@@ -990,7 +1023,7 @@ fn parse_completion_word(raw_word: &str, in_single: bool, in_double: bool) -> (S
     }
     if let Some(rest) = raw_word.strip_prefix("~/\"") {
         let unquoted = rest.strip_suffix('"').unwrap_or(rest);
-        return (format!("~/{unquoted}"), true);
+        return (format!("~/{unescaped}", unescaped = unescape_outside_single(unquoted)), true);
     }
     if let Some(inner) = raw_word.strip_prefix('\'') {
         let unquoted = inner.strip_suffix('\'').unwrap_or(inner);
@@ -998,15 +1031,18 @@ fn parse_completion_word(raw_word: &str, in_single: bool, in_double: bool) -> (S
     }
     if let Some(inner) = raw_word.strip_prefix('"') {
         let unquoted = inner.strip_suffix('"').unwrap_or(inner);
-        return (unquoted.into(), true);
+        return (unescape_outside_single(unquoted), true);
     }
     if in_single {
         return (raw_word.replace('\'', ""), true);
     }
     if in_double {
-        return (raw_word.replace('"', ""), true);
+        return (
+            unescape_outside_single(&raw_word.replace('"', "")),
+            true,
+        );
     }
-    (raw_word.into(), false)
+    (unescape_outside_single(raw_word), false)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -167,3 +167,47 @@ fn quoted_tilde_path_with_space_completes() {
     assert_eq!(std::env::current_dir().unwrap(), before);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn backslash_escaped_space_completes() {
+    assert_eq!(
+        super::parse_completion_word("Library/Mobile\\ Documents/", false, false),
+        ("Library/Mobile Documents/".into(), false)
+    );
+    assert_eq!(
+        super::shell_tokens("mv foo\\ bar baz"),
+        vec!["mv".to_string(), "foo bar".to_string(), "baz".to_string()]
+    );
+    assert_eq!(
+        super::shell_tokens("mv \"foo bar\" baz"),
+        vec!["mv".to_string(), "foo bar".to_string(), "baz".to_string()]
+    );
+    assert_eq!(super::current_cmd_start("echo \"a|b\"; cd "), 11);
+}
+
+#[test]
+fn backslash_escaped_tilde_path_with_space_completes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".work/tmp").join(format!("ish-editor-backslash-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let docs = root.join("Library/Mobile Documents");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(docs.join("target.txt"), b"").unwrap();
+    let aliases = AliasMap::new();
+    let history = history::History::from_entries(Vec::new());
+    let home_str = root.to_str().unwrap().to_string();
+    let base = context(&aliases, &history, &[]);
+    let ctx = EditorContext { aliases: base.aliases, history: base.history, cwd: &root, home: Some(home_str.as_str()), home_display: "/", path: b"", directories: &[] };
+    let before = std::env::current_dir().unwrap();
+    let mut editor = Editor::new(24, 80);
+    editor.begin("$ ".into(), 2, &ctx);
+    event(&mut editor, &ctx, EditorEvent::Paste("ln -s ~/Library/Mobile\\ Documents/"));
+    event(&mut editor, &ctx, EditorEvent::Key(KeyEvent::key(Key::Tab)));
+    match event(&mut editor, &ctx, EditorEvent::Key(KeyEvent::key(Key::Enter))) {
+        EditorAction::Submit(line) => {
+            assert!(line.contains("Mobile Documents/target.txt"), "unexpected completion: {line}");
+            assert!(line.contains("~/'Library/Mobile Documents/target.txt'"), "expected quoted tilde form, got: {line}");
+        }
+        _other => panic!("expected submit"),
+    }
+    assert_eq!(std::env::current_dir().unwrap(), before);
+    std::fs::remove_dir_all(root).unwrap();
+}

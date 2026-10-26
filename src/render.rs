@@ -365,7 +365,9 @@ fn layout_pager(input: PagerInput) -> PagerLayout {
     let header_rows = header_full.saturating_sub(1) / cols + 1;
     let cursor_row = header_before_cursor / cols;
     let cursor_col = header_before_cursor % cols;
-    let max_results = (input.term_rows as usize).saturating_sub(2).min(20);
+    let max_results = (input.term_rows as usize)
+        .saturating_sub(header_rows)
+        .max(1);
     let displayed = input.total_entries.min(max_results);
     let last_row = header_rows + displayed.saturating_sub(1);
     let scroll = if input.total_entries <= max_results || input.selected < max_results / 2 {
@@ -1331,5 +1333,13 @@ mod tests {
         assert_eq!(super::grid_visible_rows(&state), 23);
         state.term_rows = 12;
         assert_eq!(super::grid_visible_rows(&state), 11);
+    }
+
+    #[test]
+    fn pager_fills_terminal_height() {
+        let layout = super::layout_pager(super::PagerInput { prefix_width: 8, query_width: 0, suffix_width: 0, query_cursor: 0, total_entries: 100, selected: 0, term_rows: 24, term_cols: 80 });
+        assert_eq!(layout.max_results, 23);
+        let layout = super::layout_pager(super::PagerInput { prefix_width: 8, query_width: 0, suffix_width: 0, query_cursor: 0, total_entries: 100, selected: 0, term_rows: 40, term_cols: 80 });
+        assert_eq!(layout.max_results, 39);
     }
 }
