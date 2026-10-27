@@ -21,9 +21,8 @@ pub fn claim_ctty(terminal_fd: RawFd) -> std::io::Result<()> {
     rustix::process::setsid().map(|_| ()).map_err(std::io::Error::from)?;
     // SAFETY: terminal_fd names an open terminal, and the caller is a session
     // leader without a controlling terminal after setsid.
-    if unsafe { libc::ioctl(terminal_fd, libc::TIOCSCTTY as libc::c_ulong, 0) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    rustix::process::ioctl_tiocsctty(unsafe { BorrowedFd::borrow_raw(terminal_fd) })
+        .map_err(std::io::Error::from)?;
     set_foreground_group(terminal_fd, rustix::process::getpid().as_raw_pid())
 }
 
