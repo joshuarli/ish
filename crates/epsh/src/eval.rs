@@ -437,6 +437,11 @@ pub struct ShellOpts {
     pub noexec: bool,
     /// Interactive mode: tcsetpgrp for terminal control, WUNTRACED for job control.
     pub interactive: bool,
+    /// Give each spawned foreground child its own session with the terminal
+    /// descriptor as its controlling terminal, instead of handing the shell's
+    /// terminal over across the same session. Set by embedders that place
+    /// foreground children on a capture terminal.
+    pub foreground_ctty: bool,
 }
 
 impl ShellOpts {
@@ -669,6 +674,7 @@ impl ShellBuilder {
                 noglob: self.noglob,
                 noexec: self.noexec,
                 interactive: self.interactive,
+                foreground_ctty: false,
             },
             traps: FxHashMap::default(),
             tested: false,
@@ -1120,6 +1126,15 @@ impl Shell {
     /// Mutable shell options.
     pub fn opts_mut(&mut self) -> &mut ShellOpts {
         &mut self.opts
+    }
+    /// Give spawned foreground children their own session with the terminal
+    /// descriptor as their controlling terminal. Only meaningful together
+    /// with interactive mode on a terminal the embedder redirects per command.
+    /// Clears the cached terminal descriptor, since converged capture swaps
+    /// which terminal stdin points at every command.
+    pub fn set_foreground_ctty(&mut self, enabled: bool) {
+        self.opts.foreground_ctty = enabled;
+        self.terminal_descriptor = None;
     }
     /// Trap handlers.
     pub fn traps(&self) -> &FxHashMap<String, String> {
@@ -2230,10 +2245,13 @@ impl Shell {
         if self.opts.interactive {
             let handoff = !self.in_forked_child;
             let terminal_fd = self.terminal_raw_fd();
-            // SAFETY: the child uses only signal disposition syscalls and a terminal process-group ioctl before exec.
+            let converged = self.opts.foreground_ctty && !self.in_forked_child;
+            // SAFETY: the child uses only signal disposition syscalls and terminal process-group ioctls before exec.
             unsafe {
                 cmd.pre_exec(move || {
-                    if handoff {
+                    if converged {
+                        sys::claim_ctty(terminal_fd)?;
+                    } else if handoff {
                         crate::signal::ignore_signal(rustix::process::Signal::TTOU)?;
                         sys::set_foreground_group(terminal_fd, rustix::process::getpgrp().as_raw_pid())?;
                     }
@@ -2244,7 +2262,7 @@ impl Shell {
                 });
             }
         }
-        if !self.in_forked_child { cmd.process_group(0); }
+        if !self.in_forked_child && !self.opts.foreground_ctty { cmd.process_group(0); }
 
         cmd.env_clear();
         for (k, v) in env {
@@ -2306,7 +2324,7 @@ impl Shell {
             Err(error) => self.handle_exec_error(&error, &args[0]),
         };
 
-        if self.opts.interactive && !self.in_forked_child {
+        if self.opts.interactive && !self.in_forked_child && !self.opts.foreground_ctty {
             let reclaimed = self.foreground_terminal(rustix::process::getpgrp().as_raw_pid());
             match (&result, reclaimed) {
                 (Ok(_), Err(error)) => return self.finish_redirections(Err(error), saved),

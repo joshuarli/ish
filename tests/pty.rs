@@ -4432,7 +4432,7 @@ fn foreground_terminal_mode_changes_on_stdout_apply_to_stdin() {
 }
 
 #[test]
-fn pager_quits_with_q_on_a_direct_terminal() {
+fn pager_quits_with_q_on_a_converged_terminal() {
     let content = (0..200)
         .map(|index| format!("line {index:03}"))
         .collect::<Vec<_>>()
@@ -4445,17 +4445,16 @@ fn pager_quits_with_q_on_a_direct_terminal() {
         sh.wait_for("line 000", 3000);
         sh.type_str("q");
         sh.wait_for_prompt_after_line_advance(3000);
-        sh.type_str("?");
-        sh.enter();
-        let output = sh.wait_for("wrote no text", 3000);
-        assert!(clipboard_writes(&output).is_empty(), "{pager} left captured output: {output:?}");
+        let copied = copied_by_question_mark(&sh);
+        let text = String::from_utf8_lossy(&copied);
+        assert!(text.contains("line 001"), "{pager} output was not captured: {text:?}");
         let output = PtyShell::strip_ansi(&sh.run_command("echo alive"));
         assert!(output.contains("alive"), "{pager} left the shell unusable: {output:?}");
     }
 }
 
 #[test]
-fn git_log_pages_on_a_direct_terminal() {
+fn git_log_pages_on_a_converged_terminal() {
     let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
         let content = (0..200)
             .map(|index| format!("line {index:03}"))
@@ -4494,6 +4493,26 @@ fn git_log_pages_on_a_direct_terminal() {
 }
 
 #[test]
+fn single_command_sees_one_terminal_for_all_standard_streams() {
+    let sh = PtyShell::spawn();
+    let output = PtyShell::strip_ansi(&sh.run_command("sh -c 'tty <&0; tty <&1; tty <&2'"));
+    let ttys: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("/dev/"))
+        .collect();
+    // `run_command` may report a fast command's output twice: bytes that
+    // arrive with the line advance are stashed for the next read and then
+    // re-read by the prompt wait. Require at least one full set of three
+    // identical paths instead of an exact count.
+    assert!(ttys.len() >= 3, "expected three tty paths: {output:?}");
+    assert!(
+        ttys.iter().all(|tty| *tty == ttys[0]),
+        "standard streams point at different terminals: {ttys:?}"
+    );
+}
+
+#[test]
 fn question_mark_keeps_children_on_a_terminal_of_the_current_size() {
     let sh = PtyShell::spawn_reading_clipboard(&[], 10, 40);
     sh.run_command("sh -c 'test -t 1 && test -t 2 && stty size <&1'");
@@ -4516,7 +4535,21 @@ fn running_command_sees_a_resize_through_its_output_terminal() {
     sh.ctrl_c();
     sh.wait_for_prompt_after_line_advance(3000);
     let copied = copied_by_question_mark(&sh);
-    assert!(copied.starts_with(b"ready\n") && copied.ends_with(b"12 50\n"), "{copied:?}");
+    // The interrupt key's echo ("^C") is terminal output too: converged
+    // capture carries the slave's echo back, exactly as shown on screen.
+    // Exactly one resize report also locks the relay's no-spam rule: an
+    // unconditional WINCH per poll would re-trigger the trap with the old
+    // size ("24 80") and repeat the new one.
+    assert!(copied.starts_with(b"ready\n"), "{copied:?}");
+    assert!(
+        !copied.windows(b"24 80".len()).any(|w| w == b"24 80"),
+        "spurious WINCH with the old size: {copied:?}"
+    );
+    let reports = copied
+        .windows(b"12 50\n".len())
+        .filter(|w| **w == *b"12 50\n")
+        .count();
+    assert_eq!(reports, 1, "expected one resize report: {copied:?}");
 }
 
 #[test]
@@ -4687,7 +4720,7 @@ fn bracketed_paste_exactly_at_limit_accepted() {
 #[test]
 fn interactive_final_typeahead_after_enter_survives_the_next_prompt() {
     let sh = PtyShell::spawn();
-    sh.send(b"echo first > first\recho second > second\recho $((12345+67890))\r");
+    sh.send(b"echo first > first | cat\recho second > second\recho $((12345+67890))\r");
     sh.wait_for("80235", 3000);
 
     assert!(sh.home_path().join("first").exists());

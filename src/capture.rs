@@ -1,19 +1,25 @@
 //! Output capture for the most recent command.
 //!
-//! While a command runs, the shell's stdout and stderr are replaced by the
-//! slave side of a pseudo-terminal so children keep seeing terminals. A relay
-//! thread copies everything written there to the real terminal as it arrives
-//! and keeps the tail in an [`OutputBuffer`]. The slave starts with the real
-//! terminal's modes except output processing, which stays on the real terminal
-//! so output is processed once. When a foreground child changes the slave's
-//! modes, the relay mirrors those modes onto the real terminal (keeping output
-//! processing on the slave) so a program's input settings also affect the
-//! terminal it reads from. Mirroring pauses while the shell owns the terminal,
-//! such as while a job is stopped.
+//! While a command runs, the shell's standard streams that point at its
+//! terminal are replaced by the slave side of a pseudo-terminal so children
+//! keep seeing terminals. A relay thread copies everything written there to
+//! the real terminal as it arrives and keeps the tail in an
+//! [`OutputBuffer`]. Only bytes written to the shell's terminal are captured.
 //!
-//! Only bytes written to the shell's terminal are captured. A redirection or
-//! pipe that takes a stream away from the terminal also takes it away from the
-//! capture, and a stderr that was never the terminal is left alone.
+//! A single simple command converges onto the slave: stdin, stdout, and
+//! stderr all point at the slave when they pointed at the real terminal, the
+//! slave starts as a copy of the real terminal's modes, and the foreground
+//! child takes the slave as its controlling terminal in a session of its own.
+//! The relay then forwards typed input to the slave as well, so keyboard
+//! readers work no matter which descriptor they open. The real terminal sits
+//! in raw mode while the command runs and is restored when the relay stops.
+//! Pipelines and lists keep the split design instead: only stdout and stderr
+//! move to the slave, stdin stays on the real terminal, and the relay mirrors
+//! the slave's mode changes that affect input back onto the real terminal.
+//!
+//! A redirection or pipe that takes a stream away from the terminal also takes
+//! it away from the capture, and a stderr that was never the terminal is left
+//! alone.
 
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -22,10 +28,16 @@ use rustix::io::Errno;
 use rustix::pty::{grantpt, ptsname, unlockpt};
 #[cfg(not(target_os = "macos"))]
 use rustix::pty::{OpenptFlags, openpt};
-use rustix::termios::{OptionalActions, Winsize, tcgetattr, tcgetpgrp, tcgetwinsize, tcsetattr, tcsetwinsize};
+use rustix::termios::{
+    OptionalActions, Termios, Winsize, tcgetattr, tcgetwinsize, tcsetattr, tcsetwinsize,
+};
 use rustix::time::Timespec;
 use std::collections::VecDeque;
 use std::io;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::JoinHandle;
 
 pub const OUTPUT_LIMIT: usize = 1 << 20;
@@ -139,9 +151,48 @@ struct Finished {
 pub struct Session {
     stop: OwnedFd,
     thread: Option<JoinHandle<Finished>>,
+    converged: bool,
+    paused: Arc<AtomicBool>,
+    slave_ctl: Option<OwnedFd>,
+    real_raw: Option<Termios>,
 }
 
 impl Session {
+    /// Whether the captured command owns the slave as its controlling
+    /// terminal, with stdin, stdout, and stderr converged onto it.
+    pub fn is_converged(&self) -> bool {
+        self.converged
+    }
+
+    /// Pause or resume forwarding typed input to the slave. The shell pauses
+    /// while a stopped job leaves the real terminal to the next prompt, so
+    /// prompt keystrokes are not forwarded into the suspended child.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
+
+    /// The slave's current modes. Only meaningful for converged commands,
+    /// whose child drives the slave directly.
+    pub fn slave_termios(&self) -> io::Result<Termios> {
+        let Some(slave) = self.slave_ctl.as_ref() else {
+            return Err(io::Error::other("no converged capture terminal"));
+        };
+        tcgetattr(slave).map_err(std::io::Error::from)
+    }
+
+    /// Restore the slave's modes, used when resuming a stopped converged job.
+    pub fn restore_slave_termios(&self, modes: &Termios) -> io::Result<()> {
+        let Some(slave) = self.slave_ctl.as_ref() else {
+            return Err(io::Error::other("no converged capture terminal"));
+        };
+        tcsetattr(slave, OptionalActions::Now, modes).map_err(std::io::Error::from)
+    }
+
+    /// The raw modes the real terminal uses while a converged command runs.
+    pub fn real_raw_termios(&self) -> Option<Termios> {
+        self.real_raw.clone()
+    }
+
     pub fn finish_into(mut self, last: &mut OutputBuffer) {
         match self.stop_and_join() {
             Some(finished) => {
@@ -160,7 +211,18 @@ impl Session {
     fn stop_and_join(&mut self) -> Option<Finished> {
         let thread = self.thread.take()?;
         let _ = rustix::io::write(&self.stop, &[0]);
-        thread.join().ok()
+        match thread.join() {
+            Ok(finished) => Some(finished),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "unknown panic payload".to_string());
+                eprintln!("ish: output relay thread panicked: {message}");
+                None
+            }
+        }
     }
 }
 
@@ -170,7 +232,7 @@ impl Drop for Session {
     }
 }
 
-/// The shell's stdout and stderr, redirected to the capture terminal until
+/// The shell's standard streams, redirected to the capture terminal until
 /// [`Capture::end`] or drop restores them.
 pub struct Capture {
     restore: Option<Restore>,
@@ -178,6 +240,7 @@ pub struct Capture {
 }
 
 struct Restore {
+    stdin: Option<OwnedFd>,
     stdout: OwnedFd,
     stderr: Option<OwnedFd>,
 }
@@ -186,6 +249,9 @@ impl Restore {
     fn apply(self) {
         use std::io::Write;
         let _ = io::stdout().flush();
+        if let Some(stdin) = &self.stdin {
+            let _ = rustix::stdio::dup2_stdin(stdin);
+        }
         let _ = rustix::stdio::dup2_stdout(&self.stdout);
         if let Some(stderr) = &self.stderr {
             let _ = rustix::stdio::dup2_stderr(stderr);
@@ -194,15 +260,20 @@ impl Restore {
 }
 
 impl Capture {
-    /// Redirect the shell's terminal output through a relay. Returns `None`
+    /// Redirect the shell's terminal streams through a relay. Returns `None`
     /// when stdout is not a terminal, since then nothing is shown to capture.
-    pub fn begin(buffer: OutputBuffer) -> io::Result<Option<Self>> {
+    /// When `converged` is set, stdin joins stdout and stderr on the slave,
+    /// which starts as a copy of the real terminal's modes; the foreground
+    /// child is expected to claim the slave as its controlling terminal.
+    pub fn begin(buffer: OutputBuffer, converged: bool) -> io::Result<Option<Self>> {
         let stdout = io::stdout();
         let terminal = stdout.as_fd();
         if !rustix::termios::isatty(terminal) {
             return Ok(None);
         }
+        let stdin = io::stdin();
         let stderr = io::stderr();
+        let captures_stdin = converged && shares_terminal(terminal, stdin.as_fd());
         let captures_stderr = shares_terminal(terminal, stderr.as_fd());
 
         let master = openpt_cloexec()?;
@@ -215,11 +286,15 @@ impl Capture {
             Mode::empty(),
         )?;
         let real_modes = tcgetattr(terminal)?;
-        let mut slave_modes = real_modes.clone();
-        slave_modes
-            .output_modes
-            .remove(rustix::termios::OutputModes::OPOST);
-        tcsetattr(&slave, OptionalActions::Now, &slave_modes)?;
+        if converged {
+            tcsetattr(&slave, OptionalActions::Now, &real_modes)?;
+        } else {
+            let mut slave_modes = real_modes.clone();
+            slave_modes
+                .output_modes
+                .remove(rustix::termios::OutputModes::OPOST);
+            tcsetattr(&slave, OptionalActions::Now, &slave_modes)?;
+        }
         let size = tcgetwinsize(terminal).ok();
         if let Some(size) = size {
             tcsetwinsize(&slave, size)?;
@@ -228,24 +303,67 @@ impl Capture {
 
         let relay_terminal = rustix::io::fcntl_dupfd_cloexec(terminal, 3)?;
         let slave_poll = rustix::io::fcntl_dupfd_cloexec(&slave, 3)?;
+        let slave_ctl = if converged {
+            Some(rustix::io::fcntl_dupfd_cloexec(&slave, 3)?)
+        } else {
+            None
+        };
+        let saved_stdin = if captures_stdin {
+            Some(rustix::io::fcntl_dupfd_cloexec(stdin.as_fd(), 3)?)
+        } else {
+            None
+        };
         let saved_stdout = rustix::io::fcntl_dupfd_cloexec(terminal, 3)?;
         let saved_stderr = if captures_stderr {
             Some(rustix::io::fcntl_dupfd_cloexec(stderr.as_fd(), 3)?)
         } else {
             None
         };
+        let real_raw = if converged {
+            let mut raw = real_modes.clone();
+            raw.make_raw();
+            tcsetattr(terminal, OptionalActions::Now, &raw)?;
+            Some(raw)
+        } else {
+            None
+        };
+        let restore_real = if converged { Some(real_modes) } else { None };
         #[cfg(target_os = "macos")]
         let (stop_read, stop_write) = crate::sys::pipe_cloexec_owned()?;
         #[cfg(not(target_os = "macos"))]
         let (stop_read, stop_write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+        let paused = Arc::new(AtomicBool::new(false));
+        let relay_paused = Arc::clone(&paused);
         let thread = std::thread::Builder::new()
             .name("ish-output-relay".into())
-            .spawn(move || relay(master, stop_read, relay_terminal, slave_poll, size, buffer))?;
-        let session = Session { stop: stop_write, thread: Some(thread) };
+            .spawn(move || {
+                relay(RelayArgs {
+                    master,
+                    stop: stop_read,
+                    terminal: relay_terminal,
+                    slave: slave_poll,
+                    applied_size: size,
+                    buffer,
+                    forward_input: converged,
+                    paused: relay_paused,
+                    restore_real,
+                })
+            })?;
+        let session = Session {
+            stop: stop_write,
+            thread: Some(thread),
+            converged,
+            paused,
+            slave_ctl,
+            real_raw,
+        };
 
         use std::io::Write;
         let _ = io::stdout().flush();
-        let restore = Restore { stdout: saved_stdout, stderr: saved_stderr };
+        let restore = Restore { stdin: saved_stdin, stdout: saved_stdout, stderr: saved_stderr };
+        if captures_stdin {
+            rustix::stdio::dup2_stdin(&slave)?;
+        }
         rustix::stdio::dup2_stdout(&slave)?;
         if captures_stderr
             && let Err(error) = rustix::stdio::dup2_stderr(&slave)
@@ -256,7 +374,7 @@ impl Capture {
         Ok(Some(Self { restore: Some(restore), session: Some(session) }))
     }
 
-    /// Give the shell its own stdout and stderr back.
+    /// Give the shell its own standard streams back.
     pub fn end(mut self) -> Session {
         if let Some(restore) = self.restore.take() {
             restore.apply();
@@ -299,23 +417,43 @@ fn shares_terminal(first: BorrowedFd<'_>, second: BorrowedFd<'_>) -> bool {
         }
 }
 
-fn relay(
+struct RelayArgs {
     master: OwnedFd,
     stop: OwnedFd,
     terminal: OwnedFd,
     slave: OwnedFd,
-    mut applied_size: Option<Winsize>,
+    applied_size: Option<Winsize>,
     buffer: OutputBuffer,
-) -> Finished {
+    forward_input: bool,
+    paused: Arc<AtomicBool>,
+    restore_real: Option<Termios>,
+}
+
+fn relay(args: RelayArgs) -> Finished {
+    let RelayArgs {
+        master,
+        stop,
+        terminal,
+        slave,
+        mut applied_size,
+        buffer,
+        forward_input,
+        paused,
+        restore_real,
+    } = args;
     let mut pump = Pump { master, terminal, buffer, error: None, open: true };
     let mut last_slave = tcgetattr(&slave).ok();
     let mut chunk = [0u8; RELAY_CHUNK];
     loop {
+        let forwarding = forward_input && pump.open && !paused.load(Ordering::Acquire);
+        // Index 0 is always the stop pipe; index 1 is the master while it is
+        // open; the real terminal is watched last when forwarding input.
         let mut fds = [
             PollFd::new(&stop, PollFlags::IN),
             PollFd::new(&pump.master, PollFlags::IN),
+            PollFd::new(&pump.terminal, PollFlags::IN),
         ];
-        let watched = if pump.open { 2 } else { 1 };
+        let watched = 1 + usize::from(pump.open) + usize::from(forwarding && pump.open);
         match poll(&mut fds[..watched], Some(&RESIZE_POLL)) {
             Ok(_) => {}
             Err(Errno::INTR) => continue,
@@ -325,8 +463,13 @@ fn relay(
             }
         }
         let stopping = !fds[0].revents().is_empty();
-        if pump.open {
+        let master_readable = pump.open && !fds[1].revents().is_empty();
+        let input_readable = forwarding && pump.open && !fds[watched - 1].revents().is_empty();
+        if master_readable {
             pump.drain(&mut chunk, usize::MAX);
+        }
+        if input_readable {
+            pump.forward(&mut chunk, &stop, &paused, &slave);
         }
         if stopping {
             if pump.open {
@@ -334,8 +477,27 @@ fn relay(
             }
             break;
         }
-        follow_resize(&pump.terminal, &pump.master, &mut applied_size);
-        mirror_modes(&slave, &pump.terminal, &mut last_slave);
+        if forward_input {
+            // A resize must reach the converged child through its own
+            // terminal, whose foreground group differs from the shell's.
+            // Signal only on an actual size change: the child redraws on
+            // every WINCH, and an unconditional signal would keep the master
+            // readable forever as each redraw wakes the relay again.
+            let before = applied_size;
+            follow_resize(&pump.terminal, &pump.master, &mut applied_size);
+            if applied_size != before
+                && let Some(foreground) = foreground_group(&pump.master)
+                && foreground != rustix::process::getpgrp()
+            {
+                let _ = rustix::process::kill_process_group(foreground, rustix::process::Signal::WINCH);
+            }
+        } else {
+            follow_resize(&pump.terminal, &pump.master, &mut applied_size);
+            mirror_modes(&slave, &pump.terminal, &mut last_slave);
+        }
+    }
+    if let Some(startup) = restore_real {
+        let _ = tcsetattr(&pump.terminal, OptionalActions::Now, &startup);
     }
     Finished { buffer: pump.buffer, relay_error: pump.error }
 }
@@ -375,6 +537,195 @@ impl Pump {
             }
         }
     }
+
+    /// Copy typed input from the real terminal to the capture terminal, where
+    /// the foreground child reads it. Leaves bytes in the real terminal when
+    /// the capture terminal is not draining them, so nothing is lost.
+    /// Suspend characters are consumed and delivered as SIGSTOP to the slave's
+    /// foreground group instead: the kernel discards terminal-generated stops
+    /// for orphaned process groups, and every converged child is orphaned.
+    /// SIGSTOP cannot be caught or discarded, so the stop always lands.
+    fn forward(&mut self, chunk: &mut [u8], stop: &OwnedFd, paused: &Arc<AtomicBool>, slave: &OwnedFd) {
+        let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
+        loop {
+            if paused.load(Ordering::Acquire) {
+                return;
+            }
+            let mut ready = [
+                PollFd::new(stop, PollFlags::IN),
+                PollFd::new(&self.master, PollFlags::OUT),
+                PollFd::new(&self.terminal, PollFlags::IN),
+            ];
+            if poll(&mut ready, Some(&zero)).is_err() {
+                return;
+            }
+            if !ready[0].revents().is_empty() || paused.load(Ordering::Acquire) {
+                return;
+            }
+            if ready[1].revents().is_empty() || ready[2].revents().is_empty() {
+                return;
+            }
+            match rustix::io::read(&self.terminal, &mut *chunk) {
+                Ok(0) => return,
+                Ok(read) => {
+                    if self.forward_chunk(&chunk[..read], stop, paused, slave) {
+                        return;
+                    }
+                }
+                Err(Errno::INTR) => {}
+                Err(_) => return,
+            }
+            if !self.open {
+                return;
+            }
+        }
+    }
+
+    /// Forward one input chunk, turning line-discipline signal characters
+    /// into signals the kernel would otherwise discard. The suspend
+    /// character becomes SIGSTOP for the slave's foreground group: the
+    /// kernel discards terminal-generated stops for orphaned process
+    /// groups, and every converged child is orphaned. Interrupt and quit
+    /// characters reach a converged child through the slave line
+    /// discipline, but an in-process builtin owns no foreground group, so
+    /// the relay signals the shell itself for those instead — mirroring
+    /// what split capture's real terminal would do. Returns true when
+    /// forwarding should stop.
+    fn forward_chunk(&mut self, chunk: &[u8], stop: &OwnedFd, paused: &Arc<AtomicBool>, slave: &OwnedFd) -> bool {
+        let suspend = suspend_key(slave, &self.master);
+        let interrupt = interrupt_keys(slave, &self.master);
+        let mut rest = chunk;
+        loop {
+            let at = earliest_signal(rest, suspend, interrupt);
+            let Some((found, action)) = at else {
+                return write_master(&self.master, rest, stop, paused);
+            };
+            if !rest[..found].is_empty() && write_master(&self.master, &rest[..found], stop, paused) {
+                return true;
+            }
+            match action {
+                SignalAction::Stop(foreground) => {
+                    let _ = rustix::process::kill_process_group(foreground, rustix::process::Signal::STOP);
+                }
+                SignalAction::Interrupt(signal) => {
+                    let _ = rustix::process::kill_process_group(rustix::process::getpgrp(), signal);
+                }
+            }
+            rest = &rest[found + 1..];
+        }
+    }
+}
+
+/// What to do when a signal character is found in forwarded input.
+#[derive(Clone, Copy)]
+enum SignalAction {
+    Stop(rustix::process::Pid),
+    Interrupt(rustix::process::Signal),
+}
+
+/// The earliest signal character in `rest` and what it should do.
+fn earliest_signal(
+    rest: &[u8],
+    suspend: Option<(u8, rustix::process::Pid)>,
+    interrupt: Option<(u8, u8)>,
+) -> Option<(usize, SignalAction)> {
+    let mut best: Option<(usize, SignalAction)> = None;
+    if let Some((key, foreground)) = suspend
+        && let Some(at) = rest.iter().position(|&byte| byte == key)
+    {
+        best = Some((at, SignalAction::Stop(foreground)));
+    }
+    if let Some((intr, quit)) = interrupt {
+        for (key, signal) in [
+            (intr, rustix::process::Signal::INT),
+            (quit, rustix::process::Signal::QUIT),
+        ] {
+            if key == 0xff {
+                continue;
+            }
+            if let Some(at) = rest.iter().position(|&byte| byte == key)
+                && best.is_none_or(|(found, _)| at < found)
+            {
+                best = Some((at, SignalAction::Interrupt(signal)));
+            }
+        }
+    }
+    best
+}
+
+/// The slave's suspend key and foreground group, when the line discipline
+/// would turn that key into SIGTSTP itself. Converged children live in a
+/// session of their own, so the kernel discards terminal-generated stops
+/// for them as orphaned; the relay delivers SIGSTOP directly instead, which
+/// the kernel never discards for orphaned groups.
+/// The foreground group is read through the master: macOS rejects the query
+/// on the slave side.
+fn suspend_key(slave: &OwnedFd, master: &OwnedFd) -> Option<(u8, rustix::process::Pid)> {
+    let modes = tcgetattr(slave).ok()?;
+    if !modes.local_modes.contains(rustix::termios::LocalModes::ISIG) {
+        return None;
+    }
+    let key = modes.special_codes[rustix::termios::SpecialCodeIndex::VSUSP];
+    if key == 0xff {
+        return None;
+    }
+    let foreground = foreground_group(master)?;
+    if foreground == rustix::process::getpgrp() {
+        return None;
+    }
+    Some((key, foreground))
+}
+
+/// Interrupt and quit keys that should signal the shell itself. When a
+/// converged child owns the slave, its line discipline turns these keys
+/// into signals, so the relay just forwards the bytes. An in-process
+/// builtin owns no foreground group, so the relay delivers SIGINT/SIGQUIT
+/// to the shell's group instead — mirroring what split capture's real
+/// terminal would do. Suspend has no fallback: stopping mid-copy is
+/// refused by design, and the byte stays queued.
+fn interrupt_keys(slave: &OwnedFd, master: &OwnedFd) -> Option<(u8, u8)> {
+    let modes = tcgetattr(slave).ok()?;
+    if !modes.local_modes.contains(rustix::termios::LocalModes::ISIG) {
+        return None;
+    }
+    if foreground_group(master).is_some_and(|foreground| foreground != rustix::process::getpgrp()) {
+        return None;
+    }
+    Some((
+        modes.special_codes[rustix::termios::SpecialCodeIndex::VINTR],
+        modes.special_codes[rustix::termios::SpecialCodeIndex::VQUIT],
+    ))
+}
+
+/// Write input bytes to the capture master. Returns true when the caller
+/// should stop forwarding: the session is stopping or paused, or the child
+/// stopped draining its input.
+fn write_master(master: &OwnedFd, mut bytes: &[u8], stop: &OwnedFd, paused: &Arc<AtomicBool>) -> bool {
+    while !bytes.is_empty() {
+        if paused.load(Ordering::Acquire) {
+            return true;
+        }
+        match rustix::io::write(master, bytes) {
+            Ok(written) => bytes = &bytes[written..],
+            Err(Errno::INTR) => {}
+            Err(Errno::AGAIN) => {
+                let mut fds = [PollFd::new(stop, PollFlags::IN), PollFd::new(master, PollFlags::OUT)];
+                match poll(&mut fds, Some(&RESIZE_POLL)) {
+                    Ok(_) => {
+                        if !fds[0].revents().is_empty() || paused.load(Ordering::Acquire) {
+                            return true;
+                        }
+                        if fds[1].revents().is_empty() {
+                            return true;
+                        }
+                    }
+                    Err(_) => return true,
+                }
+            }
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 fn write_terminal(terminal: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
@@ -406,15 +757,28 @@ fn follow_resize(terminal: &OwnedFd, master: &OwnedFd, applied: &mut Option<Wins
         return;
     }
     *applied = Some(current);
-    if let Ok(foreground) = tcgetpgrp(terminal)
+    if let Some(foreground) = foreground_group(terminal)
         && foreground != rustix::process::getpgrp()
     {
         let _ = rustix::process::kill_process_group(foreground, rustix::process::Signal::WINCH);
     }
 }
 
+/// The terminal's foreground process group, if it has one. A fresh capture
+/// terminal has none until the child claims it, and the kernel reports that
+/// as pgid 0 rather than an error; rustix turns that into a failed assertion,
+/// so read it with libc directly.
+fn foreground_group(terminal: &OwnedFd) -> Option<rustix::process::Pid> {
+    use std::os::fd::AsRawFd;
+    let pgid = unsafe { libc::tcgetpgrp(terminal.as_raw_fd()) };
+    if pgid <= 0 {
+        return None;
+    }
+    rustix::process::Pid::from_raw(pgid)
+}
+
 fn mirror_modes(slave: &OwnedFd, terminal: &OwnedFd, last_slave: &mut Option<rustix::termios::Termios>) {
-    let Ok(foreground) = tcgetpgrp(terminal) else {
+    let Some(foreground) = foreground_group(terminal) else {
         return;
     };
     if foreground == rustix::process::getpgrp() {

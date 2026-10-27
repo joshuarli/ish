@@ -13,7 +13,26 @@ pub fn resume_job(epsh: &mut epsh::eval::Shell, slot: &mut Option<Job>, last_out
         return 1;
     };
     eprintln!("ish: resuming: {}", job.cmd);
-    if let Err(error) = rustix::termios::tcsetattr(crate::term::stdin(), rustix::termios::OptionalActions::Drain, &job.termios) {
+    let converged = job.capture.as_ref().is_some_and(|capture| capture.is_converged());
+    if converged {
+        let Some(capture) = job.capture.as_ref() else {
+            eprintln!("ish: fg: no suspended job");
+            return 1;
+        };
+        if let Some(raw) = capture.real_raw_termios()
+            && let Err(error) = rustix::termios::tcsetattr(crate::term::stdin(), rustix::termios::OptionalActions::Drain, &raw)
+        {
+            eprintln!("ish: fg: cannot restore terminal attributes: {error}");
+            *slot = Some(job);
+            return 1;
+        }
+        if let Err(error) = capture.restore_slave_termios(&job.termios) {
+            eprintln!("ish: fg: cannot restore terminal attributes: {error}");
+            *slot = Some(job);
+            return 1;
+        }
+        capture.set_paused(false);
+    } else if let Err(error) = rustix::termios::tcsetattr(crate::term::stdin(), rustix::termios::OptionalActions::Drain, &job.termios) {
         eprintln!("ish: fg: cannot restore terminal attributes: {error}");
         *slot = Some(job);
         return 1;
@@ -21,7 +40,11 @@ pub fn resume_job(epsh: &mut epsh::eval::Shell, slot: &mut Option<Job>, last_out
     let result = epsh.resume_foreground(&mut job.handle);
     match result {
         Ok(None) => {
-            match crate::term::save_termios() {
+            let saved = match job.capture.as_ref() {
+                Some(capture) if capture.is_converged() => capture.slave_termios(),
+                _ => crate::term::save_termios(),
+            };
+            match saved {
                 Ok(termios) => job.termios = termios,
                 Err(error) => {
                     eprintln!("ish: fg: cannot save terminal attributes: {error}");
@@ -29,6 +52,9 @@ pub fn resume_job(epsh: &mut epsh::eval::Shell, slot: &mut Option<Job>, last_out
                     crate::term::restore_startup_termios();
                     return WAIT_FAILURE_STATUS;
                 }
+            }
+            if let Some(capture) = job.capture.as_ref() {
+                capture.set_paused(true);
             }
             *slot = Some(job);
             crate::term::restore_startup_termios();

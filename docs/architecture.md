@@ -67,41 +67,62 @@ the single suspended-job slot, terminal modes, and terminal output capture.
 
 [`capture.rs`](../src/capture.rs) saves the last command's terminal output for
 `?`. Around every accepted line except `?`, `fg`, and `exit`, `Capture::begin`
-replaces the shell's own fds 1 and 2 with the slave side of a new
-pseudo-terminal. Replacing fds in the shell process covers builtins, epsh
-pipeline stages, and external children without touching the spawn path.
+replaces the shell's own terminal-bound standard streams with the slave side
+of a new pseudo-terminal. Replacing fds in the shell process covers builtins,
+epsh pipeline stages, and external children without touching the spawn path.
 Redirections inherit the substitution, so only bytes that would have reached the
-terminal are saved. fd 2 is replaced only when it names the same terminal as fd 1.
+terminal are saved. Each of fds 0, 1, and 2 is replaced only when it names the
+same terminal as fd 1 was.
 
-The slave starts with the real terminal's modes except output processing is
-disabled, so the real terminal still applies output processing once. Stdin
-stays on the real terminal, which keeps process groups, job control, and the
-controlling terminal as they were. When a foreground child changes the slave's
-modes, the relay mirrors those modes onto the real terminal with output
-processing still disabled there, so the child's input settings also affect the
-terminal it reads from. Mirroring pauses while the shell owns the terminal,
-such as while a job is stopped. A relay thread reads the master, writes each
-chunk to a duplicate of the real terminal, and appends it to a bounded
-`OutputBuffer`. It polls every 200 ms for window size changes, applies them to
-the master, and sends `SIGWINCH` to the terminal's foreground group when that
-group is not ish. The relay uses raw fds only, so epsh forks never need a lock
-it holds.
+A single simple command converges onto the slave: stdin joins stdout and
+stderr there, the slave starts as a copy of the real terminal's modes, and the
+foreground child takes the slave as its controlling terminal in a session of
+its own. Every descriptor the child can open for keyboard input, including
+`/dev/tty`, resolves to the same terminal, so interactive programs work as
+they do under other shells. While such a command runs, the real terminal sits
+in raw mode and a relay thread copies output from the master to the real
+terminal, appending it to a bounded `OutputBuffer`, and forwards typed input
+from the real terminal to the master. It polls every 200 ms for window size
+changes and applies them to the slave, signalling `SIGWINCH` to the slave's
+foreground group only when the size actually changed: an unconditional signal
+would make a fullscreen child redraw on every poll, and each redraw would wake
+the relay again. Output is processed once, by the slave's line discipline;
+the raw real terminal passes those bytes through unchanged.
 
-`Capture::end` flushes Rust's stdout and restores fds 1 and 2; the caller then
-finishes the `Session`, which stops the relay, drains the master, and returns
-the buffer. A command that stops keeps its `Session` in the `Job`, because the
-job still holds the slave. `fg` finishes it when the job ends. The buffer moves
-into the relay thread and back, so its allocation is reused across commands
-without sharing.
+Keyboard signals need relay help because a converged child is orphaned (its
+session has no link to the shell's), and the kernel discards
+terminal-generated stops for orphaned groups on macOS. The relay consumes the
+slave's suspend character and sends `SIGSTOP` — never `SIGTSTP`, which would
+be discarded — to the slave's foreground group. Interrupt and quit characters
+reach a converged child through the slave line discipline, but an in-process
+builtin owns no foreground group, so for those the relay signals the shell's
+own group instead, mirroring what split capture's real terminal would do;
+suspend stays ignored there. The foreground group is read through the master
+with raw libc: macOS rejects the query on the slave side, and a fresh slave
+reports pgid 0 (rustix turns that into a failed assertion, so 0 means none).
+Spawning a converged child also clears epsh's cached terminal descriptor,
+which would otherwise point at the previous command's dead slave, and shell
+diagnostics fall back to `/dev/tty` when stderr itself points at such a dead
+capture terminal.
 
-Some programs read the output terminal itself for keyboard input instead of
-stdin, so splitting stdin from stdout starves them: the relay never forwards
-typed input to the slave. [`dispatch::needs_direct_terminal`](../src/dispatch.rs)
-recognizes those programs by name through `command` chains and bare launcher
-prefixes, across pipeline stages and command substitutions. A matching program
-runs with the real terminal on every descriptor and leaves no capture, so `?`
-afterwards reports that the last command wrote no text. The match overapproximates
-redirections and wrappers rather than risk a wedged shell.
+Pipelines and lists keep the split capture: only stdout and stderr move to the
+slave, stdin stays on the real terminal, and the relay mirrors the slave's
+mode changes that affect input back onto the real terminal with output
+processing still disabled there. Mirroring pauses while the shell owns the
+terminal, such as while a job is stopped. The split keeps job control and the
+controlling terminal untouched, which pipelines need because their stages
+cannot share one controlling terminal. It cannot serve programs that read the
+output terminal for keyboard input; those hang under the split, so prefer a
+single command for fullscreen programs.
+
+`Capture::end` flushes Rust's stdout and restores the replaced fds; the caller
+then finishes the `Session`, which stops the relay, drains the master, and
+returns the buffer. The relay restores the real terminal's startup modes as it
+exits. A command that stops keeps its `Session` in the `Job`, because the job
+still holds the slave; the relay pauses input forwarding until `fg` resumes
+the job, so prompt keystrokes are not forwarded into the suspended child. `fg`
+finishes the session when the job ends. The buffer moves into the relay thread
+and back, so its allocation is reused across commands without sharing.
 
 ## Filesystem operation boundaries
 

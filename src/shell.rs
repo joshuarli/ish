@@ -187,7 +187,7 @@ pub(super) fn run(cli: crate::Args) {
                     dispatch::Plan::Builtin { name, args } => {
                         let quit = if builtin::replaces_last_output(name) {
                             let buffer = std::mem::take(&mut shell.last_output);
-                            let (quit, session) = capture_output(buffer, || {
+                            let (quit, session) = capture_output(buffer, false, || {
                                 run_shell_builtin(name, &args, &expanded, &mut shell)
                             });
                             if let Some(session) = session {
@@ -219,26 +219,19 @@ pub(super) fn run(cli: crate::Args) {
 
                 let buffer = std::mem::take(&mut shell.last_output);
                 let occupied = shell.job.is_some();
-                let direct = dispatch::needs_direct_terminal(&program);
-                let (outcome, mut session) = if direct {
-                    drop(buffer);
+                let converged = dispatch::is_single_simple_command(&program);
+                if converged {
+                    shell.epsh.set_foreground_ctty(true);
+                }
+                let (outcome, mut session) = capture_output(buffer, converged, || {
                     let outcome = shell.epsh.run_program_outcome(&program);
-                    let outcome = if occupied {
-                        continue_occupied_foreground(&mut shell.epsh, outcome)
+                    if occupied {
+                        continue_occupied_foreground(&mut shell.epsh, converged, outcome)
                     } else {
                         outcome
-                    };
-                    (outcome, None)
-                } else {
-                    capture_output(buffer, || {
-                        let outcome = shell.epsh.run_program_outcome(&program);
-                        if occupied {
-                            continue_occupied_foreground(&mut shell.epsh, outcome)
-                        } else {
-                            outcome
-                        }
-                    })
-                };
+                    }
+                });
+                shell.epsh.set_foreground_ctty(false);
                 shell.last_status = match &outcome {
                     epsh::eval::ProgramOutcome::Completed(status) => status.code(),
                     epsh::eval::ProgramOutcome::Stopped(_) => 148,
@@ -252,9 +245,16 @@ pub(super) fn run(cli: crate::Args) {
                 }
 
                 if let epsh::eval::ProgramOutcome::Stopped(handle) = outcome {
-                    match term::save_termios() {
+                    let saved_modes = match session.as_ref() {
+                        Some(session) if session.is_converged() => session.slave_termios(),
+                        _ => term::save_termios(),
+                    };
+                    match saved_modes {
                         Ok(termios) => {
                             eprintln!("ish: stopped: {} (pgid={})", expanded, handle.process_group());
+                            if let Some(session) = session.as_ref() {
+                                session.set_paused(true);
+                            }
                             shell.job = Some(Job { handle, cmd: expanded.to_string(), termios, capture: session.take() });
                         }
                         Err(error) => eprintln!("ish: cannot save stopped terminal attributes: {error}"),
@@ -287,10 +287,21 @@ pub(super) fn run(cli: crate::Args) {
     }
 }
 
-fn continue_occupied_foreground(epsh: &mut epsh::eval::Shell, outcome: epsh::eval::ProgramOutcome) -> epsh::eval::ProgramOutcome {
+fn continue_occupied_foreground(epsh: &mut epsh::eval::Shell, converged: bool, outcome: epsh::eval::ProgramOutcome) -> epsh::eval::ProgramOutcome {
     let epsh::eval::ProgramOutcome::Stopped(mut handle) = outcome else { return outcome; };
     eprintln!("ish: a job is already suspended; resume it with fg before suspending another");
     loop {
+        if converged {
+            match epsh.resume_foreground(&mut handle) {
+                Ok(None) => {}
+                Ok(Some(status)) => return epsh::eval::ProgramOutcome::Completed(status),
+                Err(error) => {
+                    eprintln!("ish: cannot continue foreground job: {error}");
+                    return epsh::eval::ProgramOutcome::Completed(epsh::error::ExitStatus::FAILURE);
+                }
+            }
+            continue;
+        }
         let termios = match term::save_termios() {
             Ok(termios) => termios,
             Err(error) => {
@@ -316,10 +327,11 @@ fn continue_occupied_foreground(epsh: &mut epsh::eval::Shell, outcome: epsh::eva
 
 fn capture_output<T>(
     mut buffer: capture::OutputBuffer,
+    converged: bool,
     run: impl FnOnce() -> T,
 ) -> (T, Option<capture::Session>) {
     buffer.clear();
-    match capture::Capture::begin(buffer) {
+    match capture::Capture::begin(buffer, converged) {
         Ok(Some(capture)) => {
             let result = run();
             (result, Some(capture.end()))

@@ -6,12 +6,27 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 pub use libc::{execve, fork};
 
-use rustix::fs::Mode;
+use rustix::fs::{Mode, OFlags};
 
 pub fn set_foreground_group(terminal_fd: RawFd, pgid: i32) -> std::io::Result<()> {
     // SAFETY: tcsetpgrp accepts a raw descriptor, including a standard input explicitly closed by shell redirection.
     if unsafe { libc::tcsetpgrp(terminal_fd, pgid) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
+
+/// Become a session leader with `terminal_fd` as the controlling terminal.
+/// For a forked foreground child that must own its terminal instead of
+/// sharing the shell's session. The parent must not touch process groups
+/// across the session boundary.
+pub fn claim_ctty(terminal_fd: RawFd) -> std::io::Result<()> {
+    rustix::process::setsid().map(|_| ()).map_err(std::io::Error::from)?;
+    // SAFETY: terminal_fd names an open terminal, and the caller is a session
+    // leader without a controlling terminal after setsid.
+    if unsafe { libc::ioctl(terminal_fd, libc::TIOCSCTTY as libc::c_ulong, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    set_foreground_group(terminal_fd, rustix::process::getpid().as_raw_pid())
+}
+
 
 pub fn pipe_owned() -> std::io::Result<(OwnedFd, OwnedFd)> {
     #[cfg(target_vendor = "apple")]
@@ -86,7 +101,24 @@ pub fn read(fd: RawFd, buf: *mut c_void, len: usize) -> isize {
 
 pub fn write(fd: RawFd, buf: &[u8]) {
     // SAFETY: callers pass descriptors that stay open for the duration of the call.
-    let _ = rustix::io::write(unsafe { BorrowedFd::borrow_raw(fd) }, buf);
+    if rustix::io::write(unsafe { BorrowedFd::borrow_raw(fd) }, buf).is_ok() {
+        return;
+    }
+    if fd != libc::STDERR_FILENO || buf.is_empty() {
+        return;
+    }
+    // Diagnostics must reach the user even when stderr points at a capture
+    // terminal whose session leader has died; macOS reports EIO for those
+    // writes. Fall back to the controlling terminal, which is always the
+    // shell's real terminal.
+    let Ok(terminal) = rustix::fs::open(
+        c"/dev/tty",
+        OFlags::WRONLY | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return;
+    };
+    let _ = rustix::io::write(&terminal, buf);
 }
 
 pub fn dup2_result(oldfd: RawFd, newfd: RawFd) -> std::io::Result<()> {

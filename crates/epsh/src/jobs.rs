@@ -51,6 +51,10 @@ pub struct ForegroundJob {
     pipefail: bool,
     inverted: bool,
     ownership_lost: bool,
+    /// The members own the terminal descriptor as their controlling terminal
+    /// in a session of their own. Terminal handoff and reclamation across
+    /// that boundary would fail, so the parent skips both.
+    pub(crate) converged: bool,
 }
 
 impl ForegroundJob {
@@ -152,6 +156,7 @@ impl Shell {
             owner_pid: std::process::id(), shell: self.job_owner.clone(), pgid,
             members: children.iter().map(|&pid| Member { pid, state: MemberState::Running, control: self.child_controls.remove(&pid) }).collect(),
             relays: Vec::new(), pipefail: self.opts.pipefail, inverted: false, ownership_lost: false,
+            converged: self.opts.foreground_ctty && !self.in_forked_child,
         };
         for &pid in children {
             if let Some(relay) = self.child_relays.remove(&pid) {
@@ -175,7 +180,8 @@ impl Shell {
     }
 
     fn wait_foreground_job(&mut self, job: &mut ForegroundJob) -> crate::error::Result<Option<ExitStatus>> {
-        if self.opts.interactive && !self.in_forked_child { self.foreground_terminal(job.pgid)?; }
+        let handoff = self.opts.interactive && !self.in_forked_child && !job.converged;
+        if handoff { self.foreground_terminal(job.pgid)?; }
         let result = self.observe_foreground_job(job);
         if let Err(error) = &result {
             if error.is_interrupted() {
@@ -188,7 +194,7 @@ impl Shell {
                 self.err_msg(&format!("epsh: cannot stop foreground group after wait failure: {stop_error}"));
             }
         }
-        if self.opts.interactive && !self.in_forked_child {
+        if self.opts.interactive && !self.in_forked_child && !job.converged {
             let reclaimed = self.foreground_terminal(rustix::process::getpgrp().as_raw_pid());
             match (&result, reclaimed) {
                 (Ok(_), Err(error)) => return Err(error),
@@ -323,9 +329,9 @@ impl Shell {
             job.finish_relays()?;
             return Err(ShellError::Io(std::io::Error::from_raw_os_error(libc::ECHILD)));
         }
-        if self.opts.interactive && !self.in_forked_child { self.foreground_terminal(job.pgid)?; }
+        if self.opts.interactive && !self.in_forked_child && !job.converged { self.foreground_terminal(job.pgid)?; }
         if let Err(error) = rustix::process::kill_process_group(rustix::process::Pid::from_raw(job.pgid).unwrap(), rustix::process::Signal::CONT) {
-            if self.opts.interactive && !self.in_forked_child { self.foreground_terminal(rustix::process::getpgrp().as_raw_pid())?; }
+            if self.opts.interactive && !self.in_forked_child && !job.converged { self.foreground_terminal(rustix::process::getpgrp().as_raw_pid())?; }
             return Err(ShellError::Io(error.into()));
         }
         for member in &mut job.members { if matches!(member.state, MemberState::Stopped) { member.state = MemberState::Running; } }
