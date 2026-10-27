@@ -73,14 +73,19 @@ pipeline stages, and external children without touching the spawn path.
 Redirections inherit the substitution, so only bytes that would have reached the
 terminal are saved. fd 2 is replaced only when it names the same terminal as fd 1.
 
-The slave is raw, with the terminal's size, so the real terminal still applies
-line-discipline output processing once. Stdin and the controlling terminal are
-unchanged, which keeps process groups, job control, and input as they were.
-A relay thread reads the master, writes each chunk to a duplicate of the real
-terminal, and appends it to a bounded `OutputBuffer`. It polls every 200 ms for
-window size changes, applies them to the master, and sends `SIGWINCH` to the
-terminal's foreground group when that group is not ish. The relay uses raw fds
-only, so epsh forks never need a lock it holds.
+The slave starts with the real terminal's modes except output processing is
+disabled, so the real terminal still applies output processing once. Stdin
+stays on the real terminal, which keeps process groups, job control, and the
+controlling terminal as they were. When a foreground child changes the slave's
+modes, the relay mirrors those modes onto the real terminal with output
+processing still disabled there, so the child's input settings also affect the
+terminal it reads from. Mirroring pauses while the shell owns the terminal,
+such as while a job is stopped. A relay thread reads the master, writes each
+chunk to a duplicate of the real terminal, and appends it to a bounded
+`OutputBuffer`. It polls every 200 ms for window size changes, applies them to
+the master, and sends `SIGWINCH` to the terminal's foreground group when that
+group is not ish. The relay uses raw fds only, so epsh forks never need a lock
+it holds.
 
 `Capture::end` flushes Rust's stdout and restores fds 1 and 2; the caller then
 finishes the `Session`, which stops the relay, drains the master, and returns

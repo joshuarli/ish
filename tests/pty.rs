@@ -4420,6 +4420,18 @@ fn question_mark_copies_terminal_output_of_pipelines_and_children() {
 }
 
 #[test]
+fn foreground_terminal_mode_changes_on_stdout_apply_to_stdin() {
+    let script = "#!/bin/sh\nstty -icanon -echo <&1\nprintf 'input-ready\\n'\nkey=$(dd bs=1 count=1 2>/dev/null)\nstty sane <&1\nprintf 'received:%s\\n' \"$key\"\n";
+    let sh = PtyShell::spawn_reading_clipboard(&[("bin/terminal-input", script)], 24, 80);
+    sh.type_str("./bin/terminal-input");
+    sh.enter();
+    sh.wait_for("input-ready", 3000);
+    sh.type_str("x");
+    sh.wait_for("received:x", 3000);
+    sh.wait_for_prompt_after_line_advance(3000);
+}
+
+#[test]
 fn question_mark_keeps_children_on_a_terminal_of_the_current_size() {
     let sh = PtyShell::spawn_reading_clipboard(&[], 10, 40);
     sh.run_command("sh -c 'test -t 1 && test -t 2 && stty size <&1'");

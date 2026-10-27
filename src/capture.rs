@@ -3,9 +3,13 @@
 //! While a command runs, the shell's stdout and stderr are replaced by the
 //! slave side of a pseudo-terminal so children keep seeing terminals. A relay
 //! thread copies everything written there to the real terminal as it arrives
-//! and keeps the tail in an [`OutputBuffer`]. Stdin and the controlling
-//! terminal stay with the real terminal, so job control and input are
-//! unchanged.
+//! and keeps the tail in an [`OutputBuffer`]. The slave starts with the real
+//! terminal's modes except output processing, which stays on the real terminal
+//! so output is processed once. When a foreground child changes the slave's
+//! modes, the relay mirrors those modes onto the real terminal (keeping output
+//! processing on the slave) so a program's input settings also affect the
+//! terminal it reads from. Mirroring pauses while the shell owns the terminal,
+//! such as while a job is stopped.
 //!
 //! Only bytes written to the shell's terminal are captured. A redirection or
 //! pipe that takes a stream away from the terminal also takes it away from the
@@ -210,9 +214,12 @@ impl Capture {
             OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        let mut modes = tcgetattr(&slave)?;
-        modes.make_raw();
-        tcsetattr(&slave, OptionalActions::Now, &modes)?;
+        let real_modes = tcgetattr(terminal)?;
+        let mut slave_modes = real_modes.clone();
+        slave_modes
+            .output_modes
+            .remove(rustix::termios::OutputModes::OPOST);
+        tcsetattr(&slave, OptionalActions::Now, &slave_modes)?;
         let size = tcgetwinsize(terminal).ok();
         if let Some(size) = size {
             tcsetwinsize(&slave, size)?;
@@ -220,6 +227,7 @@ impl Capture {
         fcntl_setfl(&master, OFlags::NONBLOCK)?;
 
         let relay_terminal = rustix::io::fcntl_dupfd_cloexec(terminal, 3)?;
+        let slave_poll = rustix::io::fcntl_dupfd_cloexec(&slave, 3)?;
         let saved_stdout = rustix::io::fcntl_dupfd_cloexec(terminal, 3)?;
         let saved_stderr = if captures_stderr {
             Some(rustix::io::fcntl_dupfd_cloexec(stderr.as_fd(), 3)?)
@@ -232,7 +240,7 @@ impl Capture {
         let (stop_read, stop_write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
         let thread = std::thread::Builder::new()
             .name("ish-output-relay".into())
-            .spawn(move || relay(master, stop_read, relay_terminal, size, buffer))?;
+            .spawn(move || relay(master, stop_read, relay_terminal, slave_poll, size, buffer))?;
         let session = Session { stop: stop_write, thread: Some(thread) };
 
         use std::io::Write;
@@ -295,10 +303,12 @@ fn relay(
     master: OwnedFd,
     stop: OwnedFd,
     terminal: OwnedFd,
+    slave: OwnedFd,
     mut applied_size: Option<Winsize>,
     buffer: OutputBuffer,
 ) -> Finished {
     let mut pump = Pump { master, terminal, buffer, error: None, open: true };
+    let mut last_slave = tcgetattr(&slave).ok();
     let mut chunk = [0u8; RELAY_CHUNK];
     loop {
         let mut fds = [
@@ -325,6 +335,7 @@ fn relay(
             break;
         }
         follow_resize(&pump.terminal, &pump.master, &mut applied_size);
+        mirror_modes(&slave, &pump.terminal, &mut last_slave);
     }
     Finished { buffer: pump.buffer, relay_error: pump.error }
 }
@@ -400,6 +411,55 @@ fn follow_resize(terminal: &OwnedFd, master: &OwnedFd, applied: &mut Option<Wins
     {
         let _ = rustix::process::kill_process_group(foreground, rustix::process::Signal::WINCH);
     }
+}
+
+fn mirror_modes(slave: &OwnedFd, terminal: &OwnedFd, last_slave: &mut Option<rustix::termios::Termios>) {
+    let Ok(foreground) = tcgetpgrp(terminal) else {
+        return;
+    };
+    if foreground == rustix::process::getpgrp() {
+        return;
+    }
+    let Ok(current) = tcgetattr(slave) else {
+        return;
+    };
+    if let Some(previous) = last_slave
+        && termios_same(&current, previous)
+    {
+        return;
+    }
+    let mut desired = current.clone();
+    desired
+        .output_modes
+        .remove(rustix::termios::OutputModes::OPOST);
+    let _ = tcsetattr(terminal, OptionalActions::Now, &desired);
+    *last_slave = Some(current);
+}
+
+fn termios_same(first: &rustix::termios::Termios, second: &rustix::termios::Termios) -> bool {
+    first.input_modes == second.input_modes
+        && first.output_modes == second.output_modes
+        && first.control_modes == second.control_modes
+        && first.local_modes == second.local_modes
+        && first.input_speed() == second.input_speed()
+        && first.output_speed() == second.output_speed()
+        && special_same(first, second)
+}
+
+fn special_same(first: &rustix::termios::Termios, second: &rustix::termios::Termios) -> bool {
+    use rustix::termios::SpecialCodeIndex as Index;
+    first.special_codes[Index::VMIN] == second.special_codes[Index::VMIN]
+        && first.special_codes[Index::VTIME] == second.special_codes[Index::VTIME]
+        && first.special_codes[Index::VINTR] == second.special_codes[Index::VINTR]
+        && first.special_codes[Index::VQUIT] == second.special_codes[Index::VQUIT]
+        && first.special_codes[Index::VERASE] == second.special_codes[Index::VERASE]
+        && first.special_codes[Index::VKILL] == second.special_codes[Index::VKILL]
+        && first.special_codes[Index::VEOF] == second.special_codes[Index::VEOF]
+        && first.special_codes[Index::VSTART] == second.special_codes[Index::VSTART]
+        && first.special_codes[Index::VSTOP] == second.special_codes[Index::VSTOP]
+        && first.special_codes[Index::VSUSP] == second.special_codes[Index::VSUSP]
+        && first.special_codes[Index::VEOL] == second.special_codes[Index::VEOL]
+        && first.special_codes[Index::VEOL2] == second.special_codes[Index::VEOL2]
 }
 
 #[cfg(test)]
