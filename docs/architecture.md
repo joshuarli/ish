@@ -94,6 +94,15 @@ job still holds the slave. `fg` finishes it when the job ends. The buffer moves
 into the relay thread and back, so its allocation is reused across commands
 without sharing.
 
+Some programs read the output terminal itself for keyboard input instead of
+stdin, so splitting stdin from stdout starves them: the relay never forwards
+typed input to the slave. [`dispatch::needs_direct_terminal`](../src/dispatch.rs)
+recognizes those programs by name through `command` chains and bare launcher
+prefixes, across pipeline stages and command substitutions. A matching program
+runs with the real terminal on every descriptor and leaves no capture, so `?`
+afterwards reports that the last command wrote no text. The match overapproximates
+redirections and wrappers rather than risk a wedged shell.
+
 ## Filesystem operation boundaries
 
 `src/fs_command.rs` parses ish's command options and adapts typed requests to

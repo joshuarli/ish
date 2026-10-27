@@ -219,10 +219,26 @@ pub(super) fn run(cli: crate::Args) {
 
                 let buffer = std::mem::take(&mut shell.last_output);
                 let occupied = shell.job.is_some();
-                let (outcome, mut session) = capture_output(buffer, || {
+                let direct = dispatch::needs_direct_terminal(&program);
+                let (outcome, mut session) = if direct {
+                    drop(buffer);
                     let outcome = shell.epsh.run_program_outcome(&program);
-                    if occupied { continue_occupied_foreground(&mut shell.epsh, outcome) } else { outcome }
-                });
+                    let outcome = if occupied {
+                        continue_occupied_foreground(&mut shell.epsh, outcome)
+                    } else {
+                        outcome
+                    };
+                    (outcome, None)
+                } else {
+                    capture_output(buffer, || {
+                        let outcome = shell.epsh.run_program_outcome(&program);
+                        if occupied {
+                            continue_occupied_foreground(&mut shell.epsh, outcome)
+                        } else {
+                            outcome
+                        }
+                    })
+                };
                 shell.last_status = match &outcome {
                     epsh::eval::ProgramOutcome::Completed(status) => status.code(),
                     epsh::eval::ProgramOutcome::Stopped(_) => 148,

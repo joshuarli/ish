@@ -4432,6 +4432,68 @@ fn foreground_terminal_mode_changes_on_stdout_apply_to_stdin() {
 }
 
 #[test]
+fn pager_quits_with_q_on_a_direct_terminal() {
+    let content = (0..200)
+        .map(|index| format!("line {index:03}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    for pager in ["less", "more"] {
+        let sh = PtyShell::spawn_reading_clipboard(&[("big.txt", content.as_str())], 24, 80);
+        sh.type_str(&format!("{pager} big.txt"));
+        sh.enter();
+        sh.wait_for("line 000", 3000);
+        sh.type_str("q");
+        sh.wait_for_prompt_after_line_advance(3000);
+        sh.type_str("?");
+        sh.enter();
+        let output = sh.wait_for("wrote no text", 3000);
+        assert!(clipboard_writes(&output).is_empty(), "{pager} left captured output: {output:?}");
+        let output = PtyShell::strip_ansi(&sh.run_command("echo alive"));
+        assert!(output.contains("alive"), "{pager} left the shell unusable: {output:?}");
+    }
+}
+
+#[test]
+fn git_log_pages_on_a_direct_terminal() {
+    let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
+        let content = (0..200)
+            .map(|index| format!("line {index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(home.join("big.txt"), content).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(home)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .status()
+                    .expect("git runs")
+                    .success()
+            );
+        };
+        run(&["init", "-q", "."]);
+        run(&["add", "."]);
+        run(&[
+            "-c", "user.email=test@example.com",
+            "-c", "user.name=test",
+            "commit", "-qm", "add big file",
+        ]);
+    });
+    sh.type_str("git log -p");
+    sh.enter();
+    sh.wait_for("line 000", 5000);
+    sh.type_str("q");
+    sh.wait_for_prompt_after_line_advance(5000);
+    let output = PtyShell::strip_ansi(&sh.run_command("echo alive"));
+    assert!(output.contains("alive"), "git log left the shell unusable: {output:?}");
+}
+
+#[test]
 fn question_mark_keeps_children_on_a_terminal_of_the_current_size() {
     let sh = PtyShell::spawn_reading_clipboard(&[], 10, 40);
     sh.run_command("sh -c 'test -t 1 && test -t 2 && stty size <&1'");

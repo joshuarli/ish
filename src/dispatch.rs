@@ -95,6 +95,107 @@ pub fn plan(line: &str) -> Result<Plan, Rejection> {
     Ok(Plan::Epsh(program))
 }
 
+/// Programs that address the output terminal for keyboard input. Output
+/// capture splits stdin from stdout, which starves them: the relay never
+/// forwards typed input to the capture terminal, so they wait forever.
+const DIRECT_TERMINAL_PROGRAMS: &[&str] = &["less", "more", "most", "pg", "git"];
+
+/// Whether any command in the program needs the real terminal directly.
+/// Matches basenames through `command` chains and bare `sudo`/`env`/`nice`
+/// launcher prefixes, including pipeline stages and command substitutions.
+/// Overmatches redirections and wrappers with flags rather than risk a hang.
+pub fn needs_direct_terminal(program: &Program) -> bool {
+    program.commands.iter().any(command_needs_direct_terminal)
+}
+
+fn command_needs_direct_terminal(command: &Command) -> bool {
+    match command {
+        Command::Simple { args, .. } => {
+            words_need_direct_terminal(args)
+                || args.iter().any(word_has_direct_terminal_subst)
+        }
+        Command::Pipeline { commands, .. } => {
+            commands.iter().any(command_needs_direct_terminal)
+        }
+        Command::And(left, right) | Command::Or(left, right) | Command::Sequence(left, right) => {
+            command_needs_direct_terminal(left) || command_needs_direct_terminal(right)
+        }
+        Command::Not(inner) => command_needs_direct_terminal(inner),
+        Command::Background { .. }
+        | Command::FuncDef { .. }
+        | Command::Subshell { .. }
+        | Command::BraceGroup { .. }
+        | Command::If { .. }
+        | Command::While { .. }
+        | Command::Until { .. }
+        | Command::For { .. }
+        | Command::Case { .. } => false,
+    }
+}
+
+fn words_need_direct_terminal(args: &[Word]) -> bool {
+    let prefix: Vec<_> = args.iter().map_while(static_text).collect();
+    let mut arguments = prefix.as_slice();
+    loop {
+        let Some(head) = arguments.first() else {
+            return false;
+        };
+        if head != "command" {
+            break;
+        }
+        match epsh::builtins::command_action(arguments) {
+            epsh::builtins::CommandAction::Execute(nested) => arguments = nested,
+            epsh::builtins::CommandAction::Empty
+            | epsh::builtins::CommandAction::Describe { .. } => return false,
+        }
+    }
+    head_is_direct_terminal(launcher_command(arguments))
+}
+
+fn launcher_command(mut arguments: &[String]) -> Option<&String> {
+    let head = arguments.first()?;
+    if !matches!(head.as_str(), "sudo" | "env" | "nice" | "nohup") {
+        return Some(head);
+    }
+    arguments = &arguments[1..];
+    if head == "env" {
+        while arguments
+            .first()
+            .is_some_and(|word| !word.starts_with('-') && word.contains('='))
+        {
+            arguments = &arguments[1..];
+        }
+    }
+    arguments.first()
+}
+
+fn head_is_direct_terminal(head: Option<&String>) -> bool {
+    let Some(head) = head else {
+        return false;
+    };
+    if head.starts_with('-') {
+        return false;
+    }
+    let basename = head.rsplit('/').next().unwrap_or(head);
+    DIRECT_TERMINAL_PROGRAMS.contains(&basename)
+}
+
+fn word_has_direct_terminal_subst(word: &Word) -> bool {
+    word.parts.iter().any(part_has_direct_terminal_subst)
+}
+
+fn part_has_direct_terminal_subst(part: &WordPart) -> bool {
+    match part {
+        WordPart::DoubleQuoted(inner) | WordPart::Arith(inner) => {
+            inner.iter().any(part_has_direct_terminal_subst)
+        }
+        WordPart::CmdSubst(command) | WordPart::Backtick(command) => {
+            command_needs_direct_terminal(command)
+        }
+        _ => false,
+    }
+}
+
 fn check_command(command: &Command) -> Result<(), Rejection> {
     match command {
         Command::Simple {
@@ -242,6 +343,13 @@ mod tests {
         }
     }
 
+    fn needs_terminal(line: &str) -> bool {
+        match plan(line).unwrap() {
+            Plan::Epsh(program) => needs_direct_terminal(&program),
+            Plan::Builtin { .. } => panic!("{line:?} planned as a builtin"),
+        }
+    }
+
     #[test]
     fn shell_builtin_alone_runs_in_the_shell_with_its_words() {
         match plan("z  foo  'a b'").unwrap() {
@@ -374,5 +482,49 @@ mod tests {
         assert!(matches!(rejection(&command_substitutions), Rejection::Syntax(_)));
         assert!(matches!(rejection(&arithmetic), Rejection::Syntax(_)));
         assert!(matches!(rejection("echo $(( ) )"), Rejection::Syntax(_)));
+    }
+
+    #[test]
+    fn direct_terminal_matches_pagers_and_their_spawners() {
+        for line in [
+            "less file",
+            "/usr/bin/less file",
+            "more file",
+            "most file",
+            "pg file",
+            "git log",
+            "git show",
+            "command git status",
+            "command -p less file",
+            "sudo less file",
+            "env PAGER=cat git log",
+            "nice less file",
+            "echo hi | less",
+            "less file | cat",
+            "git log && echo done",
+            "echo $(git log)",
+            "git log >file",
+        ] {
+            assert!(needs_terminal(line), "{line:?} should use the real terminal");
+        }
+    }
+
+    #[test]
+    fn direct_terminal_ignores_lookalikes_and_well_behaved_programs() {
+        for line in [
+            "echo less",
+            "lesson",
+            "lesser file",
+            "vim file",
+            "nano file",
+            "top",
+            "man ls",
+            "echo hi",
+            "command -v less",
+            "sudo -u root true",
+            "env",
+        ] {
+            assert!(!needs_terminal(line), "{line:?} should keep output capture");
+        }
     }
 }
