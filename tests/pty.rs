@@ -1296,9 +1296,16 @@ fn line_editing_ctrl_delete() {
     sh.enter();
     let out = sh.wait_for_prompt_after_line_advance(2000);
     let text = PtyShell::strip_ansi(&out);
+    let lines: Vec<&str> = text.lines().collect();
     assert!(
-        text.contains("\r\nalpha\r\n"),
-        "expected command output after ctrl-delete: {text:?}"
+        lines.iter().any(|line| line.trim() == "alpha"),
+        "expected standalone 'alpha' output line after ctrl-delete: {text:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| !line.contains("$ ") && line.contains("beta")),
+        "ctrl-delete should have removed 'beta' from command output: {text:?}"
     );
 }
 
