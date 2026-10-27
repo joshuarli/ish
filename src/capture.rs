@@ -539,8 +539,7 @@ impl Pump {
     }
 
     /// Copy typed input from the real terminal to the capture terminal, where
-    /// the foreground child reads it. Leaves bytes in the real terminal when
-    /// the capture terminal is not draining them, so nothing is lost.
+    /// the foreground child reads it.
     /// Suspend characters are consumed and delivered as SIGSTOP to the slave's
     /// foreground group instead: the kernel discards terminal-generated stops
     /// for orphaned process groups, and every converged child is orphaned.

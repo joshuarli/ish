@@ -1,5 +1,5 @@
 Prefix: ISH
-Next: 62
+Next: 64
 
 ## Accepted owner decisions
 
@@ -24,15 +24,15 @@ verification limits. Open implementation and acceptance work is listed below.
 
 ## Open implementation tickets
 
-### ISH-45 · P3 · Native macOS privileged ownership acceptance remains incomplete
+### ISH-62 · P2 · Converged capture drops input it has already read
 
-- **Status:** The accepted restrictive-umask boundary is implemented. Ordinary-user macOS workspace tests, `make test`, and strict workspace Clippy passed. Only privileged ownership acceptance remains.
-- **Area:** Tests
-- **Where:** `crates/ish-fs/tests/native_macos.rs` (`clone_declines_inherited_read_denial_before_creation`, `clone_declines_before_creation_when_owner_read_is_absent`, `private_directory_prepares_foreign_owned_staging_directory`), `docs/filesystem-testing.md`
-- **Problem:** The foreign-owner clone branches and staging case require native root access to change ownership and drop credentials. Noninteractive sudo still requires a password on this host, so ordinary-user passes do not establish those branches.
-- **Recommendation:** Run the two clone-decline cases as root and the ignored foreign-owned staging case using the commands in the filesystem testing guide. Close this ticket only after those native branches pass. The implementation and support-boundary decisions are settled.
-- **Fix with:** none
-- **Effort:** S (hours)
+- **Area:** Concurrency
+- **Where:** `src/capture.rs` (`Pump::forward`, `Pump::forward_chunk`, `write_master`)
+- **Problem:** The relay reads a chunk from the real terminal, then `write_master` returns without writing the remainder when the capture master stays unwritable for the 200 ms poll, the stop pipe is readable, forwarding is paused, or the write fails. `forward_chunk` treats that as "stop" and discards the remainder, including a later `VINTR` or `VQUIT` byte. The real terminal is in raw mode for a converged command, so a dropped interrupt is not delivered by the kernel either. A paste or type-ahead that fills the slave input queue can therefore lose the following Ctrl+C, and bytes read as a command exits never return to the next prompt. The old comment on `Pump::forward` claimed unread input stayed on the real terminal. That is true only before `read`. The control flow is in those functions. Runtime reproduction is unproven: `target/debug/ish` predates `src/capture.rs`, and a workspace build was not run.
+- **Recommendation:** Keep the unwritten tail and retry it on the next relay iteration while the session is live. Do not drop it on stop, pause, or a full queue. On session end, if the child has exited, give the tail to the editor as the next prompt's input. While a stopped job is paused, hold the tail for that job instead of inserting it into the prompt.
+- **Fix with:** lifecycle-concurrency
+- **Effort:** M (days)
+- **Design:** [docs/rfc/ISH-62-capture-input-tail.md](docs/rfc/ISH-62-capture-input-tail.md)
 
 ### ISH-60 · P3 · Journaled retirement makes large flat EXDEV moves take minutes
 
@@ -43,3 +43,22 @@ verification limits. Open implementation and acceptance work is listed below.
 - **Recommendation:** On a quiet host, collect five interleaved baseline/candidate 4,096-file samples with the same durable journal guarantees, readiness checks before and immediately after each sample, and full output/source-retirement verification. Reuse the retained correctness and resource evidence where applicable, and qualify the 1k and 16k observations separately. Integrate the candidate only if its measured benefit exceeds observed spread without weakening intent durability, source-version validation, recovery behavior, or destination receipts. Current result: `perf gate deferred: host busy`.
 - **Fix with:** make-it-fast
 - **Effort:** L (weeks)
+
+### ISH-45 · P3 · Native macOS privileged ownership acceptance remains incomplete
+
+- **Status:** The accepted restrictive-umask boundary is implemented. Ordinary-user macOS workspace tests, `make test`, and strict workspace Clippy passed. Only privileged ownership acceptance remains. Re-checked: `clone_declines_inherited_read_denial_before_creation` and `clone_declines_before_creation_when_owner_read_is_absent` still take the root branch only when `geteuid` is 0, and `private_directory_prepares_foreign_owned_staging_directory` is still ignored.
+- **Area:** Tests
+- **Where:** `crates/ish-fs/tests/native_macos.rs` (`clone_declines_inherited_read_denial_before_creation`, `clone_declines_before_creation_when_owner_read_is_absent`, `private_directory_prepares_foreign_owned_staging_directory`), `docs/filesystem-testing.md`
+- **Problem:** The foreign-owner clone branches and staging case require native root access to change ownership and drop credentials. Noninteractive sudo still requires a password on this host, so ordinary-user passes do not establish those branches.
+- **Recommendation:** Run the two clone-decline cases as root and the ignored foreign-owned staging case using the commands in the filesystem testing guide. Close this ticket only after those native branches pass. The implementation and support-boundary decisions are settled.
+- **Fix with:** none
+- **Effort:** S (hours)
+
+### ISH-63 · P3 · A negated simple command stays on split capture
+
+- **Area:** Concurrency
+- **Where:** `src/dispatch.rs` (`is_single_simple_command`), `crates/epsh/src/eval.rs` (`Command::Not`), `src/shell.rs` (converged capture arm)
+- **Problem:** Convergence is `matches!(program.commands, [Command::Simple { .. }])`. `! less` is `Command::Not` around one simple command, which epsh evaluates in this process and then inverts. It therefore keeps split capture: stdin stays on the real terminal, and a program that reads the output terminal for keyboard input waits forever. `less` is covered by `single_simple_commands_converge_onto_the_capture_terminal`; the negated form is not. Pipelines and lists are the split cases the rule is for.
+- **Recommendation:** Treat `Command::Not` of one simple command as converged, and add that line to the existing convergence test. Leave pipelines, lists, and other compounds on split capture.
+- **Fix with:** lifecycle-concurrency
+- **Effort:** S (hours)

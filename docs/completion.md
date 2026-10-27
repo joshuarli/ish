@@ -18,6 +18,6 @@ keep the warm path allocation-conscious.
 
 The implementation and ordering tests are in
 [`src/complete.rs`](../src/complete.rs). Input handling and the completion UI
-are in [`src/main.rs`](../src/main.rs) and [`src/render.rs`](../src/render.rs);
+are in [`src/editor.rs`](../src/editor.rs) and [`src/render.rs`](../src/render.rs);
 shell-level coverage is in [`tests/integration.rs`](../tests/integration.rs)
 and the [PTY tests](../tests/pty.rs).

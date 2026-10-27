@@ -1,7 +1,7 @@
 # ISH-8: Callback process boundary
 
-Status: accepted; implemented with Linux callback-boundary acceptance
-(2026-10-22); native macOS acceptance remains under ISH-45.
+Status: accepted; implemented. Linux and native macOS callback-boundary tests
+passed.
 
 ## Decision
 

@@ -225,15 +225,14 @@ before running leaves the saved output alone.
   the first newline in what remains, and `?` says so.
 - With nothing to copy, `?` prints a message and returns 1.
 
-While a command runs, its stdout and stderr are a pseudo-terminal that ish
-relays to your terminal, so programs still see terminals there. The relay
-follows window resizes within about 200 ms. A command that reads its size on
-the first `SIGWINCH` can see the old size, so the relay sends it a second
-`SIGWINCH` once the size is updated.
-That pseudo-terminal is not the command's controlling terminal: input, Ctrl+C,
-and Ctrl+Z still go through your terminal. Output the command writes to
-`/dev/tty` directly is not saved. A background process that outlives its command
-loses its output once ish stops relaying, because its writes then fail. If the
+While a command runs, stdout and stderr that would reach the terminal go
+through a pseudo-terminal that ish relays to your terminal. The relay applies
+a window resize within about 200 ms and signals `SIGWINCH` when the size
+changes. A single simple command uses that pseudo-terminal as its controlling
+terminal and receives what you type. Pipelines and lists do not, so a program
+in them that reads the output terminal for input waits forever. Further rules
+are in [Output capture](docs/architecture.md#output-capture). A process that
+outlives its command loses later output once relaying stops. If the
 pseudo-terminal cannot be created, ish reports it and runs the command without
 saving its output.
 

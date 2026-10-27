@@ -327,8 +327,8 @@ tracks implementation status and native verification limits:
 - [ISH-32](rfc/ISH-32-capture-and-retire.md): shared journaled quarantine and
   identity primitives, with conservative recovery rather than resumed deletion.
 
-The Linux release policy is implemented. Its native macOS panic probe remains
-tracked under [ISH-45](../TODO.md).
+The Linux release policy is implemented, including the native macOS panic
+diagnostic. Privileged macOS ownership acceptance remains [ISH-45](../TODO.md).
 
 ## Semantic verification
 

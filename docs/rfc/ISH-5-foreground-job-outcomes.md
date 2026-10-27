@@ -1,7 +1,7 @@
 # ISH-5: Foreground job outcomes
 
-Status: accepted; implemented with Linux acceptance (2026-10-22); native
-macOS acceptance remains under ISH-45.
+Status: accepted; implemented. Linux and native macOS PTY and process tests
+passed.
 
 ## Decision
 

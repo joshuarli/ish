@@ -2,7 +2,8 @@
 
 Status: accepted; Linux x86_64 implementation and acceptance passed (2026-10-22).
 ARM64 musl acceptance, including Btrfs FICLONE, passed in an OrbStack Linux VM
-(2026-10-23). Native macOS acceptance remains under ISH-45.
+(2026-10-23). Ordinary-user macOS checks passed; privileged ownership
+acceptance remains ISH-45.
 
 ## Decision
 

@@ -1,6 +1,6 @@
 # ISH-42: Release delivery and diagnostics
 
-Status: accepted; Linux implementation verified (2026-10-22); native macOS panic probe pending under ISH-45
+Status: accepted; Linux implementation verified (2026-10-22); native macOS panic probe passed (2026-10-23)
 
 ## Decision
 

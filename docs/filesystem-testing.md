@@ -76,8 +76,8 @@ foreign-owner row below.
 
 The completion branch extracts the shared identity and quarantine
 implementation into `fdu-posix`. Linux engine and fdu callers use it. ARM64
-musl acceptance subsequently passed in the Linux VM run below. Native macOS
-acceptance belongs to ISH-45.
+musl acceptance subsequently passed in the Linux VM run below. Privileged
+macOS ownership acceptance remains ISH-45.
 
 `cargo test -p fdu-posix -p fdu-delete --lib --test recovery --test quarantine`
 passed the shared journal tests (two unit tests, seven recovery tests, two
@@ -229,7 +229,7 @@ after their checks.
 
 These checks close ISH-32's remaining ARM64 musl acceptance. They establish
 process-crash recovery on the tested filesystems, not power-loss durability.
-macOS acceptance remains separately tracked under ISH-45.
+Privileged macOS ownership acceptance remains ISH-45.
 
 ## Native macOS ARM64 acceptance (2026-10-23)
 

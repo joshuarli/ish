@@ -18,6 +18,6 @@ by other running shells. Up and Down history navigation and autosuggestions use
 a session snapshot plus commands entered in the current session.
 
 The ranking implementation is in [`src/history.rs`](../src/history.rs); the
-interactive search UI is in [`src/main.rs`](../src/main.rs). Keep the ranking
+interactive search UI is in [`src/editor.rs`](../src/editor.rs). Keep the ranking
 and snapshot behavior covered by the focused history tests and the shell
 integration and [PTY tests](../tests/pty.rs) when changing it.
