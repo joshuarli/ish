@@ -95,7 +95,7 @@ bench-syscalls:
 
 install: release
 	@set -eu; \
-	  install_dir="$(HOME)/usr/bin"; \
+	  install_dir="$(HOME)/.local/bin"; \
 	  mkdir -p "$$install_dir"; \
 	  install -m 755 "target/$(TARGET)/dist/$(NAME)" "$$install_dir/$(NAME)"; \
 	  if test "$$(uname -s)" = Darwin; then codesign -fs - "$$install_dir/$(NAME)"; fi
@@ -104,7 +104,7 @@ install: release
 # Separate from install because it needs privilege and changes account state.
 install-login-shell: install
 	@set -eu; \
-	  install_dir="$(HOME)/usr/bin"; \
+	  install_dir="$(HOME)/.local/bin"; \
 	  shell_path="$$(cd "$$install_dir" && pwd -P)/$(NAME)"; \
 	  login_user="$$(id -un)"; \
 	  test -f /etc/shells || { echo '/etc/shells is required to register ish as a login shell' >&2; exit 1; }; \

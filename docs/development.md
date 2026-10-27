@@ -49,7 +49,7 @@ archive against that release's `SHA256SUMS`. A defective published prerelease
 and its tag must be withdrawn deliberately after inspection; release tags are
 not reassigned to different bytes. A fix receives a new release tag.
 
-`make install` installs the release binary in `~/usr/bin` and signs it on macOS.
+`make install` installs the release binary in `~/.local/bin` and signs it on macOS.
 `make install-login-shell` also edits `/etc/shells` and changes the account's
 login shell, using sudo or doas when needed. Run that target only when you
 intend to change account state.
