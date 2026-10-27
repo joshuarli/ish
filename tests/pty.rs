@@ -4335,18 +4335,51 @@ fn pipeline_suspend_and_resume_keeps_job_owned() {
 }
 
 fn stty_state(output: &str) -> String {
-    if let Some(start) = output.find("gfmt1:") {
-        return output[start..]
+    let raw = if let Some(start) = output.find("gfmt1:") {
+        output[start..]
             .split_whitespace()
             .next()
             .expect("stty state follows gfmt1 marker")
-            .to_string();
+            .to_string()
+    } else {
+        output
+            .split(|c: char| !(c.is_ascii_hexdigit() || c == ':'))
+            .find(|token| token.matches(':').count() >= 8)
+            .unwrap_or_else(|| panic!("no `stty -g` state in {output:?}"))
+            .to_string()
+    };
+    // FLUSHO and PENDIN are transient state, not terminal modes. Mask them
+    // so a pending retype does not fail a mode-restoration check.
+    const STATE_MASK: u32 = 0x0080_0000 | 0x2000_0000;
+    if let Some(pos) = raw.find("lflag=") {
+        let start = pos + "lflag=".len();
+        let end = raw[start..]
+            .find(':')
+            .map(|offset| start + offset)
+            .unwrap_or(raw.len());
+        if let Ok(flag) = u32::from_str_radix(&raw[start..end], 16) {
+            return format!("{}{:x}{}", &raw[..start], flag & !STATE_MASK, &raw[end..]);
+        }
+        return raw;
     }
-    output
-        .split(|c: char| !(c.is_ascii_hexdigit() || c == ':'))
-        .find(|token| token.matches(':').count() >= 8)
-        .unwrap_or_else(|| panic!("no `stty -g` state in {output:?}"))
-        .to_string()
+    let parts: Vec<&str> = raw.split(':').collect();
+    if parts.len() >= 4
+        && let Ok(flag) = u32::from_str_radix(parts[3], 16)
+    {
+        return parts
+            .iter()
+            .enumerate()
+            .map(|(index, part)| {
+                if index == 3 {
+                    format!("{:x}", flag & !STATE_MASK)
+                } else {
+                    (*part).to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(":");
+    }
+    raw
 }
 
 #[test]
