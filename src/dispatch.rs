@@ -100,7 +100,16 @@ pub fn plan(line: &str) -> Result<Plan, Rejection> {
 /// Pipelines and lists keep the split capture because their stages cannot
 /// share one controlling terminal.
 pub fn is_single_simple_command(program: &Program) -> bool {
-    matches!(program.commands.as_slice(), [Command::Simple { .. }])
+    match program.commands.as_slice() {
+        [Command::Simple { .. }] => true,
+        [Command::Not(inner)] => matches!(inner.as_ref(), Command::Simple { .. }),
+        [Command::Pipeline {
+            commands,
+            bang: true,
+            ..
+        }] => matches!(commands.as_slice(), [Command::Simple { .. }]),
+        _ => false,
+    }
 }
 
 fn check_command(command: &Command) -> Result<(), Rejection> {
@@ -402,6 +411,8 @@ mod tests {
             "echo hi",
             "echo $(git log)",
             "sh -c 'test -t 1'",
+            "! less file",
+            "! true",
         ] {
             assert!(is_converged(line), "{line:?} should converge");
         }
@@ -409,7 +420,13 @@ mod tests {
 
     #[test]
     fn lists_and_pipelines_keep_split_capture() {
-        for line in ["echo hi | less", "less file | cat", "git log && echo done", "! true"] {
+        for line in [
+            "echo hi | less",
+            "less file | cat",
+            "git log && echo done",
+            "! echo hi | cat",
+            "! echo hi && echo done",
+        ] {
             assert!(!is_converged(line), "{line:?} should keep split capture");
         }
     }
