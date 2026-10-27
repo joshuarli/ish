@@ -1,5 +1,6 @@
 use crate::signal;
 use crate::term::STDIN_FD;
+use std::collections::VecDeque;
 use std::os::fd::{BorrowedFd, RawFd};
 
 const PASTE_LIMIT: usize = 8192;
@@ -99,6 +100,7 @@ pub struct InputReader {
     buf: [u8; READ_BUF_SIZE],
     buf_pos: usize,
     buf_end: usize,
+    pending: VecDeque<u8>,
 }
 
 enum PollResult {
@@ -128,7 +130,14 @@ impl InputReader {
             buf: [0u8; READ_BUF_SIZE],
             buf_pos: 0,
             buf_end: 0,
+            pending: VecDeque::new(),
         }
+    }
+
+    /// Bytes to decode before the next read from the terminal. Used for input
+    /// the capture relay took and could not deliver before the child exited.
+    pub fn push_pending(&mut self, bytes: &[u8]) {
+        self.pending.extend(bytes);
     }
 
     pub fn in_paste(&self) -> bool {
@@ -154,7 +163,7 @@ impl InputReader {
 
     pub fn read_event(&mut self) -> InputEvent {
         loop {
-            while self.buf_pos < self.buf_end && !(self.in_paste && self.paste_limit_hit) {
+            while (self.buf_pos < self.buf_end || !self.pending.is_empty()) && !(self.in_paste && self.paste_limit_hit) {
                 if let Some(key) = self.decode_key() {
                     if self.in_paste {
                         self.accumulate_paste_key(key);
@@ -257,7 +266,7 @@ impl InputReader {
     }
 
     pub fn has_pending_input(&self) -> bool {
-        self.buf_pos < self.buf_end || self.poll_stdin(0)
+        self.buf_pos < self.buf_end || !self.pending.is_empty() || self.poll_stdin(0)
     }
 
     fn poll_stdin(&self, timeout_ms: i32) -> bool {
@@ -297,6 +306,9 @@ impl InputReader {
 
     fn read_byte(&mut self) -> Option<u8> {
         if self.buf_pos >= self.buf_end {
+            if let Some(byte) = self.pending.pop_front() {
+                return Some(byte);
+            }
             self.fill_buf()?;
         }
         let byte = self.buf[self.buf_pos];
@@ -305,6 +317,9 @@ impl InputReader {
     }
 
     fn read_byte_timeout(&mut self, timeout_ms: i32) -> Option<u8> {
+        if self.buf_pos < self.buf_end || !self.pending.is_empty() {
+            return self.read_byte();
+        }
         if self.poll_stdin(timeout_ms) {
             self.read_byte()
         } else {
@@ -312,11 +327,38 @@ impl InputReader {
         }
     }
 
+    fn shift_pending_into_buf(&mut self) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        if self.buf_pos < self.buf_end && self.buf_end >= self.buf.len() {
+            return false;
+        }
+        if self.buf_pos >= self.buf_end {
+            self.buf_pos = 0;
+            self.buf_end = 0;
+        }
+        let space = self.buf.len() - self.buf_end;
+        let mut copied = 0;
+        while copied < space {
+            let Some(byte) = self.pending.pop_front() else {
+                break;
+            };
+            self.buf[self.buf_end + copied] = byte;
+            copied += 1;
+        }
+        self.buf_end += copied;
+        copied > 0
+    }
+
     fn skip_paste_remainder(&mut self) -> SkipPasteResult {
         const PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
 
         loop {
             if self.buf_pos >= self.buf_end {
+                if self.shift_pending_into_buf() {
+                    continue;
+                }
                 match self.poll(100) {
                     PollResult::Stdin => {
                         if self.fill_buf().is_none() {
@@ -357,6 +399,9 @@ impl InputReader {
                                 return SkipPasteResult::Complete;
                             }
                             PollResult::Stdin => {}
+                        }
+                        if self.shift_pending_into_buf() {
+                            continue;
                         }
                         // SAFETY: `stdin_fd` is borrowed and remains open for this reader's lifetime.
                         let stdin = unsafe { BorrowedFd::borrow_raw(self.stdin_fd) };

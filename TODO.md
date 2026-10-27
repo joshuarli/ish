@@ -24,16 +24,6 @@ verification limits. Open implementation and acceptance work is listed below.
 
 ## Open implementation tickets
 
-### ISH-62 · P2 · Converged capture drops input it has already read
-
-- **Area:** Concurrency
-- **Where:** `src/capture.rs` (`Pump::forward`, `Pump::forward_chunk`, `write_master`)
-- **Problem:** The relay reads a chunk from the real terminal, then `write_master` returns without writing the remainder when the capture master stays unwritable for the 200 ms poll, the stop pipe is readable, forwarding is paused, or the write fails. `forward_chunk` treats that as "stop" and discards the remainder, including a later `VINTR` or `VQUIT` byte. The real terminal is in raw mode for a converged command, so a dropped interrupt is not delivered by the kernel either. A paste or type-ahead that fills the slave input queue can therefore lose the following Ctrl+C, and bytes read as a command exits never return to the next prompt. The old comment on `Pump::forward` claimed unread input stayed on the real terminal. That is true only before `read`. The control flow is in those functions. Runtime reproduction is unproven: `target/debug/ish` predates `src/capture.rs`, and a workspace build was not run.
-- **Recommendation:** Keep the unwritten tail and retry it on the next relay iteration while the session is live. Do not drop it on stop, pause, or a full queue. On session end, if the child has exited, give the tail to the editor as the next prompt's input. While a stopped job is paused, hold the tail for that job instead of inserting it into the prompt.
-- **Fix with:** lifecycle-concurrency
-- **Effort:** M (days)
-- **Design:** [docs/rfc/ISH-62-capture-input-tail.md](docs/rfc/ISH-62-capture-input-tail.md)
-
 ### ISH-60 · P3 · Journaled retirement makes large flat EXDEV moves take minutes
 
 - **Status:** Candidate parked at `e2f0f08` on `backlog-retirement-2026-10-23`; it is not integrated. Focused correctness, mount fixtures, and complete baseline/candidate 4k and 16k output verification passed. Timing proof is deferred because unrelated host builds overlapped samples.

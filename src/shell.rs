@@ -191,7 +191,8 @@ pub(super) fn run(cli: crate::Args) {
                                 run_shell_builtin(name, &args, &expanded, &mut shell)
                             });
                             if let Some(session) = session {
-                                session.finish_into(&mut shell.last_output);
+                                let tail = session.finish_into(&mut shell.last_output);
+                                give_terminal_tail(&mut shell.input_reader, tail);
                             }
                             quit
                         } else {
@@ -244,6 +245,7 @@ pub(super) fn run(cli: crate::Args) {
                     sync_cwd_change(&mut shell, &prev_cwd, new_cwd);
                 }
 
+                let child_exited = matches!(outcome, epsh::eval::ProgramOutcome::Completed(_));
                 if let epsh::eval::ProgramOutcome::Stopped(handle) = outcome {
                     let saved_modes = match session.as_ref() {
                         Some(session) if session.is_converged() => session.slave_termios(),
@@ -262,7 +264,10 @@ pub(super) fn run(cli: crate::Args) {
                 }
                 term::restore_startup_termios();
                 if let Some(session) = session {
-                    session.finish_into(&mut shell.last_output);
+                    let tail = session.finish_into(&mut shell.last_output);
+                    if child_exited {
+                        give_terminal_tail(&mut shell.input_reader, tail);
+                    }
                 }
 
                 shell.prompt_needs_line_start = true;
@@ -323,6 +328,14 @@ fn continue_occupied_foreground(epsh: &mut epsh::eval::Shell, converged: bool, o
             }
         }
     }
+}
+
+fn give_terminal_tail(reader: &mut Option<InputReader>, tail: Vec<u8>) {
+    if tail.is_empty() {
+        return;
+    }
+    let reader = reader.as_mut().expect("input reader is present when a command finishes");
+    reader.push_pending(&tail);
 }
 
 fn capture_output<T>(
@@ -471,7 +484,9 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
             shell.last_status = status;
         }
         ShellCommand::ResumeJob => {
-            shell.last_status = ish::job::resume_job(&mut shell.epsh, &mut shell.job, &mut shell.last_output);
+            let (status, tail) = ish::job::resume_job(&mut shell.epsh, &mut shell.job, &mut shell.last_output);
+            shell.last_status = status;
+            give_terminal_tail(&mut shell.input_reader, tail);
         }
         ShellCommand::Jump => {
             let args = expanded_args!();

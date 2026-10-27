@@ -120,8 +120,12 @@ then finishes the `Session`, which stops the relay, drains the master, and
 returns the buffer. The relay restores the real terminal's startup modes as it
 exits. A command that stops keeps its `Session` in the `Job`, because the job
 still holds the slave; the relay pauses input forwarding until `fg` resumes
-the job, so prompt keystrokes are not forwarded into the suspended child. `fg`
-finishes the session when the job ends. The buffer moves into the relay thread
+the job, so prompt keystrokes are not forwarded into the suspended child.
+Input the relay has already read stays queued until the master accepts it; a
+full queue, pause, or stop does not drop it. When the session ends because the
+child has exited, that tail is the next prompt's input. While the job is
+paused the tail stays with the session and is written after `fg` resumes
+forwarding. `fg` finishes the session when the job ends. The buffer moves into the relay thread
 and back, so its allocation is reused across commands without sharing.
 
 ## Filesystem operation boundaries

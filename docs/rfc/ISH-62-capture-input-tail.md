@@ -1,6 +1,6 @@
 # ISH-62: Capture input tail
 
-Status: draft
+Status: accepted; implemented.
 
 ## Summary
 
@@ -40,4 +40,4 @@ The recommendation is to delay further reads, keep output moving, and return the
 
 ## Decision
 
-Pending.
+Keep one unwritten input tail, bounded by the relay read chunk. While the session is live and not paused, retry that tail before reading more from the real terminal. A full slave queue, pause, or stop leaves the tail in place. A hard master-write error stops retrying and still keeps the tail. When the session ends because the child has exited, the tail is pending input for the next prompt. While a stopped job is paused, the tail stays with that session and is written after `fg` resumes forwarding. An output relay error is still reported and does not drop this input.

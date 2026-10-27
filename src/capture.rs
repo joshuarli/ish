@@ -11,8 +11,12 @@
 //! slave starts as a copy of the real terminal's modes, and the foreground
 //! child takes the slave as its controlling terminal in a session of its own.
 //! The relay then forwards typed input to the slave as well, so keyboard
-//! readers work no matter which descriptor they open. The real terminal sits
-//! in raw mode while the command runs and is restored when the relay stops.
+//! readers work no matter which descriptor they open. Bytes already read from
+//! the real terminal stay with the relay until the master accepts them. A full
+//! slave queue, pause, or stop does not drop them. When the session ends
+//! because the child has exited, that tail is pending input for the next
+//! prompt; a stopped job keeps it until forwarding resumes. The real terminal
+//! sits in raw mode while the command runs and is restored when the relay stops.
 //! Pipelines and lists keep the split design instead: only stdout and stderr
 //! move to the slave, stdin stays on the real terminal, and the relay mirrors
 //! the slave's mode changes that affect input back onto the real terminal.
@@ -143,6 +147,7 @@ fn strip_controls(bytes: impl Iterator<Item = u8>) -> Vec<u8> {
 struct Finished {
     buffer: OutputBuffer,
     relay_error: Option<io::Error>,
+    input_tail: Vec<u8>,
 }
 
 /// A running relay. [`Session::finish_into`] drains the pseudo-terminal and
@@ -193,17 +198,22 @@ impl Session {
         self.real_raw.clone()
     }
 
-    pub fn finish_into(mut self, last: &mut OutputBuffer) {
+    /// Stops the relay and stores captured output in `last`. Returns input
+    /// already read from the real terminal and not accepted by the master.
+    /// The caller passes that tail to the editor only when the child has exited.
+    pub fn finish_into(mut self, last: &mut OutputBuffer) -> Vec<u8> {
         match self.stop_and_join() {
             Some(finished) => {
                 if let Some(error) = finished.relay_error {
                     eprintln!("ish: output relay failed: {error}");
                 }
                 *last = finished.buffer;
+                finished.input_tail
             }
             None => {
                 eprintln!("ish: output relay thread panicked");
                 last.clear();
+                Vec::new()
             }
         }
     }
@@ -441,19 +451,33 @@ fn relay(args: RelayArgs) -> Finished {
         paused,
         restore_real,
     } = args;
-    let mut pump = Pump { master, terminal, buffer, error: None, open: true };
+    let mut pump = Pump {
+        master,
+        terminal,
+        buffer,
+        error: None,
+        open: true,
+        input_tail: Vec::new(),
+        input_blocked: false,
+    };
     let mut last_slave = tcgetattr(&slave).ok();
     let mut chunk = [0u8; RELAY_CHUNK];
     loop {
         let forwarding = forward_input && pump.open && !paused.load(Ordering::Acquire);
+        let flush_tail = forwarding && !pump.input_tail.is_empty() && !pump.input_blocked;
+        let watch_terminal = forwarding && pump.input_tail.is_empty();
         // Index 0 is always the stop pipe; index 1 is the master while it is
-        // open; the real terminal is watched last when forwarding input.
+        // open; the real terminal is watched last only when a new read is allowed.
+        let mut master_flags = PollFlags::IN;
+        if flush_tail {
+            master_flags |= PollFlags::OUT;
+        }
         let mut fds = [
             PollFd::new(&stop, PollFlags::IN),
-            PollFd::new(&pump.master, PollFlags::IN),
+            PollFd::new(&pump.master, master_flags),
             PollFd::new(&pump.terminal, PollFlags::IN),
         ];
-        let watched = 1 + usize::from(pump.open) + usize::from(forwarding && pump.open);
+        let watched = 1 + usize::from(pump.open) + usize::from(watch_terminal && pump.open);
         match poll(&mut fds[..watched], Some(&RESIZE_POLL)) {
             Ok(_) => {}
             Err(Errno::INTR) => continue,
@@ -463,19 +487,27 @@ fn relay(args: RelayArgs) -> Finished {
             }
         }
         let stopping = !fds[0].revents().is_empty();
-        let master_readable = pump.open && !fds[1].revents().is_empty();
-        let input_readable = forwarding && pump.open && !fds[watched - 1].revents().is_empty();
+        let master_events = if pump.open { fds[1].revents() } else { PollFlags::empty() };
+        let master_readable = master_events.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR);
+        let input_readable = watch_terminal && pump.open && !fds[watched - 1].revents().is_empty();
         if master_readable {
             pump.drain(&mut chunk, usize::MAX);
-        }
-        if input_readable {
-            pump.forward(&mut chunk, &stop, &paused, &slave);
         }
         if stopping {
             if pump.open {
                 pump.drain(&mut chunk, OUTPUT_LIMIT);
             }
             break;
+        }
+        if pump.open
+            && flush_tail
+            && !paused.load(Ordering::Acquire)
+            && master_events.intersects(PollFlags::OUT | PollFlags::ERR | PollFlags::HUP)
+        {
+            pump.drain_tail(&paused, &slave);
+        }
+        if input_readable {
+            pump.forward(&mut chunk, &stop, &paused, &slave);
         }
         if forward_input {
             // A resize must reach the converged child through its own
@@ -499,7 +531,7 @@ fn relay(args: RelayArgs) -> Finished {
     if let Some(startup) = restore_real {
         let _ = tcsetattr(&pump.terminal, OptionalActions::Now, &startup);
     }
-    Finished { buffer: pump.buffer, relay_error: pump.error }
+    Finished { buffer: pump.buffer, relay_error: pump.error, input_tail: pump.input_tail }
 }
 
 struct Pump {
@@ -508,6 +540,8 @@ struct Pump {
     buffer: OutputBuffer,
     error: Option<io::Error>,
     open: bool,
+    input_tail: Vec<u8>,
+    input_blocked: bool,
 }
 
 impl Pump {
@@ -547,7 +581,7 @@ impl Pump {
     fn forward(&mut self, chunk: &mut [u8], stop: &OwnedFd, paused: &Arc<AtomicBool>, slave: &OwnedFd) {
         let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
         loop {
-            if paused.load(Ordering::Acquire) {
+            if paused.load(Ordering::Acquire) || self.input_blocked {
                 return;
             }
             let mut ready = [
@@ -567,7 +601,8 @@ impl Pump {
             match rustix::io::read(&self.terminal, &mut *chunk) {
                 Ok(0) => return,
                 Ok(read) => {
-                    if self.forward_chunk(&chunk[..read], stop, paused, slave) {
+                    self.forward_chunk(&chunk[..read], paused, slave);
+                    if !self.input_tail.is_empty() || self.input_blocked {
                         return;
                     }
                 }
@@ -580,6 +615,14 @@ impl Pump {
         }
     }
 
+    fn drain_tail(&mut self, paused: &Arc<AtomicBool>, slave: &OwnedFd) {
+        if self.input_tail.is_empty() || self.input_blocked {
+            return;
+        }
+        let pending = std::mem::take(&mut self.input_tail);
+        self.forward_chunk(&pending, paused, slave);
+    }
+
     /// Forward one input chunk, turning line-discipline signal characters
     /// into signals the kernel would otherwise discard. The suspend
     /// character becomes SIGSTOP for the slave's foreground group: the
@@ -588,19 +631,30 @@ impl Pump {
     /// characters reach a converged child through the slave line
     /// discipline, but an in-process builtin owns no foreground group, so
     /// the relay signals the shell itself for those instead — mirroring
-    /// what split capture's real terminal would do. Returns true when
-    /// forwarding should stop.
-    fn forward_chunk(&mut self, chunk: &[u8], stop: &OwnedFd, paused: &Arc<AtomicBool>, slave: &OwnedFd) -> bool {
+    /// what split capture's real terminal would do. Bytes the master does
+    /// not accept stay in [`Pump::input_tail`].
+    fn forward_chunk(&mut self, chunk: &[u8], paused: &Arc<AtomicBool>, slave: &OwnedFd) {
         let suspend = suspend_key(slave, &self.master);
         let interrupt = interrupt_keys(slave, &self.master);
         let mut rest = chunk;
-        loop {
-            let at = earliest_signal(rest, suspend, interrupt);
-            let Some((found, action)) = at else {
-                return write_master(&self.master, rest, stop, paused);
+        while !rest.is_empty() {
+            if paused.load(Ordering::Acquire) {
+                self.input_tail.extend_from_slice(rest);
+                return;
+            }
+            let Some((found, action)) = earliest_signal(rest, suspend, interrupt) else {
+                self.keep_unwritten(rest, paused);
+                return;
             };
-            if !rest[..found].is_empty() && write_master(&self.master, &rest[..found], stop, paused) {
-                return true;
+            if found > 0 {
+                let outcome = write_master(&self.master, &rest[..found], paused);
+                if outcome.blocked {
+                    self.input_blocked = true;
+                }
+                if outcome.accepted < found || outcome.blocked {
+                    self.input_tail.extend_from_slice(&rest[outcome.accepted..]);
+                    return;
+                }
             }
             match action {
                 SignalAction::Stop(foreground) => {
@@ -611,6 +665,19 @@ impl Pump {
                 }
             }
             rest = &rest[found + 1..];
+        }
+    }
+
+    fn keep_unwritten(&mut self, bytes: &[u8], paused: &Arc<AtomicBool>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let outcome = write_master(&self.master, bytes, paused);
+        if outcome.blocked {
+            self.input_blocked = true;
+        }
+        if outcome.accepted < bytes.len() {
+            self.input_tail.extend_from_slice(&bytes[outcome.accepted..]);
         }
     }
 }
@@ -696,35 +763,30 @@ fn interrupt_keys(slave: &OwnedFd, master: &OwnedFd) -> Option<(u8, u8)> {
     ))
 }
 
-/// Write input bytes to the capture master. Returns true when the caller
-/// should stop forwarding: the session is stopping or paused, or the child
-/// stopped draining its input.
-fn write_master(master: &OwnedFd, mut bytes: &[u8], stop: &OwnedFd, paused: &Arc<AtomicBool>) -> bool {
-    while !bytes.is_empty() {
+struct MasterWrite {
+    accepted: usize,
+    blocked: bool,
+}
+
+/// Write input bytes to the capture master. `accepted` is how many bytes the
+/// master took. `blocked` means the rest cannot be retried; the caller still
+/// keeps those bytes. A short write or a pause leaves `blocked` clear so the
+/// next relay iteration retries the suffix.
+fn write_master(master: &OwnedFd, bytes: &[u8], paused: &Arc<AtomicBool>) -> MasterWrite {
+    let mut accepted = 0;
+    while accepted < bytes.len() {
         if paused.load(Ordering::Acquire) {
-            return true;
+            return MasterWrite { accepted, blocked: false };
         }
-        match rustix::io::write(master, bytes) {
-            Ok(written) => bytes = &bytes[written..],
+        match rustix::io::write(master, &bytes[accepted..]) {
+            Ok(0) => return MasterWrite { accepted, blocked: true },
+            Ok(written) => accepted += written,
             Err(Errno::INTR) => {}
-            Err(Errno::AGAIN) => {
-                let mut fds = [PollFd::new(stop, PollFlags::IN), PollFd::new(master, PollFlags::OUT)];
-                match poll(&mut fds, Some(&RESIZE_POLL)) {
-                    Ok(_) => {
-                        if !fds[0].revents().is_empty() || paused.load(Ordering::Acquire) {
-                            return true;
-                        }
-                        if fds[1].revents().is_empty() {
-                            return true;
-                        }
-                    }
-                    Err(_) => return true,
-                }
-            }
-            Err(_) => return true,
+            Err(Errno::AGAIN) => return MasterWrite { accepted, blocked: false },
+            Err(_) => return MasterWrite { accepted, blocked: true },
         }
     }
-    false
+    MasterWrite { accepted, blocked: false }
 }
 
 fn write_terminal(terminal: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
@@ -828,6 +890,9 @@ fn special_same(first: &rustix::termios::Termios, second: &rustix::termios::Term
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustix::fd::OwnedFd;
+    use rustix::io::Errno;
+    use std::sync::{Arc, atomic::AtomicBool};
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -892,5 +957,93 @@ mod tests {
         assert_eq!(buffer.plain_text(), b"38;5;1mred\nkept\n");
         buffer.truncated = true;
         assert_eq!(buffer.plain_text(), b"kept\n");
+    }
+
+    #[test]
+    fn short_master_write_keeps_the_suffix_including_interrupt() {
+        let (master_read, master_write) = rustix::pipe::pipe().expect("pipe");
+        rustix::fs::fcntl_setfl(&master_read, rustix::fs::OFlags::NONBLOCK).expect("nonblock read");
+        rustix::fs::fcntl_setfl(&master_write, rustix::fs::OFlags::NONBLOCK).expect("nonblock write");
+        let (slave_read, slave_write) = rustix::pipe::pipe().expect("slave pipe");
+        let capacity = write_until_full(&master_write);
+        let space = 64;
+        assert!(capacity > space);
+        let _ = read_exact(&master_read, space);
+        let mut payload = vec![b'a'; 800];
+        payload.push(0x03);
+        let paused = Arc::new(AtomicBool::new(false));
+        let mut pump = Pump {
+            master: master_write,
+            terminal: slave_write,
+            buffer: OutputBuffer::default(),
+            error: None,
+            open: true,
+            input_tail: Vec::new(),
+            input_blocked: false,
+        };
+        pump.forward_chunk(&payload, &paused, &slave_read);
+        assert!(!pump.input_blocked);
+        assert!(!pump.input_tail.is_empty(), "short write dropped its suffix");
+        assert_eq!(pump.input_tail.last().copied(), Some(0x03));
+        let prefix_len = payload.len() - pump.input_tail.len();
+        assert!(prefix_len > 0, "write accepted no prefix");
+        assert_eq!(pump.input_tail.as_slice(), &payload[prefix_len..]);
+        let suffix = pump.input_tail.clone();
+        let _filler = read_exact(&master_read, capacity - space);
+        let written_prefix = read_exact(&master_read, prefix_len);
+        assert_eq!(written_prefix, payload[..prefix_len]);
+        pump.drain_tail(&paused, &slave_read);
+        assert!(pump.input_tail.is_empty(), "suffix was not written on retry");
+        assert!(!pump.input_blocked);
+        let written_suffix = read_available(&master_read);
+        assert_eq!(written_suffix, suffix);
+        assert_eq!(written_suffix.last().copied(), Some(0x03));
+    }
+
+    fn write_until_full(fd: &OwnedFd) -> usize {
+        let filler = vec![0u8; 64 * 1024];
+        let mut total = 0;
+        loop {
+            match rustix::io::write(fd, &filler) {
+                Ok(0) => return total,
+                Ok(written) => total += written,
+                Err(Errno::INTR) => {}
+                Err(Errno::AGAIN) => return total,
+                Err(error) => panic!("fill pipe: {error}"),
+            }
+        }
+    }
+
+    fn read_exact(fd: &OwnedFd, mut needed: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(needed);
+        let mut buf = [0u8; 4096];
+        while needed > 0 {
+            let take = needed.min(buf.len());
+            match rustix::io::read(fd, &mut buf[..take]) {
+                Ok(0) => panic!("eof after {} of {needed} still needed", out.len()),
+                Ok(read) => {
+                    out.extend_from_slice(&buf[..read]);
+                    needed -= read;
+                }
+                Err(Errno::INTR) => {}
+                Err(error) => panic!("read: {error}"),
+            }
+        }
+        out
+    }
+
+    fn read_available(fd: &OwnedFd) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match rustix::io::read(fd, &mut buf) {
+                Ok(0) => break,
+                Ok(read) => out.extend_from_slice(&buf[..read]),
+                Err(Errno::INTR) => {}
+                Err(Errno::AGAIN) => break,
+                Err(error) => panic!("read: {error}"),
+            }
+        }
+        out
     }
 }
