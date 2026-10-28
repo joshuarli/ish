@@ -394,7 +394,7 @@ impl Capture {
 }
 
 #[cfg(target_os = "macos")]
-fn openpt_cloexec() -> io::Result<OwnedFd> {
+pub(crate) fn openpt_cloexec() -> io::Result<OwnedFd> {
     use std::os::fd::FromRawFd;
 
     // macOS posix_openpt supports O_CLOEXEC, which rustix omits from its Apple flags.
@@ -407,7 +407,7 @@ fn openpt_cloexec() -> io::Result<OwnedFd> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn openpt_cloexec() -> io::Result<OwnedFd> {
+pub(crate) fn openpt_cloexec() -> io::Result<OwnedFd> {
     openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC).map_err(Into::into)
 }
 
@@ -462,10 +462,15 @@ fn relay(args: RelayArgs) -> Finished {
     };
     let mut last_slave = tcgetattr(&slave).ok();
     let mut chunk = [0u8; RELAY_CHUNK];
+    // Once the real terminal hangs up (the pane went away while the child
+    // still runs), poll reports HUP/ERR on it forever. Keep polling it and
+    // the relay burns a core without ever blocking, so drop it from the
+    // poll set instead and wait on the master until the child exits.
+    let mut terminal_alive = true;
     loop {
         let forwarding = forward_input && pump.open && !paused.load(Ordering::Acquire);
         let flush_tail = forwarding && !pump.input_tail.is_empty() && !pump.input_blocked;
-        let watch_terminal = forwarding && pump.input_tail.is_empty();
+        let watch_terminal = forwarding && pump.input_tail.is_empty() && terminal_alive;
         // Index 0 is always the stop pipe; index 1 is the master while it is
         // open; the real terminal is watched last only when a new read is allowed.
         let mut master_flags = PollFlags::IN;
@@ -489,13 +494,17 @@ fn relay(args: RelayArgs) -> Finished {
         let stopping = !fds[0].revents().is_empty();
         let master_events = if pump.open { fds[1].revents() } else { PollFlags::empty() };
         let master_readable = master_events.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR);
-        let input_readable = watch_terminal && pump.open && !fds[watched - 1].revents().is_empty();
+        let term_events = if watch_terminal && pump.open {
+            fds[watched - 1].revents()
+        } else {
+            PollFlags::empty()
+        };
         if master_readable {
-            pump.drain(&mut chunk, usize::MAX);
+            pump.drain(&mut chunk, usize::MAX, terminal_alive);
         }
         if stopping {
             if pump.open {
-                pump.drain(&mut chunk, OUTPUT_LIMIT);
+                pump.drain(&mut chunk, OUTPUT_LIMIT, terminal_alive);
             }
             break;
         }
@@ -506,8 +515,17 @@ fn relay(args: RelayArgs) -> Finished {
         {
             pump.drain_tail(&paused, &slave);
         }
-        if input_readable {
-            pump.forward(&mut chunk, &stop, &paused, &slave);
+        if !term_events.is_empty() {
+            if term_events.intersects(PollFlags::IN) {
+                if !pump.forward(&mut chunk, &stop, &paused, &slave) {
+                    terminal_alive = false;
+                }
+            } else {
+                // HUP/ERR with no readable input left: the terminal hung
+                // up. Its readiness never clears, so stop watching it
+                // rather than waking on every poll.
+                terminal_alive = false;
+            }
         }
         if forward_input {
             // A resize must reach the converged child through its own
@@ -545,7 +563,7 @@ struct Pump {
 }
 
 impl Pump {
-    fn drain(&mut self, chunk: &mut [u8], mut budget: usize) {
+    fn drain(&mut self, chunk: &mut [u8], mut budget: usize, terminal_alive: bool) {
         while budget > 0 {
             match rustix::io::read(&self.master, &mut *chunk) {
                 Ok(0) | Err(Errno::IO) => {
@@ -555,7 +573,11 @@ impl Pump {
                 Ok(read) => {
                     budget = budget.saturating_sub(read);
                     self.buffer.push(&chunk[..read]);
-                    if self.error.is_none()
+                    // A hung-up terminal takes no output; the bytes stay
+                    // captured in the buffer. Writing anyway would fail on
+                    // every chunk without ever clearing poll readiness.
+                    if terminal_alive
+                        && self.error.is_none()
                         && let Err(error) = write_terminal(&self.terminal, &chunk[..read])
                     {
                         self.error = Some(error);
@@ -578,11 +600,14 @@ impl Pump {
     /// foreground group instead: the kernel discards terminal-generated stops
     /// for orphaned process groups, and every converged child is orphaned.
     /// SIGSTOP cannot be caught or discarded, so the stop always lands.
-    fn forward(&mut self, chunk: &mut [u8], stop: &OwnedFd, paused: &Arc<AtomicBool>, slave: &OwnedFd) {
+    /// Returns whether the real terminal is still usable. A hangup or I/O
+    /// error reports `false` so the caller stops polling a descriptor whose
+    /// readiness never clears.
+    fn forward(&mut self, chunk: &mut [u8], stop: &OwnedFd, paused: &Arc<AtomicBool>, slave: &OwnedFd) -> bool {
         let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
         loop {
             if paused.load(Ordering::Acquire) || self.input_blocked {
-                return;
+                return true;
             }
             let mut ready = [
                 PollFd::new(stop, PollFlags::IN),
@@ -590,27 +615,31 @@ impl Pump {
                 PollFd::new(&self.terminal, PollFlags::IN),
             ];
             if poll(&mut ready, Some(&zero)).is_err() {
-                return;
+                return true;
             }
             if !ready[0].revents().is_empty() || paused.load(Ordering::Acquire) {
-                return;
+                return true;
             }
             if ready[1].revents().is_empty() || ready[2].revents().is_empty() {
-                return;
+                return true;
+            }
+            if !ready[2].revents().intersects(PollFlags::IN) {
+                return false;
             }
             match rustix::io::read(&self.terminal, &mut *chunk) {
-                Ok(0) => return,
+                Ok(0) => return false,
                 Ok(read) => {
                     self.forward_chunk(&chunk[..read], paused, slave);
                     if !self.input_tail.is_empty() || self.input_blocked {
-                        return;
+                        return true;
                     }
                 }
                 Err(Errno::INTR) => {}
-                Err(_) => return,
+                Err(Errno::AGAIN) => return true,
+                Err(_) => return false,
             }
             if !self.open {
-                return;
+                return true;
             }
         }
     }
@@ -907,6 +936,52 @@ mod tests {
 
     fn plain(input: &[u8]) -> Vec<u8> {
         strip_controls(input.iter().copied())
+    }
+
+    fn test_pump(terminal: OwnedFd, master: OwnedFd) -> (Pump, OwnedFd, OwnedFd) {
+        let (stop_read, stop_write) = rustix::pipe::pipe().expect("stop pipe");
+        let pump = Pump {
+            master,
+            terminal,
+            buffer: OutputBuffer::default(),
+            error: None,
+            open: true,
+            input_tail: Vec::new(),
+            input_blocked: false,
+        };
+        (pump, stop_read, stop_write)
+    }
+
+    #[test]
+    fn forward_reports_a_hung_up_terminal_as_dead() {
+        let (terminal_read, terminal_write) = rustix::pipe::pipe().expect("terminal pipe");
+        drop(terminal_write);
+        let (master_read, master_write) = rustix::pipe::pipe().expect("master pipe");
+        let (mut pump, stop, _stop_write) = test_pump(terminal_read, master_write);
+        let paused = Arc::new(AtomicBool::new(false));
+        let mut chunk = [0u8; RELAY_CHUNK];
+        assert!(
+            !pump.forward(&mut chunk, &stop, &paused, &master_read),
+            "a terminal at EOF must read as dead so the relay stops polling it"
+        );
+        assert!(pump.input_tail.is_empty());
+    }
+
+    #[test]
+    fn forward_keeps_a_live_terminal_and_delivers_its_input() {
+        let (terminal_read, terminal_write) = rustix::pipe::pipe().expect("terminal pipe");
+        let (master_read, master_write) = rustix::pipe::pipe().expect("master pipe");
+        rustix::fs::fcntl_setfl(&master_read, rustix::fs::OFlags::NONBLOCK).expect("nonblock master");
+        let (mut pump, stop, _stop_write) = test_pump(terminal_read, master_write);
+        let paused = Arc::new(AtomicBool::new(false));
+        rustix::io::write(&terminal_write, b"hi").expect("type input");
+        let mut chunk = [0u8; RELAY_CHUNK];
+        assert!(
+            pump.forward(&mut chunk, &stop, &paused, &master_read),
+            "a readable terminal must stay watched"
+        );
+        assert!(pump.input_tail.is_empty());
+        assert_eq!(read_available(&master_read), b"hi");
     }
 
     #[test]
