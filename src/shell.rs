@@ -11,6 +11,16 @@ use ish::builtin::ShellCommand;
 
 use ish::editor::{Editor, EditorAction, EditorContext, EditorEvent};
 use crate::trash;
+
+/// Report a prompt teardown failure. Standard `eprintln!` panics when
+/// standard error itself is gone, which is exactly when these reports fire
+/// (a hung-up terminal fails every write), so the write failure is discarded
+/// instead of turning a quiet exit into a panic.
+fn report_teardown(message: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let _ = std::io::stderr().write_fmt(message);
+}
+
 struct Shell {
     editor: Editor,
     aliases: AliasMap,
@@ -803,16 +813,22 @@ fn read_line(shell: &mut Shell) -> ReadResult {
 fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadResult {
     let _raw = match term::RawMode::enable() {
         Ok(raw) => raw,
-        Err(error) => { eprintln!("ish: raw mode: {error}"); return ReadResult::Exit; }
+        Err(error) => { report_teardown(format_args!("ish: raw mode: {error}\n")); return ReadResult::Exit; }
     };
     // Catch SIGINT while editing (the top-level disposition ignores it) so
     // kill -INT cancels the line instead of doing nothing. Restored on drop.
     let _foreground_signals = match signal::ForegroundSignals::install() {
         Ok(guard) => guard,
-        Err(error) => { eprintln!("ish: foreground signals: {error}"); return ReadResult::Exit; }
+        Err(error) => { report_teardown(format_args!("ish: foreground signals: {error}\n")); return ReadResult::Exit; }
     };
     emit_working_directory(shell);
-    if shell.prompt_needs_line_start { print!("\r\n"); shell.prompt_needs_line_start = false; }
+    if shell.prompt_needs_line_start {
+        {
+            use std::io::Write as _;
+            let _ = write!(std::io::stdout(), "\r\n");
+        }
+        shell.prompt_needs_line_start = false;
+    }
     let pwd = shell.epsh.vars().get("PWD").unwrap_or("");
     let dirty = shell.epsh.vars().get("__DENV_DIRTY") == Some("1");
     shell.prompt.render_into(&mut shell.prompt_buf, shell.last_status, pwd, dirty);
@@ -820,7 +836,7 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
     let display_len = shell.prompt.display_len(&prompt);
     let context = editor_context(&shell.aliases, &shell.history, &shell.epsh, shell.home.as_deref(), &shell.home_display, &shell.dir_stack);
     shell.editor.begin(prompt, display_len, &context);
-    if let Err(error) = flush_editor(&mut shell.editor) { eprintln!("ish: output: {error}"); return ReadResult::Exit; }
+    if let Err(error) = flush_editor(&mut shell.editor) { report_teardown(format_args!("ish: output: {error}\n")); return ReadResult::Exit; }
     loop {
         let input = reader.read_event();
         let event = match &input {
@@ -855,16 +871,16 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
             EditorAction::Submit(line) => {
                 shell.editor.render_layout_dump(&mut shell.layout_dump, &context);
                 shell.prompt_buf = shell.editor.take_prompt();
-                if let Err(error) = flush_editor(&mut shell.editor) { eprintln!("ish: output: {error}"); return ReadResult::Exit; }
+                if let Err(error) = flush_editor(&mut shell.editor) { report_teardown(format_args!("ish: output: {error}\n")); return ReadResult::Exit; }
                 return if line.is_empty() { ReadResult::Empty } else { ReadResult::Line(line) };
             }
             EditorAction::Cancel | EditorAction::Exit => {
                 shell.prompt_buf = shell.editor.take_prompt();
-                if let Err(error) = flush_editor(&mut shell.editor) { eprintln!("ish: output: {error}"); return ReadResult::Exit; }
+                if let Err(error) = flush_editor(&mut shell.editor) { report_teardown(format_args!("ish: output: {error}\n")); return ReadResult::Exit; }
                 return match action { EditorAction::Exit => handle_exit(shell), _ => ReadResult::Empty };
             }
         }
-        if let Err(error) = flush_editor(&mut shell.editor) { eprintln!("ish: output: {error}"); return ReadResult::Exit; }
+        if let Err(error) = flush_editor(&mut shell.editor) { report_teardown(format_args!("ish: output: {error}\n")); return ReadResult::Exit; }
     }
 }
 

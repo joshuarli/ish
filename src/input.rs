@@ -1,5 +1,6 @@
 use crate::signal;
 use crate::term::STDIN_FD;
+use rustix::io::Errno;
 use std::collections::VecDeque;
 use std::os::fd::{BorrowedFd, RawFd};
 
@@ -101,6 +102,11 @@ pub struct InputReader {
     buf_pos: usize,
     buf_end: usize,
     pending: VecDeque<u8>,
+    /// Set once a read proves the terminal is gone (EOF or an I/O error).
+    /// Poll keeps reporting readiness on a hung-up descriptor forever, so
+    /// without this the reader would retry the failing read without ever
+    /// blocking.
+    stdin_dead: bool,
 }
 
 enum PollResult {
@@ -131,6 +137,7 @@ impl InputReader {
             buf_pos: 0,
             buf_end: 0,
             pending: VecDeque::new(),
+            stdin_dead: false,
         }
     }
 
@@ -235,6 +242,9 @@ impl InputReader {
     }
 
     fn poll_fds(&self, stdin_fd: RawFd, timeout_ms: i32) -> PollResult {
+        if self.stdin_dead {
+            return PollResult::StdinHup;
+        }
         // SAFETY: the input fd stays open for this call and the signal fd stays open with the reader.
         let stdin = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
         let signal = unsafe { BorrowedFd::borrow_raw(self.signal_fd) };
@@ -270,6 +280,9 @@ impl InputReader {
     }
 
     fn poll_stdin(&self, timeout_ms: i32) -> bool {
+        if self.stdin_dead {
+            return false;
+        }
         if self.buf_pos < self.buf_end {
             return true;
         }
@@ -295,12 +308,19 @@ impl InputReader {
         // SAFETY: `stdin_fd` is borrowed and remains open for this reader's lifetime.
         let stdin = unsafe { BorrowedFd::borrow_raw(self.stdin_fd) };
         match rustix::io::read(stdin, &mut self.buf) {
-            Ok(0) => None,
+            Ok(0) => {
+                self.stdin_dead = true;
+                None
+            }
             Ok(n) => {
                 self.buf_end = n;
                 Some(())
             }
-            Err(_) => None,
+            Err(Errno::INTR) => None,
+            Err(_) => {
+                self.stdin_dead = true;
+                None
+            }
         }
     }
 
@@ -627,6 +647,59 @@ mod tests {
         assert!(!m.ctrl);
         assert!(m.alt);
         assert!(!m.shift);
+    }
+
+    #[test]
+    fn eof_on_stdin_marks_the_terminal_dead() {
+        let (stdin_read, stdin_write) = rustix::pipe::pipe().unwrap();
+        drop(stdin_write);
+        let (signal_read, _signal_write) = rustix::pipe::pipe().unwrap();
+        let mut reader =
+            InputReader::with_fds(stdin_read.as_raw_fd(), signal_read.as_raw_fd());
+        assert!(reader.fill_buf().is_none());
+        assert!(reader.stdin_dead);
+        assert!(matches!(
+            reader.poll_fds(stdin_read.as_raw_fd(), -1),
+            PollResult::StdinHup
+        ));
+        assert!(!reader.poll_stdin(0));
+    }
+
+    #[test]
+    fn hung_up_terminal_reads_as_eof_without_spinning() {
+        let master = crate::capture::openpt_cloexec().expect("pty master");
+        rustix::pty::grantpt(&master).expect("grantpt");
+        rustix::pty::unlockpt(&master).expect("unlockpt");
+        let slave_name = rustix::pty::ptsname(&master, Vec::new()).expect("slave name");
+        let slave = rustix::fs::open(
+            slave_name.as_c_str(),
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("slave");
+        drop(master);
+        let (signal_read, signal_write) = rustix::pipe::pipe().expect("signal pipe");
+        let slave = Box::leak(Box::new(slave));
+        let signal_read = Box::leak(Box::new(signal_read));
+        let _signal_write = Box::leak(Box::new(signal_write));
+        let (done, waited) = std::sync::mpsc::sync_channel(1);
+        // Detached: a regression spins here forever, so the test must not
+        // join this thread to report the failure.
+        std::thread::spawn(move || {
+            let mut reader =
+                InputReader::with_fds(slave.as_raw_fd(), signal_read.as_raw_fd());
+            let _ = done.send(reader.read_event());
+        });
+        match waited.recv_timeout(Duration::from_secs(10)) {
+            Ok(InputEvent::Key(key)) => assert!(
+                key.key == Key::Char('d') && key.mods.ctrl,
+                "hung-up terminal must read as Ctrl+D, got {key:?}"
+            ),
+            Ok(InputEvent::Signal(_)) => panic!("hung-up terminal read as a signal"),
+            Ok(InputEvent::Paste(_)) => panic!("hung-up terminal read as a paste"),
+            Ok(InputEvent::PasteRejected) => panic!("hung-up terminal read as a rejected paste"),
+            Err(_) => panic!("read_event spun on a hung-up terminal instead of returning"),
+        }
     }
 
     #[test]
