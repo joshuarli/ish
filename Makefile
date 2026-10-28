@@ -77,7 +77,8 @@ verify-release:
 	fi
 
 lint:
-	cargo clippy --workspace --fix --allow-dirty --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
+	uvx ruff@0.17.3 check scripts
 
 ifeq ($(RUSTYBENCH),"$(RUSTYBENCH_DEFAULT)")
 bench bench-syscalls: rustybench

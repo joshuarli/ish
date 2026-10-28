@@ -9,7 +9,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/check-semantic-mutations.py"
 sys.dont_write_bytecode = True
@@ -65,31 +64,15 @@ class SemanticMutationRunnerTest(unittest.TestCase):
                     "signal.pause()",
                 )
             )
-            parent_source = "\n".join(
-                (
-                    "import os, signal, subprocess, sys",
-                    "read_fd, write_fd = os.pipe()",
-                    "child = subprocess.Popen(",
-                    "    [sys.executable, '-c', sys.argv[1], str(write_fd)],",
-                    "    pass_fds=(write_fd,),",
-                    ")",
-                    "os.close(write_fd)",
-                    "if os.read(read_fd, 5) != b'ready':",
-                    "    raise RuntimeError('descendant did not become ready')",
-                    "os.close(read_fd)",
-                    "print(child.pid, flush=True)",
-                    "signal.pause()",
-                )
-            )
+            parent_source = "import os, signal, subprocess, sys\nread_fd, write_fd = os.pipe()\nchild = subprocess.Popen(\n    [sys.executable, '-c', sys.argv[1], str(write_fd)],\n    pass_fds=(write_fd,),\n)\nos.close(write_fd)\nif os.read(read_fd, 5) != b'ready':\n    raise RuntimeError('descendant did not become ready')\nos.close(read_fd)\nprint(child.pid, flush=True)\nsignal.pause()"
 
-            with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit) as failure:
-                    MUTATIONS.checked(
-                        [sys.executable, "-c", parent_source, child_source],
-                        ROOT,
-                        environment,
-                        timeout=2,
-                    )
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as failure:
+                MUTATIONS.checked(
+                    [sys.executable, "-c", parent_source, child_source],
+                    ROOT,
+                    environment,
+                    timeout=2,
+                )
 
             self.assertEqual(failure.exception.code, 1)
             self.assertEqual(marker.read_text(encoding="utf-8"), "terminated")

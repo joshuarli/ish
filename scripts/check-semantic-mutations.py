@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import argparse
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE_TIMEOUT = 120
@@ -72,11 +71,15 @@ MUTATIONS = (
             ),
             (
                 "crates/epsh/src/eval.rs",
-                "        let saved_fds = self.setup_redirections(redirs)?;\n\n"
-                "        let result = match self.try_builtin(cmd_name, &expanded_args, assigns, &[], span) {\n",
-                "        let saved_fds = self.setup_redirections(redirs)?;\n"
-                "        self.check_command_policy_for_dispatch(&expanded_args, span)?;\n\n"
-                "        let result = match self.try_builtin(cmd_name, &expanded_args, assigns, &[], span) {\n",
+                (
+                    "        let saved_fds = self.setup_redirections(redirs)?;\n\n"
+                    "        let result = match self.try_builtin(cmd_name, &expanded_args, assigns, &[], span) {\n"
+                ),
+                (
+                    "        let saved_fds = self.setup_redirections(redirs)?;\n"
+                    "        self.check_command_policy_for_dispatch(&expanded_args, span)?;\n\n"
+                    "        let result = match self.try_builtin(cmd_name, &expanded_args, assigns, &[], span) {\n"
+                ),
             ),
         ),
     ),
@@ -283,7 +286,7 @@ def apply_mutation(project: Path, mutation: Mutation) -> dict[Path, str]:
     originals: dict[Path, str] = {}
     for relative, before, after in mutation.edits:
         path = project / relative
-        original = originals.setdefault(path, path.read_text())
+        originals.setdefault(path, path.read_text())
         current = path.read_text()
         if current.count(before) != 1:
             fail(f"{mutation.name}: expected one source match in {relative}")

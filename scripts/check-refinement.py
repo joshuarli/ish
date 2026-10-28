@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 import hashlib
 import os
-from pathlib import Path
 import platform
 import shutil
 import subprocess
 import tarfile
 import tempfile
 import urllib.request
-
+from pathlib import Path
 
 RELEASE = "nightly-2026.10.17-e62dd83"
 RUSTUP_VERSION = "1.29.1"
