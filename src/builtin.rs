@@ -214,9 +214,14 @@ pub fn locate_command(
 
     let name = &args[0];
 
+    let mut has_same_name_alias = false;
     if let Some(exp) = aliases.get(name) {
         println!("alias: {} {}", name, exp.join(" "));
-        return 0;
+        let same_name = exp.first().is_some_and(|first| strip_quotes(first) == name);
+        if !same_name {
+            return 0;
+        }
+        has_same_name_alias = true;
     }
 
     if is_builtin(name) {
@@ -225,6 +230,9 @@ pub fn locate_command(
     }
 
     if is_refused_epsh_builtin(name) {
+        if has_same_name_alias {
+            return 0;
+        }
         eprintln!("ish: w: not found: {name}");
         return 1;
     }
@@ -239,8 +247,23 @@ pub fn locate_command(
         return 0;
     }
 
+    if has_same_name_alias {
+        return 0;
+    }
     eprintln!("ish: w: not found: {name}");
     1
+}
+
+fn strip_quotes(word: &str) -> &str {
+    if word.len() >= 2 {
+        let bytes = word.as_bytes();
+        if (bytes[0] == b'\'' && bytes[word.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[word.len() - 1] == b'"')
+        {
+            return &word[1..word.len() - 1];
+        }
+    }
+    word
 }
 
 /// List directories using ish's native directory listing.

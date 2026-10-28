@@ -2864,6 +2864,23 @@ fn which_alias() {
 }
 
 #[test]
+fn which_same_name_alias_shows_underlying_binary() {
+    let sh = PtyShell::spawn_with_opts(&[("bin/mytool", "#!/bin/sh\necho hi\n")], &[]);
+    sh.run_command(&format!("set PATH {}/bin", sh.home_path().display()));
+    sh.run_command("alias mytool mytool --flag");
+    let out = sh.run_command("w mytool");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("alias: mytool mytool --flag"),
+        "expected alias line: {text:?}"
+    );
+    assert!(
+        text.contains("bin/mytool"),
+        "expected underlying binary path: {text:?}"
+    );
+}
+
+#[test]
 fn error_status_colors_prompt() {
     let sh = PtyShell::spawn();
     // Run a command that fails

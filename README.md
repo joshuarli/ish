@@ -143,7 +143,7 @@ ish-specific commands include:
 | `cp [OPTIONS] SOURCE DESTINATION` | Copy files or directory trees |
 | `mv [OPTIONS] SOURCE DESTINATION` | Move files or directory trees |
 | `t`, `trash` | Permanently delete entries below an explicit directory; `--yes` skips confirmation |
-| `w`, `which`, `type` | Locate a command or alias |
+| `w`, `which`, `type` | Locate a command or alias; a same-name alias also shows the underlying command |
 | `l [path...]` | List files with colors and human-readable sizes |
 | `c` | Clear the screen |
 | `denv` | Trust, revoke, or reload environment files for this directory |
