@@ -1,3 +1,4 @@
+use crate::report;
 use std::ffi::CStr;
 use std::io;
 use std::mem::MaybeUninit;
@@ -10,7 +11,7 @@ pub fn list_dir(path: impl AsRef<std::path::Path>) -> i32 {
     let entries = match read_entries(path) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("ish: l: {}: {e}", path.display());
+            report!("ish: l: {}: {e}", path.display());
             return 1;
         }
     };

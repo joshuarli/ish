@@ -22,6 +22,7 @@ mod failure;
 mod sha256;
 
 use failure::{ChannelState, Completion, FailureChannel};
+use crate::report;
 
 const ENVRC_SOURCE_VAR: &str = "__DENV_ENVRC_SOURCE";
 
@@ -157,7 +158,7 @@ pub fn init(epsh: &mut epsh::eval::Shell) -> Session {
         && let Ok(pid_namespace) = &pid_namespace
         && let Err(err) = remove_dead_shell_records(data_dir, *pid_namespace)
     {
-        eprintln!("denv: {err}");
+        report!("denv: {err}");
     }
     Session { data_dir, record_id }
 }
@@ -167,7 +168,7 @@ pub fn on_exit(session: &Session) {
         return;
     };
     if let Err(err) = clear_active(data_dir, record_id) {
-        eprintln!("denv: {err}");
+        report!("denv: {err}");
     }
 }
 
@@ -191,7 +192,7 @@ pub fn command(session: &Session, args: &[String], shell: &mut epsh::eval::Shell
     };
     match result {
         Ok(_) => 0,
-        Err(error) => { eprintln!("denv: {error}"); 1 }
+        Err(error) => { report!("denv: {error}"); 1 }
     }
 }
 
@@ -223,7 +224,7 @@ fn refresh(session: &Session, force: bool, epsh: &mut epsh::eval::Shell) -> Resu
         Ok(active) => active,
         Err(ActiveLoadError::Malformed(message)) if force => {
             clear_active(data_dir, record_id)?;
-            eprintln!(
+            report!(
                 "denv: discarded unreadable active record ({message}); variables it saved cannot be restored"
             );
             None
@@ -318,7 +319,7 @@ fn refresh_inner(
         .find(|file| !is_allowed_in(allow_dir, file))
     {
         let dir = canonicalize_fallback(&found.dir);
-        eprintln!(
+        report!(
             "denv: {} is blocked. Run `denv allow` to trust it.",
             blocked.path.display()
         );
@@ -333,10 +334,10 @@ fn refresh_inner(
     }
 
     if found.envrc.is_some() {
-        eprintln!("denv: loading .envrc");
+        report!("denv: loading .envrc");
     }
     if found.dotenv.is_some() {
-        eprintln!("denv: loading .env");
+        report!("denv: loading .env");
     }
 
     let diff = if let Some(envrc_file) = &envrc_file {
@@ -345,7 +346,7 @@ fn refresh_inner(
             Ok(diff) => diff,
             Err(err) => {
                 let dir = canonicalize_fallback(&found.dir);
-                eprintln!("denv: {err}");
+                report!("denv: {err}");
                 set_change(
                     &mut changes,
                     "__DENV_DIR",
@@ -382,7 +383,7 @@ fn allow_current_dir(session: &Session, epsh: &mut epsh::eval::Shell) -> Result<
     for (path, _) in found.envrc.iter().chain(found.dotenv.iter()) {
         let file = read_trusted_candidate(path)?;
         allow_file_in(&session.data_dir()?.join("allow"), &file)?;
-        eprintln!("denv: allowed {}", file.path.display());
+        report!("denv: allowed {}", file.path.display());
     }
     refresh(session, true, epsh)
 }
@@ -536,9 +537,9 @@ fn deny_file(data_dir: &Path, path: &Path) -> Result<(), String> {
         }
     }
     if removed {
-        eprintln!("denv: denied {}", path.display());
+        report!("denv: denied {}", path.display());
     } else {
-        eprintln!("denv: {} not currently allowed", path.display());
+        report!("denv: {} not currently allowed", path.display());
     }
     Ok(())
 }
@@ -916,11 +917,11 @@ fn load_dotenv_entries(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
     let mut entries = Vec::new();
     for (key, value) in parse_dotenv(content) {
         if !is_valid_env_key(key) {
-            eprintln!("denv: .env: skipping invalid variable name {key:?}");
+            report!("denv: .env: skipping invalid variable name {key:?}");
         } else if is_reserved_dotenv_key(key) {
-            eprintln!("denv: .env: refusing to set {key}");
+            report!("denv: .env: refusing to set {key}");
         } else if value.contains('\0') {
-            eprintln!("denv: .env: skipping {key}: value contains NUL");
+            report!("denv: .env: skipping {key}: value contains NUL");
         } else {
             entries.push((key.to_string(), value.into_owned()));
         }

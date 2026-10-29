@@ -3,6 +3,7 @@
 
 use crate::history::History;
 use crate::static_word::static_word;
+use crate::report;
 use epsh::ast::Command;
 use epsh::parser::Parser;
 
@@ -12,7 +13,7 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
     if args.is_empty() {
         // No args: cd home
         if let Err(e) = std::env::set_current_dir(home) {
-            eprintln!("ish: z: {home}: {e}");
+            report!("ish: z: {home}: {e}");
             return 1;
         }
         return 0;
@@ -21,14 +22,14 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
     let query = &args[0];
     // An empty query would match every path and has no meaningful window.
     if query.is_empty() {
-        eprintln!("ish: z: empty query");
+        report!("ish: z: empty query");
         return 1;
     }
 
     // If argument is an existing directory, go there directly
     if std::path::Path::new(query).is_dir() {
         if let Err(e) = std::env::set_current_dir(query) {
-            eprintln!("ish: z: {query}: {e}");
+            report!("ish: z: {query}: {e}");
             return 1;
         }
         return 0;
@@ -38,7 +39,7 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
     let query_lower: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
     let len = history.len();
     if len == 0 {
-        eprintln!("ish: z: no match for '{query}'");
+        report!("ish: z: no match for '{query}'");
         return 1;
     }
 
@@ -63,14 +64,14 @@ pub fn builtin_z(args: &[String], history: &History, home: &str) -> i32 {
     let target = match matches.first() {
         Some((path, _)) => *path,
         None => {
-            eprintln!("ish: z: no match for '{query}'");
+            report!("ish: z: no match for '{query}'");
             return 1;
         }
     };
 
-    eprintln!("{target}");
+    report!("{target}");
     if let Err(e) = std::env::set_current_dir(target) {
-        eprintln!("ish: z: {target}: {e}");
+        report!("ish: z: {target}: {e}");
         return 1;
     }
     0

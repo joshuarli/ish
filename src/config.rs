@@ -1,4 +1,5 @@
 use crate::alias::AliasMap;
+use crate::report;
 use epsh::ast::Word;
 use epsh::lexer::{Lexer, Token};
 use std::ffi::OsStr;
@@ -32,7 +33,7 @@ pub fn load_with_home(
         // A missing default config is normal; a missing explicit one is not.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && path_override.is_none() => return,
         Err(e) => {
-            eprintln!("ish: {}: {e}", path.display());
+            report!("ish: {}: {e}", path.display());
             return;
         }
     };
@@ -44,7 +45,7 @@ pub fn load_with_home(
         let line = match std::str::from_utf8(raw) {
             Ok(line) => line.trim(),
             Err(_) => {
-                eprintln!("ish: {}:{lineno}: line is not valid UTF-8", path.display());
+                report!("ish: {}:{lineno}: line is not valid UTF-8", path.display());
                 continue;
             }
         };
@@ -59,7 +60,7 @@ pub fn load_with_home(
         match directive {
             "set" => parse_set(rest, lineno, &path, epsh),
             "alias" => parse_alias(rest, lineno, &path, aliases),
-            _ => eprintln!(
+            _ => report!(
                 "ish: {}:{lineno}: unrecognized directive: {line}",
                 path.display(),
             ),
@@ -71,7 +72,7 @@ pub fn load_with_home(
     // silently ignoring a file the user expects to take effect.
     let init_path = path.with_file_name("init.sh");
     if init_path.exists() {
-        eprintln!(
+        report!(
             "ish: {}: init.sh is not run; move its settings into config.ish",
             init_path.display()
         );
@@ -86,7 +87,7 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh:
     };
 
     if name.is_empty() {
-        eprintln!(
+        report!(
             "ish: {}:{}: set: missing variable name",
             path.display(),
             lineno
@@ -99,7 +100,7 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh:
         .enumerate()
         .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()));
     if !valid_name {
-        eprintln!(
+        report!(
             "ish: {}:{}: set: invalid variable name '{name}'",
             path.display(),
             lineno
@@ -121,7 +122,7 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh:
                 match epsh::expand::expand_word_to_string(&word, epsh) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!(
+                        report!(
                             "ish: {}:{}: set {name}: expansion error: {e}",
                             path.display(),
                             lineno
@@ -131,7 +132,7 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh:
                 }
             }
             Ok(_) => {
-                eprintln!(
+                report!(
                     "ish: {}:{}: set {name}: value must start with a word",
                     path.display(),
                     lineno
@@ -139,7 +140,7 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh:
                 return;
             }
             Err(e) => {
-                eprintln!("ish: {}:{}: set {name}: {e}", path.display(), lineno);
+                report!("ish: {}:{}: set {name}: {e}", path.display(), lineno);
                 return;
             }
         }
@@ -148,7 +149,7 @@ fn parse_set(rest: &str, lineno: usize, path: &std::path::Path, epsh: &mut epsh:
     // Config values belong to epsh's store; child processes receive them through
     // the normal external-handler environment path.
     if let Err(e) = epsh.vars_mut().set(name, &expanded) {
-        eprintln!("ish: {}:{}: set {name}: {e}", path.display(), lineno);
+        report!("ish: {}:{}: set {name}: {e}", path.display(), lineno);
         return;
     }
     epsh.vars_mut().export(name);
@@ -158,13 +159,13 @@ fn parse_alias(rest: &str, lineno: usize, path: &std::path::Path, aliases: &mut 
     let mut words = crate::alias::lex_words(rest);
 
     if words.is_empty() {
-        eprintln!("ish: {}:{}: alias: missing name", path.display(), lineno);
+        report!("ish: {}:{}: alias: missing name", path.display(), lineno);
         return;
     }
 
     let name = words.remove(0);
     if words.is_empty() {
-        eprintln!(
+        report!(
             "ish: {}:{}: alias: missing expansion for '{name}'",
             path.display(),
             lineno,

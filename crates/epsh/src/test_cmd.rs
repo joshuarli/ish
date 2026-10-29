@@ -11,7 +11,8 @@ pub(crate) fn test_eval(args: &[&str], cwd: &Path) -> ExitStatus {
     let mut pos = 0;
     let result = test_or(args, &mut pos, cwd);
     if pos < args.len() {
-        eprintln!("test: too many arguments");
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "test: too many arguments");
         return ExitStatus::MISUSE;
     }
     if result {

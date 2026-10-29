@@ -146,7 +146,10 @@ impl Drop for ForegroundJob {
             for relay in self.relays.drain(..) { std::mem::forget(relay); }
             return;
         }
-        if let Err(error) = self.terminate() { eprintln!("epsh: cannot clean up foreground job: {error}"); }
+        if let Err(error) = self.terminate() {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "epsh: cannot clean up foreground job: {error}");
+        }
     }
 }
 

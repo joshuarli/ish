@@ -1,5 +1,6 @@
 use crate::builtin::{self, ExternalCommand};
 use crate::{fs_command, history};
+use crate::report;
 use std::ffi::OsString;
 
 fn env_pair_value(
@@ -58,7 +59,7 @@ pub fn make_external_dispatcher(
                             println!("Usage: history [reset]");
                             return Ok(epsh::eval::ExternalDispatch::Handled(epsh::error::ExitStatus::SUCCESS));
                         }
-                        eprintln!("ish: history: storage subcommands require a standalone command");
+                        report!("ish: history: storage subcommands require a standalone command");
                         return Ok(epsh::eval::ExternalDispatch::Handled(epsh::error::ExitStatus::FAILURE));
                     }
                     match history::render_history_log(&history_log) {
@@ -67,7 +68,7 @@ pub fn make_external_dispatcher(
                             return Ok(epsh::eval::ExternalDispatch::Handled(epsh::error::ExitStatus::SUCCESS));
                         }
                         Err(e) => {
-                            eprintln!("ish: history: {e}");
+                            report!("ish: history: {e}");
                             return Ok(epsh::eval::ExternalDispatch::Handled(epsh::error::ExitStatus::FAILURE));
                         }
                     }

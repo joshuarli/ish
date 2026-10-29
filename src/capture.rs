@@ -43,6 +43,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
+use crate::report;
 
 pub const OUTPUT_LIMIT: usize = 1 << 20;
 const RELAY_CHUNK: usize = 16 * 1024;
@@ -205,13 +206,13 @@ impl Session {
         match self.stop_and_join() {
             Some(finished) => {
                 if let Some(error) = finished.relay_error {
-                    eprintln!("ish: output relay failed: {error}");
+                    report!("ish: output relay failed: {error}");
                 }
                 *last = finished.buffer;
                 finished.input_tail
             }
             None => {
-                eprintln!("ish: output relay thread panicked");
+                report!("ish: output relay thread panicked");
                 last.clear();
                 Vec::new()
             }
@@ -229,7 +230,7 @@ impl Session {
                     .cloned()
                     .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
                     .unwrap_or_else(|| "unknown panic payload".to_string());
-                eprintln!("ish: output relay thread panicked: {message}");
+                report!("ish: output relay thread panicked: {message}");
                 None
             }
         }

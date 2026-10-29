@@ -1,3 +1,4 @@
+use ish::report;
 use std::ffi::OsString;
 mod shell;
 mod trash;
@@ -26,14 +27,14 @@ fn parse_args() -> Args {
             Some("-c") => match argv.next() {
                 Some(path) => args.config = Some(path),
                 None => {
-                    eprintln!("ish: -c requires a config file path");
+                    report!("ish: -c requires a config file path");
                     std::process::exit(1);
                 }
             },
             Some("--no-config") => args.no_config = true,
             _ => {
-                eprintln!("ish: this shell is interactive-only and does not run scripts");
-                eprintln!("usage: ish [-c config] [--no-config] [-h|--help]");
+                report!("ish: this shell is interactive-only and does not run scripts");
+                report!("usage: ish [-c config] [--no-config] [-h|--help]");
                 std::process::exit(1);
             }
         }

@@ -1,5 +1,6 @@
 use crate::ls;
 use crate::path;
+use crate::report;
 
 /// Where an ish-owned builtin may run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,7 +209,7 @@ pub fn locate_command(
     path_env: &[u8],
 ) -> i32 {
     if args.is_empty() {
-        eprintln!("ish: w: expected command name");
+        report!("ish: w: expected command name");
         return 1;
     }
 
@@ -233,7 +234,7 @@ pub fn locate_command(
         if has_same_name_alias {
             return 0;
         }
-        eprintln!("ish: w: not found: {name}");
+        report!("ish: w: not found: {name}");
         return 1;
     }
 
@@ -250,7 +251,7 @@ pub fn locate_command(
     if has_same_name_alias {
         return 0;
     }
-    eprintln!("ish: w: not found: {name}");
+    report!("ish: w: not found: {name}");
     1
 }
 

@@ -10,16 +10,8 @@ use std::path::Path;
 use ish::builtin::ShellCommand;
 
 use ish::editor::{Editor, EditorAction, EditorContext, EditorEvent};
+use ish::report;
 use crate::trash;
-
-/// Report a prompt teardown failure. Standard `eprintln!` panics when
-/// standard error itself is gone, which is exactly when these reports fire
-/// (a hung-up terminal fails every write), so the write failure is discarded
-/// instead of turning a quiet exit into a panic.
-fn report_teardown(message: std::fmt::Arguments<'_>) {
-    use std::io::Write as _;
-    let _ = std::io::stderr().write_fmt(message);
-}
 
 struct Shell {
     editor: Editor,
@@ -58,11 +50,11 @@ pub(super) fn run(cli: crate::Args) {
     if let Err(error) = rustix::process::setpgid(None, None)
         && error != rustix::io::Errno::PERM
     {
-        eprintln!("ish: cannot become a process group leader: {error}");
+        report!("ish: cannot become a process group leader: {error}");
     }
     let stdin = term::stdin();
     if let Err(error) = rustix::termios::tcsetpgrp(stdin, pid) {
-        eprintln!("ish: cannot take the terminal: {error}");
+        report!("ish: cannot take the terminal: {error}");
     }
 
     let (rows, cols) = term::term_size();
@@ -116,7 +108,7 @@ pub(super) fn run(cli: crate::Args) {
         last_status: 0,
         dir_stack: Vec::with_capacity(32),
         history: history::History::load_from_home(home_os.as_deref()).unwrap_or_else(|error| {
-            eprintln!("ish: cannot open history: {error}");
+            report!("ish: cannot open history: {error}");
             std::process::exit(1);
         }),
         prompt: prompt::Prompt::with_identity(&user, &home_display),
@@ -134,7 +126,7 @@ pub(super) fn run(cli: crate::Args) {
         denv,
     };
 
-    if let Err(error) = denv::on_startup(&shell.denv, &mut shell.epsh) { eprintln!("denv: {error}"); }
+    if let Err(error) = denv::on_startup(&shell.denv, &mut shell.epsh) { report!("denv: {error}"); }
     sync_shell_store_derived(&mut shell);
     builtin::install_epsh_policy(&mut shell.epsh);
 
@@ -151,7 +143,7 @@ pub(super) fn run(cli: crate::Args) {
             .epsh
             .set_exit_status(epsh::error::ExitStatus::from(shell.last_status));
         if let Err(error) = shell.history.sync() {
-            eprintln!("ish: cannot sync history: {error}");
+            report!("ish: cannot sync history: {error}");
         }
         match read_line(&mut shell) {
             ReadResult::Line(line) => {
@@ -176,7 +168,7 @@ pub(super) fn run(cli: crate::Args) {
                 if history_line.trim() != "l"
                     && let Err(error) = shell.history.add_in_dir(&history_line, Some(&history_cwd))
                 {
-                    eprintln!("ish: command was not saved to history: {error}");
+                    report!("ish: command was not saved to history: {error}");
                 }
 
                 shell.session_log.push_str(&line);
@@ -187,7 +179,7 @@ pub(super) fn run(cli: crate::Args) {
                 let plan = match dispatch::plan(&expanded) {
                     Ok(plan) => plan,
                     Err(rejection) => {
-                        eprintln!("ish: {rejection}");
+                        report!("ish: {rejection}");
                         shell.last_status = 2;
                         continue;
                     }
@@ -263,13 +255,13 @@ pub(super) fn run(cli: crate::Args) {
                     };
                     match saved_modes {
                         Ok(termios) => {
-                            eprintln!("ish: stopped: {} (pgid={})", expanded, handle.process_group());
+                            report!("ish: stopped: {} (pgid={})", expanded, handle.process_group());
                             if let Some(session) = session.as_ref() {
                                 session.set_paused(true);
                             }
                             shell.job = Some(Job { handle, cmd: expanded.to_string(), termios, capture: session.take() });
                         }
-                        Err(error) => eprintln!("ish: cannot save stopped terminal attributes: {error}"),
+                        Err(error) => report!("ish: cannot save stopped terminal attributes: {error}"),
                     }
                 }
                 term::restore_startup_termios();
@@ -304,14 +296,14 @@ pub(super) fn run(cli: crate::Args) {
 
 fn continue_occupied_foreground(epsh: &mut epsh::eval::Shell, converged: bool, outcome: epsh::eval::ProgramOutcome) -> epsh::eval::ProgramOutcome {
     let epsh::eval::ProgramOutcome::Stopped(mut handle) = outcome else { return outcome; };
-    eprintln!("ish: a job is already suspended; resume it with fg before suspending another");
+    report!("ish: a job is already suspended; resume it with fg before suspending another");
     loop {
         if converged {
             match epsh.resume_foreground(&mut handle) {
                 Ok(None) => {}
                 Ok(Some(status)) => return epsh::eval::ProgramOutcome::Completed(status),
                 Err(error) => {
-                    eprintln!("ish: cannot continue foreground job: {error}");
+                    report!("ish: cannot continue foreground job: {error}");
                     return epsh::eval::ProgramOutcome::Completed(epsh::error::ExitStatus::FAILURE);
                 }
             }
@@ -320,20 +312,20 @@ fn continue_occupied_foreground(epsh: &mut epsh::eval::Shell, converged: bool, o
         let termios = match term::save_termios() {
             Ok(termios) => termios,
             Err(error) => {
-                eprintln!("ish: cannot save foreground terminal attributes: {error}");
+                report!("ish: cannot save foreground terminal attributes: {error}");
                 return epsh::eval::ProgramOutcome::Completed(epsh::error::ExitStatus::FAILURE);
             }
         };
         term::restore_startup_termios();
         if let Err(error) = rustix::termios::tcsetattr(term::stdin(), rustix::termios::OptionalActions::Drain, &termios) {
-            eprintln!("ish: cannot restore foreground terminal attributes: {error}");
+            report!("ish: cannot restore foreground terminal attributes: {error}");
             return epsh::eval::ProgramOutcome::Completed(epsh::error::ExitStatus::FAILURE);
         }
         match epsh.resume_foreground(&mut handle) {
             Ok(None) => {}
             Ok(Some(status)) => return epsh::eval::ProgramOutcome::Completed(status),
             Err(error) => {
-                eprintln!("ish: cannot continue foreground job: {error}");
+                report!("ish: cannot continue foreground job: {error}");
                 return epsh::eval::ProgramOutcome::Completed(epsh::error::ExitStatus::FAILURE);
             }
         }
@@ -361,7 +353,7 @@ fn capture_output<T>(
         }
         Ok(None) => (run(), None),
         Err(error) => {
-            eprintln!("ish: output capture unavailable: {error}");
+            report!("ish: output capture unavailable: {error}");
             (run(), None)
         }
     }
@@ -377,16 +369,16 @@ fn write_clipboard(bytes: &[u8]) {
 
 fn copy_last_output(args: &[epsh::ast::Word], output: &capture::OutputBuffer) -> i32 {
     if !args.is_empty() {
-        eprintln!("ish: ?: takes no arguments");
+        report!("ish: ?: takes no arguments");
         return 2;
     }
     let text = output.plain_text();
     if text.is_empty() {
-        eprintln!("ish: ?: the last command wrote no text to the terminal");
+        report!("ish: ?: the last command wrote no text to the terminal");
         return 1;
     }
     if output.is_truncated() {
-        eprintln!(
+        report!(
             "ish: ?: output exceeded {} KiB; copied only its end",
             capture::OUTPUT_LIMIT / 1024
         );
@@ -406,7 +398,7 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
     }
 
     let Some(command) = builtin::lookup(name).and_then(builtin::Builtin::shell_command) else {
-        eprintln!("ish: internal error: no shell handler for builtin {name}");
+        report!("ish: internal error: no shell handler for builtin {name}");
         shell.last_status = 1;
         return false;
     };
@@ -422,14 +414,14 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                 None => return false,
             };
             if args.len() > 1 {
-                eprintln!("ish: cd: too many arguments");
+                report!("ish: cd: too many arguments");
                 shell.last_status = 1;
             } else if args.first().map(|arg| arg.as_bytes()) == Some(b"-".as_slice()) {
                 if let Some(prev) = store_env_os(&shell.epsh, "OLDPWD").filter(|s| !s.is_empty()) {
-                    eprintln!("{}", Path::new(&prev).display());
+                    report!("{}", Path::new(&prev).display());
                     shell.last_status = change_directory_path(Path::new(&prev), shell);
                 } else {
-                    eprintln!("ish: cd: no previous directory");
+                    report!("ish: cd: no previous directory");
                     shell.last_status = 1;
                 }
             } else {
@@ -476,13 +468,13 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                     match trash::run(path, assume_yes, store_env_os(&shell.epsh, "HOME")) {
                         Ok(()) => shell.last_status = 0,
                         Err(error) => {
-                            eprintln!("ish: {name}: {error}");
+                            report!("ish: {name}: {error}");
                             shell.last_status = if error.kind() == std::io::ErrorKind::Interrupted { 130 } else { 1 };
                         }
                     }
                 }
                 Err(error) => {
-                    eprintln!("ish: {name}: {error}");
+                    report!("ish: {name}: {error}");
                     shell.last_status = 2;
                 }
             }
@@ -501,7 +493,7 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
         ShellCommand::Jump => {
             let args = expanded_args!();
             let Some(home) = shell.home.as_deref() else {
-                eprintln!("ish: z: HOME is not UTF-8");
+                report!("ish: z: HOME is not UTF-8");
                 shell.last_status = 1;
                 return false;
             };
@@ -537,7 +529,7 @@ fn write_layout_dump(shell: &Shell) -> i32 {
             0
         }
         Err(message) => {
-            eprintln!("{message}");
+            report!("{message}");
             1
         }
     }
@@ -580,7 +572,7 @@ fn expand_aliases_for_history(line: &str, aliases: &AliasMap) -> String {
 fn sync_path_var(epsh: &mut epsh::eval::Shell, name: &str, path: &Path) {
     match epsh.vars_mut().set_bytes(name, epsh::shell_bytes::ShellBytes::from_os_str(path.as_os_str())) {
         Ok(()) => epsh.vars_mut().export(name),
-        Err(error) => eprintln!("ish: {error}"),
+        Err(error) => report!("ish: {error}"),
     }
 }
 
@@ -590,7 +582,7 @@ fn sync_cwd_change(shell: &mut Shell, old_cwd: &Path, new_cwd: std::path::PathBu
     shell.epsh.set_cwd(new_cwd);
     push_dir_stack(&mut shell.dir_stack);
     shell.prompt.invalidate_git();
-    if let Err(error) = denv::on_cd(&shell.denv, &mut shell.epsh) { eprintln!("denv: {error}"); }
+    if let Err(error) = denv::on_cd(&shell.denv, &mut shell.epsh) { report!("denv: {error}"); }
     sync_shell_store_derived(shell);
 }
 
@@ -605,7 +597,7 @@ fn expand_builtin_args(
         match String::from_utf8(field.into_vec()) {
             Ok(field) => args.push(field),
             Err(error) => {
-                eprintln!("ish: {name}: argument is not UTF-8: {error}");
+                report!("ish: {name}: argument is not UTF-8: {error}");
                 shell.last_status = 1;
                 return None;
             }
@@ -624,7 +616,7 @@ fn expand_builtin_args_bytes(
         match epsh::expand::expand_word_to_fields(word, &mut shell.epsh) {
             Ok(fields) => args.extend(fields.iter().map(|field| epsh::shell_bytes::ShellBytes::from_str_lossless(field))),
             Err(e) => {
-                eprintln!("ish: {name}: expansion error: {e}");
+                report!("ish: {name}: expansion error: {e}");
                 shell.last_status = 1;
                 return None;
             }
@@ -647,7 +639,7 @@ fn change_directory(target: &str, shell: &mut Shell) -> i32 {
 
 fn change_directory_path(target: &Path, shell: &mut Shell) -> i32 {
     if let Err(e) = std::env::set_current_dir(target) {
-        eprintln!("ish: cd: {}: {e}", target.display());
+        report!("ish: cd: {}: {e}", target.display());
         return 1;
     }
 
@@ -683,7 +675,7 @@ fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
             shell.last_status = code;
             return true;
         } else {
-            eprintln!("ish: there is a suspended job. Exit again to force quit.");
+            report!("ish: there is a suspended job. Exit again to force quit.");
             shell.exit_warned = true;
             shell.last_status = 1;
             return false;
@@ -705,7 +697,7 @@ fn handle_alias(line: &str, shell: &mut Shell) {
             println!("alias {} {}", words[0], exp.join(" "));
             shell.last_status = 0;
         } else {
-            eprintln!("ish: alias: not found: {}", words[0]);
+            report!("ish: alias: not found: {}", words[0]);
             shell.last_status = 1;
         }
     } else {
@@ -748,14 +740,14 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
             match shell.history.reset() {
                 Ok(()) => shell.last_status = 0,
                 Err(error) => {
-                    eprintln!("ish: history reset: {error}");
+                    report!("ish: history reset: {error}");
                     shell.last_status = 1;
                 }
             }
             true
         }
         Some(other) => {
-            eprintln!("ish: history: unknown subcommand: {other}");
+            report!("ish: history: unknown subcommand: {other}");
             shell.last_status = 1;
             true
         }
@@ -770,7 +762,7 @@ fn handle_exit(shell: &mut Shell) -> ReadResult {
             }
             ReadResult::Exit
         } else {
-            eprintln!("ish: there is a suspended job. Press Ctrl+D again to force quit.");
+            report!("ish: there is a suspended job. Press Ctrl+D again to force quit.");
             shell.exit_warned = true;
             ReadResult::Empty
         }
@@ -813,13 +805,13 @@ fn read_line(shell: &mut Shell) -> ReadResult {
 fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadResult {
     let _raw = match term::RawMode::enable() {
         Ok(raw) => raw,
-        Err(error) => { report_teardown(format_args!("ish: raw mode: {error}\n")); return ReadResult::Exit; }
+        Err(error) => { report!("ish: raw mode: {error}\n"); return ReadResult::Exit; }
     };
     // Catch SIGINT while editing (the top-level disposition ignores it) so
     // kill -INT cancels the line instead of doing nothing. Restored on drop.
     let _foreground_signals = match signal::ForegroundSignals::install() {
         Ok(guard) => guard,
-        Err(error) => { report_teardown(format_args!("ish: foreground signals: {error}\n")); return ReadResult::Exit; }
+        Err(error) => { report!("ish: foreground signals: {error}\n"); return ReadResult::Exit; }
     };
     emit_working_directory(shell);
     if shell.prompt_needs_line_start {
@@ -836,7 +828,7 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
     let display_len = shell.prompt.display_len(&prompt);
     let context = editor_context(&shell.aliases, &shell.history, &shell.epsh, shell.home.as_deref(), &shell.home_display, &shell.dir_stack);
     shell.editor.begin(prompt, display_len, &context);
-    if let Err(error) = flush_editor(&mut shell.editor) { report_teardown(format_args!("ish: output: {error}\n")); return ReadResult::Exit; }
+    if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); return ReadResult::Exit; }
     loop {
         let input = reader.read_event();
         let event = match &input {
@@ -859,28 +851,28 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
             EditorAction::Continue => {}
             EditorAction::Complete => shell.editor.complete(&context),
             EditorAction::SearchHistory => {
-                if let Err(error) = shell.history.sync() { eprintln!("ish: cannot sync history: {error}"); }
+                if let Err(error) = shell.history.sync() { report!("ish: cannot sync history: {error}"); }
                 let context = editor_context(&shell.aliases, &shell.history, &shell.epsh, shell.home.as_deref(), &shell.home_display, &shell.dir_stack);
                 shell.editor.search_history(&context);
             }
             EditorAction::Dump => {
                 shell.editor.render_layout_dump(&mut shell.layout_dump, &context);
-                if let Err(error) = write_layout_dump_to_file(shell) { eprintln!("{error}"); }
+                if let Err(error) = write_layout_dump_to_file(shell) { report!("{error}"); }
             }
-            EditorAction::ChangeDirectory(directory) => { eprintln!("{directory}"); change_directory(&directory, shell); }
+            EditorAction::ChangeDirectory(directory) => { report!("{directory}"); change_directory(&directory, shell); }
             EditorAction::Submit(line) => {
                 shell.editor.render_layout_dump(&mut shell.layout_dump, &context);
                 shell.prompt_buf = shell.editor.take_prompt();
-                if let Err(error) = flush_editor(&mut shell.editor) { report_teardown(format_args!("ish: output: {error}\n")); return ReadResult::Exit; }
+                if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); return ReadResult::Exit; }
                 return if line.is_empty() { ReadResult::Empty } else { ReadResult::Line(line) };
             }
             EditorAction::Cancel | EditorAction::Exit => {
                 shell.prompt_buf = shell.editor.take_prompt();
-                if let Err(error) = flush_editor(&mut shell.editor) { report_teardown(format_args!("ish: output: {error}\n")); return ReadResult::Exit; }
+                if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); return ReadResult::Exit; }
                 return match action { EditorAction::Exit => handle_exit(shell), _ => ReadResult::Empty };
             }
         }
-        if let Err(error) = flush_editor(&mut shell.editor) { report_teardown(format_args!("ish: output: {error}\n")); return ReadResult::Exit; }
+        if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); return ReadResult::Exit; }
     }
 }
 

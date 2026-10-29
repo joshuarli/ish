@@ -1,3 +1,4 @@
+use crate::report;
 use fxhash::FxHashMap;
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -81,7 +82,7 @@ impl History {
             }
             let store = history.store.as_mut().expect("store was just opened");
             let salvage = store.salvage()?;
-            eprintln!(
+            report!(
                 "ish: history log damaged ({error}); kept {} bytes and moved the rest to {}",
                 salvage.kept,
                 salvage.moved_to.display()

@@ -5,6 +5,19 @@ use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::Path;
 
+/// Write a diagnostic line to standard error, discarding failures.
+///
+/// Standard `eprintln!` panics when standard error itself is gone: a hung-up
+/// terminal fails every write. Diagnostics must never turn a quiet exit into
+/// a panic, so production code reports through this macro instead.
+#[macro_export]
+macro_rules! report {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 pub(crate) struct LayoutSnapshot<'a> {
     pub rows: u16,
     pub cols: u16,
