@@ -1,4 +1,6 @@
 use crate::report;
+use std::cmp::Ordering;
+use std::fmt;
 use std::os::unix::fs::MetadataExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,26 +41,34 @@ fn render(entries: &[Entry]) -> String {
     let size_w = entries
         .iter()
         .filter_map(|e| e.size.as_ref())
-        .map(|s| s.chars().count())
+        .map(Field::len)
         .max()
         .unwrap_or(0);
-    let age_w = entries
-        .iter()
-        .map(|e| e.age.chars().count())
-        .max()
-        .unwrap_or(0);
+    let age_w = entries.iter().map(|e| e.age.len()).max().unwrap_or(0);
     let max_size = entries.iter().filter_map(|e| e.size_bytes).max().unwrap_or(0);
     let show_bar = max_size > 0;
 
-    let mut out = String::new();
+    // One allocation for the whole listing: visible text plus slack for
+    // separators, bars, and escape codes.
+    let mut cap = entries.len();
     for e in entries {
-        out.push_str(&e.color_start);
+        cap += prefix_len(e)
+            + e.size.as_ref().map_or(0, Field::len)
+            + e.age.len()
+            + e.color_start.len()
+            + e.age_shade.len()
+            + 64;
+    }
+    let mut out = String::with_capacity(cap);
+    for e in entries {
+        out.push_str(e.color_start);
         out.push_str(&e.display_name);
         if !e.color_start.is_empty() {
             out.push_str("\x1b[0m");
         }
         if let Some(ref target) = e.link_target {
-            out.push_str(&format!(" -> {target}"));
+            out.push_str(" -> ");
+            out.push_str(target);
         }
         for _ in prefix_len(e)..name_w {
             out.push(' ');
@@ -66,10 +76,10 @@ fn render(entries: &[Entry]) -> String {
         out.push_str("  ");
         if size_w > 0 {
             if let Some(ref size) = e.size {
-                for _ in size.chars().count()..size_w {
+                for _ in size.len()..size_w {
                     out.push(' ');
                 }
-                out.push_str(size);
+                out.push_str(size.as_str());
             } else {
                 for _ in 0..size_w {
                     out.push(' ');
@@ -80,7 +90,7 @@ fn render(entries: &[Entry]) -> String {
         if show_bar {
             if let Some(bytes) = e.size_bytes {
                 out.push_str("\x1b[2m");
-                out.push_str(&size_bar(bytes, max_size));
+                write_size_bar(&mut out, bytes, max_size);
                 out.push_str("\x1b[0m");
             } else {
                 for _ in 0..SIZE_BAR_CELLS {
@@ -89,13 +99,13 @@ fn render(entries: &[Entry]) -> String {
             }
             out.push_str("  ");
         }
-        for _ in e.age.chars().count()..age_w {
+        for _ in e.age.len()..age_w {
             out.push(' ');
         }
         if !e.age_shade.is_empty() {
             out.push_str(e.age_shade);
         }
-        out.push_str(&e.age);
+        out.push_str(e.age.as_str());
         if !e.age_shade.is_empty() {
             out.push_str("\x1b[0m");
         }
@@ -106,12 +116,65 @@ fn render(entries: &[Entry]) -> String {
 
 struct Entry {
     size_bytes: Option<u64>,
-    size: Option<String>,
-    age: String,
+    size: Option<Field>,
+    age: Field,
     age_shade: &'static str,
     display_name: String,
     link_target: Option<String>,
-    color_start: String,
+    color_start: &'static str,
+}
+
+/// Stack-allocated ASCII field for sizes and ages: formatted with no heap
+/// use. All writers emit ASCII, so byte length is the display width.
+#[derive(Debug)]
+struct Field {
+    buf: [u8; 24],
+    len: u8,
+}
+
+impl Field {
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    fn as_str(&self) -> &str {
+        str::from_utf8(&self.buf[..self.len()]).expect("ls fields are ASCII")
+    }
+}
+
+impl PartialEq<&str> for Field {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl<'a> From<&'a str> for Field {
+    fn from(text: &'a str) -> Self {
+        field(format_args!("{text}"))
+    }
+}
+
+struct FieldWriter {
+    buf: [u8; 24],
+    len: usize,
+}
+
+impl fmt::Write for FieldWriter {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let bytes = text.as_bytes();
+        if self.len + bytes.len() > self.buf.len() {
+            return Err(fmt::Error);
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        Ok(())
+    }
+}
+
+fn field(args: fmt::Arguments) -> Field {
+    let mut out = FieldWriter { buf: [0; 24], len: 0 };
+    fmt::write(&mut out, args).expect("ls field fits in 24 bytes");
+    Field { buf: out.buf, len: out.len as u8 }
 }
 
 fn read_entries(
@@ -132,13 +195,14 @@ fn read_entries(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        return Ok(vec![build_entry(&name, p, &top_meta, now)]);
+        return Ok(vec![build_entry(&name, Some(p), &top_meta, now)]);
     }
 
     let mut entries = Vec::new();
     for dir_entry in std::fs::read_dir(path)? {
         let dir_entry = dir_entry?;
-        let name = dir_entry.file_name().to_string_lossy().into_owned();
+        let os_name = dir_entry.file_name();
+        let name = os_name.to_string_lossy();
 
         if name == "." || name == ".." {
             continue;
@@ -147,35 +211,49 @@ fn read_entries(
             continue;
         }
 
-        let full_path = dir_entry.path();
-        let lmeta = match std::fs::symlink_metadata(&full_path) {
+        // fstatat on the open dir: same lstat data as symlink_metadata with
+        // no path join and no allocation. Only symlinks pay for the joined
+        // path below, for the target stat and readlink.
+        let lmeta = match dir_entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
         };
-        entries.push(build_entry(&name, &full_path, &lmeta, now));
+        let store;
+        let for_link = if lmeta.file_type().is_symlink() {
+            store = dir_entry.path();
+            Some(store.as_path())
+        } else {
+            None
+        };
+        entries.push(build_entry(&name, for_link, &lmeta, now));
     }
 
-    entries.sort_by(|a, b| {
-        a.display_name
-            .to_lowercase()
-            .cmp(&b.display_name.to_lowercase())
-    });
+    entries.sort_by(|a, b| caseless_cmp(&a.display_name, &b.display_name));
 
     Ok(entries)
 }
 
+/// Case-insensitive ordering without allocating: `str::to_lowercase` is
+/// exactly `chars().flat_map(char::to_lowercase).collect()`, and comparing
+/// those scalar streams matches comparing the lowered strings, since UTF-8
+/// byte order preserves scalar order.
+fn caseless_cmp(a: &str, b: &str) -> Ordering {
+    a.chars()
+        .flat_map(|c| c.to_lowercase())
+        .cmp(b.chars().flat_map(|c| c.to_lowercase()))
+}
+
 fn build_entry(
     name: &str,
-    full_path: &std::path::Path,
+    full_path: Option<&std::path::Path>,
     lmeta: &std::fs::Metadata,
     now: i64,
 ) -> Entry {
     let mode = lmeta.mode();
     let is_link = lmeta.file_type().is_symlink();
-    let target_meta = if is_link {
-        std::fs::metadata(full_path).ok()
-    } else {
-        None
+    let target_meta = match full_path {
+        Some(p) if is_link => std::fs::metadata(p).ok(),
+        _ => None,
     };
     let is_dir = if is_link {
         target_meta.as_ref().is_some_and(|m| m.is_dir())
@@ -184,12 +262,11 @@ fn build_entry(
     };
     let is_exec = !is_dir && mode & 0o111 != 0;
 
-    let link_target = if is_link {
-        std::fs::read_link(full_path)
+    let link_target = match full_path {
+        Some(p) if is_link => std::fs::read_link(p)
             .ok()
-            .map(|p| sanitize_name(&p.to_string_lossy()))
-    } else {
-        None
+            .map(|p| sanitize_name(&p.to_string_lossy())),
+        _ => None,
     };
 
     let safe_name = sanitize_name(name);
@@ -199,18 +276,18 @@ fn build_entry(
         safe_name
     };
 
-    let color_start = if is_link && target_meta.is_none() {
-        "\x1b[1;31m".to_string()
+    let color_start: &'static str = if is_link && target_meta.is_none() {
+        "\x1b[1;31m"
     } else if is_link {
-        "\x1b[36m".to_string()
+        "\x1b[36m"
     } else if is_dir {
-        "\x1b[34m".to_string()
+        "\x1b[34m"
     } else if mode & 0o4000 != 0 {
-        "\x1b[31m".to_string()
+        "\x1b[31m"
     } else if is_exec {
-        "\x1b[1;32m".to_string()
+        "\x1b[1;32m"
     } else {
-        String::new()
+        ""
     };
 
     let diff = age_diff(lmeta.mtime(), now);
@@ -243,15 +320,15 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
-fn human_size(size: u64) -> String {
+fn human_size(size: u64) -> Field {
     if size < 1024 {
-        format!("{size}B")
+        field(format_args!("{size}B"))
     } else if size < 1024 * 1024 {
-        format!("{:.1}K", size as f64 / 1024.0)
+        field(format_args!("{:.1}K", size as f64 / 1024.0))
     } else if size < 1024 * 1024 * 1024 {
-        format!("{:.1}M", size as f64 / (1024.0 * 1024.0))
+        field(format_args!("{:.1}M", size as f64 / (1024.0 * 1024.0)))
     } else {
-        format!("{:.1}G", size as f64 / (1024.0 * 1024.0 * 1024.0))
+        field(format_args!("{:.1}G", size as f64 / (1024.0 * 1024.0 * 1024.0)))
     }
 }
 
@@ -266,25 +343,26 @@ fn age_diff(mtime: i64, now: i64) -> i64 {
     now.saturating_sub(mtime).max(0)
 }
 
-fn relative_age(mtime: i64, now: i64) -> String {
+#[cfg(test)]
+fn relative_age(mtime: i64, now: i64) -> Field {
     relative_age_str(age_diff(mtime, now))
 }
 
-fn relative_age_str(diff: i64) -> String {
+fn relative_age_str(diff: i64) -> Field {
     const MINUTE: i64 = 60;
     const HOUR: i64 = 3600;
     const DAY: i64 = 86400;
     const YEAR: i64 = 365 * DAY;
     if diff < MINUTE {
-        format!("{diff}s")
+        field(format_args!("{diff}s"))
     } else if diff < HOUR {
-        format!("{}m", diff / MINUTE)
+        field(format_args!("{}m", diff / MINUTE))
     } else if diff < DAY {
-        format!("{}h", diff / HOUR)
+        field(format_args!("{}h", diff / HOUR))
     } else if diff < YEAR {
-        format!("{}d", diff / DAY)
+        field(format_args!("{}d", diff / DAY))
     } else {
-        format!("{}y", diff / YEAR)
+        field(format_args!("{}y", diff / YEAR))
     }
 }
 
@@ -311,8 +389,8 @@ const SIZE_BAR_PARTIALS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '�
 
 /// Log-scale bar showing a file's size relative to `max`, the largest size
 /// in the listing. Any nonzero size earns at least a sliver; zero reads as
-/// an empty track.
-fn size_bar(size: u64, max: u64) -> String {
+/// an empty track. Written straight into the output buffer: no allocation.
+fn write_size_bar(out: &mut String, size: u64, max: u64) {
     let level = if max == 0 {
         0.0
     } else {
@@ -320,10 +398,9 @@ fn size_bar(size: u64, max: u64) -> String {
     };
     let mut eighths = (level * (SIZE_BAR_CELLS as f64) * 8.0).round() as usize;
     eighths = eighths.min(SIZE_BAR_CELLS * 8);
-    let mut bar = String::new();
     for _ in 0..SIZE_BAR_CELLS {
         let take = eighths.min(8);
-        bar.push(if take == 8 {
+        out.push(if take == 8 {
             '█'
         } else if take == 0 {
             '░'
@@ -332,12 +409,11 @@ fn size_bar(size: u64, max: u64) -> String {
         });
         eighths -= take;
     }
-    bar
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{age_shade, read_entries, relative_age, size_bar};
+    use super::{age_shade, read_entries, relative_age, write_size_bar};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -415,15 +491,20 @@ mod tests {
 
     #[test]
     fn size_bar_levels() {
-        assert_eq!(size_bar(10854, 10854), "██████");
-        assert_eq!(size_bar(0, 10854), "░░░░░░");
-        assert_eq!(size_bar(10, 10854), "█▌░░░░");
-        assert_eq!(size_bar(30, 10854), "██▎░░░");
-        assert_eq!(size_bar(0, 0), "░░░░░░");
+        fn bar(size: u64, max: u64) -> String {
+            let mut out = String::new();
+            write_size_bar(&mut out, size, max);
+            out
+        }
+        assert_eq!(bar(10854, 10854), "██████");
+        assert_eq!(bar(0, 10854), "░░░░░░");
+        assert_eq!(bar(10, 10854), "█▌░░░░");
+        assert_eq!(bar(30, 10854), "██▎░░░");
+        assert_eq!(bar(0, 0), "░░░░░░");
         for (bytes, max) in [(1, u64::MAX), (1, 1 << 40), (512, 1 << 30)] {
-            let bar = size_bar(bytes, max);
-            assert_eq!(bar.chars().count(), 6);
-            assert_ne!(bar, "░░░░░░", "nonzero size must leave a mark");
+            let rendered = bar(bytes, max);
+            assert_eq!(rendered.chars().count(), 6);
+            assert_ne!(rendered, "░░░░░░", "nonzero size must leave a mark");
         }
     }
 
@@ -461,14 +542,15 @@ mod tests {
 
     #[test]
     fn rendered_columns_align() {
+        use super::Field;
         let entry = |display_name: &str, size: Option<(u64, &str)>, age: &str| super::Entry {
             size_bytes: size.map(|(bytes, _)| bytes),
-            size: size.map(|(_, text)| text.to_owned()),
-            age: age.to_owned(),
+            size: size.map(|(_, text)| Field::from(text)),
+            age: Field::from(age),
             age_shade: "",
             display_name: display_name.to_owned(),
             link_target: None,
-            color_start: String::new(),
+            color_start: "",
         };
         let entries = vec![
             entry("a.txt", Some((10, "10B")), "2h"),
@@ -502,7 +584,7 @@ mod tests {
         let color = |name: &str| {
             let p = dir.join(name);
             let m = std::fs::symlink_metadata(&p).unwrap();
-            super::build_entry(name, &p, &m, now).color_start
+            super::build_entry(name, Some(&p), &m, now).color_start
         };
         assert_eq!(color("plain"), "");
         assert_eq!(color("exec"), "\x1b[1;32m");
