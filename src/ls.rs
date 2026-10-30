@@ -4,7 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Native directory listing: `l` hides dotfiles, `ll` shows them.
 /// Each line is `name size age`; directories and symlinks omit the size.
-/// Writes output to stdout directly. Returns 0 on success, 1 on error.
+/// Directories are blue, links cyan (bold red when broken), executables
+/// bold green. Writes output to stdout directly. Returns 0 on success,
+/// 1 on error.
 pub fn list_dir(path: impl AsRef<std::path::Path>, show_hidden: bool) -> i32 {
     let path = path.as_ref();
     let now = now_secs();
@@ -148,10 +150,13 @@ fn build_entry(
 ) -> Entry {
     let mode = lmeta.mode();
     let is_link = lmeta.file_type().is_symlink();
+    let target_meta = if is_link {
+        std::fs::metadata(full_path).ok()
+    } else {
+        None
+    };
     let is_dir = if is_link {
-        std::fs::metadata(full_path)
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
+        target_meta.as_ref().is_some_and(|m| m.is_dir())
     } else {
         lmeta.is_dir()
     };
@@ -172,14 +177,16 @@ fn build_entry(
         safe_name
     };
 
-    let color_start = if is_link {
+    let color_start = if is_link && target_meta.is_none() {
+        "\x1b[1;31m".to_string()
+    } else if is_link {
         "\x1b[36m".to_string()
     } else if is_dir {
         "\x1b[34m".to_string()
     } else if mode & 0o4000 != 0 {
         "\x1b[31m".to_string()
     } else if is_exec {
-        "\x1b[32m".to_string()
+        "\x1b[1;32m".to_string()
     } else {
         String::new()
     };
@@ -345,5 +352,27 @@ mod tests {
             widths.windows(2).all(|w| w[0] == w[1]),
             "columns should align: {widths:?}\n{out}"
         );
+    }
+
+    #[test]
+    fn semantic_colors() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempdir(&["plain", "exec"]);
+        std::fs::set_permissions(dir.join("exec"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("plain", dir.join("good")).unwrap();
+        symlink("missing", dir.join("broken")).unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let now = super::now_secs();
+        let color = |name: &str| {
+            let p = dir.join(name);
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            super::build_entry(name, &p, &m, now).color_start
+        };
+        assert_eq!(color("plain"), "");
+        assert_eq!(color("exec"), "\x1b[1;32m");
+        assert_eq!(color("good"), "\x1b[36m");
+        assert_eq!(color("broken"), "\x1b[1;31m");
+        assert_eq!(color("sub"), "\x1b[34m");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
