@@ -346,18 +346,19 @@ fn relative_age_str(diff: i64) -> Field {
     }
 }
 
-/// Grey ramp for the age column, keyed on absolute age. Recent files keep
-/// the default color; months-old files fade toward dark grey, floored at a
-/// shade that stays readable on dark terminals.
+/// Grey ramp for the age column, keyed on absolute age. Files from the last
+/// day keep the default color; week-old files are already clearly grey and
+/// older files fade toward dark grey, floored at a shade that stays
+/// readable on dark terminals.
 fn age_shade(diff: i64) -> &'static str {
     const DAY: i64 = 86400;
-    if diff < 30 * DAY {
+    if diff < DAY {
         ""
-    } else if diff < 90 * DAY {
+    } else if diff < 7 * DAY {
         "\x1b[38;5;250m"
-    } else if diff < 180 * DAY {
+    } else if diff < 30 * DAY {
         "\x1b[38;5;246m"
-    } else if diff < 365 * DAY {
+    } else if diff < 90 * DAY {
         "\x1b[38;5;242m"
     } else {
         "\x1b[38;5;240m"
@@ -446,14 +447,14 @@ mod tests {
     fn age_shade_steps() {
         const DAY: i64 = 86400;
         assert_eq!(age_shade(0), "");
-        assert_eq!(age_shade(29 * DAY), "");
-        assert_eq!(age_shade(30 * DAY), "\x1b[38;5;250m");
-        assert_eq!(age_shade(89 * DAY), "\x1b[38;5;250m");
-        assert_eq!(age_shade(90 * DAY), "\x1b[38;5;246m");
-        assert_eq!(age_shade(179 * DAY), "\x1b[38;5;246m");
-        assert_eq!(age_shade(180 * DAY), "\x1b[38;5;242m");
-        assert_eq!(age_shade(364 * DAY), "\x1b[38;5;242m");
-        assert_eq!(age_shade(365 * DAY), "\x1b[38;5;240m");
+        assert_eq!(age_shade(23 * 3600), "");
+        assert_eq!(age_shade(DAY), "\x1b[38;5;250m");
+        assert_eq!(age_shade(6 * DAY), "\x1b[38;5;250m");
+        assert_eq!(age_shade(7 * DAY), "\x1b[38;5;246m");
+        assert_eq!(age_shade(29 * DAY), "\x1b[38;5;246m");
+        assert_eq!(age_shade(30 * DAY), "\x1b[38;5;242m");
+        assert_eq!(age_shade(89 * DAY), "\x1b[38;5;242m");
+        assert_eq!(age_shade(90 * DAY), "\x1b[38;5;240m");
         assert_eq!(age_shade(800 * DAY), "\x1b[38;5;240m");
     }
 
