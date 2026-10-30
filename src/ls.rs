@@ -21,8 +21,33 @@ pub fn list_dir(path: impl AsRef<std::path::Path>, show_hidden: bool) -> i32 {
         return 0;
     }
 
+    print!("{}", render(&entries));
+    0
+}
+
+fn render(entries: &[Entry]) -> String {
+    let prefix_len = |e: &Entry| {
+        let mut len = e.display_name.chars().count();
+        if let Some(ref target) = e.link_target {
+            len += " -> ".chars().count() + target.chars().count();
+        }
+        len
+    };
+    let name_w = entries.iter().map(prefix_len).max().unwrap_or(0);
+    let size_w = entries
+        .iter()
+        .filter_map(|e| e.size.as_ref())
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0);
+    let age_w = entries
+        .iter()
+        .map(|e| e.age.chars().count())
+        .max()
+        .unwrap_or(0);
+
     let mut out = String::new();
-    for e in &entries {
+    for e in entries {
         out.push_str(&e.color_start);
         out.push_str(&e.display_name);
         if !e.color_start.is_empty() {
@@ -31,15 +56,30 @@ pub fn list_dir(path: impl AsRef<std::path::Path>, show_hidden: bool) -> i32 {
         if let Some(ref target) = e.link_target {
             out.push_str(&format!(" -> {target}"));
         }
-        if let Some(ref size) = e.size {
-            out.push_str(&format!(" {size}"));
+        for _ in prefix_len(e)..name_w {
+            out.push(' ');
         }
-        out.push_str(&format!(" {}", e.age));
+        out.push_str("  ");
+        if size_w > 0 {
+            if let Some(ref size) = e.size {
+                for _ in size.chars().count()..size_w {
+                    out.push(' ');
+                }
+                out.push_str(size);
+            } else {
+                for _ in 0..size_w {
+                    out.push(' ');
+                }
+            }
+            out.push_str("  ");
+        }
+        for _ in e.age.chars().count()..age_w {
+            out.push(' ');
+        }
+        out.push_str(&e.age);
         out.push('\n');
     }
-
-    print!("{out}");
-    0
+    out
 }
 
 struct Entry {
@@ -280,5 +320,30 @@ mod tests {
             .unwrap();
         assert!(sub.size.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rendered_columns_align() {
+        let entry = |display_name: &str, size: Option<&str>, age: &str| super::Entry {
+            size: size.map(str::to_owned),
+            age: age.to_owned(),
+            display_name: display_name.to_owned(),
+            link_target: None,
+            color_start: String::new(),
+        };
+        let entries = vec![
+            entry("a.txt", Some("1B"), "4s"),
+            entry("longname.txt", Some("10.6K"), "40d"),
+            entry("d/", None, "2h"),
+        ];
+        let out = super::render(&entries);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1], "longname.txt  10.6K  40d");
+        let widths: Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "columns should align: {widths:?}\n{out}"
+        );
     }
 }
