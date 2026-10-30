@@ -44,11 +44,13 @@ behavior contract.
 - Execution flow, epsh integration, command routing, process boundaries, and module ownership: [Architecture](docs/architecture.md).
 - History search ranking and session snapshots: [History search](docs/history-search.md).
 - Completion matching, ordering, and hot-path constraints: [Completion](docs/completion.md).
+- Design decisions: [capture and retirement](docs/rfc/ISH-32-capture-and-retire.md) and [release delivery](docs/rfc/ISH-42-release-delivery.md); [TODO](TODO.md) indexes the rest of `docs/rfc/`.
 - PTY test environment and synchronization: [PTY tests](docs/ptytest.md).
 - Lean project and bridge commands: [formal guide](formal/README.md),
   [protocol](formal/PROTOCOL.md), and
   [verification coverage](docs/verification/coverage.md).
 - Verification details: [expansion generation](docs/verification/expansion-generation.md),
   [mutations](docs/verification/mutation-testing.md),
-  [shift refinement](docs/verification/refinement.md), and
+  [shift refinement](docs/verification/refinement.md),
+  [capture convergence](docs/verification/capture-convergence.md), and
   [history-search measurements](docs/verification/history-search-profile.md).
