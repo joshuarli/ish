@@ -47,6 +47,8 @@ fn render(entries: &[Entry]) -> String {
         .map(|e| e.age.chars().count())
         .max()
         .unwrap_or(0);
+    let max_size = entries.iter().filter_map(|e| e.size_bytes).max().unwrap_or(0);
+    let show_bar = max_size > 0;
 
     let mut out = String::new();
     for e in entries {
@@ -75,18 +77,38 @@ fn render(entries: &[Entry]) -> String {
             }
             out.push_str("  ");
         }
+        if show_bar {
+            if let Some(bytes) = e.size_bytes {
+                out.push_str("\x1b[2m");
+                out.push_str(&size_bar(bytes, max_size));
+                out.push_str("\x1b[0m");
+            } else {
+                for _ in 0..SIZE_BAR_CELLS {
+                    out.push(' ');
+                }
+            }
+            out.push_str("  ");
+        }
         for _ in e.age.chars().count()..age_w {
             out.push(' ');
         }
+        if !e.age_shade.is_empty() {
+            out.push_str(e.age_shade);
+        }
         out.push_str(&e.age);
+        if !e.age_shade.is_empty() {
+            out.push_str("\x1b[0m");
+        }
         out.push('\n');
     }
     out
 }
 
 struct Entry {
+    size_bytes: Option<u64>,
     size: Option<String>,
     age: String,
+    age_shade: &'static str,
     display_name: String,
     link_target: Option<String>,
     color_start: String,
@@ -191,13 +213,21 @@ fn build_entry(
         String::new()
     };
 
+    let diff = age_diff(lmeta.mtime(), now);
+
     Entry {
+        size_bytes: if lmeta.is_file() {
+            Some(lmeta.len())
+        } else {
+            None
+        },
         size: if lmeta.is_file() {
             Some(human_size(lmeta.len()))
         } else {
             None
         },
-        age: relative_age(lmeta.mtime(), now),
+        age: relative_age_str(diff),
+        age_shade: age_shade(diff),
         display_name,
         link_target,
         color_start,
@@ -232,8 +262,15 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+fn age_diff(mtime: i64, now: i64) -> i64 {
+    now.saturating_sub(mtime).max(0)
+}
+
 fn relative_age(mtime: i64, now: i64) -> String {
-    let diff = now.saturating_sub(mtime).max(0);
+    relative_age_str(age_diff(mtime, now))
+}
+
+fn relative_age_str(diff: i64) -> String {
     const MINUTE: i64 = 60;
     const HOUR: i64 = 3600;
     const DAY: i64 = 86400;
@@ -251,9 +288,56 @@ fn relative_age(mtime: i64, now: i64) -> String {
     }
 }
 
+/// Grey ramp for the age column, keyed on absolute age. Recent files keep
+/// the default color; months-old files fade toward dark grey, floored at a
+/// shade that stays readable on dark terminals.
+fn age_shade(diff: i64) -> &'static str {
+    const DAY: i64 = 86400;
+    if diff < 30 * DAY {
+        ""
+    } else if diff < 90 * DAY {
+        "\x1b[38;5;250m"
+    } else if diff < 180 * DAY {
+        "\x1b[38;5;246m"
+    } else if diff < 365 * DAY {
+        "\x1b[38;5;242m"
+    } else {
+        "\x1b[38;5;240m"
+    }
+}
+
+const SIZE_BAR_CELLS: usize = 6;
+const SIZE_BAR_PARTIALS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+
+/// Log-scale bar showing a file's size relative to `max`, the largest size
+/// in the listing. Any nonzero size earns at least a sliver; zero reads as
+/// an empty track.
+fn size_bar(size: u64, max: u64) -> String {
+    let level = if max == 0 {
+        0.0
+    } else {
+        (1.0 + size as f64).ln() / (1.0 + max as f64).ln()
+    };
+    let mut eighths = (level * (SIZE_BAR_CELLS as f64) * 8.0).round() as usize;
+    eighths = eighths.min(SIZE_BAR_CELLS * 8);
+    let mut bar = String::new();
+    for _ in 0..SIZE_BAR_CELLS {
+        let take = eighths.min(8);
+        bar.push(if take == 8 {
+            '█'
+        } else if take == 0 {
+            '░'
+        } else {
+            SIZE_BAR_PARTIALS[take]
+        });
+        eighths -= take;
+    }
+    bar
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{read_entries, relative_age};
+    use super::{age_shade, read_entries, relative_age, size_bar};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -330,24 +414,76 @@ mod tests {
     }
 
     #[test]
+    fn size_bar_levels() {
+        assert_eq!(size_bar(10854, 10854), "██████");
+        assert_eq!(size_bar(0, 10854), "░░░░░░");
+        assert_eq!(size_bar(10, 10854), "█▌░░░░");
+        assert_eq!(size_bar(30, 10854), "██▎░░░");
+        assert_eq!(size_bar(0, 0), "░░░░░░");
+        for (bytes, max) in [(1, u64::MAX), (1, 1 << 40), (512, 1 << 30)] {
+            let bar = size_bar(bytes, max);
+            assert_eq!(bar.chars().count(), 6);
+            assert_ne!(bar, "░░░░░░", "nonzero size must leave a mark");
+        }
+    }
+
+    #[test]
+    fn age_shade_steps() {
+        const DAY: i64 = 86400;
+        assert_eq!(age_shade(0), "");
+        assert_eq!(age_shade(29 * DAY), "");
+        assert_eq!(age_shade(30 * DAY), "\x1b[38;5;250m");
+        assert_eq!(age_shade(89 * DAY), "\x1b[38;5;250m");
+        assert_eq!(age_shade(90 * DAY), "\x1b[38;5;246m");
+        assert_eq!(age_shade(179 * DAY), "\x1b[38;5;246m");
+        assert_eq!(age_shade(180 * DAY), "\x1b[38;5;242m");
+        assert_eq!(age_shade(364 * DAY), "\x1b[38;5;242m");
+        assert_eq!(age_shade(365 * DAY), "\x1b[38;5;240m");
+        assert_eq!(age_shade(800 * DAY), "\x1b[38;5;240m");
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
     fn rendered_columns_align() {
-        let entry = |display_name: &str, size: Option<&str>, age: &str| super::Entry {
-            size: size.map(str::to_owned),
+        let entry = |display_name: &str, size: Option<(u64, &str)>, age: &str| super::Entry {
+            size_bytes: size.map(|(bytes, _)| bytes),
+            size: size.map(|(_, text)| text.to_owned()),
             age: age.to_owned(),
+            age_shade: "",
             display_name: display_name.to_owned(),
             link_target: None,
             color_start: String::new(),
         };
         let entries = vec![
-            entry("a.txt", Some("1B"), "4s"),
-            entry("longname.txt", Some("10.6K"), "40d"),
-            entry("d/", None, "2h"),
+            entry("a.txt", Some((10, "10B")), "2h"),
+            entry("longname.txt", Some((10854, "10.6K")), "40d"),
+            entry("d/", None, "3d"),
         ];
         let out = super::render(&entries);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[1], "longname.txt  10.6K  40d");
-        let widths: Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
+        let visible: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
+        assert_eq!(visible[1], "longname.txt  10.6K  ██████  40d");
+        assert_eq!(visible[0], "a.txt           10B  █▌░░░░   2h");
+        assert_eq!(visible[2], format!("d/{}3d", " ".repeat(28)));
+        // 28 = 10 name pad + 2 + 5 size + 2 + 6 bar + 2 + 1 age pad.
+        let widths: Vec<usize> = visible.iter().map(|l| l.chars().count()).collect();
         assert!(
             widths.windows(2).all(|w| w[0] == w[1]),
             "columns should align: {widths:?}\n{out}"
