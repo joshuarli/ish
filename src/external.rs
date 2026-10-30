@@ -43,9 +43,10 @@ pub fn make_external_dispatcher(
                         .collect::<Vec<_>>();
                     return fs_command::run(operation, &arguments, context).map(epsh::eval::ExternalDispatch::Handled);
                 }
-                Some(ExternalCommand::List) => {
+                Some(command @ (ExternalCommand::List | ExternalCommand::ListHidden)) => {
                     let l_args: Vec<_> = args[1..].iter().map(|arg| arg.to_path_buf()).collect();
-                    let status = builtin::list_directory(&l_args);
+                    let show_hidden = matches!(command, ExternalCommand::ListHidden);
+                    let status = builtin::list_directory(&l_args, show_hidden);
                     return Ok(epsh::eval::ExternalDispatch::Handled(epsh::error::ExitStatus::from(status)));
                 }
                 Some(ExternalCommand::ClearScreen) => {

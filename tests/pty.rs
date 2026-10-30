@@ -3335,6 +3335,34 @@ fn l_glob_expansion() {
 }
 
 #[test]
+fn l_hides_dotfiles() {
+    let sh = PtyShell::spawn_with_opts(&[("visible.txt", ""), (".hidden", "")], &[]);
+    let text = PtyShell::strip_ansi(&sh.run_command("l"));
+    assert!(
+        text.contains("visible.txt"),
+        "l should list visible files: {text:?}"
+    );
+    assert!(
+        !text.contains(".hidden"),
+        "l should hide dotfiles: {text:?}"
+    );
+}
+
+#[test]
+fn ll_shows_dotfiles() {
+    let sh = PtyShell::spawn_with_opts(&[("visible.txt", ""), (".hidden", "")], &[]);
+    let text = PtyShell::strip_ansi(&sh.run_command("ll"));
+    assert!(
+        text.contains("visible.txt"),
+        "ll should list visible files: {text:?}"
+    );
+    assert!(
+        text.contains(".hidden"),
+        "ll should list dotfiles: {text:?}"
+    );
+}
+
+#[test]
 fn quoted_string_preserves_spaces() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("echo \"hello   world\"");

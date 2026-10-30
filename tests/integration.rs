@@ -1147,32 +1147,32 @@ fn history_fuzzy_match_positions_empty_query() {
 #[test]
 fn ls_list_dir_cwd() {
     let dir = tempdir_with_files(&["file.txt"]);
-    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+    assert_eq!(ls::list_dir(dir.to_str().unwrap(), false), 0);
 }
 
 #[test]
 fn ls_list_dir_file() {
     let dir = tempdir_with_files(&["test_file.txt"]);
     let file_path = dir.join("test_file.txt");
-    assert_eq!(ls::list_dir(file_path.to_str().unwrap()), 0);
+    assert_eq!(ls::list_dir(file_path.to_str().unwrap(), false), 0);
 }
 
 #[test]
 fn ls_list_dir_nonexistent() {
-    assert_eq!(ls::list_dir("/nonexistent_path_xyz"), 1);
+    assert_eq!(ls::list_dir("/nonexistent_path_xyz", false), 1);
 }
 
 #[test]
 fn ls_list_dir_tempdir() {
     let dir = tempdir_with_files(&["alpha.txt", "beta.rs"]);
     std::fs::create_dir(dir.join("subdir")).unwrap();
-    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+    assert_eq!(ls::list_dir(dir.to_str().unwrap(), false), 0);
 }
 
 #[test]
 fn ls_list_dir_empty() {
     let dir = tempdir_with_files(&[]);
-    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+    assert_eq!(ls::list_dir(dir.to_str().unwrap(), false), 0);
 }
 
 #[test]
@@ -1180,7 +1180,7 @@ fn ls_list_dir_symlink() {
     let dir = tempdir_with_files(&["target.txt"]);
     let link_path = dir.join("link.txt");
     std::os::unix::fs::symlink(dir.join("target.txt"), &link_path).unwrap();
-    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+    assert_eq!(ls::list_dir(dir.to_str().unwrap(), false), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1783,7 +1783,7 @@ fn ls_list_dir_with_executable() {
     // Make executable
     let path = dir.join("script.sh");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+    assert_eq!(ls::list_dir(dir.to_str().unwrap(), false), 0);
 }
 
 #[test]
@@ -1793,7 +1793,7 @@ fn ls_list_dir_with_symlink_to_dir() {
     std::fs::create_dir(&subdir).unwrap();
     let link_path = dir.join("linkdir");
     std::os::unix::fs::symlink(&subdir, &link_path).unwrap();
-    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+    assert_eq!(ls::list_dir(dir.to_str().unwrap(), false), 0);
 }
 
 #[test]
@@ -1804,7 +1804,7 @@ fn ls_list_symlink_to_dir_as_file() {
     let link_path = parent.join(format!("ish_test_link_{}", std::process::id()));
     let _ = std::fs::remove_file(&link_path);
     std::os::unix::fs::symlink(&dir, &link_path).unwrap();
-    assert_eq!(ls::list_dir(link_path.to_str().unwrap()), 0);
+    assert_eq!(ls::list_dir(link_path.to_str().unwrap(), false), 0);
     let _ = std::fs::remove_file(&link_path);
 }
 
@@ -1812,7 +1812,7 @@ fn ls_list_symlink_to_dir_as_file() {
 fn ls_list_dir_sorts_case_insensitive() {
     let dir = tempdir_with_files(&["Zebra", "alpha", "Beta"]);
     // Should not crash; output should be sorted
-    assert_eq!(ls::list_dir(dir.to_str().unwrap()), 0);
+    assert_eq!(ls::list_dir(dir.to_str().unwrap(), false), 0);
 }
 
 // ---------------------------------------------------------------------------

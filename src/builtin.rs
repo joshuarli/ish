@@ -40,6 +40,7 @@ pub enum ExternalCommand {
     Copy,
     Move,
     List,
+    ListHidden,
     ClearScreen,
     History,
 }
@@ -112,6 +113,7 @@ const ISH_BUILTINS: &[Builtin] = &[
     Builtin::hybrid("history", ShellCommand::History, Some(ExternalCommand::History)),
     Builtin::in_shell("ish-dump", ShellCommand::DumpLayout),
     Builtin::foreground("l", ExternalCommand::List),
+    Builtin::foreground("ll", ExternalCommand::ListHidden),
     Builtin::foreground("mv", ExternalCommand::Move),
     Builtin::in_shell("t", ShellCommand::Trash),
     Builtin::in_shell("trash", ShellCommand::Trash),
@@ -268,9 +270,10 @@ fn strip_quotes(word: &str) -> &str {
 }
 
 /// List directories using ish's native directory listing.
-pub fn list_directory(args: &[impl AsRef<std::path::Path>]) -> i32 {
+/// `show_hidden` selects `ll` (hidden files) over `l` (visible only).
+pub fn list_directory(args: &[impl AsRef<std::path::Path>], show_hidden: bool) -> i32 {
     if args.is_empty() {
-        ls::list_dir(".")
+        ls::list_dir(".", show_hidden)
     } else {
         let mut status = 0;
         let label = args.len() > 1;
@@ -281,7 +284,7 @@ pub fn list_directory(args: &[impl AsRef<std::path::Path>]) -> i32 {
                 }
                 println!("{}:", arg.as_ref().display());
             }
-            let s = ls::list_dir(arg);
+            let s = ls::list_dir(arg, show_hidden);
             if s != 0 {
                 status = s;
             }

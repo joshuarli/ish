@@ -36,7 +36,6 @@ prevent later lines from loading. A nearby `init.sh` is not run.
 ```sh
 set EDITOR nvim
 set GREETING "hello $USER"
-alias ll l
 alias gs git status
 alias .. "cd .."
 ```
@@ -118,7 +117,7 @@ Argument substitutions are allowed. Aliases after `!` expand before dispatch.
 Use `command cp` or an alias for the same native operation. Use an explicit
 path such as `/bin/cp` to run the external utility.
 
-Native `l`, `c`, and the list form of `history` also require the ish process.
+Native `l`, `ll`, `c`, and the list form of `history` also require the ish process.
 They refuse pipeline stages and command substitutions with status 2 before
 target redirections. Their host callbacks have no child-execution safety
 contract. Ordinary external programs, epsh builtins, and hybrid `cd` retain
@@ -144,7 +143,8 @@ ish-specific commands include:
 | `mv [OPTIONS] SOURCE DESTINATION` | Move files or directory trees |
 | `t`, `trash` | Permanently delete entries below an explicit directory; `--yes` skips confirmation |
 | `w`, `which`, `type` | Locate a command or alias; a same-name alias also shows the underlying command |
-| `l [path...]` | List files with colors and human-readable sizes |
+| `l [path...]` | List visible files with sizes and relative ages |
+| `ll [path...]` | List all files including hidden ones |
 | `c` | Clear the screen |
 | `denv` | Trust, revoke, or reload environment files for this directory |
 | `copy-scrollback` | Copy the terminal scrollback through OSC 52 |

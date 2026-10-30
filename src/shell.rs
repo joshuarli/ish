@@ -165,7 +165,7 @@ pub(super) fn run(cli: crate::Args) {
                     resolve_cd_for_history(&expand_aliases_for_history(&line, &shell.aliases));
                 let history_cwd = shell.epsh.cwd().to_path_buf();
 
-                if history_line.trim() != "l"
+                if !matches!(history_line.trim(), "l" | "ll")
                     && let Err(error) = shell.history.add_in_dir(&history_line, Some(&history_cwd))
                 {
                     report!("ish: command was not saved to history: {error}");

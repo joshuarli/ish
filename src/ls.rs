@@ -1,17 +1,18 @@
 use crate::report;
-use std::ffi::CStr;
-use std::io;
-use std::mem::MaybeUninit;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Native directory listing, equivalent to `ls -plAhG`.
+/// Native directory listing: `l` hides dotfiles, `ll` shows them.
+/// Each line is `name size age`; directories and symlinks omit the size.
 /// Writes output to stdout directly. Returns 0 on success, 1 on error.
-pub fn list_dir(path: impl AsRef<std::path::Path>) -> i32 {
+pub fn list_dir(path: impl AsRef<std::path::Path>, show_hidden: bool) -> i32 {
     let path = path.as_ref();
-    let entries = match read_entries(path) {
+    let now = now_secs();
+    let entries = match read_entries(path, show_hidden, now) {
         Ok(e) => e,
         Err(e) => {
-            report!("ish: l: {}: {e}", path.display());
+            let cmd = if show_hidden { "ll" } else { "l" };
+            report!("ish: {cmd}: {}: {e}", path.display());
             return 1;
         }
     };
@@ -20,26 +21,8 @@ pub fn list_dir(path: impl AsRef<std::path::Path>) -> i32 {
         return 0;
     }
 
-    let max_nlink = entries.iter().map(|e| e.nlink_str.len()).max().unwrap_or(0);
-    let max_owner = entries.iter().map(|e| e.owner.len()).max().unwrap_or(0);
-    let max_group = entries.iter().map(|e| e.group.len()).max().unwrap_or(0);
-    let max_size = entries.iter().map(|e| e.size_str.len()).max().unwrap_or(0);
-
     let mut out = String::new();
     for e in &entries {
-        out.push_str(&format!(
-            "{} {:>nw$} {:<ow$}  {:<gw$}  {:>sw$} {} ",
-            e.mode_str,
-            e.nlink_str,
-            e.owner,
-            e.group,
-            e.size_str,
-            e.date_str,
-            nw = max_nlink,
-            ow = max_owner,
-            gw = max_group,
-            sw = max_size,
-        ));
         out.push_str(&e.color_start);
         out.push_str(&e.display_name);
         if !e.color_start.is_empty() {
@@ -48,6 +31,10 @@ pub fn list_dir(path: impl AsRef<std::path::Path>) -> i32 {
         if let Some(ref target) = e.link_target {
             out.push_str(&format!(" -> {target}"));
         }
+        if let Some(ref size) = e.size {
+            out.push_str(&format!(" {size}"));
+        }
+        out.push_str(&format!(" {}", e.age));
         out.push('\n');
     }
 
@@ -56,18 +43,18 @@ pub fn list_dir(path: impl AsRef<std::path::Path>) -> i32 {
 }
 
 struct Entry {
-    mode_str: String,
-    nlink_str: String,
-    owner: String,
-    group: String,
-    size_str: String,
-    date_str: String,
+    size: Option<String>,
+    age: String,
     display_name: String,
     link_target: Option<String>,
     color_start: String,
 }
 
-fn read_entries(path: impl AsRef<std::path::Path>) -> Result<Vec<Entry>, std::io::Error> {
+fn read_entries(
+    path: impl AsRef<std::path::Path>,
+    show_hidden: bool,
+    now: i64,
+) -> Result<Vec<Entry>, std::io::Error> {
     let path = path.as_ref();
     let top_meta = std::fs::symlink_metadata(path)?;
     let top_is_dir = if top_meta.file_type().is_symlink() {
@@ -81,7 +68,7 @@ fn read_entries(path: impl AsRef<std::path::Path>) -> Result<Vec<Entry>, std::io
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        return Ok(vec![build_entry(&name, p, &top_meta)?]);
+        return Ok(vec![build_entry(&name, p, &top_meta, now)]);
     }
 
     let mut entries = Vec::new();
@@ -92,13 +79,16 @@ fn read_entries(path: impl AsRef<std::path::Path>) -> Result<Vec<Entry>, std::io
         if name == "." || name == ".." {
             continue;
         }
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
 
         let full_path = dir_entry.path();
         let lmeta = match std::fs::symlink_metadata(&full_path) {
             Ok(m) => m,
             Err(_) => continue,
         };
-        entries.push(build_entry(&name, &full_path, &lmeta)?);
+        entries.push(build_entry(&name, &full_path, &lmeta, now));
     }
 
     entries.sort_by(|a, b| {
@@ -114,10 +104,10 @@ fn build_entry(
     name: &str,
     full_path: &std::path::Path,
     lmeta: &std::fs::Metadata,
-) -> io::Result<Entry> {
+    now: i64,
+) -> Entry {
     let mode = lmeta.mode();
-    let file_type = lmeta.file_type();
-    let is_link = file_type.is_symlink();
+    let is_link = lmeta.file_type().is_symlink();
     let is_dir = if is_link {
         std::fs::metadata(full_path)
             .map(|m| m.is_dir())
@@ -154,34 +144,17 @@ fn build_entry(
         String::new()
     };
 
-    Ok(Entry {
-        mode_str: format_mode(
-            mode,
-            if is_link {
-                'l'
-            } else if is_dir {
-                'd'
-            } else if file_type.is_char_device() {
-                'c'
-            } else if file_type.is_block_device() {
-                'b'
-            } else if file_type.is_fifo() {
-                'p'
-            } else if file_type.is_socket() {
-                's'
-            } else {
-                '-'
-            },
-        ),
-        nlink_str: lmeta.nlink().to_string(),
-        owner: username(lmeta.uid())?,
-        group: groupname(lmeta.gid())?,
-        size_str: human_size(lmeta.size()),
-        date_str: format_time(lmeta.mtime()),
+    Entry {
+        size: if lmeta.is_file() {
+            Some(human_size(lmeta.len()))
+        } else {
+            None
+        },
+        age: relative_age(lmeta.mtime(), now),
         display_name,
         link_target,
         color_start,
-    })
+    }
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -191,31 +164,6 @@ fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
         .collect()
-}
-
-fn format_mode(mode: u32, file_type: char) -> String {
-    let mut s = String::with_capacity(10);
-
-    s.push(file_type);
-
-    const PERMS: [(u32, u32, u32, u32, char, char); 3] = [
-        (0o400, 0o200, 0o100, 0o4000, 's', 'S'),
-        (0o040, 0o020, 0o010, 0o2000, 's', 'S'),
-        (0o004, 0o002, 0o001, 0o1000, 't', 'T'),
-    ];
-    for &(r, w, x, set, sc, tc) in &PERMS {
-        s.push(if mode & r != 0 { 'r' } else { '-' });
-        s.push(if mode & w != 0 { 'w' } else { '-' });
-        s.push(if mode & set != 0 {
-            if mode & x != 0 { sc } else { tc }
-        } else if mode & x != 0 {
-            'x'
-        } else {
-            '-'
-        });
-    }
-
-    s
 }
 
 fn human_size(size: u64) -> String {
@@ -230,151 +178,49 @@ fn human_size(size: u64) -> String {
     }
 }
 
-fn format_time(mtime: i64) -> String {
-    // libc exposes the thread-safe localtime_r conversion that rustix lacks.
-    // SAFETY: POSIX permits a null argument to request the current time.
-    let now = unsafe { libc::time(std::ptr::null_mut()) };
-    // SAFETY: zero is valid for each integer and nullable pointer field in libc::tm.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: `mtime` is readable and `tm` is writable for the duration of the call.
-    unsafe {
-        libc::localtime_r(&mtime, &mut tm);
-    }
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let month = MONTHS.get(tm.tm_mon as usize).copied().unwrap_or("???");
-
-    let six_months = 180 * 24 * 60 * 60;
-    if (now - mtime).unsigned_abs() < six_months as u64 {
-        format!(
-            "{} {:2} {:02}:{:02}",
-            month, tm.tm_mday, tm.tm_hour, tm.tm_min
-        )
+fn relative_age(mtime: i64, now: i64) -> String {
+    let diff = now.saturating_sub(mtime).max(0);
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 3600;
+    const DAY: i64 = 86400;
+    const YEAR: i64 = 365 * DAY;
+    if diff < MINUTE {
+        format!("{diff}s")
+    } else if diff < HOUR {
+        format!("{}m", diff / MINUTE)
+    } else if diff < DAY {
+        format!("{}h", diff / HOUR)
+    } else if diff < YEAR {
+        format!("{}d", diff / DAY)
     } else {
-        format!("{} {:2}  {}", month, tm.tm_mday, tm.tm_year + 1900)
+        format!("{}y", diff / YEAR)
     }
-}
-
-const INITIAL_NSS_BUFFER_SIZE: usize = 1024;
-
-// rustix does not expose reentrant NSS account lookups.
-struct NssBuffer {
-    stack: [libc::c_char; INITIAL_NSS_BUFFER_SIZE],
-    heap: Vec<libc::c_char>,
-    len: usize,
-}
-
-impl NssBuffer {
-    fn new() -> Self {
-        Self {
-            stack: [0; INITIAL_NSS_BUFFER_SIZE],
-            heap: Vec::new(),
-            len: INITIAL_NSS_BUFFER_SIZE,
-        }
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut libc::c_char {
-        if self.heap.is_empty() {
-            self.stack.as_mut_ptr()
-        } else {
-            self.heap.as_mut_ptr()
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn grow(&mut self) -> io::Result<()> {
-        let new_len = self.len.checked_mul(2).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "NSS record exceeds addressable memory",
-            )
-        })?;
-        let additional = if self.heap.is_empty() {
-            new_len
-        } else {
-            new_len - self.heap.len()
-        };
-        self.heap
-            .try_reserve_exact(additional)
-            .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
-        self.heap.resize(new_len, 0);
-        self.len = new_len;
-        Ok(())
-    }
-}
-
-fn nss_name(name: *const libc::c_char, database: &str) -> io::Result<String> {
-    if name.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{database} record has no name"),
-        ));
-    }
-    // SAFETY: reentrant NSS calls return NUL-terminated names in the live lookup buffer.
-    Ok(unsafe { CStr::from_ptr(name) }
-        .to_string_lossy()
-        .into_owned())
-}
-
-fn lookup_nss_name<Id, Record>(
-    id: Id,
-    database: &str,
-    lookup: unsafe extern "C" fn(
-        Id,
-        *mut Record,
-        *mut libc::c_char,
-        usize,
-        *mut *mut Record,
-    ) -> libc::c_int,
-    get_name: impl FnOnce(&Record) -> *mut libc::c_char,
-) -> io::Result<String>
-where
-    Id: Copy + ToString,
-{
-    let mut buffer = NssBuffer::new();
-    let mut record = MaybeUninit::<Record>::uninit();
-    loop {
-        let mut result = std::ptr::null_mut::<Record>();
-        let buffer_len = buffer.len();
-        let buffer_ptr = buffer.as_mut_ptr();
-        // SAFETY: NSS writes through these valid output pointers and returns strings in `buffer`.
-        let status = unsafe { lookup(id, record.as_mut_ptr(), buffer_ptr, buffer_len, &mut result) };
-        if status == libc::ERANGE {
-            buffer.grow()?;
-            continue;
-        }
-        if status != 0 {
-            return Err(io::Error::from_raw_os_error(status));
-        }
-        if result.is_null() {
-            return Ok(id.to_string());
-        }
-        // SAFETY: a successful non-null NSS result means libc initialized the record.
-        let record = unsafe { record.assume_init() };
-        return nss_name(get_name(&record), database);
-    }
-}
-
-fn username(uid: u32) -> io::Result<String> {
-    lookup_nss_name(uid, "passwd", libc::getpwuid_r, |record: &libc::passwd| {
-        record.pw_name
-    })
-}
-
-fn groupname(gid: u32) -> io::Result<String> {
-    lookup_nss_name(gid, "group", libc::getgrgid_r, |record: &libc::group| {
-        record.gr_name
-    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::read_entries;
+    use super::{read_entries, relative_age};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn tempdir(files: &[&str]) -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ish_ls_test_{}_{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        dir
+    }
 
     #[test]
     fn entry_names_replace_terminal_controls() {
@@ -386,36 +232,53 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_reads_keep_owner_and_group_names() {
-        const WORKERS: usize = 8;
-        const READS_PER_WORKER: usize = 256;
+    fn relative_age_boundaries() {
+        assert_eq!(relative_age(100, 100), "0s");
+        assert_eq!(relative_age(200, 100), "0s");
+        assert_eq!(relative_age(96, 100), "4s");
+        assert_eq!(relative_age(0, 59), "59s");
+        assert_eq!(relative_age(0, 60), "1m");
+        assert_eq!(relative_age(0, 5 * 60), "5m");
+        assert_eq!(relative_age(0, 3599), "59m");
+        assert_eq!(relative_age(0, 3600), "1h");
+        assert_eq!(relative_age(0, 2 * 3600), "2h");
+        assert_eq!(relative_age(0, 86399), "23h");
+        assert_eq!(relative_age(0, 86400), "1d");
+        assert_eq!(relative_age(0, 3 * 86400), "3d");
+        assert_eq!(relative_age(0, 40 * 86400), "40d");
+        assert_eq!(relative_age(0, 364 * 86400), "364d");
+        assert_eq!(relative_age(0, 365 * 86400), "1y");
+        assert_eq!(relative_age(0, 800 * 86400), "2y");
+    }
 
-        let path = std::env::current_exe()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let expected = read_entries(&path).unwrap().remove(0);
+    #[test]
+    fn hidden_entries_filter_on_flag() {
+        let dir = tempdir(&["visible", ".hidden"]);
+        let now = super::now_secs();
+        let visible = read_entries(&dir, false, now).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert!(visible[0].display_name.contains("visible"));
+        let all = read_entries(&dir, true, now).unwrap();
+        assert_eq!(all.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        std::thread::scope(|scope| {
-            let mut workers = Vec::with_capacity(WORKERS);
-            for _ in 0..WORKERS {
-                let path = &path;
-                let owner = &expected.owner;
-                let group = &expected.group;
-                workers.push(scope.spawn(move || {
-                    for _ in 0..READS_PER_WORKER {
-                        let entries = read_entries(path).unwrap();
-                        assert_eq!(entries.len(), 1);
-                        assert_eq!(entries[0].owner, *owner);
-                        assert_eq!(entries[0].group, *group);
-                    }
-                }));
-            }
-
-            for worker in workers {
-                worker.join().unwrap();
-            }
-        });
+    #[test]
+    fn dirs_omit_size_files_keep_it() {
+        let dir = tempdir(&["file.txt"]);
+        std::fs::create_dir(dir.join("subdir")).unwrap();
+        let entries = read_entries(&dir, false, super::now_secs()).unwrap();
+        assert_eq!(entries.len(), 2);
+        let file = entries
+            .iter()
+            .find(|e| e.display_name == "file.txt")
+            .unwrap();
+        assert!(file.size.is_some());
+        let sub = entries
+            .iter()
+            .find(|e| e.display_name == "subdir/")
+            .unwrap();
+        assert!(sub.size.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

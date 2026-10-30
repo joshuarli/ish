@@ -320,8 +320,8 @@ fn ls_fixture_dir(bencher: Bencher) {
     symlink("entry_00.txt", fixture.path().join("latest.txt")).unwrap();
     let path = fixture.path().to_str().unwrap().to_owned();
     let _stdout = SuppressStdout::new();
-    black_box(ls::list_dir(&path));
-    bench_with_syscall_trace(bencher, || black_box(ls::list_dir(&path)));
+    black_box(ls::list_dir(&path, false));
+    bench_with_syscall_trace(bencher, || black_box(ls::list_dir(&path, false)));
 }
 
 fn startup_fixture(bencher: Bencher, cold: bool) {
@@ -335,7 +335,7 @@ fn startup_fixture(bencher: Bencher, cold: bool) {
     fs::write(&history_path, &history_contents).unwrap();
     fs::write(
         &config_path,
-        "set EDITOR \"vim\"\nalias gs \"git status\"\nalias ll \"l -la\"\n",
+        "set EDITOR \"vim\"\nalias gs \"git status\"\n",
     )
     .unwrap();
 
