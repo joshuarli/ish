@@ -90,12 +90,10 @@ fn render(entries: &[Entry]) -> String {
         if show_bar {
             if let Some(bytes) = e.size_bytes {
                 out.push_str("\x1b[2m");
-                write_size_bar(&mut out, bytes, max_size);
+                write_size_circle(&mut out, bytes, max_size);
                 out.push_str("\x1b[0m");
             } else {
-                for _ in 0..SIZE_BAR_CELLS {
-                    out.push(' ');
-                }
+                out.push(' ');
             }
             out.push_str("  ");
         }
@@ -384,36 +382,31 @@ fn age_shade(diff: i64) -> &'static str {
     }
 }
 
-const SIZE_BAR_CELLS: usize = 6;
-const SIZE_BAR_PARTIALS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+/// Circles grow with file size: tiny dot, small bullet, small ring, medium
+/// ring, medium disc, large ring, large disc. Rings precede same-size discs
+/// so visual presence rises monotonically. Blank means dir or empty file.
+const SIZE_CIRCLES: [char; 7] = ['·', '•', '∘', '○', '●', '◯', '⬤'];
 
-/// Log-scale bar showing a file's size relative to `max`, the largest size
-/// in the listing. Any nonzero size earns at least a sliver; zero reads as
-/// an empty track. Written straight into the output buffer: no allocation.
-fn write_size_bar(out: &mut String, size: u64, max: u64) {
+/// Log-scale circle showing a file's size relative to `max`, the largest
+/// size in the listing. Any nonzero size earns at least the tiny dot.
+/// Written straight into the output buffer: no allocation.
+fn write_size_circle(out: &mut String, size: u64, max: u64) {
+    if size == 0 {
+        out.push(' ');
+        return;
+    }
     let level = if max == 0 {
         0.0
     } else {
         (1.0 + size as f64).ln() / (1.0 + max as f64).ln()
     };
-    let mut eighths = (level * (SIZE_BAR_CELLS as f64) * 8.0).round() as usize;
-    eighths = eighths.min(SIZE_BAR_CELLS * 8);
-    for _ in 0..SIZE_BAR_CELLS {
-        let take = eighths.min(8);
-        out.push(if take == 8 {
-            '█'
-        } else if take == 0 {
-            '░'
-        } else {
-            SIZE_BAR_PARTIALS[take]
-        });
-        eighths -= take;
-    }
+    let index = ((level * (SIZE_CIRCLES.len() as f64)).round() as usize).clamp(1, SIZE_CIRCLES.len());
+    out.push(SIZE_CIRCLES[index - 1]);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{age_shade, read_entries, relative_age, write_size_bar};
+    use super::{age_shade, read_entries, relative_age, write_size_circle};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -490,21 +483,23 @@ mod tests {
     }
 
     #[test]
-    fn size_bar_levels() {
-        fn bar(size: u64, max: u64) -> String {
+    fn size_circle_levels() {
+        fn circle(size: u64, max: u64) -> String {
             let mut out = String::new();
-            write_size_bar(&mut out, size, max);
+            write_size_circle(&mut out, size, max);
             out
         }
-        assert_eq!(bar(10854, 10854), "██████");
-        assert_eq!(bar(0, 10854), "░░░░░░");
-        assert_eq!(bar(10, 10854), "█▌░░░░");
-        assert_eq!(bar(30, 10854), "██▎░░░");
-        assert_eq!(bar(0, 0), "░░░░░░");
+        assert_eq!(circle(10854, 10854), "⬤");
+        assert_eq!(circle(0, 10854), " ");
+        assert_eq!(circle(10, 10854), "•");
+        assert_eq!(circle(30, 10854), "∘");
+        assert_eq!(circle(1024, 10854), "●");
+        assert_eq!(circle(2048, 10854), "◯");
+        assert_eq!(circle(0, 0), " ");
         for (bytes, max) in [(1, u64::MAX), (1, 1 << 40), (512, 1 << 30)] {
-            let rendered = bar(bytes, max);
-            assert_eq!(rendered.chars().count(), 6);
-            assert_ne!(rendered, "░░░░░░", "nonzero size must leave a mark");
+            let rendered = circle(bytes, max);
+            assert_eq!(rendered.chars().count(), 1);
+            assert_ne!(rendered, " ", "nonzero size must leave a mark");
         }
     }
 
@@ -561,10 +556,10 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3);
         let visible: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
-        assert_eq!(visible[1], "longname.txt  10.6K  ██████  40d");
-        assert_eq!(visible[0], "a.txt           10B  █▌░░░░   2h");
-        assert_eq!(visible[2], format!("d/{}3d", " ".repeat(28)));
-        // 28 = 10 name pad + 2 + 5 size + 2 + 6 bar + 2 + 1 age pad.
+        assert_eq!(visible[1], "longname.txt  10.6K  ⬤  40d");
+        assert_eq!(visible[0], "a.txt           10B  •   2h");
+        assert_eq!(visible[2], format!("d/{}3d", " ".repeat(23)));
+        // 23 = 10 name pad + 2 + 5 size + 2 + 1 circle + 2 + 1 age pad.
         let widths: Vec<usize> = visible.iter().map(|l| l.chars().count()).collect();
         assert!(
             widths.windows(2).all(|w| w[0] == w[1]),
