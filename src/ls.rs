@@ -45,11 +45,9 @@ fn render(entries: &[Entry]) -> String {
         .max()
         .unwrap_or(0);
     let age_w = entries.iter().map(|e| e.age.len()).max().unwrap_or(0);
-    let max_size = entries.iter().filter_map(|e| e.size_bytes).max().unwrap_or(0);
-    let show_bar = max_size > 0;
 
     // One allocation for the whole listing: visible text plus slack for
-    // separators, bars, and escape codes.
+    // separators and escape codes.
     let mut cap = entries.len();
     for e in entries {
         cap += prefix_len(e)
@@ -57,7 +55,7 @@ fn render(entries: &[Entry]) -> String {
             + e.age.len()
             + e.color_start.len()
             + e.age_shade.len()
-            + 64;
+            + 32;
     }
     let mut out = String::with_capacity(cap);
     for e in entries {
@@ -87,16 +85,6 @@ fn render(entries: &[Entry]) -> String {
             }
             out.push_str("  ");
         }
-        if show_bar {
-            if let Some(bytes) = e.size_bytes {
-                out.push_str("\x1b[2m");
-                write_size_circle(&mut out, bytes, max_size);
-                out.push_str("\x1b[0m");
-            } else {
-                out.push(' ');
-            }
-            out.push_str("  ");
-        }
         for _ in e.age.len()..age_w {
             out.push(' ');
         }
@@ -113,7 +101,6 @@ fn render(entries: &[Entry]) -> String {
 }
 
 struct Entry {
-    size_bytes: Option<u64>,
     size: Option<Field>,
     age: Field,
     age_shade: &'static str,
@@ -291,11 +278,6 @@ fn build_entry(
     let diff = age_diff(lmeta.mtime(), now);
 
     Entry {
-        size_bytes: if lmeta.is_file() {
-            Some(lmeta.len())
-        } else {
-            None
-        },
         size: if lmeta.is_file() {
             Some(human_size(lmeta.len()))
         } else {
@@ -382,31 +364,9 @@ fn age_shade(diff: i64) -> &'static str {
     }
 }
 
-/// Circles grow with file size: tiny dot, small bullet, small ring, medium
-/// ring, medium disc, large ring, large disc. Rings precede same-size discs
-/// so visual presence rises monotonically. Blank means dir or empty file.
-const SIZE_CIRCLES: [char; 7] = ['·', '•', '∘', '○', '●', '◯', '⬤'];
-
-/// Log-scale circle showing a file's size relative to `max`, the largest
-/// size in the listing. Any nonzero size earns at least the tiny dot.
-/// Written straight into the output buffer: no allocation.
-fn write_size_circle(out: &mut String, size: u64, max: u64) {
-    if size == 0 {
-        out.push(' ');
-        return;
-    }
-    let level = if max == 0 {
-        0.0
-    } else {
-        (1.0 + size as f64).ln() / (1.0 + max as f64).ln()
-    };
-    let index = ((level * (SIZE_CIRCLES.len() as f64)).round() as usize).clamp(1, SIZE_CIRCLES.len());
-    out.push(SIZE_CIRCLES[index - 1]);
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{age_shade, read_entries, relative_age, write_size_circle};
+    use super::{age_shade, read_entries, relative_age};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -483,27 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn size_circle_levels() {
-        fn circle(size: u64, max: u64) -> String {
-            let mut out = String::new();
-            write_size_circle(&mut out, size, max);
-            out
-        }
-        assert_eq!(circle(10854, 10854), "⬤");
-        assert_eq!(circle(0, 10854), " ");
-        assert_eq!(circle(10, 10854), "•");
-        assert_eq!(circle(30, 10854), "∘");
-        assert_eq!(circle(1024, 10854), "●");
-        assert_eq!(circle(2048, 10854), "◯");
-        assert_eq!(circle(0, 0), " ");
-        for (bytes, max) in [(1, u64::MAX), (1, 1 << 40), (512, 1 << 30)] {
-            let rendered = circle(bytes, max);
-            assert_eq!(rendered.chars().count(), 1);
-            assert_ne!(rendered, " ", "nonzero size must leave a mark");
-        }
-    }
-
-    #[test]
     fn age_shade_steps() {
         const DAY: i64 = 86400;
         assert_eq!(age_shade(0), "");
@@ -538,9 +477,8 @@ mod tests {
     #[test]
     fn rendered_columns_align() {
         use super::Field;
-        let entry = |display_name: &str, size: Option<(u64, &str)>, age: &str| super::Entry {
-            size_bytes: size.map(|(bytes, _)| bytes),
-            size: size.map(|(_, text)| Field::from(text)),
+        let entry = |display_name: &str, size: Option<&str>, age: &str| super::Entry {
+            size: size.map(Field::from),
             age: Field::from(age),
             age_shade: "",
             display_name: display_name.to_owned(),
@@ -548,18 +486,18 @@ mod tests {
             color_start: "",
         };
         let entries = vec![
-            entry("a.txt", Some((10, "10B")), "2h"),
-            entry("longname.txt", Some((10854, "10.6K")), "40d"),
+            entry("a.txt", Some("10B"), "2h"),
+            entry("longname.txt", Some("10.6K"), "40d"),
             entry("d/", None, "3d"),
         ];
         let out = super::render(&entries);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3);
         let visible: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
-        assert_eq!(visible[1], "longname.txt  10.6K  ⬤  40d");
-        assert_eq!(visible[0], "a.txt           10B  •   2h");
-        assert_eq!(visible[2], format!("d/{}3d", " ".repeat(23)));
-        // 23 = 10 name pad + 2 + 5 size + 2 + 1 circle + 2 + 1 age pad.
+        assert_eq!(visible[1], "longname.txt  10.6K  40d");
+        assert_eq!(visible[0], "a.txt           10B   2h");
+        assert_eq!(visible[2], format!("d/{}3d", " ".repeat(20)));
+        // 20 = 10 name pad + 2 + 5 size + 2 + 1 age pad.
         let widths: Vec<usize> = visible.iter().map(|l| l.chars().count()).collect();
         assert!(
             widths.windows(2).all(|w| w[0] == w[1]),
