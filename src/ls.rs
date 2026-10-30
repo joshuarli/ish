@@ -347,15 +347,20 @@ fn relative_age_str(diff: i64) -> Field {
 }
 
 /// Grey ramp for the age column, keyed on absolute age. Files from the last
-/// day keep the default color; week-old files are already clearly grey and
-/// older files fade toward dark grey, floored at a shade that stays
-/// readable on dark terminals.
+/// day keep the default color, then fade in small steps across the first
+/// week; week-old files are already clearly grey and older files keep
+/// fading toward dark grey, floored at a shade that stays readable on dark
+/// terminals.
 fn age_shade(diff: i64) -> &'static str {
     const DAY: i64 = 86400;
     if diff < DAY {
         ""
-    } else if diff < 7 * DAY {
+    } else if diff < 2 * DAY {
+        "\x1b[38;5;252m"
+    } else if diff < 4 * DAY {
         "\x1b[38;5;250m"
+    } else if diff < 7 * DAY {
+        "\x1b[38;5;248m"
     } else if diff < 30 * DAY {
         "\x1b[38;5;246m"
     } else if diff < 90 * DAY {
@@ -448,8 +453,12 @@ mod tests {
         const DAY: i64 = 86400;
         assert_eq!(age_shade(0), "");
         assert_eq!(age_shade(23 * 3600), "");
-        assert_eq!(age_shade(DAY), "\x1b[38;5;250m");
-        assert_eq!(age_shade(6 * DAY), "\x1b[38;5;250m");
+        assert_eq!(age_shade(DAY), "\x1b[38;5;252m");
+        assert_eq!(age_shade(2 * DAY - 1), "\x1b[38;5;252m");
+        assert_eq!(age_shade(2 * DAY), "\x1b[38;5;250m");
+        assert_eq!(age_shade(4 * DAY - 1), "\x1b[38;5;250m");
+        assert_eq!(age_shade(4 * DAY), "\x1b[38;5;248m");
+        assert_eq!(age_shade(6 * DAY), "\x1b[38;5;248m");
         assert_eq!(age_shade(7 * DAY), "\x1b[38;5;246m");
         assert_eq!(age_shade(29 * DAY), "\x1b[38;5;246m");
         assert_eq!(age_shade(30 * DAY), "\x1b[38;5;242m");
