@@ -14,7 +14,7 @@ both `fdu-delete` and `ish-fs`. Extract its OS primitives and journal into a sma
 sweeper or a crash-resume transaction engine.
 
 The existing implementation in
-[`quarantine.rs`](../../crates/fdu-delete/src/posix/quarantine.rs) supplies the
+[`quarantine.rs`](../../crates/fdu-posix/src/quarantine.rs) supplies the
 ordering and conservative recovery policy. Extraction must generalize its
 `Tree` / `NodeId` inputs into owned records; callers retain their scan, transfer,
 and user-policy decisions. This is an accepted target design, not a claim that
