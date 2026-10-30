@@ -241,16 +241,26 @@ fn parse(
             }
         }
         None => {
-            if operands.len() != 2 {
+            if operands.len() < 2 {
                 return Err(SyntaxError(
-                    "expected a source and a destination, or --into and at least one source"
+                    "expected SOURCE DESTINATION, SOURCE... DIRECTORY, or --into DIRECTORY SOURCE..."
                         .to_owned(),
                 ));
             }
-            let mut operands = operands.into_iter();
-            Operands::Exact {
-                source: operands.next().unwrap(),
-                destination: operands.next().unwrap(),
+            if operands.len() == 2 {
+                let mut operands = operands.into_iter();
+                Operands::Exact {
+                    source: operands.next().unwrap(),
+                    destination: operands.next().unwrap(),
+                }
+            } else {
+                let directory = operands.pop().unwrap();
+                let mut sources = operands.into_iter();
+                Operands::Into {
+                    directory,
+                    first: sources.next().unwrap(),
+                    rest: sources.collect(),
+                }
             }
         }
     };
@@ -416,8 +426,8 @@ fn verb(operation: Operation) -> &'static str {
 
 fn usage(operation: Operation) -> &'static str {
     match operation {
-        Operation::Copy => "usage: cp [OPTIONS] SOURCE DESTINATION\n       cp [OPTIONS] --into DIRECTORY SOURCE...\n",
-        Operation::Move => "usage: mv [OPTIONS] SOURCE DESTINATION\n       mv [OPTIONS] --into DIRECTORY SOURCE...\n",
+        Operation::Copy => "usage: cp [OPTIONS] SOURCE DESTINATION\n       cp [OPTIONS] SOURCE... DIRECTORY\n       cp [OPTIONS] --into DIRECTORY SOURCE...\n",
+        Operation::Move => "usage: mv [OPTIONS] SOURCE DESTINATION\n       mv [OPTIONS] SOURCE... DIRECTORY\n       mv [OPTIONS] --into DIRECTORY SOURCE...\n",
     }
 }
 
@@ -520,12 +530,46 @@ mod tests {
     }
 
     #[test]
+    fn implicit_multi_source_maps_last_operand_to_directory() {
+        for operation in [Operation::Copy, Operation::Move] {
+            let arguments = arguments(&[b"a", b"b", b"target"]);
+            let ParsedCommand::Run(invocation) =
+                parse(operation, &arguments, context()).expect("valid request")
+            else {
+                panic!("expected a transfer request");
+            };
+            assert!(matches!(
+                invocation.request.operands,
+                Operands::Into { directory, first, rest }
+                    if directory == Path::new("target")
+                        && first == Path::new("a")
+                        && rest == vec![PathBuf::from("b")]
+            ));
+        }
+
+        let arguments = arguments(&[b"--", b"-a", b"-b", b"-target"]);
+        let ParsedCommand::Run(invocation) =
+            parse(Operation::Move, &arguments, context()).expect("valid request")
+        else {
+            panic!("expected a transfer request");
+        };
+        assert!(matches!(
+            invocation.request.operands,
+            Operands::Into { directory, first, rest }
+                if directory == Path::new("-target")
+                    && first == Path::new("-a")
+                    && rest == vec![PathBuf::from("-b")]
+        ));
+    }
+
+    #[test]
     fn invalid_options_and_mapping_are_syntax_errors() {
         for arguments in [
             arguments(&[b"--unknown", b"source", b"destination"]),
             arguments(&[b"--jobs", b"0", b"source", b"destination"]),
             arguments(&[b"--jobs", b"33", b"source", b"destination"]),
             arguments(&[b"--replace", b"-n", b"source", b"destination"]),
+            arguments(&[]),
             arguments(&[b"source"]),
             arguments(&[b"--into", b"target"]),
         ] {

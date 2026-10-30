@@ -834,6 +834,39 @@ fn native_fs_exact_targets_and_into_directories_preserve_real_bytes() {
 }
 
 #[test]
+fn native_fs_multi_source_into_trailing_directory() {
+    let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
+        std::fs::write(home.join("s1"), b"first").unwrap();
+        std::fs::write(home.join("s2"), b"second").unwrap();
+        std::fs::write(home.join("m1"), b"m-first").unwrap();
+        std::fs::write(home.join("m2"), b"m-second").unwrap();
+        std::fs::create_dir(home.join("pack")).unwrap();
+        std::fs::write(home.join("pack/p1"), b"p-first").unwrap();
+        std::fs::write(home.join("pack/p2"), b"p-second").unwrap();
+        std::fs::create_dir(home.join("target")).unwrap();
+    });
+
+    sh.run_command("cp s1 s2 target");
+    assert_eq!(std::fs::read(sh.home_path().join("target/s1")).unwrap(), b"first");
+    assert_eq!(std::fs::read(sh.home_path().join("target/s2")).unwrap(), b"second");
+    assert_native_fs_status(&sh, 0);
+
+    sh.run_command("mv m1 m2 target");
+    assert_eq!(std::fs::read(sh.home_path().join("target/m1")).unwrap(), b"m-first");
+    assert_eq!(std::fs::read(sh.home_path().join("target/m2")).unwrap(), b"m-second");
+    assert!(!sh.home_path().join("m1").exists());
+    assert!(!sh.home_path().join("m2").exists());
+    assert_native_fs_status(&sh, 0);
+
+    sh.run_command("mv pack/* .");
+    assert_eq!(std::fs::read(sh.home_path().join("p1")).unwrap(), b"p-first");
+    assert_eq!(std::fs::read(sh.home_path().join("p2")).unwrap(), b"p-second");
+    assert!(!sh.home_path().join("pack/p1").exists());
+    assert!(!sh.home_path().join("pack/p2").exists());
+    assert_native_fs_status(&sh, 0);
+}
+
+#[test]
 fn native_fs_redirections_prevent_failed_transfers_and_capture_stderr() {
     let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
         std::fs::write(home.join("source"), b"redirected bytes\0\xff").unwrap();

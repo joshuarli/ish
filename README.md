@@ -139,8 +139,8 @@ ish-specific commands include:
 | `alias [name [command...]]` | Define or list aliases |
 | `history [reset]` | List or clear saved history |
 | `z [query]` | Jump to a frequently used directory; no query goes home |
-| `cp [OPTIONS] SOURCE DESTINATION` | Copy files or directory trees |
-| `mv [OPTIONS] SOURCE DESTINATION` | Move files or directory trees |
+| `cp [OPTIONS] SOURCE DESTINATION` | Copy files or directory trees; with more than one source the last operand must be a directory |
+| `mv [OPTIONS] SOURCE DESTINATION` | Move files or directory trees; with more than one source the last operand must be a directory |
 | `t`, `trash` | Permanently delete entries below an explicit directory; `--yes` skips confirmation |
 | `w`, `which`, `type` | Locate a command or alias; a same-name alias also shows the underlying command |
 | `l [path...]` | List visible files with sizes and relative ages |
@@ -174,10 +174,14 @@ unrelated quarantine lookalikes block deletion and identify the retained paths.
 An entry removed before a synchronization error is reported as removed with a
 durability failure.
 
-ish's `cp` and `mv` use an exact-target form: the source object maps to the
-destination path. For example, `cp report.txt .` reports a type conflict when
-`.` is a directory. Use `cp --into . report.txt` to place the file inside it.
-`--into DIRECTORY` maps each source to a child named after its basename.
+ish's `cp` and `mv` follow the standard operand forms: one source maps to
+`DESTINATION`, while several sources map into the last operand, which must be
+an existing directory. For example, `cp report.txt .` places the file inside
+`.` as `./report.txt` when `.` is a directory, and `mv src/* .` moves every
+match into `.`. `--into DIRECTORY` is the explicit spelling of the multi-source
+form: `cp --into . report.txt` matches `cp report.txt .`, and
+`mv --into . src/*` matches `mv src/* .`. Each source maps to a child named
+after its basename.
 Directories recurse without `-r`; `cp -r` and `cp -R` are accepted as redundant
 flags. Read the [file operation reference](docs/filesystem.md) for collision,
 preservation, mount, durability, cancellation, and partial-completion rules.

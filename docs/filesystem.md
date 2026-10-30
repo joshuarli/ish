@@ -33,6 +33,8 @@ Use one of these forms:
 ```text
 cp [OPTIONS] SOURCE DESTINATION
 mv [OPTIONS] SOURCE DESTINATION
+cp [OPTIONS] SOURCE... DIRECTORY
+mv [OPTIONS] SOURCE... DIRECTORY
 cp [OPTIONS] --into DIRECTORY SOURCE...
 mv [OPTIONS] --into DIRECTORY SOURCE...
 ```
@@ -44,7 +46,10 @@ the source moves inside it under its basename, so `mv a ~/b` becomes
 respects the collision policy: it errors without `--replace` or `-n`,
 skips with `-n`, and replaces supported leaves with `--replace`.
 `--merge` keeps directory-merge behavior for two directories.
-`--into DIRECTORY` remains the explicit multi-source form.
+With more than two operands, the last operand must be an existing
+directory and every preceding operand is a source; this is the implicit
+spelling of `--into DIRECTORY`. `--into DIRECTORY` remains the explicit
+multi-source form.
 
 `--into DIRECTORY` requires an existing directory and one or more sources. Each
 source maps to a child named after its basename. The directory may resolve
@@ -99,7 +104,7 @@ text; the filesystem decides those during publication.
 
 | Option | Meaning |
 |---|---|
-| `--into DIR` | Map each source to a child of an existing directory. |
+| `--into DIR` | Map each source to a child of an existing directory; the `SOURCE... DIRECTORY` form is the implicit equivalent. |
 | `--merge` | Merge directory contents and retain destination-only entries. |
 | `--replace` | Replace supported leaf targets. |
 | `-n`, `--no-clobber` | Skip existing targets. |
