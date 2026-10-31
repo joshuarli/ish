@@ -4284,8 +4284,9 @@ fn native_handlers_refuse_child_execution_before_target_redirections() {
     }
     assert!(PtyShell::strip_ansi(&sh.run_command("printf parent-safe | /bin/cat")).contains("parent-safe"));
     assert!(PtyShell::strip_ansi(&sh.run_command("echo $(printf substitution-safe)")).contains("substitution-safe"));
+    std::fs::write(sh.home_path().join("visible-entry"), b"").unwrap();
     sh.run_command("l >native-parent");
-    assert!(std::fs::read_to_string(sh.home_path().join("native-parent")).unwrap().contains(".config"));
+    assert!(std::fs::read_to_string(sh.home_path().join("native-parent")).unwrap().contains("visible-entry"));
 }
 
 #[test]
