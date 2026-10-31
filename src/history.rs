@@ -35,90 +35,39 @@ fn new_session_id() -> u64 {
 /// proximity, usage bonus, usage time, latest occurrence id).
 type RankKey = (u64, usize, u32, u64, u32);
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct Usage {
     count: u64,
     timestamp: u64,
 }
 
-/// Where a command has run, addressed by directory code. A command almost
-/// always ran in one directory, so that case stays inline and only a command
-/// that really moved between directories pays for a table.
-#[derive(Default)]
-enum Directories {
-    #[default]
-    Empty,
-    One((u32, Usage)),
+/// The directory a command last ran in, as a code into `History::directory_paths`.
+/// A command that ran in exactly one directory shares the entry's totals, so
+/// only repeated directories elsewhere need a record of their own.
+const DIRECTORY_NONE: u32 = u32::MAX;
+const DIRECTORY_DETAILED: u32 = u32::MAX - 1;
+
+/// What a code of `DIRECTORY_DETAILED` stands for: a command that ran in one
+/// directory but also without one, or a command that moved between them.
+enum DirectoryDetail {
+    Tracked { code: u32, usage: Usage },
     Many(Box<FxHashMap<u32, Usage>>),
 }
 
-impl Directories {
-    fn record(&mut self, code: u32, timestamp: u64) {
-        match self {
-            Directories::Empty => {
-                *self = Directories::One((
-                    code,
-                    Usage {
-                        count: 1,
-                        timestamp,
-                    },
-                ));
-            }
-            Directories::One((directory, usage)) if *directory == code => usage.record(timestamp),
-            Directories::One(_) => {
-                let mut map = FxHashMap::default();
-                if let Directories::One((directory, usage)) = std::mem::take(self) {
-                    map.insert(directory, usage);
-                }
-                map.entry(code).or_default().record(timestamp);
-                *self = Directories::Many(Box::new(map));
-            }
-            Directories::Many(map) => map.entry(code).or_default().record(timestamp),
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Directories::Empty => 0,
-            Directories::One(_) => 1,
-            Directories::Many(map) => map.len(),
-        }
-    }
-
-    fn get(&self, code: &u32) -> Option<&Usage> {
-        match self {
-            Directories::Empty => None,
-            Directories::One((directory, usage)) => (directory == code).then_some(usage),
-            Directories::Many(map) => map.get(code),
-        }
-    }
-
-    fn iter(&self) -> DirectoriesIter<'_> {
-        match self {
-            Directories::Empty => DirectoriesIter::Empty,
-            Directories::One(entry) => DirectoriesIter::One(std::iter::once(entry)),
-            Directories::Many(map) => DirectoriesIter::Many(map.iter()),
-        }
-    }
-}
-
-enum DirectoriesIter<'a> {
+enum DirectoryCodes<'a> {
     Empty,
-    One(std::iter::Once<&'a (u32, Usage)>),
-    Many(std::collections::hash_map::Iter<'a, u32, Usage>),
+    One(std::iter::Once<u32>),
+    Many(std::collections::hash_map::Keys<'a, u32, Usage>),
 }
 
-impl<'a> Iterator for DirectoriesIter<'a> {
-    type Item = (&'a u32, &'a Usage);
+impl Iterator for DirectoryCodes<'_> {
+    type Item = u32;
 
-    fn next(&mut self) -> Option<(&'a u32, &'a Usage)> {
+    fn next(&mut self) -> Option<u32> {
         match self {
-            DirectoriesIter::Empty => None,
-            DirectoriesIter::One(iter) => {
-                let (code, usage) = iter.next()?;
-                Some((code, usage))
-            }
-            DirectoriesIter::Many(iter) => iter.next(),
+            DirectoryCodes::Empty => None,
+            DirectoryCodes::One(iter) => iter.next(),
+            DirectoryCodes::Many(keys) => keys.next().copied(),
         }
     }
 }
@@ -133,7 +82,7 @@ impl Usage {
 struct EntryUsage {
     latest_id: u32,
     total: Usage,
-    directories: Directories,
+    directories: u32,
     /// One-based slot in `History::session`, so replacing a command's session
     /// occurrence is a store instead of a search.
     session_position: Option<NonZeroU32>,
@@ -151,6 +100,8 @@ pub struct History {
     /// Directory paths addressed by the codes in `EntryUsage::directories`.
     directory_paths: Vec<PathBuf>,
     directory_codes: FxHashMap<PathBuf, u32>,
+    /// Entries whose directories are more than one shared code, by entry index.
+    directory_details: FxHashMap<u32, DirectoryDetail>,
     /// Startup snapshot plus this shell's commands, oldest first. Other
     /// sessions may update global usage without changing the order or
     /// membership of Up-arrow recall. Replaced occurrences leave a tombstone.
@@ -207,6 +158,7 @@ impl History {
             latest_occurrences: BTreeMap::new(),
             directory_paths: Vec::new(),
             directory_codes: FxHashMap::default(),
+            directory_details: FxHashMap::default(),
             session: Vec::new(),
             session_live: 0,
             session_id: new_session_id(),
@@ -263,7 +215,7 @@ impl History {
                 self.usages.push(EntryUsage {
                     latest_id: 0,
                     total: Usage::default(),
-                    directories: Directories::Empty,
+                    directories: DIRECTORY_NONE,
                     session_position: None,
                 });
                 self.index_by_hash
@@ -271,17 +223,17 @@ impl History {
                 idx
             }
         };
-        let directory = occurrence
-            .cwd
-            .map(|cwd| self.intern_directory(cwd));
-        let usage = &mut self.usages[idx];
-        self.latest_occurrences.remove(&i64::from(usage.latest_id));
-        usage.latest_id = u32::try_from(occurrence.id)
-            .expect("history occurrence ids exceed 4 billion");
-        usage.total.record(occurrence.timestamp);
-        if let Some(code) = directory {
-            usage.directories.record(code, occurrence.timestamp);
+        let directory = occurrence.cwd.map(|cwd| self.intern_directory(cwd));
+        if directory.is_none() {
+            self.detach_shared_directory(idx);
+        } else if let Some(code) = directory {
+            self.record_directory(idx, code, occurrence.timestamp);
         }
+        self.latest_occurrences
+            .remove(&i64::from(self.usages[idx].latest_id));
+        self.usages[idx].latest_id =
+            u32::try_from(occurrence.id).expect("history occurrence ids exceed 4 billion");
+        self.usages[idx].total.record(occurrence.timestamp);
         self.latest_occurrences.insert(
             occurrence.id,
             u32::try_from(idx).expect("history entries exceed 4 billion"),
@@ -335,6 +287,78 @@ impl History {
         self.index_by_hash.shrink_to_fit();
     }
 
+    /// Note that entry `idx` ran in directory `code`. One directory shares the
+    /// entry's totals, so recording it costs a code and nothing else. Call this
+    /// before the entry's totals take the occurrence.
+    fn record_directory(&mut self, idx: usize, code: u32, timestamp: u64) {
+        let key = idx as u32;
+        let current = self.usages[idx].directories;
+        if current == code {
+            return;
+        }
+        if current == DIRECTORY_NONE {
+            self.usages[idx].directories = code;
+            return;
+        }
+        if current != DIRECTORY_DETAILED {
+            let shared = self.usages[idx].total;
+            let mut map = FxHashMap::default();
+            map.insert(current, shared);
+            self.usages[idx].directories = DIRECTORY_DETAILED;
+            self.directory_details
+                .insert(key, DirectoryDetail::Many(Box::new(map)));
+        }
+        if let Some(DirectoryDetail::Tracked { code: tracked, usage }) =
+            self.directory_details.get_mut(&key)
+            && *tracked == code
+        {
+            usage.record(timestamp);
+            return;
+        }
+        if let Some(DirectoryDetail::Many(map)) = self.directory_details.get_mut(&key) {
+            map.entry(code).or_default().record(timestamp);
+            return;
+        }
+        if let Some(DirectoryDetail::Tracked {
+            code: tracked,
+            usage,
+        }) = self.directory_details.remove(&key)
+        {
+            let mut map = FxHashMap::default();
+            map.insert(tracked, usage);
+            map.entry(code).or_default().record(timestamp);
+            self.directory_details
+                .insert(key, DirectoryDetail::Many(Box::new(map)));
+        }
+    }
+
+    /// Stop sharing the entry's totals once an occurrence without a directory
+    /// arrives: one directory's usage no longer covers every use.
+    fn detach_shared_directory(&mut self, idx: usize) {
+        let current = self.usages[idx].directories;
+        if current == DIRECTORY_NONE || current == DIRECTORY_DETAILED {
+            return;
+        }
+        let usage = self.usages[idx].total;
+        self.usages[idx].directories = DIRECTORY_DETAILED;
+        self.directory_details
+            .insert(idx as u32, DirectoryDetail::Tracked { code: current, usage });
+    }
+
+    fn directory_codes_of(&self, idx: usize) -> DirectoryCodes<'_> {
+        match self.usages[idx].directories {
+            DIRECTORY_NONE => DirectoryCodes::Empty,
+            DIRECTORY_DETAILED => match self.directory_details.get(&(idx as u32)) {
+                Some(DirectoryDetail::Tracked { code, .. }) => {
+                    DirectoryCodes::One(std::iter::once(*code))
+                }
+                Some(DirectoryDetail::Many(map)) => DirectoryCodes::Many(map.keys()),
+                None => DirectoryCodes::Empty,
+            },
+            code => DirectoryCodes::One(std::iter::once(code)),
+        }
+    }
+
     fn intern_directory(&mut self, cwd: PathBuf) -> u32 {
         if let Some(&code) = self.directory_codes.get(cwd.as_path()) {
             return code;
@@ -353,6 +377,7 @@ impl History {
         self.latest_occurrences.clear();
         self.directory_paths.clear();
         self.directory_codes.clear();
+        self.directory_details.clear();
         self.session.clear();
         self.session_live = 0;
         self.last_id = 0;
@@ -630,32 +655,53 @@ impl History {
         let Some(cwd) = cwd else {
             return (0, &usage.total);
         };
-        if usage.directories.len() <= cwd_depth {
-            let mut nearest: Option<(usize, &Usage)> = None;
-            for (code, directory_usage) in usage.directories.iter() {
-                let Some(distance) =
-                    ancestor_distance(&self.directory_paths[*code as usize], cwd)
-                else {
-                    continue;
-                };
-                if nearest.is_none_or(|(closest, _)| distance < closest) {
-                    nearest = Some((distance, directory_usage));
+        match usage.directories {
+            DIRECTORY_NONE => (0, &usage.total),
+            DIRECTORY_DETAILED => match self.directory_details.get(&(idx as u32)) {
+                Some(DirectoryDetail::Tracked {
+                    code,
+                    usage: tracked,
+                }) => match ancestor_distance(&self.directory_paths[*code as usize], cwd) {
+                    Some(distance) => (usize::MAX - distance, tracked),
+                    None => (0, &usage.total),
+                },
+                Some(DirectoryDetail::Many(map)) if map.len() <= cwd_depth => {
+                    let mut nearest: Option<(usize, &Usage)> = None;
+                    for (code, directory_usage) in map.iter() {
+                        let Some(distance) =
+                            ancestor_distance(&self.directory_paths[*code as usize], cwd)
+                        else {
+                            continue;
+                        };
+                        if nearest.is_none_or(|(closest, _)| distance < closest) {
+                            nearest = Some((distance, directory_usage));
+                        }
+                    }
+                    match nearest {
+                        Some((distance, directory_usage)) => {
+                            (usize::MAX - distance, directory_usage)
+                        }
+                        None => (0, &usage.total),
+                    }
                 }
-            }
-            return match nearest {
-                Some((distance, directory_usage)) => (usize::MAX - distance, directory_usage),
+                Some(DirectoryDetail::Many(map)) => {
+                    for (distance, directory) in cwd.ancestors().enumerate() {
+                        let Some(code) = self.directory_codes.get(directory) else {
+                            continue;
+                        };
+                        if let Some(directory_usage) = map.get(code) {
+                            return (usize::MAX - distance, directory_usage);
+                        }
+                    }
+                    (0, &usage.total)
+                }
                 None => (0, &usage.total),
-            };
+            },
+            code => match ancestor_distance(&self.directory_paths[code as usize], cwd) {
+                Some(distance) => (usize::MAX - distance, &usage.total),
+                None => (0, &usage.total),
+            },
         }
-        for (distance, directory) in cwd.ancestors().enumerate() {
-            let Some(code) = self.directory_codes.get(directory) else {
-                continue;
-            };
-            if let Some(directory_usage) = usage.directories.get(code) {
-                return (usize::MAX - distance, directory_usage);
-            }
-        }
-        (0, &usage.total)
     }
 
     /// Single-row form of entry `idx` for the pager and `history` output.
@@ -665,17 +711,24 @@ impl History {
 
     #[cfg(test)]
     fn directory_usage(&self, idx: usize, path: &Path) -> Option<&Usage> {
-        self.usages[idx]
-            .directories
-            .get(self.directory_codes.get(path)?)
+        let code = self.directory_codes.get(path)?;
+        match self.usages[idx].directories {
+            DIRECTORY_NONE => None,
+            DIRECTORY_DETAILED => match self.directory_details.get(&(idx as u32))? {
+                DirectoryDetail::Tracked {
+                    code: tracked,
+                    usage,
+                } => (tracked == code).then_some(usage),
+                DirectoryDetail::Many(map) => map.get(code),
+            },
+            shared => (shared == *code).then_some(&self.usages[idx].total),
+        }
     }
 
     pub fn directories(&self, idx: usize) -> impl Iterator<Item = &Path> {
         let paths = &self.directory_paths;
-        self.usages[idx]
-            .directories
-            .iter()
-            .map(move |(code, _)| paths[*code as usize].as_path())
+        self.directory_codes_of(idx)
+            .map(move |code| paths[code as usize].as_path())
     }
 
     pub fn get(&self, idx: usize) -> &str {
@@ -1297,6 +1350,43 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn single_directory_usage_shares_command_totals() {
+        let dir = PathBuf::from("/work/a");
+        let history = History::from_entries_in_dirs([
+            ("cargo build".to_string(), Some(dir.clone())),
+            ("cargo build".to_string(), Some(dir.clone())),
+        ]);
+        assert_eq!(history.frequency(0), 2);
+        assert_eq!(history.directory_usage(0, &dir).unwrap().count, 2);
+        assert_eq!(history.directory_usage(0, &dir).unwrap().timestamp, history.timestamp(0));
+    }
+
+    #[test]
+    fn occurrence_without_directory_detaches_shared_totals() {
+        let dir = PathBuf::from("/work/a");
+        let history = History::from_entries_in_dirs([
+            ("cargo build".to_string(), Some(dir.clone())),
+            ("cargo build".to_string(), None),
+        ]);
+        assert_eq!(history.frequency(0), 2);
+        assert_eq!(history.directory_usage(0, &dir).unwrap().count, 1);
+    }
+
+    #[test]
+    fn moving_between_directories_keeps_each_usage() {
+        let a = PathBuf::from("/work/a");
+        let b = PathBuf::from("/work/b");
+        let history = History::from_entries_in_dirs([
+            ("cargo build".to_string(), Some(a.clone())),
+            ("cargo build".to_string(), Some(b.clone())),
+            ("cargo build".to_string(), Some(a.clone())),
+        ]);
+        assert_eq!(history.frequency(0), 3);
+        assert_eq!(history.directory_usage(0, &a).unwrap().count, 2);
+        assert_eq!(history.directory_usage(0, &b).unwrap().count, 1);
+    }
 
     #[test]
     fn session_recall_skips_replaced_occurrences() {
