@@ -44,7 +44,7 @@ behavior contract.
 - Execution flow, epsh integration, command routing, process boundaries, and module ownership: [Architecture](docs/architecture.md).
 - History search ranking and session snapshots: [History search](docs/history-search.md).
 - Completion matching, ordering, and hot-path constraints: [Completion](docs/completion.md).
-- Design decisions: [capture and retirement](docs/rfc/ISH-32-capture-and-retire.md) and [release delivery](docs/rfc/ISH-42-release-delivery.md); all RFCs are in [docs/rfc](docs/rfc/).
+- Design decisions: [capture and retirement](docs/rfc/ISH-32-capture-and-retire.md) and [release delivery](docs/rfc/ISH-42-release-delivery.md); all RFCs are in [docs/rfc](docs/rfc/). Dependency and data-structure decisions: [decisions](docs/decisions.md).
 - PTY test environment and synchronization: [PTY tests](docs/ptytest.md).
 - Lean project and bridge commands: [formal guide](formal/README.md),
   [protocol](formal/PROTOCOL.md), and
