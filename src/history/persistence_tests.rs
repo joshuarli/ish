@@ -858,7 +858,11 @@ fn directory_proximity_precedes_scoped_frequency() {
     }
     assert_eq!(
         history
-            .context_usage(distant, Some(Path::new("/work/project/src")))
+            .context_usage(
+                distant,
+                Some(Path::new("/work/project/src")),
+                Path::new("/work/project/src").ancestors().count(),
+            )
             .1
             .count,
         1

@@ -3,6 +3,7 @@ use fxhash::FxHashMap;
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 mod legacy;
@@ -372,6 +373,7 @@ impl History {
             *slot = byte.to_ascii_lowercase();
         }
         let mut chars = (!is_ascii).then(|| lowercase_query(query));
+        let cwd_depth = cwd.map_or(0, |cwd| cwd.ancestors().count());
         let count = candidates.map_or(self.len(), |candidates| candidates.len());
         for i in 0..count {
             let idx = candidates.map_or(i, |candidates| candidates[i]);
@@ -408,7 +410,7 @@ impl History {
             if keys.len() == limit && keys.last().is_some_and(|worst| primary < worst.0) {
                 continue;
             }
-            let key = self.rank_key(idx, primary, empty, cwd, now);
+            let key = self.rank_key(idx, primary, empty, cwd, cwd_depth, now);
             if keys.len() == limit && keys.last().is_some_and(|worst| key <= *worst) {
                 continue;
             }
@@ -430,9 +432,10 @@ impl History {
         primary: u64,
         empty: bool,
         cwd: Option<&Path>,
+        cwd_depth: usize,
         now: u64,
     ) -> RankKey {
-        let (context, usage) = self.context_usage(idx, cwd);
+        let (context, usage) = self.context_usage(idx, cwd, cwd_depth);
         let bonus = if empty { 0 } else { usage_bonus(usage, now) };
         (
             primary,
@@ -443,11 +446,34 @@ impl History {
         )
     }
 
-    fn context_usage(&self, idx: usize, cwd: Option<&Path>) -> (usize, &Usage) {
+    /// The nearest recorded directory that is `cwd` or an ancestor of it, and
+    /// its usage. Walks the smaller side: a command usually ran in one
+    /// directory and `cwd` usually nests six deep.
+    fn context_usage(&self, idx: usize, cwd: Option<&Path>, cwd_depth: usize) -> (usize, &Usage) {
         let usage = &self.usages[idx];
         let Some(cwd) = cwd else {
             return (0, &usage.total);
         };
+        if usage.directories.len() <= cwd_depth {
+            let mut nearest: Option<(usize, &Usage)> = None;
+            for (directory, directory_usage) in &usage.directories {
+                let bytes = directory.as_os_str().as_bytes();
+                if !cwd.as_os_str().as_bytes().starts_with(bytes) {
+                    continue;
+                }
+                let Ok(rest) = cwd.strip_prefix(directory.as_path()) else {
+                    continue;
+                };
+                let distance = rest.components().count();
+                if nearest.is_none_or(|(closest, _)| distance < closest) {
+                    nearest = Some((distance, directory_usage));
+                }
+            }
+            return match nearest {
+                Some((distance, directory_usage)) => (usize::MAX - distance, directory_usage),
+                None => (0, &usage.total),
+            };
+        }
         for (distance, directory) in cwd.ancestors().enumerate() {
             if let Some(directory_usage) = usage.directories.get(directory) {
                 return (usize::MAX - distance, directory_usage);
