@@ -24,17 +24,6 @@ verification limits. Open implementation and acceptance work is listed below.
 
 ## Open implementation tickets
 
-### ISH-64 · P2 · Resume interactive hot-path work from the history rewrite
-
-- **Status:** Partially delivered. History ranking and the ASCII-letter filter landed in `e2fb0d4` and `4c01330`. Three interleaved macOS aarch64 pairs against `0d62fe7` moved `history_search_trace` by -46% to -56%, `history_fuzzy_search_into_45k` by -46% to -59%, and `history_fuzzy_search_in_dir_45k` by -31% to -48%. The search allocation count is unchanged; the transient ranking buffer grew by 1,608 B. `docs/verification/history-search-profile.md` records the profile and the per-run medians. Completion metadata lookup moved to `fstatat` against the opened directory handle in `927ba47`; a 200-match completion fell from 3.60 ms to 0.25 ms in interleaved binary runs.
-- **Area:** Performance
-- **Where:** `benches/bench.rs`, `src/history.rs`, `src/complete.rs`, `src/ls.rs`, `src/shell.rs`, `docs/verification/history-search-profile.md`
-- **Problem:** `History` is 5.81 MB at 45k unique commands, down from 22.32 MB (129 B per entry, command text is 1.53 MB of it). The trace profile put 81.8% of samples in `History::search_limited`; the pager cache and rendering accounted for five samples. Every matching candidate built a 272-byte `FuzzyMatch` before the 200-result limit, and every candidate ran the byte matcher even when the command lacked a query letter. Completion rebuilt each matching entry's full path and re-walked it in `stat`. All are fixed.
-- **Recommendation:** The search and completion leads are delivered. The owner declined `startup_cold` work; the legacy migration path is a once-per-upgrade cost. `cd_prompt_with_denv` costs roughly twice the plain path on macOS aarch64; the owner deferred it, so do not take it without asking. Not worth redoing: `bbtree` (`docs/decisions.md`), a top-K `BinaryHeap` for history ranking, skipping the denv variable clone, and prefix-compressing the command arena.
-- **Measurement:** `perf-gate-ready` can exit 0 while another workload saturates the host, so check `uptime` and `ps -Ao pcpu,comm -r` too. Work in two worktrees and compare with `rustybench baseline --root <wt> --baseline <json> -- cargo bench --bench bench` followed by `rustybench diff`, interleaving baseline and candidate. Repeated runs of the same binary spread 20–40 percent on a busy host, so trust paired ratios, not single runs. The allocator counters in the bench report are deterministic and stay usable when timing does not. For attribution, run the workload in a loop long enough to sample and use `sample <pid> 4 -file <out>`; its leaf-stack table put the trace cost in `History::search_limited`. `xctrace export` did not carry backtraces. Scratch probes used this session lived in `.work/tmp` and are disposable; rebuild them from the benchmark fixtures in `benches/bench.rs` rather than relying on them.
-- **Fix with:** make-it-fast
-- **Effort:** S (remaining)
-
 ### ISH-60 · P3 · Journaled retirement makes large flat EXDEV moves take minutes
 
 - **Status:** Candidate parked at `e2f0f08` on `backlog-retirement-2026-10-23`; it is not integrated. Focused correctness, mount fixtures, and complete baseline/candidate 4k and 16k output verification passed. Timing proof is deferred because unrelated host builds overlapped samples.
