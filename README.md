@@ -2,8 +2,12 @@
 
 ish is an interactive shell for macOS and Linux. It provides a native prompt,
 line editing, history search, completion, aliases, minimal job control, native
-`cp` and `mv` commands, and protected deletion. It has no script-file or
-command-string mode.
+`cp` and `mv` commands, and protected deletion.
+
+ish does not parse or evaluate scripts or command strings. It does satisfy the
+login-shell contract: `ish -c COMMAND` hands `COMMAND` to `/bin/sh -c` and
+exits with that shell's status, so a login shell can serve `ssh`, `scp`,
+`cron`, and `make`. See [ISH-63](docs/rfc/ISH-63-login-shell-command.md).
 
 ## Install and run
 
@@ -20,13 +24,14 @@ Start the shell with:
 ish
 ```
 
-Use `ish --help` for command-line options. `-c PATH` selects a config file,
-`--no-config` skips config loading, and `-V` prints the version.
+Use `ish --help` for command-line options. `-c COMMAND` runs a command with
+`/bin/sh`, `--config PATH` selects a config file, `--no-config` skips config
+loading, and `-V` prints the version.
 
 ## Configuration
 
 By default, ish reads `~/.config/ish/config.ish`. If `HOME` is unset, it checks
-`/etc/ish/config.ish`. Use `-c PATH` to select another file.
+`/etc/ish/config.ish`. Use `--config PATH` to select another file.
 
 The file supports `set` and `alias` directives. A `set` value is one shell word;
 quote values that contain spaces. `$NAME` is expanded when the config loads.
