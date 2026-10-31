@@ -1,6 +1,6 @@
 # History search profile
 
-The baseline is the reviewed master revision `fb5797e`.
+The original baseline is the reviewed master revision `fb5797e`.
 
 The baseline `perf` profile placed 76.8% of counted samples in `History::fuzzy_search_subset_into_in_dir`. The ASCII matcher showed a repeated forward scan before ranking. The profile lost about 21% of samples under host load, so it locates work but cannot support a speed claim.
 
@@ -63,3 +63,50 @@ children, and the GNU time wrapper, including startup. Each measured run passed
 
 The ranges overlap and pass the 2× CPU ceiling. This process-creation workload
 establishes no measurable CPU-cost change and makes no latency claim.
+
+## Search ranking before materialization
+
+The next profile targeted `history_search_trace` on master `0d62fe7`. A
+five-second `sample` of the benchmark binary took 4,186 samples: 81.8% in
+`History::search_limited`, 14.5% in `find_substring_icase_ascii_bytes`, and
+2.7% in `memmove`. The pager cache and row rendering accounted for five
+samples. The trace runs four searches over 45k entries (empty, `g`, `gc`,
+`gco`), so the ranking scan, not the pager, was the cost.
+
+`FuzzyMatch` is 272 bytes because every match carries 32 positions. The search
+built one for each matching candidate before checking the 200-result limit, so
+the empty query wrote about 12 MB of positions it discarded. Candidates now
+rank by match tier only. Positions are built for the results that survive the
+limit. The ranking entry carries the candidate index in the same vector, so
+the search still makes one allocation.
+
+A 26-bit ASCII presence mask then rejects a command that lacks a letter the
+query needs. The mask is computed once when the command is stored and reuses
+padding in `EntryUsage`, so the entry layout does not grow. It applies only
+when both the query and the command are ASCII; Unicode case folding can map a
+non-ASCII character onto an ASCII letter.
+
+The mask adds one pass over each new command at load. The paired runs showed
+no consistent change in `startup_warm` or `startup_cold`; their spread was
+larger than any difference.
+
+Three interleaved pairs ran the full suite on macOS aarch64 in worktrees at
+`0d62fe7` and `4c01330`:
+
+    rustybench baseline --root <worktree> --baseline <json> -- cargo bench --bench bench
+    rustybench diff <baseline.json> <candidate.json>
+
+`perf-gate-ready` returned 0 before each pair but reported a hot process tree
+from an unrelated Rust build, and the load average stayed between 9 and 11.
+The ratios, not the absolute times, support the change.
+
+| Workload | Baseline median (range) | Candidate median (range) | Change |
+| --- | ---: | ---: | ---: |
+| `history_fuzzy_search_in_dir_45k` | 648,167 ns (609,146–757,208) | 393,500 ns (387,937–421,604) | -39.3% |
+| `history_fuzzy_search_into_45k` | 674,563 ns (598,312–786,521) | 322,604 ns (299,813–324,000) | -52.2% |
+| `history_search_trace` | 2,494,000 ns (2,325,416–2,830,333) | 1,247,250 ns (1,154,979–1,257,874) | -50.0% |
+
+Each search still makes one allocation. The ranking vector grew from 6,432 B
+to 8,040 B because it now carries the candidate index; the trace grew from
+25,728 B to 32,160 B with four searches. The candidate range stayed below the
+baseline range for each workload.
