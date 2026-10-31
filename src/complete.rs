@@ -495,24 +495,16 @@ fn complete_in_directory(dir: &std::ffi::OsStr, prefix: &str, dirs_only: bool, c
     if dp.is_null() {
         return;
     }
+    // SAFETY: dp is a valid DIR* from opendir above.
+    let dir_fd = unsafe { libc::dirfd(dp) };
+    if dir_fd < 0 {
+        // SAFETY: dp came from opendir and has not been closed.
+        unsafe { libc::closedir(dp) };
+        return;
+    }
 
     let before = comp.entries.len();
     let mut prefix_count = 0usize;
-
-    // Stack buffer for "dir/name\0" used by stat/lstat
-    let mut path_buf = [0u8; 4096];
-    let dir_prefix_len = if dir_path == "." {
-        0
-    } else {
-        let len = dir_bytes.len();
-        path_buf[..len].copy_from_slice(dir_bytes);
-        if dir_bytes.last() != Some(&b'/') {
-            path_buf[len] = b'/';
-            len + 1
-        } else {
-            len
-        }
-    };
 
     loop {
         // SAFETY: dp is a valid DIR* from opendir above.
@@ -554,18 +546,12 @@ fn complete_in_directory(dir: &std::ffi::OsStr, prefix: &str, dirs_only: bool, c
             continue;
         }
 
-        // Build full path for stat: "dir/name\0"
-        let total = dir_prefix_len + name_bytes.len();
-        if total >= path_buf.len() {
-            continue;
-        }
-        path_buf[dir_prefix_len..total].copy_from_slice(name_bytes);
-        path_buf[total] = 0;
-
-        // stat follows symlinks (so symlink-to-dir counts as dir)
-        // SAFETY: path_buf is NUL-terminated, stat writes into stack struct.
+        // stat follows symlinks (so symlink-to-dir counts as dir), and the
+        // directory fd keeps the lookup inside the directory just read.
+        // SAFETY: dir_fd is open for reading, name_cstr is NUL-terminated, and
+        // stat writes into the stack struct.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::stat(path_buf.as_ptr() as *const libc::c_char, &mut st) } != 0 {
+        if unsafe { libc::fstatat(dir_fd, name_cstr.as_ptr(), &mut st, 0) } != 0 {
             continue;
         }
         let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
@@ -573,7 +559,14 @@ fn complete_in_directory(dir: &std::ffi::OsStr, prefix: &str, dirs_only: bool, c
             true
         } else if d_type == libc::DT_UNKNOWN {
             let mut lst: libc::stat = unsafe { std::mem::zeroed() };
-            (unsafe { libc::lstat(path_buf.as_ptr() as *const libc::c_char, &mut lst) }) == 0
+            (unsafe {
+                libc::fstatat(
+                    dir_fd,
+                    name_cstr.as_ptr(),
+                    &mut lst,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            }) == 0
                 && lst.st_mode & libc::S_IFMT == libc::S_IFLNK
         } else {
             false
