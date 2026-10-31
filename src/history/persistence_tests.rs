@@ -92,7 +92,11 @@ fn migrates_cache_and_retires_originals() {
         assert_eq!(history.frequency(repeated), 3);
         assert_eq!(history.timestamp(repeated), timestamp + 2000);
         assert_eq!(
-            history.usages[repeated].directories[Path::new("/work/project")].count,
+            history.usages[repeated]
+                .directories
+                .get(Path::new("/work/project"))
+                .unwrap()
+                .count,
             2
         );
         assert!(!fixture.path().exists());
@@ -122,7 +126,11 @@ fn migration_prefers_newest_metadata_and_does_not_double_count_flush_copy() {
         .unwrap();
     assert_eq!(history.timestamp(idx), timestamp + 2000);
     assert_eq!(
-        history.usages[idx].directories[Path::new("/cached")].timestamp,
+        history.usages[idx]
+            .directories
+            .get(Path::new("/cached"))
+            .unwrap()
+            .timestamp,
         timestamp + 2000
     );
 }
@@ -280,9 +288,8 @@ fn cwd_bytes_and_full_unicode_commands_round_trip() {
     let loaded = History::load_from(fixture.path()).unwrap();
     assert_eq!(loaded.get(0), command);
     assert_eq!(
-        loaded.usages[0]
-            .directories
-            .keys()
+        loaded
+            .directories(0)
             .next()
             .unwrap()
             .as_os_str()

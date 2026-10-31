@@ -40,10 +40,103 @@ struct Usage {
     timestamp: u64,
 }
 
+/// Where a command has run. A command almost always ran in one directory, so
+/// that case stays inline and only a command that really moved between
+/// directories pays for a table.
+#[derive(Default)]
+enum Directories {
+    #[default]
+    Empty,
+    One((PathBuf, Usage)),
+    Many(FxHashMap<PathBuf, Usage>),
+}
+
+impl Directories {
+    fn record(&mut self, cwd: PathBuf, timestamp: u64) {
+        match self {
+            Directories::Empty => {
+                *self = Directories::One((
+                    cwd,
+                    Usage {
+                        count: 1,
+                        timestamp,
+                    },
+                ));
+            }
+            Directories::One((directory, usage)) if *directory == cwd => {
+                usage.count = usage.count.saturating_add(1);
+                usage.timestamp = usage.timestamp.max(timestamp);
+            }
+            Directories::One(_) => {
+                let mut map = FxHashMap::default();
+                if let Directories::One((directory, usage)) = std::mem::take(self) {
+                    map.insert(directory, usage);
+                }
+                map.entry(cwd).or_default().record(timestamp);
+                *self = Directories::Many(map);
+            }
+            Directories::Many(map) => map.entry(cwd).or_default().record(timestamp),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Directories::Empty => 0,
+            Directories::One(_) => 1,
+            Directories::Many(map) => map.len(),
+        }
+    }
+
+    fn get(&self, cwd: &Path) -> Option<&Usage> {
+        match self {
+            Directories::Empty => None,
+            Directories::One((directory, usage)) => (directory.as_path() == cwd).then_some(usage),
+            Directories::Many(map) => map.get(cwd),
+        }
+    }
+
+    fn iter(&self) -> DirectoriesIter<'_> {
+        match self {
+            Directories::Empty => DirectoriesIter::Empty,
+            Directories::One(entry) => DirectoriesIter::One(std::iter::once(entry)),
+            Directories::Many(map) => DirectoriesIter::Many(map.iter()),
+        }
+    }
+}
+
+enum DirectoriesIter<'a> {
+    Empty,
+    One(std::iter::Once<&'a (PathBuf, Usage)>),
+    Many(std::collections::hash_map::Iter<'a, PathBuf, Usage>),
+}
+
+impl<'a> Iterator for DirectoriesIter<'a> {
+    type Item = (&'a Path, &'a Usage);
+
+    fn next(&mut self) -> Option<(&'a Path, &'a Usage)> {
+        let (directory, usage) = match self {
+            DirectoriesIter::Empty => return None,
+            DirectoriesIter::One(iter) => {
+                let (directory, usage) = iter.next()?;
+                (directory, usage)
+            }
+            DirectoriesIter::Many(iter) => iter.next()?,
+        };
+        Some((directory.as_path(), usage))
+    }
+}
+
+impl Usage {
+    fn record(&mut self, timestamp: u64) {
+        self.count = self.count.saturating_add(1);
+        self.timestamp = self.timestamp.max(timestamp);
+    }
+}
+
 struct EntryUsage {
     latest_id: i64,
     total: Usage,
-    directories: FxHashMap<PathBuf, Usage>,
+    directories: Directories,
     session_occurrence_id: Option<i64>,
 }
 
@@ -149,7 +242,7 @@ impl History {
                 self.usages.push(EntryUsage {
                     latest_id: 0,
                     total: Usage::default(),
-                    directories: FxHashMap::default(),
+                    directories: Directories::Empty,
                     session_occurrence_id: None,
                 });
                 self.index_by_hash.insert(hash, idx);
@@ -159,12 +252,9 @@ impl History {
         let usage = &mut self.usages[idx];
         self.latest_occurrences.remove(&usage.latest_id);
         usage.latest_id = occurrence.id;
-        usage.total.count = usage.total.count.saturating_add(1);
-        usage.total.timestamp = usage.total.timestamp.max(occurrence.timestamp);
+        usage.total.record(occurrence.timestamp);
         if let Some(cwd) = occurrence.cwd {
-            let directory = usage.directories.entry(cwd).or_default();
-            directory.count = directory.count.saturating_add(1);
-            directory.timestamp = directory.timestamp.max(occurrence.timestamp);
+            usage.directories.record(cwd, occurrence.timestamp);
         }
         self.latest_occurrences.insert(occurrence.id, idx);
         self.last_id = self.last_id.max(occurrence.id);
@@ -456,15 +546,10 @@ impl History {
         };
         if usage.directories.len() <= cwd_depth {
             let mut nearest: Option<(usize, &Usage)> = None;
-            for (directory, directory_usage) in &usage.directories {
-                let bytes = directory.as_os_str().as_bytes();
-                if !cwd.as_os_str().as_bytes().starts_with(bytes) {
-                    continue;
-                }
-                let Ok(rest) = cwd.strip_prefix(directory.as_path()) else {
+            for (directory, directory_usage) in usage.directories.iter() {
+                let Some(distance) = ancestor_distance(directory, cwd) else {
                     continue;
                 };
-                let distance = rest.components().count();
                 if nearest.is_none_or(|(closest, _)| distance < closest) {
                     nearest = Some((distance, directory_usage));
                 }
@@ -488,7 +573,10 @@ impl History {
     }
 
     pub fn directories(&self, idx: usize) -> impl Iterator<Item = &Path> {
-        self.usages[idx].directories.keys().map(PathBuf::as_path)
+        self.usages[idx]
+            .directories
+            .iter()
+            .map(|(directory, _)| directory)
     }
 
     pub fn get(&self, idx: usize) -> &str {
@@ -505,6 +593,16 @@ impl History {
         // the common case at one lookup without allocating a second text copy.
         (0..self.len()).find(|&idx| self.get(idx) == text)
     }
+}
+
+/// How many components `cwd` is below `directory`, when it is below it at
+/// all. `Some(0)` means they are the same directory.
+fn ancestor_distance(directory: &Path, cwd: &Path) -> Option<usize> {
+    if !cwd.as_os_str().as_bytes().starts_with(directory.as_os_str().as_bytes()) {
+        return None;
+    }
+    let rest = cwd.strip_prefix(directory).ok()?;
+    Some(rest.components().count())
 }
 
 fn usage_bonus(usage: &Usage, now: u64) -> u32 {
