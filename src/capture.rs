@@ -1042,10 +1042,10 @@ mod tests {
         rustix::fs::fcntl_setfl(&master_write, rustix::fs::OFlags::NONBLOCK).expect("nonblock write");
         let (slave_read, slave_write) = rustix::pipe::pipe().expect("slave pipe");
         let capacity = write_until_full(&master_write);
-        let space = 64;
+        let space = 4096;
         assert!(capacity > space);
         let _ = read_exact(&master_read, space);
-        let mut payload = vec![b'a'; 800];
+        let mut payload = vec![b'a'; 3 * space];
         payload.push(0x03);
         let paused = Arc::new(AtomicBool::new(false));
         let mut pump = Pump {
