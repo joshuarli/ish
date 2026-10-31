@@ -3,7 +3,7 @@ use fxhash::FxHashMap;
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -136,25 +136,25 @@ struct EntryUsage {
     directories: Directories,
     /// One-based slot in `History::session`, so replacing a command's session
     /// occurrence is a store instead of a search.
-    session_position: Option<NonZeroUsize>,
+    session_position: Option<NonZeroU32>,
 }
 
-const SESSION_REMOVED: usize = usize::MAX;
+const SESSION_REMOVED: u32 = u32::MAX;
 
 pub struct History {
     /// Unique command text stays packed; updating usage never moves a candidate.
     arena: String,
     offsets: Vec<(u32, u32)>,
     usages: Vec<EntryUsage>,
-    index_by_hash: FxHashMap<u64, usize>,
-    latest_occurrences: BTreeMap<i64, usize>,
+    index_by_hash: FxHashMap<u64, u32>,
+    latest_occurrences: BTreeMap<i64, u32>,
     /// Directory paths addressed by the codes in `EntryUsage::directories`.
     directory_paths: Vec<PathBuf>,
     directory_codes: FxHashMap<PathBuf, u32>,
     /// Startup snapshot plus this shell's commands, oldest first. Other
     /// sessions may update global usage without changing the order or
     /// membership of Up-arrow recall. Replaced occurrences leave a tombstone.
-    session: Vec<usize>,
+    session: Vec<u32>,
     session_live: usize,
     session_id: u64,
     generation: i64,
@@ -191,9 +191,10 @@ impl History {
         }
         let latest = std::mem::take(&mut history.latest_occurrences);
         for &idx in latest.values() {
-            history.remember_session(idx);
+            history.remember_session(idx as usize);
         }
         history.latest_occurrences = latest;
+        history.compact();
         Ok(history)
     }
 
@@ -265,7 +266,8 @@ impl History {
                     directories: Directories::Empty,
                     session_position: None,
                 });
-                self.index_by_hash.insert(hash, idx);
+                self.index_by_hash
+                    .insert(hash, u32::try_from(idx).expect("history entries exceed 4 billion"));
                 idx
             }
         };
@@ -279,19 +281,26 @@ impl History {
         if let Some(code) = directory {
             usage.directories.record(code, occurrence.timestamp);
         }
-        self.latest_occurrences.insert(occurrence.id, idx);
+        self.latest_occurrences.insert(
+            occurrence.id,
+            u32::try_from(idx).expect("history entries exceed 4 billion"),
+        );
         self.last_id = self.last_id.max(occurrence.id);
         idx
     }
 
     fn remember_session(&mut self, idx: usize) {
         if let Some(previous) = self.usages[idx].session_position {
-            self.session[previous.get() - 1] = SESSION_REMOVED;
+            self.session[previous.get() as usize - 1] = SESSION_REMOVED;
         } else {
             self.session_live += 1;
         }
-        self.session.push(idx);
-        self.usages[idx].session_position = NonZeroUsize::new(self.session.len());
+        self.session.push(
+            u32::try_from(idx).expect("history entries exceed 4 billion"),
+        );
+        self.usages[idx].session_position = NonZeroU32::new(
+            u32::try_from(self.session.len()).expect("session exceeds 4 billion entries"),
+        );
         self.compact_session();
     }
 
@@ -308,8 +317,21 @@ impl History {
                 continue;
             }
             self.session.push(idx);
-            self.usages[idx].session_position = NonZeroUsize::new(self.session.len());
+            self.usages[idx as usize].session_position = NonZeroU32::new(
+                u32::try_from(self.session.len()).expect("session exceeds 4 billion entries"),
+            );
         }
+    }
+
+    /// Give back the growth slack a bulk load leaves behind. Entries arrive in
+    /// chunks of doubling capacity, so a loaded history sits up to twice its
+    /// content.
+    fn compact(&mut self) {
+        self.arena.shrink_to_fit();
+        self.offsets.shrink_to_fit();
+        self.usages.shrink_to_fit();
+        self.session.shrink_to_fit();
+        self.index_by_hash.shrink_to_fit();
     }
 
     fn intern_directory(&mut self, cwd: PathBuf) -> u32 {
@@ -372,6 +394,7 @@ impl History {
             });
             history.remember_session(idx);
         }
+        history.compact();
         history
     }
 
@@ -424,7 +447,7 @@ impl History {
         self.latest_occurrences
             .values()
             .rev()
-            .map(|&idx| self.get(idx))
+            .map(|&idx| self.get(idx as usize))
             .filter(|command| command.starts_with(prefix))
             .nth(skip)
     }
@@ -435,7 +458,7 @@ impl History {
             .rev()
             .filter(|&&idx| idx != SESSION_REMOVED)
             .nth(skip)
-            .map(|&idx| self.get(idx))
+            .map(|&idx| self.get(idx as usize))
     }
 
     pub fn session_prefix_search(&self, prefix: &str, skip: usize) -> Option<&str> {
@@ -443,7 +466,7 @@ impl History {
             .iter()
             .rev()
             .filter(|&&idx| idx != SESSION_REMOVED)
-            .map(|&idx| self.get(idx))
+            .map(|&idx| self.get(idx as usize))
             .filter(|command| command.starts_with(prefix))
             .nth(skip)
     }
@@ -451,7 +474,7 @@ impl History {
     /// Unique commands ordered by actual last-use time, with commit IDs breaking ties.
     pub fn command_indices_into(&self, out: &mut Vec<usize>) {
         out.clear();
-        out.extend(self.latest_occurrences.values().copied());
+        out.extend(self.latest_occurrences.values().map(|&idx| idx as usize));
         out.sort_unstable_by(|&a, &b| {
             self.timestamp(a)
                 .cmp(&self.timestamp(b))
@@ -462,7 +485,7 @@ impl History {
     /// All global candidates, independent of the session recall snapshot.
     pub fn search_entry_indices_into(&self, out: &mut Vec<usize>) {
         out.clear();
-        out.extend(self.latest_occurrences.values().rev().copied());
+        out.extend(self.latest_occurrences.values().rev().map(|&idx| idx as usize));
     }
 
     /// Ctrl+R search: keep the best `limit` matches of `query` among
@@ -661,8 +684,8 @@ impl History {
 
     fn find_entry_index(&self, hash: u64, text: &str) -> Option<usize> {
         let &idx = self.index_by_hash.get(&hash)?;
-        if self.get(idx) == text {
-            return Some(idx);
+        if self.get(idx as usize) == text {
+            return Some(idx as usize);
         }
         // Hash collisions must not merge commands. This rare slow path keeps
         // the common case at one lookup without allocating a second text copy.
