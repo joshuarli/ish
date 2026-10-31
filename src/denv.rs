@@ -49,6 +49,8 @@ enum EnvChange {
 pub struct Session {
     data_dir: Result<PathBuf, String>,
     record_id: Result<String, String>,
+    active: Option<ActiveState>,
+    active_loaded: bool,
 }
 
 impl Session {
@@ -160,7 +162,12 @@ pub fn init(epsh: &mut epsh::eval::Shell) -> Session {
     {
         report!("denv: {err}");
     }
-    Session { data_dir, record_id }
+    Session {
+        data_dir,
+        record_id,
+        active: None,
+        active_loaded: false,
+    }
 }
 
 pub fn on_exit(session: &Session) {
@@ -173,17 +180,17 @@ pub fn on_exit(session: &Session) {
 }
 
 /// Refresh the environment at startup; errors leave the caller's store unchanged.
-pub fn on_startup(session: &Session, shell: &mut epsh::eval::Shell) -> Result<(), String> {
+pub fn on_startup(session: &mut Session, shell: &mut epsh::eval::Shell) -> Result<(), String> {
     refresh(session, false, shell).map(|_| ())
 }
 
 /// Refresh after a cwd change, using the supplied shell's cwd and variables.
-pub fn on_cd(session: &Session, shell: &mut epsh::eval::Shell) -> Result<(), String> {
+pub fn on_cd(session: &mut Session, shell: &mut epsh::eval::Shell) -> Result<(), String> {
     refresh(session, false, shell).map(|_| ())
 }
 
 /// Execute a denv command and publish a validated, persisted environment transition.
-pub fn command(session: &Session, args: &[String], shell: &mut epsh::eval::Shell) -> i32 {
+pub fn command(session: &mut Session, args: &[String], shell: &mut epsh::eval::Shell) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("allow") => allow_current_dir(session, shell),
         Some("deny") => deny_current_dir(session, shell),
@@ -217,27 +224,41 @@ fn apply_changes(variables: &mut Variables, changes: &[EnvChange]) -> Result<(),
     Ok(())
 }
 
-fn refresh(session: &Session, force: bool, epsh: &mut epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
-    let data_dir = session.data_dir()?;
-    let record_id = session.record_id()?;
-    let active = match load_active(data_dir, record_id) {
-        Ok(active) => active,
-        Err(ActiveLoadError::Malformed(message)) if force => {
-            clear_active(data_dir, record_id)?;
-            report!(
-                "denv: discarded unreadable active record ({message}); variables it saved cannot be restored"
-            );
-            None
-        }
-        Err(err) => return Err(err.into_message()),
-    };
-    let transition = refresh_inner(force, epsh, active, &data_dir.join("allow"))?;
+fn refresh(session: &mut Session, force: bool, epsh: &mut epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
+    let data_dir = session.data_dir.as_deref().map_err(Clone::clone)?;
+    let record_id = session.record_id.as_deref().map_err(Clone::clone)?;
+    if !session.active_loaded {
+        session.active = match load_active(data_dir, record_id) {
+            Ok(active) => active,
+            Err(ActiveLoadError::Malformed(message)) if force => {
+                clear_active(data_dir, record_id)?;
+                report!(
+                    "denv: discarded unreadable active record ({message}); variables it saved cannot be restored"
+                );
+                None
+            }
+            Err(err) => return Err(err.into_message()),
+        };
+        session.active_loaded = true;
+    }
+    let transition = refresh_inner(
+        force,
+        epsh,
+        session.active.as_ref(),
+        &data_dir.join("allow"),
+    )?;
     let mut candidate = epsh.vars().clone();
     apply_changes(&mut candidate, &transition.changes)?;
     match transition.record {
         RecordUpdate::Keep => {}
-        RecordUpdate::Clear => clear_active(data_dir, record_id)?,
-        RecordUpdate::Save(state) => save_active(data_dir, record_id, &state)?,
+        RecordUpdate::Clear => {
+            clear_active(data_dir, record_id)?;
+            session.active = None;
+        }
+        RecordUpdate::Save(state) => {
+            save_active(data_dir, record_id, &state)?;
+            session.active = Some(state);
+        }
     }
     *epsh.vars_mut() = candidate;
     print_summary(transition.changes.iter().filter_map(|change| match change {
@@ -251,7 +272,7 @@ fn refresh(session: &Session, force: bool, epsh: &mut epsh::eval::Shell) -> Resu
 fn refresh_inner(
     force: bool,
     epsh: &epsh::eval::Shell,
-    active: Option<ActiveState>,
+    active: Option<&ActiveState>,
     allow_dir: &Path,
 ) -> Result<Transition, String> {
     let cwd = current_dir_from_store(epsh)?;
@@ -268,10 +289,11 @@ fn refresh_inner(
         .and_then(|found| found.dotenv.as_ref())
         .map(|(path, _)| read_trusted_candidate(path))
         .transpose()?;
-    let files_allowed = [&envrc_file, &dotenv_file]
+    let blocked = [&envrc_file, &dotenv_file]
         .into_iter()
         .flatten()
-        .all(|file| is_allowed_in(allow_dir, file));
+        .find(|file| !is_allowed_in(allow_dir, file));
+    let files_allowed = blocked.is_none();
     let dotenv_entries = if files_allowed {
         match &dotenv_file {
             Some(file) => load_dotenv_entries(&file.bytes)?,
@@ -286,7 +308,7 @@ fn refresh_inner(
             return Ok(Transition { changes: Vec::new(), record: RecordUpdate::Keep });
         }
         if files_allowed
-            && let Some(active) = &active
+            && let Some(active) = active
             && active.envrc_mtime == found.envrc.as_ref().map(|(_, m)| *m).unwrap_or(0)
             && active.dotenv_mtime == found.dotenv.as_ref().map(|(_, m)| *m).unwrap_or(0)
             && paths_match(&active.dir, &found.dir)
@@ -297,7 +319,7 @@ fn refresh_inner(
 
     let mut changes = Vec::new();
 
-    if let Some(ref state) = active {
+    if let Some(state) = active {
         apply_restore(&state.prev, &mut changes);
     }
 
@@ -313,11 +335,7 @@ fn refresh_inner(
     let envrc_mtime = found.envrc.as_ref().map(|(_, m)| *m).unwrap_or(0);
     let dotenv_mtime = found.dotenv.as_ref().map(|(_, m)| *m).unwrap_or(0);
 
-    if let Some(blocked) = [&envrc_file, &dotenv_file]
-        .into_iter()
-        .flatten()
-        .find(|file| !is_allowed_in(allow_dir, file))
-    {
+    if let Some(blocked) = blocked {
         let dir = canonicalize_fallback(&found.dir);
         report!(
             "denv: {} is blocked. Run `denv allow` to trust it.",
@@ -377,7 +395,7 @@ fn refresh_inner(
     Ok(Transition { changes, record: RecordUpdate::Save(state) })
 }
 
-fn allow_current_dir(session: &Session, epsh: &mut epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
+fn allow_current_dir(session: &mut Session, epsh: &mut epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
     let cwd = current_dir_from_store(epsh)?;
     let found = find_env_files(&cwd).ok_or("no .envrc or .env found")?;
     for (path, _) in found.envrc.iter().chain(found.dotenv.iter()) {
@@ -388,7 +406,7 @@ fn allow_current_dir(session: &Session, epsh: &mut epsh::eval::Shell) -> Result<
     refresh(session, true, epsh)
 }
 
-fn deny_current_dir(session: &Session, epsh: &mut epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
+fn deny_current_dir(session: &mut Session, epsh: &mut epsh::eval::Shell) -> Result<Vec<EnvChange>, String> {
     let cwd = current_dir_from_store(epsh)?;
     let found = find_env_files(&cwd).ok_or("no .envrc or .env found")?;
     for (path, _) in found.envrc.iter().chain(found.dotenv.iter()) {
@@ -1660,7 +1678,7 @@ mod tests {
             epsh.vars_mut().export(key);
         }
         if let Some(pwd) = epsh.get_var_bytes("PWD") { epsh.set_cwd(pwd.to_path_buf()); }
-        let session = init(&mut epsh);
+        let mut session = init(&mut epsh);
         save_active(
             &data,
             session.record_id().unwrap(),
@@ -1673,7 +1691,7 @@ mod tests {
         )
         .unwrap();
 
-        let changes = refresh(&session, false, &mut epsh).unwrap();
+        let changes = refresh(&mut session, false, &mut epsh).unwrap();
 
         assert!(changes.iter().any(|change| matches!(
             change,
@@ -1754,14 +1772,14 @@ mod tests {
             epsh.vars_mut().export(key);
         }
         if let Some(pwd) = epsh.get_var_bytes("PWD") { epsh.set_cwd(pwd.to_path_buf()); }
-        let session = init(&mut epsh);
+        let mut session = init(&mut epsh);
         std::fs::write(
             active_path(&data, session.record_id().unwrap()),
             b"DENV-ACTIVE 99\n",
         )
         .unwrap();
 
-        let err = match refresh(&session, false, &mut epsh) {
+        let err = match refresh(&mut session, false, &mut epsh) {
             Ok(_) => panic!("expected malformed active format to fail"),
             Err(err) => err,
         };
@@ -1822,8 +1840,8 @@ mod tests {
         std::mem::forget(earlier);
 
         if let Some(pwd) = epsh.get_var_bytes("PWD") { epsh.set_cwd(pwd.to_path_buf()); }
-        let later = init(&mut epsh);
-        let changes = refresh(&later, false, &mut epsh).unwrap();
+        let mut later = init(&mut epsh);
+        let changes = refresh(&mut later, false, &mut epsh).unwrap();
 
         assert!(!changes.iter().any(|change| matches!(
             change,
@@ -1842,19 +1860,19 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         let mut epsh = denv_test_shell(&data, &outside, &[]);
         if let Some(pwd) = epsh.get_var_bytes("PWD") { epsh.set_cwd(pwd.to_path_buf()); }
-        let session = init(&mut epsh);
+        let mut session = init(&mut epsh);
         let id = epsh.vars().get("__DENV_PID").unwrap().to_string();
         let record = active_path(&data, &id);
         std::fs::write(&record, b"DENV-ACTIVE 99\n").unwrap();
 
-        assert!(refresh(&session, false, &mut epsh).is_err());
+        assert!(refresh(&mut session, false, &mut epsh).is_err());
         assert!(record.exists());
 
-        let outcome = command(&session, &["reload".to_string()], &mut epsh);
+        let outcome = command(&mut session, &["reload".to_string()], &mut epsh);
 
         assert_eq!(outcome, 0);
         assert!(!record.exists());
-        assert!(refresh(&session, false, &mut epsh).is_ok());
+        assert!(refresh(&mut session, false, &mut epsh).is_ok());
     }
 
     #[test]
@@ -1869,9 +1887,9 @@ mod tests {
         allow_file_in(&data.join("allow"), &read_trusted_candidate(&dotenv).unwrap()).unwrap();
         let mut epsh = denv_test_shell(&data, &project, &[]);
         if let Some(pwd) = epsh.get_var_bytes("PWD") { epsh.set_cwd(pwd.to_path_buf()); }
-        let session = init(&mut epsh);
+        let mut session = init(&mut epsh);
 
-        refresh(&session, false, &mut epsh).unwrap();
+        refresh(&mut session, false, &mut epsh).unwrap();
         assert_eq!(active_record_names(&data).len(), 1);
 
         drop(session);
@@ -2285,29 +2303,29 @@ mod tests {
             home.join(".local/share/denv")
         };
         if let Some(pwd) = epsh.get_var_bytes("PWD") { epsh.set_cwd(pwd.to_path_buf()); }
-        let session = init(&mut epsh);
-        let outcome = command(&session, &["allow".to_string()], &mut epsh);
+        let mut session = init(&mut epsh);
+        let outcome = command(&mut session, &["allow".to_string()], &mut epsh);
         assert_eq!(outcome, 0);
         assert_eq!(epsh.vars().get("DENV_SESSION_MARKER"), Some("project"));
         assert_eq!(epsh.vars().get(key), changed.to_str());
         let active = active_path(&data, session.record_id().unwrap());
         assert!(active.exists());
 
-        let reload = command(&session, &["reload".to_string()], &mut epsh);
+        let reload = command(&mut session, &["reload".to_string()], &mut epsh);
         assert_eq!(reload, 0);
         assert_eq!(epsh.vars().get("DENV_SESSION_MARKER"), Some("project"));
         assert_eq!(epsh.vars().get(key), changed.to_str());
-        let deny = command(&session, &["deny".to_string()], &mut epsh);
+        let deny = command(&mut session, &["deny".to_string()], &mut epsh);
         assert_eq!(deny, 0);
         assert_eq!(epsh.vars().get("DENV_SESSION_MARKER"), Some("original"));
         assert!(!active.exists());
-        let allow = command(&session, &["allow".to_string()], &mut epsh);
+        let allow = command(&mut session, &["allow".to_string()], &mut epsh);
         assert_eq!(allow, 0);
         assert_eq!(epsh.vars().get("DENV_SESSION_MARKER"), Some("project"));
 
         epsh.vars_mut().set("PWD", outside.to_str().unwrap()).unwrap();
         epsh.set_cwd(outside.clone());
-        on_cd(&session, &mut epsh).unwrap();
+        on_cd(&mut session, &mut epsh).unwrap();
         assert_eq!(epsh.vars().get("DENV_SESSION_MARKER"), Some("original"));
         assert_eq!(epsh.vars().get("HOME"), home.to_str());
         if key == "DENV_DATA_DIR" {
@@ -2370,7 +2388,7 @@ mod tests {
             epsh.vars_mut().export(key);
         }
         if let Some(pwd) = epsh.get_var_bytes("PWD") { epsh.set_cwd(pwd.to_path_buf()); }
-        let session = init(&mut epsh);
+        let mut session = init(&mut epsh);
         save_active(
             &data,
             session.record_id().unwrap(),
@@ -2383,7 +2401,7 @@ mod tests {
         )
         .unwrap();
 
-        let child_changes = refresh(&session, false, &mut epsh).unwrap();
+        let child_changes = refresh(&mut session, false, &mut epsh).unwrap();
         assert!(child_changes.iter().any(|change| matches!(
             change,
             EnvChange::Set(key, value) if key == "DENV_CACHE_TEST" && value == "child"
@@ -2397,7 +2415,7 @@ mod tests {
             .unwrap()
             .set_modified(old_mtime)
             .unwrap();
-        let changed = refresh(&session, false, &mut epsh).unwrap();
+        let changed = refresh(&mut session, false, &mut epsh).unwrap();
         assert!(changed.iter().any(|change| matches!(
             change,
             EnvChange::Unset(key) if key == "DENV_CACHE_TEST"
@@ -2433,7 +2451,7 @@ mod tests {
             epsh.vars_mut().export(key);
         }
         if let Some(pwd) = epsh.get_var_bytes("PWD") { epsh.set_cwd(pwd.to_path_buf()); }
-        let session = init(&mut epsh);
+        let mut session = init(&mut epsh);
         let pid = session.record_id().unwrap().to_string();
         save_active(
             &data,
@@ -2447,7 +2465,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = match refresh(&session, false, &mut epsh) {
+        let err = match refresh(&mut session, false, &mut epsh) {
             Ok(_) => panic!("expected malformed dotenv to fail"),
             Err(err) => err,
         };
@@ -2456,7 +2474,7 @@ mod tests {
 
         epsh.vars_mut().set("PWD", outside.to_str().unwrap()).unwrap();
         epsh.set_cwd(outside.clone());
-        let changes = refresh(&session, false, &mut epsh).unwrap();
+        let changes = refresh(&mut session, false, &mut epsh).unwrap();
         assert!(changes.iter().any(|change| matches!(
             change,
             EnvChange::Unset(key) if key == "DENV_RESTORE_TEST"
@@ -2492,8 +2510,8 @@ mod tests {
         }
 
         if let Some(pwd) = epsh.get_var_bytes("PWD") { epsh.set_cwd(pwd.to_path_buf()); }
-        let session = init(&mut epsh);
-        refresh(&session, false, &mut epsh).unwrap();
+        let mut session = init(&mut epsh);
+        refresh(&mut session, false, &mut epsh).unwrap();
         let pid = session.record_id().unwrap().to_string();
         let active_path = active_path(&data, &pid);
         assert_eq!(
@@ -2514,7 +2532,7 @@ mod tests {
         for id in first_temp_id..first_temp_id + ACTIVE_TEMP_NAME_ATTEMPTS {
             std::fs::write(data.join(format!(".active_{pid}.{id}.tmp")), b"occupied").unwrap();
         }
-        let failed_refresh = refresh(&session, true, &mut epsh);
+        let failed_refresh = refresh(&mut session, true, &mut epsh);
         let err = match failed_refresh {
             Ok(_) => panic!("expected active-state write to fail"),
             Err(err) => err,
@@ -2533,7 +2551,7 @@ mod tests {
 
         epsh.vars_mut().set("PWD", outside.to_str().unwrap()).unwrap();
         epsh.set_cwd(outside.clone());
-        let restored = refresh(&session, false, &mut epsh).unwrap();
+        let restored = refresh(&mut session, false, &mut epsh).unwrap();
         assert!(restored.iter().any(|change| matches!(
             change,
             EnvChange::Set(key, value) if key == "DENV_SAVE_TEST" && value == "base"

@@ -393,6 +393,7 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
     fs::create_dir_all(&first).unwrap();
     fs::create_dir_all(&second).unwrap();
     fs::create_dir_all(&data_dir).unwrap();
+    let data_dir = data_dir.canonicalize().unwrap();
     if with_denv {
         fs::write(first.join(".env"), b"ISH_BENCH_DIR=first\n").unwrap();
         fs::write(second.join(".env"), b"ISH_BENCH_DIR=second\n").unwrap();
@@ -405,14 +406,14 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
         .build();
     epsh.vars_mut().set_bytes("DENV_DATA_DIR", epsh::shell_bytes::ShellBytes::from_os_str(data_dir.as_os_str())).unwrap();
     epsh.vars_mut().export("DENV_DATA_DIR");
-    let denv = ish::denv::init(&mut epsh);
+    let mut denv = ish::denv::init(&mut epsh);
     std::env::set_current_dir(&first).unwrap();
     sync_bench_pwd(&mut epsh, &first);
     if with_denv {
         for (dir, expected) in [(&first, "first"), (&second, "second")] {
             std::env::set_current_dir(dir).unwrap();
             sync_bench_pwd(&mut epsh, dir);
-            let status = ish::denv::command(&denv, &["allow".to_owned()], &mut epsh);
+            let status = ish::denv::command(&mut denv, &["allow".to_owned()], &mut epsh);
             assert_eq!(status, 0);
             assert_bench_denv_store_value(&epsh, expected);
         }
@@ -420,9 +421,14 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
         for dir in [&first, &second] {
             std::env::set_current_dir(dir).unwrap();
             sync_bench_pwd(&mut epsh, dir);
-            ish::denv::on_cd(&denv, &mut epsh).unwrap();
+            ish::denv::on_cd(&mut denv, &mut epsh).unwrap();
         }
     }
+
+    std::env::set_current_dir(&first).unwrap();
+    let first = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&second).unwrap();
+    let second = std::env::current_dir().unwrap();
 
     let mut prompt = prompt::Prompt::new();
     let mut out = String::with_capacity(128);
@@ -437,7 +443,7 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
         use_first = !use_first;
         std::env::set_current_dir(dir).unwrap();
         sync_bench_pwd(&mut epsh, dir);
-        ish::denv::on_cd(&denv, &mut epsh).unwrap();
+        ish::denv::on_cd(&mut denv, &mut epsh).unwrap();
         if with_denv {
             assert_bench_denv_store_value(&epsh, expected);
         }

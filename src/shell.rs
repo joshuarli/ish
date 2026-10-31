@@ -126,7 +126,7 @@ pub(super) fn run(cli: crate::Args) {
         denv,
     };
 
-    if let Err(error) = denv::on_startup(&shell.denv, &mut shell.epsh) { report!("denv: {error}"); }
+    if let Err(error) = denv::on_startup(&mut shell.denv, &mut shell.epsh) { report!("denv: {error}"); }
     sync_shell_store_derived(&mut shell);
     builtin::install_epsh_policy(&mut shell.epsh);
 
@@ -481,7 +481,7 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
         }
         ShellCommand::Denv => {
             let args = expanded_args!();
-            let status = denv::command(&shell.denv, &args, &mut shell.epsh);
+            let status = denv::command(&mut shell.denv, &args, &mut shell.epsh);
             sync_shell_store_derived(shell);
             shell.last_status = status;
         }
@@ -582,7 +582,7 @@ fn sync_cwd_change(shell: &mut Shell, old_cwd: &Path, new_cwd: std::path::PathBu
     shell.epsh.set_cwd(new_cwd);
     push_dir_stack(&mut shell.dir_stack);
     shell.prompt.invalidate_git();
-    if let Err(error) = denv::on_cd(&shell.denv, &mut shell.epsh) { report!("denv: {error}"); }
+    if let Err(error) = denv::on_cd(&mut shell.denv, &mut shell.epsh) { report!("denv: {error}"); }
     sync_shell_store_derived(shell);
 }
 

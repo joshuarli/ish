@@ -60,8 +60,8 @@ fn dotenv_sessions_restore_exact_bindings_without_host_environment_changes() {
         a.vars_mut().set("ISH_EMPTY", "").unwrap();
         a.vars_mut().export("ISH_DECLARED");
         a.vars_mut().declare("ISH_LOCAL_UNSET");
-        let a_session = denv::init(&mut a);
-        let b_session = denv::init(&mut b);
+        let mut a_session = denv::init(&mut a);
+        let mut b_session = denv::init(&mut b);
         let running = Arc::new(AtomicBool::new(true));
         let reader_running = running.clone();
         let reader = std::thread::spawn(move || {
@@ -70,17 +70,17 @@ fn dotenv_sessions_restore_exact_bindings_without_host_environment_changes() {
                 std::thread::yield_now();
             }
         });
-        assert_eq!(denv::command(&a_session, &["allow".into()], &mut a), 0);
+        assert_eq!(denv::command(&mut a_session, &["allow".into()], &mut a), 0);
         running.store(false, Ordering::Relaxed);
         reader.join().unwrap();
         assert_eq!(std::env::var_os("ISH_HOST_SENTINEL"), Some("inherited".into()));
         assert_eq!(a.get_var("ISH_LAYER"), Some("first"));
-        assert_eq!(denv::command(&b_session, &["allow".into()], &mut b), 0);
+        assert_eq!(denv::command(&mut b_session, &["allow".into()], &mut b), 0);
         assert_eq!(b.get_var("ISH_LAYER"), Some("second"));
         assert_eq!(a.get_var("ISH_LAYER"), Some("first"));
         a.set_cwd(dir.path().to_path_buf());
         a.vars_mut().set("PWD", first.to_str().unwrap()).unwrap();
-        denv::on_cd(&a_session, &mut a).unwrap();
+        denv::on_cd(&mut a_session, &mut a).unwrap();
         assert_eq!(a.get_var("ISH_LAYER"), Some("a-base"));
         assert_eq!(a.get_var_bytes("ISH_LOCAL").unwrap().as_bytes(), b"local\xff");
         assert_eq!(a.get_var("ISH_EMPTY"), Some(""));
@@ -94,7 +94,7 @@ fn dotenv_sessions_restore_exact_bindings_without_host_environment_changes() {
         let child_env = a.vars().env_for_command_os(&[]);
         assert!(!child_env.iter().any(|(name, _)| name == "ISH_LOCAL" || name == "ISH_EMPTY"));
         assert_eq!(b.get_var("ISH_LAYER"), Some("second"));
-        assert_eq!(denv::command(&b_session, &["deny".into()], &mut b), 0);
+        assert_eq!(denv::command(&mut b_session, &["deny".into()], &mut b), 0);
         assert_eq!(b.get_var("ISH_LAYER"), Some("b-base"));
         assert_eq!(std::env::var_os("ISH_LAYER"), None);
         assert_eq!(std::env::var_os(OsString::from_vec(b"ISH_RAW_\xff".to_vec())), Some(OsString::from_vec(b"value\x80".to_vec())));
@@ -110,8 +110,8 @@ fn readonly_delta_rejects_every_assignment_before_installing_active_state() {
         let mut shell = shell(&data, dir.path(), "base");
         shell.set_var("ISH_READONLY", "original").unwrap();
         shell.vars_mut().set_readonly("ISH_READONLY");
-        let session = denv::init(&mut shell);
-        assert_eq!(denv::command(&session, &["allow".into()], &mut shell), 1);
+        let mut session = denv::init(&mut shell);
+        assert_eq!(denv::command(&mut session, &["allow".into()], &mut shell), 1);
         assert_eq!(shell.get_var("ISH_FIRST"), None);
         assert_eq!(shell.get_var("ISH_READONLY"), Some("original"));
         assert!(!std::fs::read_dir(data).unwrap().any(|entry| entry.unwrap().file_name().as_encoded_bytes().starts_with(b"active_")));
@@ -135,8 +135,8 @@ fn evaluators_use_selected_raw_environment_and_restore_it_after_failure() {
             selected.set_var("ISH_PREFIX", "original").unwrap();
             selected.vars_mut().export("ISH_RAW_VALUE");
             selected.vars_mut().export("ISH_PREFIX");
-            let session = denv::init(&mut selected);
-            assert_eq!(denv::command(&session, &["allow".into()], &mut selected), 0);
+            let mut session = denv::init(&mut selected);
+            assert_eq!(denv::command(&mut session, &["allow".into()], &mut selected), 0);
             assert_eq!(selected.get_var("ISH_LAYER"), Some("dotenv"));
             assert_eq!(selected.get_var_bytes("ISH_CAPTURE").unwrap().as_bytes(), b"raw\xff\x80");
             assert_eq!(selected.get_var("ISH_PREFIX"), Some("original"));
@@ -145,7 +145,7 @@ fn evaluators_use_selected_raw_environment_and_restore_it_after_failure() {
             assert!(bytes.split(|byte| *byte == 0).any(|entry| entry == b"ISH_PREFIX=prefix"));
             assert!(!bytes.split(|byte| *byte == 0).any(|entry| entry.starts_with(b"ISH_HOST_SENTINEL=")));
             std::fs::write(project.join(".envrc"), format!("{interpreter}\nexport ISH_REJECTED=partial\nfalse\n")).unwrap();
-            let _ = denv::command(&session, &["allow".into()], &mut selected);
+            let _ = denv::command(&mut session, &["allow".into()], &mut selected);
             assert_eq!(selected.get_var("ISH_REJECTED"), None);
             assert_eq!(selected.get_var("ISH_CAPTURE"), None);
             assert_eq!(selected.get_var("ISH_LAYER"), Some("base"));
