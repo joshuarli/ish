@@ -111,7 +111,7 @@ fn shell_accessor_methods() {
 
     // Accessor methods
     let _vars: &var::Variables = shell.vars();
-    let _funcs: &fxhash::FxHashMap<String, ast::Command> = shell.functions();
+    let _funcs: &rustc_hash::FxHashMap<String, ast::Command> = shell.functions();
     let _status: error::ExitStatus = shell.exit_status();
     let _pid: u32 = shell.pid();
     let _cwd: &std::path::Path = shell.cwd();

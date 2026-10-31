@@ -3,15 +3,22 @@
 Accepted decisions about dependencies and data structures. Each record states
 the choice, the evidence, and what would reopen it.
 
-## Keep `fxhash` and `std` collections; reject `bbtree`
+## Use `rustc-hash` and `std` collections; reject `bbtree`
 
 Status: accepted (2026-10-31).
 
 ### Decision
 
-`ish` and `epsh` keep `fxhash::FxHashMap` and `fxhash::FxHashSet` for unordered
-lookup, and `std::collections::BTreeMap` and `BTreeSet` for ordered keys. Do not
-adopt [`bbtree`](https://github.com/laputa-systems/bbtree).
+`ish` and `epsh` use `rustc_hash::FxHashMap` and `rustc_hash::FxHashSet` for
+unordered lookup, and `std::collections::BTreeMap` and `BTreeSet` for ordered
+keys. Do not adopt [`bbtree`](https://github.com/laputa-systems/bbtree).
+
+`fxhash` is unmaintained ([RUSTSEC-2025-0057](https://rustsec.org/advisories/RUSTSEC-2025-0057.html)).
+`rustc-hash` is the maintained replacement and keeps the same `FxHashMap` and
+`FxHashSet` names. Its 2.x hasher mixes differently from `fxhash`, so iteration
+order changes; neither `ish` nor `epsh` persists `FxHasher` output. The history
+index in [`src/history.rs`](../src/history.rs) hashes commands with
+`DefaultHasher`, not `FxHasher`.
 
 ### Why
 
@@ -72,13 +79,15 @@ a whole page for it.
 - Release binary: 2.67 MB to 3.11 MB, +16.8%. All of the growth is `bbtree`
   monomorphized across seven key types; no `vstd` symbols survive linking.
 - Dependencies: `fxhash` and `byteorder` leave, twelve crates arrive. Fresh
-  dependency build time goes from 0.7–1.0 s to 7.6–10.9 s.
+  dependency build time goes from 0.7–1.0 s to 7.6–10.9 s. The `rustc-hash`
+  migration itself replaces `fxhash` with one dependency-free crate.
 - `bbtree` depends on `vstd` unconditionally, and neither it nor the six Verus
   crates behind it resolve from the `stuff` registry in
   [`.cargo/config.toml`](../.cargo/config.toml).
-- `epsh::eval::Shell::functions` and `traps` return `&FxHashMap`. Swapping them
-  changes a public API that [`crates/epsh/tests/api_stability.rs`](../crates/epsh/tests/api_stability.rs)
-  pins.
+- `epsh::eval::Shell::functions` and `traps` return `&FxHashMap`. `rustc-hash`
+  keeps the alias names but changes the type's crate, and
+  [`crates/epsh/tests/api_stability.rs`](../crates/epsh/tests/api_stability.rs)
+  pins the new type.
 
 ### Scope
 

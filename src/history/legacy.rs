@@ -1,5 +1,5 @@
 use super::store::Occurrence;
-use fxhash::FxHashSet;
+use rustc_hash::FxHashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

@@ -1,5 +1,5 @@
 use crate::report;
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;

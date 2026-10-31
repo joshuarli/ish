@@ -1,4 +1,4 @@
-use fxhash::FxHashSet;
+use rustc_hash::FxHashSet;
 use std::path::PathBuf;
 
 /// The one definition of "runnable command file": a regular file (not a

@@ -1,4 +1,4 @@
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 /// Maps alias names to their expansion as raw shell words.
 pub struct AliasMap {

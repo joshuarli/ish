@@ -586,7 +586,7 @@ pub(super) fn render(path: &Path) -> io::Result<String> {
     let _lock = lock(path)?;
     let mut file = open_file(path, rustix::fs::OFlags::RDWR)?;
     let snapshot = read_snapshot(path, &mut file, &mut Cursor::default(), -1, 0)?;
-    let mut latest = fxhash::FxHashMap::default();
+    let mut latest = rustc_hash::FxHashMap::default();
     for occurrence in snapshot.occurrences {
         let usage = latest.entry(occurrence.command).or_insert((0, 0));
         usage.0 = usage.0.max(occurrence.timestamp);
