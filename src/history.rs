@@ -33,7 +33,7 @@ fn new_session_id() -> u64 {
 
 /// Ranking key: (text tier or last-use time for an empty query, directory
 /// proximity, usage bonus, usage time, latest occurrence id).
-type RankKey = (u64, usize, u32, u64, i64);
+type RankKey = (u64, usize, u32, u64, u32);
 
 #[derive(Default)]
 struct Usage {
@@ -131,7 +131,7 @@ impl Usage {
 }
 
 struct EntryUsage {
-    latest_id: i64,
+    latest_id: u32,
     total: Usage,
     directories: Directories,
     /// One-based slot in `History::session`, so replacing a command's session
@@ -275,8 +275,9 @@ impl History {
             .cwd
             .map(|cwd| self.intern_directory(cwd));
         let usage = &mut self.usages[idx];
-        self.latest_occurrences.remove(&usage.latest_id);
-        usage.latest_id = occurrence.id;
+        self.latest_occurrences.remove(&i64::from(usage.latest_id));
+        usage.latest_id = u32::try_from(occurrence.id)
+            .expect("history occurrence ids exceed 4 billion");
         usage.total.record(occurrence.timestamp);
         if let Some(code) = directory {
             usage.directories.record(code, occurrence.timestamp);
