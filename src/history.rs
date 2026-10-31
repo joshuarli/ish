@@ -567,7 +567,7 @@ impl History {
         }
         let now = now_millis();
         let empty = query.is_empty();
-        let mut keys: Vec<RankKey> = Vec::with_capacity(limit.min(self.len()) + 1);
+        let mut ranking: Vec<(RankKey, usize)> = Vec::with_capacity(limit.min(self.len()) + 1);
         let mut ascii = [0u8; 32];
         let is_ascii = query.is_ascii() && query.len() <= ascii.len();
         for (slot, byte) in ascii.iter_mut().zip(query.bytes()) {
@@ -579,21 +579,23 @@ impl History {
         for i in 0..count {
             let idx = candidates.map_or(i, |candidates| candidates[i]);
             let text = self.get(idx);
-            let result = if query.is_empty() {
-                Some(contiguous_match(idx, 0, 0, 0))
-            } else if is_ascii && text.is_ascii() {
-                classify_match_ascii(&ascii[..query.len()], text, idx)
-            } else if let Some(chars) = &chars {
-                classify_match(chars, text, idx)
+            let rank = if empty {
+                MatchRank::Empty
             } else {
-                classify_match(
-                    chars.get_or_insert_with(|| lowercase_query(query)),
-                    text,
-                    idx,
-                )
-            };
-            let Some(result) = result else {
-                continue;
+                let rank = if is_ascii && text.is_ascii() {
+                    rank_match_ascii(&ascii[..query.len()], text)
+                } else if let Some(chars) = &chars {
+                    rank_match(chars, text)
+                } else {
+                    rank_match(
+                        chars.get_or_insert_with(|| lowercase_query(query)),
+                        text,
+                    )
+                };
+                let Some(rank) = rank else {
+                    continue;
+                };
+                rank
             };
             if let Some(matched) = matched.as_mut() {
                 matched.push(idx);
@@ -604,24 +606,41 @@ impl History {
             let primary = if empty {
                 self.timestamp(idx)
             } else {
-                result.score as u64
+                rank.score()
             };
             // The text tier alone rejects most candidates once the result
             // list is full, before any directory lookup.
-            if keys.len() == limit && keys.last().is_some_and(|worst| primary < worst.0) {
+            if ranking.len() == limit && ranking.last().is_some_and(|worst| primary < worst.0.0) {
                 continue;
             }
             let key = self.rank_key(idx, primary, empty, cwd, cwd_depth, now);
-            if keys.len() == limit && keys.last().is_some_and(|worst| key <= *worst) {
+            if ranking.len() == limit && ranking.last().is_some_and(|worst| key <= worst.0) {
                 continue;
             }
-            let position = keys.partition_point(|existing| *existing > key);
-            if keys.len() == limit {
-                keys.pop();
-                results.pop();
+            let position = ranking.partition_point(|existing| existing.0 > key);
+            if ranking.len() == limit {
+                ranking.pop();
             }
-            keys.insert(position, key);
-            results.insert(position, result);
+            ranking.insert(position, (key, idx));
+        }
+        if limit == 0 {
+            return;
+        }
+        // Matched positions are only observable for results, so build them
+        // once the ranking has chosen the few that fit.
+        let bytes = &ascii[..query.len().min(ascii.len())];
+        for (_, idx) in ranking {
+            let text = self.get(idx);
+            let rank = if empty {
+                MatchRank::Empty
+            } else if is_ascii && text.is_ascii() {
+                rank_match_ascii(&ascii[..query.len()], text)
+                    .expect("a selected candidate still matches")
+            } else {
+                rank_match(chars.get_or_insert_with(|| lowercase_query(query)), text)
+                    .expect("a selected candidate still matches")
+            };
+            results.push(materialize_match(rank, idx, text, bytes, chars.as_deref()));
         }
     }
 
@@ -824,31 +843,48 @@ pub struct FuzzyMatch {
     pub score: i16,
 }
 
-fn classify_match(query: &[char], text: &str, entry_idx: usize) -> Option<FuzzyMatch> {
+/// Which tier a candidate matched at, and where a contiguous match starts.
+/// Ranking needs only this; matched positions are built for the few results
+/// that survive the limit.
+#[derive(Clone, Copy)]
+enum MatchRank {
+    Empty,
+    Prefix,
+    BoundarySubstring(usize),
+    Substring(usize),
+    Subsequence,
+}
+
+impl MatchRank {
+    fn score(self) -> u64 {
+        match self {
+            Self::Empty | Self::Subsequence => 0,
+            Self::Substring(_) => 1,
+            Self::BoundarySubstring(_) => 2,
+            Self::Prefix => 3,
+        }
+    }
+}
+
+fn rank_match(query: &[char], text: &str) -> Option<MatchRank> {
     if starts_with_icase(query, text) {
-        return Some(contiguous_match(entry_idx, 3, 0, query.len()));
+        return Some(MatchRank::Prefix);
     }
 
     if let Some(start) = find_substring_icase(query, text, true) {
-        return Some(contiguous_match(entry_idx, 2, start, query.len()));
+        return Some(MatchRank::BoundarySubstring(start));
     }
 
     if let Some(start) = find_substring_icase(query, text, false) {
-        return Some(contiguous_match(entry_idx, 1, start, query.len()));
+        return Some(MatchRank::Substring(start));
     }
 
-    let (positions, count) = subsequence_match(query, text)?;
-    Some(FuzzyMatch {
-        entry_idx,
-        match_positions: positions,
-        match_count: count,
-        score: 0,
-    })
+    subsequence_match(query, text).map(|_| MatchRank::Subsequence)
 }
 
-fn classify_match_ascii(query: &[u8], text: &str, entry_idx: usize) -> Option<FuzzyMatch> {
+fn rank_match_ascii(query: &[u8], text: &str) -> Option<MatchRank> {
     if starts_with_icase_ascii(query, text.as_bytes()) {
-        return Some(contiguous_match(entry_idx, 3, 0, query.len()));
+        return Some(MatchRank::Prefix);
     }
 
     // Every substring is also a subsequence, so entries that fail this
@@ -859,20 +895,43 @@ fn classify_match_ascii(query: &[u8], text: &str, entry_idx: usize) -> Option<Fu
     }
 
     if let Some(start) = find_substring_icase_ascii_bytes(query, text.as_bytes(), true) {
-        return Some(contiguous_match(entry_idx, 2, start, query.len()));
+        return Some(MatchRank::BoundarySubstring(start));
     }
 
     if let Some(start) = find_substring_icase_ascii_bytes(query, text.as_bytes(), false) {
-        return Some(contiguous_match(entry_idx, 1, start, query.len()));
+        return Some(MatchRank::Substring(start));
     }
 
-    let (positions, count) = subsequence_match_ascii_bytes(query, text.as_bytes())?;
-    Some(FuzzyMatch {
-        entry_idx,
-        match_positions: positions,
-        match_count: count,
-        score: 0,
-    })
+    Some(MatchRank::Subsequence)
+}
+
+fn materialize_match(
+    rank: MatchRank,
+    entry_idx: usize,
+    text: &str,
+    bytes: &[u8],
+    chars: Option<&[char]>,
+) -> FuzzyMatch {
+    let len = chars.map_or(bytes.len(), |chars| chars.len());
+    match rank {
+        MatchRank::Empty => contiguous_match(entry_idx, 0, 0, 0),
+        MatchRank::Prefix => contiguous_match(entry_idx, 3, 0, len),
+        MatchRank::BoundarySubstring(start) => contiguous_match(entry_idx, 2, start, len),
+        MatchRank::Substring(start) => contiguous_match(entry_idx, 1, start, len),
+        MatchRank::Subsequence => {
+            let (positions, count) = chars.map_or_else(
+                || subsequence_match_ascii_bytes(bytes, text.as_bytes()),
+                |query| subsequence_match(query, text),
+            )
+            .expect("a ranked subsequence still matches");
+            FuzzyMatch {
+                entry_idx,
+                match_positions: positions,
+                match_count: count,
+                score: 0,
+            }
+        }
+    }
 }
 
 fn contiguous_match(entry_idx: usize, score: i16, start: usize, len: usize) -> FuzzyMatch {
