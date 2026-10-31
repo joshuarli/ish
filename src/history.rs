@@ -3,6 +3,7 @@ use fxhash::FxHashMap;
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
+use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -40,42 +41,39 @@ struct Usage {
     timestamp: u64,
 }
 
-/// Where a command has run. A command almost always ran in one directory, so
-/// that case stays inline and only a command that really moved between
-/// directories pays for a table.
+/// Where a command has run, addressed by directory code. A command almost
+/// always ran in one directory, so that case stays inline and only a command
+/// that really moved between directories pays for a table.
 #[derive(Default)]
 enum Directories {
     #[default]
     Empty,
-    One((PathBuf, Usage)),
-    Many(FxHashMap<PathBuf, Usage>),
+    One((u32, Usage)),
+    Many(Box<FxHashMap<u32, Usage>>),
 }
 
 impl Directories {
-    fn record(&mut self, cwd: PathBuf, timestamp: u64) {
+    fn record(&mut self, code: u32, timestamp: u64) {
         match self {
             Directories::Empty => {
                 *self = Directories::One((
-                    cwd,
+                    code,
                     Usage {
                         count: 1,
                         timestamp,
                     },
                 ));
             }
-            Directories::One((directory, usage)) if *directory == cwd => {
-                usage.count = usage.count.saturating_add(1);
-                usage.timestamp = usage.timestamp.max(timestamp);
-            }
+            Directories::One((directory, usage)) if *directory == code => usage.record(timestamp),
             Directories::One(_) => {
                 let mut map = FxHashMap::default();
                 if let Directories::One((directory, usage)) = std::mem::take(self) {
                     map.insert(directory, usage);
                 }
-                map.entry(cwd).or_default().record(timestamp);
-                *self = Directories::Many(map);
+                map.entry(code).or_default().record(timestamp);
+                *self = Directories::Many(Box::new(map));
             }
-            Directories::Many(map) => map.entry(cwd).or_default().record(timestamp),
+            Directories::Many(map) => map.entry(code).or_default().record(timestamp),
         }
     }
 
@@ -87,11 +85,11 @@ impl Directories {
         }
     }
 
-    fn get(&self, cwd: &Path) -> Option<&Usage> {
+    fn get(&self, code: &u32) -> Option<&Usage> {
         match self {
             Directories::Empty => None,
-            Directories::One((directory, usage)) => (directory.as_path() == cwd).then_some(usage),
-            Directories::Many(map) => map.get(cwd),
+            Directories::One((directory, usage)) => (directory == code).then_some(usage),
+            Directories::Many(map) => map.get(code),
         }
     }
 
@@ -106,23 +104,22 @@ impl Directories {
 
 enum DirectoriesIter<'a> {
     Empty,
-    One(std::iter::Once<&'a (PathBuf, Usage)>),
-    Many(std::collections::hash_map::Iter<'a, PathBuf, Usage>),
+    One(std::iter::Once<&'a (u32, Usage)>),
+    Many(std::collections::hash_map::Iter<'a, u32, Usage>),
 }
 
 impl<'a> Iterator for DirectoriesIter<'a> {
-    type Item = (&'a Path, &'a Usage);
+    type Item = (&'a u32, &'a Usage);
 
-    fn next(&mut self) -> Option<(&'a Path, &'a Usage)> {
-        let (directory, usage) = match self {
-            DirectoriesIter::Empty => return None,
+    fn next(&mut self) -> Option<(&'a u32, &'a Usage)> {
+        match self {
+            DirectoriesIter::Empty => None,
             DirectoriesIter::One(iter) => {
-                let (directory, usage) = iter.next()?;
-                (directory, usage)
+                let (code, usage) = iter.next()?;
+                Some((code, usage))
             }
-            DirectoriesIter::Many(iter) => iter.next()?,
-        };
-        Some((directory.as_path(), usage))
+            DirectoriesIter::Many(iter) => iter.next(),
+        }
     }
 }
 
@@ -137,19 +134,28 @@ struct EntryUsage {
     latest_id: i64,
     total: Usage,
     directories: Directories,
-    session_occurrence_id: Option<i64>,
+    /// One-based slot in `History::session`, so replacing a command's session
+    /// occurrence is a store instead of a search.
+    session_position: Option<NonZeroUsize>,
 }
+
+const SESSION_REMOVED: usize = usize::MAX;
 
 pub struct History {
     /// Unique command text stays packed; updating usage never moves a candidate.
     arena: String,
-    offsets: Vec<(usize, usize)>,
+    offsets: Vec<(u32, u32)>,
     usages: Vec<EntryUsage>,
     index_by_hash: FxHashMap<u64, usize>,
     latest_occurrences: BTreeMap<i64, usize>,
-    /// Startup snapshot plus this shell's commands. Other sessions may update
-    /// global usage without changing the order or membership of Up-arrow recall.
-    session: BTreeMap<i64, usize>,
+    /// Directory paths addressed by the codes in `EntryUsage::directories`.
+    directory_paths: Vec<PathBuf>,
+    directory_codes: FxHashMap<PathBuf, u32>,
+    /// Startup snapshot plus this shell's commands, oldest first. Other
+    /// sessions may update global usage without changing the order or
+    /// membership of Up-arrow recall. Replaced occurrences leave a tombstone.
+    session: Vec<usize>,
+    session_live: usize,
     session_id: u64,
     generation: i64,
     last_id: i64,
@@ -183,10 +189,11 @@ impl History {
             );
             history.sync()?;
         }
-        for (&id, &idx) in &history.latest_occurrences {
-            history.session.insert(id, idx);
-            history.usages[idx].session_occurrence_id = Some(id);
+        let latest = std::mem::take(&mut history.latest_occurrences);
+        for &idx in latest.values() {
+            history.remember_session(idx);
         }
+        history.latest_occurrences = latest;
         Ok(history)
     }
 
@@ -197,7 +204,10 @@ impl History {
             usages: Vec::new(),
             index_by_hash: FxHashMap::default(),
             latest_occurrences: BTreeMap::new(),
-            session: BTreeMap::new(),
+            directory_paths: Vec::new(),
+            directory_codes: FxHashMap::default(),
+            session: Vec::new(),
+            session_live: 0,
             session_id: new_session_id(),
             generation: 0,
             last_id: 0,
@@ -225,6 +235,14 @@ impl History {
             self.clear();
             self.generation = snapshot.generation;
         }
+        if self.arena.is_empty() {
+            let text: usize = snapshot
+                .occurrences
+                .iter()
+                .map(|occurrence| occurrence.command.len())
+                .sum();
+            self.arena.reserve_exact(text);
+        }
         for occurrence in snapshot.occurrences {
             self.apply_occurrence(occurrence);
         }
@@ -236,37 +254,72 @@ impl History {
             Some(idx) => idx,
             None => {
                 let idx = self.offsets.len();
-                let start = self.arena.len();
+                let start = u32::try_from(self.arena.len()).expect("history text exceeds 4 GiB");
                 self.arena.push_str(&occurrence.command);
-                self.offsets.push((start, occurrence.command.len()));
+                let length =
+                    u32::try_from(occurrence.command.len()).expect("history command exceeds 4 GiB");
+                self.offsets.push((start, length));
                 self.usages.push(EntryUsage {
                     latest_id: 0,
                     total: Usage::default(),
                     directories: Directories::Empty,
-                    session_occurrence_id: None,
+                    session_position: None,
                 });
                 self.index_by_hash.insert(hash, idx);
                 idx
             }
         };
+        let directory = occurrence
+            .cwd
+            .map(|cwd| self.intern_directory(cwd));
         let usage = &mut self.usages[idx];
         self.latest_occurrences.remove(&usage.latest_id);
         usage.latest_id = occurrence.id;
         usage.total.record(occurrence.timestamp);
-        if let Some(cwd) = occurrence.cwd {
-            usage.directories.record(cwd, occurrence.timestamp);
+        if let Some(code) = directory {
+            usage.directories.record(code, occurrence.timestamp);
         }
         self.latest_occurrences.insert(occurrence.id, idx);
         self.last_id = self.last_id.max(occurrence.id);
         idx
     }
 
-    fn remember_session(&mut self, idx: usize, id: i64) {
-        if let Some(previous) = self.usages[idx].session_occurrence_id {
-            self.session.remove(&previous);
+    fn remember_session(&mut self, idx: usize) {
+        if let Some(previous) = self.usages[idx].session_position {
+            self.session[previous.get() - 1] = SESSION_REMOVED;
+        } else {
+            self.session_live += 1;
         }
-        self.usages[idx].session_occurrence_id = Some(id);
-        self.session.insert(id, idx);
+        self.session.push(idx);
+        self.usages[idx].session_position = NonZeroUsize::new(self.session.len());
+        self.compact_session();
+    }
+
+    /// Reclaim tombstones once they outnumber live occurrences. Compaction is
+    /// rare, so rewriting every slot's position stays amortized constant.
+    fn compact_session(&mut self) {
+        if self.session.len() <= 2 * self.session_live || self.session.len() <= 64 {
+            return;
+        }
+        let session = std::mem::take(&mut self.session);
+        self.session = Vec::with_capacity(self.session_live);
+        for idx in session {
+            if idx == SESSION_REMOVED {
+                continue;
+            }
+            self.session.push(idx);
+            self.usages[idx].session_position = NonZeroUsize::new(self.session.len());
+        }
+    }
+
+    fn intern_directory(&mut self, cwd: PathBuf) -> u32 {
+        if let Some(&code) = self.directory_codes.get(cwd.as_path()) {
+            return code;
+        }
+        let code = u32::try_from(self.directory_paths.len()).expect("directory table exhausted");
+        self.directory_paths.push(cwd.clone());
+        self.directory_codes.insert(cwd, code);
+        code
     }
 
     fn clear(&mut self) {
@@ -275,7 +328,10 @@ impl History {
         self.usages.clear();
         self.index_by_hash.clear();
         self.latest_occurrences.clear();
+        self.directory_paths.clear();
+        self.directory_codes.clear();
         self.session.clear();
+        self.session_live = 0;
         self.last_id = 0;
     }
 
@@ -296,7 +352,14 @@ impl History {
 
     /// Like `from_entries`, recording the directory each command ran in.
     pub fn from_entries_in_dirs(entries: impl IntoIterator<Item = (String, Option<PathBuf>)>) -> Self {
+        let entries: Vec<_> = entries.into_iter().collect();
         let mut history = Self::empty();
+        history.arena.reserve_exact(
+            entries
+                .iter()
+                .map(|(command, _)| command.len())
+                .sum(),
+        );
         let timestamp = now_millis();
         for (i, (command, cwd)) in entries.into_iter().enumerate() {
             let id = i as i64 + 1;
@@ -307,7 +370,7 @@ impl History {
                 session_id: 0,
                 cwd,
             });
-            history.remember_session(idx, id);
+            history.remember_session(idx);
         }
         history
     }
@@ -331,19 +394,16 @@ impl History {
             session_id: self.session_id,
             cwd: cwd.map(Path::to_path_buf),
         };
-        let id = if let Some(store) = self.store.as_mut() {
-            let (snapshot, id) = store.append(self.generation, self.last_id, occurrence)?;
+        if let Some(store) = self.store.as_mut() {
+            let (snapshot, _) = store.append(self.generation, self.last_id, occurrence)?;
             self.apply_snapshot(snapshot);
-            id
         } else {
-            let id = occurrence.id;
             self.apply_occurrence(occurrence);
-            id
-        };
+        }
         let idx = self
             .find_entry_index(hash_str(line), line)
             .expect("committed command missing");
-        self.remember_session(idx, id);
+        self.remember_session(idx);
         Ok(())
     }
 
@@ -371,16 +431,18 @@ impl History {
 
     pub fn session_get(&self, skip: usize) -> Option<&str> {
         self.session
-            .values()
+            .iter()
             .rev()
+            .filter(|&&idx| idx != SESSION_REMOVED)
             .nth(skip)
             .map(|&idx| self.get(idx))
     }
 
     pub fn session_prefix_search(&self, prefix: &str, skip: usize) -> Option<&str> {
         self.session
-            .values()
+            .iter()
             .rev()
+            .filter(|&&idx| idx != SESSION_REMOVED)
             .map(|&idx| self.get(idx))
             .filter(|command| command.starts_with(prefix))
             .nth(skip)
@@ -546,8 +608,10 @@ impl History {
         };
         if usage.directories.len() <= cwd_depth {
             let mut nearest: Option<(usize, &Usage)> = None;
-            for (directory, directory_usage) in usage.directories.iter() {
-                let Some(distance) = ancestor_distance(directory, cwd) else {
+            for (code, directory_usage) in usage.directories.iter() {
+                let Some(distance) =
+                    ancestor_distance(&self.directory_paths[*code as usize], cwd)
+                else {
                     continue;
                 };
                 if nearest.is_none_or(|(closest, _)| distance < closest) {
@@ -560,7 +624,10 @@ impl History {
             };
         }
         for (distance, directory) in cwd.ancestors().enumerate() {
-            if let Some(directory_usage) = usage.directories.get(directory) {
+            let Some(code) = self.directory_codes.get(directory) else {
+                continue;
+            };
+            if let Some(directory_usage) = usage.directories.get(code) {
                 return (usize::MAX - distance, directory_usage);
             }
         }
@@ -572,16 +639,24 @@ impl History {
         display_line(self.get(idx))
     }
 
+    #[cfg(test)]
+    fn directory_usage(&self, idx: usize, path: &Path) -> Option<&Usage> {
+        self.usages[idx]
+            .directories
+            .get(self.directory_codes.get(path)?)
+    }
+
     pub fn directories(&self, idx: usize) -> impl Iterator<Item = &Path> {
+        let paths = &self.directory_paths;
         self.usages[idx]
             .directories
             .iter()
-            .map(|(directory, _)| directory)
+            .map(move |(code, _)| paths[*code as usize].as_path())
     }
 
     pub fn get(&self, idx: usize) -> &str {
         let (start, len) = self.offsets[idx];
-        &self.arena[start..start + len]
+        &self.arena[start as usize..start as usize + len as usize]
     }
 
     fn find_entry_index(&self, hash: u64, text: &str) -> Option<usize> {
@@ -1198,6 +1273,44 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn session_recall_skips_replaced_occurrences() {
+        let history = History::from_entries(vec![
+            "echo a".to_string(),
+            "echo b".to_string(),
+            "echo a".to_string(),
+            "echo c".to_string(),
+        ]);
+        assert_eq!(history.session_get(0), Some("echo c"));
+        assert_eq!(history.session_get(1), Some("echo a"));
+        assert_eq!(history.session_get(2), Some("echo b"));
+        assert_eq!(history.session_get(3), None);
+    }
+
+    #[test]
+    fn session_compaction_keeps_recall_order() {
+        let mut entries: Vec<String> = (0..200).map(|i| format!("echo {i}")).collect();
+        entries.extend((0..300).map(|_| "echo repeated".to_string()));
+        let history = History::from_entries(entries);
+        assert_eq!(history.session_get(0), Some("echo repeated"));
+        assert_eq!(history.session_get(1), Some("echo 199"));
+        assert_eq!(history.session_get(2), Some("echo 198"));
+        assert!(history.session.len() <= 2 * history.session_live.max(1) + 64);
+    }
+
+    #[test]
+    fn directories_share_one_path_across_commands() {
+        let same = PathBuf::from("/work/shared");
+        let history = History::from_entries_in_dirs([
+            ("one".to_string(), Some(same.clone())),
+            ("two".to_string(), Some(same.clone())),
+            ("three".to_string(), Some(PathBuf::from("/work/other"))),
+        ]);
+        assert_eq!(history.directory_paths.len(), 2);
+        assert_eq!(history.directories(0).collect::<Vec<_>>(), [same.as_path()]);
+        assert_eq!(history.directories(2).collect::<Vec<_>>(), [Path::new("/work/other")]);
+    }
 
     #[test]
     fn subsequence() {
