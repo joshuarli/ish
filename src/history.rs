@@ -81,11 +81,24 @@ impl Usage {
 
 struct EntryUsage {
     latest_id: u32,
+    /// ASCII letters present in the command, as one bit per `a`..`z`.
+    letters: u32,
     total: Usage,
     directories: u32,
     /// One-based slot in `History::session`, so replacing a command's session
     /// occurrence is a store instead of a search.
     session_position: Option<NonZeroU32>,
+}
+
+fn letter_mask(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0, |mask, &byte| {
+        let lower = byte.to_ascii_lowercase();
+        if lower.is_ascii_lowercase() {
+            mask | 1 << (lower - b'a')
+        } else {
+            mask
+        }
+    })
 }
 
 const SESSION_REMOVED: u32 = u32::MAX;
@@ -214,6 +227,7 @@ impl History {
                 self.offsets.push((start, length));
                 self.usages.push(EntryUsage {
                     latest_id: 0,
+                    letters: letter_mask(occurrence.command.as_bytes()),
                     total: Usage::default(),
                     directories: DIRECTORY_NONE,
                     session_position: None,
@@ -574,6 +588,11 @@ impl History {
             *slot = byte.to_ascii_lowercase();
         }
         let mut chars = (!is_ascii).then(|| lowercase_query(query));
+        let query_letters = if is_ascii {
+            letter_mask(&ascii[..query.len()])
+        } else {
+            0
+        };
         let cwd_depth = cwd.map_or(0, |cwd| cwd.ancestors().count());
         let count = candidates.map_or(self.len(), |candidates| candidates.len());
         for i in 0..count {
@@ -583,6 +602,9 @@ impl History {
                 MatchRank::Empty
             } else {
                 let rank = if is_ascii && text.is_ascii() {
+                    if self.usages[idx].letters & query_letters != query_letters {
+                        continue;
+                    }
                     rank_match_ascii(&ascii[..query.len()], text)
                 } else if let Some(chars) = &chars {
                     rank_match(chars, text)
