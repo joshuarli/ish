@@ -22,7 +22,7 @@ defaults:
 jobs:
   macos:
     name: Lint and test (macOS)
-    runs-on: macos-26
+    runs-on: macos-latest
     timeout-minutes: 30
     permissions:
       contents: read
