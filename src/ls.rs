@@ -10,11 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Native directory listing: `l` hides dotfiles, `ll` shows them.
 /// Each entry is `name size age`; directories and symlinks omit the size.
 /// Directories are blue, links cyan (bold red when broken), executables
-/// bold green. Names keep their type color in a faint form and ages fade
-/// through a grey ramp once entries pass a day old. On a terminal, names
-/// wrap to the available width in at most three lines and then end in an
-/// ellipsis; other output keeps one line per entry. Writes output to stdout
-/// directly. Returns 0 on success, 1 on error.
+/// bold green. Names keep their type color in a faint form once entries pass
+/// a week old; ages fade through a grey ramp from one day. On a terminal,
+/// names wrap to the available width in at most three lines and then end in
+/// an ellipsis; other output keeps one line per entry. Writes output to
+/// stdout directly. Returns 0 on success, 1 on error.
 pub fn list_dir(path: impl AsRef<std::path::Path>, show_hidden: bool) -> i32 {
     let path = path.as_ref();
     let now = now_secs();
@@ -241,6 +241,7 @@ struct Entry {
     size: Option<Field>,
     age: Field,
     age_shade: &'static str,
+    name_dim: bool,
     display_name: String,
     link_target: Option<String>,
     color_start: &'static str,
@@ -251,10 +252,10 @@ impl Entry {
     /// Old entries keep the color that identifies their kind, in its faint
     /// form; recent entries stay at full brightness.
     fn name_start(&self) -> &'static str {
-        if self.age_shade.is_empty() {
-            self.color_start
-        } else {
+        if self.name_dim {
             self.dim_start
+        } else {
+            self.color_start
         }
     }
 }
@@ -436,6 +437,7 @@ fn build_entry(
         },
         age: relative_age_str(diff),
         age_shade: age_shade(diff),
+        name_dim: name_dimmed(diff),
         display_name,
         link_target,
         color_start,
@@ -473,6 +475,13 @@ fn now_secs() -> i64 {
 
 fn age_diff(mtime: i64, now: i64) -> i64 {
     now.saturating_sub(mtime).max(0)
+}
+
+/// A binary faint step is much heavier than the age column's first greys,
+/// so names stay at full brightness until entries are a week old.
+fn name_dimmed(diff: i64) -> bool {
+    const WEEK: i64 = 7 * 86400;
+    diff >= WEEK
 }
 
 #[cfg(test)]
@@ -524,7 +533,7 @@ fn age_shade(diff: i64) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{age_shade, read_entries, relative_age};
+    use super::{age_shade, name_dimmed, read_entries, relative_age};
     use crate::line::str_width;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -620,6 +629,15 @@ mod tests {
         assert_eq!(age_shade(800 * DAY), "\x1b[38;5;240m");
     }
 
+    #[test]
+    fn names_dim_at_one_week() {
+        const DAY: i64 = 86400;
+        assert!(!name_dimmed(0));
+        assert!(!name_dimmed(6 * DAY + 23 * 3600));
+        assert!(name_dimmed(7 * DAY));
+        assert!(name_dimmed(8 * DAY));
+    }
+
     fn strip_ansi(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         let mut chars = s.chars();
@@ -643,6 +661,7 @@ mod tests {
             size: size.map(Field::from),
             age: Field::from(age),
             age_shade: "",
+            name_dim: false,
             display_name: display_name.to_owned(),
             link_target: None,
             color_start: "",
@@ -748,8 +767,10 @@ mod tests {
         old.color_start = "\x1b[1;32m";
         old.dim_start = "\x1b[2;32m";
         old.age_shade = "\x1b[38;5;246m";
-        let mut recent = entry("new", Some("1B"), "2h");
+        old.name_dim = true;
+        let mut recent = entry("new", Some("1B"), "1d");
         recent.color_start = "\x1b[1;32m";
+        recent.age_shade = "\x1b[38;5;252m";
         let out = super::render(&[old, recent], None);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("\x1b[2;32mold\x1b[0m"));
@@ -763,6 +784,7 @@ mod tests {
         old.color_start = "\x1b[34m";
         old.dim_start = "\x1b[2;34m";
         old.age_shade = "\x1b[38;5;246m";
+        old.name_dim = true;
         let out = super::render(&[old], Some(20));
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3);

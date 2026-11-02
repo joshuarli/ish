@@ -159,8 +159,8 @@ ish-specific commands include:
 Native `l` and `ll` wrap names to the terminal width, using at most three
 lines per name and ending longer names with `…`. Piped or redirected output
 keeps one line per entry. Names keep their type color and switch to a faint
-version once the age ramp starts, so recent files stay bright and old ones
-recede.
+version once entries are a week old, so recent files stay bright and stale
+ones recede.
 
 `command -v` and `command -V` identify registered ish commands as builtins even
 when `PATH` is empty. A command path such as `/bin/cp` is reported and run as
