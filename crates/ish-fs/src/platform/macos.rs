@@ -909,11 +909,20 @@ fn copy_bytes_to_cstring(bytes: &[u8], budget: &mut CaptureBudget) -> io::Result
 }
 
 fn capture_resource_fork_size(fd: BorrowedFd<'_>) -> io::Result<Option<u64>> {
+    let kind = fs::fstat(fd)?.st_mode & libc::S_IFMT;
     let name = c"com.apple.ResourceFork";
     let mut size_query = [0_u8; 0];
-    match fs::fgetxattr(fd, name, &mut size_query[..]) {
+    classify_resource_fork_size(fs::fgetxattr(fd, name, &mut size_query[..]), kind)
+}
+
+fn classify_resource_fork_size(
+    result: Result<usize, Errno>,
+    kind: libc::mode_t,
+) -> io::Result<Option<u64>> {
+    match result {
         Ok(length) => Ok(Some(length as u64)),
         Err(Errno::NOATTR) | Err(Errno::NOENT) => Ok(None),
+        Err(Errno::PERM) if kind != libc::S_IFREG => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -1209,3 +1218,30 @@ fn invalid_data(message: &'static str) -> io::Error {
 }
 
 pub(crate) use fdu_posix::identity::mount_identity as mount_id;
+
+#[cfg(test)]
+mod tests {
+    use super::classify_resource_fork_size;
+    use rustix::io::Errno;
+
+    #[test]
+    fn denied_resource_fork_queries_are_absent_for_non_regular_entries() {
+        assert_eq!(
+            classify_resource_fork_size(Err(Errno::PERM), libc::S_IFDIR).unwrap(),
+            None
+        );
+        assert_eq!(
+            classify_resource_fork_size(Err(Errno::PERM), libc::S_IFLNK).unwrap(),
+            None
+        );
+        assert_eq!(
+            classify_resource_fork_size(Err(Errno::NOATTR), libc::S_IFREG).unwrap(),
+            None
+        );
+        assert_eq!(
+            classify_resource_fork_size(Ok(11), libc::S_IFREG).unwrap(),
+            Some(11)
+        );
+        assert!(classify_resource_fork_size(Err(Errno::PERM), libc::S_IFREG).is_err());
+    }
+}
