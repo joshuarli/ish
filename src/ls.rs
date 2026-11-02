@@ -10,9 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Native directory listing: `l` hides dotfiles, `ll` shows them.
 /// Each entry is `name size age`; directories and symlinks omit the size.
 /// Directories are blue, links cyan (bold red when broken), executables
-/// bold green. On a terminal, names wrap to the available width in at most
-/// three lines and then end in an ellipsis; other output keeps one line per
-/// entry. Writes output to stdout directly. Returns 0 on success, 1 on error.
+/// bold green. Names and ages fade through the same grey ramp as entries
+/// age, with the ramp overriding a name's type color once it starts. On a
+/// terminal, names wrap to the available width in at most three lines and
+/// then end in an ellipsis; other output keeps one line per entry. Writes
+/// output to stdout directly. Returns 0 on success, 1 on error.
 pub fn list_dir(path: impl AsRef<std::path::Path>, show_hidden: bool) -> i32 {
     let path = path.as_ref();
     let now = now_secs();
@@ -69,7 +71,7 @@ fn render(entries: &[Entry], terminal_cols: Option<usize>) -> String {
             + e.link_target.as_ref().map_or(0, |target| target.len() + 4)
             + e.size.as_ref().map_or(0, Field::len)
             + e.age.len()
-            + e.color_start.len() * MAX_NAME_LINES
+            + e.name_color().len() * MAX_NAME_LINES
             + e.age_shade.len() * 2;
     }
     let mut out = String::with_capacity(cap);
@@ -80,14 +82,15 @@ fn render(entries: &[Entry], terminal_cols: Option<usize>) -> String {
 }
 
 fn write_entry(out: &mut String, e: &Entry, name_w: usize, size_w: usize, age_w: usize) {
+    let name_color = e.name_color();
     let width = str_width(&e.display_name)
         + e.link_target
             .as_ref()
             .map_or(0, |target| " -> ".len() + str_width(target));
     if width <= name_w {
-        out.push_str(e.color_start);
+        out.push_str(name_color);
         out.push_str(&e.display_name);
-        if !e.color_start.is_empty() {
+        if !name_color.is_empty() {
             out.push_str("\x1b[0m");
         }
         if let Some(ref target) = e.link_target {
@@ -119,9 +122,9 @@ fn write_entry(out: &mut String, e: &Entry, name_w: usize, size_w: usize, age_w:
             start
         };
         if start < colored_end {
-            out.push_str(e.color_start);
+            out.push_str(name_color);
             out.push_str(&text[start..colored_end]);
-            if !e.color_start.is_empty() {
+            if !name_color.is_empty() {
                 out.push_str("\x1b[0m");
             }
         }
@@ -241,6 +244,18 @@ struct Entry {
     display_name: String,
     link_target: Option<String>,
     color_start: &'static str,
+}
+
+impl Entry {
+    /// The age ramp replaces the type color so old entries recede uniformly;
+    /// recent entries keep the color that identifies their kind.
+    fn name_color(&self) -> &'static str {
+        if self.age_shade.is_empty() {
+            self.color_start
+        } else {
+            self.age_shade
+        }
+    }
 }
 
 /// Stack-allocated ASCII field for sizes and ages: formatted with no heap
@@ -720,6 +735,34 @@ mod tests {
         assert!(!lines[1].contains("\x1b[36m"));
         for line in &lines {
             assert!(str_width(&strip_ansi(line)) <= 20, "line exceeds terminal: {line:?}");
+        }
+    }
+
+    #[test]
+    fn aged_names_use_the_age_shade_instead_of_the_type_color() {
+        let mut old = entry("old", Some("1B"), "40d");
+        old.color_start = "\x1b[1;32m";
+        old.age_shade = "\x1b[38;5;246m";
+        let mut recent = entry("new", Some("1B"), "2h");
+        recent.color_start = "\x1b[1;32m";
+        let out = super::render(&[old, recent], None);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("\x1b[38;5;246mold\x1b[0m"));
+        assert!(!lines[0].contains("\x1b[1;32m"));
+        assert!(lines[1].starts_with("\x1b[1;32mnew\x1b[0m"));
+    }
+
+    #[test]
+    fn wrapped_aged_names_keep_the_shade_on_every_line() {
+        let mut old = entry("abcdefghijklmnopqrstuvwxyz0123456789", Some("1B"), "40d");
+        old.color_start = "\x1b[34m";
+        old.age_shade = "\x1b[38;5;246m";
+        let out = super::render(&[old], Some(20));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert!(line.starts_with("\x1b[38;5;246m"), "line lost the shade: {line:?}");
+            assert!(!line.contains("\x1b[34m"), "line kept the type color: {line:?}");
         }
     }
 
