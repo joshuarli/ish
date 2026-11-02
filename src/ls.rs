@@ -10,11 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Native directory listing: `l` hides dotfiles, `ll` shows them.
 /// Each entry is `name size age`; directories and symlinks omit the size.
 /// Directories are blue, links cyan (bold red when broken), executables
-/// bold green. Names and ages fade through the same grey ramp as entries
-/// age, with the ramp overriding a name's type color once it starts. On a
-/// terminal, names wrap to the available width in at most three lines and
-/// then end in an ellipsis; other output keeps one line per entry. Writes
-/// output to stdout directly. Returns 0 on success, 1 on error.
+/// bold green. Names keep their type color in a faint form and ages fade
+/// through a grey ramp once entries pass a day old. On a terminal, names
+/// wrap to the available width in at most three lines and then end in an
+/// ellipsis; other output keeps one line per entry. Writes output to stdout
+/// directly. Returns 0 on success, 1 on error.
 pub fn list_dir(path: impl AsRef<std::path::Path>, show_hidden: bool) -> i32 {
     let path = path.as_ref();
     let now = now_secs();
@@ -71,7 +71,7 @@ fn render(entries: &[Entry], terminal_cols: Option<usize>) -> String {
             + e.link_target.as_ref().map_or(0, |target| target.len() + 4)
             + e.size.as_ref().map_or(0, Field::len)
             + e.age.len()
-            + e.name_color().len() * MAX_NAME_LINES
+            + e.name_start().len() * MAX_NAME_LINES
             + e.age_shade.len() * 2;
     }
     let mut out = String::with_capacity(cap);
@@ -82,15 +82,15 @@ fn render(entries: &[Entry], terminal_cols: Option<usize>) -> String {
 }
 
 fn write_entry(out: &mut String, e: &Entry, name_w: usize, size_w: usize, age_w: usize) {
-    let name_color = e.name_color();
+    let name_start = e.name_start();
     let width = str_width(&e.display_name)
         + e.link_target
             .as_ref()
             .map_or(0, |target| " -> ".len() + str_width(target));
     if width <= name_w {
-        out.push_str(name_color);
+        out.push_str(name_start);
         out.push_str(&e.display_name);
-        if !name_color.is_empty() {
+        if !name_start.is_empty() {
             out.push_str("\x1b[0m");
         }
         if let Some(ref target) = e.link_target {
@@ -122,9 +122,9 @@ fn write_entry(out: &mut String, e: &Entry, name_w: usize, size_w: usize, age_w:
             start
         };
         if start < colored_end {
-            out.push_str(name_color);
+            out.push_str(name_start);
             out.push_str(&text[start..colored_end]);
-            if !name_color.is_empty() {
+            if !name_start.is_empty() {
                 out.push_str("\x1b[0m");
             }
         }
@@ -244,16 +244,17 @@ struct Entry {
     display_name: String,
     link_target: Option<String>,
     color_start: &'static str,
+    dim_start: &'static str,
 }
 
 impl Entry {
-    /// The age ramp replaces the type color so old entries recede uniformly;
-    /// recent entries keep the color that identifies their kind.
-    fn name_color(&self) -> &'static str {
+    /// Old entries keep the color that identifies their kind, in its faint
+    /// form; recent entries stay at full brightness.
+    fn name_start(&self) -> &'static str {
         if self.age_shade.is_empty() {
             self.color_start
         } else {
-            self.age_shade
+            self.dim_start
         }
     }
 }
@@ -410,19 +411,20 @@ fn build_entry(
         safe_name
     };
 
-    let color_start: &'static str = if is_link && target_meta.is_none() {
-        "\x1b[1;31m"
-    } else if is_link {
-        "\x1b[36m"
-    } else if is_dir {
-        "\x1b[34m"
-    } else if mode & 0o4000 != 0 {
-        "\x1b[31m"
-    } else if is_exec {
-        "\x1b[1;32m"
-    } else {
-        ""
-    };
+    let (color_start, dim_start): (&'static str, &'static str) =
+        if is_link && target_meta.is_none() {
+            ("\x1b[1;31m", "\x1b[2;31m")
+        } else if is_link {
+            ("\x1b[36m", "\x1b[2;36m")
+        } else if is_dir {
+            ("\x1b[34m", "\x1b[2;34m")
+        } else if mode & 0o4000 != 0 {
+            ("\x1b[31m", "\x1b[2;31m")
+        } else if is_exec {
+            ("\x1b[1;32m", "\x1b[2;32m")
+        } else {
+            ("", "\x1b[2m")
+        };
 
     let diff = age_diff(lmeta.mtime(), now);
 
@@ -437,6 +439,7 @@ fn build_entry(
         display_name,
         link_target,
         color_start,
+        dim_start,
     }
 }
 
@@ -643,6 +646,7 @@ mod tests {
             display_name: display_name.to_owned(),
             link_target: None,
             color_start: "",
+            dim_start: "",
         }
     }
 
@@ -739,30 +743,32 @@ mod tests {
     }
 
     #[test]
-    fn aged_names_use_the_age_shade_instead_of_the_type_color() {
+    fn aged_names_keep_the_type_color_in_faint_form() {
         let mut old = entry("old", Some("1B"), "40d");
         old.color_start = "\x1b[1;32m";
+        old.dim_start = "\x1b[2;32m";
         old.age_shade = "\x1b[38;5;246m";
         let mut recent = entry("new", Some("1B"), "2h");
         recent.color_start = "\x1b[1;32m";
         let out = super::render(&[old, recent], None);
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[0].starts_with("\x1b[38;5;246mold\x1b[0m"));
+        assert!(lines[0].starts_with("\x1b[2;32mold\x1b[0m"));
         assert!(!lines[0].contains("\x1b[1;32m"));
         assert!(lines[1].starts_with("\x1b[1;32mnew\x1b[0m"));
     }
 
     #[test]
-    fn wrapped_aged_names_keep_the_shade_on_every_line() {
+    fn wrapped_aged_names_dim_every_line() {
         let mut old = entry("abcdefghijklmnopqrstuvwxyz0123456789", Some("1B"), "40d");
         old.color_start = "\x1b[34m";
+        old.dim_start = "\x1b[2;34m";
         old.age_shade = "\x1b[38;5;246m";
         let out = super::render(&[old], Some(20));
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3);
         for line in &lines {
-            assert!(line.starts_with("\x1b[38;5;246m"), "line lost the shade: {line:?}");
-            assert!(!line.contains("\x1b[34m"), "line kept the type color: {line:?}");
+            assert!(line.starts_with("\x1b[2;34m"), "line lost the faint color: {line:?}");
+            assert!(!line.contains("\x1b[34m"), "line stayed at full brightness: {line:?}");
         }
     }
 
@@ -775,16 +781,17 @@ mod tests {
         symlink("missing", dir.join("broken")).unwrap();
         std::fs::create_dir(dir.join("sub")).unwrap();
         let now = super::now_secs();
-        let color = |name: &str| {
+        let styles = |name: &str| {
             let p = dir.join(name);
             let m = std::fs::symlink_metadata(&p).unwrap();
-            super::build_entry(name, Some(&p), &m, now).color_start
+            let entry = super::build_entry(name, Some(&p), &m, now);
+            (entry.color_start, entry.dim_start)
         };
-        assert_eq!(color("plain"), "");
-        assert_eq!(color("exec"), "\x1b[1;32m");
-        assert_eq!(color("good"), "\x1b[36m");
-        assert_eq!(color("broken"), "\x1b[1;31m");
-        assert_eq!(color("sub"), "\x1b[34m");
+        assert_eq!(styles("plain"), ("", "\x1b[2m"));
+        assert_eq!(styles("exec"), ("\x1b[1;32m", "\x1b[2;32m"));
+        assert_eq!(styles("good"), ("\x1b[36m", "\x1b[2;36m"));
+        assert_eq!(styles("broken"), ("\x1b[1;31m", "\x1b[2;31m"));
+        assert_eq!(styles("sub"), ("\x1b[34m", "\x1b[2;34m"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
