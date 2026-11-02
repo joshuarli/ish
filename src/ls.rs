@@ -1,14 +1,18 @@
+use crate::line::{char_width, str_width};
 use crate::report;
+use crate::term;
 use std::cmp::Ordering;
 use std::fmt;
+use std::io::IsTerminal;
 use std::os::unix::fs::MetadataExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Native directory listing: `l` hides dotfiles, `ll` shows them.
-/// Each line is `name size age`; directories and symlinks omit the size.
+/// Each entry is `name size age`; directories and symlinks omit the size.
 /// Directories are blue, links cyan (bold red when broken), executables
-/// bold green. Writes output to stdout directly. Returns 0 on success,
-/// 1 on error.
+/// bold green. On a terminal, names wrap to the available width in at most
+/// three lines and then end in an ellipsis; other output keeps one line per
+/// entry. Writes output to stdout directly. Returns 0 on success, 1 on error.
 pub fn list_dir(path: impl AsRef<std::path::Path>, show_hidden: bool) -> i32 {
     let path = path.as_ref();
     let now = now_secs();
@@ -25,19 +29,25 @@ pub fn list_dir(path: impl AsRef<std::path::Path>, show_hidden: bool) -> i32 {
         return 0;
     }
 
-    print!("{}", render(&entries));
+    let terminal_cols = std::io::stdout()
+        .is_terminal()
+        .then(|| usize::from(term::term_size().1));
+    print!("{}", render(&entries, terminal_cols));
     0
 }
 
-fn render(entries: &[Entry]) -> String {
-    let prefix_len = |e: &Entry| {
-        let mut len = e.display_name.chars().count();
+const MAX_NAME_LINES: usize = 3;
+const MIN_NAME_WIDTH: usize = 8;
+
+fn render(entries: &[Entry], terminal_cols: Option<usize>) -> String {
+    let prefix_width = |e: &Entry| {
+        let mut width = str_width(&e.display_name);
         if let Some(ref target) = e.link_target {
-            len += " -> ".chars().count() + target.chars().count();
+            width += " -> ".len() + str_width(target);
         }
-        len
+        width
     };
-    let name_w = entries.iter().map(prefix_len).max().unwrap_or(0);
+    let max_name_w = entries.iter().map(prefix_width).max().unwrap_or(0);
     let size_w = entries
         .iter()
         .filter_map(|e| e.size.as_ref())
@@ -45,20 +55,36 @@ fn render(entries: &[Entry]) -> String {
         .max()
         .unwrap_or(0);
     let age_w = entries.iter().map(|e| e.age.len()).max().unwrap_or(0);
+    let tail_w = 2 + if size_w > 0 { size_w + 2 } else { 0 } + age_w;
+    let name_w = match terminal_cols {
+        Some(cols) => max_name_w.min(cols.saturating_sub(tail_w).max(MIN_NAME_WIDTH)),
+        None => max_name_w,
+    };
 
     // One allocation for the whole listing: visible text plus slack for
-    // separators and escape codes.
-    let mut cap = entries.len();
+    // separators, wrapping, and escape codes.
+    let mut cap = entries.len() * (32 * MAX_NAME_LINES + 1);
     for e in entries {
-        cap += prefix_len(e)
+        cap += e.display_name.len()
+            + e.link_target.as_ref().map_or(0, |target| target.len() + 4)
             + e.size.as_ref().map_or(0, Field::len)
             + e.age.len()
-            + e.color_start.len()
-            + e.age_shade.len()
-            + 32;
+            + e.color_start.len() * MAX_NAME_LINES
+            + e.age_shade.len() * 2;
     }
     let mut out = String::with_capacity(cap);
     for e in entries {
+        write_entry(&mut out, e, name_w, size_w, age_w);
+    }
+    out
+}
+
+fn write_entry(out: &mut String, e: &Entry, name_w: usize, size_w: usize, age_w: usize) {
+    let width = str_width(&e.display_name)
+        + e.link_target
+            .as_ref()
+            .map_or(0, |target| " -> ".len() + str_width(target));
+    if width <= name_w {
         out.push_str(e.color_start);
         out.push_str(&e.display_name);
         if !e.color_start.is_empty() {
@@ -68,36 +94,144 @@ fn render(entries: &[Entry]) -> String {
             out.push_str(" -> ");
             out.push_str(target);
         }
-        for _ in prefix_len(e)..name_w {
+        for _ in width..name_w {
             out.push(' ');
         }
-        out.push_str("  ");
-        if size_w > 0 {
-            if let Some(ref size) = e.size {
-                for _ in size.len()..size_w {
-                    out.push(' ');
-                }
-                out.push_str(size.as_str());
-            } else {
-                for _ in 0..size_w {
-                    out.push(' ');
-                }
+        write_metadata(out, e, size_w, age_w);
+        out.push('\n');
+        return;
+    }
+
+    let mut text = String::with_capacity(width);
+    text.push_str(&e.display_name);
+    if let Some(ref target) = e.link_target {
+        text.push_str(" -> ");
+        text.push_str(target);
+    }
+    let name_bytes = e.display_name.len();
+    let wrapped = wrap_name(&text, name_w);
+    for i in 0..wrapped.len {
+        let (start, line) = wrapped.lines[i];
+        let end = start + line.len();
+        let colored_end = if start < name_bytes {
+            end.min(name_bytes)
+        } else {
+            start
+        };
+        if start < colored_end {
+            out.push_str(e.color_start);
+            out.push_str(&text[start..colored_end]);
+            if !e.color_start.is_empty() {
+                out.push_str("\x1b[0m");
             }
-            out.push_str("  ");
         }
-        for _ in e.age.len()..age_w {
-            out.push(' ');
+        if colored_end < end {
+            out.push_str(&text[colored_end..end]);
         }
-        if !e.age_shade.is_empty() {
-            out.push_str(e.age_shade);
-        }
-        out.push_str(e.age.as_str());
-        if !e.age_shade.is_empty() {
-            out.push_str("\x1b[0m");
+        if i + 1 == wrapped.len {
+            let mut line_width = str_width(line);
+            if wrapped.truncated {
+                out.push('…');
+                line_width += 1;
+            }
+            for _ in line_width..name_w {
+                out.push(' ');
+            }
+            write_metadata(out, e, size_w, age_w);
         }
         out.push('\n');
     }
-    out
+}
+
+struct WrappedName<'a> {
+    lines: [(usize, &'a str); MAX_NAME_LINES],
+    len: usize,
+    truncated: bool,
+}
+
+fn wrap_name(text: &str, width: usize) -> WrappedName<'_> {
+    let mut wrapped = WrappedName {
+        lines: [(0, ""); MAX_NAME_LINES],
+        len: 0,
+        truncated: false,
+    };
+    let mut start = 0;
+    let mut used = 0;
+    let mut after_joiner = false;
+    for (i, ch) in text.char_indices() {
+        let w = if after_joiner { 0 } else { char_width(ch) };
+        after_joiner = ch == '\u{200D}';
+        if used > 0 && used + w > width {
+            if wrapped.len == MAX_NAME_LINES {
+                let (line_start, line) = wrapped.lines[MAX_NAME_LINES - 1];
+                wrapped.lines[MAX_NAME_LINES - 1] =
+                    (line_start, truncate_to_width(line, width.saturating_sub(1)));
+                wrapped.truncated = true;
+                return wrapped;
+            }
+            wrapped.lines[wrapped.len] = (start, &text[start..i]);
+            wrapped.len += 1;
+            start = i;
+            used = 0;
+        }
+        used += w;
+    }
+    if wrapped.len == 0 {
+        wrapped.lines[0] = (start, &text[start..]);
+        wrapped.len = 1;
+    } else if start < text.len() {
+        if wrapped.len == MAX_NAME_LINES {
+            let (line_start, line) = wrapped.lines[MAX_NAME_LINES - 1];
+            wrapped.lines[MAX_NAME_LINES - 1] =
+                (line_start, truncate_to_width(line, width.saturating_sub(1)));
+            wrapped.truncated = true;
+        } else {
+            wrapped.lines[wrapped.len] = (start, &text[start..]);
+            wrapped.len += 1;
+        }
+    }
+    wrapped
+}
+
+fn truncate_to_width(text: &str, max_width: usize) -> &str {
+    let mut used = 0;
+    let mut after_joiner = false;
+    for (i, ch) in text.char_indices() {
+        let w = if after_joiner { 0 } else { char_width(ch) };
+        after_joiner = ch == '\u{200D}';
+        if used + w > max_width {
+            return &text[..i];
+        }
+        used += w;
+    }
+    text
+}
+
+fn write_metadata(out: &mut String, e: &Entry, size_w: usize, age_w: usize) {
+    out.push_str("  ");
+    if size_w > 0 {
+        if let Some(ref size) = e.size {
+            for _ in size.len()..size_w {
+                out.push(' ');
+            }
+            out.push_str(size.as_str());
+        } else {
+            for _ in 0..size_w {
+                out.push(' ');
+            }
+        }
+        out.push_str("  ");
+    }
+    for _ in e.age.len()..age_w {
+        out.push(' ');
+    }
+    if !e.age_shade.is_empty() {
+        out.push_str(e.age_shade);
+    }
+    out.push_str(e.age.as_str());
+    if !e.age_shade.is_empty() {
+        out.push_str("\x1b[0m");
+    }
 }
 
 struct Entry {
@@ -373,6 +507,7 @@ fn age_shade(diff: i64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{age_shade, read_entries, relative_age};
+    use crate::line::str_width;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -484,23 +619,26 @@ mod tests {
         out
     }
 
-    #[test]
-    fn rendered_columns_align() {
+    fn entry(display_name: &str, size: Option<&str>, age: &str) -> super::Entry {
         use super::Field;
-        let entry = |display_name: &str, size: Option<&str>, age: &str| super::Entry {
+        super::Entry {
             size: size.map(Field::from),
             age: Field::from(age),
             age_shade: "",
             display_name: display_name.to_owned(),
             link_target: None,
             color_start: "",
-        };
+        }
+    }
+
+    #[test]
+    fn rendered_columns_align() {
         let entries = vec![
             entry("a.txt", Some("10B"), "2h"),
             entry("longname.txt", Some("10.6K"), "40d"),
             entry("d/", None, "3d"),
         ];
-        let out = super::render(&entries);
+        let out = super::render(&entries, None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3);
         let visible: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
@@ -508,11 +646,81 @@ mod tests {
         assert_eq!(visible[0], "a.txt           10B   2h");
         assert_eq!(visible[2], format!("d/{}3d", " ".repeat(20)));
         // 20 = 10 name pad + 2 + 5 size + 2 + 1 age pad.
-        let widths: Vec<usize> = visible.iter().map(|l| l.chars().count()).collect();
+        let widths: Vec<usize> = visible.iter().map(|l| str_width(l)).collect();
         assert!(
             widths.windows(2).all(|w| w[0] == w[1]),
             "columns should align: {widths:?}\n{out}"
         );
+    }
+
+    #[test]
+    fn rendered_columns_align_on_display_width() {
+        let entries = vec![
+            entry("a.txt", Some("10B"), "2h"),
+            entry("｜.txt", Some("1.0K"), "3d"),
+            entry("e\u{0301}.txt", Some("10.6K"), "40d"),
+        ];
+        let out = super::render(&entries, None);
+        let visible: Vec<String> = out.lines().map(strip_ansi).collect();
+        assert_eq!(visible.len(), 3);
+        let widths: Vec<usize> = visible.iter().map(|l| str_width(l)).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "display columns should align: {widths:?}\n{out}"
+        );
+    }
+
+    #[test]
+    fn narrow_terminal_wraps_names_before_metadata() {
+        let name = "abcdefghijklmnopqrstuvwxyz0123456789.txt";
+        let entries = vec![
+            entry(name, Some("1.0K"), "2h"),
+            entry("short", Some("1B"), "3d"),
+        ];
+        let out = super::render(&entries, Some(40));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], &name[..30]);
+        assert!(lines[1].starts_with(&name[30..]));
+        assert!(lines[1].ends_with("1.0K  2h"));
+        assert!(lines[2].starts_with("short"));
+        assert!(lines[2].ends_with("1B  3d"));
+        for line in &lines {
+            assert!(str_width(line) <= 40, "line exceeds terminal: {line:?}");
+        }
+    }
+
+    #[test]
+    fn names_truncate_after_three_wrapped_lines() {
+        for len in [100, 200] {
+            let name = "x".repeat(len);
+            let entries = vec![entry(&name, Some("1B"), "2h")];
+            let out = super::render(&entries, Some(40));
+            let lines: Vec<&str> = out.lines().collect();
+            assert_eq!(lines.len(), 3, "len={len}");
+            assert_eq!(lines[0], "x".repeat(32));
+            assert_eq!(lines[1], "x".repeat(32));
+            assert!(lines[2].starts_with(&"x".repeat(31)));
+            assert!(lines[2].contains('…'));
+            for line in &lines {
+                assert!(str_width(line) <= 40, "line exceeds terminal: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_symlink_colors_only_the_name() {
+        let mut link = entry("link", None, "2h");
+        link.link_target = Some("target".repeat(3));
+        link.color_start = "\x1b[36m";
+        let out = super::render(&[link], Some(20));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("\x1b[36mlink\x1b[0m -> "));
+        assert!(!lines[1].contains("\x1b[36m"));
+        for line in &lines {
+            assert!(str_width(&strip_ansi(line)) <= 20, "line exceeds terminal: {line:?}");
+        }
     }
 
     #[test]

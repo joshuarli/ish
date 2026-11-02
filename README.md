@@ -156,6 +156,10 @@ ish-specific commands include:
 | `?` | Copy the previous command's output through OSC 52 |
 | `ish-dump` | Write the current layout dump |
 
+Native `l` and `ll` wrap names to the terminal width, using at most three
+lines per name and ending longer names with `…`. Piped or redirected output
+keeps one line per entry.
+
 `command -v` and `command -V` identify registered ish commands as builtins even
 when `PATH` is empty. A command path such as `/bin/cp` is reported and run as
 the external program. Unavailable epsh builtin names are absent from command

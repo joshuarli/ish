@@ -1421,6 +1421,34 @@ fn l_lists_files() {
 }
 
 #[test]
+fn l_wraps_long_names_at_narrow_terminal_width() {
+    let name = "abcdefghijklmnopqrstuvwxyz0123456789.txt";
+    let sh = PtyShell::spawn_with_size(&[(name, "x"), ("short.txt", "y")], &[], 24, 40);
+    sh.run_command("l");
+    let screen = sh.screen();
+    let rows: Vec<String> = (0..screen.row_count())
+        .map(|row| screen.row(row).unwrap_or_default())
+        .collect();
+    let first = rows
+        .iter()
+        .position(|row| row.contains(&name[..32]))
+        .unwrap_or_else(|| panic!("wrapped name prefix missing: {rows:?}"));
+    assert!(
+        rows[first + 1].starts_with(&name[32..]),
+        "name continuation should start on the next row: {rows:?}"
+    );
+    assert!(
+        rows[first + 1].contains("1B") && rows[first + 1].contains("0s"),
+        "metadata should follow the final name line: {rows:?}"
+    );
+    assert_eq!(
+        screen.row_wrapped(first),
+        Some(false),
+        "ish should wrap the name itself instead of letting the terminal hard-wrap it: {rows:?}"
+    );
+}
+
+#[test]
 fn set_and_echo_var() {
     let sh = PtyShell::spawn();
     sh.run_command("export MY_VAR=hello_world");
