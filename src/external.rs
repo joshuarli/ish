@@ -57,7 +57,9 @@ pub fn make_external_dispatcher(
                     if args.len() > 1 {
                         let argument = args[1].to_shell_string();
                         if args.len() == 2 && matches!(argument.as_str(), "-h" | "--help") {
-                            println!("Usage: history [reset]");
+                            if let Some(help) = builtin::help("history") {
+                                print!("{help}");
+                            }
                             return Ok(epsh::eval::ExternalDispatch::Handled(epsh::error::ExitStatus::SUCCESS));
                         }
                         report!("ish: history: storage subcommands require a standalone command");

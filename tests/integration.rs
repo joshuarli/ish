@@ -1946,3 +1946,17 @@ fn builtin_registry_drives_names_and_execution_classes() {
     }
     assert!(builtin::lookup("echo").is_none());
 }
+
+#[test]
+fn every_builtin_has_help() {
+    for name in builtin::all_builtin_names() {
+        let help = builtin::help(name).unwrap_or_else(|| panic!("missing help for {name}"));
+        assert!(
+            help.to_ascii_lowercase().contains("usage:"),
+            "{name} help has no usage line: {help}"
+        );
+        assert!(!help.contains("{name}"), "{name} help kept its placeholder: {help}");
+    }
+    assert!(builtin::help("t").unwrap().contains("PATH stays in place"));
+    assert!(builtin::help("cp").unwrap().contains("--merge"));
+}

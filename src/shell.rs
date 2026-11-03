@@ -459,9 +459,9 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
             };
             match trash::parse_args(&args) {
                 Ok(trash::Command::Help) => {
-                    println!("Usage: {name} [--yes] [--] PATH");
-                    println!("Scan PATH before permanently deleting its entries. PATH stays in place.");
-                    println!("Type 'yes' to confirm. --yes skips confirmation.");
+                    if let Some(help) = builtin::help(name) {
+                        print!("{help}");
+                    }
                     shell.last_status = 0;
                 }
                 Ok(trash::Command::Run { path, assume_yes }) => {
@@ -730,9 +730,9 @@ fn handle_history(line: &str, shell: &mut Shell) -> bool {
             true
         }
         Some("-h") | Some("--help") => {
-            println!("Usage: history [reset]");
-            println!();
-            println!("Show history or reset it.");
+            if let Some(help) = builtin::help("history") {
+                print!("{help}");
+            }
             shell.last_status = 0;
             true
         }

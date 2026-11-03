@@ -147,7 +147,7 @@ ish-specific commands include:
 | `cp [OPTIONS] SOURCE DESTINATION` | Copy files or directory trees; with more than one source the last operand must be a directory |
 | `mv [OPTIONS] SOURCE DESTINATION` | Move files or directory trees; with more than one source the last operand must be a directory |
 | `t`, `trash` | Permanently delete entries below an explicit directory; `--yes` skips confirmation |
-| `w`, `which`, `type` | Locate a command or alias; a same-name alias also shows the underlying command |
+| `w`, `which`, `type` | Locate a command or alias; builtins print their usage and description, and a same-name alias also shows the underlying command |
 | `l [path...]` | List visible files with sizes and relative ages |
 | `ll [path...]` | List all files including hidden ones |
 | `c` | Clear the screen |

@@ -431,7 +431,7 @@ fn usage(operation: Operation) -> &'static str {
     }
 }
 
-fn help(operation: Operation) -> String {
+pub(crate) fn help(operation: Operation) -> String {
     let recursion = match operation {
         Operation::Copy => "  -r, -R                   Accepted; directory recursion is automatic\n",
         Operation::Move => "",

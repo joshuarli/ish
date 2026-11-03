@@ -2896,8 +2896,18 @@ fn which_builtin() {
     let out = sh.run_command("w echo");
     let text = PtyShell::strip_ansi(&out);
     assert!(
-        text.contains("builtin"),
-        "expected 'builtin' for echo: {text:?}"
+        text.contains("echo: builtin"),
+        "expected builtin identity for echo: {text:?}"
+    );
+    assert!(
+        text.contains("Usage: echo [-n] [-e|-E] [ARG]..."),
+        "expected echo help: {text:?}"
+    );
+    let out = sh.run_command("w t");
+    let text = PtyShell::strip_ansi(&out);
+    assert!(
+        text.contains("PATH stays in place"),
+        "expected trash help: {text:?}"
     );
 }
 
