@@ -109,7 +109,7 @@ sixteen sampled engine descriptors after traversal recovery checks were added.
 The `.` and `..` source cases retain the original parent descriptor and charge
 that extra descriptor before mutation.
 
-The shell trash tests passed all three cases, including a removed entry whose
+The shell deletion tests passed all three cases, including a removed entry whose
 later directory sync fails: the summary counts the removal and reports a
 warning. Foreign-owner, deferred-flag, and Btrfs clone acceptance ran in Linux
 containers with the required capabilities and are recorded below. The ext4

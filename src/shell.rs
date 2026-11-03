@@ -11,7 +11,7 @@ use ish::builtin::ShellCommand;
 
 use ish::editor::{Editor, EditorAction, EditorContext, EditorEvent};
 use ish::report;
-use crate::trash;
+use crate::rmrf;
 
 struct Shell {
     editor: Editor,
@@ -449,7 +449,7 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
         }
         ShellCommand::CopyLastOutput => shell.last_status = copy_last_output(args, &shell.last_output),
         ShellCommand::DumpLayout => shell.last_status = write_layout_dump(shell),
-        ShellCommand::Trash => {
+        ShellCommand::Rmrf => {
             let args = match expand_builtin_args_bytes(args, shell, name) {
                 Some(args) => args
                     .iter()
@@ -457,15 +457,15 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                     .collect::<Vec<_>>(),
                 None => return false,
             };
-            match trash::parse_args(&args) {
-                Ok(trash::Command::Help) => {
+            match rmrf::parse_args(&args) {
+                Ok(rmrf::Command::Help) => {
                     if let Some(help) = builtin::help(name) {
                         print!("{help}");
                     }
                     shell.last_status = 0;
                 }
-                Ok(trash::Command::Run { path, assume_yes }) => {
-                    match trash::run(path, assume_yes, store_env_os(&shell.epsh, "HOME")) {
+                Ok(rmrf::Command::Run { paths }) => {
+                    match rmrf::run(paths, store_env_os(&shell.epsh, "HOME")) {
                         Ok(()) => shell.last_status = 0,
                         Err(error) => {
                             report!("ish: {name}: {error}");

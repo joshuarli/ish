@@ -139,7 +139,7 @@ does not change cwd or process environment.
 The operation runs in the parent shell so redirections and list status use
 epsh's normal evaluation. Workers must finish before the handler returns. The
 foreground controller owns signal handling, cancellation, progress output,
-worker event draining, and terminal restoration. `trash` uses the same
+worker event draining, and terminal restoration. `rmrf` uses the same
 controller while keeping its separate command contract and root protections.
 Workers receive explicit handles and options. They do not mutate shell state,
 cwd, or process environment.

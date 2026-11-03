@@ -1,7 +1,6 @@
 use crate::{signal, term};
 use ish_fs::{Cancellation, Event, EventSink, Progress};
 use std::io::{self, IsTerminal, Write};
-use std::os::fd::{BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -13,7 +12,6 @@ const PROGRESS_DELAY: Duration = Duration::from_millis(200);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const BLOCKED_REPORT_AFTER: Duration = Duration::from_secs(30);
 const EVENT_CAPACITY: usize = 256;
-const MAX_CONFIRMATION_BYTES: usize = 256;
 
 #[derive(Default)]
 struct ProgressReplay {
@@ -278,69 +276,6 @@ impl Foreground {
         }
     }
 
-    pub fn read_confirmation_line(&mut self) -> io::Result<Option<String>> {
-        let mut nonblocking = NonblockingStdin::enable(0)?;
-        let result = self.read_confirmation_nonblocking(0);
-        let restore = nonblocking.restore();
-        match (result, restore) {
-            (Ok(answer), Ok(())) => Ok(answer),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(error), Err(restore_error)) => Err(io::Error::other(format!(
-                "{error}; failed to restore stdin flags: {restore_error}"
-            ))),
-        }
-    }
-
-    fn read_confirmation_nonblocking(&mut self, stdin_fd: RawFd) -> io::Result<Option<String>> {
-        let stdin = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
-        let mut answer = Vec::with_capacity(4);
-        let mut too_long = false;
-        let finish_line = |answer: Vec<u8>, too_long: bool| -> io::Result<Option<String>> {
-            if too_long {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "confirmation answer exceeds 256 bytes",
-                ));
-            }
-            if answer.is_empty() {
-                return Ok(None);
-            }
-            String::from_utf8(answer)
-                .map(Some)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-        };
-        loop {
-            self.poll();
-            if self.cancellation.is_cancelled() {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "operation cancelled"));
-            }
-            match poll_stdin(stdin_fd)? {
-                Some(true) => {
-                    self.watchdog.note_activity(Instant::now());
-                    let mut byte = [0u8; 1];
-                    match rustix::io::read(stdin, &mut byte) {
-                        Ok(0) => return finish_line(answer, too_long),
-                        Ok(_) if byte[0] == b'\n' => {
-                            if !too_long {
-                                answer.push(b'\n');
-                            }
-                            return finish_line(answer, too_long);
-                        }
-                        Ok(_) if answer.len() < MAX_CONFIRMATION_BYTES => answer.push(byte[0]),
-                        Ok(_) => too_long = true,
-                        Err(error)
-                            if error == rustix::io::Errno::AGAIN
-                                || error == rustix::io::Errno::INTR => {}
-                        Err(error) => return Err(io::Error::from(error)),
-                    }
-                }
-                Some(false) => self.poll(),
-                None => return finish_line(answer, too_long),
-            }
-        }
-    }
-
     pub fn run<T, F, H>(&mut self, operation: F, mut handle_event: H) -> io::Result<T>
     where
         T: Send,
@@ -565,41 +500,6 @@ impl Drop for Foreground {
     }
 }
 
-struct NonblockingStdin {
-    fd: RawFd,
-    original_flags: rustix::fs::OFlags,
-    restored: bool,
-}
-
-impl NonblockingStdin {
-    fn enable(fd: RawFd) -> io::Result<Self> {
-        let stdin = unsafe { BorrowedFd::borrow_raw(fd) };
-        let original_flags = rustix::fs::fcntl_getfl(stdin)?;
-        rustix::fs::fcntl_setfl(stdin, original_flags | rustix::fs::OFlags::NONBLOCK)?;
-        Ok(Self {
-            fd,
-            original_flags,
-            restored: false,
-        })
-    }
-
-    fn restore(&mut self) -> io::Result<()> {
-        if self.restored {
-            return Ok(());
-        }
-        let stdin = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        rustix::fs::fcntl_setfl(stdin, self.original_flags)?;
-        self.restored = true;
-        Ok(())
-    }
-}
-
-impl Drop for NonblockingStdin {
-    fn drop(&mut self) {
-        let _ = self.restore();
-    }
-}
-
 fn merge_progress(current: &mut Progress, newer: Progress) {
     current.discovered_files = current.discovered_files.max(newer.discovered_files);
     current.completed_files = current.completed_files.max(newer.completed_files);
@@ -610,26 +510,6 @@ fn merge_progress(current: &mut Progress, newer: Progress) {
     current.cloned_files = current.cloned_files.max(newer.cloned_files);
     current.native_copied_files = current.native_copied_files.max(newer.native_copied_files);
     current.buffered_copied_files = current.buffered_copied_files.max(newer.buffered_copied_files);
-}
-
-fn poll_stdin(stdin_fd: RawFd) -> io::Result<Option<bool>> {
-    let stdin = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
-    let mut fds = [rustix::event::PollFd::from_borrowed_fd(
-        stdin,
-        rustix::event::PollFlags::IN,
-    )];
-    let timeout = rustix::event::Timespec {
-        tv_sec: POLL_INTERVAL.as_secs() as i64,
-        tv_nsec: POLL_INTERVAL.subsec_nanos() as i64,
-    };
-    match rustix::event::poll(&mut fds, Some(&timeout)) {
-        Ok(0) => Ok(Some(false)),
-        Ok(_) if fds[0].revents().contains(rustix::event::PollFlags::IN) => Ok(Some(true)),
-        Ok(_) if fds[0].revents().contains(rustix::event::PollFlags::HUP) => Ok(None),
-        Ok(_) => Ok(Some(false)),
-        Err(error) if error == rustix::io::Errno::INTR => Ok(Some(false)),
-        Err(error) => Err(io::Error::from(error)),
-    }
 }
 
 fn escape_path(path: &std::path::Path) -> String {

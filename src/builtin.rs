@@ -29,7 +29,7 @@ pub enum ShellCommand {
     ResumeJob,
     History,
     DumpLayout,
-    Trash,
+    Rmrf,
     Locate,
     Jump,
 }
@@ -151,8 +151,8 @@ const LIST_HIDDEN_HELP: &str =
     "Usage: {name} [PATH...]\nList all files, including hidden ones, with sizes and relative ages.";
 const CLEAR_SCREEN_HELP: &str =
     "Usage: {name}\nClear the screen.";
-const TRASH_HELP: &str =
-    "Usage: {name} [--yes] [--] PATH\nScan PATH before permanently deleting its entries. PATH stays in place.\nType 'yes' to confirm; --yes skips confirmation.";
+const RMRF_HELP: &str =
+    "Usage: {name} [--] PATH...\nPermanently remove each PATH, including directory trees. Missing paths are ignored.";
 const LOCATE_HELP: &str =
     "Usage: {name} NAME\nLocate a command through aliases, builtins, functions, or PATH.";
 const JUMP_HELP: &str =
@@ -173,8 +173,7 @@ const ISH_BUILTINS: &[Builtin] = &[
     Builtin::foreground("l", ExternalCommand::List, Help::Text(LIST_HELP)),
     Builtin::foreground("ll", ExternalCommand::ListHidden, Help::Text(LIST_HIDDEN_HELP)),
     Builtin::foreground("mv", ExternalCommand::Move, Help::Move),
-    Builtin::in_shell("t", ShellCommand::Trash, Help::Text(TRASH_HELP)),
-    Builtin::in_shell("trash", ShellCommand::Trash, Help::Text(TRASH_HELP)),
+    Builtin::in_shell("rmrf", ShellCommand::Rmrf, Help::Text(RMRF_HELP)),
     Builtin::in_shell("type", ShellCommand::Locate, Help::Text(LOCATE_HELP)),
     Builtin::in_shell("w", ShellCommand::Locate, Help::Text(LOCATE_HELP)),
     Builtin::in_shell("which", ShellCommand::Locate, Help::Text(LOCATE_HELP)),

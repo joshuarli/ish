@@ -1957,6 +1957,8 @@ fn every_builtin_has_help() {
         );
         assert!(!help.contains("{name}"), "{name} help kept its placeholder: {help}");
     }
-    assert!(builtin::help("t").unwrap().contains("PATH stays in place"));
+    assert!(builtin::help("rmrf").unwrap().contains("Permanently remove each PATH"));
+    assert!(builtin::lookup("t").is_none());
+    assert!(builtin::lookup("trash").is_none());
     assert!(builtin::help("cp").unwrap().contains("--merge"));
 }

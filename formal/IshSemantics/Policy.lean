@@ -12,7 +12,7 @@ inductive Exec where
   deriving Repr, BEq, DecidableEq
 
 def classify (name : Bytes) : Option Exec :=
-  if ["?", "alias", "copy-scrollback", "denv", "exit", "fg", "ish-dump", "t", "trash", "type", "w", "which", "z"].any
+  if ["?", "alias", "copy-scrollback", "denv", "exit", "fg", "ish-dump", "rmrf", "type", "w", "which", "z"].any
       (fun text => text.toUTF8.toList == name) then some .inShell
   else if ["cd", "history"].any (fun text => text.toUTF8.toList == name) then some .hybrid
   else if ["cp", "mv"].any (fun text => text.toUTF8.toList == name) then some .foreground
@@ -312,12 +312,11 @@ example : decodePlacementContext "parallel" = .error "unknown placement context"
 
 theorem cp_foreground_class : classify "cp".toUTF8.toList = some .foreground := by decide +kernel
 theorem mv_foreground_class : classify "mv".toUTF8.toList = some .foreground := by decide +kernel
-theorem t_in_shell_class : classify "t".toUTF8.toList = some .inShell := by decide +kernel
-theorem trash_in_shell_class : classify "trash".toUTF8.toList = some .inShell := by decide +kernel
+theorem rmrf_in_shell_class : classify "rmrf".toUTF8.toList = some .inShell := by decide +kernel
 theorem foreground_parent_allowed : targetAllowedAt "cp".toUTF8.toList .parent = true := by decide +kernel
 theorem foreground_pipeline_refused : targetAllowedAt "cp".toUTF8.toList .pipeline = false := by decide +kernel
 theorem foreground_substitution_refused : targetAllowedAt "mv".toUTF8.toList .substitution = false := by decide +kernel
-theorem trash_dynamic_refused : dynamicAllowed "trash".toUTF8.toList = false := by decide +kernel
+theorem rmrf_dynamic_refused : dynamicAllowed "rmrf".toUTF8.toList = false := by decide +kernel
 theorem negated_foreground_parent_allowed : targetAllowedAt "mv".toUTF8.toList .negatedParent = true := by decide +kernel
 theorem negated_foreground_pipeline_refused : targetAllowedAt "mv".toUTF8.toList .negatedPipeline = false := by decide +kernel
 theorem negated_foreground_substitution_refused : targetAllowedAt "mv".toUTF8.toList .negatedSubstitution = false := by decide +kernel

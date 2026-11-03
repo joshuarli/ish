@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 mod shell;
-mod trash;
+mod rmrf;
 
 struct Args {
     config: Option<OsString>,

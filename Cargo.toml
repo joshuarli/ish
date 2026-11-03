@@ -22,6 +22,7 @@ hashbrown = { version = "0.17.1", default-features = false, features = ["default
 epsh = { version = "0.0.9", path = "crates/epsh" }
 fdu-core = { path = "crates/fdu-core" }
 fdu-delete = { path = "crates/fdu-delete" }
+fdu-posix = { path = "crates/fdu-posix" }
 fdu-scan = { path = "crates/fdu-scan" }
 ish-fs = { path = "crates/ish-fs" }
 rustc-hash = "2.1"

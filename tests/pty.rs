@@ -2903,12 +2903,24 @@ fn which_builtin() {
         text.contains("Usage: echo [-n] [-e|-E] [ARG]..."),
         "expected echo help: {text:?}"
     );
-    let out = sh.run_command("w t");
+    let out = sh.run_command("w rmrf");
     let text = PtyShell::strip_ansi(&out);
     assert!(
-        text.contains("PATH stays in place"),
-        "expected trash help: {text:?}"
+        text.contains("Permanently remove each PATH"),
+        "expected rmrf help: {text:?}"
     );
+}
+
+#[test]
+fn rmrf_removes_a_directory() {
+    let sh = PtyShell::spawn_with_opts(&[("victim/nested/file", "content")], &[]);
+    let victim = sh.home_path().join("victim");
+
+    sh.run_command("rmrf victim/");
+
+    assert!(!victim.exists(), "rmrf kept the selected directory");
+    let status = PtyShell::strip_ansi(&sh.run_command("echo status-$?"));
+    assert!(status.contains("status-0"), "rmrf did not succeed: {status:?}");
 }
 
 #[test]

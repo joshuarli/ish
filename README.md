@@ -110,8 +110,8 @@ violations prevent the input line from starting. Expanded targets are checked
 before their redirections, assignments for dispatch, or execution; earlier
 commands and expansions keep their effects. Commands that need shell state,
 including `alias`, `exit`, `fg`, `denv`, and `z`, must be the whole input line.
-`cd` and `history` can also be used in lists. `t` and `trash` must also be the
-whole input line.
+`cd` and `history` can also be used in lists. `rmrf` must also be the whole
+input line.
 
 Native `cp` and `mv` run in the shell process, including lists, redirections,
 and standalone negation. `! cp source copy` performs the copy and inverts its
@@ -146,7 +146,7 @@ ish-specific commands include:
 | `z [query]` | Jump to a frequently used directory; no query goes home |
 | `cp [OPTIONS] SOURCE DESTINATION` | Copy files or directory trees; with more than one source the last operand must be a directory |
 | `mv [OPTIONS] SOURCE DESTINATION` | Move files or directory trees; with more than one source the last operand must be a directory |
-| `t`, `trash` | Permanently delete entries below an explicit directory; `--yes` skips confirmation |
+| `rmrf PATH...` | Permanently remove each path, including directory trees |
 | `w`, `which`, `type` | Locate a command or alias; builtins print their usage and description, and a same-name alias also shows the underlying command |
 | `l [path...]` | List visible files with sizes and relative ages |
 | `ll [path...]` | List all files including hidden ones |
@@ -169,16 +169,15 @@ completion and lookup, even if a same-named executable exists on `PATH`. Use
 an explicit path to run that executable. `command -v exit` can identify the
 whole-line ish command; `command exit` refuses its execution.
 
-`t PATH` and `trash PATH` scan the directory tree before deleting anything.
-They permanently delete its entries and keep `PATH` itself. The last component
-of `PATH` must name a directory, not a symlink. The command refuses
-`/`, `$HOME`, and any parent of the current directory. It removes nested
-symlinks themselves and leaves their targets alone. An incomplete scan or mount
-boundary stops deletion before it starts. By default, the command asks you to
-type `yes`. Pass `--yes` to skip the prompt. Without a terminal, `--yes` is
-required. A terminal shows scan progress and a deletion progress bar.
+`rmrf PATH...` removes each path. Directory trees are scanned before deleting
+anything. The command refuses `/`, `$HOME`, the current directory, and any
+parent of the current directory. A directory operand that is a mount point is
+refused. An incomplete scan or nested mount boundary stops deletion before it
+starts. Symlinks are removed as links; their targets are left alone. Missing
+paths are ignored, and a failure on one path does not stop the remaining paths.
+A terminal shows scan progress and a deletion progress bar.
 If deletion is interrupted, entries may remain in a `.fdu-quarantine-v2-*`
-directory inside `PATH`. The next `t PATH` restores verified captures without
+directory inside `PATH`. The next `rmrf PATH` restores verified captures without
 overwriting live names and requires a fresh scan and retry. Existing v1 sessions
 retain their restoration behavior. Damaged records, conflicting names, and
 unrelated quarantine lookalikes block deletion and identify the retained paths.

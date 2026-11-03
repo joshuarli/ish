@@ -147,6 +147,7 @@ dependencies = [
  "epsh",
  "fdu-core",
  "fdu-delete",
+ "fdu-posix",
  "fdu-scan",
  "ish-fs",
  "laputa-ptytest",

@@ -1,9 +1,13 @@
-use fdu_core::{EntryType, NodeState, NodeStatus, ScanEvent, Tree};
+use fdu_core::{EntryType, FileIdentity, NodeState, NodeStatus, ScanEvent, Tree};
 use fdu_delete::{DeleteEvent, OutcomeKind, create_plan};
+use fdu_posix::identity;
 use fdu_scan::{RootAnchor, open_root_no_follow, start_indexed_scan};
 use ish::foreground::Foreground;
+use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::io::Errno;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, IsTerminal, Write};
+use std::io;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -20,14 +24,13 @@ const PROGRESS_BAR_WIDTH: usize = 30;
 
 pub(super) enum Command {
     Help,
-    Run { path: PathBuf, assume_yes: bool },
+    Run { paths: Vec<PathBuf> },
 }
 
 pub(super) fn parse_args(args: &[OsString]) -> Result<Command, String> {
-    let mut assume_yes = false;
     let mut positional_only = false;
     let mut help = false;
-    let mut path = None;
+    let mut paths = Vec::new();
     for argument in args {
         let bytes = argument.as_os_str().as_bytes();
         if !positional_only {
@@ -36,156 +39,343 @@ pub(super) fn parse_args(args: &[OsString]) -> Result<Command, String> {
                     positional_only = true;
                     continue;
                 }
-                b"--yes" => {
-                    assume_yes = true;
-                    continue;
-                }
                 b"-h" | b"--help" => {
                     help = true;
                     continue;
                 }
+                b"--force" | b"--recursive" => continue,
+                _ if is_force_recursive_option(bytes) => continue,
                 _ if bytes.starts_with(b"-") => {
                     return Err(format!("unknown option: {}", argument.to_string_lossy()));
                 }
                 _ => {}
             }
         }
-        if path.is_some() {
-            return Err("only one path may be given".to_owned());
-        }
-        path = Some(PathBuf::from(argument));
+        paths.push(PathBuf::from(argument));
     }
     if help {
         return Ok(Command::Help);
     }
-    let path = path.ok_or_else(|| "requires an explicit PATH".to_owned())?;
-    Ok(Command::Run { path, assume_yes })
+    if paths.is_empty() {
+        return Err("requires at least one PATH".to_owned());
+    }
+    Ok(Command::Run { paths })
 }
 
-pub(super) fn run(
-    path: PathBuf,
-    assume_yes: bool,
-    home: Option<OsString>,
-) -> io::Result<()> {
+fn is_force_recursive_option(bytes: &[u8]) -> bool {
+    bytes.len() > 1
+        && bytes[0] == b'-'
+        && bytes[1..].iter().all(|byte| matches!(byte, b'r' | b'R' | b'f'))
+}
+
+pub(super) fn run(paths: Vec<PathBuf>, home: Option<OsString>) -> io::Result<()> {
     let mut foreground = Foreground::start()?;
-    let result = run_with_foreground(path, assume_yes, home, &mut foreground);
+    let mut first_error = None;
+    for path in paths {
+        if foreground.cancellation().is_cancelled() {
+            break;
+        }
+        if let Err(error) = remove_path(&path, home.as_deref(), &mut foreground)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Err(error) = foreground.clear_progress() {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+            break;
+        }
+    }
     foreground.poll();
     let cancelled_by_user = foreground.cancellation().reason() == Some(ish_fs::CancelReason::User);
     let finish = foreground.finish();
     if cancelled_by_user {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "operation cancelled"));
     }
-    result?;
+    if let Some(error) = first_error {
+        return Err(error);
+    }
     finish
 }
 
-fn run_with_foreground(
-    path: PathBuf,
-    assume_yes: bool,
-    home: Option<OsString>,
-    foreground: &mut Foreground,
-) -> io::Result<()> {
-    let root = open_root_no_follow(&path).map_err(|error| describe_open_failure(&path, error))?;
-    let confirmation_path = (!assume_yes)
-        .then(|| resolve_confirmation_path(&root, &path))
-        .transpose()?;
-    let cwd = std::env::current_dir()?;
-    if let Some(reason) = protected_root_reason(&root, &cwd, home.as_deref())? {
+fn remove_path(path: &Path, home: Option<&OsStr>, foreground: &mut Foreground) -> io::Result<()> {
+    let (parent_path, name) = target_components(path)?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("{}: {error}", path.display()),
+            ));
+        }
+    };
+    if metadata.file_type().is_dir() {
+        remove_directory(path, &parent_path, &name, home, foreground)
+    } else {
+        let file_type = metadata.file_type();
+        let expected_kind = if file_type.is_symlink() {
+            EntryType::Symlink
+        } else if file_type.is_file() {
+            EntryType::RegularFile
+        } else {
+            EntryType::Other
+        };
+        remove_leaf(
+            path,
+            &parent_path,
+            &name,
+            FileIdentity { device: metadata.dev(), inode: metadata.ino() },
+            expected_kind,
+        )
+    }
+}
+
+fn target_components(path: &Path) -> io::Result<(PathBuf, OsString)> {
+    let bytes = path.as_os_str().as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("refusing to empty {}: it is {reason}", path.display()),
+            "refusing to remove the filesystem root",
+        ));
+    }
+    let start = bytes[..end]
+        .iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or(0, |index| index + 1);
+    let last = &bytes[start..end];
+    if last == b"." || last == b".." {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing to remove {}", path.display()),
+        ));
+    }
+    let trimmed = Path::new(OsStr::from_bytes(&bytes[..end]));
+    let name = trimmed.file_name().expect("a non-empty final component has a name");
+    let parent = trimmed
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Ok((parent.to_path_buf(), name.to_os_string()))
+}
+
+fn open_parent(path: &Path) -> io::Result<OwnedFd> {
+    rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| path_error(path, error.into()))
+}
+
+fn path_error(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+
+fn sync_error(path: &Path, error: Errno) -> io::Error {
+    let error = io::Error::from(error);
+    io::Error::new(
+        error.kind(),
+        format!("{} was removed; synchronization failed: {error}", path.display()),
+    )
+}
+
+fn remove_leaf(
+    path: &Path,
+    parent_path: &Path,
+    name: &OsStr,
+    expected: FileIdentity,
+    expected_kind: EntryType,
+) -> io::Result<()> {
+    let parent = open_parent(parent_path)?;
+    let stat = match identity::stat_at(parent.as_fd(), name) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => {
+            return Err(path_error(path, error.into()));
+        }
+    };
+    let actual = identity::entry_identity(&stat)?;
+    if actual.file != expected || actual.kind != expected_kind {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} changed before it could be removed", path.display()),
+        ));
+    }
+    match rustix::fs::unlinkat(parent.as_fd(), name, AtFlags::empty()) {
+        Ok(()) => {}
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => {
+            return Err(path_error(path, error.into()));
+        }
+    }
+    sync_removed_parent(&parent, path)
+}
+
+fn sync_removed_parent(parent: &OwnedFd, path: &Path) -> io::Result<()> {
+    rustix::fs::fsync(parent.as_fd()).map_err(|error| sync_error(path, error))
+}
+
+fn remove_directory(
+    path: &Path,
+    parent_path: &Path,
+    name: &OsStr,
+    home: Option<&OsStr>,
+    foreground: &mut Foreground,
+) -> io::Result<()> {
+    let root = open_root_no_follow(path).map_err(|error| describe_open_failure(path, error))?;
+    let parent = open_parent(parent_path)?;
+    ensure_not_mount_point(&root, parent.as_fd(), path)?;
+    let cwd = std::env::current_dir()?;
+    if let Some(reason) = protected_root_reason(&root, &cwd, home)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing to remove {}: it is {reason}", path.display()),
         ));
     }
     let tree = build_index(&root, foreground)?;
     foreground.clear_progress()?;
     require_complete_scan_root(&tree).map_err(|error| {
-        io::Error::other(format!("refusing to empty {}: {error}", path.display()))
+        io::Error::other(format!("refusing to remove {}: {error}", path.display()))
     })?;
     let selected: Vec<fdu_core::NodeId> = tree.children(tree.root()).collect();
-    if selected.is_empty() {
-        return Ok(());
-    }
-    let tree = Arc::new(tree);
-    let plan = create_plan(Arc::clone(&tree), &selected).map_err(|error| {
-        let mut details = error
-            .rejected
-            .iter()
-            .map(|rejection| match rejection.node {
-                Some(node) => format!("{}: {}", display_name(&tree, node), rejection.reason),
-                None => rejection.reason.clone(),
-            })
-            .collect::<Vec<_>>();
-        details.sort();
-        let details = details.join("; ");
-        io::Error::other(format!("{error}: {details}"))
-    })?;
-    let total = plan.operation_count();
-    if !assume_yes {
-        confirm_interactively(
-            &root,
-            &path,
-            confirmation_path.as_deref().expect("confirmation path is resolved"),
-            selected.len(),
-            total,
-            foreground,
-        )?;
-    }
-    let root_fd = root.try_clone_fd()?;
-    let (sender, receiver) = mpsc::sync_channel(DELETE_CHANNEL_CAPACITY);
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let worker_cancelled = Arc::clone(&cancelled);
-    let worker = thread::spawn(move || {
-        fdu_delete::execute(root_fd, plan, worker_cancelled, sender);
-    });
-    let mut report = DeletionReport::default();
-    let mut receive_error = None;
-    let mut finished = false;
-    while !finished {
-        let received = foreground.recv_timeout(&receiver);
-        sync_cancel_flag(foreground, &cancelled);
-        match received {
-            Ok(DeleteEvent::Outcomes(outcomes)) => {
-                for outcome in outcomes {
-                    report.record(&tree, outcome);
+    if !selected.is_empty() {
+        let tree = Arc::new(tree);
+        let plan = create_plan(Arc::clone(&tree), &selected).map_err(|error| {
+            let mut details = error
+                .rejected
+                .iter()
+                .map(|rejection| match rejection.node {
+                    Some(node) => format!("{}: {}", display_name(&tree, node), rejection.reason),
+                    None => rejection.reason.clone(),
+                })
+                .collect::<Vec<_>>();
+            details.sort();
+            let details = details.join("; ");
+            io::Error::other(format!("{error}: {details}"))
+        })?;
+        let total = plan.operation_count();
+        let root_fd = root.try_clone_fd()?;
+        let (sender, receiver) = mpsc::sync_channel(DELETE_CHANNEL_CAPACITY);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker = thread::spawn(move || {
+            fdu_delete::execute(root_fd, plan, worker_cancelled, sender);
+        });
+        let mut report = DeletionReport::default();
+        let mut receive_error = None;
+        let mut finished = false;
+        while !finished {
+            let received = foreground.recv_timeout(&receiver);
+            sync_cancel_flag(foreground, &cancelled);
+            match received {
+                Ok(DeleteEvent::Outcomes(outcomes)) => {
+                    for outcome in outcomes {
+                        report.record(&tree, outcome);
+                    }
+                    let completed = report.completed();
+                    let line = deleting_progress(completed, total);
+                    if let Err(error) = foreground.report_progress_line(&line) {
+                        receive_error.get_or_insert(error);
+                    }
                 }
-                let completed = report.completed();
-                let line = deleting_progress(completed, total);
-                if let Err(error) = foreground.report_progress_line(&line) {
-                    receive_error.get_or_insert(error);
+                Ok(DeleteEvent::Progress { .. }) => {}
+                Ok(DeleteEvent::Failed { message }) => {
+                    receive_error.get_or_insert_with(|| {
+                        io::Error::other(format!("deletion stopped: {message}"))
+                    });
                 }
-            }
-            Ok(DeleteEvent::Progress { .. }) => {}
-            Ok(DeleteEvent::Failed { message }) => {
-                receive_error.get_or_insert_with(|| io::Error::other(format!("deletion stopped: {message}")));
-            }
-            Ok(DeleteEvent::Finished) => finished = true,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                receive_error.get_or_insert_with(|| {
-                    io::Error::other("deletion worker stopped without finishing")
-                });
-                finished = true;
+                Ok(DeleteEvent::Finished) => finished = true,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    receive_error.get_or_insert_with(|| {
+                        io::Error::other("deletion worker stopped without finishing")
+                    });
+                    finished = true;
+                }
             }
         }
-    }
-    let worker_result = foreground
-        .join(worker)
-        .map_err(|_| io::Error::other("deletion worker terminated unexpectedly"));
-    match (receive_error, worker_result) {
-        (Some(receive_error), Err(worker_error)) => {
-            return Err(report.with_operation_error(io::Error::other(format!("{receive_error}; {worker_error}"))));
+        let worker_result = foreground
+            .join(worker)
+            .map_err(|_| io::Error::other("deletion worker terminated unexpectedly"));
+        match (receive_error, worker_result) {
+            (Some(receive_error), Err(worker_error)) => {
+                return Err(report.with_operation_error(io::Error::other(format!(
+                    "{receive_error}; {worker_error}"
+                ))));
+            }
+            (Some(error), Ok(())) | (None, Err(error)) => {
+                return Err(report.with_operation_error(error));
+            }
+            (None, Ok(())) => {}
         }
-        (Some(error), Ok(())) | (None, Err(error)) => return Err(report.with_operation_error(error)),
-        (None, Ok(())) => {}
+        foreground.clear_progress()?;
+        if report.has_problems() {
+            return Err(io::Error::other(report.failure_summary()));
+        }
+        if report.completed() != total {
+            return Err(io::Error::other(format!(
+                "deletion reported {} outcomes for {total} planned entries",
+                report.completed()
+            )));
+        }
     }
     foreground.clear_progress()?;
-    if !report.has_problems() {
-        if report.completed() != total {
-            return Err(io::Error::other(format!("deletion reported {} outcomes for {total} planned entries", report.completed())));
-        }
-        return Ok(());
+    if foreground.cancellation().is_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "operation cancelled"));
     }
-    Err(io::Error::other(report.failure_summary()))
+    remove_root(&root, parent.as_fd(), name, path)
+}
+
+fn ensure_not_mount_point(
+    root: &RootAnchor,
+    parent: BorrowedFd<'_>,
+    path: &Path,
+) -> io::Result<()> {
+    let root_mount = identity::mount_identity(root.as_fd())?;
+    let parent_mount = identity::mount_identity(parent)?;
+    if root_mount != parent_mount {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing to remove {}: it is a mount point", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_root(
+    root: &RootAnchor,
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    path: &Path,
+) -> io::Result<()> {
+    let stat = match identity::stat_at(parent, name) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => {
+            return Err(path_error(path, error.into()));
+        }
+    };
+    let actual = identity::entry_identity(&stat)?;
+    if actual.file != root.identity || actual.kind != EntryType::Directory {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} changed before it could be removed", path.display()),
+        ));
+    }
+    match rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR) {
+        Ok(()) => {}
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => {
+            return Err(path_error(path, error.into()));
+        }
+    }
+    rustix::fs::fsync(parent).map_err(|error| sync_error(path, error))
 }
 
 #[derive(Default)]
@@ -305,7 +495,6 @@ fn protected_root_reason(
         return Ok(Some("the filesystem root"));
     }
     if let Some(home) = home.filter(|home| !home.is_empty()) {
-        
         match is_root(Path::new(home)) {
             Ok(true) => return Ok(Some("your home directory")),
             Ok(false) => {}
@@ -313,73 +502,15 @@ fn protected_root_reason(
             Err(error) => return Err(error),
         }
     }
+    if is_root(cwd)? {
+        return Ok(Some("the current directory"));
+    }
     for parent in cwd.ancestors().skip(1) {
         if is_root(parent)? {
             return Ok(Some("a parent of the current directory"));
         }
     }
     Ok(None)
-}
-
-fn resolve_confirmation_path(root: &RootAnchor, path: &Path) -> io::Result<PathBuf> {
-    let resolved = std::fs::canonicalize(path)?;
-    verify_confirmation_target(root, path)?;
-    verify_confirmation_target(root, &resolved)?;
-    Ok(resolved)
-}
-
-fn verify_confirmation_target(root: &RootAnchor, path: &Path) -> io::Result<()> {
-    if last_path_component_is_symlink(path) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "selected path became a symlink after it was opened",
-        ));
-    }
-    let metadata = std::fs::metadata(path)?;
-    if metadata.dev() != root.identity.device || metadata.ino() != root.identity.inode {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "selected path no longer resolves to the opened directory",
-        ));
-    }
-    Ok(())
-}
-
-fn confirm_interactively(
-    root: &RootAnchor,
-    selected_path: &Path,
-    resolved_path: &Path,
-    top_level: usize,
-    total: usize,
-    foreground: &mut Foreground,
-) -> io::Result<()> {
-    if !io::stdin().is_terminal() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "cannot ask for confirmation without a terminal; pass --yes to delete without asking",
-        ));
-    }
-    verify_confirmation_target(root, selected_path)?;
-    verify_confirmation_target(root, resolved_path)?;
-    let prompt = write!(
-        io::stderr().lock(),
-        "Permanently delete {top_level} entries ({total} including nested) below {}? \
-         The directory itself is kept. Type 'yes' to continue: ",
-        resolved_path.display()
-    )
-    .and_then(|()| io::stderr().flush());
-    if let Err(error) = prompt {
-        foreground.cancellation().cancel_for_output();
-        return Err(error);
-    }
-    if foreground
-        .read_confirmation_line()?
-        .is_some_and(|answer| answer.trim() == "yes")
-    {
-        Ok(())
-    } else {
-        Err(io::Error::new(io::ErrorKind::PermissionDenied, "not confirmed; nothing was deleted"))
-    }
 }
 
 fn display_name(tree: &Tree, id: fdu_core::NodeId) -> String {
@@ -608,9 +739,6 @@ fn apply_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CStr;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -633,170 +761,84 @@ mod tests {
     }
 
     #[test]
-    fn assume_yes_deletes_contents_and_keeps_the_selected_directory() {
-        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join(".work/tmp");
-        std::fs::create_dir_all(&scratch).expect("scratch directory is available");
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock is after the epoch")
-            .as_nanos();
-        let root = scratch.join(format!("ish-trash-{}-{unique}", std::process::id()));
-        std::fs::create_dir(&root).expect("trash root is created");
-        std::fs::create_dir(root.join("nested")).expect("nested directory is created");
+    fn removes_directory_tree_and_root() {
+        let base = scratch_path("tree");
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("nested")).expect("nested directory is created");
         std::fs::write(root.join("nested/file"), b"content").expect("file is created");
+        std::fs::write(root.join("top"), b"top").expect("top-level file is created");
 
-        let result = run(root.clone(), true, None);
+        let result = run(vec![root.clone()], None);
 
-        assert!(result.is_ok(), "trash failed: {result:?}");
-        assert!(root.is_dir());
-        assert_eq!(
-            std::fs::read_dir(&root)
-                .expect("selected directory remains readable")
-                .count(),
-            0
-        );
-        std::fs::remove_dir(&root).expect("selected directory is removed by test cleanup");
+        assert!(result.is_ok(), "rmrf failed: {result:?}");
+        assert!(!root.exists(), "rmrf kept the selected directory");
+        std::fs::remove_dir_all(&base).expect("test cleanup removes the scratch tree");
     }
 
     #[test]
-    fn interactive_confirmation_deletes_after_yes_and_preserves_after_no() {
-        const CHILD: &str = "ISH_TRASH_INTERACTIVE_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let status = Command::new(std::env::current_exe().expect("test binary is available"))
-                .arg("--exact")
-                .arg("trash::tests::interactive_confirmation_deletes_after_yes_and_preserves_after_no")
-                .env(CHILD, "1")
-                .status()
-                .expect("interactive trash test child starts");
-            assert!(status.success());
-            return;
-        }
-        let (yes_root, no_root, cancel_root) = test_roots();
-        let yes = with_pty_stdin(b"yes\n", || run(yes_root.clone(), false, None))
-            .expect("yes confirmation uses a PTY");
-        assert!(yes.is_ok(), "yes confirmation failed: {yes:?}");
-        assert!(yes_root.is_dir());
-        assert_eq!(std::fs::read_dir(&yes_root).unwrap().count(), 0);
+    fn removes_files_symlinks_and_missing_paths() {
+        let base = scratch_path("mixed");
+        std::fs::create_dir_all(&base).expect("scratch base is created");
+        let file = base.join("file");
+        std::fs::write(&file, b"content").expect("file is created");
+        let target = base.join("target");
+        std::fs::create_dir_all(&target).expect("symlink target is created");
+        std::fs::write(target.join("inside"), b"content").expect("target file is created");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink is created");
+        let missing = base.join("missing");
 
-        let no = with_pty_stdin(b"no\n", || run(no_root.clone(), false, None))
-            .expect("no confirmation uses a PTY");
-        assert_eq!(no.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
-        assert!(no_root.join("nested/file").is_file());
+        let result = run(vec![file.clone(), link.clone(), missing], None);
 
-        let cancelled = with_pty_stdin(b"", || {
-            let interrupter = thread::spawn(|| {
-                thread::sleep(std::time::Duration::from_millis(500));
-                // SAFETY: raising SIGINT delivers it to this test process.
-                assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
-            });
-            let result = run(cancel_root.clone(), false, None);
-            interrupter.join().expect("interrupt thread completes");
-            result
-        })
-        .expect("cancel confirmation uses a PTY");
-        assert_eq!(cancelled.unwrap_err().kind(), io::ErrorKind::Interrupted);
-        assert!(cancel_root.join("nested/file").is_file());
-        std::fs::remove_dir_all(&yes_root).expect("yes root is removed by test cleanup");
-        std::fs::remove_dir_all(&no_root).expect("no root is removed by test cleanup");
-        std::fs::remove_dir_all(&cancel_root).expect("cancelled root is removed by test cleanup");
+        assert!(result.is_ok(), "rmrf failed: {result:?}");
+        assert!(!file.exists(), "regular file was kept");
+        assert!(!link.exists(), "symlink was kept");
+        assert!(target.join("inside").is_file(), "symlink target was removed");
+        std::fs::remove_dir_all(&base).expect("test cleanup removes the scratch tree");
     }
 
-    fn test_roots() -> (PathBuf, PathBuf, PathBuf) {
+    #[test]
+    fn protects_home_directory() {
+        let base = scratch_path("protected");
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join("nested")).expect("protected tree is created");
+        std::fs::write(home.join("nested/file"), b"content").expect("file is created");
+
+        let error = run(vec![home.clone()], Some(home.as_os_str().to_owned()))
+            .expect_err("rmrf removed the home directory");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(home.join("nested/file").is_file(), "protected content was removed");
+        std::fs::remove_dir_all(&base).expect("test cleanup removes the scratch tree");
+    }
+
+    #[test]
+    fn parses_multiple_paths_and_force_flags() {
+        let args = [
+            OsString::from("-rf"),
+            OsString::from("first"),
+            OsString::from("--"),
+            OsString::from("-second"),
+        ];
+        match parse_args(&args) {
+            Ok(Command::Run { paths }) => {
+                assert_eq!(paths, vec![PathBuf::from("first"), PathBuf::from("-second")]);
+            }
+            _ => panic!("multiple paths were not parsed"),
+        }
+        assert!(matches!(parse_args(&[OsString::from("--help")]), Ok(Command::Help)));
+        assert!(parse_args(&[]).is_err());
+        assert!(parse_args(&[OsString::from("--yes"), OsString::from("path")]).is_err());
+    }
+
+    fn scratch_path(label: &str) -> PathBuf {
         let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join(".work/tmp");
         std::fs::create_dir_all(&scratch).expect("scratch directory is available");
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the epoch")
             .as_nanos();
-        let base = scratch.join(format!("ish-trash-confirm-{}-{unique}", std::process::id()));
-        let yes_root = base.join("yes");
-        let no_root = base.join("no");
-        let cancel_root = base.join("cancel");
-        for root in [&yes_root, &no_root, &cancel_root] {
-            std::fs::create_dir_all(root.join("nested")).expect("confirmation root is created");
-            std::fs::write(root.join("nested/file"), b"content").expect("file is created");
-        }
-        (yes_root, no_root, cancel_root)
-    }
-
-    fn with_pty_stdin<T>(input: &[u8], operation: impl FnOnce() -> T) -> io::Result<T> {
-        // SAFETY: posix_openpt returns a new descriptor on success.
-        let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
-        if master_raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: master_raw is a newly opened descriptor owned by this function.
-        let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
-        // SAFETY: master is an open pseudo-terminal master.
-        if unsafe { libc::grantpt(master.as_raw_fd()) } != 0
-            // SAFETY: master is an open pseudo-terminal master.
-            || unsafe { libc::unlockpt(master.as_raw_fd()) } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: ptsname returns a NUL-terminated name for the open master descriptor.
-        let slave_name = unsafe { libc::ptsname(master.as_raw_fd()) };
-        if slave_name.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: slave_name remains valid until the next ptsname call and is copied immediately.
-        let slave_name = unsafe { CStr::from_ptr(slave_name) }.to_owned();
-        // SAFETY: slave_name is a valid PTY path.
-        let slave_raw = unsafe {
-            libc::open(
-                slave_name.as_ptr(),
-                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
-            )
-        };
-        if slave_raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: slave_raw is a newly opened descriptor owned by this function.
-        let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
-        let mut terminal_settings = rustix::termios::tcgetattr(&slave)?;
-        terminal_settings.local_modes.remove(rustix::termios::LocalModes::ECHO);
-        rustix::termios::tcsetattr(
-            &slave,
-            rustix::termios::OptionalActions::Now,
-            &terminal_settings,
-        )?;
-        // SAFETY: dup returns a new descriptor for stdin on success.
-        let original_raw = unsafe { libc::dup(0) };
-        if original_raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: original_raw is a newly duplicated descriptor owned by this function.
-        let original = unsafe { OwnedFd::from_raw_fd(original_raw) };
-        // SAFETY: slave is open and descriptor 0 is replaced with its terminal endpoint.
-        if unsafe { libc::dup2(slave.as_raw_fd(), 0) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let _restore = StdinRestore(original);
-        let mut written = 0;
-        while written < input.len() {
-            // SAFETY: input[written..] is a valid readable buffer and master is open.
-            let count = unsafe {
-                libc::write(
-                    master.as_raw_fd(),
-                    input[written..].as_ptr().cast::<libc::c_void>(),
-                    input.len() - written,
-                )
-            };
-            if count < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            written += count as usize;
-        }
-        Ok(operation())
-    }
-
-    struct StdinRestore(OwnedFd);
-
-    impl Drop for StdinRestore {
-        fn drop(&mut self) {
-            // SAFETY: the saved descriptor is open and descriptor 0 remains the PTY slave.
-            let _ = unsafe { libc::dup2(self.0.as_raw_fd(), 0) };
-        }
+        scratch.join(format!("ish-rmrf-{label}-{}-{unique}", std::process::id()))
     }
 }
 

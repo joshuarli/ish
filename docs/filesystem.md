@@ -264,7 +264,7 @@ protect against a same-account process with authority to modify the same trees.
 ## Inspect retained operation state
 
 Normal error and partial-completion diagnostics identify retained staging and
-captured source paths. `cp`, `mv`, and `t` use versioned
+captured source paths. `cp`, `mv`, and `rmrf` use versioned
 `.fdu-quarantine-v2-*` session directories. A session has a nonblocking root lock,
 a private mode-0700 directory, and a name with 128 bits of OS randomness.
 A competing operation on the same root fails instead of waiting.
