@@ -776,6 +776,32 @@ mod tests {
     }
 
     #[test]
+    fn removes_directory_trees_across_journal_batches() {
+        let base = scratch_path("batched");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside directory is created");
+        std::fs::write(outside.join("kept"), b"kept").expect("outside file is created");
+        for branch in 0..2 {
+            let directory = root.join(format!("branch-{branch}"));
+            std::fs::create_dir_all(&directory).expect("branch directory is created");
+            for index in 0..300 {
+                std::fs::write(directory.join(format!("item-{index:03}")), b"content")
+                    .expect("branch file is created");
+            }
+        }
+        std::os::unix::fs::symlink(outside.join("kept"), root.join("link"))
+            .expect("symlink is created");
+
+        let result = run(vec![root.clone()], None);
+
+        assert!(result.is_ok(), "rmrf failed: {result:?}");
+        assert!(!root.exists(), "rmrf kept the selected directory");
+        assert!(outside.join("kept").is_file(), "symlink target was removed");
+        std::fs::remove_dir_all(&base).expect("test cleanup removes the scratch tree");
+    }
+
+    #[test]
     fn removes_files_symlinks_and_missing_paths() {
         let base = scratch_path("mixed");
         std::fs::create_dir_all(&base).expect("scratch base is created");

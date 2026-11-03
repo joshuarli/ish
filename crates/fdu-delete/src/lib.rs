@@ -269,6 +269,7 @@ mod posix {
     use std::time::Instant;
 
     const DELETE_THREADS: usize = 16;
+    const DELETE_BATCH_SIZE: usize = 256;
 
     
     
@@ -282,6 +283,7 @@ mod posix {
         parent: NodeId,
         children: Vec<NodeId>,
         next_child: usize,
+        ancestry: Arc<[quarantine::Ancestor]>,
     }
 
     struct Deletion<'a> {
@@ -480,6 +482,8 @@ mod posix {
                 return;
             }
         };
+        let ancestry = directory_ancestry(deletion.tree, parent);
+        let mut batch = Vec::new();
         for node in selected {
             if deletion.stopped() {
                 return;
@@ -489,11 +493,26 @@ mod posix {
                 .record(node)
                 .is_some_and(|record| record.entry_type == EntryType::Directory);
             if is_directory {
+                if !batch.is_empty() {
+                    delete_files_batch(deletion, context.fd.as_fd(), &ancestry, &mut batch);
+                    if deletion.stopped() {
+                        return;
+                    }
+                }
                 let context = Arc::clone(&context);
                 scope.spawn(move |_| delete_directory(deletion, context, node));
             } else {
-                delete_file(deletion, context.fd.as_fd(), node);
+                batch.push(node);
+                if batch.len() >= DELETE_BATCH_SIZE {
+                    delete_files_batch(deletion, context.fd.as_fd(), &ancestry, &mut batch);
+                    if deletion.stopped() {
+                        return;
+                    }
+                }
             }
+        }
+        if !batch.is_empty() {
+            delete_files_batch(deletion, context.fd.as_fd(), &ancestry, &mut batch);
         }
     }
 
@@ -570,7 +589,8 @@ mod posix {
                 return;
             }
         };
-        let mut stack = vec![directory_walk_frame(deletion.tree, node, parent.node)];
+        let mut stack = vec![directory_walk_frame(deletion.tree, node, parent.node, directory_ancestry(deletion.tree, node))];
+        let mut batch: Vec<NodeId> = Vec::new();
 
         loop {
             if deletion.stopped() {
@@ -585,11 +605,20 @@ mod posix {
             };
             if let Some(child) = child {
                 if deletion.tree.record(child).expect("indexed child").entry_type == EntryType::Directory {
+                    if !batch.is_empty() {
+                        let ancestry = Arc::clone(&stack.last().expect("directory frame exists").ancestry);
+                        delete_files_batch(deletion, current.as_fd(), &ancestry, &mut batch);
+                        if deletion.stopped() {
+                            return;
+                        }
+                    }
                     match open_checked(deletion, current.as_fd(), child) {
                         Ok(directory) => {
-                            let parent_node = stack.last().expect("parent directory frame exists").node;
+                            let frame = stack.last().expect("parent directory frame exists");
+                            let parent_node = frame.node;
+                            let ancestry = child_ancestry(deletion.tree, &frame.ancestry, child);
                             current = directory;
-                            stack.push(directory_walk_frame(deletion.tree, child, parent_node));
+                            stack.push(directory_walk_frame(deletion.tree, child, parent_node, ancestry));
                         }
                         Err((kind, message)) => {
                             deletion.record(child, kind, Some(message.clone()));
@@ -598,9 +627,24 @@ mod posix {
                         }
                     }
                 } else {
-                    delete_file(deletion, current.as_fd(), child);
+                    batch.push(child);
+                    if batch.len() >= DELETE_BATCH_SIZE {
+                        let ancestry = Arc::clone(&stack.last().expect("directory frame exists").ancestry);
+                        delete_files_batch(deletion, current.as_fd(), &ancestry, &mut batch);
+                        if deletion.stopped() {
+                            return;
+                        }
+                    }
                 }
                 continue;
+            }
+
+            if !batch.is_empty() {
+                let ancestry = Arc::clone(&stack.last().expect("directory frame exists").ancestry);
+                delete_files_batch(deletion, current.as_fd(), &ancestry, &mut batch);
+                if deletion.stopped() {
+                    return;
+                }
             }
 
             let frame = stack.last().expect("directory frame exists");
@@ -628,13 +672,77 @@ mod posix {
         }
     }
 
-    fn directory_walk_frame(tree: &Tree, node: NodeId, parent: NodeId) -> DirectoryWalkFrame {
+    fn delete_files_batch(
+        deletion: &Deletion<'_>,
+        parent_fd: BorrowedFd<'_>,
+        ancestry: &Arc<[quarantine::Ancestor]>,
+        batch: &mut Vec<NodeId>,
+    ) {
+        let mut nodes = Vec::with_capacity(batch.len());
+        let mut requests = Vec::with_capacity(batch.len());
+        for node in batch.drain(..) {
+            let record = deletion.tree.record(node).expect("indexed deletion target");
+            let name = deletion.tree.name(node).expect("indexed entry has name");
+            match quarantine::Retirement::with_parents(Arc::clone(ancestry), std::ffi::OsString::from(std::ffi::OsStr::from_bytes(name)), fdu_posix::identity::EntryIdentity { file: record.identity, kind: record.entry_type }) {
+                Ok(request) => {
+                    nodes.push(node);
+                    requests.push(request);
+                }
+                Err(error) => deletion.record(node, OutcomeKind::Failed, Some(error.to_string())),
+            }
+        }
+        if requests.is_empty() { return; }
+        let results = deletion.quarantine.remove_batch(parent_fd, requests, |boundary| {
+            if matches!(boundary, quarantine::Boundary::BeforeCapture | quarantine::Boundary::BeforeUnlink) && deletion.stopped() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "deletion cancelled"));
+            }
+            Ok(())
+        });
+        let mut results = results.into_iter();
+        for node in nodes {
+            let result = results.next().unwrap_or_else(|| Err(quarantine::RemovalError { removed: false, error: io::Error::other("batch deletion result missing") }));
+            if matches!(&result, Err(error) if error.error.kind() == io::ErrorKind::Interrupted) {
+                deletion.record(node, OutcomeKind::Cancelled, None);
+            } else {
+                let (kind, message) = removal_outcome(result);
+                deletion.record(node, kind, message);
+            }
+        }
+    }
+
+    fn directory_ancestry(tree: &Tree, node: NodeId) -> Arc<[quarantine::Ancestor]> {
+        let mut ancestry = Vec::new();
+        let mut current = Some(node);
+        while let Some(next) = current {
+            if next == tree.root() { break; }
+            let record = tree.record(next).expect("indexed ancestor");
+            ancestry.push(quarantine::Ancestor {
+                name: std::ffi::OsString::from(std::ffi::OsStr::from_bytes(tree.name(next).expect("indexed ancestor name"))),
+                identity: record.identity,
+            });
+            current = record.parent();
+        }
+        ancestry.reverse();
+        Arc::from(ancestry)
+    }
+
+    fn child_ancestry(tree: &Tree, parent: &Arc<[quarantine::Ancestor]>, node: NodeId) -> Arc<[quarantine::Ancestor]> {
+        let mut ancestry = Vec::from(&**parent);
+        let record = tree.record(node).expect("indexed child directory");
+        ancestry.push(quarantine::Ancestor {
+            name: std::ffi::OsString::from(std::ffi::OsStr::from_bytes(tree.name(node).expect("indexed child name"))),
+            identity: record.identity,
+        });
+        Arc::from(ancestry)
+    }
+
+    fn directory_walk_frame(tree: &Tree, node: NodeId, parent: NodeId, ancestry: Arc<[quarantine::Ancestor]>) -> DirectoryWalkFrame {
         let mut children: Vec<_> = tree.children(node).collect();
         children.sort_unstable_by_key(|child| {
             let record = tree.record(*child).expect("indexed child");
             (record.entry_type == EntryType::Directory, record.identity.inode)
         });
-        DirectoryWalkFrame { node, parent, children, next_child: 0 }
+        DirectoryWalkFrame { node, parent, children, next_child: 0, ancestry }
     }
 
     fn open_parent_checked(
@@ -670,28 +778,6 @@ mod posix {
                     node,
                     OutcomeKind::Changed,
                     Some("entry changed immediately before removal".to_owned()),
-                );
-            }
-            Err(error) => return deletion.record(node, OutcomeKind::Failed, Some(error.to_string())),
-        }
-        capture_and_remove(deletion, parent_fd, name, node);
-    }
-
-    fn delete_file(deletion: &Deletion<'_>, parent_fd: BorrowedFd<'_>, node: NodeId) {
-        let record = deletion.tree.record(node).expect("deletion target exists");
-        let name = deletion.tree.name(node).expect("indexed entry has name");
-        let current = match stat_at(parent_fd, name) {
-            Ok(stat) => stat,
-            Err(Errno::NOENT) => return deletion.record(node, OutcomeKind::AlreadyAbsent, None),
-            Err(error) => return deletion.record(node, OutcomeKind::Failed, Some(io::Error::from(error).to_string())),
-        };
-        match identity(&current) {
-            Ok(found) if found == record.identity && entry_type(&current) == record.entry_type => {}
-            Ok(_) => {
-                return deletion.record(
-                    node,
-                    OutcomeKind::Changed,
-                    Some("entry was replaced since scanning".to_owned()),
                 );
             }
             Err(error) => return deletion.record(node, OutcomeKind::Failed, Some(error.to_string())),

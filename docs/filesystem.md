@@ -267,7 +267,10 @@ Normal error and partial-completion diagnostics identify retained staging and
 captured source paths. `cp`, `mv`, and `rmrf` use versioned
 `.fdu-quarantine-v2-*` session directories. A session has a nonblocking root lock,
 a private mode-0700 directory, and a name with 128 bits of OS randomness.
-A competing operation on the same root fails instead of waiting.
+A competing operation on the same root fails instead of waiting. `rmrf`
+publishes intent records and synchronizes namespace changes for entries that
+share a directory as a group; each entry keeps its own intent record, and
+recovery treats each record independently.
 
 Before planning a new operation, ish checks sessions in participating parents
 and roots. Recovery validates ownership, records, ancestry, mount identity, and

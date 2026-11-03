@@ -51,6 +51,66 @@ fn crash_child() {
     panic!("crash boundary was not reached");
 }
 
+#[test]
+#[ignore = "subprocess fixture for journal interruption"]
+fn crash_batch_child() {
+    let Some(root) = std::env::var_os("ISH32_CRASH_ROOT") else { return; };
+    let boundary = std::env::var("ISH32_CRASH_BOUNDARY").unwrap();
+    let root = PathBuf::from(root);
+    let fd = fs::File::open(&root).unwrap();
+    let session = Session::start(fd.as_fd()).unwrap();
+    let requests = ["source-a", "source-b", "source-c"]
+        .into_iter()
+        .map(|name| Retirement::new(Vec::new(), name.into(), expected(&root.join(name))).unwrap())
+        .collect();
+    let results = session.remove_batch(fd.as_fd(), requests, |point| {
+        if format!("{point:?}") == boundary {
+            println!("ready");
+            std::io::stdout().flush().unwrap();
+            loop { std::thread::park(); }
+        }
+        Ok(())
+    });
+    drop(results);
+    panic!("crash boundary was not reached");
+}
+
+#[test]
+fn killed_batch_restores_every_unlinked_capture() {
+    for boundary in [Boundary::IntentPublished, Boundary::BeforeCapture, Boundary::BeforeUnlink] {
+        let fixture = Fixture::new();
+        for name in ["source-a", "source-b", "source-c"] {
+            fs::write(fixture.0.join(name), name.as_bytes()).unwrap();
+        }
+        fs::write(fixture.0.join("untouched"), b"kept").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_batch_child", "--ignored", "--nocapture"])
+            .env("ISH32_CRASH_ROOT", &fixture.0)
+            .env("ISH32_CRASH_BOUNDARY", format!("{boundary:?}"))
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            assert_ne!(output.read_line(&mut line).unwrap(), 0, "child ended before {boundary:?}");
+            if line.trim() == "ready" { break; }
+            line.clear();
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        let root = fixture.root();
+        let result = Session::check_recovery(root.as_fd());
+        assert!(result.unwrap_err().to_string().contains("interrupted deletion recovered"), "{boundary:?}");
+        for name in ["source-a", "source-b", "source-c"] {
+            assert_eq!(fs::read(fixture.0.join(name)).unwrap(), name.as_bytes(), "{boundary:?}");
+        }
+        assert_eq!(fs::read(fixture.0.join("untouched")).unwrap(), b"kept");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 4);
+        Session::check_recovery(root.as_fd()).unwrap();
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn killed_retirement_under_restrictive_umask_recovers_records() {
