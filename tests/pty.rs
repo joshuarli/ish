@@ -878,8 +878,8 @@ fn native_fs_redirections_prevent_failed_transfers_and_capture_stderr() {
     sh.run_command("cp missing never-created 2> copy-error");
     let error = std::fs::read_to_string(sh.home_path().join("copy-error")).unwrap();
     assert!(
-        error.contains("No such file or directory"),
-        "stderr redirection did not capture the diagnostic: {error:?}"
+        error.contains("ish: cp: missing: No such file or directory"),
+        "stderr redirection did not capture the diagnostic with the missing path: {error:?}"
     );
     assert!(!sh.home_path().join("never-created").exists());
     assert_native_fs_status(&sh, 1);

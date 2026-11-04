@@ -50,6 +50,30 @@ fn copy_always_transfers_even_same_size_same_mtime() {
 }
 
 #[test]
+fn diagnostics_name_the_missing_operand_instead_of_the_working_directory() {
+    let fixture = Fixture::new();
+    let diagnostics = std::sync::Mutex::new(Vec::new());
+    let run = |request: &Request| {
+        diagnostics.lock().unwrap().clear();
+        let status = execute(request, &Cancellation::default(), &|event: Event| -> io::Result<()> {
+            if let Event::Diagnostic(diagnostic) = event { diagnostics.lock().unwrap().push(diagnostic); }
+            Ok(())
+        }).status();
+        let paths = diagnostics.lock().unwrap().iter().map(|diagnostic| diagnostic.path.clone()).collect::<Vec<_>>();
+        (status, paths)
+    };
+
+    let (status, paths) = run(&fixture.request("missing", "destination"));
+    assert_eq!(status, 1);
+    assert_eq!(paths, vec![PathBuf::from("missing")]);
+
+    fs::write(fixture.0.join("source"), b"bytes").unwrap();
+    let (status, paths) = run(&fixture.request("source", "missing/destination"));
+    assert_eq!(status, 1);
+    assert_eq!(paths, vec![PathBuf::from("missing/destination")]);
+}
+
+#[test]
 fn byte_paths_symlinks_and_hardlinks_are_preserved() {
     let fixture = Fixture::new();
     fs::create_dir(fixture.0.join("source")).unwrap();

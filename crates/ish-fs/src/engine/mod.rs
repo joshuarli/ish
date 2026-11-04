@@ -8,14 +8,14 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 #[cfg(target_os = "linux")]
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Condvar};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rustix::fd::{AsFd, BorrowedFd};
 use rustix::fs::{self, Mode, OFlags};
 
-use crate::policy::{self, Action, PlannedOperand};
+use crate::policy::{self, Action, PathError, PlannedOperand};
 use crate::roots::{self, EntryKind, Observation, Requirement, Root};
 use crate::{CancelReason, Cancellation, Completion, Diagnostic, Event, EventSink, MAX_DESCRIPTORS, MIN_DESCRIPTORS, OperandOutcome, OperandState, Operation, Outcome, Progress, RESERVED_DESCRIPTORS, Request};
 use records::{Record, IndexedRecords, Records};
@@ -222,19 +222,19 @@ pub fn execute(request: &Request, cancellation: &Cancellation, sink: &dyn EventS
     let mut completion = Completion::Complete;
     let cwd = match fs::open(&request.context.cwd, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()) {
         Ok(cwd) => cwd,
-        Err(error) => return early_error(request, cancellation, sink, error.into()),
+        Err(error) => return early_error(cancellation, sink, &request.context.cwd, error.into()),
     };
     let jobs = match resource_jobs(request) {
         Ok(jobs) => jobs,
-        Err(error) => return early_error(request, cancellation, sink, error),
+        Err(error) => return early_error(cancellation, sink, &request.context.cwd, error),
     };
     if !request.options.dry_run
-        && let Err(error) = check_recovery_roots(request, cwd.as_fd()) { return early_error(request, cancellation, sink, error); }
+        && let Err(error) = check_recovery_roots(request, cwd.as_fd()) { return early_error(cancellation, sink, &error.path, error.error); }
     let plan = match policy::preflight(request, cwd.as_fd()) {
         Ok(plan) => plan,
-        Err(error) => return early_error(request, cancellation, sink, error),
+        Err(error) => return early_error(cancellation, sink, &error.path, error.error),
     };
-    if let Err(error) = validate_hardlink_devices(&plan.operands) { return early_error(request, cancellation, sink, error); }
+    if let Err(error) = validate_hardlink_devices(&plan.operands) { return early_error(cancellation, sink, &error.path, error.error); }
     let mut hardlink_members = std::collections::HashMap::new();
     for operand in &plan.operands {
         if !matches!(operand.action, Action::Skip | Action::SameEntry)
@@ -343,21 +343,25 @@ pub fn execute(request: &Request, cancellation: &Cancellation, sink: &dyn EventS
     Outcome { progress: *invocation.progress.lock().unwrap(), completion, metrics: *invocation.metrics.lock().unwrap() }
 }
 
-fn check_recovery_roots(request: &Request, cwd: BorrowedFd<'_>) -> io::Result<()> {
-    let check = |path: &std::path::Path| -> io::Result<()> {
-        let root = Root::establish(cwd, path, Requirement::MayBeAbsent)?;
-        fdu_posix::quarantine::Session::check_recovery(root.parent.as_fd()).map_err(|error| io::Error::new(error.kind(), format!("recovery root {:?}: {error}", path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new(".")))))?;
+fn check_recovery_roots(request: &Request, cwd: BorrowedFd<'_>) -> Result<(), PathError> {
+    let check = |path: &Path| -> Result<(), PathError> {
+        let root = Root::establish(cwd, path, Requirement::MayBeAbsent)
+            .map_err(|error| PathError::new(path, error))?;
+        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        fdu_posix::quarantine::Session::check_recovery(root.parent.as_fd())
+            .map_err(|error| PathError::new(parent, io::Error::new(error.kind(), error.to_string())))?;
         if root.observed.is_some_and(|entry| entry.identity.kind == EntryKind::Directory) {
-            let directory = root.open_directory()?;
-            fdu_posix::quarantine::Session::check_recovery(directory.as_fd()).map_err(|error| io::Error::new(error.kind(), format!("recovery root {path:?}: {error}")))?;
+            let directory = root.open_directory().map_err(|error| PathError::new(path, error))?;
+            fdu_posix::quarantine::Session::check_recovery(directory.as_fd())
+                .map_err(|error| PathError::new(path, io::Error::new(error.kind(), error.to_string())))?;
         }
         Ok(())
     };
     match &request.operands {
         crate::Operands::Exact { source, destination } => { check(source)?; check(destination) },
         crate::Operands::Into { directory, first, rest } => {
-            policy::into_basename(first)?;
-            for source in rest { policy::into_basename(source)?; }
+            policy::into_basename(first).map_err(|error| PathError::new(first, error))?;
+            for source in rest { policy::into_basename(source).map_err(|error| PathError::new(source, error))?; }
             check(directory)?;
             check(first)?;
             for source in rest { check(source)?; }
@@ -366,9 +370,9 @@ fn check_recovery_roots(request: &Request, cwd: BorrowedFd<'_>) -> io::Result<()
     }
 }
 
-fn early_error(request: &Request, cancellation: &Cancellation, sink: &dyn EventSink, error: io::Error) -> Outcome {
+fn early_error(cancellation: &Cancellation, sink: &dyn EventSink, path: &Path, error: io::Error) -> Outcome {
     let mut completion = if error.kind() == io::ErrorKind::InvalidInput { Completion::InvalidRequest } else { Completion::Failed };
-    if sink.emit(Event::Diagnostic(Diagnostic { path: request.context.cwd.clone(), message: error.to_string() })).is_err() { cancellation.cancel_for_output(); }
+    if sink.emit(Event::Diagnostic(Diagnostic { path: path.to_path_buf(), message: error.to_string() })).is_err() { cancellation.cancel_for_output(); }
     if cancellation.reason() == Some(CancelReason::User) { completion = Completion::Cancelled; }
     Outcome { progress: Progress::default(), completion, metrics: crate::Metrics::default() }
 }
@@ -614,20 +618,20 @@ impl Drop for Span<'_, '_> {
     }
 }
 
-fn validate_hardlink_devices(operands: &[PlannedOperand]) -> io::Result<()> {
+fn validate_hardlink_devices(operands: &[PlannedOperand]) -> Result<(), PathError> {
     let mut known = std::collections::HashMap::new();
     for (index, operand) in operands.iter().enumerate() {
         if matches!(operand.action, Action::Skip | Action::SameEntry) || !matches!(operand.source_observed.identity.kind, EntryKind::RegularFile | EntryKind::Symlink) || operand.source_observed.links < 2 { continue; }
         let identity = operand.source_observed.identity;
         let device = operand.destination_parent.device;
         if let Some(previous) = known.get(&identity) {
-            if *previous != device { return Err(io::Error::new(io::ErrorKind::Unsupported, "hardlink group cannot span destination filesystems")); }
+            if *previous != device { return Err(PathError::new(&operand.source, io::Error::new(io::ErrorKind::Unsupported, "hardlink group cannot span destination filesystems"))); }
         } else if known.len() < 4096 {
             known.insert(identity, device);
         } else {
             for previous in &operands[..index] {
                 if !matches!(previous.action, Action::Skip | Action::SameEntry) && previous.source_observed.identity == identity && previous.destination_parent.device != device {
-                    return Err(io::Error::new(io::ErrorKind::Unsupported, "hardlink group cannot span destination filesystems"));
+                    return Err(PathError::new(&operand.source, io::Error::new(io::ErrorKind::Unsupported, "hardlink group cannot span destination filesystems")));
                 }
             }
         }

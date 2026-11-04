@@ -42,6 +42,19 @@ struct EntryKey {
     name: OsString,
 }
 
+pub(crate) struct PathError {
+    pub(crate) path: PathBuf,
+    pub(crate) error: io::Error,
+}
+
+impl PathError {
+    pub(crate) fn new(path: &Path, error: io::Error) -> Self {
+        Self { path: path.to_path_buf(), error }
+    }
+}
+
+type PolicyResult<T> = std::result::Result<T, PathError>;
+
 pub(crate) enum Target {
     Absent,
     SameEntry,
@@ -54,7 +67,7 @@ struct Mapping {
     destination_name: Option<OsString>,
 }
 
-pub(crate) fn preflight(request: &Request, cwd: BorrowedFd<'_>) -> io::Result<Preflight> {
+pub(crate) fn preflight(request: &Request, cwd: BorrowedFd<'_>) -> PolicyResult<Preflight> {
     let (mappings, into_directory) = mappings(request, cwd)?;
     let mut operands = Vec::with_capacity(mappings.len());
     let mut outputs = HashMap::with_capacity(mappings.len());
@@ -63,26 +76,28 @@ pub(crate) fn preflight(request: &Request, cwd: BorrowedFd<'_>) -> io::Result<Pr
     for mapping in mappings {
         let source = mapping.source;
         let destination = mapping.destination;
-        let source_root = Root::establish(cwd, &source, Requirement::Existing)?;
-        let source_observed = source_root.observed.ok_or_else(|| io::Error::other("source disappeared during preflight"))?;
+        let source_root = Root::establish(cwd, &source, Requirement::Existing)
+            .map_err(|error| PathError::new(&source, error))?;
+        let source_observed = source_root.observed.ok_or_else(|| PathError::new(&source, io::Error::other("source disappeared during preflight")))?;
         let destination_root = establish_destination(
             cwd,
             into_directory.as_ref(),
             &destination,
             mapping.destination_name.as_deref(),
             Requirement::MayBeAbsent,
-        )?;
-        let source_parent = source_root.parent_identity()?;
-        let destination_parent = destination_root.parent_identity()?;
+        )
+        .map_err(|error| PathError::new(&destination, error))?;
+        let source_parent = source_root.parent_identity().map_err(|error| PathError::new(&source, error))?;
+        let destination_parent = destination_root.parent_identity().map_err(|error| PathError::new(&destination, error))?;
         let source_key = EntryKey { parent: source_parent, name: source_root.name.clone() };
         let destination_key = EntryKey { parent: destination_parent, name: destination_root.name.clone() };
 
         let index = operands.len();
         if source_entries.insert(source_key.clone(), index).is_some() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "source operand is repeated"));
+            return Err(PathError::new(&source, io::Error::new(io::ErrorKind::InvalidInput, "source operand is repeated")));
         }
         if outputs.insert(destination_key, index).is_some() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "multiple sources map to the same output"));
+            return Err(PathError::new(&destination, io::Error::new(io::ErrorKind::InvalidInput, "multiple sources map to the same output")));
         }
 
         operands.push(PlannedOperand {
@@ -97,27 +112,29 @@ pub(crate) fn preflight(request: &Request, cwd: BorrowedFd<'_>) -> io::Result<Pr
         });
     }
 
-    if source_entries
-        .iter()
-        .any(|(source, source_index)| outputs.get(source).is_some_and(|destination_index| destination_index != source_index))
-    {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "an output conflicts with another source operand"));
+    if let Some(source_index) = source_entries.iter().find_map(|(source, source_index)| {
+        outputs.get(source).is_some_and(|destination_index| destination_index != source_index).then_some(*source_index)
+    }) {
+        return Err(PathError::new(&operands[source_index].source, io::Error::new(io::ErrorKind::InvalidInput, "an output conflicts with another source operand")));
     }
 
     validate_ancestry(cwd, into_directory.as_ref(), &operands)?;
     validate_move_roots(request, cwd, &operands)?;
 
     for operand in &mut operands {
-        let source = reestablish(cwd, &operand.source, Requirement::Existing, operand.source_parent, Some(operand.source_observed))?;
-        let destination = reestablish_destination(cwd, into_directory.as_ref(), operand)?;
-        let target = if source.same_entry(&destination)? {
+        let source = reestablish(cwd, &operand.source, Requirement::Existing, operand.source_parent, Some(operand.source_observed))
+            .map_err(|error| PathError::new(&operand.source, error))?;
+        let destination = reestablish_destination(cwd, into_directory.as_ref(), operand)
+            .map_err(|error| PathError::new(&operand.destination, error))?;
+        let target = if source.same_entry(&destination).map_err(|error| PathError::new(&operand.source, error))? {
             Target::SameEntry
         } else if let Some(observed) = operand.destination_observed {
             Target::Existing(observed)
         } else {
             Target::Absent
         };
-        operand.action = decide(operand.source_observed, target, &request.options)?;
+        operand.action = decide(operand.source_observed, target, &request.options)
+            .map_err(|error| PathError::new(&operand.destination, error))?;
     }
 
     Ok(Preflight { operands, into_directory })
@@ -158,26 +175,30 @@ pub(crate) fn decide(source: Observation, target: Target, options: &Options) -> 
     Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination exists and the selected policy does not permit replacement"))
 }
 
-fn mappings(request: &Request, cwd: BorrowedFd<'_>) -> io::Result<(Vec<Mapping>, Option<OwnedFd>)> {
+fn mappings(request: &Request, cwd: BorrowedFd<'_>) -> PolicyResult<(Vec<Mapping>, Option<OwnedFd>)> {
     match &request.operands {
         Operands::Exact { source, destination } => {
             let mut mappings = Vec::with_capacity(1);
             let mut memory_bytes = 0;
             let destination = exact_destination(request, cwd, source, destination);
-            push_mapping(&mut mappings, &mut memory_bytes, source.clone(), destination, None)?;
+            push_mapping(&mut mappings, &mut memory_bytes, source.clone(), destination, None)
+                .map_err(|error| PathError::new(source, error))?;
             Ok((mappings, None))
         }
         Operands::Into { directory, first, rest } => {
-            let into_root = Root::establish(cwd, directory, Requirement::Existing)?;
-            let into_directory = into_root.open_directory_following_final()?;
+            let into_root = Root::establish(cwd, directory, Requirement::Existing)
+                .map_err(|error| PathError::new(directory, error))?;
+            let into_directory = into_root.open_directory_following_final()
+                .map_err(|error| PathError::new(directory, error))?;
             let sources = std::iter::once(first).chain(rest.iter());
             let mut mappings = Vec::new();
             let mut memory_bytes = 0;
             for source in sources {
-                let name = into_basename(source)?;
+                let name = into_basename(source).map_err(|error| PathError::new(source, error))?;
                 let mut destination = directory.clone();
                 destination.push(name);
-                push_mapping(&mut mappings, &mut memory_bytes, source.clone(), destination, Some(name.to_os_string()))?;
+                push_mapping(&mut mappings, &mut memory_bytes, source.clone(), destination, Some(name.to_os_string()))
+                    .map_err(|error| PathError::new(source, error))?;
             }
             Ok((mappings, Some(into_directory)))
         }
@@ -274,7 +295,7 @@ pub(crate) fn into_basename(source: &Path) -> io::Result<&OsStr> {
     Ok(OsStr::from_bytes(basename))
 }
 
-fn validate_ancestry(cwd: BorrowedFd<'_>, into_directory: Option<&OwnedFd>, operands: &[PlannedOperand]) -> io::Result<()> {
+fn validate_ancestry(cwd: BorrowedFd<'_>, into_directory: Option<&OwnedFd>, operands: &[PlannedOperand]) -> PolicyResult<()> {
     let mut source_directories: HashMap<Identity, Vec<usize>> = HashMap::new();
     let mut destination_directories: HashMap<Identity, Vec<usize>> = HashMap::new();
 
@@ -296,58 +317,63 @@ fn validate_ancestry(cwd: BorrowedFd<'_>, into_directory: Option<&OwnedFd>, oper
         for source_index in source_indices {
             for destination_index in destination_indices {
                 if source_index != destination_index {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "source and destination identify the same directory"));
+                    let path = &operands[*source_index].source;
+                    return Err(PathError::new(path, io::Error::new(io::ErrorKind::InvalidInput, "source and destination identify the same directory")));
                 }
                 let operand = &operands[*source_index];
-                let source = reestablish(cwd, &operand.source, Requirement::Existing, operand.source_parent, Some(operand.source_observed))?;
-                let destination = reestablish_destination(cwd, into_directory, operand)?;
-                if !source.same_entry(&destination)? {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "source and destination identify the same directory"));
+                let source = reestablish(cwd, &operand.source, Requirement::Existing, operand.source_parent, Some(operand.source_observed))
+                    .map_err(|error| PathError::new(&operand.source, error))?;
+                let destination = reestablish_destination(cwd, into_directory, operand)
+                    .map_err(|error| PathError::new(&operand.destination, error))?;
+                if !source.same_entry(&destination).map_err(|error| PathError::new(&operand.source, error))? {
+                    return Err(PathError::new(&operand.source, io::Error::new(io::ErrorKind::InvalidInput, "source and destination identify the same directory")));
                 }
             }
         }
     }
 
     for (index, operand) in operands.iter().enumerate() {
-        let source = reestablish(cwd, &operand.source, Requirement::Existing, operand.source_parent, Some(operand.source_observed))?;
-        let destination = reestablish_destination(cwd, into_directory, operand)?;
-        let source_key = entry_key(&source)?;
-        let destination_key = entry_key(&destination)?;
+        let source = reestablish(cwd, &operand.source, Requirement::Existing, operand.source_parent, Some(operand.source_observed))
+            .map_err(|error| PathError::new(&operand.source, error))?;
+        let destination = reestablish_destination(cwd, into_directory, operand)
+            .map_err(|error| PathError::new(&operand.destination, error))?;
+        let source_key = entry_key(&source).map_err(|error| PathError::new(&operand.source, error))?;
+        let destination_key = entry_key(&destination).map_err(|error| PathError::new(&operand.destination, error))?;
         let same_mapping_entry = source_key == destination_key;
 
         if operand.source_observed.identity.kind == EntryKind::Directory
             && source_directories.get(&operand.source_observed.identity).is_some_and(|indices| indices.len() > 1)
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "source directory operands overlap"));
+            return Err(PathError::new(&operand.source, io::Error::new(io::ErrorKind::InvalidInput, "source directory operands overlap")));
         }
 
         if source.parent_chain_contains(|identity| {
             source_directories.get(&identity).is_some_and(|indices| indices.iter().any(|other| *other != index))
-        })? {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "source operands overlap by directory ancestry"));
+        }).map_err(|error| PathError::new(&operand.source, error))? {
+            return Err(PathError::new(&operand.source, io::Error::new(io::ErrorKind::InvalidInput, "source operands overlap by directory ancestry")));
         }
 
         if source.parent_chain_contains(|identity| {
             destination_directories.get(&identity).is_some_and(|indices| {
                 indices.iter().any(|other| *other != index || !same_mapping_entry)
             })
-        })? {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "source and destination overlap by directory ancestry"));
+        }).map_err(|error| PathError::new(&operand.source, error))? {
+            return Err(PathError::new(&operand.source, io::Error::new(io::ErrorKind::InvalidInput, "source and destination overlap by directory ancestry")));
         }
 
         if !same_mapping_entry
             && operand.source_observed.identity.kind == EntryKind::Directory
             && destination.observed.is_some_and(|observed| observed.identity == operand.source_observed.identity)
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "source and destination identify the same directory"));
+            return Err(PathError::new(&operand.source, io::Error::new(io::ErrorKind::InvalidInput, "source and destination identify the same directory")));
         }
 
         if destination.parent_chain_contains(|identity| {
             source_directories.get(&identity).is_some_and(|indices| {
                 indices.iter().any(|other| *other != index || !same_mapping_entry)
             })
-        })? {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "destination lies within a source directory"));
+        }).map_err(|error| PathError::new(&operand.destination, error))? {
+            return Err(PathError::new(&operand.destination, io::Error::new(io::ErrorKind::InvalidInput, "destination lies within a source directory")));
         }
 
         if let Some(destination) = destination.observed.filter(|observed| observed.identity.kind == EntryKind::Directory)
@@ -355,27 +381,31 @@ fn validate_ancestry(cwd: BorrowedFd<'_>, into_directory: Option<&OwnedFd>, oper
                 .get(&destination.identity)
                 .is_some_and(|indices| indices.iter().any(|other| *other != index))
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "destination directory is mapped more than once"));
+            return Err(PathError::new(&operand.destination, io::Error::new(io::ErrorKind::InvalidInput, "destination directory is mapped more than once")));
         }
     }
 
     for operand in operands {
-        let source = reestablish(cwd, &operand.source, Requirement::Existing, operand.source_parent, Some(operand.source_observed))?;
-        let destination = reestablish_destination(cwd, into_directory, operand)?;
-        let source_key = entry_key(&source)?;
-        let destination_key = entry_key(&destination)?;
+        let source = reestablish(cwd, &operand.source, Requirement::Existing, operand.source_parent, Some(operand.source_observed))
+            .map_err(|error| PathError::new(&operand.source, error))?;
+        let destination = reestablish_destination(cwd, into_directory, operand)
+            .map_err(|error| PathError::new(&operand.destination, error))?;
+        let source_key = entry_key(&source).map_err(|error| PathError::new(&operand.source, error))?;
+        let destination_key = entry_key(&destination).map_err(|error| PathError::new(&operand.destination, error))?;
         if source_key == destination_key {
             continue;
         }
-        if source.is_ancestor_of(&destination)? || destination.is_ancestor_of(&source)? {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "source and destination overlap by directory ancestry"));
+        if source.is_ancestor_of(&destination).map_err(|error| PathError::new(&operand.source, error))?
+            || destination.is_ancestor_of(&source).map_err(|error| PathError::new(&operand.destination, error))?
+        {
+            return Err(PathError::new(&operand.source, io::Error::new(io::ErrorKind::InvalidInput, "source and destination overlap by directory ancestry")));
         }
     }
 
     Ok(())
 }
 
-fn validate_move_roots(request: &Request, cwd: BorrowedFd<'_>, operands: &[PlannedOperand]) -> io::Result<()> {
+fn validate_move_roots(request: &Request, cwd: BorrowedFd<'_>, operands: &[PlannedOperand]) -> PolicyResult<()> {
     if request.operation != Operation::Move {
         return Ok(());
     }
@@ -383,27 +413,39 @@ fn validate_move_roots(request: &Request, cwd: BorrowedFd<'_>, operands: &[Plann
         .context
         .home
         .as_deref()
-        .map(|path| Root::establish(cwd, path, Requirement::Existing)?.open_directory_following_final())
+        .map(|path| {
+            Root::establish(cwd, path, Requirement::Existing)
+                .and_then(|root| root.open_directory_following_final())
+                .map_err(|error| PathError::new(path, error))
+        })
         .transpose()?;
-    let home_identity = home.as_ref().map(|directory| observe_fd(directory.as_fd()).map(|observed| observed.identity)).transpose()?;
+    let home_identity = home
+        .as_ref()
+        .map(|directory| {
+            observe_fd(directory.as_fd())
+                .map(|observed| observed.identity)
+                .map_err(|error| PathError::new(request.context.home.as_deref().unwrap_or_else(|| Path::new(".")), error))
+        })
+        .transpose()?;
     for operand in operands {
         if operand.source_observed.identity.kind != EntryKind::Directory {
             continue;
         }
-        let source = reestablish(cwd, &operand.source, Requirement::Existing, operand.source_parent, Some(operand.source_observed))?;
-        if source.parent_identity()? == operand.destination_parent && source.name == operand.destination_name {
+        let source = reestablish(cwd, &operand.source, Requirement::Existing, operand.source_parent, Some(operand.source_observed))
+            .map_err(|error| PathError::new(&operand.source, error))?;
+        if source.parent_identity().map_err(|error| PathError::new(&operand.source, error))? == operand.destination_parent && source.name == operand.destination_name {
             continue;
         }
-        let parent_identity = source.parent_identity()?;
-        let is_mount_root = source.is_mount_root()?;
-        let protects_cwd = source.is_ancestor_of_fd(cwd)?;
+        let parent_identity = source.parent_identity().map_err(|error| PathError::new(&operand.source, error))?;
+        let is_mount_root = source.is_mount_root().map_err(|error| PathError::new(&operand.source, error))?;
+        let protects_cwd = source.is_ancestor_of_fd(cwd).map_err(|error| PathError::new(&operand.source, error))?;
         let protects_home = home_identity.is_some_and(|identity| identity == operand.source_observed.identity);
         if operand.source_observed.identity == parent_identity
             || is_mount_root
             || protects_cwd
             || protects_home
         {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "move source is a protected filesystem or shell root"));
+            return Err(PathError::new(&operand.source, io::Error::new(io::ErrorKind::PermissionDenied, "move source is a protected filesystem or shell root")));
         }
     }
 
