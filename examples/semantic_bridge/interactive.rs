@@ -2,7 +2,7 @@ use crate::semantic_bridge::protocol::{Family, Request, empty_state, require_byt
 use crate::semantic_bridge::random::Generator;
 use crate::semantic_bridge::{BridgeError, BridgeResult};
 use ish::line::LineBuffer;
-use serde_json::{Value, json};
+use deser_value::{Value, value};
 
 pub(crate) fn generate(index: usize, seed: u64) -> Request {
     let mut random = Generator::new(seed ^ (index as u64).wrapping_mul(0xd6e8feb86659fd93));
@@ -52,13 +52,13 @@ pub(crate) fn generate(index: usize, seed: u64) -> Request {
         match operation {
             "insert_char" => {
                 let text = [b"x".as_slice(), "λ".as_bytes(), "漢".as_bytes()][random.below(3) as usize];
-                operations.push(json!({"op": operation, "text": text}));
+                operations.push(value!({"op": operation, "text": text}));
             }
             "insert_str" => {
                 let text = [b" ".as_slice(), b"tail", " café".as_bytes()][random.below(3) as usize];
-                operations.push(json!({"op": operation, "text": text}));
+                operations.push(value!({"op": operation, "text": text}));
             }
-            _ => operations.push(json!({"op": operation})),
+            _ => operations.push(value!({"op": operation})),
         }
     }
     Request {
@@ -67,7 +67,7 @@ pub(crate) fn generate(index: usize, seed: u64) -> Request {
         source: source.as_bytes().to_vec(),
         state: empty_state(),
         fuel: 128,
-        input: json!({"cursor": cursor, "operations": operations}),
+        input: value!({"cursor": cursor, "operations": operations}),
     }
 }
 
@@ -79,7 +79,7 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
         .ok_or_else(|| BridgeError::new("interactive cursor is not a natural number"))?
         as usize;
     let operations = request.input["operations"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("interactive operations are not an array"))?;
     let mut line = LineBuffer::new();
     line.set_with_cursor(source, cursor);
@@ -131,7 +131,7 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
             _ => return Err(BridgeError::new(format!("unsupported interactive operation {name:?}"))),
         }
     }
-    Ok(json!({
+    Ok(value!({
         "tag": "success",
         "value": {"text": line.text().as_bytes(), "cursor": line.cursor()},
     }))
@@ -143,21 +143,21 @@ pub(crate) fn negative_control(outcome: &Value) -> BridgeResult<Value> {
         return Err(BridgeError::new("interactive negative control needs success"));
     }
     let text = altered["value"]["text"]
-        .as_array_mut()
+        .as_seq_mut()
         .ok_or_else(|| BridgeError::new("interactive result text is malformed"))?;
-    text.push(json!(0));
+    text.push(value!(0));
     Ok(altered)
 }
 
 pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
     let operations = request.input["operations"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("interactive operations are not an array"))?;
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for length in [operations.len() / 2, operations.len().saturating_sub(1), 0] {
         let mut candidate = request.clone();
-        candidate.input["operations"] = Value::Array(operations[..length].to_vec());
+        candidate.input["operations"] = Value::from(operations[..length].to_vec());
         if seen.insert(candidate.input.clone()) {
             candidates.push(candidate);
         }
@@ -165,7 +165,7 @@ pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
     if !request.source.is_empty() {
         let mut candidate = request.clone();
         candidate.source.clear();
-        candidate.input["cursor"] = json!(0);
+        candidate.input["cursor"] = value!(0);
         if seen.insert(candidate.input.clone()) {
             candidates.push(candidate);
         }
@@ -177,7 +177,7 @@ pub(crate) fn validate_case(request: &Request) -> BridgeResult<()> {
     if request.source.len() > 256 {
         return Err(BridgeError::new("generated interactive source exceeds 256 bytes"));
     }
-    if request.input["operations"].as_array().is_none_or(|operations| operations.len() > 64) {
+    if request.input["operations"].as_seq().is_none_or(|operations| operations.len() > 64) {
         return Err(BridgeError::new("generated interactive operation count exceeds 64"));
     }
     Ok(())

@@ -4,7 +4,7 @@ use crate::semantic_bridge::{BridgeError, BridgeResult};
 use epsh::error::ExitStatus;
 use epsh::shell_bytes::ShellBytes;
 use epsh::var::Variables;
-use serde_json::{Value, json};
+use deser_value::{Value, value};
 use std::collections::BTreeSet;
 
 #[derive(Clone)]
@@ -23,20 +23,20 @@ enum Expr {
 impl Expr {
     fn tree(&self) -> Value {
         match self {
-            Self::Lit(value) => json!(["lit", value]),
-            Self::Var(name) => json!(["var", name]),
-            Self::Unary(operator, value) => json!(["unary", operator, value.tree()]),
+            Self::Lit(value) => value!(["lit", *value]),
+            Self::Var(name) => value!(["var", name.clone()]),
+            Self::Unary(operator, value) => value!(["unary", *operator, value.tree()]),
             Self::Binary(operator, left, right) => {
-                json!(["binary", operator, left.tree(), right.tree()])
+                value!(["binary", *operator, left.tree(), right.tree()])
             }
-            Self::Assign(name, value) => json!(["assign", name, value.tree()]),
+            Self::Assign(name, value) => value!(["assign", name.clone(), value.tree()]),
             Self::Compound(operator, name, value) => {
-                json!(["compound", operator, name, value.tree()])
+                value!(["compound", *operator, name.clone(), value.tree()])
             }
-            Self::And(left, right) => json!(["and", left.tree(), right.tree()]),
-            Self::Or(left, right) => json!(["or", left.tree(), right.tree()]),
+            Self::And(left, right) => value!(["and", left.tree(), right.tree()]),
+            Self::Or(left, right) => value!(["or", left.tree(), right.tree()]),
             Self::If(condition, yes, no) => {
-                json!(["if", condition.tree(), yes.tree(), no.tree()])
+                value!(["if", condition.tree(), yes.tree(), no.tree()])
             }
         }
     }
@@ -130,15 +130,15 @@ pub(crate) fn generate(index: usize, seed: u64) -> Request {
         generated_expr(&mut random, 5)
     };
     let source = expr.source();
-    let input = json!({"tree": expr.tree()});
+    let input = value!({"tree": expr.tree()});
     let variables = vec![
         ("v0", b"7".to_vec()),
         ("v1", if index.is_multiple_of(7) { vec![255] } else { b"-3".to_vec() }),
         ("v2", if index.is_multiple_of(11) { b"not-an-int".to_vec() } else { b"9223372036854775808".to_vec() }),
         ("min", i64::MIN.to_string().into_bytes()),
     ];
-    let state = json!({
-        "variables": variables,
+    let state = value!({
+        "variables": super::pairs(variables),
         "exported": [["v0", [55]], ["v1", [45, 51]]],
         "inherited": [],
         "cwd": [47],
@@ -190,12 +190,12 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
     let source = std::str::from_utf8(&request.source)
         .map_err(|_| BridgeError::new("arithmetic source is not UTF-8"))?;
     let initial = request.state["variables"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("arithmetic state variables are malformed"))?;
     let mut variables = Variables::new_clean();
     let mut names = BTreeSet::new();
     for binding in initial {
-        if binding.as_array().is_none_or(|pair| pair.len() != 2) {
+        if binding.as_seq().is_none_or(|pair| pair.len() != 2) {
             return Err(BridgeError::new("arithmetic binding is not a pair"));
         }
         let name = binding[0]
@@ -215,14 +215,14 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
     let result = epsh::arith::eval_arith(source, &mut variables, ExitStatus::SUCCESS, 1);
     let bindings = bindings_for(&variables, names.iter().cloned());
     match result {
-        Ok(value) => Ok(json!({
+        Ok(value) => Ok(value!({
             "tag": "success",
             "value": {"value": value, "variables": bindings},
         })),
         Err(message) => {
             let kind = arithmetic_error_code(&message, source);
             let state = update_arithmetic_state(&request.state, &variables, &touched)?;
-            Ok(json!({
+            Ok(value!({
                 "tag": "semantic_error",
                 "error": {"kind": "arithmetic", "message": kind},
                 "state": state,
@@ -234,15 +234,15 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
 
 fn collect_writes(tree: &Value, names: &mut BTreeSet<String>) -> BridgeResult<()> {
     let list = tree
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("arithmetic tree is malformed"))?;
-    let tag = list.first().and_then(Value::as_str).unwrap_or("");
+    let tag = list.first().and_then(|value| value.as_str()).unwrap_or("");
     match tag {
         "assign" | "compound" => {
             let name_index = if tag == "assign" { 1 } else { 2 };
             let name = list
                 .get(name_index)
-                .and_then(Value::as_str)
+                .and_then(|value| value.as_str())
                 .ok_or_else(|| BridgeError::new("arithmetic write has no name"))?;
             names.insert(name.to_string());
             let rhs = list
@@ -280,12 +280,12 @@ fn bindings_for(variables: &Variables, names: impl IntoIterator<Item = String>) 
         })
         .collect();
     bindings.sort_by(|left, right| left.0.cmp(&right.0));
-    json!(bindings)
+    super::pairs(bindings)
 }
 
 fn update_arithmetic_state(state: &Value, variables: &Variables, touched: &[String]) -> BridgeResult<Value> {
     let existing: Vec<String> = state["variables"]
-        .as_array()
+        .as_seq()
         .into_iter()
         .flatten()
         .filter_map(|pair| pair[0].as_str().map(ToOwned::to_owned))
@@ -295,7 +295,7 @@ fn update_arithmetic_state(state: &Value, variables: &Variables, touched: &[Stri
     updated["variables"] = bindings_for(variables, names.iter().cloned());
     let mut exported = Vec::new();
     for pair in state["exported"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("arithmetic exported state is malformed"))?
     {
         let name = pair[0]
@@ -309,7 +309,7 @@ fn update_arithmetic_state(state: &Value, variables: &Variables, touched: &[Stri
         exported.push((name.to_string(), value));
     }
     exported.sort_by(|left, right| left.0.cmp(&right.0));
-    updated["exported"] = json!(exported);
+    updated["exported"] = super::pairs(exported);
     Ok(updated)
 }
 
@@ -334,9 +334,9 @@ pub(crate) fn negative_control(outcome: &Value) -> BridgeResult<Value> {
             let value = altered["value"]["value"]
                 .as_i64()
                 .ok_or_else(|| BridgeError::new("arithmetic outcome has no value"))?;
-            altered["value"]["value"] = json!(value.wrapping_add(1));
+            altered["value"]["value"] = value!(value.wrapping_add(1));
         }
-        Some("semantic_error") => altered["error"]["kind"] = json!("environment"),
+        Some("semantic_error") => altered["error"]["kind"] = value!("environment"),
         _ => return Err(BridgeError::new("arithmetic negative control needs a result")),
     }
     Ok(altered)
@@ -364,13 +364,13 @@ pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
 }
 
 fn reduced_trees(tree: &Value, candidates: &mut Vec<Value>) {
-    let Some(items) = tree.as_array() else {
+    let Some(items) = tree.as_seq() else {
         return;
     };
-    let tag = items.first().and_then(Value::as_str).unwrap_or("");
+    let tag = items.first().and_then(|value| value.as_str()).unwrap_or("");
     if !matches!(tag, "lit" | "var") {
-        candidates.push(json!(["lit", 0]));
-        candidates.push(json!(["lit", 1]));
+        candidates.push(value!(["lit", 0]));
+        candidates.push(value!(["lit", 1]));
     }
     let child_indices: &[usize] = match tag {
         "unary" => &[2],
@@ -390,18 +390,18 @@ fn reduced_trees(tree: &Value, candidates: &mut Vec<Value>) {
         for replacement in child_reductions {
             let mut reduced = items.clone();
             reduced[*index] = replacement;
-            candidates.push(Value::Array(reduced));
+            candidates.push(Value::from(reduced));
         }
     }
 }
 
 fn tree_source(tree: &Value) -> BridgeResult<String> {
     let items = tree
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("arithmetic tree is not an array"))?;
     let tag = items
         .first()
-        .and_then(Value::as_str)
+        .and_then(|value| value.as_str())
         .ok_or_else(|| BridgeError::new("arithmetic tree has no tag"))?;
     let child = |index: usize| -> BridgeResult<String> {
         tree_source(
@@ -459,8 +459,8 @@ fn tree_source(tree: &Value) -> BridgeResult<String> {
 }
 
 fn source_tree_depth(tree: &Value) -> usize {
-    tree.as_array()
-        .map(|items| 1 + items.iter().filter(|value| value.is_array()).map(source_tree_depth).max().unwrap_or(0))
+    tree.as_seq()
+        .map(|items| 1 + items.iter().filter(|value| value.is_seq()).map(source_tree_depth).max().unwrap_or(0))
         .unwrap_or(0)
 }
 

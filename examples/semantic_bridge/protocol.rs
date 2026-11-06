@@ -1,5 +1,5 @@
 use crate::semantic_bridge::{BridgeError, BridgeResult};
-use serde_json::{Value, json};
+use deser_value::{Kind, Value, value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Family {
@@ -57,14 +57,14 @@ pub(crate) struct Request {
 
 impl Request {
     pub(crate) fn to_json(&self) -> Value {
-        json!({
+        value!({
             "version": 1,
-            "id": self.id,
+            "id": self.id.clone(),
             "family": self.family.name(),
-            "source": self.source,
-            "state": self.state,
+            "source": self.source.clone(),
+            "state": self.state.clone(),
             "fuel": self.fuel,
-            "input": self.input,
+            "input": self.input.clone(),
         })
     }
 
@@ -92,7 +92,7 @@ impl Request {
         let fuel = value["fuel"]
             .as_u64()
             .ok_or_else(|| BridgeError::new("request fuel is not a natural number"))?;
-        if !value["input"].is_object() {
+        if !value["input"].is_map() {
             return Err(BridgeError::new("request input is not an object"));
         }
         Ok(Self {
@@ -107,7 +107,7 @@ impl Request {
 }
 
 pub(crate) fn empty_state() -> Value {
-    json!({
+    value!({
         "variables": [],
         "exported": [],
         "inherited": [],
@@ -119,7 +119,7 @@ pub(crate) fn empty_state() -> Value {
 
 pub(crate) fn exact_object(value: &Value, fields: &[&str], context: &str) -> BridgeResult<()> {
     let object = value
-        .as_object()
+        .as_map()
         .ok_or_else(|| BridgeError::new(format!("{context} is not an object")))?;
     if object.len() != fields.len() || fields.iter().any(|field| !object.contains_key(*field)) {
         return Err(BridgeError::new(format!("{context} has incorrect fields")));
@@ -129,7 +129,7 @@ pub(crate) fn exact_object(value: &Value, fields: &[&str], context: &str) -> Bri
 
 pub(crate) fn require_bytes(value: &Value, context: &str) -> BridgeResult<Vec<u8>> {
     let array = value
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new(format!("{context} is not a byte array")))?;
     array
         .iter()
@@ -164,7 +164,7 @@ pub(crate) fn validate_response(value: Value, expected_id: &str) -> BridgeResult
         }
         "unsupported_domain" => {
             exact_object(outcome, &["tag", "reason"], "unsupported-domain outcome")?;
-            if !outcome["reason"].is_string() {
+            if !outcome["reason"].is_str() {
                 return Err(BridgeError::new("unsupported-domain reason is not text"));
             }
         }
@@ -173,7 +173,7 @@ pub(crate) fn validate_response(value: Value, expected_id: &str) -> BridgeResult
     }
     let mut normalized = outcome.clone();
     if normalized["tag"] == "semantic_error"
-        && let Some(error) = normalized["error"].as_object_mut()
+        && let Some(error) = normalized["error"].as_map_mut()
     {
         error.remove("message");
     }
@@ -182,13 +182,13 @@ pub(crate) fn validate_response(value: Value, expected_id: &str) -> BridgeResult
 }
 
 fn normalize_maps(value: &mut Value) -> BridgeResult<()> {
-    match value {
-        Value::Object(object) => {
+    match value.kind_mut() {
+        Kind::Map(object) => {
             for key in ["variables", "exported"] {
                 if let Some(entries) = object.get_mut(key) {
                     validate_bindings(entries, key)?;
                     entries
-                        .as_array_mut()
+                        .as_seq_mut()
                         .expect("validated binding array")
                         .sort_by(|left, right| {
                             left[0]
@@ -202,7 +202,7 @@ fn normalize_maps(value: &mut Value) -> BridgeResult<()> {
                 if let Some(entries) = object.get_mut(key) {
                     validate_pairs(entries, key)?;
                     entries
-                        .as_array_mut()
+                        .as_seq_mut()
                         .expect("validated byte-pair array")
                         .sort_by(|left, right| byte_key(&left[0]).cmp(&byte_key(&right[0])));
                 }
@@ -210,7 +210,7 @@ fn normalize_maps(value: &mut Value) -> BridgeResult<()> {
             if let Some(entries) = object.get_mut("descriptors") {
                 validate_descriptors(entries)?;
                 entries
-                    .as_array_mut()
+                    .as_seq_mut()
                     .expect("validated descriptor array")
                     .sort_by_key(|entry| entry[0].as_u64().expect("validated descriptor key"));
             }
@@ -218,8 +218,8 @@ fn normalize_maps(value: &mut Value) -> BridgeResult<()> {
                 normalize_maps(child)?;
             }
         }
-        Value::Array(values) => {
-            for child in values {
+        Kind::Seq(values) => {
+            for child in values.iter_mut() {
                 normalize_maps(child)?;
             }
         }
@@ -230,22 +230,22 @@ fn normalize_maps(value: &mut Value) -> BridgeResult<()> {
 
 fn byte_key(value: &Value) -> Vec<u8> {
     value
-        .as_array()
+        .as_seq()
         .into_iter()
-        .flatten()
-        .filter_map(Value::as_u64)
+        .flat_map(|items| items.iter())
+        .filter_map(|byte| byte.as_u64())
         .map(|byte| byte as u8)
         .collect()
 }
 
 fn validate_descriptors(value: &Value) -> BridgeResult<()> {
     let entries = value
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("descriptor map is not an array"))?;
     let mut descriptors = std::collections::HashSet::new();
     for entry in entries {
         let pair = entry
-            .as_array()
+            .as_seq()
             .filter(|pair| pair.len() == 2)
             .ok_or_else(|| BridgeError::new("descriptor entry is not a pair"))?;
         let descriptor = pair[0]
@@ -274,7 +274,7 @@ fn validate_error(value: &Value) -> BridgeResult<()> {
         _ => return Err(BridgeError::new(format!("unknown semantic error kind {kind:?}"))),
     };
     exact_object(value, keys, "semantic error payload")?;
-    if value.get("message").is_some_and(|message| !message.is_string()) {
+    if value.get("message").is_some_and(|message| !message.is_str()) {
         return Err(BridgeError::new("semantic error diagnostic is not text"));
     }
     if kind == "policy" {
@@ -309,7 +309,7 @@ fn validate_state(value: &Value) -> BridgeResult<()> {
     validate_bindings(&value["exported"], "exported")?;
     validate_pairs(&value["inherited"], "inherited")?;
     let positional = value["positional"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("positional state is not an array"))?;
     for item in positional {
         require_bytes(item, "positional argument")?;
@@ -319,7 +319,7 @@ fn validate_state(value: &Value) -> BridgeResult<()> {
 
 fn validate_trace(value: &Value) -> BridgeResult<()> {
     let events = value
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("semantic error trace is not an array"))?;
     for event in events {
         let tag = event["tag"]
@@ -329,7 +329,7 @@ fn validate_trace(value: &Value) -> BridgeResult<()> {
             "invoke" => {
                 exact_object(event, &["tag", "argv", "environment", "cwd"], "invoke trace event")?;
                 let argv = event["argv"]
-                    .as_array()
+                    .as_seq()
                     .ok_or_else(|| BridgeError::new("invoke argv is not an array"))?;
                 for bytes in argv {
                     require_bytes(bytes, "invoke argv")?;
@@ -379,11 +379,11 @@ fn require_fd(value: &Value) -> BridgeResult<()> {
 
 fn validate_bindings(value: &Value, context: &str) -> BridgeResult<()> {
     let bindings = value
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new(format!("{context} is not an array")))?;
     let mut names = std::collections::HashSet::new();
     for binding in bindings {
-        if binding.as_array().is_none_or(|pair| pair.len() != 2) {
+        if binding.as_seq().is_none_or(|pair| pair.len() != 2) {
             return Err(BridgeError::new(format!("{context} entry is not a pair")));
         }
         let name = binding[0]
@@ -399,11 +399,11 @@ fn validate_bindings(value: &Value, context: &str) -> BridgeResult<()> {
 
 fn validate_pairs(value: &Value, context: &str) -> BridgeResult<()> {
     let pairs = value
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new(format!("{context} is not an array")))?;
     let mut names = std::collections::HashSet::new();
     for pair in pairs {
-        if pair.as_array().is_none_or(|pair| pair.len() != 2) {
+        if pair.as_seq().is_none_or(|pair| pair.len() != 2) {
             return Err(BridgeError::new(format!("{context} entry is not a pair")));
         }
         let name = require_bytes(&pair[0], context)?;

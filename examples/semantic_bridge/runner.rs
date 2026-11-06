@@ -5,8 +5,8 @@ use crate::semantic_bridge::expansion;
 use crate::semantic_bridge::interactive;
 use crate::semantic_bridge::policy;
 use crate::semantic_bridge::protocol::{Family, Request, validate_response};
-use crate::semantic_bridge::{BridgeError, BridgeResult};
-use serde_json::{Value, json};
+use crate::semantic_bridge::{BridgeError, BridgeResult, render};
+use deser_value::{Value, value};
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const DEFAULT_SEED: u64 = 0x5e6d_616e_7469_6373;
+const PRETTY_JSON: deser_json::SerializerConfig =
+    deser_json::SerializerConfig::builder().pretty(deser_json::Indent::Spaces(2)).build();
 
 struct Options {
     families: Vec<Family>,
@@ -103,8 +105,8 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
                     "{} mismatch at {}; expected {}, Lean returned {}; minimized request saved to formal/fixtures/bridge-regressions/{}/{}.json",
                     family.name(),
                     request.id,
-                    expected,
-                    observed,
+                    render(&expected),
+                    render(&observed),
                     family.name(),
                     retained_id
                 )));
@@ -158,7 +160,7 @@ fn load_regressions(root: &Path, family: Family) -> BridgeResult<Vec<Request>> {
     for path in paths.into_iter().filter(|path| path.extension().is_some_and(|extension| extension == "json")) {
         let bytes = fs::read(&path)
             .map_err(|error| BridgeError::new(format!("cannot read regression {}: {error}", path.display())))?;
-        let json = serde_json::from_slice(&bytes)
+        let json = deser_json::from_slice(&bytes)
             .map_err(|error| BridgeError::new(format!("regression {} is malformed: {error}", path.display())))?;
         let mut request = Request::from_json(json)?;
         if request.family != family {
@@ -181,7 +183,7 @@ fn load_regression_by_id(root: &Path, family: Family, id: &str) -> BridgeResult<
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(BridgeError::new(format!("cannot read regression {}: {error}", path.display()))),
     };
-    let json = serde_json::from_slice(&bytes)
+    let json = deser_json::from_slice(&bytes)
         .map_err(|error| BridgeError::new(format!("regression {} is malformed: {error}", path.display())))?;
     let request = Request::from_json(json)?;
     if request.family != family || request.id != id {
@@ -198,11 +200,11 @@ fn regression_filename(family: Family, id: &str) -> String {
 
 fn verify_response_corruption(response: Value) -> BridgeResult<()> {
     let mut corrupted = response;
-    corrupted["version"] = json!(2);
+    corrupted["version"] = value!(2);
     if validate_response(corrupted, "corruption-probe").is_ok() {
         return Err(BridgeError::new("bridge accepted a corrupted Lean response"));
     }
-    let mut malformed_trace = json!({
+    let mut malformed_trace = value!({
         "version": 1,
         "id": "corruption-probe",
         "outcome": {
@@ -215,7 +217,7 @@ fn verify_response_corruption(response: Value) -> BridgeResult<()> {
     if validate_response(malformed_trace.clone(), "corruption-probe").is_ok() {
         return Err(BridgeError::new("bridge accepted an unknown Lean trace event"));
     }
-    malformed_trace["outcome"]["trace"] = json!([]);
+    malformed_trace["outcome"]["trace"] = value!([]);
     if validate_response(malformed_trace, "wrong-id").is_ok() {
         return Err(BridgeError::new("bridge accepted a Lean response with the wrong ID"));
     }
@@ -371,7 +373,7 @@ fn negative_control(family: Family, outcome: &Value) -> BridgeResult<Value> {
 
 fn normalize_actual(outcome: &Value, id: &str) -> BridgeResult<Value> {
     validate_response(
-        json!({"version": 1, "id": id, "outcome": outcome}),
+        value!({"version": 1, "id": id, "outcome": outcome.clone()}),
         id,
     )
 }
@@ -387,7 +389,7 @@ fn run_lean(binary: &Path, tmpdir: &Path, requests: &[Request]) -> BridgeResult<
         .map_err(|error| BridgeError::new(format!("cannot start Lean bridge: {error}")))?;
     let mut input = Vec::new();
     for request in requests {
-        serde_json::to_writer(&mut input, &request.to_json())
+        deser_json::to_writer(&mut input, &request.to_json())
             .map_err(|error| BridgeError::new(format!("cannot encode request: {error}")))?;
         input.push(b'\n');
     }
@@ -418,7 +420,7 @@ fn run_lean(binary: &Path, tmpdir: &Path, requests: &[Request]) -> BridgeResult<
     stdout
         .lines()
         .map(|line| {
-            serde_json::from_str(line)
+            deser_json::from_str(line)
                 .map_err(|error| BridgeError::new(format!("Lean response is malformed: {error}")))
         })
         .collect()
@@ -480,7 +482,7 @@ fn verify_protocol_boundary(binary: &Path, tmpdir: &Path, root: &Path) -> Bridge
         .iter()
         .zip(&outputs[expected.len()..expected.len() + valid_lines.len()])
     {
-        let request: Value = serde_json::from_str(line)
+        let request: Value = deser_json::from_str(line)
             .map_err(|error| BridgeError::new(format!("protocol-v1 fixture is malformed: {error}")))?;
         let normalized = validate_response(response.clone(), request["id"].as_str().unwrap_or(""))?;
         if normalized["tag"] != "unsupported_domain" {
@@ -511,7 +513,7 @@ fn validate_boundary_error(response: &Value, tag: &str, id: Option<&str>) -> Bri
         return Err(BridgeError::new(format!("boundary error tag is not {tag:?}")));
     }
     match tag {
-        "malformed" if response["error"]["message"].is_string() => {}
+        "malformed" if response["error"]["message"].is_str() => {}
         "unsupported_version" if response["error"]["version"] == 2 => {}
         "duplicate_id" if response["error"]["id"].as_str() == id => {}
         _ => return Err(BridgeError::new(format!("boundary {tag:?} payload is invalid"))),
@@ -529,7 +531,7 @@ fn verify_rust_protocol_boundary(root: &Path) -> BridgeResult<()> {
         return Err(BridgeError::new("protocol-invalid fixture count changed"));
     }
     for (index, line) in invalid_lines.iter().enumerate() {
-        let value = match serde_json::from_str::<Value>(line) {
+        let value = match deser_json::from_str::<Value>(line) {
             Ok(value) => value,
             Err(_) if index != 0 => continue,
             Err(error) => {
@@ -560,7 +562,7 @@ fn verify_rust_protocol_boundary(root: &Path) -> BridgeResult<()> {
     }
     let mut requests = Vec::with_capacity(valid_lines.len());
     for (line, expected_family) in valid_lines.iter().zip(Family::ALL) {
-        let value: Value = serde_json::from_str(line)
+        let value: Value = deser_json::from_str(line)
             .map_err(|error| BridgeError::new(format!("protocol-v1 fixture is malformed: {error}")))?;
         let request = Request::from_json(value)?;
         if request.family != expected_family {
@@ -626,7 +628,7 @@ fn run_lean_text(
         .map_err(|_| BridgeError::new("Lean protocol output is not UTF-8"))?
         .lines()
         .map(|line| {
-            serde_json::from_str(line)
+            deser_json::from_str(line)
                 .map_err(|error| BridgeError::new(format!("Lean protocol response is malformed: {error}")))
         })
         .collect()
@@ -696,7 +698,7 @@ fn minimize_mismatch_with(
 }
 
 fn request_key(request: &Request) -> BridgeResult<Vec<u8>> {
-    serde_json::to_vec(&request.to_json())
+    deser_json::to_string(&request.to_json()).map(String::into_bytes)
         .map_err(|error| BridgeError::new(format!("cannot measure shrink candidate: {error}")))
 }
 
@@ -741,13 +743,13 @@ fn semantic_outcomes_match(
 
 fn verify_nonsemantic_outcomes_rejected() -> BridgeResult<()> {
     for outcome in [
-        json!({"tag": "unsupported_domain", "reason": "probe"}),
-        json!({"tag": "fuel_exhausted"}),
+        value!({"tag": "unsupported_domain", "reason": "probe"}),
+        value!({"tag": "fuel_exhausted"}),
     ] {
         if semantic_outcomes_match(Family::Effects, "runner-negative-control", &outcome, &outcome).is_ok() {
             return Err(BridgeError::new(format!(
                 "runner accepted matching {} outcomes as a semantic pass",
-                outcome["tag"]
+                render(&outcome["tag"])
             )));
         }
     }
@@ -809,7 +811,7 @@ fn retain_regression(root: &Path, family: Family, request: &Request) -> BridgeRe
         BridgeError::new(format!("cannot create regression directory: {error}"))
     })?;
     let path = directory.join(format!("{}.json", regression_filename(family, &request.id)));
-    let bytes = serde_json::to_vec_pretty(&request.to_json())
+    let bytes = PRETTY_JSON.to_string(&request.to_json()).map(String::into_bytes)
         .map_err(|error| BridgeError::new(format!("cannot encode regression fixture: {error}")))?;
     fs::write(&path, bytes)
         .map_err(|error| BridgeError::new(format!("cannot retain {}: {error}", path.display())))
@@ -823,8 +825,8 @@ mod tests {
     #[test]
     fn matching_nonsemantic_outcomes_are_rejected() {
         for outcome in [
-            json!({"tag": "unsupported_domain", "reason": "probe"}),
-            json!({"tag": "fuel_exhausted"}),
+            value!({"tag": "unsupported_domain", "reason": "probe"}),
+            value!({"tag": "fuel_exhausted"}),
         ] {
             assert!(semantic_outcomes_match(Family::Effects, "probe", &outcome, &outcome).is_err());
         }
@@ -841,12 +843,12 @@ mod tests {
 
     #[test]
     fn matching_semantic_outcomes_are_accepted() {
-        let success = json!({"tag": "success", "value": {"route": "epsh"}});
+        let success = value!({"tag": "success", "value": {"route": "epsh"}});
         assert!(matches!(
             semantic_outcomes_match(Family::Policy, "probe", &success, &success),
             Ok(true)
         ));
-        let different = json!({"tag": "success", "value": {"route": "builtin"}});
+        let different = value!({"tag": "success", "value": {"route": "builtin"}});
         assert!(matches!(
             semantic_outcomes_match(Family::Policy, "probe", &success, &different),
             Ok(false)
@@ -870,7 +872,7 @@ mod tests {
         let minimized = minimize_mismatch_with(Family::Policy, &request, |case| {
             let expected = normalize_actual(&policy::actual(case)?, &case.id)?;
             let altered = policy::negative_control(&expected)?;
-            Ok(json!({"version": 1, "id": case.id, "outcome": altered}))
+            Ok(value!({"version": 1, "id": case.id.clone(), "outcome": altered}))
         })
         .expect("minimized mismatch");
         let minimized_key = request_key(&minimized).expect("minimized key");
@@ -891,9 +893,9 @@ mod tests {
         let path = root
             .join("formal/fixtures/bridge-regressions/policy")
             .join(format!("{}.json", retained.id));
-        let loaded: Value = serde_json::from_slice(&fs::read(&path).expect("retained fixture bytes"))
+        let loaded: Value = deser_json::from_slice(&fs::read(&path).expect("retained fixture bytes"))
             .expect("retained fixture JSON");
-        assert_eq!(loaded["source"], json!(minimized.source));
+        assert_eq!(loaded["source"], value!(minimized.source));
         fs::remove_dir_all(root).expect("removed temporary regression fixture");
     }
 }

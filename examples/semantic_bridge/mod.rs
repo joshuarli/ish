@@ -40,3 +40,18 @@ pub(crate) fn run_from_args(args: impl IntoIterator<Item = String>) -> BridgeRes
     }
     runner::run(args)
 }
+
+pub(crate) fn pairs<A, B>(items: impl IntoIterator<Item = (A, B)>) -> deser_value::Value
+where
+    A: Into<deser_value::Value>,
+    B: Into<deser_value::Value>,
+{
+    items
+        .into_iter()
+        .map(|(first, second)| deser_value::Value::from(vec![first.into(), second.into()]))
+        .collect()
+}
+
+pub(crate) fn render(value: &deser_value::Value) -> String {
+    deser_json::to_string(value).expect("values are plain data")
+}

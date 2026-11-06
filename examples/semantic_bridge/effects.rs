@@ -7,7 +7,7 @@ use epsh::eval::Shell;
 use epsh::parser::Parser;
 use epsh::shell_bytes::ShellBytes;
 use epsh::var::Variables;
-use serde_json::{Value, json};
+use deser_value::{Value, value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
@@ -34,15 +34,15 @@ static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
     let mut random = Generator::new(seed ^ (index as u64).wrapping_mul(0x8ebc_6af0_9c88_c6e3));
     let (state, input) = match index {
-        0 => (empty_state(), json!({"mode": "bytes", "bytes": []})),
+        0 => (empty_state(), value!({"mode": "bytes", "bytes": []})),
         1 => (
             empty_state(),
-            json!({"mode": "bytes", "bytes": (0u8..=u8::MAX).collect::<Vec<_>>() }),
+            value!({"mode": "bytes", "bytes": (0u8..=u8::MAX).collect::<Vec<_>>() }),
         ),
         2 => {
             let mut bytes = vec![b'a', 0, 0xee, 0x82, 0x80, 0xef, 0x80, 0x80, 0xff, 0x80];
             bytes.extend((0..24).map(|_| random.next() as u8));
-            (empty_state(), json!({"mode": "bytes", "bytes": bytes}))
+            (empty_state(), value!({"mode": "bytes", "bytes": bytes}))
         }
         3 => environment_case(
             vec![("A", b"2".to_vec()), ("EXPORTED", vec![0xef, 0x80, 0x80])],
@@ -84,7 +84,7 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
             0 => {
                 let length = random.below(64) as usize;
                 let bytes: Vec<u8> = (0..length).map(|_| random.next() as u8).collect();
-                (empty_state(), json!({"mode": "bytes", "bytes": bytes}))
+                (empty_state(), value!({"mode": "bytes", "bytes": bytes}))
             }
             1 => {
                 let raw_name = vec![0xff, b'A' + random.below(26) as u8];
@@ -159,20 +159,20 @@ fn environment_case(
     inherited: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> (Value, Value) {
     let mut state = empty_state();
-    state["variables"] = json!([["HIDDEN", [112, 114, 105, 118, 97, 116, 101]]]);
-    state["exported"] = json!(exported
+    state["variables"] = value!([["HIDDEN", [112, 114, 105, 118, 97, 116, 101]]]);
+    state["exported"] = value!(exported
         .into_iter()
-        .map(|(name, value)| json!([name, value]))
+        .map(|(name, value)| value!([name, value]))
         .collect::<Vec<_>>());
-    state["inherited"] = json!(inherited
+    state["inherited"] = value!(inherited
         .into_iter()
-        .map(|(name, value)| json!([name, value]))
+        .map(|(name, value)| value!([name, value]))
         .collect::<Vec<_>>());
-    let input = json!({
+    let input = value!({
         "mode": "environment",
         "assignments": assignments
             .into_iter()
-            .map(|(name, value)| json!([name, value]))
+            .map(|(name, value)| value!([name, value]))
             .collect::<Vec<_>>(),
     });
     (state, input)
@@ -180,10 +180,10 @@ fn environment_case(
 
 fn cwd_case(success: bool, shell: u64) -> (Value, Value) {
     let mut state = empty_state();
-    state["cwd"] = json!(b"start".to_vec());
+    state["cwd"] = value!(b"start".to_vec());
     (
         state,
-        json!({
+        value!({
             "mode": "cwd",
             "shell": shell,
             "path": b"selected".to_vec(),
@@ -194,7 +194,7 @@ fn cwd_case(success: bool, shell: u64) -> (Value, Value) {
 }
 
 fn redirection_case(permanent: bool, variant: usize) -> (Value, Value) {
-    let descriptors = json!([[3, 7], [4, 8]]);
+    let descriptors = value!([[3, 7], [4, 8]]);
     let operations = match (permanent, variant) {
         (false, 0) => vec![
             redirection_op(5, 32, "open", 9),
@@ -218,10 +218,10 @@ fn redirection_case(permanent: bool, variant: usize) -> (Value, Value) {
         ],
     };
     let mut state = empty_state();
-    state["cwd"] = json!(b"/".to_vec());
+    state["cwd"] = value!(b"/".to_vec());
     (
         state,
-        json!({
+        value!({
             "mode": "redirection",
             "descriptors": descriptors,
             "operations": operations,
@@ -231,7 +231,7 @@ fn redirection_case(permanent: bool, variant: usize) -> (Value, Value) {
 }
 
 fn redirection_op(target: u64, copy: u64, kind: &str, resource: u64) -> Value {
-    json!({
+    value!({
         "target": target,
         "copy": copy,
         "kind": kind,
@@ -282,7 +282,7 @@ fn validate_state(state: &Value) -> BridgeResult<()> {
     decode_environment(&state["inherited"], "inherited")?;
     require_bytes(&state["cwd"], "cwd")?;
     let positional = state["positional"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("positional state is not an array"))?;
     for item in positional {
         require_bytes(item, "positional argument")?;
@@ -319,7 +319,7 @@ fn validate_cwd_input(request: &Request) -> BridgeResult<()> {
     let path = require_bytes(&request.input["path"], "cwd path")?;
     let cwd = require_bytes(&request.state["cwd"], "cwd state")?;
     let other_cwds = request.input["other_cwds"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("other_cwds is not an array"))?;
     let others = other_cwds
         .iter()
@@ -348,7 +348,7 @@ fn validate_redirection_input(request: &Request) -> BridgeResult<()> {
     )?;
     let descriptors = decode_descriptors(&request.input["descriptors"])?;
     let operations = request.input["operations"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("redirection operations are not an array"))?;
     if operations.len() > 16 {
         return Err(BridgeError::new("redirection operation count exceeds 16"));
@@ -424,13 +424,13 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
     if mode == "environment"
         && let Some(reason) = environment_domain_error(request)?
     {
-        return Ok(json!({"tag": "unsupported_domain", "reason": reason}));
+        return Ok(value!({"tag": "unsupported_domain", "reason": reason}));
     }
     if request.fuel == 0
         || (mode == "redirection"
-            && request.fuel <= request.input["operations"].as_array().map_or(0, Vec::len) as u64)
+            && request.fuel <= request.input["operations"].as_seq().map_or(0, |items| items.len()) as u64)
     {
-        return Ok(json!({"tag": "fuel_exhausted"}));
+        return Ok(value!({"tag": "fuel_exhausted"}));
     }
     if matches!(mode, "environment" | "redirection") {
         run_isolated(request)
@@ -448,25 +448,25 @@ pub(crate) fn subprocess_worker() -> BridgeResult<()> {
     if input.len() > MAX_REQUEST_BYTES {
         return Err(BridgeError::new("effects worker request exceeds the size limit"));
     }
-    let value: Value = serde_json::from_slice(&input)
+    let value: Value = deser_json::from_slice(&input)
         .map_err(|error| BridgeError::new(format!("effects worker request is malformed: {error}")))?;
     let request = request_from_json(value)?;
     validate_case(&request)?;
     let outcome = if request.fuel == 0
         || (request.input["mode"] == "redirection"
-            && request.fuel <= request.input["operations"].as_array().map_or(0, Vec::len) as u64)
+            && request.fuel <= request.input["operations"].as_seq().map_or(0, |items| items.len()) as u64)
     {
-        json!({"tag": "fuel_exhausted"})
+        value!({"tag": "fuel_exhausted"})
     } else if request.input["mode"] == "environment"
         && let Some(reason) = environment_domain_error(&request)?
     {
-        json!({"tag": "unsupported_domain", "reason": reason})
+        value!({"tag": "unsupported_domain", "reason": reason})
     } else {
         actual_in_process(&request)?
     };
     std::io::stdout()
         .lock()
-        .write_all(&serde_json::to_vec(&outcome).map_err(|error| {
+        .write_all(&deser_json::to_string(&outcome).map(String::into_bytes).map_err(|error| {
             BridgeError::new(format!("cannot encode effects worker outcome: {error}"))
         })?)
         .map_err(|error| BridgeError::new(format!("cannot write effects worker outcome: {error}")))?;
@@ -495,7 +495,7 @@ fn request_from_json(value: Value) -> BridgeResult<Request> {
     let fuel = value["fuel"]
         .as_u64()
         .ok_or_else(|| BridgeError::new("effects worker fuel is not a natural number"))?;
-    if !value["input"].is_object() {
+    if !value["input"].is_map() {
         return Err(BridgeError::new("effects worker input is not an object"));
     }
     Ok(Request {
@@ -528,7 +528,7 @@ fn run_isolated(request: &Request) -> BridgeResult<Value> {
     let mut child = command
         .spawn()
         .map_err(|error| BridgeError::new(format!("cannot start effects worker: {error}")))?;
-    let encoded = serde_json::to_vec(&request.to_json())
+    let encoded = deser_json::to_string(&request.to_json()).map(String::into_bytes)
         .map_err(|error| BridgeError::new(format!("cannot encode effects worker request: {error}")))?;
     let mut stdin = child
         .stdin
@@ -566,9 +566,9 @@ fn run_isolated(request: &Request) -> BridgeResult<Value> {
             String::from_utf8_lossy(&stderr[..stderr.len().min(MAX_WORKER_OUTPUT_BYTES)])
         )));
     }
-    let outcome: Value = serde_json::from_slice(&output)
+    let outcome: Value = deser_json::from_slice(&output)
         .map_err(|error| BridgeError::new(format!("effects worker outcome is malformed: {error}")))?;
-    let envelope = json!({"version": 1, "id": request.id, "outcome": outcome.clone()});
+    let envelope = value!({"version": 1, "id": request.id.clone(), "outcome": outcome.clone()});
     let _ = crate::semantic_bridge::protocol::validate_response(envelope, &request.id)?;
     Ok(outcome)
 }
@@ -612,7 +612,7 @@ fn actual_bytes(input: &Value) -> BridgeResult<Value> {
     let os = shell.to_os_string();
     let raw_os = ShellBytes::from_os_str(os.as_os_str());
     let c_string = raw_os.to_cstring().is_ok();
-    Ok(json!({
+    Ok(value!({
         "tag": "success",
         "value": {"bytes": raw_os.as_bytes(), "c_string": c_string},
     }))
@@ -635,9 +635,9 @@ fn actual_environment(request: &Request) -> BridgeResult<Value> {
         })
         .collect::<Vec<_>>();
     environment.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(json!({
+    Ok(value!({
         "tag": "success",
-        "value": {"environment": environment},
+        "value": {"environment": super::pairs(environment)},
     }))
 }
 
@@ -704,7 +704,7 @@ fn actual_cwd(request: &Request) -> BridgeResult<Value> {
         let cwd_bytes = require_bytes(&request.state["cwd"], "cwd state")?;
         let target_bytes = require_bytes(&request.input["path"], "cwd path")?;
         let other_bytes = request.input["other_cwds"]
-            .as_array()
+            .as_seq()
             .ok_or_else(|| BridgeError::new("other_cwds is not an array"))?
             .iter()
             .map(|path| require_bytes(path, "other cwd"))
@@ -772,7 +772,7 @@ fn actual_cwd(request: &Request) -> BridgeResult<Value> {
                 return Err(BridgeError::new("epsh changed another shell cwd"));
             }
         }
-        Ok(json!({
+        Ok(value!({
             "tag": "success",
             "value": {
                 "cwd": if success { target_bytes } else { cwd_bytes },
@@ -786,7 +786,7 @@ fn actual_redirections(request: &Request) -> BridgeResult<Value> {
     with_scratch(|root| {
     let descriptors = decode_descriptors(&request.input["descriptors"])?;
     let operations = request.input["operations"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("redirection operations are not an array"))?;
     let mut resources = BTreeSet::new();
     resources.extend(descriptors.values().copied());
@@ -854,10 +854,10 @@ fn actual_redirections(request: &Request) -> BridgeResult<Value> {
     let mut observed = Vec::new();
     for fd in probes {
         if let Some(resource) = descriptor_resource(fd, &identities)? {
-            observed.push(json!([fd, resource]));
+            observed.push(value!([fd, resource]));
         }
     }
-    Ok(json!({
+    Ok(value!({
         "tag": "success",
         "value": {"descriptors": observed, "setup_error": setup_error},
     }))
@@ -947,13 +947,13 @@ fn shell_quote(path: &Path) -> String {
 
 fn decode_bindings(value: &Value, context: &str) -> BridgeResult<Vec<(String, Vec<u8>)>> {
     let entries = value
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new(format!("{context} is not an array")))?;
     let mut names = BTreeSet::new();
     let mut decoded = Vec::with_capacity(entries.len());
     for entry in entries {
         let pair = entry
-            .as_array()
+            .as_seq()
             .filter(|pair| pair.len() == 2)
             .ok_or_else(|| BridgeError::new(format!("{context} entry is not a pair")))?;
         let name = pair[0]
@@ -970,13 +970,13 @@ fn decode_bindings(value: &Value, context: &str) -> BridgeResult<Vec<(String, Ve
 
 fn decode_environment(value: &Value, context: &str) -> BridgeResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let entries = value
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new(format!("{context} is not an array")))?;
     let mut names = BTreeSet::new();
     let mut decoded = Vec::with_capacity(entries.len());
     for entry in entries {
         let pair = entry
-            .as_array()
+            .as_seq()
             .filter(|pair| pair.len() == 2)
             .ok_or_else(|| BridgeError::new(format!("{context} entry is not a pair")))?;
         let name = require_bytes(&pair[0], context)?;
@@ -990,12 +990,12 @@ fn decode_environment(value: &Value, context: &str) -> BridgeResult<Vec<(Vec<u8>
 
 fn decode_descriptors(value: &Value) -> BridgeResult<BTreeMap<u64, u64>> {
     let entries = value
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("descriptors is not an array"))?;
     let mut decoded = BTreeMap::new();
     for entry in entries {
         let pair = entry
-            .as_array()
+            .as_seq()
             .filter(|pair| pair.len() == 2)
             .ok_or_else(|| BridgeError::new("descriptor entry is not a pair"))?;
         let fd = require_fd(&pair[0], "descriptor number")?;
@@ -1081,13 +1081,13 @@ fn scratch_path(root: &Path, namespace: &str, bytes: &[u8]) -> PathBuf {
 pub(crate) fn negative_control(outcome: &Value) -> BridgeResult<Value> {
     let mut altered = outcome.clone();
     match altered["tag"].as_str() {
-        Some("success") => match altered["value"].as_object_mut() {
+        Some("success") => match altered["value"].as_map_mut() {
             Some(value) => {
-                value.insert("negative_control".into(), json!(true));
+                value.insert("negative_control", value!(true));
             }
             None => return Err(BridgeError::new("effects result value is not an object")),
         },
-        Some("unsupported_domain") => altered["reason"] = json!("negative control"),
+        Some("unsupported_domain") => altered["reason"] = value!("negative control"),
         Some("fuel_exhausted") => return Err(BridgeError::new("effects negative control needs an observed value")),
         _ => return Err(BridgeError::new("effects negative control received an unknown outcome")),
     }
@@ -1103,28 +1103,28 @@ pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
             let bytes = require_bytes(&request.input["bytes"], "bytes input")?;
             for length in [bytes.len() / 2, 0] {
                 let mut candidate = request.clone();
-                candidate.input["bytes"] = json!(&bytes[..length]);
+                candidate.input["bytes"] = value!(&bytes[..length]);
                 add_candidate(&mut candidates, &mut seen, request, candidate)?;
             }
         }
         "environment" => {
-            let assignments = request.input["assignments"].as_array().unwrap();
+            let assignments = request.input["assignments"].as_seq().unwrap();
             for length in [assignments.len() / 2, 0] {
                 let mut candidate = request.clone();
-                candidate.input["assignments"] = Value::Array(assignments[..length].to_vec());
+                candidate.input["assignments"] = Value::from(assignments[..length].to_vec());
                 add_candidate(&mut candidates, &mut seen, request, candidate)?;
             }
         }
         "cwd" => {
             let mut candidate = request.clone();
-            candidate.input["success"] = json!(false);
+            candidate.input["success"] = value!(false);
             add_candidate(&mut candidates, &mut seen, request, candidate)?;
         }
         "redirection" => {
-            let operations = request.input["operations"].as_array().unwrap();
+            let operations = request.input["operations"].as_seq().unwrap();
             for length in [operations.len() / 2, operations.len().saturating_sub(1), 0] {
                 let mut candidate = request.clone();
-                candidate.input["operations"] = Value::Array(operations[..length].to_vec());
+                candidate.input["operations"] = Value::from(operations[..length].to_vec());
                 add_candidate(&mut candidates, &mut seen, request, candidate)?;
             }
         }
@@ -1140,7 +1140,7 @@ mod tests {
     #[test]
     fn environment_request_initializes_unexported_values_without_exporting_them() {
         let mut request = generate(3, 0).expect("environment case");
-        request.state["variables"] = json!([["BRIDGE_PRIVATE", [255, 128, 112]]]);
+        request.state["variables"] = value!([["BRIDGE_PRIVATE", [255, 128, 112]]]);
         let variables = environment_variables(&request).expect("initialized environment variables");
         assert_eq!(
             variables.get_bytes("BRIDGE_PRIVATE").map(ShellBytes::as_bytes),
@@ -1172,7 +1172,7 @@ fn add_candidate(
     candidate: Request,
 ) -> BridgeResult<()> {
     if candidate.input != original.input {
-        let key = serde_json::to_string(&candidate.input)
+        let key = deser_json::to_string(&candidate.input)
             .map_err(|error| BridgeError::new(format!("cannot encode effects shrink candidate: {error}")))?;
         if seen.insert(key) {
             candidates.push(candidate);

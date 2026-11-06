@@ -7,7 +7,7 @@ use epsh::ast::{
 use epsh::eval::{CommandPlacement, Shell};
 use epsh::parser::Parser;
 use epsh::shell_bytes::ShellBytes;
-use serde_json::{Value, json};
+use deser_value::{Value, value};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -54,7 +54,7 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         source: bytes,
         state: empty_state(),
         fuel: 256,
-        input: json!({"mode": "static", "ast": program_json(&program)}),
+        input: value!({"mode": "static", "ast": program_json(&program)}),
     })
 }
 
@@ -96,14 +96,14 @@ fn dynamic_target_rejection(target: &ShellBytes) -> Option<ish::dispatch::Reject
 
 fn dynamic_case(index: usize, target: Vec<u8>) -> BridgeResult<Request> {
     let mut state = empty_state();
-    state["variables"] = json!([["TARGET", target]]);
+    state["variables"] = value!([["TARGET", target.clone()]]);
     Ok(Request {
         id: format!("policy-{index:05}"),
         family: Family::Policy,
         source: b"\"$TARGET\"".to_vec(),
         state,
         fuel: 256,
-        input: json!({"mode": "dynamic", "target": target}),
+        input: value!({"mode": "dynamic", "target": target}),
     })
 }
 
@@ -122,14 +122,14 @@ fn placement_case(index: usize, target: Vec<u8>) -> BridgeResult<Request> {
 fn placement_request(id: String, target: Vec<u8>, context: &str) -> BridgeResult<Request> {
     let source = placement_source(context)?;
     let mut state = empty_state();
-    state["variables"] = json!([["TARGET", target.clone()]]);
+    state["variables"] = value!([["TARGET", target.clone()]]);
     Ok(Request {
         id,
         family: Family::Policy,
         source: source.into_bytes(),
         state,
         fuel: 256,
-        input: json!({"mode": "placement", "target": target, "context": context}),
+        input: value!({"mode": "placement", "target": target, "context": context}),
     })
 }
 
@@ -156,7 +156,7 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
     if request.input["mode"] == "dynamic" {
         let target = require_policy_bytes(&request.input["target"])?;
         let allowed = dynamic_target_rejection(&ShellBytes::from_vec(target)).is_none();
-        return Ok(json!({
+        return Ok(value!({
             "tag": "success",
             "value": {"allowed": allowed, "status": if allowed { 0 } else { 2 }},
         }));
@@ -168,25 +168,25 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
         .map_err(|_| BridgeError::new("policy source is not UTF-8"))?;
     let result = ish::dispatch::plan(source);
     let value = match result {
-        Ok(ish::dispatch::Plan::Epsh(_)) => json!({
+        Ok(ish::dispatch::Plan::Epsh(_)) => value!({
             "tag": "success",
             "value": {"route": "epsh", "builtin": null, "rejection": null},
         }),
-        Ok(ish::dispatch::Plan::Builtin { name, .. }) => json!({
+        Ok(ish::dispatch::Plan::Builtin { name, .. }) => value!({
             "tag": "success",
             "value": {"route": "builtin", "builtin": name, "rejection": null},
         }),
-        Err(ish::dispatch::Rejection::Syntax(message)) => json!({
+        Err(ish::dispatch::Rejection::Syntax(message)) => value!({
             "tag": "semantic_error",
             "error": {"kind": "syntax", "message": message},
-            "state": request.state,
+            "state": request.state.clone(),
             "trace": [],
         }),
         Err(rejection) => {
             let reason = rejection_name(&rejection).ok_or_else(|| {
                 BridgeError::new("expanded builtin rejection cannot come from static planning")
             })?;
-            json!({
+            value!({
                 "tag": "success",
                 "value": {"route": "reject", "builtin": null, "rejection": reason},
             })
@@ -216,14 +216,14 @@ pub(crate) fn negative_control(outcome: &Value) -> BridgeResult<Value> {
         return Err(BridgeError::new("policy negative control needs success"));
     }
     if let Some(allowed) = altered["value"]["allowed"].as_bool() {
-        altered["value"]["allowed"] = json!(!allowed);
-        altered["value"]["status"] = json!(if allowed { 2 } else { 0 });
+        altered["value"]["allowed"] = value!(!allowed);
+        altered["value"]["status"] = value!(if allowed { 2 } else { 0 });
         return Ok(altered);
     }
     altered["value"]["route"] = match altered["value"]["route"].as_str() {
-        Some("epsh") => json!("builtin"),
-        Some("builtin") => json!("epsh"),
-        Some("reject") => json!("epsh"),
+        Some("epsh") => value!("builtin"),
+        Some("builtin") => value!("epsh"),
+        Some("reject") => value!("epsh"),
         _ => return Err(BridgeError::new("policy route is unknown")),
     };
     Ok(altered)
@@ -267,7 +267,7 @@ pub(crate) fn validate_case(request: &Request) -> BridgeResult<()> {
     if request.input["mode"] == "dynamic" {
         exact_object(&request.input, &["mode", "target"], "dynamic policy input")?;
         let target = require_policy_bytes(&request.input["target"])?;
-        if request.state["variables"] != json!([["TARGET", target]]) {
+        if request.state["variables"] != value!([["TARGET", target.clone()]]) {
             return Err(BridgeError::new("dynamic policy target differs from its source variable"));
         }
         if request.source != b"\"$TARGET\"" {
@@ -298,7 +298,7 @@ pub(crate) fn validate_case(request: &Request) -> BridgeResult<()> {
         if request.source != expected_source.as_bytes() {
             return Err(BridgeError::new("placement source does not match its context"));
         }
-        if request.state["variables"] != json!([["TARGET", target]]) {
+        if request.state["variables"] != value!([["TARGET", target.clone()]]) {
             return Err(BridgeError::new("placement target differs from TARGET bytes"));
         }
         let _ = parse_program(&expected_source)?;
@@ -433,7 +433,7 @@ fn actual_placement(request: &Request) -> BridgeResult<Value> {
             ish::builtin::Exec::Foreground => "foreground",
         });
     directory.remove()?;
-    Ok(json!({
+    Ok(value!({
         "tag": "success",
         "value": {
             "allowed": target_allowed,
@@ -507,7 +507,7 @@ fn verify_runtime_placement() -> BridgeResult<()> {
             validate_case(&request)?;
             let outcome = actual_placement(&request)?;
             if outcome["tag"] != "success"
-                || outcome["value"]["allowed"] != json!(placement_properties(context)?.0)
+                || outcome["value"]["allowed"] != value!(placement_properties(context)?.0)
             {
                 return Err(BridgeError::new("runtime placement probe returned the wrong context result"));
             }
@@ -552,62 +552,62 @@ fn enclosing_placement_status(negated: bool, target_status: i32) -> i32 {
 }
 
 fn program_json(program: &Program) -> Value {
-    json!(program.commands.iter().map(command_json).collect::<Vec<_>>())
+    value!(program.commands.iter().map(command_json).collect::<Vec<_>>())
 }
 
 fn command_json(command: &Command) -> Value {
     match command {
-        Command::Simple { assigns, args, redirs, .. } => json!([
+        Command::Simple { assigns, args, redirs, .. } => value!([
             "simple",
             assigns.iter().map(assignment_json).collect::<Vec<_>>(),
             args.iter().map(word_json).collect::<Vec<_>>(),
             redirs.iter().map(redirection_json).collect::<Vec<_>>(),
         ]),
-        Command::Pipeline { commands, bang, .. } => json!([
+        Command::Pipeline { commands, bang, .. } => value!([
             "pipeline",
             commands.iter().map(command_json).collect::<Vec<_>>(),
-            bang,
+            *bang,
         ]),
-        Command::And(left, right) => json!(["and", command_json(left), command_json(right)]),
-        Command::Or(left, right) => json!(["or", command_json(left), command_json(right)]),
+        Command::And(left, right) => value!(["and", command_json(left), command_json(right)]),
+        Command::Or(left, right) => value!(["or", command_json(left), command_json(right)]),
         Command::Sequence(left, right) => {
-            json!(["sequence", command_json(left), command_json(right)])
+            value!(["sequence", command_json(left), command_json(right)])
         }
-        Command::Subshell { body, redirs, .. } => json!([
+        Command::Subshell { body, redirs, .. } => value!([
             "subshell",
             command_json(body),
             redirs.iter().map(redirection_json).collect::<Vec<_>>(),
         ]),
-        Command::BraceGroup { body, redirs, .. } => json!([
+        Command::BraceGroup { body, redirs, .. } => value!([
             "brace_group",
             command_json(body),
             redirs.iter().map(redirection_json).collect::<Vec<_>>(),
         ]),
-        Command::If { cond, then_part, else_part, .. } => json!([
+        Command::If { cond, then_part, else_part, .. } => value!([
             "if",
             command_json(cond),
             command_json(then_part),
-            else_part.as_ref().map(|body| command_json(body)).unwrap_or(Value::Null),
+            else_part.as_ref().map(|body| command_json(body)).unwrap_or(Value::null()),
         ]),
-        Command::While { cond, body, .. } => json!(["while", command_json(cond), command_json(body)]),
-        Command::Until { cond, body, .. } => json!(["until", command_json(cond), command_json(body)]),
-        Command::For { var, words, body, .. } => json!([
+        Command::While { cond, body, .. } => value!(["while", command_json(cond), command_json(body)]),
+        Command::Until { cond, body, .. } => value!(["until", command_json(cond), command_json(body)]),
+        Command::For { var, words, body, .. } => value!([
             "for",
             var,
             words
                 .as_ref()
-                .map(|items| Value::Array(items.iter().map(word_json).collect()))
-                .unwrap_or(Value::Null),
+                .map(|items| Value::from(items.iter().map(word_json).collect::<Vec<_>>()))
+                .unwrap_or(Value::null()),
             command_json(body),
         ]),
-        Command::Case { word, arms, .. } => json!([
+        Command::Case { word, arms, .. } => value!([
             "case",
             word_json(word),
             arms.iter().map(case_arm_json).collect::<Vec<_>>(),
         ]),
-        Command::FuncDef { name, body, .. } => json!(["func_def", name, command_json(body)]),
-        Command::Not(body) => json!(["not", command_json(body)]),
-        Command::Background { cmd, redirs } => json!([
+        Command::FuncDef { name, body, .. } => value!(["func_def", name, command_json(body)]),
+        Command::Not(body) => value!(["not", command_json(body)]),
+        Command::Background { cmd, redirs } => value!([
             "background",
             command_json(cmd),
             redirs.iter().map(redirection_json).collect::<Vec<_>>(),
@@ -616,72 +616,72 @@ fn command_json(command: &Command) -> Value {
 }
 
 fn word_json(word: &Word) -> Value {
-    json!(word.parts.iter().map(part_json).collect::<Vec<_>>())
+    value!(word.parts.iter().map(part_json).collect::<Vec<_>>())
 }
 
 fn part_json(part: &WordPart) -> Value {
     match part {
-        WordPart::Literal(bytes) => json!(["literal", bytes.as_bytes()]),
-        WordPart::SingleQuoted(bytes) => json!(["single_quoted", bytes.as_bytes()]),
+        WordPart::Literal(bytes) => value!(["literal", bytes.as_bytes()]),
+        WordPart::SingleQuoted(bytes) => value!(["single_quoted", bytes.as_bytes()]),
         WordPart::DoubleQuoted(parts) => {
-            json!(["double_quoted", parts.iter().map(part_json).collect::<Vec<_>>()])
+            value!(["double_quoted", parts.iter().map(part_json).collect::<Vec<_>>()])
         }
-        WordPart::Param(parameter) => json!(["param", parameter.name, param_op_json(&parameter.op)]),
-        WordPart::CmdSubst(command) => json!(["cmd_subst", command_json(command)]),
-        WordPart::Backtick(command) => json!(["backtick", command_json(command)]),
-        WordPart::Arith(parts) => json!(["arith", parts.iter().map(part_json).collect::<Vec<_>>()]),
-        WordPart::Tilde(user) => json!(["tilde", user.as_bytes()]),
+        WordPart::Param(parameter) => value!(["param", parameter.name.clone(), param_op_json(&parameter.op)]),
+        WordPart::CmdSubst(command) => value!(["cmd_subst", command_json(command)]),
+        WordPart::Backtick(command) => value!(["backtick", command_json(command)]),
+        WordPart::Arith(parts) => value!(["arith", parts.iter().map(part_json).collect::<Vec<_>>()]),
+        WordPart::Tilde(user) => value!(["tilde", user.as_bytes()]),
     }
 }
 
 fn param_op_json(operator: &ParamOp) -> Value {
     match operator {
-        ParamOp::Normal => json!(["normal"]),
-        ParamOp::Length => json!(["length"]),
-        ParamOp::Default { colon, word } => json!(["default", colon, word.iter().map(part_json).collect::<Vec<_>>()]),
-        ParamOp::Assign { colon, word } => json!(["assign", colon, word.iter().map(part_json).collect::<Vec<_>>()]),
-        ParamOp::Error { colon, word } => json!(["error", colon, word.iter().map(part_json).collect::<Vec<_>>()]),
-        ParamOp::Alternative { colon, word } => json!(["alternative", colon, word.iter().map(part_json).collect::<Vec<_>>()]),
-        ParamOp::TrimSuffixSmall(parts) => json!(["trim_suffix_small", parts.iter().map(part_json).collect::<Vec<_>>()]),
-        ParamOp::TrimSuffixLarge(parts) => json!(["trim_suffix_large", parts.iter().map(part_json).collect::<Vec<_>>()]),
-        ParamOp::TrimPrefixSmall(parts) => json!(["trim_prefix_small", parts.iter().map(part_json).collect::<Vec<_>>()]),
-        ParamOp::TrimPrefixLarge(parts) => json!(["trim_prefix_large", parts.iter().map(part_json).collect::<Vec<_>>()]),
-        ParamOp::BadSubst => json!(["bad_subst"]),
+        ParamOp::Normal => value!(["normal"]),
+        ParamOp::Length => value!(["length"]),
+        ParamOp::Default { colon, word } => value!(["default", *colon, word.iter().map(part_json).collect::<Vec<_>>()]),
+        ParamOp::Assign { colon, word } => value!(["assign", *colon, word.iter().map(part_json).collect::<Vec<_>>()]),
+        ParamOp::Error { colon, word } => value!(["error", *colon, word.iter().map(part_json).collect::<Vec<_>>()]),
+        ParamOp::Alternative { colon, word } => value!(["alternative", *colon, word.iter().map(part_json).collect::<Vec<_>>()]),
+        ParamOp::TrimSuffixSmall(parts) => value!(["trim_suffix_small", parts.iter().map(part_json).collect::<Vec<_>>()]),
+        ParamOp::TrimSuffixLarge(parts) => value!(["trim_suffix_large", parts.iter().map(part_json).collect::<Vec<_>>()]),
+        ParamOp::TrimPrefixSmall(parts) => value!(["trim_prefix_small", parts.iter().map(part_json).collect::<Vec<_>>()]),
+        ParamOp::TrimPrefixLarge(parts) => value!(["trim_prefix_large", parts.iter().map(part_json).collect::<Vec<_>>()]),
+        ParamOp::BadSubst => value!(["bad_subst"]),
     }
 }
 
 fn assignment_json(assignment: &Assignment) -> Value {
-    json!([assignment.name, word_json(&assignment.value)])
+    value!([assignment.name.clone(), word_json(&assignment.value)])
 }
 
 fn redirection_json(redirection: &Redir) -> Value {
-    json!([redirection.fd, redirection_kind_json(&redirection.kind)])
+    value!([redirection.fd, redirection_kind_json(&redirection.kind)])
 }
 
 fn redirection_kind_json(kind: &RedirKind) -> Value {
     match kind {
-        RedirKind::Input(word) => json!(["input", word_json(word)]),
-        RedirKind::Output(word) => json!(["output", word_json(word)]),
-        RedirKind::Clobber(word) => json!(["clobber", word_json(word)]),
-        RedirKind::Append(word) => json!(["append", word_json(word)]),
-        RedirKind::ReadWrite(word) => json!(["read_write", word_json(word)]),
-        RedirKind::DupInput(word) => json!(["dup_input", word_json(word)]),
-        RedirKind::DupOutput(word) => json!(["dup_output", word_json(word)]),
-        RedirKind::HereDoc(body) => json!(["here_doc", here_doc_json(body)]),
-        RedirKind::HereDocStrip(body) => json!(["here_doc_strip", here_doc_json(body)]),
+        RedirKind::Input(word) => value!(["input", word_json(word)]),
+        RedirKind::Output(word) => value!(["output", word_json(word)]),
+        RedirKind::Clobber(word) => value!(["clobber", word_json(word)]),
+        RedirKind::Append(word) => value!(["append", word_json(word)]),
+        RedirKind::ReadWrite(word) => value!(["read_write", word_json(word)]),
+        RedirKind::DupInput(word) => value!(["dup_input", word_json(word)]),
+        RedirKind::DupOutput(word) => value!(["dup_output", word_json(word)]),
+        RedirKind::HereDoc(body) => value!(["here_doc", here_doc_json(body)]),
+        RedirKind::HereDocStrip(body) => value!(["here_doc_strip", here_doc_json(body)]),
     }
 }
 
 fn here_doc_json(body: &HereDocBody) -> Value {
     match body {
-        HereDocBody::Literal(bytes) => json!(["literal", bytes.as_bytes()]),
-        HereDocBody::Parsed(parts) => json!(["parsed", parts.iter().map(part_json).collect::<Vec<_>>()]),
+        HereDocBody::Literal(bytes) => value!(["literal", bytes.as_bytes()]),
+        HereDocBody::Parsed(parts) => value!(["parsed", parts.iter().map(part_json).collect::<Vec<_>>()]),
     }
 }
 
 fn case_arm_json(arm: &CaseArm) -> Value {
-    json!([
+    value!([
         arm.patterns.iter().map(word_json).collect::<Vec<_>>(),
-        arm.body.as_ref().map(command_json).unwrap_or(Value::Null),
+        arm.body.as_ref().map(command_json).unwrap_or(Value::null()),
     ])
 }

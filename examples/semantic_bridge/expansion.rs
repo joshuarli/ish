@@ -6,7 +6,7 @@ use epsh::error::{ExitStatus, ShellError};
 use epsh::expand::ShellExpand;
 use epsh::parser::Parser;
 use epsh::shell_bytes::ShellBytes;
-use serde_json::{Value, json};
+use deser_value::{Value, value};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
@@ -170,35 +170,35 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         _ => vec![32, 9, 10],
     };
     let mut variables = vec![
-        json!(["EMPTY", []]),
-        json!(["HOME", [47, 98, 114, 105, 100, 103, 101, 45, 104, 111, 109, 101]]),
-        json!(["IFS", ifs]),
-        json!(["VALUE", value]),
+        value!(["EMPTY", []]),
+        value!(["HOME", [47, 98, 114, 105, 100, 103, 101, 45, 104, 111, 109, 101]]),
+        value!(["IFS", ifs]),
+        value!(["VALUE", value]),
     ];
     if matches!(case, 43..=45 | 51) {
-        variables.push(json!(["x", [49]]));
+        variables.push(value!(["x", [49]]));
     }
     if matches!(case, 47 | 48) {
         let value: &[u8] = if case == 47 { b"fresh=4" } else { b"nested=4" };
-        variables.push(json!(["EXPR", value]));
+        variables.push(value!(["EXPR", value]));
     }
-    state["variables"] = Value::Array(variables);
-    state["last_status"] = json!(if case == 20 { 37 } else { 0 });
+    state["variables"] = Value::from(variables);
+    state["last_status"] = value!(if case == 20 { 37 } else { 0 });
     state["positional"] = match case {
-        7 | 21 | 22..=25 => json!([[111, 110, 101], [], [116, 104, 114, 101, 101]]),
-        30 => json!([[97], [255]]),
-        _ => json!([]),
+        7 | 21 | 22..=25 => value!([[111, 110, 101], [], [116, 104, 114, 101, 101]]),
+        30 => value!([[97], [255]]),
+        _ => value!([]),
     };
     let process_observations = match case {
-        26 => vec![json!({"id": "parameter:0", "bytes": [115, 99, 114, 105, 112, 116, 255]})],
-        27 => vec![json!({"id": "parameter:$", "bytes": std::process::id().to_string().bytes().collect::<Vec<_>>()})],
-        28 => vec![json!({"id": "parameter:-", "bytes": []})],
-        29 | 42 => vec![json!({"id": "parameter:!", "bytes": [52, 50]})],
+        26 => vec![value!({"id": "parameter:0", "bytes": [115, 99, 114, 105, 112, 116, 255]})],
+        27 => vec![value!({"id": "parameter:$", "bytes": std::process::id().to_string().bytes().collect::<Vec<_>>()})],
+        28 => vec![value!({"id": "parameter:-", "bytes": []})],
+        29 | 42 => vec![value!({"id": "parameter:!", "bytes": [52, 50]})],
         _ => Vec::new(),
     };
     let globs = match case {
-        11 => json!([{
-            "pattern": b"bridge-*.txt",
+        11 => value!([{
+            "pattern": b"bridge-*.txt".to_vec(),
             "quoted": vec![false; b"bridge-*.txt".len()],
             "matches": [
                 b"bridge-a.txt".to_vec(),
@@ -206,7 +206,7 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
                 b"bridge-\xff.txt".to_vec(),
             ],
         }]),
-        12 => json!([glob_json(
+        12 => value!([glob_json(
             b"absent-*.txt",
             vec![false; b"absent-*.txt".len()],
             &[],
@@ -214,7 +214,7 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         13 => {
             let mut quoted = vec![false; b"bridge-**.txt".len()];
             quoted[b"bridge-".len()] = true;
-            json!([glob_json(
+            value!([glob_json(
                 b"bridge-**.txt",
                 quoted,
                 &[b"bridge-*a.txt", b"bridge-*b.txt"],
@@ -231,13 +231,13 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
             prefix.push(b'*');
             prefix.extend_from_slice(b".txt");
             let matched = format!("bridge-{suffix}-a.txt");
-            json!([glob_json(
+            value!([glob_json(
                 &prefix,
                 vec![false; prefix.len()],
                 &[matched.as_bytes()],
             )])
         }
-        _ => json!([]),
+        _ => value!([]),
     };
     generated_request(index, source, state, process_observations, globs)
 }
@@ -297,15 +297,15 @@ fn generate_combinatorial(index: usize, seed: u64) -> BridgeResult<Request> {
         ValuePattern::Empty => vec![Vec::new(), Vec::new(), Vec::new()],
     };
     let mut state = empty_state();
-    state["variables"] = json!([
+    state["variables"] = value!([
         ["EMPTY", []],
         ["HOME", [47, 98, 114, 105, 100, 103, 101, 45, 104, 111, 109, 101]],
         ["IFS", ifs],
         ["VALUE", value],
     ]);
-    state["positional"] = json!(positional);
-    state["last_status"] = json!(0);
-    generated_request(index, source, state, Vec::new(), json!([]))
+    state["positional"] = value!(positional);
+    state["last_status"] = value!(0);
+    generated_request(index, source, state, Vec::new(), value!([]))
 }
 
 fn generated_ifs(kind: IfsKind) -> Vec<u8> {
@@ -413,7 +413,7 @@ fn generated_request(
     let observation_values = observation_map_from_slice(&process_observations)?;
     let process = process_values(&observation_values)?;
     let glob_observations = globs
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("generated expansion globs are not an array"))?;
     let effect_observations = with_glob_directory(glob_observations, |cwd| {
         observe_effects(&words, &state, &process, cwd)
@@ -431,7 +431,7 @@ fn generated_request(
         source: source.into_bytes(),
         state,
         fuel: 128,
-        input: json!({
+        input: value!({
             "words": model_words,
             "observations": observations,
             "globs": globs,
@@ -440,7 +440,7 @@ fn generated_request(
 }
 
 fn glob_json(pattern: &[u8], quoted: Vec<bool>, matches: &[&[u8]]) -> Value {
-    json!({
+    value!({
         "pattern": pattern,
         "quoted": quoted,
         "matches": matches,
@@ -461,11 +461,11 @@ pub(crate) fn validate_case(request: &Request) -> BridgeResult<()> {
         .iter()
         .map(|word| word_json(word, &mut ids))
         .collect::<BridgeResult<Vec<_>>>()?;
-    if request.input["words"] != json!(model_words) {
+    if request.input["words"] != value!(model_words) {
         return Err(BridgeError::new("expansion word oracle does not match parsed source"));
     }
     let observations = request.input["observations"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("expansion observations are not an array"))?;
     let mut observed_ids = std::collections::HashSet::new();
     for observation in observations {
@@ -481,20 +481,20 @@ pub(crate) fn validate_case(request: &Request) -> BridgeResult<()> {
         }
     }
     let globs = request.input["globs"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("expansion glob observations are not an array"))?;
     let mut keys = std::collections::HashSet::new();
     for glob in globs {
         exact_object(glob, &["pattern", "quoted", "matches"], "expansion glob observation")?;
         let pattern = require_bytes(&glob["pattern"], "expansion glob pattern")?;
         let quoted = glob["quoted"]
-            .as_array()
+            .as_seq()
             .ok_or_else(|| BridgeError::new("expansion glob quote mask is not an array"))?;
-        if pattern.len() != quoted.len() || quoted.iter().any(|value| !value.is_boolean()) {
+        if pattern.len() != quoted.len() || quoted.iter().any(|value| value.as_bool().is_none()) {
             return Err(BridgeError::new("expansion glob quote mask has incorrect length or values"));
         }
         let matches = glob["matches"]
-            .as_array()
+            .as_seq()
             .ok_or_else(|| BridgeError::new("expansion glob matches are not an array"))?;
         for matched in matches {
             let bytes = require_bytes(matched, "expansion glob match")?;
@@ -518,7 +518,7 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
     let program = parse_program(source)?;
     let words = command_words(&program)?;
     let globs = request.input["globs"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("expansion glob observations are not an array"))?;
     let mut ids = ObservationIds::default();
     for word in &words {
@@ -530,7 +530,7 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
         .iter()
         .find(|id| !observations.contains_key(id.as_str()) && id.as_str() != "parameter:!");
     if let Some(id) = missing {
-        return Ok(json!({
+        return Ok(value!({
             "tag": "unsupported_domain",
             "reason": format!("missing process parameter observation: {id}"),
         }));
@@ -545,7 +545,7 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
                 .ok_or_else(|| BridgeError::new("production effect observation ID is not text"))?;
             let Some(expected) = observations.get(id) else {
                 let kind = if id.starts_with("sub") { "substitution" } else { "arithmetic" };
-                return Ok(json!({
+                return Ok(value!({
                     "tag": "unsupported_domain",
                     "reason": format!("missing {kind} oracle: {id}"),
                 }));
@@ -582,7 +582,7 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
             }
         }
         let state = resulting_state(request, &initial_bindings, context.shell)?;
-        Ok(json!({
+        Ok(value!({
             "tag": "success",
             "value": {"fields": fields, "state": state, "trace": []},
         }))
@@ -605,7 +605,7 @@ fn effect_observations_match(expected: &[Value], actual: &[Value], initial_statu
             }
             Some(_) => return false,
             None => {
-                if let Some(actual_status) = actual.get("status").and_then(Value::as_u64) {
+                if let Some(actual_status) = actual.get("status").and_then(|value| value.as_u64()) {
                     if actual_status != u64::from(status) {
                         return false;
                     }
@@ -617,11 +617,11 @@ fn effect_observations_match(expected: &[Value], actual: &[Value], initial_statu
             if expected_bindings != &actual["bindings"] {
                 return false;
             }
-        } else if actual["bindings"].as_array().is_none_or(|bindings| !bindings.is_empty()) {
+        } else if actual["bindings"].as_seq().is_none_or(|bindings| !bindings.is_empty()) {
             return false;
         }
         if let Some(expected_error) = expected.get("error") {
-            if expected_error != actual.get("error").unwrap_or(&Value::Null) {
+            if expected_error != actual.get("error").unwrap_or(&Value::null()) {
                 return false;
             }
         } else if actual.get("error").is_some() {
@@ -694,7 +694,7 @@ impl ShellExpand for PrimitiveExpandContext<'_> {
 
 fn observation_map(request: &Request) -> BridgeResult<HashMap<&str, &Value>> {
     let entries = request.input["observations"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("expansion observations are not an array"))?;
     observation_map_from_slice(entries)
 }
@@ -751,13 +751,13 @@ fn parse_observed_pid(bytes: &[u8], context: &str) -> BridgeResult<u32> {
 
 fn validate_observation(value: &Value) -> BridgeResult<()> {
     let object = value
-        .as_object()
+        .as_map()
         .ok_or_else(|| BridgeError::new("expansion observation is not an object"))?;
     if !object.contains_key("id")
         || !object.contains_key("bytes")
         || object
             .keys()
-            .any(|key| !matches!(key.as_str(), "id" | "bytes" | "status" | "bindings" | "error"))
+            .any(|key| !matches!(key.as_str(), Some("id" | "bytes" | "status" | "bindings" | "error")))
     {
         return Err(BridgeError::new("expansion observation has incorrect fields"));
     }
@@ -774,10 +774,10 @@ fn validate_observation(value: &Value) -> BridgeResult<()> {
     }
     if let Some(bindings) = object.get("bindings") {
         let bindings = bindings
-            .as_array()
+            .as_seq()
             .ok_or_else(|| BridgeError::new("expansion observation bindings are not an array"))?;
         for binding in bindings {
-            if binding.as_array().is_none_or(|pair| pair.len() != 2) {
+            if binding.as_seq().is_none_or(|pair| pair.len() != 2) {
                 return Err(BridgeError::new("expansion observation binding is not a pair"));
             }
             let name = binding[0]
@@ -831,16 +831,16 @@ fn build_shell(
         }))
         .build();
     let variables = state["variables"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("expansion variables are not an array"))?;
     for binding in variables {
         set_variable(&mut shell, binding)?;
     }
     let exported = state["exported"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("expansion exported variables are not an array"))?;
     for binding in exported {
-        if binding.as_array().is_none_or(|pair| pair.len() != 2) {
+        if binding.as_seq().is_none_or(|pair| pair.len() != 2) {
             return Err(BridgeError::new("expansion exported variable is not a pair"));
         }
         let name = binding[0]
@@ -857,7 +857,7 @@ fn build_shell(
         .set_bytes("IFS", ShellBytes::from_vec(ifs))
         .map_err(BridgeError::new)?;
     let positional = state["positional"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("expansion positional state is not an array"))?
         .iter()
         .map(|bytes| require_bytes(bytes, "expansion positional argument").map(ShellBytes::from_vec))
@@ -880,7 +880,7 @@ fn build_shell(
 fn state_binding(state: &Value, name: &str) -> BridgeResult<Option<Vec<u8>>> {
     for field in ["variables", "exported"] {
         let bindings = state[field]
-            .as_array()
+            .as_seq()
             .ok_or_else(|| BridgeError::new(format!("expansion {field} are not an array")))?;
         if let Some(binding) = bindings
             .iter()
@@ -942,7 +942,7 @@ fn observe_word_effects(
                         "command substitution changed parent bindings",
                     ));
                 }
-                let mut observation = json!({
+                let mut observation = value!({
                     "id": id,
                     "bytes": bytes,
                     "status": shell.exit_status().code().clamp(0, 255),
@@ -965,7 +965,7 @@ fn observe_word_effects(
                             return Err(BridgeError::new("arithmetic observation did not produce one field"));
                         }
                         let after = context.shell.vars().bindings_bytes();
-                        result.push(json!({
+                        result.push(value!({
                             "id": id,
                             "bytes": ShellBytes::from_str_lossless(&fields[0]).into_vec(),
                             "bindings": changed_bindings(&before, &after),
@@ -977,7 +977,7 @@ fn observe_word_effects(
                             _ => error.to_string(),
                         };
                         let after = context.shell.vars().bindings_bytes();
-                        result.push(json!({
+                        result.push(value!({
                             "id": id,
                             "bytes": [],
                             "bindings": changed_bindings(&before, &after),
@@ -1013,7 +1013,7 @@ fn changed_bindings(
                 .iter()
                 .find(|(previous_name, _)| previous_name == name)
                 .map(|(_, previous_value)| previous_value);
-            (previous != Some(value)).then(|| json!([name, value.as_bytes()]))
+            (previous != Some(value)).then(|| value!([name, value.as_bytes()]))
         })
         .collect()
 }
@@ -1027,7 +1027,7 @@ fn resulting_state(
     let current_bindings = shell.vars().bindings_bytes();
     let changes: Vec<_> = changed_bindings(initial_bindings, &current_bindings);
     let variables = state["variables"]
-        .as_array_mut()
+        .as_seq_mut()
         .ok_or_else(|| BridgeError::new("expansion variables are not an array"))?;
     for change in &changes {
         let name = change[0]
@@ -1038,13 +1038,13 @@ fn resulting_state(
             .iter_mut()
             .find(|binding| binding[0].as_str() == Some(name))
         {
-            binding[1] = json!(value);
+            binding[1] = value!(value);
         } else {
-            variables.push(json!([name, value]));
+            variables.push(value!([name, value]));
         }
     }
     let exported = state["exported"]
-        .as_array_mut()
+        .as_seq_mut()
         .ok_or_else(|| BridgeError::new("expansion exported variables are not an array"))?;
     for binding in exported {
         let name = binding[0]
@@ -1054,7 +1054,7 @@ fn resulting_state(
             binding[1] = change[1].clone();
         }
     }
-    state["last_status"] = json!(shell.exit_status().code().clamp(0, 255));
+    state["last_status"] = value!(shell.exit_status().code().clamp(0, 255));
     Ok(state)
 }
 
@@ -1063,7 +1063,7 @@ fn semantic_error_outcome(error: ShellError, state: Value) -> BridgeResult<Value
         BridgeError::new(format!("production expansion error is outside semantic domain: {error}"))
     })?;
     let message = expansion_error_message(error)?;
-    Ok(json!({
+    Ok(value!({
         "tag": "semantic_error",
         "error": {"kind": kind, "message": message},
         "state": state,
@@ -1076,7 +1076,7 @@ fn expansion_error_value(error: ShellError) -> BridgeResult<Value> {
         BridgeError::new(format!("command substitution error is outside semantic domain: {error}"))
     })?;
     let message = expansion_error_message(error)?;
-    Ok(json!({"kind": kind, "message": message}))
+    Ok(value!({"kind": kind, "message": message}))
 }
 
 fn expansion_error_kind(error: &ShellError) -> Option<&'static str> {
@@ -1098,7 +1098,7 @@ fn expansion_error_message(error: ShellError) -> BridgeResult<String> {
 }
 
 fn set_variable(shell: &mut epsh::eval::Shell, binding: &Value) -> BridgeResult<()> {
-    if binding.as_array().is_none_or(|pair| pair.len() != 2) {
+    if binding.as_seq().is_none_or(|pair| pair.len() != 2) {
         return Err(BridgeError::new("expansion variable is not a pair"));
     }
     let name = binding[0]
@@ -1130,7 +1130,7 @@ fn with_glob_directory<T>(
     let result = (|| {
         for glob in globs {
             let matches = glob["matches"]
-                .as_array()
+                .as_seq()
                 .ok_or_else(|| BridgeError::new("expansion glob matches are not an array"))?;
             for matched in matches {
                 let bytes = require_bytes(matched, "expansion glob match")?;
@@ -1167,15 +1167,15 @@ pub(crate) fn negative_control(outcome: &Value) -> BridgeResult<Value> {
         return Err(BridgeError::new("expansion negative control needs success"));
     }
     let fields = altered["value"]["fields"]
-        .as_array_mut()
+        .as_seq_mut()
         .ok_or_else(|| BridgeError::new("expansion result fields are malformed"))?;
     if let Some(first) = fields.first_mut() {
         first
-            .as_array_mut()
+            .as_seq_mut()
             .ok_or_else(|| BridgeError::new("expansion result field is not bytes"))?
-            .push(json!(0));
+            .push(value!(0));
     } else {
-        fields.push(json!([0]));
+        fields.push(value!([0]));
     }
     Ok(altered)
 }
@@ -1294,29 +1294,29 @@ fn validate_substitution(command: &Command, depth: usize) -> BridgeResult<()> {
 }
 
 fn word_json(word: &Word, ids: &mut ObservationIds) -> BridgeResult<Value> {
-    Ok(Value::Array(parts_json(&word.parts, false, ids)?))
+    Ok(Value::from(parts_json(&word.parts, false, ids)?))
 }
 
 fn parts_json(parts: &[WordPart], quoted: bool, ids: &mut ObservationIds) -> BridgeResult<Vec<Value>> {
     let mut result = Vec::new();
     for part in parts {
         match part {
-            WordPart::Literal(bytes) => result.push(json!({
+            WordPart::Literal(bytes) => result.push(value!({
                 "tag": if quoted { "quoted" } else { "literal" },
                 "bytes": bytes.as_bytes(),
             })),
-            WordPart::SingleQuoted(bytes) => result.push(json!({"tag": "quoted", "bytes": bytes.as_bytes()})),
+            WordPart::SingleQuoted(bytes) => result.push(value!({"tag": "quoted", "bytes": bytes.as_bytes()})),
             WordPart::DoubleQuoted(inner) if inner.is_empty() => {
-                result.push(json!({"tag": "quoted", "bytes": []}));
+                result.push(value!({"tag": "quoted", "bytes": []}));
             }
             WordPart::DoubleQuoted(inner) => result.extend(parts_json(inner, true, ids)?),
             WordPart::Param(parameter) => {
                 let default = match &parameter.op {
-                    ParamOp::Normal => Value::Null,
-                    ParamOp::Default { colon, word } => json!({"colon": colon, "bytes": static_parts(word)
+                    ParamOp::Normal => Value::null(),
+                    ParamOp::Default { colon, word } => value!({"colon": *colon, "bytes": static_parts(word)
                         .ok_or_else(|| BridgeError::new("parameter default is not literal"))?}),
                     ParamOp::BadSubst => {
-                        result.push(json!({"tag": "bad_substitution", "name": parameter.name}));
+                        result.push(value!({"tag": "bad_substitution", "name": parameter.name.clone()}));
                         continue;
                     }
                     _ => return Err(BridgeError::new("unsupported expansion parameter operator")),
@@ -1326,25 +1326,25 @@ fn parts_json(parts: &[WordPart], quoted: bool, ids: &mut ObservationIds) -> Bri
                     ids.all.insert(id.clone());
                     ids.process.insert(id);
                 }
-                result.push(json!({
+                result.push(value!({
                     "tag": "parameter",
-                    "name": parameter.name,
+                    "name": parameter.name.clone(),
                     "quoted": quoted,
                     "default": default,
                 }));
             }
-            WordPart::Tilde(user) => result.push(json!({"tag": "tilde", "user": user.as_bytes()})),
+            WordPart::Tilde(user) => result.push(value!({"tag": "tilde", "user": user.as_bytes()})),
             WordPart::CmdSubst(_) | WordPart::Backtick(_) => {
                 let id = format!("sub{}", ids.substitution);
                 ids.substitution += 1;
                 register_effect(ids, &id);
-                result.push(json!({"tag": "substitution", "id": id, "quoted": quoted}));
+                result.push(value!({"tag": "substitution", "id": id, "quoted": quoted}));
             }
             WordPart::Arith(_) => {
                 let id = format!("arith{}", ids.arithmetic);
                 ids.arithmetic += 1;
                 register_effect(ids, &id);
-                result.push(json!({"tag": "arithmetic", "id": id, "quoted": quoted}));
+                result.push(value!({"tag": "arithmetic", "id": id, "quoted": quoted}));
             }
         }
     }
@@ -1362,7 +1362,7 @@ mod tests {
         COMBINATORIAL_PERIOD, LEGACY_FIXTURE_COUNT,
     };
     use epsh::error::ShellError;
-    use serde_json::json;
+    use deser_value::value;
     use std::collections::HashSet;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -1376,7 +1376,7 @@ mod tests {
             .iter()
             .map(|request| {
                 request.state["variables"][2][1]
-                    .as_array()
+                    .as_seq()
                     .unwrap()
                     .iter()
                     .map(|byte| byte.as_u64().unwrap() as u8)
@@ -1387,7 +1387,7 @@ mod tests {
             .iter()
             .map(|request| {
                 request.state["variables"][3][1]
-                    .as_array()
+                    .as_seq()
                     .unwrap()
                     .iter()
                     .map(|byte| byte.as_u64().unwrap() as u8)
@@ -1432,20 +1432,20 @@ mod tests {
         assert!(sources.contains("echo \"$*\""));
         assert!(sources.contains("echo $*"));
         assert!(requests.iter().any(|request| {
-            request.state["variables"][2][1] == json!([58])
-                && request.state["variables"][3][1] == json!([97, 58, 58, 98, 58])
+            request.state["variables"][2][1] == value!([58])
+                && request.state["variables"][3][1] == value!([97, 58, 58, 98, 58])
         }));
         let combinations: HashSet<(usize, usize, usize)> = requests
             .iter()
             .map(|request| {
                 let ifs: Vec<u8> = request.state["variables"][2][1]
-                    .as_array()
+                    .as_seq()
                     .unwrap()
                     .iter()
                     .map(|byte| byte.as_u64().unwrap() as u8)
                     .collect();
                 let value: Vec<u8> = request.state["variables"][3][1]
-                    .as_array()
+                    .as_seq()
                     .unwrap()
                     .iter()
                     .map(|byte| byte.as_u64().unwrap() as u8)
@@ -1551,15 +1551,15 @@ mod tests {
         let literal_noncharacter = actual(&generate(50, 0).unwrap()).unwrap();
         let glob = actual(&generate(11, 0).unwrap()).unwrap();
 
-        assert_eq!(invalid["value"]["fields"], json!([[255]]));
-        assert_eq!(literal_pua["value"]["fields"], json!([[238, 130, 128]]));
+        assert_eq!(invalid["value"]["fields"], value!([[255]]));
+        assert_eq!(literal_pua["value"]["fields"], value!([[238, 130, 128]]));
         assert_eq!(
             literal_noncharacter["value"]["fields"],
-            json!(["literal:\u{fffe}".as_bytes()])
+            value!(["literal:\u{fffe}".as_bytes()])
         );
         assert_eq!(
             glob["value"]["fields"],
-            json!([
+            value!([
                 [98, 114, 105, 100, 103, 101, 45, 97, 46, 116, 120, 116],
                 [98, 114, 105, 100, 103, 101, 45, 238, 130, 128, 46, 116, 120, 116],
                 [98, 114, 105, 100, 103, 101, 45, 255, 46, 116, 120, 116],
@@ -1572,13 +1572,13 @@ mod tests {
         let request = generate(51, 0).unwrap();
         let outcome = actual(&request).unwrap();
 
-        assert_eq!(request.input["observations"], json!([
+        assert_eq!(request.input["observations"], value!([
             {"id": "sub0", "bytes": [52], "status": 0, "bindings": []}
         ]));
-        assert_eq!(outcome["value"]["fields"], json!([[52, 49]]));
+        assert_eq!(outcome["value"]["fields"], value!([[52, 49]]));
         assert_eq!(
-            outcome["value"]["state"]["variables"].as_array().unwrap().last(),
-            Some(&json!(["x", [49]]))
+            outcome["value"]["state"]["variables"].as_seq().unwrap().last(),
+            Some(&value!(["x", [49]]))
         );
     }
 
@@ -1587,10 +1587,10 @@ mod tests {
         let request = generate(52, 0).unwrap();
         let outcome = actual(&request).unwrap();
 
-        assert_eq!(request.input["observations"], json!([
+        assert_eq!(request.input["observations"], value!([
             {"id": "sub0", "bytes": [], "status": 0, "bindings": []}
         ]));
-        assert_eq!(outcome["value"]["fields"], json!([]));
+        assert_eq!(outcome["value"]["fields"], value!([]));
         assert_eq!(outcome["value"]["state"]["cwd"], request.state["cwd"]);
         assert_eq!(outcome["value"]["state"]["variables"], request.state["variables"]);
     }
@@ -1614,7 +1614,7 @@ mod tests {
     fn effect_ids_are_unique_and_substitution_status_flows_to_later_parts() {
         let sibling_substitutions = generate(36, 0).unwrap();
         let sibling_ids: Vec<_> = sibling_substitutions.input["observations"]
-            .as_array()
+            .as_seq()
             .unwrap()
             .iter()
             .map(|observation| observation["id"].as_str().unwrap())
@@ -1624,7 +1624,7 @@ mod tests {
         let backtick = actual(&generate(39, 0).unwrap()).unwrap();
         let arithmetic = generate(37, 0).unwrap();
         let arithmetic_ids: Vec<_> = arithmetic.input["observations"]
-            .as_array()
+            .as_seq()
             .unwrap()
             .iter()
             .map(|observation| observation["id"].as_str().unwrap())
@@ -1632,12 +1632,12 @@ mod tests {
         let status = actual(&generate(40, 0).unwrap()).unwrap();
 
         assert_eq!(sibling_ids, ["sub0", "sub1"]);
-        assert_eq!(sibling_output["value"]["fields"], json!([[97, 108, 112, 104, 97, 98, 101, 116, 97]]));
-        assert_eq!(nested_substitution["value"]["fields"], json!([[120]]));
-        assert_eq!(backtick["value"]["fields"], json!([[98, 97, 99, 107, 116, 105, 99, 107]]));
+        assert_eq!(sibling_output["value"]["fields"], value!([[97, 108, 112, 104, 97, 98, 101, 116, 97]]));
+        assert_eq!(nested_substitution["value"]["fields"], value!([[120]]));
+        assert_eq!(backtick["value"]["fields"], value!([[98, 97, 99, 107, 116, 105, 99, 107]]));
         assert_eq!(arithmetic_ids, ["arith0", "arith1"]);
-        assert_eq!(status["value"]["fields"], json!([[49]]));
-        assert_eq!(status["value"]["state"]["last_status"], json!(1));
+        assert_eq!(status["value"]["fields"], value!([[49]]));
+        assert_eq!(status["value"]["state"]["last_status"], value!(1));
     }
 
     #[test]
@@ -1646,7 +1646,7 @@ mod tests {
 
         assert_eq!(outcome["tag"], "semantic_error");
         assert_eq!(outcome["error"]["kind"], "arithmetic");
-        assert_eq!(outcome["state"]["variables"], json!([
+        assert_eq!(outcome["state"]["variables"], value!([
             ["EMPTY", []],
             ["HOME", [47, 98, 114, 105, 100, 103, 101, 45, 104, 111, 109, 101]],
             ["IFS", [32, 9, 10]],
@@ -1662,14 +1662,14 @@ mod tests {
         let unreachable = generate(49, 0).unwrap();
         assert_eq!(
             unreachable.input["observations"],
-            json!([{"id": "arith0", "bytes": [], "bindings": [], "error": {"kind": "arithmetic", "message": "arithmetic error: division by zero"}}])
+            value!([{"id": "arith0", "bytes": [], "bindings": [], "error": {"kind": "arithmetic", "message": "arithmetic error: division by zero"}}])
         );
         let failed = actual(&unreachable).unwrap();
 
-        assert_eq!(simple["value"]["fields"], json!([[52]]));
-        assert_eq!(simple["value"]["state"]["variables"].as_array().unwrap().iter().find(|binding| binding[0] == "fresh"), Some(&json!(["fresh", [52]])));
-        assert_eq!(nested["value"]["fields"], json!([[53]]));
-        assert_eq!(nested["value"]["state"]["variables"].as_array().unwrap().iter().find(|binding| binding[0] == "nested"), Some(&json!(["nested", [52]])));
+        assert_eq!(simple["value"]["fields"], value!([[52]]));
+        assert_eq!(simple["value"]["state"]["variables"].as_seq().unwrap().iter().find(|binding| binding[0] == "fresh"), Some(&value!(["fresh", [52]])));
+        assert_eq!(nested["value"]["fields"], value!([[53]]));
+        assert_eq!(nested["value"]["state"]["variables"].as_seq().unwrap().iter().find(|binding| binding[0] == "nested"), Some(&value!(["nested", [52]])));
         assert_eq!(failed["tag"], "semantic_error");
         assert_eq!(failed["error"]["kind"], "arithmetic");
     }

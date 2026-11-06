@@ -7,7 +7,7 @@ use epsh::eval::{Shell, external_command_cwd};
 use epsh::expand::remove_glob_escapes;
 use epsh::parser::Parser;
 use epsh::shell_bytes::ShellBytes;
-use serde_json::{Value, json};
+use deser_value::{Value, value};
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -341,7 +341,7 @@ fn initial_state(index: usize) -> Value {
     } else {
         vec![b'e', 0xff]
     };
-    json!({
+    value!({
         "variables": [
             ["counter", index.to_string().into_bytes()],
             ["plain", b"before".to_vec()],
@@ -507,7 +507,7 @@ fn quote_bytes(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn join_source(parts: &[Vec<u8>], separator: &[u8]) -> Vec<u8> {
-    let capacity = parts.iter().map(Vec::len).sum::<usize>()
+    let capacity = parts.iter().map(|items| items.len()).sum::<usize>()
         + separator.len().saturating_mul(parts.len().saturating_sub(1));
     let mut source = Vec::with_capacity(capacity);
     for (index, part) in parts.iter().enumerate() {
@@ -587,7 +587,7 @@ fn decode_state(value: &Value) -> BridgeResult<InitialState> {
     )?;
     let variables = decode_bindings(&value["variables"], "evaluation variables")?;
     let exported_pairs = decode_bindings(&value["exported"], "evaluation exports")?;
-    if value["inherited"].as_array().is_none_or(|entries| !entries.is_empty()) {
+    if value["inherited"].as_seq().is_none_or(|entries| !entries.is_empty()) {
         return Err(BridgeError::new(
             "evaluation source adapter requires an empty inherited environment",
         ));
@@ -602,7 +602,7 @@ fn decode_state(value: &Value) -> BridgeResult<InitialState> {
     }
     let cwd = require_bytes(&value["cwd"], "evaluation cwd")?;
     let positional = value["positional"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("evaluation positional state is not an array"))?
         .iter()
         .map(|argument| require_bytes(argument, "evaluation positional argument"))
@@ -622,14 +622,14 @@ fn decode_state(value: &Value) -> BridgeResult<InitialState> {
 
 fn decode_bindings(value: &Value, context: &str) -> BridgeResult<Vec<(String, Vec<u8>)>> {
     let pairs = value
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new(format!("{context} is not an array")))?;
     let mut seen = HashSet::new();
     pairs
         .iter()
         .map(|pair| {
             let pair = pair
-                .as_array()
+                .as_seq()
                 .filter(|pair| pair.len() == 2)
                 .ok_or_else(|| BridgeError::new(format!("{context} entry is not a pair")))?;
             let name = pair[0]
@@ -660,7 +660,7 @@ fn is_shell_name(name: &str) -> bool {
 fn decode_observations(input: &Value) -> BridgeResult<Vec<Observation>> {
     exact_object(input, &["program", "observations", "options"], "evaluation input")?;
     let entries = input["observations"]
-        .as_array()
+        .as_seq()
         .ok_or_else(|| BridgeError::new("evaluation observations are not an array"))?;
     entries
         .iter()
@@ -699,7 +699,7 @@ fn parse_source(source: &[u8]) -> BridgeResult<Program> {
 
 fn make_input(source: &[u8], observations: &[Observation], options: &Options) -> BridgeResult<Value> {
     let program = parse_source(source)?;
-    Ok(json!({
+    Ok(value!({
         "program": program_json(&program)?,
         "observations": observations.iter().map(observation_json).collect::<Vec<_>>(),
         "options": {"errexit": options.errexit, "pipefail": options.pipefail},
@@ -707,7 +707,7 @@ fn make_input(source: &[u8], observations: &[Observation], options: &Options) ->
 }
 
 fn observation_json(observation: &Observation) -> Value {
-    json!({
+    value!({
         "status": observation.status,
         "stdout": observation.stdout.clone(),
         "stderr": observation.stderr.clone(),
@@ -725,7 +725,7 @@ fn program_json(program: &Program) -> BridgeResult<Value> {
         .cloned()
         .ok_or_else(|| BridgeError::new("evaluation program is empty"))?;
     Ok(commands.into_iter().skip(1).fold(first, |left, right| {
-        json!({"tag": "sequence", "left": left, "right": right})
+        value!({"tag": "sequence", "left": left, "right": right})
     }))
 }
 
@@ -749,8 +749,8 @@ fn command_json(command: &Command) -> BridgeResult<Value> {
                     if status.is_some() {
                         assignment_status = status;
                     }
-                    Ok(json!([
-                        assignment.name,
+                    Ok(value!([
+                        assignment.name.clone(),
                         value
                     ]))
                 })
@@ -778,7 +778,7 @@ fn command_json(command: &Command) -> BridgeResult<Value> {
             } else {
                 callback_index(&argv[0])?
             };
-            Ok(json!({
+            Ok(value!({
                 "tag": "simple",
                 "assignments": assignments,
                 "argv": argv,
@@ -786,35 +786,35 @@ fn command_json(command: &Command) -> BridgeResult<Value> {
                 "assignment_status": assignment_status,
             }))
         }
-        Command::Sequence(left, right) => Ok(json!({
+        Command::Sequence(left, right) => Ok(value!({
             "tag": "sequence",
             "left": command_json(left)?,
             "right": command_json(right)?,
         })),
-        Command::And(left, right) => Ok(json!({
+        Command::And(left, right) => Ok(value!({
             "tag": "and",
             "left": command_json(left)?,
             "right": command_json(right)?,
         })),
-        Command::Or(left, right) => Ok(json!({
+        Command::Or(left, right) => Ok(value!({
             "tag": "or",
             "left": command_json(left)?,
             "right": command_json(right)?,
         })),
-        Command::Not(body) => Ok(json!({"tag": "not", "body": command_json(body)?})),
+        Command::Not(body) => Ok(value!({"tag": "not", "body": command_json(body)?})),
         Command::Subshell { body, redirs, .. } => {
             if !redirs.is_empty() {
                 return Err(BridgeError::new("evaluation subshell contains a redirection"));
             }
-            Ok(json!({"tag": "subshell", "body": command_json(body)?}))
+            Ok(value!({"tag": "subshell", "body": command_json(body)?}))
         }
         Command::Pipeline { commands, bang, .. } if commands.len() == 1 && *bang => {
-            Ok(json!({"tag": "not", "body": command_json(&commands[0])?}))
+            Ok(value!({"tag": "not", "body": command_json(&commands[0])?}))
         }
-        Command::Pipeline { commands, bang, .. } => Ok(json!({
+        Command::Pipeline { commands, bang, .. } => Ok(value!({
             "tag": "pipeline",
             "commands": commands.iter().map(command_json).collect::<BridgeResult<Vec<_>>>()?,
-            "bang": bang,
+            "bang": *bang,
         })),
         _ => Err(BridgeError::new(
             "evaluation source uses syntax outside the admitted command set",
@@ -975,7 +975,7 @@ fn callback_index(name: &[u8]) -> BridgeResult<usize> {
 fn collect_observation_indices(program: &Value, indices: &mut Vec<usize>) -> BridgeResult<()> {
     match program["tag"].as_str() {
         Some("simple") => {
-            if program["argv"].as_array().is_none_or(|argv| argv.is_empty()) {
+            if program["argv"].as_seq().is_none_or(|argv| argv.is_empty()) {
                 return Ok(());
             }
             let index = program["observation"]
@@ -990,7 +990,7 @@ fn collect_observation_indices(program: &Value, indices: &mut Vec<usize>) -> Bri
         Some("not" | "subshell") => collect_observation_indices(&program["body"], indices)?,
         Some("pipeline") => {
             let commands = program["commands"]
-                .as_array()
+                .as_seq()
                 .ok_or_else(|| BridgeError::new("evaluation pipeline commands are malformed"))?;
             for command in commands {
                 collect_observation_indices(command, indices)?;
@@ -1008,7 +1008,7 @@ fn expression_depth(program: &Value) -> usize {
         }
         Some("not" | "subshell") => 1 + expression_depth(&program["body"]),
         Some("pipeline") => 1 + program["commands"]
-            .as_array()
+            .as_seq()
             .into_iter()
             .flatten()
             .map(expression_depth)
@@ -1025,14 +1025,14 @@ fn validate_pipeline_observations(
     match program["tag"].as_str() {
         Some("pipeline") => {
             let commands = program["commands"]
-                .as_array()
+                .as_seq()
                 .ok_or_else(|| BridgeError::new("evaluation pipeline commands are malformed"))?;
             if commands.len() < 2 {
                 return Err(BridgeError::new("evaluation pipeline must have at least two stages"));
             }
             for (index, command) in commands.iter().enumerate() {
                 if command["tag"] != "simple"
-                    || command["argv"].as_array().is_none_or(|argv| argv.is_empty())
+                    || command["argv"].as_seq().is_none_or(|argv| argv.is_empty())
                 {
                     return Err(BridgeError::new(
                         "evaluation pipeline stages must be direct external commands",
@@ -1165,14 +1165,14 @@ fn actual_in_scratch(
             })
             .collect();
         environment.sort_by(|left, right| left.0.cmp(&right.0));
-        let event = json!({
+        let event = value!({
             "argv": argv.iter().map(|argument| argument.as_bytes().to_vec()).collect::<Vec<_>>(),
-            "environment": environment,
+            "environment": super::pairs(environment),
             "cwd": cwd.as_os_str().as_bytes(),
-            "stdout": observation.stdout,
-            "stderr": observation.stderr,
+            "stdout": observation.stdout.clone(),
+            "stderr": observation.stderr.clone(),
         });
-        let bytes = serde_json::to_vec(&event)
+        let bytes = deser_json::to_string(&event).map(String::into_bytes)
             .map_err(|error| ShellError::Io(std::io::Error::other(error.to_string())))?;
         let mut file = OpenOptions::new()
             .write(true)
@@ -1207,7 +1207,7 @@ fn actual_in_scratch(
     let program = program_json(parsed)?;
     let state = resulting_state(&program, initial_state, &shell, status)?;
     let trace = recorded_trace(scratch, &program, observations.len())?;
-    Ok(json!({
+    Ok(value!({
         "tag": "success",
         "value": {
             "state": state,
@@ -1237,7 +1237,7 @@ fn resulting_state(
         .filter_map(|name| {
             shell
                 .get_var_bytes(&name)
-                .map(|value| json!([name, value.as_bytes()]))
+                .map(|value| value!([name, value.as_bytes()]))
         })
         .collect::<Vec<_>>();
     let mut exported_names = initial.exported.clone();
@@ -1248,15 +1248,15 @@ fn resulting_state(
             let value = shell
                 .get_var_bytes(&name)
                 .ok_or_else(|| BridgeError::new("exported evaluation variable became unset"))?;
-            Ok(json!([name, value.as_bytes()]))
+            Ok(value!([name, value.as_bytes()]))
         })
         .collect::<BridgeResult<Vec<_>>>()?;
-    Ok(json!({
+    Ok(value!({
         "variables": variables,
         "exported": exported,
         "inherited": [],
-        "cwd": initial.cwd,
-        "positional": initial.positional,
+        "cwd": initial.cwd.clone(),
+        "positional": initial.positional.clone(),
         "last_status": status,
     }))
 }
@@ -1267,9 +1267,9 @@ fn collect_persistent_assignment_names(
 ) -> BridgeResult<()> {
     match program["tag"].as_str() {
         Some("simple") => {
-            if program["argv"].as_array().is_some_and(|argv| argv.is_empty()) {
+            if program["argv"].as_seq().is_some_and(|argv| argv.is_empty()) {
                 let assignments = program["assignments"]
-                    .as_array()
+                    .as_seq()
                     .ok_or_else(|| BridgeError::new("evaluation assignments are malformed"))?;
                 for assignment in assignments {
                     let name = assignment[0]
@@ -1295,7 +1295,7 @@ fn collect_persistent_assignment_names(
 fn pipeline_observation_groups(program: &Value, groups: &mut Vec<Vec<usize>>) -> BridgeResult<()> {
     match program["tag"].as_str() {
         Some("pipeline") => {
-            let commands = program["commands"].as_array()
+            let commands = program["commands"].as_seq()
                 .ok_or_else(|| BridgeError::new("evaluation pipeline commands are malformed"))?;
             let indices = commands.iter().map(|command| {
                 command["observation"].as_u64()
@@ -1359,19 +1359,19 @@ fn recorded_trace(scratch: &Scratch, program: &Value, observation_count: usize) 
                 )));
             }
         };
-        let event: Value = serde_json::from_slice(&bytes)
+        let event: Value = deser_json::from_slice(&bytes)
             .map_err(|error| BridgeError::new(format!("evaluation callback event is malformed: {error}")))?;
-        trace.push(json!({
+        trace.push(value!({
             "tag": "invoke",
-            "argv": event["argv"],
-            "environment": event["environment"],
-            "cwd": event["cwd"],
+            "argv": event["argv"].clone(),
+            "environment": event["environment"].clone(),
+            "cwd": event["cwd"].clone(),
         }));
-        if !event["stdout"].as_array().is_some_and(Vec::is_empty) {
-            trace.push(json!({"tag": "write", "fd": 1, "bytes": event["stdout"]}));
+        if !event["stdout"].as_seq().is_some_and(|items| items.is_empty()) {
+            trace.push(value!({"tag": "write", "fd": 1, "bytes": event["stdout"].clone()}));
         }
-        if !event["stderr"].as_array().is_some_and(Vec::is_empty) {
-            trace.push(json!({"tag": "write", "fd": 2, "bytes": event["stderr"]}));
+        if !event["stderr"].as_seq().is_some_and(|items| items.is_empty()) {
+            trace.push(value!({"tag": "write", "fd": 2, "bytes": event["stderr"].clone()}));
         }
     }
     Ok(trace)
@@ -1386,7 +1386,7 @@ pub(crate) fn negative_control(outcome: &Value) -> BridgeResult<Value> {
         .filter(|status| *status < 256)
         .ok_or_else(|| BridgeError::new("evaluation outcome status is malformed"))?;
     let mut altered = outcome.clone();
-    altered["value"]["status"] = json!(if status == 0 { 1 } else { 0 });
+    altered["value"]["status"] = value!(if status == 0 { 1 } else { 0 });
     altered["value"]["state"]["last_status"] = altered["value"]["status"].clone();
     Ok(altered)
 }
@@ -1580,18 +1580,18 @@ mod tests {
     fn sequential_callback_trace_preserves_observed_invocation_order() {
         let scratch = Scratch::new().expect("evaluation scratch");
         for index in [1, 0] {
-            let event = json!({
+            let event = value!({
                 "argv": [callback_name(index).as_bytes()],
                 "environment": [], "cwd": [47], "stdout": [], "stderr": [],
             });
-            fs::write(scratch.path.join(event_name(index)), serde_json::to_vec(&event).unwrap()).unwrap();
+            fs::write(scratch.path.join(event_name(index)), deser_json::to_string(&event).map(String::into_bytes).unwrap()).unwrap();
         }
         fs::write(scratch.path.join("invocation-order"), b"1\n0\n").unwrap();
         let program = program_json(&parse_source(format!("{}; {}", callback_name(0), callback_name(1)).as_bytes()).unwrap()).unwrap();
         let trace = recorded_trace(&scratch, &program, 2).expect("recorded trace");
         assert_eq!(trace.iter().map(|event| event["argv"].clone()).collect::<Vec<_>>(), vec![
-            json!([callback_name(1).as_bytes()]),
-            json!([callback_name(0).as_bytes()]),
+            value!([callback_name(1).as_bytes()]),
+            value!([callback_name(0).as_bytes()]),
         ]);
         scratch.remove().expect("removed scratch");
     }
