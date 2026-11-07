@@ -1,6 +1,5 @@
 use crate::report;
 use rustc_hash::FxHashMap;
-use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::num::NonZeroU32;
@@ -109,7 +108,10 @@ pub struct History {
     offsets: Vec<(u32, u32)>,
     usages: Vec<EntryUsage>,
     index_by_hash: FxHashMap<u64, u32>,
-    latest_occurrences: BTreeMap<i64, u32>,
+    /// Latest occurrence id to entry index, kept sorted by id. Ascending order
+    /// is oldest first and its reverse is the most-recent-first order recall
+    /// and prefix search walk.
+    latest_occurrences: Vec<(i64, u32)>,
     /// Directory paths addressed by the codes in `EntryUsage::directories`.
     directory_paths: Vec<PathBuf>,
     directory_codes: FxHashMap<PathBuf, u32>,
@@ -154,7 +156,7 @@ impl History {
             history.sync()?;
         }
         let latest = std::mem::take(&mut history.latest_occurrences);
-        for &idx in latest.values() {
+        for &(_, idx) in &latest {
             history.remember_session(idx as usize);
         }
         history.latest_occurrences = latest;
@@ -168,7 +170,7 @@ impl History {
             offsets: Vec::new(),
             usages: Vec::new(),
             index_by_hash: FxHashMap::default(),
-            latest_occurrences: BTreeMap::new(),
+            latest_occurrences: Vec::new(),
             directory_paths: Vec::new(),
             directory_codes: FxHashMap::default(),
             directory_details: FxHashMap::default(),
@@ -243,17 +245,33 @@ impl History {
         } else if let Some(code) = directory {
             self.record_directory(idx, code, occurrence.timestamp);
         }
-        self.latest_occurrences
-            .remove(&i64::from(self.usages[idx].latest_id));
+        self.forget_latest_occurrence(i64::from(self.usages[idx].latest_id));
         self.usages[idx].latest_id =
             u32::try_from(occurrence.id).expect("history occurrence ids exceed 4 billion");
         self.usages[idx].total.record(occurrence.timestamp);
-        self.latest_occurrences.insert(
+        self.record_latest_occurrence(
             occurrence.id,
             u32::try_from(idx).expect("history entries exceed 4 billion"),
         );
         self.last_id = self.last_id.max(occurrence.id);
         idx
+    }
+
+    /// Track `idx` as the entry behind latest occurrence `id`, keeping the
+    /// table sorted by id. Committed ids usually grow, so the insert lands at
+    /// the end.
+    fn record_latest_occurrence(&mut self, id: i64, idx: u32) {
+        match self.latest_occurrences.binary_search_by_key(&id, |&(key, _)| key) {
+            Ok(position) => self.latest_occurrences[position].1 = idx,
+            Err(position) => self.latest_occurrences.insert(position, (id, idx)),
+        }
+    }
+
+    /// Drop the row for occurrence `id` when the table still holds it.
+    fn forget_latest_occurrence(&mut self, id: i64) {
+        if let Ok(position) = self.latest_occurrences.binary_search_by_key(&id, |&(key, _)| key) {
+            self.latest_occurrences.remove(position);
+        }
     }
 
     fn remember_session(&mut self, idx: usize) {
@@ -485,9 +503,9 @@ impl History {
 
     pub fn prefix_search(&self, prefix: &str, skip: usize) -> Option<&str> {
         self.latest_occurrences
-            .values()
+            .iter()
             .rev()
-            .map(|&idx| self.get(idx as usize))
+            .map(|&(_, idx)| self.get(idx as usize))
             .filter(|command| command.starts_with(prefix))
             .nth(skip)
     }
@@ -514,7 +532,7 @@ impl History {
     /// Unique commands ordered by actual last-use time, with commit IDs breaking ties.
     pub fn command_indices_into(&self, out: &mut Vec<usize>) {
         out.clear();
-        out.extend(self.latest_occurrences.values().map(|&idx| idx as usize));
+        out.extend(self.latest_occurrences.iter().map(|&(_, idx)| idx as usize));
         out.sort_unstable_by(|&a, &b| {
             self.timestamp(a)
                 .cmp(&self.timestamp(b))
@@ -525,7 +543,7 @@ impl History {
     /// All global candidates, independent of the session recall snapshot.
     pub fn search_entry_indices_into(&self, out: &mut Vec<usize>) {
         out.clear();
-        out.extend(self.latest_occurrences.values().rev().map(|&idx| idx as usize));
+        out.extend(self.latest_occurrences.iter().rev().map(|&(_, idx)| idx as usize));
     }
 
     /// Ctrl+R search: keep the best `limit` matches of `query` among

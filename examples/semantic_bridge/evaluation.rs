@@ -8,7 +8,8 @@ use epsh::expand::remove_glob_escapes;
 use epsh::parser::Parser;
 use epsh::shell_bytes::ShellBytes;
 use deser_value::{Value, value};
-use std::collections::{BTreeSet, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -592,7 +593,7 @@ fn decode_state(value: &Value) -> BridgeResult<InitialState> {
             "evaluation source adapter requires an empty inherited environment",
         ));
     }
-    let variable_map: std::collections::BTreeMap<_, _> = variables.iter().cloned().collect();
+    let variable_map: FxHashMap<_, _> = variables.iter().cloned().collect();
     for (name, exported_value) in &exported_pairs {
         if variable_map.get(name) != Some(exported_value) {
             return Err(BridgeError::new(
@@ -1229,9 +1230,12 @@ fn resulting_state(
     shell: &Shell,
     status: u8,
 ) -> BridgeResult<Value> {
-    let mut variable_names: BTreeSet<String> =
+    let mut variable_names: FxHashSet<String> =
         initial.variables.iter().map(|(name, _)| name.clone()).collect();
     collect_persistent_assignment_names(program, &mut variable_names)?;
+    // A hash set has no iteration order, so sort the reported names.
+    let mut variable_names: Vec<String> = variable_names.into_iter().collect();
+    variable_names.sort();
     let variables = variable_names
         .into_iter()
         .filter_map(|name| {
@@ -1263,7 +1267,7 @@ fn resulting_state(
 
 fn collect_persistent_assignment_names(
     program: &Value,
-    names: &mut BTreeSet<String>,
+    names: &mut FxHashSet<String>,
 ) -> BridgeResult<()> {
     match program["tag"].as_str() {
         Some("simple") => {

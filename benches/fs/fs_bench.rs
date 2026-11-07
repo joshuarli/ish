@@ -4,8 +4,8 @@ use ish_fs::{
     RESERVED_DESCRIPTORS, TRANSFER_BUFFER_BYTES,
 };
 use ptytest::{CommandSpec, ProtocolProfile, PtyTest, Scenario, Size, TestEnv};
+use rustc_hash::FxHashMap;
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
-use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
@@ -1562,20 +1562,20 @@ fn limit_text(limit: Option<u64>) -> String {
 }
 
 fn verify_merged_tree(source: &Path, seed: &Path, destination: &Path) {
-    let mut expected = BTreeMap::new();
+    let mut expected = FxHashMap::default();
     collect_files(source, Path::new(""), &mut expected);
     collect_files(seed, Path::new(""), &mut expected);
     let actual = tree_entries(destination);
     assert_eq!(actual, expected, "merged destination differs from expected files");
 }
 
-fn tree_entries(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    let mut entries = BTreeMap::new();
+fn tree_entries(root: &Path) -> FxHashMap<PathBuf, Vec<u8>> {
+    let mut entries = FxHashMap::default();
     collect_files(root, Path::new(""), &mut entries);
     entries
 }
 
-fn collect_files(root: &Path, relative: &Path, entries: &mut BTreeMap<PathBuf, Vec<u8>>) {
+fn collect_files(root: &Path, relative: &Path, entries: &mut FxHashMap<PathBuf, Vec<u8>>) {
     for entry in fs::read_dir(root.join(relative)).expect("read compared tree") {
         let entry = entry.expect("read compared tree entry");
         let path = relative.join(entry.file_name());

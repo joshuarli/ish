@@ -8,7 +8,7 @@ use epsh::parser::Parser;
 use epsh::shell_bytes::ShellBytes;
 use epsh::var::Variables;
 use deser_value::{Value, value};
-use std::collections::{BTreeMap, BTreeSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
@@ -356,8 +356,8 @@ fn validate_redirection_input(request: &Request) -> BridgeResult<()> {
     let permanent = request.input["permanent"]
         .as_bool()
         .ok_or_else(|| BridgeError::new("redirection permanence is not boolean"))?;
-    let mut open: BTreeSet<u64> = descriptors.keys().copied().collect();
-    let mut copies = BTreeSet::new();
+    let mut open: FxHashSet<u64> = descriptors.keys().copied().collect();
+    let mut copies = FxHashSet::default();
     for (index, operation) in operations.iter().enumerate() {
         exact_object(
             operation,
@@ -788,7 +788,7 @@ fn actual_redirections(request: &Request) -> BridgeResult<Value> {
     let operations = request.input["operations"]
         .as_seq()
         .ok_or_else(|| BridgeError::new("redirection operations are not an array"))?;
-    let mut resources = BTreeSet::new();
+    let mut resources = FxHashSet::default();
     resources.extend(descriptors.values().copied());
     for operation in operations {
         if operation["kind"] == "open" {
@@ -808,7 +808,7 @@ fn actual_redirections(request: &Request) -> BridgeResult<Value> {
             })?;
             Ok((*resource, path))
         })
-        .collect::<BridgeResult<BTreeMap<_, _>>>()?;
+        .collect::<BridgeResult<FxHashMap<_, _>>>()?;
     let mut shell = Shell::builder().cwd(root.to_path_buf()).env_clear().build();
     for (fd, resource) in &descriptors {
         let path = resource_paths
@@ -837,7 +837,7 @@ fn actual_redirections(request: &Request) -> BridgeResult<Value> {
         }
         setup_error = evaluate_source(&mut shell, &source).is_err();
     }
-    let mut probes: BTreeSet<u64> = descriptors.keys().copied().collect();
+    let mut probes: FxHashSet<u64> = descriptors.keys().copied().collect();
     for operation in operations {
         probes.insert(operation["target"].as_u64().unwrap_or(0));
         probes.insert(operation["copy"].as_u64().unwrap_or(0));
@@ -850,7 +850,10 @@ fn actual_redirections(request: &Request) -> BridgeResult<Value> {
             })?;
             Ok((*resource, (metadata.dev(), metadata.ino())))
         })
-        .collect::<BridgeResult<BTreeMap<_, _>>>()?;
+        .collect::<BridgeResult<FxHashMap<_, _>>>()?;
+    // A hash set has no iteration order, so sort what the outcome reports.
+    let mut probes: Vec<u64> = probes.into_iter().collect();
+    probes.sort_unstable();
     let mut observed = Vec::new();
     for fd in probes {
         if let Some(resource) = descriptor_resource(fd, &identities)? {
@@ -866,7 +869,7 @@ fn actual_redirections(request: &Request) -> BridgeResult<Value> {
 
 fn descriptor_resource(
     fd: u64,
-    identities: &BTreeMap<u64, (u64, u64)>,
+    identities: &FxHashMap<u64, (u64, u64)>,
 ) -> BridgeResult<Option<u64>> {
     let path = PathBuf::from(format!("/dev/fd/{fd}"));
     let metadata = match fs::metadata(path) {
@@ -876,15 +879,17 @@ fn descriptor_resource(
             return Err(BridgeError::new(format!("cannot inspect descriptor {fd}: {error}")));
         }
     };
+    // A hash map has no iteration order, so report the lowest matching resource.
     Ok(identities
         .iter()
-        .find(|(_, identity)| **identity == (metadata.dev(), metadata.ino()))
-        .map(|(resource, _)| *resource))
+        .filter(|(_, identity)| **identity == (metadata.dev(), metadata.ino()))
+        .map(|(resource, _)| *resource)
+        .min())
 }
 
 fn redirection_command(
     operation: &Value,
-    resources: &BTreeMap<u64, PathBuf>,
+    resources: &FxHashMap<u64, PathBuf>,
     root: &Path,
 ) -> BridgeResult<String> {
     let fragment = redirection_fragment(operation, resources, root)?;
@@ -893,7 +898,7 @@ fn redirection_command(
 
 fn redirection_fragment(
     operation: &Value,
-    resources: &BTreeMap<u64, PathBuf>,
+    resources: &FxHashMap<u64, PathBuf>,
     root: &Path,
 ) -> BridgeResult<String> {
     let target = operation["target"]
@@ -949,7 +954,7 @@ fn decode_bindings(value: &Value, context: &str) -> BridgeResult<Vec<(String, Ve
     let entries = value
         .as_seq()
         .ok_or_else(|| BridgeError::new(format!("{context} is not an array")))?;
-    let mut names = BTreeSet::new();
+    let mut names = FxHashSet::default();
     let mut decoded = Vec::with_capacity(entries.len());
     for entry in entries {
         let pair = entry
@@ -972,7 +977,7 @@ fn decode_environment(value: &Value, context: &str) -> BridgeResult<Vec<(Vec<u8>
     let entries = value
         .as_seq()
         .ok_or_else(|| BridgeError::new(format!("{context} is not an array")))?;
-    let mut names = BTreeSet::new();
+    let mut names = FxHashSet::default();
     let mut decoded = Vec::with_capacity(entries.len());
     for entry in entries {
         let pair = entry
@@ -988,11 +993,11 @@ fn decode_environment(value: &Value, context: &str) -> BridgeResult<Vec<(Vec<u8>
     Ok(decoded)
 }
 
-fn decode_descriptors(value: &Value) -> BridgeResult<BTreeMap<u64, u64>> {
+fn decode_descriptors(value: &Value) -> BridgeResult<FxHashMap<u64, u64>> {
     let entries = value
         .as_seq()
         .ok_or_else(|| BridgeError::new("descriptors is not an array"))?;
-    let mut decoded = BTreeMap::new();
+    let mut decoded = FxHashMap::default();
     for entry in entries {
         let pair = entry
             .as_seq()
@@ -1097,7 +1102,7 @@ pub(crate) fn negative_control(outcome: &Value) -> BridgeResult<Value> {
 pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
     validate_case(request)?;
     let mut candidates = Vec::new();
-    let mut seen = BTreeSet::<String>::new();
+    let mut seen = FxHashSet::<String>::default();
     match request.input["mode"].as_str().unwrap_or("") {
         "bytes" => {
             let bytes = require_bytes(&request.input["bytes"], "bytes input")?;
@@ -1167,7 +1172,7 @@ mod tests {
 
 fn add_candidate(
     candidates: &mut Vec<Request>,
-    seen: &mut BTreeSet<String>,
+    seen: &mut FxHashSet<String>,
     original: &Request,
     candidate: Request,
 ) -> BridgeResult<()> {

@@ -229,6 +229,7 @@ dependencies = [
  "fdu-posix",
  "hashbrown",
  "rayon",
+ "rustc-hash",
  "rustix",
 ]
 
@@ -337,6 +338,7 @@ version = "0.1.0"
 dependencies = [
  "fdu-posix",
  "libc",
+ "rustc-hash",
  "rustix",
 ]
 

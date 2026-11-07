@@ -148,12 +148,12 @@ mod tests {
     use super::*;
     use crate::engine::{Invocation, records::IndexedRecords};
     use crate::{Cancellation, Completion, Context, Event, Metrics, OperandState, Options, Operands, Progress, Request};
+    use rustc_hash::FxHashMap;
     use rustix::fs::OFlags;
     use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::path::Path;
-    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct Fixture(PathBuf);
@@ -187,8 +187,8 @@ mod tests {
         bytes: Option<Vec<u8>>,
     }
 
-    fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, EntrySnapshot> {
-        fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<PathBuf, EntrySnapshot>) {
+    fn snapshot_tree(root: &Path) -> FxHashMap<PathBuf, EntrySnapshot> {
+        fn visit(root: &Path, path: &Path, entries: &mut FxHashMap<PathBuf, EntrySnapshot>) {
             let metadata = std::fs::symlink_metadata(path).expect("stat dry-run snapshot entry");
             let bytes = metadata.is_file().then(|| std::fs::read(path).expect("read dry-run snapshot file"));
             entries.insert(
@@ -213,7 +213,7 @@ mod tests {
             }
         }
 
-        let mut entries = BTreeMap::new();
+        let mut entries = FxHashMap::default();
         visit(root, root, &mut entries);
         entries
     }
