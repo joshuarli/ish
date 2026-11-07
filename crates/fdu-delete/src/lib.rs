@@ -259,9 +259,9 @@ mod posix {
     use fdu_posix::quarantine;
     use fdu_posix::identity::{DIRECTORY_FLAGS, MountIdentity, directory_state, identity, entry_type, retry_errno};
     use super::*;
+    use rustc_hash::FxHashMap;
     use rustix::fs::{self, AtFlags, Mode, Stat};
     use rustix::io::Errno;
-    use std::collections::BTreeMap;
     use std::os::fd::{AsFd, BorrowedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -342,7 +342,7 @@ mod posix {
 
         
         
-        let mut groups: BTreeMap<usize, Vec<NodeId>> = BTreeMap::new();
+        let mut groups: FxHashMap<usize, Vec<NodeId>> = FxHashMap::default();
         for selected in &plan.roots {
             let parent = tree
                 .record(*selected)
@@ -369,6 +369,10 @@ mod posix {
             }
         };
         let deletion = &deletion;
+        // Hash collection order is arbitrary, so groups are spawned in parent
+        // index order to keep deletion request order reproducible.
+        let mut groups: Vec<(usize, Vec<NodeId>)> = groups.into_iter().collect();
+        groups.sort_unstable_by_key(|&(parent, _)| parent);
         pool.scope(|scope| {
             for (parent, selected) in groups {
                 let root_context = Arc::clone(&root_context);

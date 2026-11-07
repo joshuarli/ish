@@ -5,7 +5,7 @@ use epsh::error::ExitStatus;
 use epsh::shell_bytes::ShellBytes;
 use epsh::var::Variables;
 use deser_value::{Value, value};
-use std::collections::BTreeSet;
+use rustc_hash::FxHashSet;
 
 #[derive(Clone)]
 enum Expr {
@@ -193,7 +193,7 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
         .as_seq()
         .ok_or_else(|| BridgeError::new("arithmetic state variables are malformed"))?;
     let mut variables = Variables::new_clean();
-    let mut names = BTreeSet::new();
+    let mut names = FxHashSet::default();
     for binding in initial {
         if binding.as_seq().is_none_or(|pair| pair.len() != 2) {
             return Err(BridgeError::new("arithmetic binding is not a pair"));
@@ -209,9 +209,11 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
     }
     let tree = request.input["tree"].clone();
     collect_writes(&tree, &mut names)?;
-    let mut write_names = BTreeSet::new();
+    let mut write_names = FxHashSet::default();
     collect_writes(&request.input["tree"], &mut write_names)?;
-    let touched: Vec<String> = write_names.into_iter().collect();
+    // Collect first: hash sets have no iteration order.
+    let mut touched: Vec<String> = write_names.into_iter().collect();
+    touched.sort();
     let result = epsh::arith::eval_arith(source, &mut variables, ExitStatus::SUCCESS, 1);
     let bindings = bindings_for(&variables, names.iter().cloned());
     match result {
@@ -232,7 +234,7 @@ pub(crate) fn actual(request: &Request) -> BridgeResult<Value> {
     }
 }
 
-fn collect_writes(tree: &Value, names: &mut BTreeSet<String>) -> BridgeResult<()> {
+fn collect_writes(tree: &Value, names: &mut FxHashSet<String>) -> BridgeResult<()> {
     let list = tree
         .as_seq()
         .ok_or_else(|| BridgeError::new("arithmetic tree is malformed"))?;
@@ -290,7 +292,7 @@ fn update_arithmetic_state(state: &Value, variables: &Variables, touched: &[Stri
         .flatten()
         .filter_map(|pair| pair[0].as_str().map(ToOwned::to_owned))
         .collect();
-    let names: BTreeSet<String> = existing.into_iter().chain(touched.iter().cloned()).collect();
+    let names: FxHashSet<String> = existing.into_iter().chain(touched.iter().cloned()).collect();
     let mut updated = state.clone();
     updated["variables"] = bindings_for(variables, names.iter().cloned());
     let mut exported = Vec::new();
