@@ -690,9 +690,13 @@ impl SyncSession<'_> {
 
         let target_dir = dst_dir.to_path_buf();
 
+        let initial_transferred = self.progress.transferred_files;
+        let initial_deleted = self.progress.deleted_files;
+        let target_dir_existed = target_dir.exists();
+
         if !contents_mode {
             self.progress.examined_files += 1;
-            if !target_dir.exists() {
+            if !target_dir_existed {
                 if !self.request.options.dry_run {
                     if let Err(error) = fs::create_dir_all(&target_dir) {
                         let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
@@ -972,7 +976,10 @@ impl SyncSession<'_> {
             }
         }
 
-        if !self.request.options.dry_run && target_dir.exists() {
+        let children_modified = self.progress.transferred_files > initial_transferred
+            || self.progress.deleted_files > initial_deleted;
+
+        if !self.request.options.dry_run && (!target_dir_existed || children_modified) && target_dir.exists() {
             if let Some(ref src_fd) = src_dir_fd {
                 if let Some(ref dst_fd) = dst_dir_fd {
                     if let Ok(obs) = roots::observe_fd(src_fd.as_fd()) {
