@@ -1,5 +1,5 @@
 Prefix: ISH
-Next: 65
+Next: 73
 
 ## Accepted owner decisions
 
@@ -21,6 +21,8 @@ verification limits. Open implementation and acceptance work is listed below.
 | [ISH-42](docs/rfc/ISH-42-release-delivery.md) | Default-branch releases, verified bytes, diagnostic panic aborts | Linux implementation verified; native macOS release build and panic diagnostic passed |
 | [ISH-48](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor) | Private binary `Shell`; reusable library editor | Implemented; focused Linux editor and PTY acceptance passed |
 | [ISH-45](docs/filesystem.md#macos-staging-permissions) | Keep filesystem operations in-process; macOS masks must preserve owner read/search | Implemented with explicit rejection; ordinary-user native gates passed; privileged ownership acceptance remains |
+| [ISH-62](docs/rfc/ISH-62-capture-input-tail.md) | Keep unwritten input tail on converged capture relay; return on session end | Implemented; PTY input capture tests passed |
+| [ISH-63](docs/rfc/ISH-63-login-shell-command.md) | Login shell `-c COMMAND` delegation to `/bin/sh -c`; `--config` for file | Implemented; non-interactive invocation tests passed |
 
 ## Open implementation tickets
 

@@ -5,7 +5,6 @@ edition = "2024"
 description = "embeddable posix shell"
 license = "MIT"
 repository = "https://github.com/joshuarli/ish"
-readme = "README.md"
 keywords = ["shell", "posix", "embedded", "scripting"]
 categories = ["command-line-utilities", "os::unix-apis"]
 exclude = ["tests/stress/"]

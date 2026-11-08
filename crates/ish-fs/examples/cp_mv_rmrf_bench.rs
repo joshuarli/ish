@@ -69,9 +69,6 @@ fn main() -> io::Result<()> {
         scratch: tmp_root.join("scratch"),
     };
 
-    // ==========================================
-    // SECTION 1: CP Benchmarks (ish-fs vs /bin/cp)
-    // ==========================================
     println!("\n--- SECTION 1: CP BENCHMARKS ---");
 
     // 1A. Flat 4,096 files
@@ -180,9 +177,6 @@ fn main() -> io::Result<()> {
     }
     let _ = fs::remove_dir_all(&fixture_wide);
 
-    // ==========================================
-    // SECTION 2: MV Benchmarks (ish-fs vs /bin/mv)
-    // ==========================================
     println!("\n--- SECTION 2: MV BENCHMARKS ---");
 
     let mut mv_ish_times = Vec::new();
@@ -227,9 +221,6 @@ fn main() -> io::Result<()> {
         let _ = fs::remove_dir_all(&dst_sys);
     }
 
-    // ==========================================
-    // SECTION 3: RMRF Benchmarks (ish rmrf vs /bin/rm -rf)
-    // ==========================================
     println!("\n--- SECTION 3: RMRF BENCHMARKS ---");
 
     let ish_bin = repo_root.join("target/release/ish");

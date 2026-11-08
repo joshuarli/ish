@@ -9,4 +9,6 @@ description = "Anchored native filesystem operations for ish"
 fdu-posix = { path = "../fdu-posix" }
 rustix = { version = "1.1.4", features = ["fs", "process", "system"] }
 libc = "0.2"
+
+[dev-dependencies]
 rustc-hash = "2"
