@@ -64,6 +64,14 @@ impl SyncOutcome {
     }
 }
 
+pub fn owner_lacks_directory_write(dir: BorrowedFd<'_>) -> io::Result<bool> {
+    let stat = rustix::fs::fstat(dir)?;
+    if stat.st_uid != rustix::process::geteuid().as_raw() {
+        return Ok(false);
+    }
+    Ok(stat.st_mode & 0o200 == 0)
+}
+
 pub fn execute(
     request: &SyncRequest,
     cancellation: &Cancellation,
@@ -375,6 +383,27 @@ impl SyncSession<'_> {
                 }
             }
         };
+
+        // Linux lets root create entries even when the owner write bit is clear.
+        match owner_lacks_directory_write(parent_fd.as_fd()) {
+            Ok(true) => {
+                let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                    path: parent.to_path_buf(),
+                    message: "destination directory does not grant its owner write permission".to_owned(),
+                }));
+                self.failed = true;
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                    path: parent.to_path_buf(),
+                    message: format!("cannot check destination directory permissions: {error}"),
+                }));
+                self.failed = true;
+                return;
+            }
+        }
 
         let src_parent = src_path.parent().unwrap_or_else(|| Path::new("."));
         let src_file_name = match src_path.file_name() {
