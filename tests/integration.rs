@@ -1999,3 +1999,296 @@ fn rsync_help_and_option_rejections() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn rsync_operand_mapping_and_trailing_slash_invariance() {
+    let test_dir = std::env::temp_dir().join(format!("ish_rsync_map_{}", std::process::id()));
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let context = ish_fs::Context {
+        cwd: test_dir.clone(),
+        home: None,
+        scratch: test_dir.join("scratch"),
+    };
+
+    let src = test_dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("file1.txt"), b"hello").unwrap();
+
+    let dst_into1 = test_dir.join("dst_into1");
+    std::fs::create_dir_all(&dst_into1).unwrap();
+    let status = ish::sync_command::run(
+        &[
+            std::ffi::OsString::from("--into"),
+            std::ffi::OsString::from("dst_into1"),
+            std::ffi::OsString::from("src"),
+        ],
+        context.clone(),
+    )
+    .unwrap();
+    assert_eq!(status, epsh::error::ExitStatus::SUCCESS);
+    assert!(dst_into1.join("src/file1.txt").exists());
+
+    let dst_into2 = test_dir.join("dst_into2");
+    std::fs::create_dir_all(&dst_into2).unwrap();
+    let status = ish::sync_command::run(
+        &[
+            std::ffi::OsString::from("--into"),
+            std::ffi::OsString::from("dst_into2"),
+            std::ffi::OsString::from("src/"),
+        ],
+        context.clone(),
+    )
+    .unwrap();
+    assert_eq!(status, epsh::error::ExitStatus::SUCCESS);
+    assert!(dst_into2.join("src/file1.txt").exists());
+    assert!(!dst_into2.join("file1.txt").exists());
+
+    let dst_exist1 = test_dir.join("dst_exist1");
+    std::fs::create_dir_all(&dst_exist1).unwrap();
+    let status = ish::sync_command::run(
+        &[
+            std::ffi::OsString::from("src"),
+            std::ffi::OsString::from("dst_exist1"),
+        ],
+        context.clone(),
+    )
+    .unwrap();
+    assert_eq!(status, epsh::error::ExitStatus::SUCCESS);
+    assert!(dst_exist1.join("src/file1.txt").exists());
+
+    let dst_exist2 = test_dir.join("dst_exist2");
+    std::fs::create_dir_all(&dst_exist2).unwrap();
+    let status = ish::sync_command::run(
+        &[
+            std::ffi::OsString::from("src/"),
+            std::ffi::OsString::from("dst_exist2"),
+        ],
+        context.clone(),
+    )
+    .unwrap();
+    assert_eq!(status, epsh::error::ExitStatus::SUCCESS);
+    assert!(dst_exist2.join("src/file1.txt").exists());
+    assert!(!dst_exist2.join("file1.txt").exists());
+
+    let dst_contents = test_dir.join("dst_contents");
+    std::fs::create_dir_all(&dst_contents).unwrap();
+    let status = ish::sync_command::run(
+        &[
+            std::ffi::OsString::from("--contents"),
+            std::ffi::OsString::from("src"),
+            std::ffi::OsString::from("dst_contents"),
+        ],
+        context.clone(),
+    )
+    .unwrap();
+    assert_eq!(status, epsh::error::ExitStatus::SUCCESS);
+    assert!(dst_contents.join("file1.txt").exists());
+    assert!(!dst_contents.join("src").exists());
+
+    let dst_exact = test_dir.join("dst_exact");
+    let status = ish::sync_command::run(
+        &[
+            std::ffi::OsString::from("src"),
+            std::ffi::OsString::from("dst_exact"),
+        ],
+        context,
+    )
+    .unwrap();
+    assert_eq!(status, epsh::error::ExitStatus::SUCCESS);
+    assert!(dst_exact.join("file1.txt").exists());
+    assert!(!dst_exact.join("src").exists());
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn rsync_incremental_quick_check_skip() {
+    let test_dir = std::env::temp_dir().join(format!("ish_rsync_skip_{}", std::process::id()));
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let context = ish_fs::Context {
+        cwd: test_dir.clone(),
+        home: None,
+        scratch: test_dir.join("scratch"),
+    };
+
+    let src = test_dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"content-a").unwrap();
+    std::fs::write(src.join("b.txt"), b"content-b").unwrap();
+
+    let dst = test_dir.join("dst");
+    std::fs::create_dir_all(&dst).unwrap();
+
+    let req1 = ish_fs::sync::SyncRequest {
+        operands: ish_fs::sync::SyncOperands::Contents {
+            source: src.clone(),
+            directory: dst.clone(),
+        },
+        options: ish_fs::sync::SyncOptions::default(),
+        context: context.clone(),
+    };
+    let cancel = ish_fs::Cancellation::default();
+    let sink = |_event: ish_fs::Event| Ok::<(), std::io::Error>(());
+    let outcome1 = ish_fs::sync::execute(&req1, &cancel, &sink);
+    assert_eq!(outcome1.status(), 0);
+    assert_eq!(outcome1.progress.transferred_files, 2);
+    assert_eq!(outcome1.progress.skipped_files, 0);
+
+    let req2 = ish_fs::sync::SyncRequest {
+        operands: ish_fs::sync::SyncOperands::Contents {
+            source: src.clone(),
+            directory: dst.clone(),
+        },
+        options: ish_fs::sync::SyncOptions::default(),
+        context: context.clone(),
+    };
+    let outcome2 = ish_fs::sync::execute(&req2, &cancel, &sink);
+    assert_eq!(outcome2.status(), 0);
+    assert_eq!(outcome2.progress.transferred_files, 0);
+    assert_eq!(outcome2.progress.skipped_files, 2);
+    assert_eq!(outcome2.progress.bytes_transferred, 0);
+
+    std::fs::write(src.join("b.txt"), b"content-b-modified-now").unwrap();
+    let req3 = ish_fs::sync::SyncRequest {
+        operands: ish_fs::sync::SyncOperands::Contents {
+            source: src,
+            directory: dst,
+        },
+        options: ish_fs::sync::SyncOptions::default(),
+        context,
+    };
+    let outcome3 = ish_fs::sync::execute(&req3, &cancel, &sink);
+    assert_eq!(outcome3.status(), 0);
+    assert_eq!(outcome3.progress.transferred_files, 1);
+    assert_eq!(outcome3.progress.skipped_files, 1);
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn rsync_delete_and_dry_run() {
+    let test_dir = std::env::temp_dir().join(format!("ish_rsync_del_{}", std::process::id()));
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let context = ish_fs::Context {
+        cwd: test_dir.clone(),
+        home: None,
+        scratch: test_dir.join("scratch"),
+    };
+
+    let src = test_dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("keep.txt"), b"keep").unwrap();
+
+    let dst = test_dir.join("dst");
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(dst.join("keep.txt"), b"keep").unwrap();
+    std::fs::write(dst.join("extra.txt"), b"extra").unwrap();
+
+    let cancel = ish_fs::Cancellation::default();
+    let sink = |_event: ish_fs::Event| Ok::<(), std::io::Error>(());
+
+    let req_dry = ish_fs::sync::SyncRequest {
+        operands: ish_fs::sync::SyncOperands::Contents {
+            source: src.clone(),
+            directory: dst.clone(),
+        },
+        options: ish_fs::sync::SyncOptions {
+            delete: true,
+            dry_run: true,
+            jobs: None,
+        },
+        context: context.clone(),
+    };
+    let outcome_dry = ish_fs::sync::execute(&req_dry, &cancel, &sink);
+    assert_eq!(outcome_dry.status(), 0);
+    assert_eq!(outcome_dry.progress.deleted_files, 1);
+    assert!(dst.join("extra.txt").exists(), "dry-run must not delete file");
+
+    let req_no_del = ish_fs::sync::SyncRequest {
+        operands: ish_fs::sync::SyncOperands::Contents {
+            source: src.clone(),
+            directory: dst.clone(),
+        },
+        options: ish_fs::sync::SyncOptions {
+            delete: false,
+            dry_run: false,
+            jobs: None,
+        },
+        context: context.clone(),
+    };
+    let outcome_no_del = ish_fs::sync::execute(&req_no_del, &cancel, &sink);
+    assert_eq!(outcome_no_del.status(), 0);
+    assert_eq!(outcome_no_del.progress.deleted_files, 0);
+    assert!(dst.join("extra.txt").exists(), "without --delete extra must be retained");
+
+    let req_del = ish_fs::sync::SyncRequest {
+        operands: ish_fs::sync::SyncOperands::Contents {
+            source: src,
+            directory: dst.clone(),
+        },
+        options: ish_fs::sync::SyncOptions {
+            delete: true,
+            dry_run: false,
+            jobs: None,
+        },
+        context,
+    };
+    let outcome_del = ish_fs::sync::execute(&req_del, &cancel, &sink);
+    assert_eq!(outcome_del.status(), 0);
+    assert_eq!(outcome_del.progress.deleted_files, 1);
+    assert!(!dst.join("extra.txt").exists(), "extra file must be deleted");
+    assert!(dst.join("keep.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn rsync_metadata_and_permissions_preserved() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let test_dir = std::env::temp_dir().join(format!("ish_rsync_meta_{}", std::process::id()));
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let context = ish_fs::Context {
+        cwd: test_dir.clone(),
+        home: None,
+        scratch: test_dir.join("scratch"),
+    };
+
+    let src = test_dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let src_file = src.join("readonly.txt");
+    std::fs::write(&src_file, b"content-readonly").unwrap();
+    std::fs::set_permissions(&src_file, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let src_exec = src.join("script.sh");
+    std::fs::write(&src_exec, b"#!/bin/sh\necho hi\n").unwrap();
+    std::fs::set_permissions(&src_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let dst = test_dir.join("dst");
+    let status = ish::sync_command::run(
+        &[
+            std::ffi::OsString::from("src"),
+            std::ffi::OsString::from("dst"),
+        ],
+        context,
+    )
+    .unwrap();
+    assert_eq!(status, epsh::error::ExitStatus::SUCCESS);
+
+    let dst_file_meta = std::fs::symlink_metadata(dst.join("readonly.txt")).unwrap();
+    assert_eq!(dst_file_meta.mode() & 0o777, 0o444);
+
+    let dst_exec_meta = std::fs::symlink_metadata(dst.join("script.sh")).unwrap();
+    assert_eq!(dst_exec_meta.mode() & 0o777, 0o755);
+
+    let src_file_meta = std::fs::symlink_metadata(&src_file).unwrap();
+    assert_eq!(dst_file_meta.mtime(), src_file_meta.mtime());
+
+    let _ = std::fs::set_permissions(&src_file, std::fs::Permissions::from_mode(0o644));
+    let _ = std::fs::set_permissions(dst.join("readonly.txt"), std::fs::Permissions::from_mode(0o644));
+    let _ = std::fs::remove_dir_all(&test_dir);
+}

@@ -9,9 +9,7 @@ use epsh::error::{ExitStatus, ShellError};
 
 struct Invocation {
     request: SyncRequest,
-    #[allow(dead_code)]
     verbose: bool,
-    #[allow(dead_code)]
     no_progress: bool,
 }
 
@@ -53,13 +51,39 @@ pub fn run(
         }
     };
     let cancellation = foreground.cancellation();
+    let verbose = invocation.verbose;
+    let no_progress = invocation.no_progress;
+    let show_delete = invocation.request.options.delete;
     let request = invocation.request;
-    let sink = |_event: ish_fs::Event| Ok::<(), io::Error>(());
-    let outcome = foreground.run(
-        move |cancellation, _events| {
+    let result = foreground.run(
+        move |cancellation, events| {
+            let sink = move |event: ish_fs::Event| events.emit(event);
             ish_fs::sync::execute(&request, &cancellation, &sink)
         },
-        |_foreground, _event| Ok(()),
+        |foreground, event| {
+            match event {
+                ish_fs::Event::Progress(progress) if !no_progress => {
+                    foreground.report_progress_line(&format!(
+                        "rsync: {} examined, {} transferred, {} skipped, {} bytes",
+                        progress.discovered_files,
+                        progress.completed_files,
+                        progress.skipped_files,
+                        progress.bytes_streamed
+                    ))
+                }
+                ish_fs::Event::Progress(_) => foreground.clear_progress(),
+                ish_fs::Event::Diagnostic(diagnostic) => {
+                    let _ = foreground.clear_progress();
+                    writeln!(
+                        io::stderr(),
+                        "ish: rsync: {}: {}",
+                        diagnostic.path.display(),
+                        diagnostic.message
+                    )
+                }
+                _ => Ok(()),
+            }
+        },
     );
     let finish = foreground.finish();
 
@@ -67,7 +91,7 @@ pub fn run(
         let _ = writeln!(io::stderr(), "ish: rsync: cancelled");
         return Err(ShellError::Cancelled);
     }
-    let outcome = match (outcome, finish) {
+    let outcome = match (result, finish) {
         (Ok(outcome), Ok(())) => outcome,
         (Err(error), Err(finish_error)) => {
             let _ = writeln!(
@@ -81,6 +105,29 @@ pub fn run(
             return Ok(ExitStatus::FAILURE);
         }
     };
+
+    if verbose {
+        if show_delete && outcome.progress.deleted_files > 0 {
+            let _ = writeln!(
+                io::stderr(),
+                "ish: rsync: {} examined, {} transferred, {} skipped, {} deleted, {} bytes",
+                outcome.progress.examined_files,
+                outcome.progress.transferred_files,
+                outcome.progress.skipped_files,
+                outcome.progress.deleted_files,
+                outcome.progress.bytes_transferred
+            );
+        } else {
+            let _ = writeln!(
+                io::stderr(),
+                "ish: rsync: {} examined, {} transferred, {} skipped, {} bytes",
+                outcome.progress.examined_files,
+                outcome.progress.transferred_files,
+                outcome.progress.skipped_files,
+                outcome.progress.bytes_transferred
+            );
+        }
+    }
 
     Ok(ExitStatus::from(outcome.status()))
 }

@@ -1823,6 +1823,33 @@ fn command_lookup_classifies_ish_commands_with_empty_path() {
 }
 
 #[test]
+fn native_fs_rsync_interactive() {
+    let sh = PtyShell::spawn_with_setup(
+        &[("source", "rsync sync bytes")],
+        &[],
+        &[],
+        24,
+        80,
+        None,
+        |home| {
+            std::fs::create_dir(home.join("dst-dir")).unwrap();
+        },
+    );
+
+    let output = clean(&sh.run_command("command -V rsync"));
+    assert!(
+        output.lines().any(|line| line.trim() == "rsync is a shell builtin"),
+        "{output:?}"
+    );
+
+    sh.run_command("rsync source dst-dir");
+    assert_eq!(
+        std::fs::read(sh.home_path().join("dst-dir/source")).unwrap(),
+        b"rsync sync bytes"
+    );
+}
+
+#[test]
 fn tilde_expansion() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("echo ~");
