@@ -1,11 +1,13 @@
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustix::fd::AsFd;
+use rustix::fd::{AsFd, BorrowedFd};
 use rustix::fs::{AtFlags, Mode, OFlags};
 
 use crate::platform::{self, MetadataTarget, Preservation};
@@ -73,6 +75,7 @@ pub fn execute(
         sink,
         progress: SyncProgress::default(),
         seen_hardlinks: HashSet::new(),
+        buffer: vec![0u8; TRANSFER_BUFFER_BYTES],
         failed: false,
     };
 
@@ -203,6 +206,7 @@ struct SyncSession<'a> {
     sink: &'a dyn EventSink,
     progress: SyncProgress,
     seen_hardlinks: HashSet<Identity>,
+    buffer: Vec<u8>,
     failed: bool,
 }
 
@@ -335,15 +339,91 @@ impl SyncSession<'_> {
             return;
         }
 
-        if let Some(parent) = dst_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
+        let parent = dst_path.parent().unwrap_or_else(|| Path::new("."));
+        let dst_file_name = match dst_path.file_name() {
+            Some(name) => name,
+            None => {
+                let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                    path: dst_path.to_path_buf(),
+                    message: "missing destination file name".to_owned(),
+                }));
+                self.failed = true;
+                return;
+            }
+        };
+
+        let parent_fd = match rustix::fs::open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(_) => {
+                let _ = fs::create_dir_all(parent);
+                match rustix::fs::open(
+                    parent,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => fd,
+                    Err(error) => {
+                        let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                            path: parent.to_path_buf(),
+                            message: format!("cannot open destination directory: {error}"),
+                        }));
+                        self.failed = true;
+                        return;
+                    }
+                }
+            }
+        };
+
+        let src_parent = src_path.parent().unwrap_or_else(|| Path::new("."));
+        let src_file_name = match src_path.file_name() {
+            Some(name) => name,
+            None => {
+                let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                    path: src_path.to_path_buf(),
+                    message: "missing source file name".to_owned(),
+                }));
+                self.failed = true;
+                return;
+            }
+        };
+
+        let src_parent_fd = match rustix::fs::open(
+            src_parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(error) => {
+                let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                    path: src_parent.to_path_buf(),
+                    message: format!("cannot open source parent directory: {error}"),
+                }));
+                self.failed = true;
+                return;
+            }
+        };
 
         let is_replacement = dst_meta.is_some();
         let copy_result = if is_replacement {
-            self.copy_file_staged(src_path, dst_path, size)
+            self.copy_file_staged_at(
+                src_parent_fd.as_fd(),
+                src_file_name,
+                parent_fd.as_fd(),
+                dst_file_name,
+                size,
+            )
         } else {
-            self.copy_file_direct(src_path, dst_path, size)
+            self.copy_file_direct_at(
+                src_parent_fd.as_fd(),
+                src_file_name,
+                parent_fd.as_fd(),
+                dst_file_name,
+                size,
+            )
         };
 
         if let Err(error) = copy_result {
@@ -355,41 +435,65 @@ impl SyncSession<'_> {
         }
     }
 
-    fn copy_file_direct(&self, src_path: &Path, dst_path: &Path, length: u64) -> io::Result<()> {
-        let parent = dst_path.parent().unwrap_or_else(|| Path::new("."));
-        let dst_file_name = dst_path.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing destination file name")
-        })?;
-
-        let parent_fd = rustix::fs::open(
-            parent,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-
-        let src_file = rustix::fs::open(
-            src_path,
+    fn direct_copy_static(
+        src_parent_fd: BorrowedFd<'_>,
+        src_name: &OsStr,
+        dst_parent_fd: BorrowedFd<'_>,
+        dst_name: &OsStr,
+        length: u64,
+        buffer: &mut [u8],
+        cancellation: &Cancellation,
+    ) -> io::Result<()> {
+        let src_file = rustix::fs::openat(
+            src_parent_fd,
+            src_name,
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
         )?;
         let src_obs = roots::observe_fd(src_file.as_fd())?;
         let src_ext = platform::capture_metadata(MetadataTarget::Fd(src_file.as_fd()))?;
 
+        #[cfg(target_os = "macos")]
+        {
+            if rustix::fs::fclonefileat(
+                src_file.as_fd(),
+                dst_parent_fd,
+                dst_name,
+                rustix::fs::CloneFlags::NOOWNERCOPY,
+            )
+            .is_ok()
+            {
+                if let Ok(cloned_fd) = rustix::fs::openat(
+                    dst_parent_fd,
+                    dst_name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    let _ = platform::apply_metadata(
+                        MetadataTarget::Fd(cloned_fd.as_fd()),
+                        &src_obs,
+                        &src_ext,
+                        Preservation::Copy,
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         let dst_fd = rustix::fs::openat(
-            parent_fd.as_fd(),
-            dst_file_name,
+            dst_parent_fd,
+            dst_name,
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
         )?;
 
-        let mut buffer = vec![0u8; TRANSFER_BUFFER_BYTES];
         let copy_result = (|| -> io::Result<()> {
             platform::copy_data(
                 src_file.as_fd(),
                 dst_fd.as_fd(),
                 length,
-                &mut buffer,
-                self.cancellation,
+                buffer,
+                cancellation,
             )?;
             platform::apply_metadata(
                 MetadataTarget::Fd(dst_fd.as_fd()),
@@ -401,85 +505,182 @@ impl SyncSession<'_> {
         })();
 
         if let Err(error) = copy_result {
-            let _ = rustix::fs::unlinkat(parent_fd.as_fd(), dst_file_name, AtFlags::empty());
+            let _ = rustix::fs::unlinkat(dst_parent_fd, dst_name, AtFlags::empty());
             return Err(error);
         }
 
         Ok(())
     }
 
-    fn copy_file_staged(&self, src_path: &Path, dst_path: &Path, length: u64) -> io::Result<()> {
-        let parent = dst_path.parent().unwrap_or_else(|| Path::new("."));
+    fn staged_copy_static(
+        src_parent_fd: BorrowedFd<'_>,
+        src_name: &OsStr,
+        dst_parent_fd: BorrowedFd<'_>,
+        dst_name: &OsStr,
+        length: u64,
+        buffer: &mut [u8],
+        cancellation: &Cancellation,
+    ) -> io::Result<()> {
         let temp_name = format!(
             ".ish-sync-{}-{}.tmp",
             std::process::id(),
             NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
         );
 
-        let parent_fd = rustix::fs::open(
-            parent,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-
-        let src_file = rustix::fs::open(
-            src_path,
+        let src_file = rustix::fs::openat(
+            src_parent_fd,
+            src_name,
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
         )?;
         let src_obs = roots::observe_fd(src_file.as_fd())?;
         let src_ext = platform::capture_metadata(MetadataTarget::Fd(src_file.as_fd()))?;
 
-        let temp_fd = rustix::fs::openat(
-            parent_fd.as_fd(),
-            &temp_name,
-            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )?;
-
-        let mut buffer = vec![0u8; TRANSFER_BUFFER_BYTES];
-        let copy_result = (|| -> io::Result<()> {
-            platform::copy_data(
+        #[cfg(target_os = "macos")]
+        let mut cloned = false;
+        #[cfg(target_os = "macos")]
+        {
+            if rustix::fs::fclonefileat(
                 src_file.as_fd(),
-                temp_fd.as_fd(),
-                length,
-                &mut buffer,
-                self.cancellation,
-            )?;
-            platform::apply_metadata(
-                MetadataTarget::Fd(temp_fd.as_fd()),
-                &src_obs,
-                &src_ext,
-                Preservation::Copy,
-            )?;
-            Ok(())
-        })();
+                dst_parent_fd,
+                &temp_name,
+                rustix::fs::CloneFlags::NOOWNERCOPY,
+            )
+            .is_ok()
+            {
+                if let Ok(cloned_fd) = rustix::fs::openat(
+                    dst_parent_fd,
+                    &temp_name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    let _ = platform::apply_metadata(
+                        MetadataTarget::Fd(cloned_fd.as_fd()),
+                        &src_obs,
+                        &src_ext,
+                        Preservation::Copy,
+                    );
+                    cloned = true;
+                }
+            }
+        }
 
-        drop(temp_fd);
+        #[cfg(target_os = "macos")]
+        let copy_result: io::Result<()> = if cloned {
+            Ok(())
+        } else {
+            let temp_fd = rustix::fs::openat(
+                dst_parent_fd,
+                &temp_name,
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )?;
+            let res = (|| -> io::Result<()> {
+                platform::copy_data(
+                    src_file.as_fd(),
+                    temp_fd.as_fd(),
+                    length,
+                    buffer,
+                    cancellation,
+                )?;
+                platform::apply_metadata(
+                    MetadataTarget::Fd(temp_fd.as_fd()),
+                    &src_obs,
+                    &src_ext,
+                    Preservation::Copy,
+                )?;
+                Ok(())
+            })();
+            drop(temp_fd);
+            res
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let copy_result: io::Result<()> = {
+            let temp_fd = rustix::fs::openat(
+                dst_parent_fd,
+                &temp_name,
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )?;
+            let res = (|| -> io::Result<()> {
+                platform::copy_data(
+                    src_file.as_fd(),
+                    temp_fd.as_fd(),
+                    length,
+                    buffer,
+                    cancellation,
+                )?;
+                platform::apply_metadata(
+                    MetadataTarget::Fd(temp_fd.as_fd()),
+                    &src_obs,
+                    &src_ext,
+                    Preservation::Copy,
+                )?;
+                Ok(())
+            })();
+            drop(temp_fd);
+            res
+        };
+
         drop(src_file);
 
         if let Err(error) = copy_result {
-            let _ = rustix::fs::unlinkat(parent_fd.as_fd(), &temp_name, AtFlags::empty());
+            let _ = rustix::fs::unlinkat(dst_parent_fd, &temp_name, AtFlags::empty());
             return Err(error);
         }
 
-        let dst_file_name = dst_path.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing destination file name")
-        })?;
-
         let rename_result = rustix::fs::renameat(
-            parent_fd.as_fd(),
+            dst_parent_fd,
             &temp_name,
-            parent_fd.as_fd(),
-            dst_file_name,
+            dst_parent_fd,
+            dst_name,
         );
 
         if let Err(error) = rename_result {
-            let _ = rustix::fs::unlinkat(parent_fd.as_fd(), &temp_name, AtFlags::empty());
+            let _ = rustix::fs::unlinkat(dst_parent_fd, &temp_name, AtFlags::empty());
             return Err(error.into());
         }
 
         Ok(())
+    }
+
+    fn copy_file_direct_at(
+        &mut self,
+        src_parent_fd: BorrowedFd<'_>,
+        src_name: &OsStr,
+        dst_parent_fd: BorrowedFd<'_>,
+        dst_name: &OsStr,
+        length: u64,
+    ) -> io::Result<()> {
+        Self::direct_copy_static(
+            src_parent_fd,
+            src_name,
+            dst_parent_fd,
+            dst_name,
+            length,
+            &mut self.buffer,
+            self.cancellation,
+        )
+    }
+
+    fn copy_file_staged_at(
+        &mut self,
+        src_parent_fd: BorrowedFd<'_>,
+        src_name: &OsStr,
+        dst_parent_fd: BorrowedFd<'_>,
+        dst_name: &OsStr,
+        length: u64,
+    ) -> io::Result<()> {
+        Self::staged_copy_static(
+            src_parent_fd,
+            src_name,
+            dst_parent_fd,
+            dst_name,
+            length,
+            &mut self.buffer,
+            self.cancellation,
+        )
     }
 
     fn sync_directory(&mut self, src_dir: &Path, dst_dir: &Path, contents_mode: bool) {
@@ -487,11 +688,7 @@ impl SyncSession<'_> {
             return;
         }
 
-        let target_dir = if contents_mode {
-            dst_dir.to_path_buf()
-        } else {
-            dst_dir.to_path_buf()
-        };
+        let target_dir = dst_dir.to_path_buf();
 
         if !contents_mode {
             self.progress.examined_files += 1;
@@ -567,30 +764,221 @@ impl SyncSession<'_> {
             }
         }
 
+        let src_dir_fd = rustix::fs::open(
+            src_dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ).ok();
+
+        let dst_dir_fd = if target_dir.exists() {
+            rustix::fs::open(
+                &target_dir,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            ).ok()
+        } else {
+            None
+        };
+
+        let mut files_to_transfer = Vec::new();
+
         for name in child_entries {
             if self.cancellation.is_cancelled() {
                 return;
             }
             let child_src = src_dir.join(&name);
             let child_dst = target_dir.join(&name);
-            self.sync_pair(&child_src, &child_dst, false);
+
+            let child_src_meta = match fs::symlink_metadata(&child_src) {
+                Ok(m) => m,
+                Err(error) => {
+                    let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                        path: child_src,
+                        message: format!("cannot access source: {error}"),
+                    }));
+                    self.failed = true;
+                    continue;
+                }
+            };
+
+            if child_src_meta.is_file() && src_dir_fd.is_some() && dst_dir_fd.is_some() && !self.request.options.dry_run {
+                self.progress.examined_files += 1;
+                let size = child_src_meta.len();
+
+                if child_src_meta.nlink() > 1 {
+                    let identity = Identity {
+                        file: fdu_posix::identity::FileIdentity {
+                            device: child_src_meta.dev(),
+                            inode: child_src_meta.ino(),
+                        },
+                        kind: EntryKind::RegularFile,
+                    };
+                    if !self.seen_hardlinks.insert(identity) {
+                        let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                            path: child_src.clone(),
+                            message: format!(
+                                "hardlink group detected for {}; topology preservation is not supported in v1 without --split-hardlinks",
+                                child_src.display()
+                            ),
+                        }));
+                        self.failed = true;
+                        continue;
+                    }
+                }
+
+                let dst_meta = fs::symlink_metadata(&child_dst).ok();
+                if let Some(ref dst_meta) = dst_meta {
+                    if dst_meta.is_file()
+                        && dst_meta.len() == child_src_meta.len()
+                        && dst_meta.mtime() == child_src_meta.mtime()
+                        && dst_meta.mtime_nsec() == child_src_meta.mtime_nsec()
+                    {
+                        self.progress.skipped_files += 1;
+                        let _ = self.sink.emit(Event::Progress(self.progress_event()));
+                        continue;
+                    }
+                }
+
+                files_to_transfer.push((name, child_src, child_dst, size, dst_meta.is_some()));
+            } else {
+                self.sync_pair(&child_src, &child_dst, false);
+            }
+        }
+
+        if !files_to_transfer.is_empty() {
+            let jobs = self.request.options.jobs.map_or(4, Jobs::get).min(files_to_transfer.len());
+            if jobs <= 1 || files_to_transfer.len() < 4 {
+                for (name, _child_src, child_dst, size, is_replacement) in files_to_transfer {
+                    if self.cancellation.is_cancelled() {
+                        return;
+                    }
+                    self.progress.transferred_files += 1;
+                    self.progress.bytes_transferred += size;
+                    let _ = self.sink.emit(Event::Progress(self.progress_event()));
+
+                    let src_fd_ref = src_dir_fd.as_ref().unwrap().as_fd();
+                    let dst_fd_ref = dst_dir_fd.as_ref().unwrap().as_fd();
+
+                    let copy_result = if is_replacement {
+                        self.copy_file_staged_at(
+                            src_fd_ref,
+                            &name,
+                            dst_fd_ref,
+                            &name,
+                            size,
+                        )
+                    } else {
+                        self.copy_file_direct_at(
+                            src_fd_ref,
+                            &name,
+                            dst_fd_ref,
+                            &name,
+                            size,
+                        )
+                    };
+
+                    if let Err(error) = copy_result {
+                        let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                            path: child_dst,
+                            message: format!("failed to copy file: {error}"),
+                        }));
+                        self.failed = true;
+                    }
+                }
+            } else {
+                use std::sync::Mutex;
+                let queue = Mutex::new(files_to_transfer);
+                let first_error = Mutex::new(None::<(PathBuf, io::Error)>);
+                let total_transferred = std::sync::atomic::AtomicU64::new(0);
+                let total_bytes = std::sync::atomic::AtomicU64::new(0);
+
+                let src_fd_ref = src_dir_fd.as_ref().unwrap().as_fd();
+                let dst_fd_ref = dst_dir_fd.as_ref().unwrap().as_fd();
+
+                std::thread::scope(|scope| {
+                    for _ in 0..jobs {
+                        let queue = &queue;
+                        let first_error = &first_error;
+                        let total_transferred = &total_transferred;
+                        let total_bytes = &total_bytes;
+                        let cancellation = self.cancellation;
+
+                        scope.spawn(move || {
+                            let mut buffer = vec![0u8; TRANSFER_BUFFER_BYTES];
+                            loop {
+                                if cancellation.is_cancelled() {
+                                    break;
+                                }
+                                let item = {
+                                    let mut q = queue.lock().unwrap();
+                                    q.pop()
+                                };
+                                let Some((name, _child_src, child_dst, size, is_replacement)) = item else {
+                                    break;
+                                };
+
+                                let res = if is_replacement {
+                                    Self::staged_copy_static(
+                                        src_fd_ref,
+                                        &name,
+                                        dst_fd_ref,
+                                        &name,
+                                        size,
+                                        &mut buffer,
+                                        cancellation,
+                                    )
+                                } else {
+                                    Self::direct_copy_static(
+                                        src_fd_ref,
+                                        &name,
+                                        dst_fd_ref,
+                                        &name,
+                                        size,
+                                        &mut buffer,
+                                        cancellation,
+                                    )
+                                };
+
+                                match res {
+                                    Ok(()) => {
+                                        total_transferred.fetch_add(1, Ordering::Relaxed);
+                                        total_bytes.fetch_add(size, Ordering::Relaxed);
+                                    }
+                                    Err(err) => {
+                                        let mut e = first_error.lock().unwrap();
+                                        if e.is_none() {
+                                            *e = Some((child_dst, err));
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+
+                let transferred = total_transferred.load(Ordering::Relaxed);
+                let bytes = total_bytes.load(Ordering::Relaxed);
+                self.progress.transferred_files += transferred;
+                self.progress.bytes_transferred += bytes;
+                let _ = self.sink.emit(Event::Progress(self.progress_event()));
+
+                if let Some((path, err)) = first_error.into_inner().unwrap() {
+                    let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                        path,
+                        message: format!("failed to copy file: {err}"),
+                    }));
+                    self.failed = true;
+                }
+            }
         }
 
         if !self.request.options.dry_run && target_dir.exists() {
-            if let Ok(src_file) = rustix::fs::open(
-                src_dir,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            ) {
-                if let Ok(dst_file) = rustix::fs::open(
-                    &target_dir,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                    Mode::empty(),
-                ) {
-                    if let Ok(obs) = roots::observe_fd(src_file.as_fd()) {
-                        if let Ok(ext) = platform::capture_metadata(MetadataTarget::Fd(src_file.as_fd())) {
+            if let Some(ref src_fd) = src_dir_fd {
+                if let Some(ref dst_fd) = dst_dir_fd {
+                    if let Ok(obs) = roots::observe_fd(src_fd.as_fd()) {
+                        if let Ok(ext) = platform::capture_metadata(MetadataTarget::Fd(src_fd.as_fd())) {
                             let _ = platform::apply_metadata(
-                                MetadataTarget::Fd(dst_file.as_fd()),
+                                MetadataTarget::Fd(dst_fd.as_fd()),
                                 &obs,
                                 &ext,
                                 Preservation::Copy,
@@ -644,9 +1032,19 @@ impl SyncSession<'_> {
 }
 
 fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let raw = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
+    };
+    normalize_trailing_slashes(&raw)
+}
+
+fn normalize_trailing_slashes(path: &Path) -> PathBuf {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() <= 1 || !bytes.ends_with(b"/") {
+        return path.to_path_buf();
     }
+    let end = bytes.iter().rposition(|b| *b != b'/').map(|i| i + 1).unwrap_or(1);
+    PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end]))
 }

@@ -61,10 +61,10 @@ Small tree: 200 files × 4 KiB + 1 × 1 MiB under `src/` (201 files, ~1.78 MiB p
 
 | Workload | Meaning | ish builtin (median 5) | `/usr/bin/rsync` (median 5) | Ratio (ish / rsync) |
 |---|---|---:|---:|---:|
-| `sync-fresh-tree` | fresh copy, contents mode | 0.0900 s | 0.0860 s | 1.05x (parity) |
-| `sync-noop-tree` | second run, unchanged | 0.0027 s | 0.0285 s | 0.09x (10.5x faster) |
-| `sync-update-small` | 1 file modified (size/mtime) | 0.0030 s | 0.0288 s | 0.10x (9.6x faster) |
-| `sync-delete` | 5 extraneous files deleted | 0.0044 s | 0.0290 s | 0.15x (6.6x faster) |
+| `sync-fresh-tree` | fresh copy, contents mode | 0.0332 s | 0.0828 s | 0.40x (2.5x faster) |
+| `sync-noop-tree` | second run, unchanged | 0.0026 s | 0.0275 s | 0.10x (10.6x faster) |
+| `sync-update-small` | 1 file modified (size/mtime) | 0.0034 s | 0.0281 s | 0.12x (8.3x faster) |
+| `sync-delete` | 5 extraneous files deleted | 0.0029 s | 0.0291 s | 0.10x (10.0x faster) |
 
 Correctness verified via `diff -r` after 100% of samples. `perf-gate-ready -1` verified pass (0).
 
