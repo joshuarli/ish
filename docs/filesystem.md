@@ -364,6 +364,28 @@ streamed and logical bytes cloned. These count different transfer methods; do
 not add them to estimate physical I/O. Logical clone size does not report
 physical I/O, and ish makes no universal speed-ratio claim.
 
+## Local synchronization (rsync)
+
+ish provides a native `rsync` builtin for local filesystem synchronization with
+explicit operand semantics:
+
+- `--into DIRECTORY SOURCE...`: synchronizes each `SOURCE` into `DIRECTORY/basename(SOURCE)`.
+- `SOURCE... DIRECTORY`: if the final operand exists as a directory, treats as `--into DIRECTORY`. If two operands and the destination is absent or non-directory, treats as exact mapping.
+- `SOURCE DEST`: synchronizes `SOURCE` to `DEST` (mirrors directory tree or copies file).
+- `--contents SOURCE DIRECTORY`: synchronizes the contents of `SOURCE` directly into `DIRECTORY` without creating an intermediate `basename(SOURCE)` subdirectory.
+
+Trailing `/` characters on operand paths never change the operation mode: `src`
+and `src/` produce the exact same target mapping.
+
+Sync defaults:
+- Recurses into directory trees automatically.
+- Quick-check skips unchanged regular files when entry kind, logical size, and modification timestamp match.
+- Differing destination files are updated atomically via staged replacement.
+- Symlinks are preserved as symlink objects without following contents.
+- `--delete` removes destination entries absent from the source mapping; without the flag, destination-only files remain intact.
+- `-n` is not supported (rejected with status 2 to prevent confusion with `cp -n` `--no-clobber`); use `--dry-run`.
+- Remote rsync protocol, daemon mode, and network rolling delta transfer are non-goals. Use explicit `/usr/bin/rsync` for remote transfers.
+
 ## Recovery limits
 
 Both fdu deletion and ish-fs retirement use the shared journaled quarantine

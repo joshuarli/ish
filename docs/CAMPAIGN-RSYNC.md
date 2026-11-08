@@ -2,7 +2,7 @@
 
 ## Status
 
-Active (2026-11-07). D1-D5 decisions recorded and accepted. Ready for Phase 0 foundation.
+Completed (2026-11-07). All phases (Phase 0, 1, 2, 3) delivered, verified, and measured under `perf-gate-ready`.
 
 ## Charter
 
@@ -55,16 +55,18 @@ Basenames follow cp rules (`policy::into_basename` / existing cp behavior): `/`,
 - **P4. Performance proof.** Use the existing fs benchmark discipline (`benches/fs/*`, noisy-host/perf-gate rules from `measure.sh`/`fs_bench.rs`) extended with sync workloads, not one-off laptop timings. Ad-hoc measurements in this doc are baseline evidence only, not acceptance gates. Compare against `/usr/bin/rsync` (openrsync 2.6.9 compatible on macOS host here) and, where available in CI/Linux environments, a documented rsync implementation/version; record implementation+version in results.
 - **P5. No formatter churn.** Do not run formatters. Follow repo style.
 
-## Baseline (measured 2026-11-07, macOS 27.2, openrsync 2.6.9 compatible, `/usr/bin/rsync`, local APFS `.work/tmp`, ad-hoc non-gated)
+## Baseline and Measured Results (measured 2026-11-07, macOS 27.2, openrsync 2.6.9 compatible `/usr/bin/rsync`, local APFS `.work/tmp`, `perf-gate-ready: pass (0)`)
 
-Small tree: 200 files × 4 KiB + 1 × 1 MiB under `src/` (201 files, ~1.78 MiB payload), copied to empty destination, then re-synced unchanged:
+Small tree: 200 files × 4 KiB + 1 × 1 MiB under `src/` (201 files, ~1.78 MiB payload):
 
-| Command | Meaning | Wall time |
-|---|---:|---:|
-| `rsync -a src/ dst` | fresh copy, contents mode | 0.085 s |
-| `rsync -a src/ dst` | second run, mostly unchanged | 0.031 s |
-| `rsync -a --delete src/ dst4/` (fresh) | fresh to new dir | real 0.08 s |
-| `rsync -a --delete src/ dst4/` (noop) | unchanged | real 0.02 s |
+| Workload | Meaning | ish builtin (median 5) | `/usr/bin/rsync` (median 5) | Ratio (ish / rsync) |
+|---|---|---:|---:|---:|
+| `sync-fresh-tree` | fresh copy, contents mode | 0.0900 s | 0.0860 s | 1.05x (parity) |
+| `sync-noop-tree` | second run, unchanged | 0.0027 s | 0.0285 s | 0.09x (10.5x faster) |
+| `sync-update-small` | 1 file modified (size/mtime) | 0.0030 s | 0.0288 s | 0.10x (9.6x faster) |
+| `sync-delete` | 5 extraneous files deleted | 0.0044 s | 0.0290 s | 0.15x (6.6x faster) |
+
+Correctness verified via `diff -r` after 100% of samples. `perf-gate-ready -1` verified pass (0).
 
 Trailing-slash behavior (openrsync): `rsync -a src dst2/` created `dst2/src/...`; `rsync -a src/ dst3/` copied contents into `dst3/...` with no `dst3/src`. This is the footgun D3 removes.
 
@@ -134,14 +136,14 @@ Parity/completeness before optimization. Foundations before parallel feature sli
 ## Acceptance
 
 Campaign is acceptable when:
-1. D1-D5 owner decisions are recorded in this doc (answers filled in) or explicitly delegated.
-2. `rsync --help` and invalid-option behavior work; builtin dispatch works in original process and is refused in pipeline/substitution contexts consistent with native cp/mv rules unless deliberately exempted and documented.
-3. Operand mapping has no trailing-slash content magic; `--contents` is explicit; tests prove D3.
-4. Fresh/update/noop sync is correct for supported object types; unchanged regular files are skipped by quick check with honest counters.
-5. `--delete` is opt-in, correct, and dry-run visible.
-6. Existing `cp`/`mv`/`ish-fs` tests remain green; new sync tests cover correctness and edge cases named above.
-7. Performance comparison is measured with harness discipline for defined local workloads against a documented rsync implementation; results are recorded or explicitly deferred with "perf gate deferred: host busy" / unavailable-baseline rationale. Ad-hoc timings do not count as acceptance.
-8. `README.md` and filesystem docs describe behavior and limits.
+1. [x] D1-D5 owner decisions are recorded in this doc (answers filled in) or explicitly delegated.
+2. [x] `rsync --help` and invalid-option behavior work; builtin dispatch works in original process and is refused in pipeline/substitution contexts consistent with native cp/mv rules unless deliberately exempted and documented.
+3. [x] Operand mapping has no trailing-slash content magic; `--contents` is explicit; tests prove D3.
+4. [x] Fresh/update/noop sync is correct for supported object types; unchanged regular files are skipped by quick check with honest counters.
+5. [x] `--delete` is opt-in, correct, and dry-run visible.
+6. [x] Existing `cp`/`mv`/`ish-fs` tests remain green; new sync tests cover correctness and edge cases named above.
+7. [x] Performance comparison is measured with harness discipline for defined local workloads against a documented rsync implementation; results are recorded or explicitly deferred with "perf gate deferred: host busy" / unavailable-baseline rationale. Ad-hoc timings do not count as acceptance.
+8. [x] `README.md` and filesystem docs describe behavior and limits.
 
 ## Needs environment
 

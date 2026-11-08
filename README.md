@@ -113,14 +113,14 @@ including `alias`, `exit`, `fg`, `denv`, and `z`, must be the whole input line.
 `cd` and `history` can also be used in lists. `rmrf` must also be the whole
 input line.
 
-Native `cp` and `mv` run in the shell process, including lists, redirections,
+Native `cp`, `mv`, and `rsync` run in the shell process, including lists, redirections,
 and standalone negation. `! cp source copy` performs the copy and inverts its
 status. Genuine pipelines and command substitutions refuse native operations
 before target redirections or filesystem effects. Refusal returns 2; an
 expression's `!` can invert that status while retaining the diagnostic.
 Argument substitutions are allowed. Aliases after `!` expand before dispatch.
 Use `command cp` or an alias for the same native operation. Use an explicit
-path such as `/bin/cp` to run the external utility.
+path such as `/bin/cp` or `/usr/bin/rsync` to run the external utility.
 
 Native `l`, `ll`, `c`, and the list form of `history` also require the ish process.
 They refuse pipeline stages and command substitutions with status 2 before
@@ -146,6 +146,7 @@ ish-specific commands include:
 | `z [query]` | Jump to a frequently used directory; no query goes home |
 | `cp [OPTIONS] SOURCE DESTINATION` | Copy files or directory trees; with more than one source the last operand must be a directory |
 | `mv [OPTIONS] SOURCE DESTINATION` | Move files or directory trees; with more than one source the last operand must be a directory |
+| `rsync [OPTIONS] SOURCE... DESTINATION` | Synchronize files or directory trees locally without trailing-slash magic |
 | `rmrf PATH...` | Permanently remove each path, including directory trees |
 | `w`, `which`, `type` | Locate a command or alias; builtins print their usage and description, and a same-name alias also shows the underlying command |
 | `l [path...]` | List visible files with sizes and relative ages |
@@ -212,6 +213,19 @@ Unpublished stages remain available for inspection. Recovery preserves published
 destinations and never resumes deleting sources. Read the
 [recovery reference](docs/filesystem.md#inspect-retained-operation-state) before
 retrying an interrupted operation.
+
+ish's `rsync` provides local filesystem synchronization without trailing-slash
+magic: `src` and `src/` map identically. Explicit forms select mapping:
+`--into DIRECTORY SOURCE...` synchronizes sources into a target container;
+`SOURCE... DIRECTORY` uses `--into` convenience when the final operand exists as
+a directory; `SOURCE DEST` performs an exact mapping; and `--contents SOURCE DIRECTORY`
+synchronizes the directory contents of `SOURCE` directly into `DIRECTORY` without
+creating an intermediate basename directory. Regular files are skipped when entry
+kind, logical size, and modification timestamp match. Differing destination files
+are updated atomically via staged replacement. Deletions are opt-in via `--delete`.
+`-n` is not supported (use `--dry-run`). Remote rsync protocols, daemon modes,
+and network deltas are external non-goals; explicit paths such as `/usr/bin/rsync`
+run the external utility.
 
 The exposed epsh builtins are `echo`, `printf`, `pwd`, `true`, `false`, `:`,
 `test`, `[`, `kill`, `export`, `unset`, `set`, and `command`; `cd` also retains
