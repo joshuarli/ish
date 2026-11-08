@@ -113,7 +113,13 @@ fn new_stage<'a>(invocation: &Invocation<'a>, destination: &'a Root, source: Obs
     let name = session.stage_name();
     let display = destination.path.parent().unwrap_or_else(|| Path::new(".")).join(session.name()).join(&name);
     let placeholder = Observation { identity: Identity { file: fdu_posix::identity::FileIdentity { device: 0, inode: 0 }, kind: source.identity.kind }, ..source };
-    let registration = Some(session.register_stage(&name)?);
+    let registration = Some(match session.register_stage(&name) {
+        Ok(record) => record,
+        Err(error) => return Err(match session.finish() {
+            Ok(()) => error,
+            Err(cleanup) => io::Error::new(error.kind(), format!("{error}; staging journal cleanup failed: {cleanup}")),
+        }),
+    });
     let mut stage = Stage { session, registration, name, observed: placeholder, entries, directories, directory: None, published: false, journal_finished: false, sink: invocation.sink, display };
     if source.identity.kind == EntryKind::Directory {
         fs::mkdirat(stage.session.directory(), &stage.name, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;

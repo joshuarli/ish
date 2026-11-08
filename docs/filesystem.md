@@ -24,7 +24,12 @@ permissions by pathname would permit a
 substitution race. Inspect the retained directory before repairing permissions
 or removing an empty directory yourself. Recovery remains blocked until the
 retained directory is accessible and its state is resolved. ish does not change the process umask or working
-directory, or launch a filesystem helper.
+directory, or launch a filesystem helper. When session initialization fails
+after the directory was created but nothing was captured, ish removes the
+empty session directory itself; if that directory is not accessible, it stays
+for the manual repair above. Other unsupported filesystems fail with a
+staging-initialization diagnostic and no capture; for a copy, `/bin/cp` or a
+filesystem that supports staging (for example APFS) avoids the failure.
 
 ## Choose a destination form
 

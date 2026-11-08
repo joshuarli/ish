@@ -379,6 +379,41 @@ fn retained(workspace: &OsStr, capture: Option<&OsStr>, error: io::Error) -> io:
     io::Error::new(error.kind(), format!("{error}; retained at scan root/{location:?}; restore without overwriting the original name, then rescan"))
 }
 
+fn abandon_fresh_session(root: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
+    let observed = match identity::stat_at(root, name) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if identity::entry_type(&observed) != EntryType::Directory || observed.st_uid != rustix::process::geteuid().as_raw() {
+        return Err(invalid("fresh session cleanup found a foreign or non-directory entry"));
+    }
+    let expected = identity::identity(&observed)?;
+    let directory = retry(|| fs::openat(root, name, DIRECTORY_FLAGS, Mode::empty()))?;
+    if identity::identity(&retry(|| fs::fstat(directory.as_fd()))?)? != expected {
+        return Err(invalid("fresh session cleanup found a substituted directory"));
+    }
+    for record in [OsStr::new("pending-header"), OsStr::new("header")] {
+        match fs::unlinkat(&directory, record, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {},
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let _ = sync(directory.as_fd());
+    fs::unlinkat(root, name, AtFlags::REMOVEDIR)?;
+    let _ = sync(root);
+    Ok(())
+}
+
+fn start_failure(error: io::Error) -> io::Error {
+    let hint = if error.kind() == io::ErrorKind::Unsupported {
+        "this filesystem does not support the operations ish staging requires; try a filesystem that does (for example APFS) or /bin/cp for copies"
+    } else {
+        "no entry was captured"
+    };
+    io::Error::new(error.kind(), format!("staging session initialization failed: {error}; {hint}"))
+}
+
 fn lock(root: BorrowedFd<'_>) -> io::Result<RootLock> {
     let fd = retry(|| fs::openat(root, c".", DIRECTORY_FLAGS, Mode::empty()))?;
     fs::flock(&fd, fs::FlockOperation::NonBlockingLockExclusive).map_err(|error| io::Error::new(io::Error::from(error).kind(), "another deletion or recovery owns this root"))?;
@@ -564,21 +599,30 @@ impl Session {
         if recover(&mut root)? { return Err(io::Error::other("interrupted deletion recovered; rescan before deleting")); }
         let mount = identity::mount_identity(root.as_fd())?;
         let name = create_session_directory(root.as_fd(), random_bytes)?;
-        let directory = open_created_directory(root.as_fd(), &name).map_err(|error| retained(&name, None, error))?;
-        let initialized = (|| {
-            fs::fchmod(&directory, Mode::RWXU)?;
-            validate_directory(directory.as_fd(), false)?;
-            let (session_identity, session_mount) = directory_state(directory.as_fd())?;
-            if session_mount != mount { return Err(invalid("quarantine is on another mount")); }
-            let mut header = MAGIC.to_vec();
-            put_identity(&mut header, directory_state(root.as_fd())?.0);
-            header.extend_from_slice(&rustix::process::geteuid().as_raw().to_le_bytes());
-            put_identity(&mut header, session_identity);
-            put_mount(&mut header, &mount)?;
-            publish(directory.as_fd(), OsStr::new("pending-header"), OsStr::new("header"), &header)?;
-            sync(root.as_fd())
+        let initiated = (|| -> io::Result<OwnedFd> {
+            let directory = open_created_directory(root.as_fd(), &name)?;
+            (|| {
+                fs::fchmod(&directory, Mode::RWXU)?;
+                validate_directory(directory.as_fd(), false)?;
+                let (session_identity, session_mount) = directory_state(directory.as_fd())?;
+                if session_mount != mount { return Err(invalid("quarantine is on another mount")); }
+                let mut header = MAGIC.to_vec();
+                put_identity(&mut header, directory_state(root.as_fd())?.0);
+                header.extend_from_slice(&rustix::process::geteuid().as_raw().to_le_bytes());
+                put_identity(&mut header, session_identity);
+                put_mount(&mut header, &mount)?;
+                publish(directory.as_fd(), OsStr::new("pending-header"), OsStr::new("header"), &header)?;
+                sync(root.as_fd())
+            })()?;
+            Ok(directory)
         })();
-        if let Err(error) = initialized { return Err(retained(&name, None, error)); }
+        let directory = match initiated {
+            Ok(directory) => directory,
+            Err(error) => return Err(match abandon_fresh_session(root.as_fd(), &name) {
+                Ok(()) => start_failure(error),
+                Err(cleanup) => io::Error::new(error.kind(), format!("{error}; retained at scan root/{name:?}; empty staging directory could not be removed; inspect it and remove it yourself before retrying: {cleanup}")),
+            }),
+        };
         Ok(Self { owner: rustix::process::getpid(), root, directory, name, mount, next: AtomicU64::new(0), recovery_required: AtomicBool::new(false) })
     }
 
@@ -1136,6 +1180,40 @@ mod tests {
         next.finish().unwrap();
         drop(next);
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn fresh_session_cleanup_removes_only_an_empty_session_directory() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join(".work/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let root_path = base.join(format!("ish-fresh-cleanup-{}", std::process::id()));
+        std::fs::create_dir(&root_path).unwrap();
+        let root = std::fs::File::open(&root_path).unwrap();
+        let empty = format!("{}{}", std::str::from_utf8(PREFIX).unwrap(), "00".repeat(16));
+        std::fs::create_dir(root_path.join(&empty)).unwrap();
+        std::fs::write(root_path.join(&empty).join("pending-header"), b"pending").unwrap();
+        std::fs::write(root_path.join(&empty).join("header"), b"header").unwrap();
+        abandon_fresh_session(root.as_fd(), OsStr::new(&empty)).unwrap();
+        assert!(!root_path.join(&empty).exists());
+        abandon_fresh_session(root.as_fd(), OsStr::new(&empty)).unwrap();
+        let occupied = format!("{}{}", std::str::from_utf8(PREFIX).unwrap(), "11".repeat(16));
+        std::fs::create_dir(root_path.join(&occupied)).unwrap();
+        std::fs::write(root_path.join(&occupied).join("user-file"), b"unowned").unwrap();
+        assert!(abandon_fresh_session(root.as_fd(), OsStr::new(&occupied)).is_err());
+        assert_eq!(std::fs::read(root_path.join(&occupied).join("user-file")).unwrap(), b"unowned");
+        std::fs::remove_dir_all(&root_path).unwrap();
+    }
+
+    #[test]
+    fn start_failure_distinguishes_unsupported_filesystems() {
+        let unsupported = start_failure(io::Error::new(io::ErrorKind::Unsupported, "Operation not supported (os error 45)"));
+        assert_eq!(unsupported.kind(), io::ErrorKind::Unsupported);
+        assert!(unsupported.to_string().contains("staging session initialization failed: Operation not supported (os error 45)"), "{unsupported}");
+        assert!(unsupported.to_string().contains("does not support the operations ish staging requires"), "{unsupported}");
+        assert!(!unsupported.to_string().contains("retained"), "{unsupported}");
+        let other = start_failure(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+        assert!(other.to_string().contains("no entry was captured"), "{other}");
+        assert!(!other.to_string().contains("retained"), "{other}");
     }
 
 }
