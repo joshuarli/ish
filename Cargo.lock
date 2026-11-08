@@ -691,9 +691,9 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rustybench"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1308d0f42c26143247ee10cce1fbe72d73f5cb6156919bd3a7e9a0093920d92f"
+checksum = "8a64392032c28cc45d5fe44fe9232b6bf91498c407f1cfcd532ab742b6241712"
 dependencies = [
  "lexopt",
  "miniserde",
@@ -703,9 +703,9 @@ dependencies = [
 
 [[package]]
 name = "rustybench-macros"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "568c962a78d39a16e438d24a905c117f62b311bcc46d166a818950f61ca8074f"
+checksum = "3dc620959d82483d14afbe317790bc9814aa90df11c91565ead4f3a578883f50"
 
 [[package]]
 name = "serde"
