@@ -292,6 +292,7 @@ fn direct_apply_metadata(invocation: &Invocation<'_>, display: &Path, target: Me
         },
         Err(error) => return Err(error),
     };
+    #[cfg(target_os = "macos")]
     if metadata.resource_fork_size.unwrap_or(0) > 0 {
         invocation.warn_direct_once(display.to_path_buf(), "warning: resource fork not preserved".into());
     }

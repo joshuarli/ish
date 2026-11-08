@@ -258,14 +258,13 @@ impl SyncSession<'_> {
         };
 
         if let Ok(dst_meta) = fs::symlink_metadata(dst_path) {
-            if dst_meta.is_symlink() {
-                if let Ok(existing_target) = fs::read_link(dst_path) {
-                    if existing_target == target {
-                        self.progress.skipped_files += 1;
-                        let _ = self.sink.emit(Event::Progress(self.progress_event()));
-                        return;
-                    }
-                }
+            if dst_meta.is_symlink()
+                && let Ok(existing_target) = fs::read_link(dst_path)
+                && existing_target == target
+            {
+                self.progress.skipped_files += 1;
+                let _ = self.sink.emit(Event::Progress(self.progress_event()));
+                return;
             }
             if !self.request.options.dry_run {
                 if dst_meta.is_dir() {
@@ -318,16 +317,15 @@ impl SyncSession<'_> {
         }
 
         let dst_meta = fs::symlink_metadata(dst_path).ok();
-        if let Some(ref dst_meta) = dst_meta {
-            if dst_meta.is_file()
-                && dst_meta.len() == src_meta.len()
-                && dst_meta.mtime() == src_meta.mtime()
-                && dst_meta.mtime_nsec() == src_meta.mtime_nsec()
-            {
-                self.progress.skipped_files += 1;
-                let _ = self.sink.emit(Event::Progress(self.progress_event()));
-                return;
-            }
+        if let Some(ref dst_meta) = dst_meta
+            && dst_meta.is_file()
+            && dst_meta.len() == src_meta.len()
+            && dst_meta.mtime() == src_meta.mtime()
+            && dst_meta.mtime_nsec() == src_meta.mtime_nsec()
+        {
+            self.progress.skipped_files += 1;
+            let _ = self.sink.emit(Event::Progress(self.progress_event()));
+            return;
         }
 
         let size = src_meta.len();
@@ -462,21 +460,20 @@ impl SyncSession<'_> {
                 rustix::fs::CloneFlags::NOOWNERCOPY,
             )
             .is_ok()
-            {
-                if let Ok(cloned_fd) = rustix::fs::openat(
+                && let Ok(cloned_fd) = rustix::fs::openat(
                     dst_parent_fd,
                     dst_name,
                     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                     Mode::empty(),
-                ) {
-                    let _ = platform::apply_metadata(
-                        MetadataTarget::Fd(cloned_fd.as_fd()),
-                        &src_obs,
-                        &src_ext,
-                        Preservation::Copy,
-                    );
-                    return Ok(());
-                }
+                )
+            {
+                let _ = platform::apply_metadata(
+                    MetadataTarget::Fd(cloned_fd.as_fd()),
+                    &src_obs,
+                    &src_ext,
+                    Preservation::Copy,
+                );
+                return Ok(());
             }
         }
 
@@ -547,21 +544,20 @@ impl SyncSession<'_> {
                 rustix::fs::CloneFlags::NOOWNERCOPY,
             )
             .is_ok()
-            {
-                if let Ok(cloned_fd) = rustix::fs::openat(
+                && let Ok(cloned_fd) = rustix::fs::openat(
                     dst_parent_fd,
                     &temp_name,
                     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                     Mode::empty(),
-                ) {
-                    let _ = platform::apply_metadata(
-                        MetadataTarget::Fd(cloned_fd.as_fd()),
-                        &src_obs,
-                        &src_ext,
-                        Preservation::Copy,
-                    );
-                    cloned = true;
-                }
+                )
+            {
+                let _ = platform::apply_metadata(
+                    MetadataTarget::Fd(cloned_fd.as_fd()),
+                    &src_obs,
+                    &src_ext,
+                    Preservation::Copy,
+                );
+                cloned = true;
             }
         }
 
@@ -696,22 +692,20 @@ impl SyncSession<'_> {
 
         if !contents_mode {
             self.progress.examined_files += 1;
-            if !target_dir_existed {
-                if !self.request.options.dry_run {
-                    if let Err(error) = fs::create_dir_all(&target_dir) {
-                        let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
-                            path: target_dir.clone(),
-                            message: format!("cannot create directory: {error}"),
-                        }));
-                        self.failed = true;
-                        return;
-                    }
-                    if let Ok(src_meta) = fs::symlink_metadata(src_dir) {
-                        let _ = fs::set_permissions(
-                            &target_dir,
-                            fs::Permissions::from_mode(src_meta.mode()),
-                        );
-                    }
+            if !target_dir_existed && !self.request.options.dry_run {
+                if let Err(error) = fs::create_dir_all(&target_dir) {
+                    let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                        path: target_dir.clone(),
+                        message: format!("cannot create directory: {error}"),
+                    }));
+                    self.failed = true;
+                    return;
+                }
+                if let Ok(src_meta) = fs::symlink_metadata(src_dir) {
+                    let _ = fs::set_permissions(
+                        &target_dir,
+                        fs::Permissions::from_mode(src_meta.mode()),
+                    );
                 }
             }
         }
@@ -728,7 +722,24 @@ impl SyncSession<'_> {
             }
         };
 
-        let mut src_names = HashSet::new();
+        let src_dir_fd = rustix::fs::open(
+            src_dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok();
+
+        let dst_dir_fd = if target_dir.exists() {
+            rustix::fs::open(
+                &target_dir,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .ok()
+        } else {
+            None
+        };
+
         let mut child_entries = Vec::new();
 
         for entry in src_entries {
@@ -743,46 +754,29 @@ impl SyncSession<'_> {
                     continue;
                 }
             };
-            let name = entry.file_name();
-            src_names.insert(name.clone());
-            child_entries.push(name);
+            child_entries.push(entry.file_name());
         }
         child_entries.sort();
 
-        if self.request.options.delete && target_dir.exists() {
-            if let Ok(dst_entries) = fs::read_dir(&target_dir) {
-                let mut extraneous = Vec::new();
-                for entry in dst_entries.flatten() {
-                    let name = entry.file_name();
-                    if !src_names.contains(&name) {
-                        extraneous.push(entry.path());
-                    }
-                }
-                extraneous.sort();
-                for path in extraneous {
-                    if self.cancellation.is_cancelled() {
-                        return;
-                    }
-                    self.delete_entry(&path);
+        if self.request.options.delete
+            && target_dir.exists()
+            && let Ok(dst_entries) = fs::read_dir(&target_dir)
+        {
+            let mut extraneous = Vec::new();
+            for entry in dst_entries.flatten() {
+                let name = entry.file_name();
+                if child_entries.binary_search(&name).is_err() {
+                    extraneous.push(entry.path());
                 }
             }
+            extraneous.sort();
+            for path in extraneous {
+                if self.cancellation.is_cancelled() {
+                    return;
+                }
+                self.delete_entry(&path);
+            }
         }
-
-        let src_dir_fd = rustix::fs::open(
-            src_dir,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        ).ok();
-
-        let dst_dir_fd = if target_dir.exists() {
-            rustix::fs::open(
-                &target_dir,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            ).ok()
-        } else {
-            None
-        };
 
         let mut files_to_transfer = Vec::new();
 
@@ -790,39 +784,72 @@ impl SyncSession<'_> {
             if self.cancellation.is_cancelled() {
                 return;
             }
-            let child_src = src_dir.join(&name);
-            let child_dst = target_dir.join(&name);
 
-            let child_src_meta = match fs::symlink_metadata(&child_src) {
-                Ok(m) => m,
-                Err(error) => {
-                    let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
-                        path: child_src,
-                        message: format!("cannot access source: {error}"),
-                    }));
-                    self.failed = true;
-                    continue;
+            let (is_file, size, nlink, dev, ino, mtime, mtime_nsec) = if let Some(ref fd) = src_dir_fd {
+                match rustix::fs::statat(fd.as_fd(), &name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(st) => {
+                        let is_file = (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFREG as u32;
+                        #[allow(clippy::unnecessary_cast)]
+                        (
+                            is_file,
+                            st.st_size as u64,
+                            st.st_nlink as u64,
+                            st.st_dev as u64,
+                            st.st_ino as u64,
+                            st.st_mtime as i64,
+                            st.st_mtime_nsec as i64,
+                        )
+                    }
+                    Err(error) => {
+                        let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                            path: src_dir.join(&name),
+                            message: format!("cannot access source: {error}"),
+                        }));
+                        self.failed = true;
+                        continue;
+                    }
+                }
+            } else {
+                let child_src = src_dir.join(&name);
+                match fs::symlink_metadata(&child_src) {
+                    Ok(m) => (
+                        m.is_file(),
+                        m.len(),
+                        m.nlink(),
+                        m.dev(),
+                        m.ino(),
+                        m.mtime(),
+                        m.mtime_nsec(),
+                    ),
+                    Err(error) => {
+                        let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                            path: child_src,
+                            message: format!("cannot access source: {error}"),
+                        }));
+                        self.failed = true;
+                        continue;
+                    }
                 }
             };
 
-            if child_src_meta.is_file() && src_dir_fd.is_some() && dst_dir_fd.is_some() && !self.request.options.dry_run {
+            if is_file && src_dir_fd.is_some() && dst_dir_fd.is_some() && !self.request.options.dry_run {
                 self.progress.examined_files += 1;
-                let size = child_src_meta.len();
 
-                if child_src_meta.nlink() > 1 {
+                if nlink > 1 {
                     let identity = Identity {
                         file: fdu_posix::identity::FileIdentity {
-                            device: child_src_meta.dev(),
-                            inode: child_src_meta.ino(),
+                            device: dev,
+                            inode: ino,
                         },
                         kind: EntryKind::RegularFile,
                     };
                     if !self.seen_hardlinks.insert(identity) {
+                        let path = src_dir.join(&name);
                         let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
-                            path: child_src.clone(),
+                            path: path.clone(),
                             message: format!(
                                 "hardlink group detected for {}; topology preservation is not supported in v1 without --split-hardlinks",
-                                child_src.display()
+                                path.display()
                             ),
                         }));
                         self.failed = true;
@@ -830,29 +857,38 @@ impl SyncSession<'_> {
                     }
                 }
 
-                let dst_meta = fs::symlink_metadata(&child_dst).ok();
-                if let Some(ref dst_meta) = dst_meta {
-                    if dst_meta.is_file()
-                        && dst_meta.len() == child_src_meta.len()
-                        && dst_meta.mtime() == child_src_meta.mtime()
-                        && dst_meta.mtime_nsec() == child_src_meta.mtime_nsec()
-                    {
-                        self.progress.skipped_files += 1;
-                        let _ = self.sink.emit(Event::Progress(self.progress_event()));
-                        continue;
-                    }
+                let dst_stat = dst_dir_fd.as_ref().and_then(|fd| {
+                    rustix::fs::statat(fd.as_fd(), &name, AtFlags::SYMLINK_NOFOLLOW).ok()
+                });
+
+                #[allow(clippy::unnecessary_cast)]
+                let skipped = if let Some(ref dst_st) = dst_stat
+                    && (dst_st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFREG as u32
+                    && dst_st.st_size as u64 == size
+                    && dst_st.st_mtime as i64 == mtime
+                    && dst_st.st_mtime_nsec as i64 == mtime_nsec
+                {
+                    self.progress.skipped_files += 1;
+                    let _ = self.sink.emit(Event::Progress(self.progress_event()));
+                    true
+                } else {
+                    false
+                };
+
+                if skipped {
+                    continue;
                 }
 
-                files_to_transfer.push((name, child_src, child_dst, size, dst_meta.is_some()));
+                files_to_transfer.push((name, size, dst_stat.is_some()));
             } else {
-                self.sync_pair(&child_src, &child_dst, false);
+                self.sync_pair(&src_dir.join(&name), &target_dir.join(&name), false);
             }
         }
 
         if !files_to_transfer.is_empty() {
             let jobs = self.request.options.jobs.map_or(4, Jobs::get).min(files_to_transfer.len());
             if jobs <= 1 || files_to_transfer.len() < 4 {
-                for (name, _child_src, child_dst, size, is_replacement) in files_to_transfer {
+                for (name, size, is_replacement) in files_to_transfer {
                     if self.cancellation.is_cancelled() {
                         return;
                     }
@@ -883,7 +919,7 @@ impl SyncSession<'_> {
 
                     if let Err(error) = copy_result {
                         let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
-                            path: child_dst,
+                            path: target_dir.join(&name),
                             message: format!("failed to copy file: {error}"),
                         }));
                         self.failed = true;
@@ -898,6 +934,7 @@ impl SyncSession<'_> {
 
                 let src_fd_ref = src_dir_fd.as_ref().unwrap().as_fd();
                 let dst_fd_ref = dst_dir_fd.as_ref().unwrap().as_fd();
+                let target_dir_ref = &target_dir;
 
                 std::thread::scope(|scope| {
                     for _ in 0..jobs {
@@ -917,7 +954,7 @@ impl SyncSession<'_> {
                                     let mut q = queue.lock().unwrap();
                                     q.pop()
                                 };
-                                let Some((name, _child_src, child_dst, size, is_replacement)) = item else {
+                                let Some((name, size, is_replacement)) = item else {
                                     break;
                                 };
 
@@ -951,7 +988,7 @@ impl SyncSession<'_> {
                                     Err(err) => {
                                         let mut e = first_error.lock().unwrap();
                                         if e.is_none() {
-                                            *e = Some((child_dst, err));
+                                            *e = Some((target_dir_ref.join(&name), err));
                                         }
                                     }
                                 }
@@ -979,21 +1016,20 @@ impl SyncSession<'_> {
         let children_modified = self.progress.transferred_files > initial_transferred
             || self.progress.deleted_files > initial_deleted;
 
-        if !self.request.options.dry_run && (!target_dir_existed || children_modified) && target_dir.exists() {
-            if let Some(ref src_fd) = src_dir_fd {
-                if let Some(ref dst_fd) = dst_dir_fd {
-                    if let Ok(obs) = roots::observe_fd(src_fd.as_fd()) {
-                        if let Ok(ext) = platform::capture_metadata(MetadataTarget::Fd(src_fd.as_fd())) {
-                            let _ = platform::apply_metadata(
-                                MetadataTarget::Fd(dst_fd.as_fd()),
-                                &obs,
-                                &ext,
-                                Preservation::Copy,
-                            );
-                        }
-                    }
-                }
-            }
+        if !self.request.options.dry_run
+            && (!target_dir_existed || children_modified)
+            && target_dir.exists()
+            && let Some(ref src_fd) = src_dir_fd
+            && let Some(ref dst_fd) = dst_dir_fd
+            && let Ok(obs) = roots::observe_fd(src_fd.as_fd())
+            && let Ok(ext) = platform::capture_metadata(MetadataTarget::Fd(src_fd.as_fd()))
+        {
+            let _ = platform::apply_metadata(
+                MetadataTarget::Fd(dst_fd.as_fd()),
+                &obs,
+                &ext,
+                Preservation::Copy,
+            );
         }
     }
 
