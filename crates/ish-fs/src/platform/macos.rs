@@ -867,14 +867,13 @@ fn capture_xattr_value(
     name: &CStr,
     budget: &mut CaptureBudget,
 ) -> io::Result<Vec<u8>> {
-    let mut size_query = [0_u8; 0];
-    let expected = fs::fgetxattr(fd, name, &mut size_query[..])?;
+    let expected = fs::fgetxattr_query(fd, name)?;
     budget.check(expected)?;
     let mut value = Vec::new();
     value.try_reserve_exact(expected).map_err(allocation_error)?;
     budget.record(value.capacity())?;
     value.resize(expected, 0);
-    let value_length = fs::fgetxattr(fd, name, value.as_mut_slice())?;
+    let value_length = fgetxattr_len(fd, name, value.as_mut_slice())?;
     if value_length != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -910,9 +909,24 @@ fn copy_bytes_to_cstring(bytes: &[u8], budget: &mut CaptureBudget) -> io::Result
 
 fn capture_resource_fork_size(fd: BorrowedFd<'_>) -> io::Result<Option<u64>> {
     let kind = fs::fstat(fd)?.st_mode & libc::S_IFMT;
-    let name = c"com.apple.ResourceFork";
-    let mut size_query = [0_u8; 0];
-    classify_resource_fork_size(fs::fgetxattr(fd, name, &mut size_query[..]), kind)
+    classify_resource_fork_size(fs::fgetxattr_query(fd, RESOURCE_FORK_NAME), kind)
+}
+
+// rustix reports a zero-length buffer as empty instead of the attribute size.
+fn fgetxattr_len(fd: BorrowedFd<'_>, name: &CStr, value: &mut [u8]) -> Result<usize, Errno> {
+    if value.is_empty() {
+        fs::fgetxattr_query(fd, name)
+    } else {
+        fs::fgetxattr(fd, name, value)
+    }
+}
+
+fn flistxattr_len(fd: BorrowedFd<'_>, names: &mut [u8]) -> Result<usize, Errno> {
+    if names.is_empty() {
+        fs::flistxattr_query(fd)
+    } else {
+        fs::flistxattr(fd, names)
+    }
 }
 
 fn classify_resource_fork_size(
@@ -1004,8 +1018,7 @@ fn reconcile_xattrs(fd: BorrowedFd<'_>, desired: &[Xattr]) -> io::Result<()> {
 }
 
 fn list_xattr_names(fd: BorrowedFd<'_>, budget: &mut CaptureBudget) -> io::Result<Vec<u8>> {
-    let mut size_query = [0_u8; 0];
-    let length = match fs::flistxattr(fd, &mut size_query[..]) {
+    let length = match fs::flistxattr_query(fd) {
         Ok(length) => length,
         Err(error) if is_no_xattrs(error) => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
@@ -1015,7 +1028,7 @@ fn list_xattr_names(fd: BorrowedFd<'_>, budget: &mut CaptureBudget) -> io::Resul
     names.try_reserve_exact(length).map_err(allocation_error)?;
     budget.record(names.capacity())?;
     names.resize(length, 0);
-    let actual_length = fs::flistxattr(fd, names.as_mut_slice())?;
+    let actual_length = flistxattr_len(fd, names.as_mut_slice())?;
     if actual_length != length {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

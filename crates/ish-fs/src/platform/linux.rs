@@ -652,16 +652,41 @@ pub(crate) fn capture_metadata(target: MetadataTarget<'_>) -> io::Result<Extende
 
 fn read_fd_xattrs(fd: BorrowedFd<'_>) -> io::Result<(Vec<Xattr>, Option<Vec<u8>>)> {
     read_xattrs(
-        |buffer| fs::flistxattr(fd, buffer),
-        |name, buffer| fs::fgetxattr(fd, name, buffer),
+        |buffer| xattr_query_or_read(buffer, || fs::flistxattr_query(fd), |buffer| fs::flistxattr(fd, buffer)),
+        |name, buffer| {
+            xattr_query_or_read(
+                buffer,
+                || fs::fgetxattr_query(fd, name),
+                |buffer| fs::fgetxattr(fd, name, buffer),
+            )
+        },
     )
 }
 
 fn read_path_xattrs(path: &OsStr) -> io::Result<(Vec<Xattr>, Option<Vec<u8>>)> {
     read_xattrs(
-        |buffer| fs::llistxattr(path, buffer),
-        |name, buffer| fs::lgetxattr(path, name, buffer),
+        |buffer| xattr_query_or_read(buffer, || fs::llistxattr_query(path), |buffer| fs::llistxattr(path, buffer)),
+        |name, buffer| {
+            xattr_query_or_read(
+                buffer,
+                || fs::lgetxattr_query(path, name),
+                |buffer| fs::lgetxattr(path, name, buffer),
+            )
+        },
     )
+}
+
+// rustix reports a zero-length buffer as empty instead of the attribute size.
+fn xattr_query_or_read(
+    buffer: &mut [u8],
+    query: impl FnOnce() -> rustix::io::Result<usize>,
+    read: impl FnOnce(&mut [u8]) -> rustix::io::Result<usize>,
+) -> rustix::io::Result<usize> {
+    if buffer.is_empty() {
+        query()
+    } else {
+        read(buffer)
+    }
 }
 
 fn read_xattrs(
@@ -955,7 +980,10 @@ fn remove_unpreserved_fd_xattrs(
     owner_matches: bool,
 ) -> io::Result<()> {
     let mut budget = MetadataCaptureBudget::new(METADATA_CAPTURE_BYTES);
-    let names = list_xattr_names(|buffer| fs::flistxattr(fd, buffer), &mut budget)?;
+    let names = list_xattr_names(
+        |buffer| xattr_query_or_read(buffer, || fs::flistxattr_query(fd), |buffer| fs::flistxattr(fd, buffer)),
+        &mut budget,
+    )?;
     visit_xattr_names(&names, |name| {
         let preserved = metadata
             .xattrs
@@ -978,7 +1006,10 @@ fn remove_unpreserved_path_xattrs(
     owner_matches: bool,
 ) -> io::Result<()> {
     let mut budget = MetadataCaptureBudget::new(METADATA_CAPTURE_BYTES);
-    let names = list_xattr_names(|buffer| fs::llistxattr(path, buffer), &mut budget)?;
+    let names = list_xattr_names(
+        |buffer| xattr_query_or_read(buffer, || fs::llistxattr_query(path), |buffer| fs::llistxattr(path, buffer)),
+        &mut budget,
+    )?;
     visit_xattr_names(&names, |name| {
         let preserved = metadata
             .xattrs
