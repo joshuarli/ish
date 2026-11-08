@@ -6,3 +6,5 @@ benches/*-baseline.txt
 .tox/
 .venv/
 __pycache__/
+.work/
+
