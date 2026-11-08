@@ -55,7 +55,7 @@ fn try_run(root: &Path, tree: Tree, selected: &[NodeId]) -> Result<Vec<DeleteOut
         match event {
             DeleteEvent::Outcomes(batch) => outcomes.extend(batch),
             DeleteEvent::Failed { message } => return Err(message),
-            DeleteEvent::Progress { .. } => {}
+            DeleteEvent::Progress { .. } | DeleteEvent::Diagnostic { .. } => {}
             DeleteEvent::Finished => return Ok(outcomes),
         }
     }

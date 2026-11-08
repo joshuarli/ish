@@ -73,6 +73,7 @@ pub struct DeleteOutcome {
 pub enum DeleteEvent {
     Progress { completed: usize, total: usize, current: NodeId },
     Outcomes(Vec<DeleteOutcome>),
+    Diagnostic { message: String },
     Failed { message: String },
     Finished,
 }
@@ -288,7 +289,7 @@ mod posix {
 
     struct Deletion<'a> {
         tree: &'a Tree,
-        quarantine: &'a quarantine::Session,
+        quarantine: Option<&'a quarantine::Session>,
         root_mount: MountIdentity,
         cancelled: &'a AtomicBool,
         sender: &'a SyncSender<DeleteEvent>,
@@ -322,12 +323,16 @@ mod posix {
             }
         };
         let quarantine = match quarantine::Session::start(root.as_fd()) {
-            Ok(session) => session,
+            Ok(session) => Some(session),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported && !error.to_string().contains("restrictive umask") => {
+                let _ = sender.send(DeleteEvent::Diagnostic { message: format!("warning: deletion quarantine unsupported; deleting directly without journaled recovery: {error}") });
+                None
+            }
             Err(error) => { send_failure(&sender, &error.to_string()); return; }
         };
         let deletion = Deletion {
             tree,
-            quarantine: &quarantine,
+            quarantine: quarantine.as_ref(),
             root_mount,
             cancelled: &cancelled,
             sender: &sender,
@@ -400,16 +405,18 @@ mod posix {
         if !flush(&sender, &mut outcomes) {
             return;
         }
-        if let Err(error) = quarantine.finish() {
-            send_failure(&sender, &error.to_string());
-            return;
+        if let Some(session) = &quarantine {
+            if let Err(error) = session.finish() {
+                send_failure(&sender, &error.to_string());
+                return;
+            }
         }
         let _ = sender.send(DeleteEvent::Finished);
     }
 
     impl Deletion<'_> {
         fn stopped(&self) -> bool {
-            self.cancelled.load(Ordering::Relaxed) || self.receiver_gone.load(Ordering::Relaxed) || self.quarantine.recovery_required()
+            self.cancelled.load(Ordering::Relaxed) || self.receiver_gone.load(Ordering::Relaxed) || self.quarantine.is_some_and(|session| session.recovery_required())
         }
 
         fn record(&self, node: NodeId, kind: OutcomeKind, message: Option<String>) {
@@ -696,7 +703,20 @@ mod posix {
             }
         }
         if requests.is_empty() { return; }
-        let results = deletion.quarantine.remove_batch(parent_fd, requests, |boundary| {
+        if deletion.quarantine.is_none() {
+            for node in nodes {
+                if deletion.stopped() {
+                    deletion.record(node, OutcomeKind::Cancelled, None);
+                    continue;
+                }
+                let record = deletion.tree.record(node).expect("indexed deletion target");
+                let name = deletion.tree.name(node).expect("indexed entry has name");
+                let (kind, message) = direct_remove(parent_fd, name, record);
+                deletion.record(node, kind, message);
+            }
+            return;
+        }
+        let results = deletion.quarantine.expect("journaled session").remove_batch(parent_fd, requests, |boundary| {
             if matches!(boundary, quarantine::Boundary::BeforeCapture | quarantine::Boundary::BeforeUnlink) && deletion.stopped() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "deletion cancelled"));
             }
@@ -790,6 +810,12 @@ mod posix {
     }
 
     fn capture_and_remove(deletion: &Deletion<'_>, parent_fd: BorrowedFd<'_>, name: &[u8], node: NodeId) {
+        if deletion.quarantine.is_none() {
+            let record = deletion.tree.record(node).expect("indexed target");
+            let (kind, message) = direct_remove(parent_fd, name, record);
+            deletion.record(node, kind, message);
+            return;
+        }
         let mut parents = Vec::new();
         let mut current = deletion.tree.record(node).and_then(NodeRecord::parent);
         while let Some(parent) = current {
@@ -801,12 +827,40 @@ mod posix {
         parents.reverse();
         let record = deletion.tree.record(node).expect("indexed target");
         let request = quarantine::Retirement::new(parents, std::ffi::OsString::from(std::ffi::OsStr::from_bytes(name)), fdu_posix::identity::EntryIdentity { file: record.identity, kind: record.entry_type });
-        let result = request.map_err(|error| quarantine::RemovalError { removed: false, error }).and_then(|request| deletion.quarantine.remove(parent_fd, request, |boundary, _, _| {
+        let result = request.map_err(|error| quarantine::RemovalError { removed: false, error }).and_then(|request| deletion.quarantine.expect("journaled session").remove(parent_fd, request, |boundary, _, _| {
             if matches!(boundary, quarantine::Boundary::BeforeCapture | quarantine::Boundary::BeforeUnlink) && deletion.stopped() { return Err(io::Error::new(io::ErrorKind::Interrupted, "deletion cancelled")); }
             Ok(())
         }));
         let (kind, message) = removal_outcome(result);
         deletion.record(node, kind, message);
+    }
+
+    fn direct_remove(parent_fd: BorrowedFd<'_>, name: &[u8], record: &NodeRecord) -> (OutcomeKind, Option<String>) {
+        let latest = match stat_at(parent_fd, name) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => return (OutcomeKind::AlreadyAbsent, None),
+            Err(error) => return (OutcomeKind::Failed, Some(io::Error::from(error).to_string())),
+        };
+        match identity(&latest) {
+            Ok(found) if found == record.identity && entry_type(&latest) == record.entry_type => {},
+            Ok(_) => return (OutcomeKind::Changed, Some("entry changed immediately before removal".to_owned())),
+            Err(error) => return (OutcomeKind::Failed, Some(error.to_string())),
+        }
+        let flags = if record.entry_type == EntryType::Directory { AtFlags::REMOVEDIR } else { AtFlags::empty() };
+        if let Err(error) = retry_errno(|| fs::unlinkat(parent_fd, name, flags)) {
+            if error == Errno::NOENT {
+                return (OutcomeKind::AlreadyAbsent, None);
+            }
+            if error == Errno::NOTEMPTY {
+                return (OutcomeKind::Failed, Some(format!("directory gained unindexed children: {}", io::Error::from(error))));
+            }
+            return (OutcomeKind::Failed, Some(io::Error::from(error).to_string()));
+        }
+        match retry_errno(|| fs::fsync(parent_fd)) {
+            Ok(()) => (OutcomeKind::Deleted, None),
+            Err(error) if io::Error::from(error).kind() == io::ErrorKind::Unsupported => (OutcomeKind::Deleted, None),
+            Err(error) => (OutcomeKind::DeletedSyncFailed, Some(io::Error::from(error).to_string())),
+        }
     }
 
     fn removal_outcome(result: Result<quarantine::Removal, quarantine::RemovalError>) -> (OutcomeKind, Option<String>) {
@@ -841,6 +895,7 @@ mod posix {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use fdu_core::NodeStatus;
 
         #[test]
         fn removed_entry_with_sync_error_is_reported_removed_with_failure() {
@@ -863,6 +918,45 @@ mod posix {
             assert!(!path.join("source").exists());
             assert!(session.finish().is_err());
             drop(session);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+
+        #[test]
+        fn direct_remove_deletes_only_verified_entries() {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join(".work/tmp");
+            std::fs::create_dir_all(&base).unwrap();
+            let path = base.join(format!("fdu-direct-remove-{}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("victim"), b"victim").unwrap();
+            std::fs::write(path.join("target"), b"target").unwrap();
+            std::os::unix::fs::symlink("target", path.join("link")).unwrap();
+            std::fs::create_dir(path.join("empty")).unwrap();
+            std::fs::create_dir(path.join("full")).unwrap();
+            std::fs::write(path.join("full/unindexed"), b"late").unwrap();
+            let root = std::fs::File::open(&path).unwrap();
+            let root_identity = identity(&stat_at(root.as_fd(), b".").unwrap()).unwrap();
+            let mut tree = Tree::new(b"root", root_identity, 2).unwrap();
+            assert!(tree.set_state(tree.root(), NodeStatus::Complete));
+            let root_id = tree.root();
+            let identity_of = |name: &[u8]| identity(&stat_at(root.as_fd(), name).unwrap()).unwrap();
+            let victim = tree.append(root_id, b"victim", EntryType::RegularFile, identity_of(b"victim"), 1, 0, 0, NodeStatus::Complete).unwrap();
+            let link = tree.append(root_id, b"link", EntryType::Symlink, identity_of(b"link"), 1, 0, 0, NodeStatus::Complete).unwrap();
+            let empty = tree.append(root_id, b"empty", EntryType::Directory, identity_of(b"empty"), 1, 0, 0, NodeStatus::Complete).unwrap();
+            let full = tree.append(root_id, b"full", EntryType::Directory, identity_of(b"full"), 1, 0, 0, NodeStatus::Complete).unwrap();
+            assert_eq!(direct_remove(root.as_fd(), b"victim", tree.record(victim).unwrap()).0, OutcomeKind::Deleted);
+            assert!(!path.join("victim").exists());
+            assert_eq!(direct_remove(root.as_fd(), b"victim", tree.record(victim).unwrap()).0, OutcomeKind::AlreadyAbsent);
+            std::fs::write(path.join("victim"), b"replacement").unwrap();
+            assert_eq!(direct_remove(root.as_fd(), b"victim", tree.record(victim).unwrap()).0, OutcomeKind::Changed);
+            assert_eq!(std::fs::read(path.join("victim")).unwrap(), b"replacement");
+            std::fs::remove_file(path.join("victim")).unwrap();
+            assert_eq!(direct_remove(root.as_fd(), b"link", tree.record(link).unwrap()).0, OutcomeKind::Deleted);
+            assert_eq!(std::fs::read(path.join("target")).unwrap(), b"target");
+            assert_eq!(direct_remove(root.as_fd(), b"empty", tree.record(empty).unwrap()).0, OutcomeKind::Deleted);
+            let (kind, message) = direct_remove(root.as_fd(), b"full", tree.record(full).unwrap());
+            assert_eq!(kind, OutcomeKind::Failed);
+            assert!(message.unwrap().contains("unindexed children"), "{kind:?}");
+            assert!(path.join("full").is_dir() && path.join("full/unindexed").exists());
             std::fs::remove_dir_all(path).unwrap();
         }
     }

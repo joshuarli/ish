@@ -6,7 +6,7 @@ use ish::foreground::Foreground;
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::io::{self, Write as _};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -285,6 +285,9 @@ fn remove_directory(
                     }
                 }
                 Ok(DeleteEvent::Progress { .. }) => {}
+                Ok(DeleteEvent::Diagnostic { message }) => {
+                    let _ = writeln!(io::stderr(), "rmrf: warning: {message}");
+                }
                 Ok(DeleteEvent::Failed { message }) => {
                     receive_error.get_or_insert_with(|| {
                         io::Error::other(format!("deletion stopped: {message}"))

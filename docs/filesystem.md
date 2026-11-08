@@ -368,7 +368,13 @@ physical I/O, and ish makes no universal speed-ratio claim.
 
 Both fdu deletion and ish-fs retirement use the shared journaled quarantine
 protocol. Recovery restores verified captures without replacing live names and
-stops the operation so the caller must rescan and plan again. ish-fs still
+stops the operation so the caller must rescan and plan again. When the
+deletion filesystem cannot support that protocol (for example exFAT),
+`rmrf` falls back to deleting directly without journaled recovery and
+reports a warning. Deleted entries stay deleted, interruption or
+cancellation leaves only remaining entries, and the next operation needs no
+recovery or rescan for journal state. A restrictive umask remains a hard
+failure and never falls back. ish-fs still
 validates source versions and durable destination receipts before retiring a
 source. SIGKILL tests cover process interruption; they do not establish power
 loss durability or storage-device behavior. ARM64 Linux acceptance and the

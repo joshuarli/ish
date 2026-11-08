@@ -182,7 +182,10 @@ overwriting live names and requires a fresh scan and retry. Existing v1 sessions
 retain their restoration behavior. Damaged records, conflicting names, and
 unrelated quarantine lookalikes block deletion and identify the retained paths.
 An entry removed before a synchronization error is reported as removed with a
-durability failure.
+durability failure. On filesystems that cannot support journaled deletion
+quarantine (for example exFAT), `rmrf` deletes directly without journaled
+recovery and warns on stderr; interrupted direct deletion leaves remaining
+entries instead of restorable captures.
 
 ish's `cp` and `mv` follow the standard operand forms: one source maps to
 `DESTINATION`, while several sources map into the last operand, which must be
