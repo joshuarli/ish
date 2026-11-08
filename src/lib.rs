@@ -11,6 +11,7 @@ pub mod dispatch;
 pub mod external;
 pub mod frecency;
 mod fs_command;
+pub mod sync_command;
 pub mod foreground;
 pub mod history;
 pub mod input;

@@ -1,5 +1,5 @@
 use crate::builtin::{self, ExternalCommand};
-use crate::{fs_command, history};
+use crate::{fs_command, history, sync_command};
 use crate::report;
 use std::ffi::OsString;
 
@@ -42,6 +42,22 @@ pub fn make_external_dispatcher(
                         .map(epsh::shell_bytes::ShellBytes::to_os_string)
                         .collect::<Vec<_>>();
                     return fs_command::run(operation, &arguments, context).map(epsh::eval::ExternalDispatch::Handled);
+                }
+                Some(ExternalCommand::Sync) => {
+                    let cwd = epsh::eval::external_command_cwd().ok_or_else(|| {
+                        epsh::error::ShellError::Io(std::io::Error::other("external command cwd was unavailable"))
+                    })?;
+                    let context = ish_fs::Context {
+                        cwd,
+                        home: env_pair_value(env_pairs, "HOME").map(std::path::PathBuf::from),
+                        scratch: env_pair_value(env_pairs, "TMPDIR")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| fs_default_scratch.clone()),
+                    };
+                    let arguments = args[1..].iter()
+                        .map(epsh::shell_bytes::ShellBytes::to_os_string)
+                        .collect::<Vec<_>>();
+                    return sync_command::run(&arguments, context).map(epsh::eval::ExternalDispatch::Handled);
                 }
                 Some(command @ (ExternalCommand::List | ExternalCommand::ListHidden)) => {
                     let l_args: Vec<_> = args[1..].iter().map(|arg| arg.to_path_buf()).collect();

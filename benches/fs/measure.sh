@@ -30,7 +30,7 @@ if [ "$#" -eq 5 ]; then
     cross_identity=$5
 fi
 case "$workload" in
-    all|tiny-copy|tiny-move|flat|nested|deep|wide|large|clone|sparse|hardlinks|rename|cross|cross-flat-1k|cross-flat-4k|cross-flat-16k|merge|dry-run-wide|progress-on|progress-off) ;;
+    all|tiny-copy|tiny-move|flat|nested|deep|wide|large|clone|sparse|hardlinks|rename|cross|cross-flat-1k|cross-flat-4k|cross-flat-16k|merge|dry-run-wide|progress-on|progress-off|sync-fresh-tree|sync-noop-tree|sync-update-small|sync-delete) ;;
     *) printf 'measure.sh: unknown workload %s\n' "$workload" >&2; exit 2 ;;
 esac
 

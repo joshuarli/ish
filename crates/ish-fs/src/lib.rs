@@ -13,6 +13,8 @@ pub use engine::execute;
 pub(crate) mod platform;
 pub(crate) mod policy;
 pub(crate) mod roots;
+pub mod sync;
+pub use sync::{SyncOperands, SyncOptions, SyncOutcome, SyncProgress, SyncRequest};
 
 pub const QUEUE_CAPACITY: usize = 256;
 pub const TRANSFER_BUFFER_BYTES: usize = 256 * 1024;

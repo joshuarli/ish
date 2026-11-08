@@ -1940,7 +1940,7 @@ fn builtin_registry_drives_names_and_execution_classes() {
     }
     assert_eq!(builtin::lookup("z").map(|b| b.exec), Some(builtin::Exec::InShell));
     assert_eq!(builtin::lookup("cd").map(|b| b.exec), Some(builtin::Exec::Hybrid));
-    for name in ["cp", "mv"] {
+    for name in ["cp", "mv", "rsync"] {
         assert_eq!(builtin::lookup(name).map(|b| b.exec), Some(builtin::Exec::Foreground));
         assert_eq!(names.iter().filter(|candidate| **candidate == name).count(), 1);
     }
@@ -1961,4 +1961,41 @@ fn every_builtin_has_help() {
     assert!(builtin::lookup("t").is_none());
     assert!(builtin::lookup("trash").is_none());
     assert!(builtin::help("cp").unwrap().contains("--merge"));
+    assert!(builtin::help("rsync").unwrap().contains("--contents"));
+}
+
+#[test]
+fn rsync_help_and_option_rejections() {
+    let help = builtin::help("rsync").expect("rsync help");
+    assert!(help.contains("Synchronize files and directories locally"));
+    assert!(help.contains("--into DIRECTORY"));
+    assert!(help.contains("--contents"));
+    assert!(help.contains("--delete"));
+    assert!(help.contains("--dry-run"));
+    assert!(help.contains("-j, --jobs N"));
+
+    let dir = std::env::temp_dir().join(format!("ish_rsync_test_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let context = ish_fs::Context {
+        cwd: dir.clone(),
+        home: None,
+        scratch: dir.join("scratch"),
+    };
+
+    let status = ish::sync_command::run(&[std::ffi::OsString::from("-n")], context.clone())
+        .expect("run -n");
+    assert_eq!(status, epsh::error::ExitStatus::MISUSE);
+
+    let status = ish::sync_command::run(
+        &[std::ffi::OsString::from("--bogus-option")],
+        context.clone(),
+    )
+    .expect("run --bogus-option");
+    assert_eq!(status, epsh::error::ExitStatus::MISUSE);
+
+    let status = ish::sync_command::run(&[std::ffi::OsString::from("--help")], context)
+        .expect("run --help");
+    assert_eq!(status, epsh::error::ExitStatus::SUCCESS);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

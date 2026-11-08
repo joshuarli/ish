@@ -39,6 +39,7 @@ pub enum ShellCommand {
 pub enum ExternalCommand {
     Copy,
     Move,
+    Sync,
     List,
     ListHidden,
     ClearScreen,
@@ -60,6 +61,7 @@ enum Help {
     Text(&'static str),
     Copy,
     Move,
+    Sync,
 }
 
 impl Help {
@@ -68,6 +70,7 @@ impl Help {
             Help::Text(text) => text.replace("{name}", name),
             Help::Copy => crate::fs_command::help(ish_fs::Operation::Copy),
             Help::Move => crate::fs_command::help(ish_fs::Operation::Move),
+            Help::Sync => crate::sync_command::help(),
         }
     }
 }
@@ -174,6 +177,7 @@ const ISH_BUILTINS: &[Builtin] = &[
     Builtin::foreground("ll", ExternalCommand::ListHidden, Help::Text(LIST_HIDDEN_HELP)),
     Builtin::foreground("mv", ExternalCommand::Move, Help::Move),
     Builtin::in_shell("rmrf", ShellCommand::Rmrf, Help::Text(RMRF_HELP)),
+    Builtin::foreground("rsync", ExternalCommand::Sync, Help::Sync),
     Builtin::in_shell("type", ShellCommand::Locate, Help::Text(LOCATE_HELP)),
     Builtin::in_shell("w", ShellCommand::Locate, Help::Text(LOCATE_HELP)),
     Builtin::in_shell("which", ShellCommand::Locate, Help::Text(LOCATE_HELP)),
