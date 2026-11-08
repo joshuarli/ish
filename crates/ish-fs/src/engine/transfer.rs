@@ -1073,9 +1073,29 @@ fn snapshot_destinations(invocation: &Invocation<'_>, destination: &Root, root: 
 
 fn validate_sources(invocation: &Invocation<'_>, source: &Root, root: Option<&OwnedFd>, stage: &Stage<'_>) -> io::Result<()> {
     let mut cursor = 0;
+    let mut parent_cache: Option<(PathBuf, OwnedFd)> = None;
     while let Some(record) = stage.entries.lock().unwrap().next(&mut cursor)? {
-        let (parent, name) = if record.source.as_os_str().is_empty() { (duplicate(source.parent.as_fd())?, source.name.clone()) } else { anchored::checked_parent(root.ok_or_else(|| io::Error::other("source directory missing"))?.as_fd(), &record.source, &stage.directories, false).map_err(|error| io::Error::new(error.kind(), format!("source validation traversal {:?}: {error}", record.source)))? };
-        anchored::require_unchanged(parent.as_fd(), &name, invocation.effective(record.observed)?)?;
+        let (parent_fd, name) = if record.source.as_os_str().is_empty() {
+            (source.parent.as_fd(), source.name.clone())
+        } else {
+            let dir = record.source.parent().unwrap_or_else(|| Path::new(""));
+            let p_fd = match &parent_cache {
+                Some((cached_dir, fd)) if cached_dir == dir => fd.as_fd(),
+                _ => {
+                    let (p, _) = anchored::checked_parent(
+                        root.ok_or_else(|| io::Error::other("source directory missing"))?.as_fd(),
+                        &record.source,
+                        &stage.directories,
+                        false,
+                    ).map_err(|error| io::Error::new(error.kind(), format!("source validation traversal {:?}: {error}", record.source)))?;
+                    parent_cache = Some((dir.to_path_buf(), p));
+                    parent_cache.as_ref().unwrap().1.as_fd()
+                }
+            };
+            let name = record.source.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "entry has no final name"))?.to_os_string();
+            (p_fd, name)
+        };
+        anchored::require_unchanged(parent_fd, &name, invocation.effective(record.observed)?)?;
     }
     Ok(())
 }

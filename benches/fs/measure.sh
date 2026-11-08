@@ -4,6 +4,7 @@ set -eu
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd -P)
 repo_root=$(CDPATH= cd "$script_dir/../.." && pwd -P)
 tmp_root="$repo_root/.work/tmp"
+export PATH="/Users/josh/.local/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$PATH"
 export TMPDIR="$tmp_root"
 export CARGO_TARGET_DIR="$repo_root/.work/bench-target"
 if [ "$#" -lt 3 ] || [ "$#" -gt 5 ] || [ "$#" -eq 4 ]; then
