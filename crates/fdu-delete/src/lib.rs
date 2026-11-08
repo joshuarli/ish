@@ -12,10 +12,25 @@ const OUTCOME_BATCH_SIZE: usize = 2048;
 
 const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Disposition {
+    Retain,
+    Enter,
+    Remove,
+}
+
+#[derive(Clone, Debug)]
+pub struct SkippedEntry {
+    pub node: NodeId,
+    pub reason: &'static str,
+}
+
 pub struct DeletionPlan {
     tree: Arc<Tree>,
     pub roots: Vec<NodeId>,
-    targets: Vec<NodeId>,
+    pub targets: Vec<NodeId>,
+    pub disposition: Option<Vec<Disposition>>,
+    pub skipped: Vec<SkippedEntry>,
     pub apparent_bytes: u64,
     pub allocated_bytes: u64,
 }
@@ -134,9 +149,190 @@ pub fn create_plan(tree: Arc<Tree>, selected: &[NodeId]) -> Result<DeletionPlan,
         tree,
         roots: unique,
         targets,
+        disposition: None,
+        skipped: Vec::new(),
         apparent_bytes,
         allocated_bytes,
     })
+}
+
+pub fn create_browser_plan(tree: Arc<Tree>, selected: &[NodeId]) -> Result<DeletionPlan, PlanError> {
+    let mut rejected = Vec::new();
+    if selected.is_empty() {
+        rejected.push(Rejection { node: None, reason: "no entries are selected".to_owned() });
+    }
+    let mut unique = Vec::with_capacity(selected.len());
+    let mut seen = HashSet::with_capacity(selected.len());
+    for id in selected {
+        if seen.insert(*id) {
+            unique.push(*id);
+        }
+    }
+    for id in &unique {
+        let reject = |reason: &str| Rejection { node: Some(*id), reason: reason.to_owned() };
+        match tree.record(*id) {
+            None => rejected.push(reject("absent from the index")),
+            Some(record) if *id == tree.root() || record.entry_type == EntryType::Root => {
+                rejected.push(reject("the scan root is protected"));
+            }
+            Some(_) if has_selected_ancestor(&tree, &seen, *id) => {
+                rejected.push(reject("already covered by a selected parent directory"));
+            }
+            Some(_) => {}
+        }
+    }
+    if !unique.is_empty() {
+        let root_state = tree.record(tree.root()).expect("root record exists").state;
+        let block = match root_state {
+            NodeState::Complete | NodeState::Incomplete | NodeState::Scanning => None,
+            _ => Some("root totals are stale; rescan first"),
+        };
+        if let Some(reason) = block {
+            rejected.push(Rejection { node: None, reason: reason.to_owned() });
+        }
+    }
+    if !rejected.is_empty() {
+        return Err(PlanError { rejected });
+    }
+
+    let mut disposition = vec![Disposition::Retain; tree.len()];
+    let mut targets = Vec::new();
+    let mut skipped = Vec::new();
+    let mut roots = Vec::with_capacity(unique.len());
+    for root in &unique {
+        classify_subtree(&tree, *root, &mut disposition, &mut targets, &mut skipped).map_err(|reason| PlanError {
+            rejected: vec![Rejection { node: Some(*root), reason: reason.to_owned() }],
+        })?;
+        if disposition[root.index()] != Disposition::Retain {
+            roots.push(*root);
+        }
+    }
+    if targets.is_empty() {
+        return Err(PlanError {
+            rejected: skipped
+                .into_iter()
+                .map(|entry| Rejection { node: Some(entry.node), reason: entry.reason.to_owned() })
+                .collect(),
+        });
+    }
+
+    let overflow = |what: &str| PlanError {
+        rejected: vec![Rejection { node: None, reason: format!("selected {what} byte total exceeds u64") }],
+    };
+    let mut apparent_bytes = 0u64;
+    let mut allocated_bytes = 0u64;
+    for target in &targets {
+        let record = tree.record(*target).expect("validated deletion target");
+        let covered = record.parent().is_some_and(|parent| disposition[parent.index()] == Disposition::Remove);
+        if !covered {
+            apparent_bytes = apparent_bytes.checked_add(record.apparent_bytes).ok_or_else(|| overflow("apparent"))?;
+            allocated_bytes = allocated_bytes.checked_add(record.allocated_bytes).ok_or_else(|| overflow("allocated"))?;
+        }
+    }
+    Ok(DeletionPlan {
+        tree,
+        roots,
+        targets,
+        disposition: Some(disposition),
+        skipped,
+        apparent_bytes,
+        allocated_bytes,
+    })
+}
+
+fn skip_reason(state: NodeState) -> &'static str {
+    match state {
+        NodeState::Excluded(ExclusionReason::MountBoundary) => "mount boundary is protected",
+        NodeState::Excluded(ExclusionReason::UnsupportedAlias) => "unsupported directory alias is protected",
+        NodeState::Complete => "nothing inside it can be deleted",
+        NodeState::Scanning => "scan is still in progress",
+        NodeState::Incomplete => "scan is incomplete",
+        NodeState::Stale => "entry totals are stale; rescan first",
+        NodeState::Tombstone => "entry has already been removed from the index",
+    }
+}
+
+struct ClassifyFrame {
+    node: NodeId,
+    state: NodeState,
+    next_child: Option<NodeId>,
+    skipped_start: usize,
+    all_removed: bool,
+    any_planned: bool,
+}
+
+impl ClassifyFrame {
+    fn settle(&mut self, child: Disposition) {
+        self.all_removed &= child == Disposition::Remove;
+        self.any_planned |= child != Disposition::Retain;
+    }
+}
+
+enum Visit {
+    Leaf(Disposition),
+    Descend(ClassifyFrame),
+}
+
+const INVALID_INDEX: &str = "directory index is invalid";
+
+fn visit_node(tree: &Tree, id: NodeId, targets: &mut Vec<NodeId>, disposition: &mut [Disposition], skipped: &mut Vec<SkippedEntry>) -> Result<Visit, &'static str> {
+    let record = tree.record(id).ok_or(INVALID_INDEX)?;
+    if record.entry_type == EntryType::Directory && matches!(record.state, NodeState::Complete | NodeState::Incomplete) {
+        return Ok(Visit::Descend(ClassifyFrame {
+            node: id,
+            state: record.state,
+            next_child: record.first_child(),
+            skipped_start: skipped.len(),
+            all_removed: true,
+            any_planned: false,
+        }));
+    }
+    if record.state == NodeState::Complete {
+        disposition[id.index()] = Disposition::Remove;
+        targets.push(id);
+        return Ok(Visit::Leaf(Disposition::Remove));
+    }
+    skipped.push(SkippedEntry { node: id, reason: skip_reason(record.state) });
+    Ok(Visit::Leaf(Disposition::Retain))
+}
+
+fn classify_subtree(
+    tree: &Tree,
+    root: NodeId,
+    disposition: &mut [Disposition],
+    targets: &mut Vec<NodeId>,
+    skipped: &mut Vec<SkippedEntry>,
+) -> Result<(), &'static str> {
+    let mut stack = Vec::new();
+    if let Visit::Descend(frame) = visit_node(tree, root, targets, disposition, skipped)? {
+        stack.push(frame);
+    }
+    while let Some(top) = stack.last_mut() {
+        if let Some(child) = top.next_child {
+            top.next_child = tree.record(child).ok_or(INVALID_INDEX)?.next_sibling();
+            match visit_node(tree, child, targets, disposition, skipped)? {
+                Visit::Leaf(outcome) => top.settle(outcome),
+                Visit::Descend(frame) => stack.push(frame),
+            }
+            continue;
+        }
+        let frame = stack.pop().expect("frame exists");
+        let outcome = if frame.state == NodeState::Complete && frame.all_removed {
+            targets.push(frame.node);
+            Disposition::Remove
+        } else if frame.any_planned {
+            Disposition::Enter
+        } else {
+            skipped.truncate(frame.skipped_start);
+            skipped.push(SkippedEntry { node: frame.node, reason: skip_reason(frame.state) });
+            Disposition::Retain
+        };
+        disposition[frame.node.index()] = outcome;
+        if let Some(parent) = stack.last_mut() {
+            parent.settle(outcome);
+        }
+    }
+    Ok(())
 }
 
 fn has_selected_ancestor(tree: &Tree, selected: &HashSet<NodeId>, id: NodeId) -> bool {
@@ -289,6 +485,7 @@ mod posix {
 
     struct Deletion<'a> {
         tree: &'a Tree,
+        disposition: Option<&'a [Disposition]>,
         quarantine: Option<&'a quarantine::Session>,
         root_mount: MountIdentity,
         cancelled: &'a AtomicBool,
@@ -332,6 +529,7 @@ mod posix {
         };
         let deletion = Deletion {
             tree,
+            disposition: plan.disposition.as_deref(),
             quarantine: quarantine.as_ref(),
             root_mount,
             cancelled: &cancelled,
@@ -499,6 +697,11 @@ mod posix {
             if deletion.stopped() {
                 return;
             }
+            if let Some(disp) = deletion.disposition {
+                if disp[node.index()] == Disposition::Retain {
+                    continue;
+                }
+            }
             let is_directory = deletion
                 .tree
                 .record(node)
@@ -600,7 +803,7 @@ mod posix {
                 return;
             }
         };
-        let mut stack = vec![directory_walk_frame(deletion.tree, node, parent.node, directory_ancestry(deletion.tree, node))];
+        let mut stack = vec![directory_walk_frame(deletion.tree, deletion.disposition, node, parent.node, directory_ancestry(deletion.tree, node))];
         let mut batch: Vec<NodeId> = Vec::new();
 
         loop {
@@ -629,7 +832,7 @@ mod posix {
                             let parent_node = frame.node;
                             let ancestry = child_ancestry(deletion.tree, &frame.ancestry, child);
                             current = directory;
-                            stack.push(directory_walk_frame(deletion.tree, child, parent_node, ancestry));
+                            stack.push(directory_walk_frame(deletion.tree, deletion.disposition, child, parent_node, ancestry));
                         }
                         Err((kind, message)) => {
                             deletion.record(child, kind, Some(message.clone()));
@@ -660,15 +863,23 @@ mod posix {
 
             let frame = stack.last().expect("directory frame exists");
             let finished = frame.node;
+            let removable = match deletion.disposition {
+                Some(disp) => disp[finished.index()] == Disposition::Remove,
+                None => true,
+            };
             if stack.len() == 1 {
-                remove_directory(deletion, parent.fd.as_fd(), finished);
+                if removable {
+                    remove_directory(deletion, parent.fd.as_fd(), finished);
+                }
                 return;
             }
 
             let expected_parent = frame.parent;
             match open_parent_checked(deletion, current.as_fd(), expected_parent) {
                 Ok(parent_fd) => {
-                    remove_directory(deletion, parent_fd.as_fd(), finished);
+                    if removable {
+                        remove_directory(deletion, parent_fd.as_fd(), finished);
+                    }
                     stack.pop();
                     current = parent_fd;
                 }
@@ -760,8 +971,11 @@ mod posix {
         Arc::from(ancestry)
     }
 
-    fn directory_walk_frame(tree: &Tree, node: NodeId, parent: NodeId, ancestry: Arc<[quarantine::Ancestor]>) -> DirectoryWalkFrame {
-        let mut children: Vec<_> = tree.children(node).collect();
+    fn directory_walk_frame(tree: &Tree, disposition: Option<&[Disposition]>, node: NodeId, parent: NodeId, ancestry: Arc<[quarantine::Ancestor]>) -> DirectoryWalkFrame {
+        let mut children: Vec<_> = match disposition {
+            Some(disp) => tree.children(node).filter(|child| disp[child.index()] != Disposition::Retain).collect(),
+            None => tree.children(node).collect(),
+        };
         children.sort_unstable_by_key(|child| {
             let record = tree.record(*child).expect("indexed child");
             (record.entry_type == EntryType::Directory, record.identity.inode)
