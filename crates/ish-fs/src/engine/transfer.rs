@@ -588,14 +588,28 @@ fn copy_tree(invocation: &Invocation<'_>, observed: Observation, source_path: &P
             let worker = std::thread::Builder::new().name("ish-fs-transfer".into()).stack_size(super::THREAD_STACK_BYTES).spawn_scoped(scope, move || {
                 let _finished = Finished { count: finished, stopped: &invocation.stopped };
                 let mut buffer = vec![0; TRANSFER_BUFFER_BYTES];
+                let mut parent_cache: Option<(PathBuf, OwnedFd, OwnedFd)> = None;
                 loop {
                     let work = match receiver.lock().unwrap().recv() { Ok(work) => work, Err(_) => break };
                     if invocation.checkpoint().is_err() { continue; }
                     let result = (|| {
-                        let (source_parent, source_name) = anchored::parent(source_fd, &work.path, &stage.directories, false)?;
-                        let (target_parent, target_name) = anchored::parent(target_fd, &work.path, &stage.directories, true)?;
+                        let dir = work.path.parent().unwrap_or_else(|| Path::new(""));
+                        let (src_p_fd, dst_p_fd) = match &parent_cache {
+                            Some((cached_dir, s_fd, t_fd)) if cached_dir == dir => {
+                                (s_fd.as_fd(), t_fd.as_fd())
+                            }
+                            _ => {
+                                let (source_parent, _) = anchored::parent(source_fd, &work.path, &stage.directories, false)?;
+                                let (target_parent, _) = anchored::parent(target_fd, &work.path, &stage.directories, true)?;
+                                parent_cache = Some((dir.to_path_buf(), source_parent, target_parent));
+                                let (_, s_fd, t_fd) = parent_cache.as_ref().unwrap();
+                                (s_fd.as_fd(), t_fd.as_fd())
+                            }
+                        };
+                        let source_name = work.path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "entry has no final name"))?;
+                        let target_name = source_name;
                         let visible = stage.display.clone().join(&work.path);
-                        let result = transfer_leaf(invocation, LeafSource { parent: source_parent.as_fd(), name: &source_name, observed: work.observed, mount: Some(source_mount) }, LeafDestination { parent: target_parent.as_fd(), name: &target_name, visible: &visible, placement: &Placement { root: target_fd, base: stage.display.clone(), relative: work.path.clone(), directories: Some(&stage.directories) } }, &mut buffer)?;
+                        let result = transfer_leaf(invocation, LeafSource { parent: src_p_fd, name: source_name, observed: work.observed, mount: Some(source_mount) }, LeafDestination { parent: dst_p_fd, name: target_name, visible: &visible, placement: &Placement { root: target_fd, base: stage.display.clone(), relative: work.path.clone(), directories: Some(&stage.directories) } }, &mut buffer)?;
                         stage.entries.lock().unwrap().push(&Record { source: work.path.clone(), destination: work.path, ..result })
                     })();
                     if let Err(error) = result {
