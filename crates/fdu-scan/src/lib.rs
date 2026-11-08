@@ -9,11 +9,13 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 pub use fdu_core::{DirectoryToken, EntryBatch, FileIdentity, ModifiedTime, ScanEvent};
+pub use exclusions::ScanExclusions;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("fdu supports Linux and macOS");
 
 mod fsutil;
+mod exclusions;
 mod indexed;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -25,6 +27,7 @@ pub struct RootAnchor {
     fd: Arc<OwnedFd>,
     pub name: Vec<u8>,
     pub identity: FileIdentity,
+    modified_time: ModifiedTime,
     pub link_count: u64,
 }
 
@@ -36,16 +39,28 @@ impl RootAnchor {
     pub fn try_clone_fd(&self) -> io::Result<OwnedFd> {
         self.fd.try_clone()
     }
+
+    pub fn modified_time(&self) -> ModifiedTime {
+        self.modified_time
+    }
+}
+
+pub fn open_root(path: &Path) -> io::Result<RootAnchor> {
+    anchor_root(path, fsutil::open_directory(path)?)
 }
 
 pub fn open_root_no_follow(path: &Path) -> io::Result<RootAnchor> {
     let open_path = without_trailing_slashes(path);
-    let fd = fsutil::open_directory_no_follow(open_path.as_ref())?;
-    let (identity, link_count) = fsutil::identity_and_link_count(fd.as_fd())?;
+    anchor_root(path, fsutil::open_directory_no_follow(open_path.as_ref())?)
+}
+
+fn anchor_root(path: &Path, fd: OwnedFd) -> io::Result<RootAnchor> {
+    let (identity, link_count, modified_time) = fsutil::identity_link_count_and_modified_time(fd.as_fd())?;
     Ok(RootAnchor {
         fd: Arc::new(fd),
         name: path.as_os_str().as_bytes().to_vec(),
         identity,
+        modified_time,
         link_count,
     })
 }
@@ -69,5 +84,15 @@ pub fn start_indexed_scan(
     returned_batches: Receiver<EntryBatch>,
     cancelled: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
-    thread::spawn(move || indexed::scan_indexed(&root, sender, returned_batches, cancelled))
+    start_indexed_scan_with_exclusions(root, ScanExclusions::default(), sender, returned_batches, cancelled)
+}
+
+pub fn start_indexed_scan_with_exclusions(
+    root: RootAnchor,
+    exclusions: ScanExclusions,
+    sender: SyncSender<ScanEvent>,
+    returned_batches: Receiver<EntryBatch>,
+    cancelled: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || indexed::scan_indexed(&root, &exclusions, sender, returned_batches, cancelled))
 }

@@ -2,7 +2,7 @@
 
 
 use crate::fsutil::{open_directory_at, stat_entry_at};
-use crate::{DirectoryToken, EntryBatch, RootAnchor};
+use crate::{DirectoryToken, EntryBatch, RootAnchor, ScanExclusions};
 use fdu_core::{EntryType, ExclusionReason, FileIdentity, ModifiedTime, NodeStatus, ScanEntry, ScanEvent};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::cell::RefCell;
@@ -125,6 +125,7 @@ struct IndexedDirectoryTask {
     source: IndexedDirectorySource,
     lineage: Arc<DirectoryLineage>,
     token: DirectoryToken,
+    exclusion_node: Option<usize>,
 }
 
 const NO_PARENT: u32 = u32::MAX;
@@ -485,6 +486,7 @@ struct ScanContext<'a> {
     seen_directories: &'a SeenDirectories,
     next_token: &'a AtomicUsize,
     root_mount: &'a MountIdentity,
+    exclusions: &'a ScanExclusions,
     hints: ScanHints,
     progress: &'a ScanProgress<'a>,
     queue: &'a IndexedWorkQueue,
@@ -591,6 +593,7 @@ fn take_batch(returned_batches: &Mutex<Receiver<EntryBatch>>) -> EntryBatch {
 
 pub(crate) fn scan_indexed(
     anchor: &RootAnchor,
+    exclusions: &ScanExclusions,
     sender: SyncSender<ScanEvent>,
     returned_batches: Receiver<EntryBatch>,
     cancelled: Arc<AtomicBool>,
@@ -649,6 +652,7 @@ pub(crate) fn scan_indexed(
         seen_directories: &seen_directories,
         next_token: &next_token,
         root_mount: &root_mount,
+        exclusions,
         hints: scan_hints(anchor.as_fd()),
         progress: &progress,
         queue: &queue,
@@ -671,6 +675,7 @@ pub(crate) fn scan_indexed(
             }),
             lineage: Arc::new(DirectoryLineage { parent: None, name: Vec::new(), identity: root_identity }),
             token: DirectoryToken(0),
+            exclusion_node: exclusions.root_node(),
         };
         if !run_task_tree(root_task, context, &mut Outbox::new()) {
             queue.cancel();
@@ -834,6 +839,7 @@ fn classify_entry(
     directory: BorrowedFd<'_>,
     lineage: &Arc<DirectoryLineage>,
     token: DirectoryToken,
+    exclusion_node: Option<usize>,
     context: &ScanContext<'_>,
     outbox: &mut Outbox,
 ) -> ClassifiedEntry {
@@ -945,6 +951,7 @@ fn classify_entry(
                 identity: facts.identity,
             }),
             token: child_token,
+            exclusion_node: exclusion_node.filter(|node| context.exclusions.has_children(*node)),
         });
     }
     found
@@ -991,7 +998,13 @@ fn scan_indexed_directory_with_buffer(
             continue;
         }
 
-        let mut found = classify_entry(&entry, directory, &task.lineage, token, context, outbox);
+        let child_exclusion_node = context.exclusions.child(task.exclusion_node, name_bytes);
+        if child_exclusion_node.is_some_and(|node| context.exclusions.excludes(node)) {
+            complete = false;
+            continue;
+        }
+
+        let mut found = classify_entry(&entry, directory, &task.lineage, token, child_exclusion_node, context, outbox);
         if found.state != NodeStatus::Complete {
             complete = false;
         }
@@ -1039,6 +1052,9 @@ fn scan_indexed_directory_with_buffer(
 
     if let Some(sample) = sample {
         context.queue.note_sample(sample.was_blocked());
+    }
+    if token == DirectoryToken(0) {
+        outbox.notices.push(ScanEvent::RootListed);
     }
     outbox.releases.push((token, complete));
     

@@ -612,6 +612,7 @@ fn build_index(root: &RootAnchor, foreground: &mut Foreground) -> io::Result<Tre
                     fatal.get_or_insert("scan cancelled".to_owned());
                     tree.mark_scanning_incomplete();
                 }
+                ScanEvent::RootListed | ScanEvent::DirectoryWaiting { .. } => {}
                 ScanEvent::Finished => done = true,
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -665,6 +666,7 @@ fn apply_batch(
         parent: fdu_core::NodeId,
         apparent: u64,
         allocated: u64,
+        entries: u32,
         fits: bool,
         problem: bool,
     }
@@ -673,7 +675,7 @@ fn apply_batch(
         if run.problem {
             tree.mark_incomplete_to_root(run.parent);
         }
-        if !run.fits || !tree.add_to_ancestors(run.parent, run.apparent, run.allocated) {
+        if !run.fits || !tree.add_to_ancestors(run.parent, run.apparent, run.allocated, run.entries) {
             tree.mark_incomplete_to_root(run.parent);
         }
     };
@@ -686,7 +688,8 @@ fn apply_batch(
         if run.as_ref().is_some_and(|run| run.parent != parent) {
             finish(tree, run.take().expect("run exists"));
         }
-        let current = run.get_or_insert(Run { parent, apparent: 0, allocated: 0, fits: true, problem: false });
+        let current = run.get_or_insert(Run { parent, apparent: 0, allocated: 0, entries: 0, fits: true, problem: false });
+        current.entries = current.entries.saturating_add(1);
         let name = batch
             .names
             .get(entry.name.start as usize..entry.name.end as usize)

@@ -1,7 +1,7 @@
 
 
 use fdu_core::{EntryType, FileIdentity, ModifiedTime};
-use rustix::fs::{self, Mode, Stat};
+use rustix::fs::{self, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 use std::ffi::CStr;
@@ -69,12 +69,15 @@ pub(crate) fn identity_and_link_count(fd: BorrowedFd<'_>) -> io::Result<(FileIde
     Ok((identity(&stat)?, link_count(&stat)?))
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) fn identity_link_count_and_modified_time(
     fd: BorrowedFd<'_>,
 ) -> io::Result<(FileIdentity, u64, ModifiedTime)> {
     let stat = retry(|| fs::fstat(fd))?;
     Ok((identity(&stat)?, link_count(&stat)?, modified_time(&stat)?))
+}
+
+pub(crate) fn open_directory(path: &std::path::Path) -> io::Result<OwnedFd> {
+    retry(|| fs::open(path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()))
 }
 
 pub(crate) fn identity_of(fd: BorrowedFd<'_>) -> io::Result<FileIdentity> {
