@@ -311,6 +311,51 @@ fn late_target_no_replace_race() {
     assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
 }
 
+fn force_staging_unsupported(boundary: &str) -> io::Result<()> { if boundary == "staging_init" { Err(io::Error::new(io::ErrorKind::Unsupported, "Operation not supported (os error 45)")) } else { Ok(()) } }
+
+#[test]
+fn direct_copy_fallback_copies_file_without_staging() {
+    let fixture = Fixture::new(); fs::write(fixture.0.join("source"), b"direct bytes").unwrap();
+    let mut request = fixture.request(); request.operation = Operation::Copy;
+    let (outcome, events) = fixture.run(&request, force_staging_unsupported);
+    assert_eq!(outcome.status(), 0); assert_eq!(fs::read(fixture.0.join("destination")).unwrap(), b"direct bytes");
+    assert_eq!(fs::read(fixture.0.join("source")).unwrap(), b"direct bytes");
+    assert!(fs::read_dir(&fixture.0).unwrap().map(|entry| entry.unwrap().path()).all(|path| !entry_is_quarantine(&path)));
+    assert!(events.iter().any(|event| matches!(event, Event::Diagnostic(diagnostic) if diagnostic.message.contains("copying directly"))), "{events:?}");
+}
+
+fn entry_is_quarantine(path: &std::path::Path) -> bool { path.file_name().is_some_and(|name| name.as_encoded_bytes().starts_with(b".fdu-quarantine-v2-")) }
+
+#[test]
+fn direct_copy_fallback_copies_tree_without_staging() {
+    let fixture = Fixture::new(); fs::create_dir_all(fixture.0.join("source/tree/sub")).unwrap();
+    fs::write(fixture.0.join("source/tree/a"), b"a").unwrap(); fs::write(fixture.0.join("source/tree/sub/b"), b"b").unwrap();
+    let mut request = fixture.request(); request.operation = Operation::Copy;
+    let (outcome, events) = fixture.run(&request, force_staging_unsupported);
+    assert_eq!(outcome.status(), 0, "{events:?}");
+    assert_eq!(fs::read(fixture.0.join("destination/tree/a")).unwrap(), b"a");
+    assert_eq!(fs::read(fixture.0.join("destination/tree/sub/b")).unwrap(), b"b");
+    assert!(fs::read_dir(&fixture.0).unwrap().map(|entry| entry.unwrap().path()).all(|path| !entry_is_quarantine(&path)));
+}
+
+#[test]
+fn direct_copy_fallback_cleans_partial_file_on_error() {
+    let fixture = Fixture::new(); fs::write(fixture.0.join("source"), b"complete bytes").unwrap();
+    let mut request = fixture.request(); request.operation = Operation::Copy;
+    let (outcome, _) = fixture.run(&request, |point| { force_staging_unsupported(point)?; if point == "after_copy" { Err(io::Error::other("direct copy fault")) } else { Ok(()) } });
+    assert_eq!(outcome.status(), 1); assert_eq!(fs::read(fixture.0.join("source")).unwrap(), b"complete bytes");
+    assert!(!fixture.0.join("destination").exists(), "partial direct copy must be removed");
+}
+
+#[test]
+fn direct_copy_fallback_does_not_apply_to_move() {
+    let fixture = Fixture::new(); fs::write(fixture.0.join("source"), b"source bytes").unwrap();
+    let request = fixture.request();
+    let (outcome, _) = fixture.run(&request, move |point| { force_exdev(point)?; force_staging_unsupported(point) });
+    assert_eq!(outcome.status(), 1); assert_eq!(fs::read(fixture.0.join("source")).unwrap(), b"source bytes");
+    assert!(!fixture.0.join("destination").exists());
+}
+
 #[test]
 fn staging_name_substitution_retains_ambiguous_object() {
     let fixture = Fixture::new(); fs::write(fixture.0.join("source"), b"source").unwrap();

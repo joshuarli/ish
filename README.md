@@ -197,7 +197,11 @@ flags. Read the [file operation reference](docs/filesystem.md) for collision,
 preservation, mount, durability, cancellation, and partial-completion rules.
 Unsupported required metadata is reported as a failure and the source is
 retained. Explicit paths such as `/bin/cp` and `/bin/mv` still run external
-utilities. Interrupted copies and moves use the same quarantine protocol.
+utilities. Interrupted copies and moves use the same quarantine protocol,
+except a `cp` to a new destination on a filesystem that cannot support
+journaled staging (for example exFAT), which copies directly without
+quarantine and may leave a partial destination; see the
+[file operation reference](docs/filesystem.md#understand-copy-and-move-completion).
 On macOS, filesystem staging does not support an inherited umask that removes
 owner read or search permission (mask bits `0500`); for example, `0777` is
 unsupported. ish reports a failure and keeps filesystem operations in-process.

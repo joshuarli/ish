@@ -205,6 +205,18 @@ entries to make a partial move look atomic.
 If a later merge phase fails after children were published or a source entry
 was retired, the shell reports that partial progress even without `--verbose`.
 
+When the destination filesystem cannot support journaled staging (for
+example an exFAT volume without private directories or event-only opens),
+`cp` for a new destination falls back to copying directly without quarantine
+staging and reports a warning. The destination is written in place, so an
+interruption, error, or cancellation may leave a partial destination; only
+the top-level file is removed on failure, while a partial directory tree
+remains for inspection. Metadata and synchronization are best-effort and
+emit warnings when the filesystem cannot represent them; hardlink groups and
+explicit replacements still require journaled staging. `mv`, `--merge`, and
+`--replace` still require journaled staging. A restrictive umask remains a
+hard failure and never falls back.
+
 Cross-filesystem moves preserve source ownership when the destination permits
 it. If a move cannot reproduce meaningful ownership, ACL, extended attribute,
 resource fork, timestamp, permission, or flag semantics, ish reports a failure

@@ -140,7 +140,15 @@ pub(super) fn whole(invocation: &Invocation<'_>, source: Root, destination: &Roo
     let retain_tree_parent = observed.identity.kind == EntryKind::Directory && matches!(source.name.as_bytes(), b"." | b"..");
     invocation.require_descriptors((if observed.identity.kind == EntryKind::Directory { 10 + super::WORKER_DESCRIPTORS * invocation.jobs } else { super::WORKER_DESCRIPTORS + 2 }) + invocation.index_descriptors() + root_discovery_descriptors + usize::from(retain_tree_parent))?;
     invocation.update(|progress| progress.discovered_files += 1);
-    let mut stage = new_stage(invocation, destination, observed)?;
+    let stage_result = invocation.fault("staging_init").and_then(|()| new_stage(invocation, destination, observed));
+    let mut stage = match stage_result {
+        Ok(stage) => stage,
+        Err(error) if invocation.request.operation == Operation::Copy && action == Action::Transfer && error.kind() == io::ErrorKind::Unsupported && !error.to_string().contains("restrictive umask") && !defer_final_flags && (observed.links <= 1 || observed.identity.kind == EntryKind::Directory) => {
+            invocation.emit(Event::Diagnostic(Diagnostic { path: destination.path.clone(), message: format!("warning: destination staging unsupported; copying directly without journaled staging: {error}") }));
+            return direct_whole(invocation, source, destination);
+        },
+        Err(error) => return Err(error.into()),
+    };
     let source_directory = if observed.identity.kind == EntryKind::Directory { Some(source.open_directory()?) } else { None };
     let source_parent_identity = source.parent_identity()?;
     let source_parent = if source_directory.is_some() && !retain_tree_parent { drop(source.parent); None } else { Some(source.parent) };
@@ -226,6 +234,217 @@ pub(super) fn whole(invocation: &Invocation<'_>, source: Root, destination: &Roo
     let entries = std::mem::replace(stage.entries.get_mut().unwrap(), Records::new(&invocation.request.context.scratch).map_err(publication_failure)?);
     let directories = std::mem::replace(stage.directories.get_mut().unwrap(), Records::new(&invocation.request.context.scratch).map_err(publication_failure)?);
     Ok(Some(DurableReceipt { source_parent, source_name: source.name.clone(), source_path: source.path.clone(), source_directory, records: Mutex::new(entries), directories: Mutex::new(directories), destination_parent, destination_name: destination.name.clone(), destination_directory, destinations: Mutex::new(destinations) }))
+}
+
+fn direct_whole(invocation: &Invocation<'_>, source: Root, destination: &Root) -> Result<Option<DurableReceipt>, Failure> {
+    let observed = source.observed.ok_or_else(|| io::Error::other("source disappeared"))?;
+    if observed.identity.kind == EntryKind::Other {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported source object for transfer").into());
+    }
+    if observed.links > 1 && matches!(observed.identity.kind, EntryKind::RegularFile | EntryKind::Symlink) {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "direct copy cannot preserve hardlinks; journaled staging is still required").into());
+    }
+    invocation.require_descriptors(12 + invocation.index_descriptors())?;
+    if roots::observe(destination.parent.as_fd(), &destination.name).is_ok() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination already exists").into());
+    }
+    anchored::require_unchanged(source.parent.as_fd(), &source.name, invocation.effective(observed)?)?;
+    let mut buffer = vec![0; TRANSFER_BUFFER_BYTES];
+    match observed.identity.kind {
+        EntryKind::RegularFile | EntryKind::Symlink => {
+            direct_leaf(invocation, LeafSource { parent: source.parent.as_fd(), name: &source.name, observed: invocation.effective(observed)?, mount: None }, DirectLeafTarget { parent: destination.parent.as_fd(), name: &destination.name, visible: &destination.path }, &mut buffer)?;
+        },
+        EntryKind::Directory => {
+            let source_directory = source.open_directory()?;
+            let source_mount = platform::mount_id(source_directory.as_fd())?;
+            fs::mkdirat(destination.parent.as_fd(), &destination.name, Mode::from_raw_mode(0o777))?;
+            let destination_directory = fs::openat(destination.parent.as_fd(), &destination.name, DIRECTORY, Mode::empty())?;
+            direct_tree(invocation, source_directory.as_fd(), destination_directory.as_fd(), &source_mount, &mut buffer, &source.path, &destination.path)?;
+            if !anchored::unchanged(invocation.effective(observed)?, roots::observe_fd(source_directory.as_fd())?) {
+                return Err(io::Error::other("source directory changed during direct copy").into());
+            }
+            direct_apply_metadata(invocation, &destination.path, MetadataTarget::Fd(destination_directory.as_fd()), invocation.effective(observed)?)?;
+            direct_sync(invocation, &destination.path, destination_directory.as_fd(), true)?;
+            invocation.remember_change(roots::observe_fd(destination_directory.as_fd())?)?;
+        },
+        EntryKind::Other | EntryKind::Root => return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported source object for transfer").into()),
+    }
+    invocation.update(|progress| progress.completed_files += 1);
+    if invocation.durable() {
+        direct_sync(invocation, &destination.path, destination.parent.as_fd(), true)?;
+    }
+    Ok(None)
+}
+
+fn direct_apply_metadata(invocation: &Invocation<'_>, display: &Path, target: MetadataTarget<'_>, observed: Observation) -> io::Result<()> {
+    let metadata = match platform::capture_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            invocation.emit(Event::Diagnostic(Diagnostic { path: display.to_path_buf(), message: format!("warning: destination does not support metadata preservation: {error}") }));
+            return Ok(());
+        },
+        Err(error) => return Err(error),
+    };
+    if metadata.resource_fork_size.unwrap_or(0) > 0 {
+        invocation.emit(Event::Diagnostic(Diagnostic { path: display.to_path_buf(), message: "warning: resource fork not preserved".into() }));
+    }
+    if let Err(error) = platform::apply_metadata(target, &observed, &metadata, Preservation::Copy) {
+        if error.kind() == io::ErrorKind::Unsupported {
+            invocation.emit(Event::Diagnostic(Diagnostic { path: display.to_path_buf(), message: format!("warning: destination does not support metadata preservation: {error}") }));
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn direct_sync(invocation: &Invocation<'_>, display: &Path, fd: BorrowedFd<'_>, directory: bool) -> io::Result<()> {
+    if !invocation.durable() {
+        return Ok(());
+    }
+    let result = if directory { invocation.sync_directory(fd) } else { invocation.sync_file(fd) };
+    if let Err(error) = result {
+        if error.kind() == io::ErrorKind::Unsupported {
+            invocation.emit(Event::Diagnostic(Diagnostic { path: display.to_path_buf(), message: format!("warning: destination does not support synchronization: {error}") }));
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+struct DirectLeafTarget<'a> {
+    parent: BorrowedFd<'a>,
+    name: &'a OsStr,
+    visible: &'a Path,
+}
+
+fn direct_leaf(invocation: &Invocation<'_>, source: LeafSource<'_>, target: DirectLeafTarget<'_>, buffer: &mut [u8]) -> io::Result<()> {
+    let LeafSource { parent: source_parent, name: source_name, observed, mount: source_mount } = source;
+    let DirectLeafTarget { parent: destination_parent, name: destination_name, visible } = target;
+    invocation.checkpoint()?;
+    invocation.fault("before_copy")?;
+    anchored::require_unchanged(source_parent, source_name, observed)?;
+    if observed.identity.kind == EntryKind::Other {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "special objects cannot be transferred"));
+    }
+    if observed.links > 1 {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "direct copy cannot preserve hardlinks; journaled staging is still required"));
+    }
+    let source_file = if observed.identity.kind == EntryKind::RegularFile {
+        let source = fs::openat(source_parent, source_name, READ_FILE, Mode::empty())?;
+        if !anchored::unchanged(observed, roots::observe_fd(source.as_fd())?) {
+            return Err(io::Error::other("source changed while opening"));
+        }
+        if let Some(mount) = source_mount
+            && !invocation.request.options.cross_file_systems
+            && platform::mount_id(source.as_fd())? != *mount
+        {
+            return Err(io::Error::other("nested source file mount requires --cross-file-systems"));
+        }
+        Some(source)
+    } else {
+        None
+    };
+    match observed.identity.kind {
+        EntryKind::RegularFile => {
+            let source = source_file.unwrap();
+            invocation.fault("during_copy")?;
+            invocation.checkpoint()?;
+            let target = fs::openat(destination_parent, destination_name, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH)?;
+            let published = roots::observe_fd(target.as_fd())?.identity;
+            let result = (|| {
+                let stats = platform::copy_data(source.as_fd(), target.as_fd(), observed.size, buffer, invocation.cancellation)?;
+                invocation.update(|progress| {
+                    progress.logical_bytes_cloned += if stats.method == CopyMethod::Clone { stats.logical_bytes } else { 0 };
+                    progress.bytes_streamed += stats.streamed_bytes;
+                    match stats.method {
+                        CopyMethod::Clone => progress.cloned_files += 1,
+                        CopyMethod::Native => progress.native_copied_files += 1,
+                        CopyMethod::Buffered => progress.buffered_copied_files += 1,
+                    }
+                });
+                let copied = roots::observe_fd(target.as_fd())?;
+                invocation.fault("after_copy")?;
+                anchored::require_unchanged(destination_parent, destination_name, copied)?;
+                invocation.checkpoint()?;
+                anchored::require_unchanged(source_parent, source_name, observed)?;
+                direct_apply_metadata(invocation, visible, MetadataTarget::Fd(target.as_fd()), observed)?;
+                invocation.fault("after_metadata")?;
+                let output = roots::observe_fd(target.as_fd())?;
+                direct_sync(invocation, visible, target.as_fd(), false)?;
+                anchored::require_unchanged(destination_parent, destination_name, output)?;
+                Ok(output)
+            })();
+            match result {
+                Ok(output) => {
+                    invocation.remember_change(output)?;
+                    Ok(())
+                },
+                Err(error) => {
+                    let cleanup = cleanup_owned(destination_parent, destination_name, published);
+                    Err(with_cleanup(error, cleanup, visible))
+                },
+            }
+        },
+        EntryKind::Symlink => {
+            let target = fs::readlinkat(source_parent, source_name, Vec::new())?;
+            anchored::require_unchanged(source_parent, source_name, observed)?;
+            fs::symlinkat(target.as_c_str(), destination_parent, destination_name)?;
+            let published = roots::observe(destination_parent, destination_name)?.identity;
+            let result = direct_apply_metadata(invocation, visible, MetadataTarget::Symlink { parent: destination_parent, name: destination_name }, observed)
+                .and_then(|()| anchored::require_unchanged(source_parent, source_name, observed));
+            if let Err(error) = result {
+                return Err(with_cleanup(error, cleanup_owned(destination_parent, destination_name, published), visible));
+            }
+            let output = roots::observe(destination_parent, destination_name)?;
+            direct_sync(invocation, visible, destination_parent, true)?;
+            invocation.remember_change(output)?;
+            Ok(())
+        },
+        _ => Err(io::Error::other("invalid leaf kind")),
+    }
+}
+
+fn direct_tree(invocation: &Invocation<'_>, source_fd: BorrowedFd<'_>, destination_fd: BorrowedFd<'_>, source_mount: &fdu_posix::identity::MountIdentity, buffer: &mut [u8], source_path: &Path, destination_path: &Path) -> io::Result<()> {
+    for entry in fs::Dir::read_from(source_fd)? {
+        invocation.checkpoint()?;
+        let entry = entry?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let name = OsStr::from_bytes(bytes);
+        let observed = roots::observe(source_fd, name)?;
+        invocation.update(|progress| progress.discovered_files += 1);
+        let child_source_path = source_path.join(name);
+        let child_destination_path = destination_path.join(name);
+        if observed.identity.kind == EntryKind::Directory {
+            if !invocation.request.options.cross_file_systems
+                && platform::mount_id(fs::openat(source_fd, name, DIRECTORY, Mode::empty())?.as_fd())? != *source_mount
+            {
+                return Err(io::Error::other("nested source mount requires --cross-file-systems"));
+            }
+            fs::mkdirat(destination_fd, name, Mode::from_raw_mode(0o777))?;
+            let source_child = fs::openat(source_fd, name, DIRECTORY, Mode::empty())?;
+            if roots::observe_fd(source_child.as_fd())?.identity != observed.identity {
+                return Err(io::Error::other("discovered directory substituted"));
+            }
+            let destination_child = fs::openat(destination_fd, name, DIRECTORY, Mode::empty())?;
+            direct_tree(invocation, source_child.as_fd(), destination_child.as_fd(), source_mount, buffer, &child_source_path, &child_destination_path)?;
+            if !anchored::unchanged(invocation.effective(observed)?, roots::observe_fd(source_child.as_fd())?) {
+                return Err(io::Error::other("source directory changed during direct copy"));
+            }
+            direct_apply_metadata(invocation, &child_destination_path, MetadataTarget::Fd(destination_child.as_fd()), invocation.effective(observed)?)?;
+            direct_sync(invocation, &child_destination_path, destination_child.as_fd(), true)?;
+            invocation.remember_change(roots::observe_fd(destination_child.as_fd())?)?;
+            invocation.update(|progress| progress.completed_files += 1);
+        } else {
+            direct_leaf(invocation, LeafSource { parent: source_fd, name, observed: invocation.effective(observed)?, mount: Some(source_mount) }, DirectLeafTarget { parent: destination_fd, name, visible: &child_destination_path }, buffer)?;
+            invocation.update(|progress| progress.completed_files += 1);
+        }
+    }
+    Ok(())
 }
 
 fn finalize_published(invocation: &Invocation<'_>, destination: &Root, stage: &Stage<'_>) -> io::Result<()> {
