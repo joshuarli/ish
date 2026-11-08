@@ -11,9 +11,10 @@ members = [
     "crates/fdu-posix",
     "crates/fdu-delete",
     "crates/fdu-scan",
+    "crates/fdu-tui",
     "crates/ish-fs",
 ]
-default-members = [".", "crates/epsh", "crates/fdu-delete", "crates/ish-fs"]
+default-members = [".", "crates/epsh", "crates/fdu-delete", "crates/fdu-tui", "crates/ish-fs"]
 
 [workspace.dependencies]
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }
@@ -24,6 +25,8 @@ fdu-core = { path = "crates/fdu-core" }
 fdu-delete = { path = "crates/fdu-delete" }
 fdu-posix = { path = "crates/fdu-posix" }
 fdu-scan = { path = "crates/fdu-scan" }
+fdu-tui = { path = "crates/fdu-tui" }
+hashbrown = { workspace = true }
 ish-fs = { path = "crates/ish-fs" }
 rustc-hash = "2.1"
 rustix = { version = "1.1.4", features = ["event", "fs", "pipe", "process", "pty", "rand", "stdio", "system", "termios", "time"] }
@@ -42,6 +45,14 @@ harness = false
 [[test]]
 name = "fs_bench"
 path = "benches/fs/fs_bench.rs"
+
+[[test]]
+name = "fdu_pty"
+path = "tests/fdu_pty.rs"
+
+[[test]]
+name = "fdu_snapshots"
+path = "tests/fdu_snapshots.rs"
 
 [profile.dev]
 incremental = false

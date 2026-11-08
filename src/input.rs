@@ -147,6 +147,17 @@ impl InputReader {
         self.pending.extend(bytes);
     }
 
+    pub fn take_pending_bytes(&mut self) -> Vec<u8> {
+        let mut result = Vec::with_capacity(self.pending.len() + (self.buf_end - self.buf_pos));
+        result.extend(self.pending.drain(..));
+        if self.buf_pos < self.buf_end {
+            result.extend_from_slice(&self.buf[self.buf_pos..self.buf_end]);
+            self.buf_pos = 0;
+            self.buf_end = 0;
+        }
+        result
+    }
+
     pub fn in_paste(&self) -> bool {
         self.in_paste
     }

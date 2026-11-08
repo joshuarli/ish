@@ -9,6 +9,8 @@ pub mod editor;
 pub mod diagnostics;
 pub mod dispatch;
 pub mod external;
+pub mod fdu;
+pub mod fdu_browser;
 pub mod frecency;
 mod fs_command;
 pub mod sync_command;

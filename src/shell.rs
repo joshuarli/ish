@@ -479,6 +479,30 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                 }
             }
         }
+        ShellCommand::Fdu => {
+            let args = match expand_builtin_args_bytes(args, shell, name) {
+                Some(args) => args
+                    .iter()
+                    .map(epsh::shell_bytes::ShellBytes::to_os_string)
+                    .collect::<Vec<_>>(),
+                None => return false,
+            };
+            let mut reader = shell.input_reader.take();
+            let pending_input = reader.as_mut().map_or_else(Vec::new, |r| r.take_pending_bytes());
+            let cwd = store_env_os(&shell.epsh, "PWD")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                });
+            let (status, unconsumed) = ish::fdu::run(&args, cwd, pending_input);
+            if let Some(ref mut r) = reader {
+                if !unconsumed.is_empty() {
+                    r.push_pending(&unconsumed);
+                }
+            }
+            shell.input_reader = reader;
+            shell.last_status = status;
+        }
         ShellCommand::Denv => {
             let args = expanded_args!();
             let status = denv::command(&mut shell.denv, &args, &mut shell.epsh);

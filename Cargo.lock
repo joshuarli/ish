@@ -255,6 +255,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdu-tui"
+version = "0.1.0"
+dependencies = [
+ "fdu-core",
+ "hashbrown",
+ "rustix",
+ "unicode-width",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -324,6 +334,8 @@ dependencies = [
  "fdu-delete",
  "fdu-posix",
  "fdu-scan",
+ "fdu-tui",
+ "hashbrown",
  "ish-fs",
  "laputa-ptytest",
  "libc",

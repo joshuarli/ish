@@ -26,6 +26,7 @@ pub enum ShellCommand {
     CopyScrollback,
     Denv,
     Exit,
+    Fdu,
     ResumeJob,
     History,
     DumpLayout,
@@ -154,6 +155,8 @@ const LIST_HIDDEN_HELP: &str =
     "Usage: {name} [PATH...]\nList all files, including hidden ones, with sizes and relative ages.";
 const CLEAR_SCREEN_HELP: &str =
     "Usage: {name}\nClear the screen.";
+const FDU_HELP: &str =
+    "Usage: {name} [--apparent] [-x PATH | --exclude PATH]... [--summary | --interactive] [--read-only] [PATH]\nBrowse disk usage in a terminal or write a summary of directory sizes.";
 const RMRF_HELP: &str =
     "Usage: {name} [--] PATH...\nPermanently remove each PATH, including directory trees. Missing paths are ignored.";
 const LOCATE_HELP: &str =
@@ -170,6 +173,7 @@ const ISH_BUILTINS: &[Builtin] = &[
     Builtin::foreground("c", ExternalCommand::ClearScreen, Help::Text(CLEAR_SCREEN_HELP)),
     Builtin::in_shell("denv", ShellCommand::Denv, Help::Text(DENV_HELP)),
     Builtin::in_shell("exit", ShellCommand::Exit, Help::Text(EXIT_HELP)),
+    Builtin::in_shell("fdu", ShellCommand::Fdu, Help::Text(FDU_HELP)),
     Builtin::in_shell("fg", ShellCommand::ResumeJob, Help::Text(RESUME_JOB_HELP)),
     Builtin::hybrid("history", ShellCommand::History, Some(ExternalCommand::History), Help::Text(HISTORY_HELP)),
     Builtin::in_shell("ish-dump", ShellCommand::DumpLayout, Help::Text(DUMP_LAYOUT_HELP)),

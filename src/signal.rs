@@ -272,7 +272,7 @@ unsafe fn restore_terminal_for_crash() {
     // SAFETY: descriptors 0 and 1 stay open for the life of the shell.
     unsafe {
         let stdout = std::os::fd::BorrowedFd::borrow_raw(1);
-        let mut remaining = &b"\x1b[?2004l\x1b[?25h"[..];
+        let mut remaining = &b"\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l"[..];
         while !remaining.is_empty() {
             match rustix::io::write(stdout, remaining) {
                 Ok(0) => break,
