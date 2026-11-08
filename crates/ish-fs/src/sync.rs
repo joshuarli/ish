@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustix::fd::{AsFd, BorrowedFd};
-use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
 use crate::platform::{self, MetadataTarget, Preservation};
 use crate::policy::into_basename;
@@ -788,7 +788,7 @@ impl SyncSession<'_> {
             let (is_file, size, nlink, dev, ino, mtime, mtime_nsec) = if let Some(ref fd) = src_dir_fd {
                 match rustix::fs::statat(fd.as_fd(), &name, AtFlags::SYMLINK_NOFOLLOW) {
                     Ok(st) => {
-                        let is_file = (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFREG as u32;
+                        let is_file = FileType::from_raw_mode(st.st_mode) == FileType::RegularFile;
                         #[allow(clippy::unnecessary_cast)]
                         (
                             is_file,
@@ -863,7 +863,7 @@ impl SyncSession<'_> {
 
                 #[allow(clippy::unnecessary_cast)]
                 let skipped = if let Some(ref dst_st) = dst_stat
-                    && (dst_st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFREG as u32
+                    && FileType::from_raw_mode(dst_st.st_mode) == FileType::RegularFile
                     && dst_st.st_size as u64 == size
                     && dst_st.st_mtime as i64 == mtime
                     && dst_st.st_mtime_nsec as i64 == mtime_nsec
