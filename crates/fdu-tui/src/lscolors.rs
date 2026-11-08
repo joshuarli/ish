@@ -36,7 +36,14 @@ impl LsColors {
         }
     }
 
-    fn parse(value: &str) -> Self {
+    pub fn from_value(value: Option<&std::ffi::OsStr>) -> Self {
+        match value.and_then(|v| v.to_str()) {
+            Some(value) if !value.trim().is_empty() => Self::parse(value),
+            _ => Self::default(),
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
         let mut colors = Self::default();
         for entry in value.split(':') {
             let Some((key, codes)) = entry.split_once('=') else {

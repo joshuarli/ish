@@ -1982,33 +1982,53 @@ fn fdu_help_and_rejections_and_summary() {
     std::fs::write(dir.join("sub1/file.bin"), vec![b'1'; 4096]).unwrap();
     std::fs::write(dir.join("sub2/file.bin"), vec![b'2'; 8192]).unwrap();
 
-    let (status, _) = ish::fdu::run(
+    let outcome = ish::fdu::run(
         &[std::ffi::OsString::from("--rmrf"), std::ffi::OsString::from("sub1")],
         dir.clone(),
         Vec::new(),
+        None,
     );
-    assert_eq!(status, 2);
+    assert_eq!(outcome, ish::fdu::FduOutcome::Completed { status: 2, unconsumed: Vec::new() });
 
-    let (status, _) = ish::fdu::run(
+    let outcome = ish::fdu::run(
         &[std::ffi::OsString::from("--invalid-flag-xyz")],
         dir.clone(),
         Vec::new(),
+        None,
     );
-    assert_eq!(status, 2);
+    assert_eq!(outcome, ish::fdu::FduOutcome::Completed { status: 2, unconsumed: Vec::new() });
 
-    let (status, _) = ish::fdu::run(
+    let outcome = ish::fdu::run(
+        &[std::ffi::OsString::from("--summary"), std::ffi::OsString::from("--interactive")],
+        dir.clone(),
+        Vec::new(),
+        None,
+    );
+    assert_eq!(outcome, ish::fdu::FduOutcome::Completed { status: 2, unconsumed: Vec::new() });
+
+    let outcome = ish::fdu::run(
+        &[std::ffi::OsString::from("--interactive"), std::ffi::OsString::from("--summary")],
+        dir.clone(),
+        Vec::new(),
+        None,
+    );
+    assert_eq!(outcome, ish::fdu::FduOutcome::Completed { status: 2, unconsumed: Vec::new() });
+
+    let outcome = ish::fdu::run(
         &[std::ffi::OsString::from("--help")],
         dir.clone(),
         Vec::new(),
+        None,
     );
-    assert_eq!(status, 0);
+    assert_eq!(outcome, ish::fdu::FduOutcome::Completed { status: 0, unconsumed: Vec::new() });
 
-    let (status, _) = ish::fdu::run(
+    let outcome = ish::fdu::run(
         &[std::ffi::OsString::from("--summary")],
         dir.clone(),
         Vec::new(),
+        None,
     );
-    assert_eq!(status, 0);
+    assert_eq!(outcome, ish::fdu::FduOutcome::Completed { status: 0, unconsumed: Vec::new() });
 
     let _ = std::fs::remove_dir_all(&dir);
 }

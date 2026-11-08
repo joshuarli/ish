@@ -8,7 +8,7 @@ use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::cell::RefCell;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -82,6 +82,79 @@ struct ScanEventSender<'a> {
 impl ScanEventSender<'_> {
     fn send(&self, event: ScanEvent) -> Result<(), ScanEvent> {
         self.sender.send(event).map_err(|error| error.0)
+    }
+}
+
+const OPEN_WAIT_REPORT: std::time::Duration = std::time::Duration::from_secs(2);
+const OPEN_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+struct OpenWatch {
+    epoch: std::time::Instant,
+    slots: Box<[OpenSlot]>,
+}
+
+#[repr(align(64))]
+struct OpenSlot {
+    started: AtomicU64,
+    token: AtomicU32,
+}
+
+struct PendingOpen<'a>(&'a OpenSlot);
+
+impl Drop for PendingOpen<'_> {
+    fn drop(&mut self) {
+        self.0.started.store(0, Ordering::Release);
+    }
+}
+
+impl OpenWatch {
+    fn new(threads: usize) -> Self {
+        Self {
+            epoch: std::time::Instant::now(),
+            slots: (0..threads)
+                .map(|_| OpenSlot {
+                    started: AtomicU64::new(0),
+                    token: AtomicU32::new(0),
+                })
+                .collect(),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX).max(1)
+    }
+
+    fn begin(&self, slot: usize, token: DirectoryToken) -> PendingOpen<'_> {
+        let slot = &self.slots[slot];
+        slot.token.store(token.0, Ordering::Relaxed);
+        slot.started.store(self.now(), Ordering::Release);
+        PendingOpen(slot)
+    }
+
+    fn watch(&self, done: &AtomicBool, sender: &ScanEventSender<'_>) {
+        let mut reported = Vec::<(usize, u64)>::new();
+        while !done.load(Ordering::Acquire) {
+            thread::park_timeout(OPEN_WATCH_INTERVAL);
+            let now = self.now();
+            for (index, slot) in self.slots.iter().enumerate() {
+                let started = slot.started.load(Ordering::Acquire);
+                if started == 0 {
+                    continue;
+                }
+                let token = slot.token.load(Ordering::Relaxed);
+                if slot.started.load(Ordering::Acquire) != started
+                    || now.saturating_sub(started) < OPEN_WAIT_REPORT.as_nanos() as u64
+                    || reported.contains(&(index, started))
+                {
+                    continue;
+                }
+                reported.retain(|(reported_index, _)| *reported_index != index);
+                reported.push((index, started));
+                if sender.send(ScanEvent::DirectoryWaiting { directory: DirectoryToken(token) }).is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -492,6 +565,7 @@ struct ScanContext<'a> {
     queue: &'a IndexedWorkQueue,
     root_directory: BorrowedFd<'a>,
     descriptor_budget: Arc<AtomicUsize>,
+    open_watch: &'a OpenWatch,
 }
 
 
@@ -514,11 +588,13 @@ struct Outbox {
     held: Vec<IndexedDirectoryTask>,
     held_open: usize,
     directories_scanned: u32,
+    open_slot: usize,
 }
 
 impl Outbox {
-    fn new() -> Self {
+    fn new(open_slot: usize) -> Self {
         Self {
+            open_slot,
             batch: EntryBatch::with_capacity(PUBLISH_ENTRIES + PUBLISH_ENTRIES / 4, BATCH_NAME_BYTES),
             notices: Vec::new(),
             releases: Vec::new(),
@@ -644,6 +720,8 @@ pub(crate) fn scan_indexed(
     let limits = indexed_scan_limits();
     let worker_count = limits.workers.max(1);
     let queue = IndexedWorkQueue::new(limits.queued_directories.max(1), worker_count, limits.base_workers.max(1));
+    let open_watch = OpenWatch::new(worker_count + 1);
+    let watch_done = AtomicBool::new(false);
     let context = ScanContext {
         sender: &event_sender,
         returned_batches: &returned_batches,
@@ -658,10 +736,12 @@ pub(crate) fn scan_indexed(
         queue: &queue,
         root_directory: anchor.as_fd(),
         descriptor_budget: Arc::new(AtomicUsize::new(limits.retained_directory_budget.max(1))),
+        open_watch: &open_watch,
     };
 
     thread::scope(|scope| {
         let context = &context;
+        let watcher = scope.spawn(|| open_watch.watch(&watch_done, &event_sender));
         let workers = (0..worker_count)
             .map(|index| scope.spawn(move || worker_loop(index, context)))
             .collect::<Vec<_>>();
@@ -677,7 +757,7 @@ pub(crate) fn scan_indexed(
             token: DirectoryToken(0),
             exclusion_node: exclusions.root_node(),
         };
-        if !run_task_tree(root_task, context, &mut Outbox::new()) {
+        if !run_task_tree(root_task, context, &mut Outbox::new(worker_count)) {
             queue.cancel();
         }
         queue.finish_root();
@@ -690,6 +770,9 @@ pub(crate) fn scan_indexed(
                 queue.cancel();
             }
         }
+        watch_done.store(true, Ordering::Release);
+        watcher.thread().unpark();
+        let _ = watcher.join();
     });
     let _ = progress.flush_finishes();
     let _ = event_sender.send(ScanEvent::Finished);
@@ -697,7 +780,7 @@ pub(crate) fn scan_indexed(
 
 fn worker_loop(index: usize, context: &ScanContext<'_>) {
     context.queue.register_worker(index);
-    let mut outbox = Outbox::new();
+    let mut outbox = Outbox::new(index);
     while let Some(task) = context.queue.next_task(index, context.cancelled) {
         if !run_task_tree(task, context, &mut outbox) {
             context.queue.cancel();
@@ -736,7 +819,10 @@ fn scan_indexed_task(
     let directory = match &task.source {
         IndexedDirectorySource::Opened(directory) => directory.descriptor.as_fd(),
         IndexedDirectorySource::Reopen => {
-            reopened = match reopen_directory(&task.lineage, context.root_directory, context.root_mount) {
+            let pending = context.open_watch.begin(outbox.open_slot, task.token);
+            let opened = reopen_directory(&task.lineage, context.root_directory, context.root_mount);
+            drop(pending);
+            reopened = match opened {
                 Ok(directory) => directory,
                 Err(error) => return failed_task(task.token, error.to_string(), context, outbox),
             };

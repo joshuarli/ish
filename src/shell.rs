@@ -494,14 +494,25 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                 .unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
                 });
-            let (status, unconsumed) = ish::fdu::run(&args, cwd, pending_input);
-            if let Some(ref mut r) = reader {
-                if !unconsumed.is_empty() {
-                    r.push_pending(&unconsumed);
+            let ls_colors = store_env_os(&shell.epsh, "LS_COLORS");
+            match ish::fdu::run(&args, cwd, pending_input, ls_colors.as_deref()) {
+                ish::fdu::FduOutcome::Completed { status, unconsumed } => {
+                    if let Some(ref mut r) = reader
+                        && !unconsumed.is_empty()
+                    {
+                        r.push_pending(&unconsumed);
+                    }
+                    shell.input_reader = reader;
+                    shell.last_status = status;
+                }
+                ish::fdu::FduOutcome::Terminated { signal } => {
+                    if let Some(job) = shell.job.take() {
+                        job::abandon(job);
+                    }
+                    shell.last_status = 128 + signal;
+                    return true;
                 }
             }
-            shell.input_reader = reader;
-            shell.last_status = status;
         }
         ShellCommand::Denv => {
             let args = expanded_args!();

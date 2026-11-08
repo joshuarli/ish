@@ -103,11 +103,14 @@ impl ScanRun {
     }
 }
 
-/// An abandoned scan is cancelled but not joined: a worker can be stuck in an `open` that the OS
-/// holds until the user answers a privacy prompt, and quitting must not wait for that.
 impl Drop for ScanRun {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.receiver.take();
+        self.returned_batches.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -172,6 +175,42 @@ impl Drop for DeleteRun {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[derive(Debug)]
+struct BrowserShutdownError {
+    operation: Box<dyn std::error::Error>,
+    restoration: io::Error,
+}
+
+impl std::fmt::Display for BrowserShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; additionally, terminal restore failed: {}",
+            self.operation, self.restoration
+        )
+    }
+}
+
+impl std::error::Error for BrowserShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.operation.as_ref())
+    }
+}
+
+fn combine_shutdown_result<T>(
+    operation: Result<T, Box<dyn std::error::Error>>,
+    restoration: io::Result<()>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    match (operation, restoration) {
+        (Err(operation), Ok(())) => Err(operation),
+        (Err(operation), Err(restoration)) => {
+            Err(BrowserShutdownError { operation, restoration }.into())
+        }
+        (Ok(_), Err(restoration)) => Err(restoration.into()),
+        (Ok(value), Ok(())) => Ok(value),
     }
 }
 
@@ -417,8 +456,47 @@ fn duration_ms(duration: Option<Duration>) -> f64 {
     duration.map_or(0.0, |duration| duration.as_secs_f64() * 1000.0)
 }
 
+fn compare_nodes(
+    left: NodeId,
+    right: NodeId,
+    tree: &Tree,
+    sort_mode: SortMode,
+    size_mode: SizeMode,
+) -> std::cmp::Ordering {
+    let left_record = tree.record(left).expect("listing node exists");
+    let right_record = tree.record(right).expect("listing node exists");
+    match sort_mode {
+        SortMode::Name => tree
+            .name(left)
+            .unwrap_or_default()
+            .cmp(tree.name(right).unwrap_or_default()),
+        SortMode::Size => size_for(right_record, size_mode)
+            .cmp(&size_for(left_record, size_mode))
+            .then_with(|| {
+                tree.name(left)
+                    .unwrap_or_default()
+                    .cmp(tree.name(right).unwrap_or_default())
+            }),
+        SortMode::Date => right_record
+            .modified_time()
+            .unix_seconds()
+            .cmp(&left_record.modified_time().unix_seconds())
+            .then_with(|| {
+                tree.name(left)
+                    .unwrap_or_default()
+                    .cmp(tree.name(right).unwrap_or_default())
+            }),
+    }
+}
+
 impl BrowserModel {
-    fn new(root: &RootAnchor, read_only: bool, apparent: bool, terminal: TerminalSize) -> io::Result<Self> {
+    fn new(
+        root: &RootAnchor,
+        read_only: bool,
+        apparent: bool,
+        terminal: TerminalSize,
+        ls_colors: Option<&std::ffi::OsStr>,
+    ) -> io::Result<Self> {
         let mut tree = Tree::new(&root.name, root.identity, root.link_count).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "root path exceeds index limits")
         })?;
@@ -457,7 +535,7 @@ impl BrowserModel {
             root_listed: false,
             waiting_for_access: HashSet::new(),
             read_only,
-            ls_colors: LsColors::from_env(),
+            ls_colors: LsColors::from_value(ls_colors),
         };
         model.size_mode = if apparent { SizeMode::Apparent } else { SizeMode::Allocated };
         model.rebuild_listing(false);
@@ -1245,30 +1323,26 @@ impl BrowserModel {
         let mode = self.sort_mode;
         let size_mode = self.size_mode;
         let tree = &self.tree;
-        self.listing.sort_unstable_by(|left, right| {
-            let left_record = tree.record(*left).expect("listing node exists");
-            let right_record = tree.record(*right).expect("listing node exists");
-            match mode {
-                SortMode::Name => tree.name(*left).unwrap_or_default().cmp(tree.name(*right).unwrap_or_default()),
-                SortMode::Size => {
-                    size_for(right_record, size_mode)
-                        .cmp(&size_for(left_record, size_mode))
-                        .then_with(|| tree.name(*left).unwrap_or_default().cmp(tree.name(*right).unwrap_or_default()))
-                }
-                SortMode::Date => right_record
-                    .modified_time()
-                    .unix_seconds()
-                    .cmp(&left_record.modified_time().unix_seconds())
-                    .then_with(|| tree.name(*left).unwrap_or_default().cmp(tree.name(*right).unwrap_or_default())),
-            }
-        });
+        self.listing
+            .sort_unstable_by(|&left, &right| compare_nodes(left, right, tree, mode, size_mode));
     }
 
     fn resort_during_scan(&mut self) {
         if !self.scanning || self.range_mode {
             return;
         }
-        self.sort_listing();
+        let k = (self.terminal.rows as usize * 4).max(64);
+        let mode = self.sort_mode;
+        let size_mode = self.size_mode;
+        let tree = &self.tree;
+        if !self.cursor_moved_during_scan && self.listing.len() > k {
+            self.listing
+                .select_nth_unstable_by(k, |&left, &right| compare_nodes(left, right, tree, mode, size_mode));
+            self.listing[..k]
+                .sort_unstable_by(|&left, &right| compare_nodes(left, right, tree, mode, size_mode));
+        } else {
+            self.sort_listing();
+        }
         self.rebuild_visible(self.cursor_moved_during_scan);
     }
 
@@ -1676,27 +1750,37 @@ pub fn run(
     apparent: bool,
     exclusions: ScanExclusions,
     pending_input: Vec<u8>,
-) -> (i32, Vec<u8>) {
-    let _ = fdu_tui::feed_input(&pending_input);
+    ls_colors: Option<&std::ffi::OsStr>,
+) -> crate::fdu::FduOutcome {
     let mut terminal = match TerminalSession::enter() {
         Ok(t) => t,
         Err(error) => {
             eprintln!("fdu: cannot enter terminal: {error}");
-            return (1, pending_input);
+            return crate::fdu::FduOutcome::Completed {
+                status: 1,
+                unconsumed: pending_input,
+            };
         }
     };
-    let result = run_session(path, read_only, apparent, exclusions, &mut terminal);
-    let _ = terminal.restore();
+    let _ = fdu_tui::feed_input(&pending_input);
+    let session_result = run_session(path, read_only, apparent, exclusions, ls_colors, &mut terminal);
+    let result = combine_shutdown_result(session_result, terminal.restore());
     let unconsumed = fdu_tui::take_unconsumed_input().unwrap_or_default();
     match result {
-        Ok((Some(sig), _, _)) => (128 + sig, unconsumed),
+        Ok((Some(sig), _, _)) => crate::fdu::FduOutcome::Terminated { signal: sig },
         Ok((None, mut profile, model)) => {
             profile.report(&model);
-            (0, unconsumed)
+            crate::fdu::FduOutcome::Completed {
+                status: 0,
+                unconsumed,
+            }
         }
         Err(error) => {
             eprintln!("fdu: {error}");
-            (1, unconsumed)
+            crate::fdu::FduOutcome::Completed {
+                status: 1,
+                unconsumed,
+            }
         }
     }
 }
@@ -1706,10 +1790,11 @@ fn run_session(
     read_only: bool,
     apparent: bool,
     exclusions: ScanExclusions,
+    ls_colors: Option<&std::ffi::OsStr>,
     terminal: &mut TerminalSession,
 ) -> Result<(Option<i32>, BrowserProfile, BrowserModel), Box<dyn std::error::Error>> {
     let root = open_root(&path)?;
-    let mut model = BrowserModel::new(&root, read_only, apparent, fdu_tui::terminal_size()?)?;
+    let mut model = BrowserModel::new(&root, read_only, apparent, fdu_tui::terminal_size()?, ls_colors)?;
     let profiling_enabled = std::env::var_os("FDU_PROFILE").is_some();
     let mut profile = BrowserProfile::new(profiling_enabled);
     let mut phase = AppPhase::Scanning(ScanRun::start(root.clone(), exclusions.clone()));
@@ -2063,7 +2148,7 @@ mod tests {
 
     fn make_model(temp: &TempDir, read_only: bool) -> io::Result<(RootAnchor, BrowserModel)> {
         let root = temp.root()?;
-        let model = BrowserModel::new(&root, read_only, false, TerminalSize { columns: 120, rows: 40 })?;
+        let model = BrowserModel::new(&root, read_only, false, TerminalSize { columns: 120, rows: 40 }, None)?;
         Ok((root, model))
     }
 

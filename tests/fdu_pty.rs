@@ -206,7 +206,7 @@ fn profile_large_layout_fixture() -> io::Result<()> {
         })
     }).unwrap();
     let raw = session.terminal.raw_output();
-    let text = String::from_utf8_lossy(&raw);
+    let text = String::from_utf8_lossy(raw);
     for line in text.lines() {
         if line.contains("fdu-profile") {
             println!("{line}");
@@ -215,5 +215,64 @@ fn profile_large_layout_fixture() -> io::Result<()> {
     session.terminal.send_bytes(deadline, b"exit\r").unwrap();
     let status = session.terminal.wait_for_exit(deadline).unwrap();
     assert_eq!(status, ptytest::ExitStatus::Code(0));
+    Ok(())
+}
+
+#[test]
+fn rapid_input_handoff_burst_does_not_drop_queued_quit() -> io::Result<()> {
+    let (_temp, root) = TempDir::standard_tree()?;
+    let ish_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ish"));
+    let temp = TempDir::new()?;
+    let home = temp.0.join("home");
+    fs::create_dir_all(home.join(".config/ish"))?;
+
+    let command = ptytest::CommandSpec::new(ish_bin)
+        .env("HOME", &home)
+        .env("USER", "testuser")
+        .env("PWD", env!("CARGO_MANIFEST_DIR"))
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    let scenario = ptytest::Scenario::new("rapid-fdu-handoff-burst")
+        .unwrap()
+        .command(command.current_dir(env!("CARGO_MANIFEST_DIR")))
+        .size(ptytest::Size::new(100, 24).unwrap())
+        .environment(ptytest::TestEnv::hermetic().unwrap());
+    let mut terminal = ptytest::PtyTest::spawn(scenario).unwrap();
+
+    let deadline = terminal.deadline(std::time::Duration::from_secs(15));
+    terminal.wait_for_screen(deadline, "initial prompt", |screen| {
+        let cursor = screen.cursor();
+        screen.row(usize::from(cursor.row)).is_some_and(|r| {
+            r.get(..usize::from(cursor.column)).is_some_and(|p| p.ends_with("$ "))
+        })
+    }).unwrap();
+
+    let cmd = format!("fdu --interactive {}\rq", root.display());
+    terminal.send_bytes(terminal.deadline(std::time::Duration::from_secs(5)), cmd.as_bytes()).unwrap();
+
+    let deadline = terminal.deadline(std::time::Duration::from_secs(15));
+    terminal.wait_for_screen(deadline, "prompt returns after rapid q in burst", |screen| {
+        let cursor = screen.cursor();
+        screen.row(usize::from(cursor.row)).is_some_and(|r| {
+            r.get(..usize::from(cursor.column)).is_some_and(|p| p.ends_with("$ "))
+        })
+    }).unwrap();
+
+    terminal.send_bytes(deadline, b"exit\r").unwrap();
+    let status = terminal.wait_for_exit(deadline).unwrap();
+    assert_eq!(status, ptytest::ExitStatus::Code(0));
+    Ok(())
+}
+
+#[test]
+fn sigterm_terminates_shell_running_fdu() -> io::Result<()> {
+    let (_temp, root) = TempDir::standard_tree()?;
+    let mut session = Session::start("sigterm-fdu", &root, &[], 100, 24);
+    session.wait_ready();
+
+    session.terminal.signal(libc::SIGTERM).unwrap();
+
+    let deadline = session.terminal.deadline(session.step);
+    let status = session.terminal.wait_for_exit(deadline).unwrap();
+    assert_eq!(status, ptytest::ExitStatus::Code(128 + libc::SIGTERM));
     Ok(())
 }

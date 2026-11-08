@@ -190,7 +190,7 @@ pub fn list_is_dimmed(screen: &ScreenSnapshot) -> bool {
     screen.cell(1, 0).is_some_and(|cell| cell.attributes().dim)
 }
 
-pub fn row_containing<'a>(screen: &'a ScreenSnapshot, needle: &str) -> String {
+pub fn row_containing(screen: &ScreenSnapshot, needle: &str) -> String {
     screen
         .lines()
         .into_iter()
