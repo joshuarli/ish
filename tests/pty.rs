@@ -1850,6 +1850,16 @@ fn native_fs_rsync_interactive() {
 }
 
 #[test]
+fn native_fs_fdu_interactive() {
+    let sh = PtyShell::spawn();
+    let output = clean(&sh.run_command("command -V fdu"));
+    assert!(
+        output.lines().any(|line| line.trim() == "fdu is a shell builtin"),
+        "{output:?}"
+    );
+}
+
+#[test]
 fn tilde_expansion() {
     let sh = PtyShell::spawn();
     let out = sh.run_command("echo ~");

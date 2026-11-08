@@ -1939,6 +1939,7 @@ fn builtin_registry_drives_names_and_execution_classes() {
         assert!(builtin::is_builtin(name), "{name}");
     }
     assert_eq!(builtin::lookup("z").map(|b| b.exec), Some(builtin::Exec::InShell));
+    assert_eq!(builtin::lookup("fdu").map(|b| b.exec), Some(builtin::Exec::InShell));
     assert_eq!(builtin::lookup("cd").map(|b| b.exec), Some(builtin::Exec::Hybrid));
     for name in ["cp", "mv", "rsync"] {
         assert_eq!(builtin::lookup(name).map(|b| b.exec), Some(builtin::Exec::Foreground));
@@ -1962,6 +1963,54 @@ fn every_builtin_has_help() {
     assert!(builtin::lookup("trash").is_none());
     assert!(builtin::help("cp").unwrap().contains("--merge"));
     assert!(builtin::help("rsync").unwrap().contains("--contents"));
+    assert!(builtin::help("fdu").unwrap().contains("--apparent"));
+}
+
+#[test]
+fn fdu_help_and_rejections_and_summary() {
+    let help = builtin::help("fdu").expect("fdu help");
+    assert!(help.contains("--apparent"));
+    assert!(help.contains("--exclude PATH"));
+    assert!(help.contains("--summary"));
+    assert!(help.contains("--interactive"));
+    assert!(help.contains("--read-only"));
+
+    let dir = std::env::temp_dir().join(format!("ish_fdu_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("sub1")).unwrap();
+    std::fs::create_dir_all(dir.join("sub2")).unwrap();
+    std::fs::write(dir.join("sub1/file.bin"), vec![b'1'; 4096]).unwrap();
+    std::fs::write(dir.join("sub2/file.bin"), vec![b'2'; 8192]).unwrap();
+
+    let (status, _) = ish::fdu::run(
+        &[std::ffi::OsString::from("--rmrf"), std::ffi::OsString::from("sub1")],
+        dir.clone(),
+        Vec::new(),
+    );
+    assert_eq!(status, 2);
+
+    let (status, _) = ish::fdu::run(
+        &[std::ffi::OsString::from("--invalid-flag-xyz")],
+        dir.clone(),
+        Vec::new(),
+    );
+    assert_eq!(status, 2);
+
+    let (status, _) = ish::fdu::run(
+        &[std::ffi::OsString::from("--help")],
+        dir.clone(),
+        Vec::new(),
+    );
+    assert_eq!(status, 0);
+
+    let (status, _) = ish::fdu::run(
+        &[std::ffi::OsString::from("--summary")],
+        dir.clone(),
+        Vec::new(),
+    );
+    assert_eq!(status, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
