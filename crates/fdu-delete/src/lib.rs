@@ -1056,7 +1056,26 @@ mod posix {
             Err(error) => return (OutcomeKind::Failed, Some(io::Error::from(error).to_string())),
         };
         match identity(&latest) {
-            Ok(found) if found == record.identity && entry_type(&latest) == record.entry_type => {},
+            Ok(found) if found == record.identity && entry_type(&latest) == record.entry_type => {
+                if record.entry_type == EntryType::RegularFile {
+                    #[allow(clippy::unnecessary_cast)]
+                    if record.apparent_bytes != 0 && (latest.st_size as u64) != record.apparent_bytes {
+                        return (
+                            OutcomeKind::Changed,
+                            Some("entry changed immediately before removal".to_owned()),
+                        );
+                    }
+                    #[allow(clippy::unnecessary_cast)]
+                    if let Some(mtime) = fdu_core::ModifiedTime::from_unix_seconds(latest.st_mtime as i64) {
+                        if record.modified_time().unix_seconds().is_some() && mtime != record.modified_time() {
+                            return (
+                                OutcomeKind::Changed,
+                                Some("entry changed immediately before removal".to_owned()),
+                            );
+                        }
+                    }
+                }
+            }
             Ok(_) => return (OutcomeKind::Changed, Some("entry changed immediately before removal".to_owned())),
             Err(error) => return (OutcomeKind::Failed, Some(error.to_string())),
         }
@@ -1153,7 +1172,10 @@ mod posix {
             assert!(tree.set_state(tree.root(), NodeStatus::Complete));
             let root_id = tree.root();
             let identity_of = |name: &[u8]| identity(&stat_at(root.as_fd(), name).unwrap()).unwrap();
-            let victim = tree.append(root_id, b"victim", EntryType::RegularFile, identity_of(b"victim"), 1, 0, 0, NodeStatus::Complete).unwrap();
+            let victim_stat = stat_at(root.as_fd(), b"victim").unwrap();
+            #[allow(clippy::unnecessary_cast)]
+            let victim = tree.append(root_id, b"victim", EntryType::RegularFile, identity(&victim_stat).unwrap(), 1, victim_stat.st_size as u64, 0, NodeStatus::Complete).unwrap();
+            let _ = tree.set_modified_time(victim, fdu_core::ModifiedTime::from_unix_seconds(victim_stat.st_mtime as i64).unwrap());
             let link = tree.append(root_id, b"link", EntryType::Symlink, identity_of(b"link"), 1, 0, 0, NodeStatus::Complete).unwrap();
             let empty = tree.append(root_id, b"empty", EntryType::Directory, identity_of(b"empty"), 1, 0, 0, NodeStatus::Complete).unwrap();
             let full = tree.append(root_id, b"full", EntryType::Directory, identity_of(b"full"), 1, 0, 0, NodeStatus::Complete).unwrap();
