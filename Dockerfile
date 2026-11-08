@@ -14,6 +14,7 @@ RUN apk add --no-cache \
     bash=5.3.9-r1 \
     file=5.47-r2 \
     make=4.4.1-r4 \
+    python3=3.14.10-r1 \
     strace=6.19-r1 \
     musl-dev=1.2.6-r3 \
     libgcc=15.2.0-r5 \
