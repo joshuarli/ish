@@ -109,7 +109,7 @@ including targets selected through expansion or nested `command`. Static
 violations prevent the input line from starting. Expanded targets are checked
 before their redirections, assignments for dispatch, or execution; earlier
 commands and expansions keep their effects. Commands that need shell state,
-including `alias`, `exit`, `fg`, `denv`, and `z`, must be the whole input line.
+including `alias`, `exit`, `fdu`, `fg`, `denv`, and `z`, must be the whole input line.
 `cd` and `history` can also be used in lists. `rmrf` must also be the whole
 input line.
 
@@ -140,6 +140,7 @@ ish-specific commands include:
 |---|---|
 | `cd [dir]` | Change directory; `cd -` returns to the previous directory |
 | `exit [status]` | Exit, warning if a job is suspended |
+| `fdu [OPTIONS] [PATH]` | Browse disk usage interactively or write a summary of directory sizes |
 | `fg` | Resume the suspended foreground job |
 | `alias [name [command...]]` | Define or list aliases |
 | `history [reset]` | List or clear saved history |
@@ -226,6 +227,28 @@ are updated atomically via staged replacement. Deletions are opt-in via `--delet
 `-n` is not supported (use `--dry-run`). Remote rsync protocols, daemon modes,
 and network deltas are external non-goals; explicit paths such as `/usr/bin/rsync`
 run the external utility.
+
+### Browsing disk usage (fdu)
+
+`fdu` scans disk usage and lets you browse a directory in an interactive terminal.
+It must be the whole input line. With no path, it scans the current directory;
+with `PATH`, it starts at that directory. When redirected, it writes a compact
+size summary of immediate child directories to standard output.
+
+```text
+fdu [--apparent] [-x PATH | --exclude PATH]... [--summary | --interactive] [--read-only] [PATH]
+```
+
+- Navigate with arrow keys or `j`/`k`/`h`/`l`; open with Enter; move up with Backspace or `h`.
+- Mark with `d`, range with `v`, clear marks with `c`.
+- Tab switches focus between the directory listing and the marked-items pane.
+- `-` toggles between side-by-side and stacked panes.
+- `s` cycles sort order (size, name, date); `a` toggles apparent vs. allocated sizes; `/` filters by name; `?` opens help; `q` quits.
+- In the marked pane, press Ctrl-R to review and confirm permanent deletion. Incomplete scans or excluded items are skipped and preserved.
+- `--read-only` disables deletion.
+- `-x PATH` / `--exclude PATH` omits exact paths relative to the scan root.
+- `--summary` writes immediate child directory sizes without starting the interactive browser.
+- `fdu --rmrf` is rejected: `ish` provides native `rmrf`. Unlike standalone `fdu --rmrf`, which empties a directory while preserving it, `rmrf PATH` permanently removes the named directory itself.
 
 The exposed epsh builtins are `echo`, `printf`, `pwd`, `true`, `false`, `:`,
 `test`, `[`, `kill`, `export`, `unset`, `set`, and `command`; `cd` also retains

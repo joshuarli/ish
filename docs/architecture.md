@@ -16,9 +16,10 @@ ish's user-facing syntax smaller than epsh's parser and runtime.
    The native dispatcher handles ish-owned operations in the original process.
    ish synchronizes the resulting status and working directory.
 
-The builtin registry assigns `cp` and `mv` the `Exec::Foreground` class. epsh
+The builtin registry assigns `cp`, `mv`, and `rsync` the `Exec::Foreground` class. epsh
 handles their list and redirection syntax, then calls ish's handler in the
-original shell process. `l` and `c` use the same execution class.
+original shell process. `l` and `c` use the same execution class. `fdu` runs
+in-process as an `InShell` builtin with exclusive terminal access.
 Explicit executable paths bypass the builtin registry
 and keep the external utility available. The [file operation reference](filesystem.md)
 defines their operands and filesystem policy.
