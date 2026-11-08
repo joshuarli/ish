@@ -348,6 +348,9 @@ mod tests {
                 jobs: 1,
                 metrics: Mutex::new(Metrics::default()),
                 descriptor_reservation: AtomicUsize::new(0),
+                staging_unsupported: Mutex::new(std::collections::HashSet::new()),
+                staging_warned: Mutex::new(false),
+                direct_warned: Mutex::new(false),
                 hook: None,
             };
             let source = Root::establish(invocation.cwd, Path::new("source"), roots::Requirement::Existing).expect("establish source root");

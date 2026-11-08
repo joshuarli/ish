@@ -140,11 +140,18 @@ pub(super) fn whole(invocation: &Invocation<'_>, source: Root, destination: &Roo
     let retain_tree_parent = observed.identity.kind == EntryKind::Directory && matches!(source.name.as_bytes(), b"." | b"..");
     invocation.require_descriptors((if observed.identity.kind == EntryKind::Directory { 10 + super::WORKER_DESCRIPTORS * invocation.jobs } else { super::WORKER_DESCRIPTORS + 2 }) + invocation.index_descriptors() + root_discovery_descriptors + usize::from(retain_tree_parent))?;
     invocation.update(|progress| progress.discovered_files += 1);
+    let fallback_eligible = invocation.request.operation == Operation::Copy && action == Action::Transfer && !defer_final_flags && (observed.links <= 1 || observed.identity.kind == EntryKind::Directory);
+    let device = roots::observe_fd(destination.parent.as_fd())?.identity.device;
+    if fallback_eligible && invocation.staging_unsupported.lock().unwrap().contains(&device) {
+        invocation.warn_staging_once(destination.path.clone(), "warning: destination staging unsupported; copying directly without journaled staging".to_owned());
+        return direct_whole(invocation, source, destination);
+    }
     let stage_result = invocation.fault("staging_init").and_then(|()| new_stage(invocation, destination, observed));
     let mut stage = match stage_result {
         Ok(stage) => stage,
-        Err(error) if invocation.request.operation == Operation::Copy && action == Action::Transfer && error.kind() == io::ErrorKind::Unsupported && !error.to_string().contains("restrictive umask") && !defer_final_flags && (observed.links <= 1 || observed.identity.kind == EntryKind::Directory) => {
-            invocation.emit(Event::Diagnostic(Diagnostic { path: destination.path.clone(), message: format!("warning: destination staging unsupported; copying directly without journaled staging: {error}") }));
+        Err(error) if fallback_eligible && error.kind() == io::ErrorKind::Unsupported && !error.to_string().contains("restrictive umask") => {
+            invocation.staging_unsupported.lock().unwrap().insert(device);
+            invocation.warn_staging_once(destination.path.clone(), format!("warning: destination staging unsupported; copying directly without journaled staging: {error}"));
             return direct_whole(invocation, source, destination);
         },
         Err(error) => return Err(error.into()),
@@ -280,17 +287,17 @@ fn direct_apply_metadata(invocation: &Invocation<'_>, display: &Path, target: Me
     let metadata = match platform::capture_metadata(target) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-            invocation.emit(Event::Diagnostic(Diagnostic { path: display.to_path_buf(), message: format!("warning: destination does not support metadata preservation: {error}") }));
+            invocation.warn_direct_once(display.to_path_buf(), format!("warning: destination does not support metadata preservation: {error}"));
             return Ok(());
         },
         Err(error) => return Err(error),
     };
     if metadata.resource_fork_size.unwrap_or(0) > 0 {
-        invocation.emit(Event::Diagnostic(Diagnostic { path: display.to_path_buf(), message: "warning: resource fork not preserved".into() }));
+        invocation.warn_direct_once(display.to_path_buf(), "warning: resource fork not preserved".into());
     }
     if let Err(error) = platform::apply_metadata(target, &observed, &metadata, Preservation::Copy) {
         if error.kind() == io::ErrorKind::Unsupported {
-            invocation.emit(Event::Diagnostic(Diagnostic { path: display.to_path_buf(), message: format!("warning: destination does not support metadata preservation: {error}") }));
+            invocation.warn_direct_once(display.to_path_buf(), format!("warning: destination does not support metadata preservation: {error}"));
             return Ok(());
         }
         return Err(error);
@@ -305,7 +312,7 @@ fn direct_sync(invocation: &Invocation<'_>, display: &Path, fd: BorrowedFd<'_>, 
     let result = if directory { invocation.sync_directory(fd) } else { invocation.sync_file(fd) };
     if let Err(error) = result {
         if error.kind() == io::ErrorKind::Unsupported {
-            invocation.emit(Event::Diagnostic(Diagnostic { path: display.to_path_buf(), message: format!("warning: destination does not support synchronization: {error}") }));
+            invocation.warn_direct_once(display.to_path_buf(), format!("warning: destination does not support synchronization: {error}"));
             return Ok(());
         }
         return Err(error);

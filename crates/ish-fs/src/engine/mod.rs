@@ -59,6 +59,9 @@ struct Invocation<'a> {
     jobs: usize,
     metrics: Mutex<crate::Metrics>,
     descriptor_reservation: std::sync::atomic::AtomicUsize,
+    staging_unsupported: Mutex<std::collections::HashSet<u64>>,
+    staging_warned: Mutex<bool>,
+    direct_warned: Mutex<bool>,
     #[cfg(test)]
     hook: Option<Hook>,
 }
@@ -93,6 +96,26 @@ impl Invocation<'_> {
         if self.sink.emit(event).is_err() {
             self.cancellation.cancel_for_output();
             self.stopped.store(true, Ordering::Release);
+        }
+    }
+
+    fn warn_staging_once(&self, path: std::path::PathBuf, message: String) {
+        let first = {
+            let mut warned = self.staging_warned.lock().unwrap();
+            !std::mem::replace(&mut *warned, true)
+        };
+        if first {
+            self.emit(Event::Diagnostic(Diagnostic { path, message }));
+        }
+    }
+
+    fn warn_direct_once(&self, path: std::path::PathBuf, message: String) {
+        let first = {
+            let mut warned = self.direct_warned.lock().unwrap();
+            !std::mem::replace(&mut *warned, true)
+        };
+        if first {
+            self.emit(Event::Diagnostic(Diagnostic { path, message }));
         }
     }
 
@@ -244,7 +267,7 @@ pub fn execute(request: &Request, cancellation: &Cancellation, sink: &dyn EventS
             *hardlink_members.entry(operand.source_observed.identity).or_insert(0) += 1;
         }
     }
-    let invocation = Invocation { request, cancellation, sink, cwd: cwd.as_fd(), progress: Mutex::new(Progress::default()), hardlinks: Mutex::new(None), self_changes: Mutex::new(None), hardlink_members: Mutex::new(hardlink_members), deferred_flags: Mutex::new(None), active_hardlinks: Mutex::new(std::collections::HashSet::new()), hardlink_ready: Condvar::new(), renamed_trees: Mutex::new(None), track_renamed_trees: request.options.merge || matches!(&request.operands, crate::Operands::Into { rest, .. } if !rest.is_empty()), renamed_tree_cursor: AtomicU64::new(0), copied_hardlinks: AtomicBool::new(false), unverified_directory_rename: AtomicBool::new(false), root_discovery_active: Mutex::new(false), root_discovery_ready: Condvar::new(), stopped: AtomicBool::new(false), jobs, metrics: Mutex::new(crate::Metrics::default()), descriptor_reservation: std::sync::atomic::AtomicUsize::new(0), #[cfg(test)] hook: HOOK.with(|hook| hook.borrow().clone()) };
+    let invocation = Invocation { request, cancellation, sink, cwd: cwd.as_fd(), progress: Mutex::new(Progress::default()), hardlinks: Mutex::new(None), self_changes: Mutex::new(None), hardlink_members: Mutex::new(hardlink_members), deferred_flags: Mutex::new(None), active_hardlinks: Mutex::new(std::collections::HashSet::new()), hardlink_ready: Condvar::new(), renamed_trees: Mutex::new(None), track_renamed_trees: request.options.merge || matches!(&request.operands, crate::Operands::Into { rest, .. } if !rest.is_empty()), renamed_tree_cursor: AtomicU64::new(0), copied_hardlinks: AtomicBool::new(false), unverified_directory_rename: AtomicBool::new(false), root_discovery_active: Mutex::new(false), root_discovery_ready: Condvar::new(), stopped: AtomicBool::new(false), jobs, metrics: Mutex::new(crate::Metrics::default()), descriptor_reservation: std::sync::atomic::AtomicUsize::new(0), staging_unsupported: Mutex::new(std::collections::HashSet::new()), staging_warned: Mutex::new(false), direct_warned: Mutex::new(false), #[cfg(test)] hook: HOOK.with(|hook| hook.borrow().clone()) };
     let mut outcomes = vec![None; plan.operands.len()];
     let mut ready = vec![false; plan.operands.len()];
     let mut next_outcome = 0;

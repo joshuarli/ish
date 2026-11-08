@@ -357,6 +357,18 @@ fn direct_copy_fallback_does_not_apply_to_move() {
 }
 
 #[test]
+fn direct_copy_fallback_warns_once_per_command() {
+    let fixture = Fixture::new(); fs::write(fixture.0.join("a"), b"a").unwrap(); fs::write(fixture.0.join("b"), b"b").unwrap(); fs::create_dir(fixture.0.join("out")).unwrap();
+    let mut request = fixture.request(); request.operation = Operation::Copy; request.operands = crate::Operands::Into { directory: "out".into(), first: "a".into(), rest: vec!["b".into()] };
+    let (outcome, events) = fixture.run(&request, force_staging_unsupported);
+    assert_eq!(outcome.status(), 0);
+    assert_eq!(fs::read(fixture.0.join("out/a")).unwrap(), b"a");
+    assert_eq!(fs::read(fixture.0.join("out/b")).unwrap(), b"b");
+    let warnings = events.iter().filter(|event| matches!(event, Event::Diagnostic(diagnostic) if diagnostic.message.contains("copying directly"))).count();
+    assert_eq!(warnings, 1, "{events:?}");
+}
+
+#[test]
 fn staging_name_substitution_retains_ambiguous_object() {
     let fixture = Fixture::new(); fs::write(fixture.0.join("source"), b"source").unwrap();
     let directory = fixture.0.clone(); let mut request = fixture.request(); request.operation = Operation::Copy;
