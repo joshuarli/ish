@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft, preflighted in place (2026-11-07). Not started. `ready after the owner answers D1-D5`.
+Active (2026-11-07). D1-D5 decisions recorded and accepted. Ready for Phase 0 foundation.
 
 ## Charter
 
@@ -13,17 +13,15 @@ Evidence for current state: there is no `rsync` builtin (`src/builtin.rs:161-181
 ## Decisions
 
 ### D1 (owner-decided). Command name and shadowing
-**Recommendation:** name the builtin `rsync`. Bare `rsync` resolves to the builtin, like `cp`/`mv` (`src/builtin.rs:166,175`, `README.md:3-7,346-351`); `/usr/bin/rsync` and `command /usr/bin/rsync` remain external. Completion/history SSH-command special casing that mentions `rsync` (`src/editor.rs:1071`) stays correct for external remote use but should not imply remote protocol support.
+**Decision:** Accepted recommendation. Name the builtin `rsync`. Bare `rsync` resolves to the builtin, like `cp`/`mv` (`src/builtin.rs:166,175`, `README.md:3-7,346-351`); `/usr/bin/rsync` and `command /usr/bin/rsync` remain external. Completion/history SSH-command special casing that mentions `rsync` (`src/editor.rs:1071`) stays correct for external remote use but should not imply remote protocol support.
 **Why:** matches the goal and user expectation; explicit path preserves escape hatch.
-**Reverses if:** owner wants a non-conflicting name (`sync` conflicts with Unix `sync`; `mirror`/`fsync`/other names change muscle memory).
 
 ### D2 (owner-decided). Local-only scope and guarantees
-**Recommendation:** v1 is local-path synchronization only (source and destination reachable through local filesystem paths/anchored descriptors). No `rsync://`, no `host:`, no `-e ssh`, no daemon protocol, no rolling checksum delta format, no batch files. Guarantees are "similar" where defined and stronger where ish-fs safety applies: no remote-transfer semantics, no partial publication through staged replacement for operations that use ish-fs staging, no following destination symlinks as containers unless an explicit container form is selected, identity-rechecked retirement/publication per existing ish-fs discipline. File-content delta inside a changed local file is **not** required in v1; changed files use whole-file copy/reflink-aware transfer. Quick-check skip is the incremental mechanism.
+**Decision:** Accepted recommendation. v1 is local-path synchronization only (source and destination reachable through local filesystem paths/anchored descriptors). No `rsync://`, no `host:`, no `-e ssh`, no daemon protocol, no rolling checksum delta format, no batch files. Guarantees are "similar" where defined and stronger where ish-fs safety applies: no remote-transfer semantics, no partial publication through staged replacement for operations that use ish-fs staging, no following destination symlinks as containers unless an explicit container form is selected, identity-rechecked retirement/publication per existing ish-fs discipline. File-content delta inside a changed local file is **not** required in v1; changed files use whole-file copy/reflink-aware transfer. Quick-check skip is the incremental mechanism.
 **Why:** remote protocol/delta is a separate product with network, auth, compatibility, and security surface; the stated pain points are flags and trailing-slash behavior. Reflink/parallel whole-file copy plus skip-unchanged covers common local sync cases.
-**Reverses if:** owner requires remote interop or block-delta for large locally changed files in v1.
 
 ### D3 (owner-decided). Trailing `/` and operand semantics
-**Recommendation:** **never interpret a trailing `/` as "copy contents"**. Path spelling normalization (treating `dir/` as `dir` for existence) is harmless, but operand meaning never changes. Sync uses explicit forms:
+**Decision:** Accepted recommendation. **Never interpret a trailing `/` as "copy contents"**. Path spelling normalization (treating `dir/` as `dir` for existence) is harmless, but operand meaning never changes. Sync uses explicit forms:
 
 - `rsync [OPTIONS] --into DIRECTORY SOURCE...` — synchronize each `SOURCE` into `DIRECTORY` as `DIRECTORY/basename(SOURCE)`. Explicit container form; like cp `--into`.
 - `rsync [OPTIONS] SOURCE... DIRECTORY` — if final operand is an existing directory, treat as `--into DIRECTORY` (cp-compatible multi-source convenience). If exactly two operands and final is not an existing directory, treat as exact mapping (below). This preserves cp's existing-directory convenience without slash magic.
@@ -32,10 +30,9 @@ Evidence for current state: there is no `rsync` builtin (`src/builtin.rs:161-181
 
 Basenames follow cp rules (`policy::into_basename` / existing cp behavior): `/`, `.`/`..` rejected where ambiguous.
 **Why:** removes the footgun while keeping an explicit contents operation. Aligns with cp's `--into` and existing-directory mapping where possible.
-**Reverses if:** owner wants rsync-compat operand semantics for migration scripts (would require a compat mode, not the default).
 
 ### D4 (owner-decided). Default sync policy
-**Recommendation:** defaults are safe and unsurprising:
+**Decision:** Accepted recommendation. Defaults are safe and unsurprising:
 - Recurse into directories automatically.
 - **Skip unchanged** regular files by quick check: same entry kind, same logical size, and same mtime (using available timestamp precision; treat incomparable precision conservatively as changed unless proven equal). No `--checksum` in v1.
 - Preserve metadata that ish-fs copy preserves for local copies where representable (mode/timestamps/ACL/xattrs/resource forks/platform flags per existing platform code paths), using existing metadata helpers; report limitations as diagnostics, not silent broadening.
@@ -45,12 +42,10 @@ Basenames follow cp rules (`policy::into_basename` / existing cp behavior): `/`,
 - **Hardlinks (prescribed bound):** v1 does not promise rsync `-H` hardlink topology preservation. The sync planner must not silently create independent copies for a source hardlink group it detected as linked; if hardlink preservation is not implemented for the sync path, it reports a clear diagnostic per affected group/entry and either (a) skips with failure status for that case, or (b) copies content independently only when an explicit future `--split-hardlinks` option is added — default is (a), no data corruption claim. Revisit if owner requires `-H` parity in v1.
 - No `--archive` flag bundle; options are explicit and few.
 **Why:** "sane defaults" means safe by default, incremental by default, no hidden deletion, no silent semantic loss.
-**Reverses if:** owner wants delete-by-default mirror semantics, rsync-archive shorthand, or requires hardlink topology preservation in v1.
 
 ### D5 (owner-decided). Progress, dry-run, and output
-**Recommendation:** support `--dry-run`, `--verbose`, `--no-progress`, `-j/--jobs` (reuse ish-fs budgeting where applicable), `--delete`, `--contents`, `-n/--dry-run`? No - keep long options primary; accept `-n` only if unambiguous (cp uses `-n` for `--no-clobber`; conflict - **do not** reuse `-n` for dry-run). Accept `--help`/`-h`. No short flag soup. Progress reports files examined, files transferred, files skipped unchanged, bytes transferred, and deletions (when `--delete`) — text adapted from fs_command rendering style but honest about sync-specific counters.
+**Decision:** Accepted recommendation. Support `--dry-run`, `--verbose`, `--no-progress`, `-j/--jobs` (reuse ish-fs budgeting where applicable), `--delete`, `--contents`, `-h/--help`. Do **not** accept `-n` for dry-run (conflict with cp `-n` for `--no-clobber`). Keep long options primary. Progress reports files examined, files transferred, files skipped unchanged, bytes transferred, and deletions (when `--delete`) — text adapted from fs_command rendering style but honest about sync-specific counters.
 **Why:** avoids flag bloat/conflicts; cp already uses `-n` for no-clobber.
-**Reverses if:** owner wants rsync flag compatibility aliases.
 
 ### Prescribed (executor settles inside bounds)
 
