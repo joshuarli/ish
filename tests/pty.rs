@@ -5270,4 +5270,53 @@ fn delegated_ish_c_emits_no_osc133_markers() {
     let mut combined = output.stdout;
     combined.extend_from_slice(&output.stderr);
     assert!(!combined.windows(b"\x1b]133;".len()).any(|w| w == b"\x1b]133;"), "delegated ish -c must not emit OSC 133: {:?}", String::from_utf8_lossy(&combined));
+    assert!(!combined.windows(b"\x1b]7;".len()).any(|w| w == b"\x1b]7;"), "delegated ish -c must not emit OSC 7: {:?}", String::from_utf8_lossy(&combined));
+}
+
+#[test]
+fn osc7_working_directory_emitted_to_interactive_terminal() {
+    let sh = PtyShell::spawn();
+    let _ = sh.run_command("true");
+    let raw = sh.raw_output_bytes();
+    assert!(raw.windows(b"\x1b]7;file://".len()).any(|w| w == b"\x1b]7;file://"), "missing OSC 7 in {:?}", String::from_utf8_lossy(&raw));
+}
+
+#[test]
+fn resize_storm_keeps_shell_responsive() {
+    let sh = PtyShell::spawn_with_osc133();
+    for (rows, cols) in [(24u16, 80u16), (30, 100), (20, 60), (40, 120), (24, 80), (10, 40), (24, 80)] {
+        sh.resize(rows, cols);
+        sh.wait_for_quiescence(100);
+    }
+    let out = sh.run_command("echo storm-ok");
+    assert!(clean(&out).contains("storm-ok"), "{out:?}");
+    let raw = sh.raw_output_bytes();
+    let d_count = osc133_positions(&raw, b"\x1b]133;D;0\x07").len();
+    assert!(d_count >= 1, "resize storm must not break command lifecycle: {:?}", String::from_utf8_lossy(&raw));
+}
+
+#[test]
+fn repeated_stop_resume_preserves_command_boundaries() {
+    let home = PtyShell::build_home(&[], &[], |home| {
+        for name in ["s1.sh", "s2.sh"] {
+            let path = home.join(name);
+            std::fs::write(&path, READY_SLEEP_SCRIPT).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    });
+    let sh = PtyShell::spawn_in_home_with_profile(home, &[("ISH_TEST_SUPPRESS_OSC133", "0")], 24, 80, None, ProtocolProfile::disabled());
+    for script in ["$HOME/s1.sh", "$HOME/s2.sh"] {
+        sh.type_str(&format!("{script}\r"));
+        sh.wait_for("pty-child-ready", 5000);
+        sh.ctrl_z();
+        sh.wait_for("stopped:", 5000);
+        sh.type_str("fg\r");
+        sh.wait_for("resuming:", 5000);
+        sh.ctrl_c();
+        let _ = sh.wait_for_prompt_after_line_advance(5000);
+    }
+    let raw = sh.raw_output_bytes();
+    assert!(osc133_positions(&raw, b"\x1b]133;D;148\x07").len() >= 2, "each stop should emit D;148: {:?}", String::from_utf8_lossy(&raw));
+    assert!(osc133_positions(&raw, b"\x1b]133;C\x07").len() >= 4, "each job and fg should emit C: {:?}", String::from_utf8_lossy(&raw));
 }

@@ -116,11 +116,11 @@ license choice reserved for the owner.
 
 ### ISH-80 · P1 · Establish a terminal interoperability regression matrix
 
-- **Status:** Planned; a standing acceptance requirement, not a claim that PTY tests emulate real terminals completely.
+- **Status:** In progress (2026-11-09); standing acceptance requirement, not a claim that PTY tests emulate real terminals completely.
 - **Area:** Tests / terminal correctness
-- **Where:** `tests/pty.rs`, `tests/external_signals.rs`, `tests/login_shell.rs`, `docs/ptytest.md`, `.github/workflows/ci.yml`, terminal integration documentation
-- **Recommendation:** Extend automated PTY fixtures with a reproducible native-terminal matrix covering Ghostty, at least one independent terminal emulator, SSH sessions, and tmux on supported macOS/Linux hosts. Exercise direct terminal inheritance after capture removal and OSC 133 integration. Separate deterministic CI coverage from manual/native observations, recording host, terminal/multiplexer versions, commands, and actual outcomes.
-- **Acceptance:** Cover simple commands, interactive pipeline/list members, `/dev/tty` input, fullscreen/alternate-screen programs, multiline/bracketed paste, resize storms, Ctrl+C/Ctrl+Z, repeated stop/resume, EOF/hangup, redirections, prompt markers, OSC 7/52 behavior, and delegated login-shell command mode. Add bounded stress checks for leaked descriptors/children, hung waits, lost input, or terminal modes not restored. Keep non-interactive output free of interactive markers. Unavailable native environments are explicitly unverified, not counted as passes.
+- **Where:** `tests/pty.rs`, `tests/external_signals.rs`, `tests/login_shell.rs`, `docs/ptytest.md`, [docs/terminal-interop-matrix.md](docs/terminal-interop-matrix.md), `.github/workflows/ci.yml`, terminal integration documentation
+- **Delivered so far:** Added [docs/terminal-interop-matrix.md](docs/terminal-interop-matrix.md) separating deterministic PTY coverage from native/manual observations with host/environment records. Extended automated PTY coverage for OSC 7 emission, OSC 133 lifecycle (including cancel/refusal/continuation/suspend/fg/redirection isolation), delegated `ish -c` non-emission, bounded resize storms, and bounded repeated stop/resume. Recorded Ghostty 1.4.1-main (installed), tmux 3.8 (available; automated detached capture inconclusive), SSH localhost unavailable on this host as unverified/manual follow-up.
+- **Remaining:** Isolated `/dev/tty` and fullscreen/alternate-screen PTY fixtures, explicit EOF/hangup and OSC 52 PTY assertions, broader leak/hung-wait/lost-input/terminal-restore stress checks, and reproducible native/manual evidence for Ghostty, an independent terminal, SSH sessions, and tmux (including prompt navigation/output boundaries and notification/completion behavior where supported). Unavailable native environments remain explicitly unverified, not passes.
 - **Dependencies:** Develop alongside ISH-73/74 and use it as the acceptance gate for their terminal behavior.
 - **Effort:** M
 

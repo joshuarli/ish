@@ -10,6 +10,11 @@ cursors, screens, and other shell events. Short bounded quiescence waits are
 used for terminal transitions; a few filesystem checks wait for timestamp
 boundaries when testing denv trust invalidation. Avoid arbitrary settle sleeps.
 
+Terminal integration coverage and native/manual observations are tracked in
+[terminal-interop-matrix.md](terminal-interop-matrix.md). OSC 133 marker tests
+enable markers with `ISH_TEST_SUPPRESS_OSC133=0` and use a protocol profile
+that admits OSC 133 byte-level assertions.
+
 Normal exit and Ctrl+D tests verify that the represented terminal lifecycle is
 restored to its initial state. Cleanup after a failed test only prevents a
 stray process; it is not a restoration assertion.
