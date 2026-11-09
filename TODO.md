@@ -1,5 +1,5 @@
 Prefix: ISH
-Next: 73
+Next: 83
 
 ## Accepted owner decisions
 
@@ -21,10 +21,131 @@ verification limits. Open implementation and acceptance work is listed below.
 | [ISH-42](docs/rfc/ISH-42-release-delivery.md) | Default-branch releases, verified bytes, diagnostic panic aborts | Linux implementation verified; native macOS release build and panic diagnostic passed |
 | [ISH-48](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor) | Private binary `Shell`; reusable library editor | Implemented; focused Linux editor and PTY acceptance passed |
 | [ISH-45](docs/filesystem.md#macos-staging-permissions) | Keep filesystem operations in-process; macOS masks must preserve owner read/search | Implemented with explicit rejection; ordinary-user native gates passed; privileged ownership acceptance remains |
-| [ISH-62](docs/rfc/ISH-62-capture-input-tail.md) | Keep unwritten input tail on converged capture relay; return on session end | Implemented; PTY input capture tests passed |
+| [ISH-62](docs/rfc/ISH-62-capture-input-tail.md) | Keep unwritten input tail on converged capture relay; return on session end | Implemented; PTY input capture tests passed; capture retirement planned under ISH-73 |
 | [ISH-63](docs/rfc/ISH-63-login-shell-command.md) | Login shell `-c COMMAND` delegation to `/bin/sh -c`; `--config` for file | Implemented; non-interactive invocation tests passed |
+| [ISH-73](#ish-73--p1--remove-debug-output-capture) | Remove the debugging-only `?` builtin and terminal-output capture rather than extending the capture architecture | Owner-approved 2026-11-09; not implemented; preserve job control and filesystem quarantine |
+
+## Interactive improvement campaign
+
+Owner requested these TODOs on 2026-11-09. This is a backlog, not a claim that
+any of the work below has shipped.
+
+- Do not add `denv status`, `denv diff`, or other denv introspection work. Existing denv behavior is outside this campaign.
+- Remove `?` and its terminal-output capture machinery instead of fixing or expanding split/converged capture. The proposed shell-owned previous-output browser is superseded by that removal: output navigation, search, selection, and copying belong to terminal integration (ISH-74 and ISH-80), not new shell-owned output storage.
+- Keep ish interactive-only, with no scripting expansion, general plugin/completion framework, themes, configurable prompt language, daemon, or new general-purpose TUI framework. Preserve the single suspended-job limit and epsh ownership of child waits.
+- Keep shell-owned completion, listing, and Git inspection in-process. Reuse epsh lexical/syntax information rather than introducing a second parser or an ish-owned AST. Editor inspection must not execute substitutions or commands.
+- Record before/after prompt and completion latency, allocations, release size, and relevant resource behavior on matched workloads. Reuse existing benchmarks and buffers; require measured justification for dependencies, binary growth, or hot-path regressions. Never trade away execution, byte-preservation, or filesystem durability guarantees for convenience.
+- Each implementation updates the relevant README contract and focused tests. Retain historical RFCs and qualify their status; do not erase evidence or claim model proofs establish untested terminal behavior.
+
+Suggested delivery order: remove capture (ISH-73), add terminal integration
+(ISH-74), improve completion (ISH-75), then history and editing (ISH-76/77).
+Build the interoperability matrix (ISH-80) alongside the terminal changes.
+Highlighting and picker consistency (ISH-78/79) follow the shared editor work.
+Licensing and release identity (ISH-81/82) can proceed independently, with the
+license choice reserved for the owner.
 
 ## Open implementation tickets
+
+### ISH-73 · P1 · Remove debug output capture
+
+- **Status:** Accepted owner direction; not implemented. Replaces the proposed PTY/capture repair campaign. The owner no longer needs the debugging-only `?` builtin.
+- **Area:** Simplification / terminal correctness
+- **Where:** `src/capture.rs`, `src/shell.rs`, `src/job.rs`, `src/builtin.rs`, `src/lib.rs`, relevant epsh foreground integration, `tests/pty.rs`, `README.md`, `docs/architecture.md`, capture RFCs and verification notes
+- **Recommendation:** Remove `?` from dispatch, lookup, completion, and help; remove last-output buffers and capture-only PTY allocation, relay threads, session state, descriptor substitution, input-tail plumbing, and signal/termios workarounds. Restore ordinary terminal inheritance and foreground process-group handling for simple commands, pipelines, and lists. Audit each shared helper before deletion; remove ish-only interfaces only when no remaining caller needs them. Preserve epsh's child-wait ownership and standalone API contracts.
+- **Boundaries:** This is terminal-output capture removal, not filesystem capture-and-retire removal. Do not weaken or delete `fdu-posix::quarantine`, `ish-fs` journals, protected deletion, native progress/cancellation, or parent-process callback placement. Keep the separate `copy-scrollback` feature unless an actual dependency requires a narrowly documented adjustment; do not remove shared OSC 52 helpers blindly. Do not replace `?` with a differently named capture feature or output browser.
+- **Acceptance:** No shell-owned last-command output storage or capture-only PTY/relay remains. PTY tests cover ordinary input and `/dev/tty` access, pagers/fullscreen commands in supported pipelines and lists, redirections, Ctrl+C/Ctrl+Z, repeated `fg`, resizing, EOF, terminal restoration, and type-ahead without lost or replayed input. Preserve the single suspended-job policy, whole-pipeline waits/status, and lack of leaked children/descriptors. Replace capture-specific assertions with direct-terminal regression coverage. Update user-facing docs and mark superseded capture design/verification material historical, including ISH-62, without deleting unrelated coverage.
+- **Dependencies:** Coordinate acceptance with ISH-80; complete before finalizing ISH-74 lifecycle emission.
+- **Effort:** M–L
+
+### ISH-74 · P1 · Add native terminal command integration
+
+- **Status:** Planned.
+- **Area:** Interactive UX / terminal protocol
+- **Where:** `src/shell.rs`, `src/editor.rs`, `src/prompt.rs`, `src/term.rs`, `tests/pty.rs`, `README.md`
+- **Recommendation:** Extend existing OSC 7 working-directory reporting with OSC 133 prompt, input, command-execution, and completion/status markers. Define one documented lifecycle for submitted lines, cancellation, refusal, multiline editing, suspended jobs, and `fg`. Emit markers at runtime boundaries, not on every editor repaint. Use the terminal's command navigation and output-selection/search/copy facilities instead of rebuilding the removed capture buffer. Validate Ghostty behavior first, without making it the only supported terminal.
+- **Acceptance:** Byte-level PTY assertions establish marker order, status, and absence of duplicate markers during redraws/resizes. Cancelled or refused input does not masquerade as an executed command. Markers go only to the interactive terminal, never redirected command output or delegated `ish -c` output. Unsupported terminals degrade without broken rendering or execution. Native-terminal checks verify prompt navigation and command/output boundaries, and completion/notification behavior where the terminal supports it. Document terminal-owned capabilities and limits rather than promising every terminal supports every feature.
+- **Dependencies:** ISH-73 for the final execution path; ISH-80 for native-terminal evidence.
+- **Effort:** S–M
+
+### ISH-75 · P1 · Add argument-aware in-process completion
+
+- **Status:** Planned.
+- **Area:** Completion
+- **Where:** `src/editor.rs`, `src/complete.rs`, `src/builtin.rs`, `src/path.rs`, epsh lexer/parser interfaces, `docs/completion.md`, editor/integration/PTY tests, `benches/bench.rs`
+- **Recommendation:** Complete ish builtin options and operands, common command subcommands/options, and Git branches, tags, and remotes. Start with a finite native set, using builtin metadata as the source of truth where possible. Derive the command and argument position from reusable epsh lexical/syntax information instead of expanding `shell_tokens`, `split_whitespace`, and ad hoc command-position heuristics. Add a bounded tolerant inspection API in epsh if incomplete input requires one; do not build a second parser or evaluate the line. Read Git metadata in-process with explicit worktree/common-dir, loose/packed-ref, invalidation, and resource-bound behavior.
+- **Acceptance:** Tests cover incomplete quotes, escapes, assignments, redirections, command lists/pipelines, aliases, supported wrappers, mid-line insertion, option arguments, and `--`. Suggestions preserve quoting and operand bytes, remain aligned with dispatch restrictions, and never execute substitutions. Git fixtures cover worktrees and changed refs without stale suggestions. Preserve existing path/host matching and ordering contracts unless an intentional change is documented. Benchmark cold/warm completion and large candidate sets; no subprocess-per-keystroke behavior, plugin ecosystem, or general completion configuration language.
+- **Dependencies:** Shared syntax inspection should also serve ISH-78 and syntax-aware editing in ISH-77.
+- **Effort:** M
+
+### ISH-76 · P1 · Add selective history privacy and execution metadata
+
+- **Status:** Planned; deliver privacy controls before optional ranking/UI changes.
+- **Area:** History / privacy
+- **Where:** `src/history.rs`, `src/history/store.rs`, `src/history/persistence_tests.rs`, `src/shell.rs`, `src/builtin.rs`, `src/editor.rs`, `docs/history-search.md`, history/integration/PTY tests
+- **Recommendation:** Add documented leading-space history exclusion and selective `history forget` rather than requiring `history reset`. Detect exclusion on the original submitted input before trimming, alias expansion, or implicit-cd rewriting. Ensure excluded commands are not copied into other shell-owned command logs or diagnostic dumps as a side effect. Define explicit selection/identity semantics for forgetting an entry or its occurrences, including other active shells' search and recall snapshots. Retain the compact log architecture with deletion records and compaction as needed. Add versioned exit-status/outcome metadata so history can distinguish successful, failed, refused, interrupted, and unfinished commands; a stopped job is not a completed invocation.
+- **Acceptance:** Private commands do not enter persisted history or later autosuggestions/search. Forgetting propagates without another shell resurrecting the deleted entry; migration, concurrent append/delete/reset, interrupted writes, and compaction have regression tests. Outcome updates preserve the distinction between pending/stopped and completed work, including `fg` and shell termination. Do not silently hide failed commands or change literal-first ranking. Document that exclusion/deletion is not secure disk erasure and does not stop invoked programs or the terminal from recording data.
+- **Dependencies:** Coordinate runtime outcome recording with ISH-73/74; preserve existing session-snapshot semantics except explicit deletion propagation.
+- **Effort:** M
+
+### ISH-77 · P1 · Improve line editing and autosuggestion acceptance
+
+- **Status:** Planned.
+- **Area:** Editor UX
+- **Where:** `src/line.rs`, `src/editor.rs`, `src/editor/tests.rs`, `src/input.rs`, `src/render.rs`, `tests/pty.rs`, `README.md`
+- **Recommendation:** Add a bounded undo/redo history with deliberate edit grouping, word-by-word autosuggestion acceptance at the end of input, and more useful shell-word/path movement. Preserve Right-to-accept-the-whole-suggestion and existing cursor movement inside the line. Give typing runs, paste, completion acceptance, history recall, and alias expansion predictable undo boundaries; navigation/preview alone should not flood the undo history. Choose and document bindings without stealing Ctrl+Z from foreground job control.
+- **Acceptance:** Deterministic editor tests and PTY tests cover undo/redo after paste and completion, multiline edits, cancelled pickers, suggestion acceptance one word at a time, and cursor movement around quoting and path separators. Maintain UTF-8 validity and display-width correctness, explicitly testing combining/wide-character cases and narrow/wrapped terminals. Bound retained memory and verify the warm editing path does not acquire avoidable per-keystroke allocations. Reuse shared lexical information where syntax matters rather than adding another tokenizer.
+- **Dependencies:** Undo/redo can proceed independently; share syntax-aware movement work with ISH-75/78.
+- **Effort:** M
+
+### ISH-78 · P2 · Add parser-aware highlighting and diagnostics
+
+- **Status:** Planned.
+- **Area:** Editor feedback
+- **Where:** `src/editor.rs`, `src/render.rs`, `src/dispatch.rs`, epsh lexer/parser interfaces, editor/PTY tests, `README.md`
+- **Recommendation:** Extend command-existence coloring to shell words, quotes, operators, redirections, and unsupported/invalid syntax using the shared epsh inspection path. Distinguish incomplete input that legitimately needs continuation from a definite syntax/policy error. Validate commands at each command position rather than treating the entire line as one whitespace-delimited command. Keep the visual vocabulary fixed and small; no themes or configurable highlighter language.
+- **Acceptance:** Highlighting and completion agree on spans and command positions for aliases, assignments, nested substitutions, multiline input, and supported operators. Inspection never evaluates substitutions, performs redirections, or mutates shell state; actual dispatch remains authoritative. Highlighted text cannot inject terminal controls. Snapshot/PTY coverage checks cursor geometry and Unicode/wrapping, and benchmarks quantify repaint/inspection cost.
+- **Dependencies:** Reuse the tolerant lexical/syntax work from ISH-75 and integrate with ISH-77's edit model.
+- **Effort:** M
+
+### ISH-79 · P2 · Make interactive pickers consistent
+
+- **Status:** Planned; does not include a captured-output browser.
+- **Area:** Interactive UX / focused reuse
+- **Where:** `src/editor.rs`, `src/mode.rs`, `src/render.rs`, `src/complete.rs`, history/directory-picker tests, `README.md`
+- **Recommendation:** Make Ctrl+R history search, Tab completion, and Ctrl+Backspace directory selection a coherent family: consistent acceptance/cancellation, keyboard navigation, filtering/paste behavior, empty states, and resizing. Retain useful domain differences such as completion's grid and directory selection's navigation purpose. Share small layout/input helpers only where that removes duplication; do not introduce a generic TUI framework or change `fdu`'s independent browser contract gratuitously.
+- **Acceptance:** A documented key/behavior matrix and focused tests show that cancellation restores the intended original input, previews do not execute commands, selection remains stable as results change, and resize/paste/multiline cases leave no stale rows or displaced cursor. Memory remains bounded and existing rendering caches/buffer reuse are preserved. Output search/selection stays terminal-owned under ISH-74 rather than adding a fourth picker backed by capture storage.
+- **Dependencies:** Coordinate with ISH-75/77/78; preserve intentional existing paste/cancellation contracts unless explicitly revised.
+- **Effort:** S–M
+
+### ISH-80 · P1 · Establish a terminal interoperability regression matrix
+
+- **Status:** Planned; a standing acceptance requirement, not a claim that PTY tests emulate real terminals completely.
+- **Area:** Tests / terminal correctness
+- **Where:** `tests/pty.rs`, `tests/external_signals.rs`, `tests/login_shell.rs`, `docs/ptytest.md`, `.github/workflows/ci.yml`, terminal integration documentation
+- **Recommendation:** Extend automated PTY fixtures with a reproducible native-terminal matrix covering Ghostty, at least one independent terminal emulator, SSH sessions, and tmux on supported macOS/Linux hosts. Exercise direct terminal inheritance after capture removal and OSC 133 integration. Separate deterministic CI coverage from manual/native observations, recording host, terminal/multiplexer versions, commands, and actual outcomes.
+- **Acceptance:** Cover simple commands, interactive pipeline/list members, `/dev/tty` input, fullscreen/alternate-screen programs, multiline/bracketed paste, resize storms, Ctrl+C/Ctrl+Z, repeated stop/resume, EOF/hangup, redirections, prompt markers, OSC 7/52 behavior, and delegated login-shell command mode. Add bounded stress checks for leaked descriptors/children, hung waits, lost input, or terminal modes not restored. Keep non-interactive output free of interactive markers. Unavailable native environments are explicitly unverified, not counted as passes.
+- **Dependencies:** Develop alongside ISH-73/74 and use it as the acceptance gate for their terminal behavior.
+- **Effort:** M
+
+### ISH-81 · P2 · Resolve repository-wide licensing
+
+- **Status:** Needs an explicit owner license choice before implementation; adding this TODO does not select or grant a license.
+- **Area:** Project distribution
+- **Where:** Repository root license/notice files, `README.md`, `Cargo.toml`, workspace crate manifests, imported crate license/import records
+- **Recommendation:** Inventory the top-level project's ownership and the licenses/notices of bundled or imported code. Have the owner choose the license for code they are entitled to license, then add the appropriate root license and consistent package/readme metadata. Preserve imported notices and scope exceptions explicitly; do not infer a repository-wide MIT license from individual MIT-licensed crates or silently relicense third-party code.
+- **Acceptance:** README, package metadata, root notices, and release contents clearly state the applicable license scopes and retain required attribution. Any unresolved ownership/license question remains visible rather than being guessed away.
+- **Dependencies:** Owner decision; independent of the implementation campaign.
+- **Effort:** S after owner decision
+
+### ISH-82 · P3 · Give prereleases explicit version and revision identity
+
+- **Status:** Planned; lower priority than interactive correctness and usability.
+- **Area:** Release metadata
+- **Where:** `Cargo.toml`, `src/main.rs`, `.github/workflows/release.yml`, `Makefile`, `README.md`, `docs/development.md`
+- **Recommendation:** Define a lightweight development/prerelease version policy instead of leaving user-visible builds indefinitely identified only as `0.0.0`. Align package version, `ish -V`, release tags/names, and archive names, while retaining a source revision identifier for exact bug reports. Do not imply a stable API/behavior guarantee before one is intended, or turn this into a new release-management subsystem.
+- **Acceptance:** A produced artifact can be traced unambiguously to its source revision and declared version. Local development builds and tagged prereleases report their identity consistently. Verify release metadata without weakening the existing verified-bytes, panic-diagnostic, static-Linux, or native-macOS release requirements.
+- **Dependencies:** Coordinate published license metadata with ISH-81 when that decision lands; preserve ISH-42's release contract.
+- **Effort:** S
 
 ### ISH-60 · P3 · Journaled retirement makes large flat EXDEV moves take minutes
 
