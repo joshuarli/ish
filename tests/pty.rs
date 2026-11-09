@@ -157,11 +157,12 @@ impl PtyShell {
             .env("USER", "testuser")
             .env("PWD", &cwd)
             .env("TMPDIR", &temp_path)
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("ISH_TEST_SUPPRESS_OSC133", "1");
         for (key, value) in extra_env {
             command = command.env(key, value);
         }
-        let environment = if cfg!(target_os = "linux") {
+        let mut environment = if cfg!(target_os = "linux") {
             TestEnv::hermetic_ascii()
         } else {
             TestEnv::hermetic_utf8("C.UTF-8")
@@ -171,7 +172,11 @@ impl PtyShell {
         .env("USER", "testuser")
         .env("PWD", &cwd)
         .env("TMPDIR", &temp_path)
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("ISH_TEST_SUPPRESS_OSC133", "1");
+        for (key, value) in extra_env {
+            environment = environment.env(key, value);
+        }
         let scenario = Scenario::new("ish interactive shell")
             .expect("valid scenario label")
             .command(command)
@@ -5087,4 +5092,182 @@ fn native_copy_uses_current_store_and_prefix_tmpdir_values() {
     assert_eq!(std::fs::read(sh.home_path().join("accepted-copy/file")).unwrap(), b"selected scratch");
     sh.run_command("/bin/sh -c 'printf %s \"$TMPDIR\"' >selected-tmpdir");
     assert_eq!(std::fs::read(sh.home_path().join("selected-tmpdir")).unwrap(), b"scratch");
+}
+
+impl PtyShell {
+    fn spawn_with_osc133() -> Self {
+        Self::spawn_with_osc133_profile(ProtocolProfile::disabled())
+    }
+
+    fn spawn_with_osc133_profile(profile: ProtocolProfile) -> Self {
+        let home = Self::build_home(&[], &[], |_| {});
+        Self::spawn_in_home_with_profile(
+            home,
+            &[("ISH_TEST_SUPPRESS_OSC133", "0")],
+            24,
+            80,
+            None,
+            profile,
+        )
+    }
+
+    fn raw_output_bytes(&self) -> Vec<u8> {
+        let mut terminal = self.terminal.borrow_mut();
+        let deadline = terminal.deadline(std::time::Duration::from_millis(200));
+        let _ = terminal.drain(deadline);
+        terminal.raw_output().to_vec()
+    }
+}
+
+fn osc133_positions(raw: &[u8], marker: &[u8]) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut start = 0;
+    while let Some(pos) = raw[start..].windows(marker.len()).position(|w| w == marker) {
+        positions.push(start + pos);
+        start += pos + marker.len();
+    }
+    positions
+}
+
+fn assert_osc133_order(raw: &[u8], markers: &[&[u8]]) {
+    let mut last = 0usize;
+    for marker in markers {
+        let pos = raw[last..]
+            .windows(marker.len())
+            .position(|w| w == *marker)
+            .unwrap_or_else(|| panic!("missing OSC 133 marker {:?} after offset {last} in {:?}", String::from_utf8_lossy(marker), String::from_utf8_lossy(raw)));
+        last += pos + marker.len();
+    }
+}
+
+#[test]
+fn osc133_marks_prompt_input_execution_and_completion() {
+    let sh = PtyShell::spawn_with_osc133_profile(ProtocolProfile::disabled());
+    let out = sh.run_command("true");
+    assert!(clean(&out).contains("$ "), "{out:?}");
+    let raw = sh.raw_output_bytes();
+    assert_osc133_order(&raw, &[b"\x1b]133;A\x07", b"\x1b]133;B\x07", b"\x1b]133;C\x07", b"\x1b]133;D;0\x07"]);
+    let d0 = osc133_positions(&raw, b"\x1b]133;D;0\x07");
+    assert!(!d0.is_empty(), "missing D;0 in {:?}", String::from_utf8_lossy(&raw));
+}
+
+#[test]
+fn osc133_reports_command_status() {
+    let sh = PtyShell::spawn_with_osc133_profile(ProtocolProfile::disabled());
+    sh.run_command("/bin/sh -c 'exit 7'");
+    let raw = sh.raw_output_bytes();
+    assert!(!osc133_positions(&raw, b"\x1b]133;C\x07").is_empty(), "{:?}", String::from_utf8_lossy(&raw));
+    assert!(!osc133_positions(&raw, b"\x1b]133;D;7\x07").is_empty(), "{:?}", String::from_utf8_lossy(&raw));
+}
+
+#[test]
+fn osc133_cancelled_input_has_no_execution_marker() {
+    let sh = PtyShell::spawn_with_osc133_profile(ProtocolProfile::disabled());
+    sh.type_str("echo nope");
+    sh.ctrl_c();
+    let _ = sh.read_timeout(500);
+    sh.type_str("echo after\r");
+    let _ = sh.wait_for("after", 3000);
+    let raw = sh.raw_output_bytes();
+    let d130 = osc133_positions(&raw, b"\x1b]133;D;130\x07");
+    assert!(!d130.is_empty(), "cancelled input should close prompt with D;130: {:?}", String::from_utf8_lossy(&raw));
+    assert!(!raw.windows(b"nope\r\n".len()).any(|w| w == b"nope\r\n"), "cancelled command must not execute: {:?}", String::from_utf8_lossy(&raw));
+    let c_count = osc133_positions(&raw, b"\x1b]133;C\x07").len();
+    assert_eq!(c_count, 1, "only the executed command should emit C: {:?}", String::from_utf8_lossy(&raw));
+}
+
+#[test]
+fn osc133_refused_input_has_no_execution_marker() {
+    let sh = PtyShell::spawn_with_osc133_profile(ProtocolProfile::disabled());
+    let out = sh.run_command("source /etc/profile");
+    assert!(clean(&out).contains("ish:"), "{out:?}");
+    let raw = sh.raw_output_bytes();
+    assert!(!osc133_positions(&raw, b"\x1b]133;D;2\x07").is_empty(), "refused dispatch should emit D;2: {:?}", String::from_utf8_lossy(&raw));
+    assert_eq!(osc133_positions(&raw, b"\x1b]133;C\x07").len(), 0, "refused input must not emit C: {:?}", String::from_utf8_lossy(&raw));
+}
+
+#[test]
+fn osc133_resize_does_not_duplicate_markers() {
+    let sh = PtyShell::spawn_with_osc133_profile(ProtocolProfile::disabled());
+    sh.run_command("true");
+    let before = sh.raw_output_bytes();
+    let a = osc133_positions(&before, b"\x1b]133;A\x07").len();
+    let b = osc133_positions(&before, b"\x1b]133;B\x07").len();
+    let c = osc133_positions(&before, b"\x1b]133;C\x07").len();
+    let d = osc133_positions(&before, b"\x1b]133;D;0\x07").len();
+    sh.resize(30, 100);
+    sh.run_command("true");
+    let after = sh.raw_output_bytes();
+    assert_eq!(osc133_positions(&after, b"\x1b]133;A\x07").len(), a + 1, "{:?}", String::from_utf8_lossy(&after));
+    assert_eq!(osc133_positions(&after, b"\x1b]133;B\x07").len(), b + 1, "{:?}", String::from_utf8_lossy(&after));
+    assert_eq!(osc133_positions(&after, b"\x1b]133;C\x07").len(), c + 1, "{:?}", String::from_utf8_lossy(&after));
+    assert_eq!(osc133_positions(&after, b"\x1b]133;D;0\x07").len(), d + 1, "{:?}", String::from_utf8_lossy(&after));
+}
+
+#[test]
+fn osc133_redirected_output_keeps_markers_off_command_file() {
+    let sh = PtyShell::spawn_with_osc133();
+    sh.run_command("echo hi >out.txt");
+    let raw = sh.raw_output_bytes();
+    assert!(!osc133_positions(&raw, b"\x1b]133;C\x07").is_empty(), "{:?}", String::from_utf8_lossy(&raw));
+    assert!(!osc133_positions(&raw, b"\x1b]133;D;0\x07").is_empty(), "{:?}", String::from_utf8_lossy(&raw));
+    let content = std::fs::read(sh.home_path().join("out.txt")).unwrap();
+    assert_eq!(content, b"hi\n");
+    assert!(!content.windows(b"\x1b]133;".len()).any(|w| w == b"\x1b]133;"), "markers leaked into redirected output: {:?}", String::from_utf8_lossy(&content));
+}
+
+#[test]
+fn osc133_continuation_does_not_emit_extra_execution_markers() {
+    let sh = PtyShell::spawn_with_osc133();
+    sh.type_str("true |\r");
+    let _ = sh.read_timeout(300);
+    sh.type_str("cat\r");
+    let _ = sh.wait_for_prompt_after_line_advance(3000);
+    let raw = sh.raw_output_bytes();
+    assert_eq!(osc133_positions(&raw, b"\x1b]133;C\x07").len(), 1, "continuation is one submitted command: {:?}", String::from_utf8_lossy(&raw));
+    assert!(osc133_positions(&raw, b"\x1b]133;D;0\x07").len() >= 1, "{:?}", String::from_utf8_lossy(&raw));
+}
+
+#[test]
+fn osc133_suspended_job_and_fg_emit_completion_markers() {
+    let home = PtyShell::build_home(&[], &[], |home| {
+        let path = home.join("sleeper.sh");
+        std::fs::write(&path, READY_SLEEP_SCRIPT).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    });
+    let sh = PtyShell::spawn_in_home_with_profile(
+        home,
+        &[("ISH_TEST_SUPPRESS_OSC133", "0")],
+        24,
+        80,
+        None,
+        ProtocolProfile::disabled(),
+    );
+    sh.type_str("$HOME/sleeper.sh\r");
+    sh.wait_for("pty-child-ready", 5000);
+    sh.ctrl_z();
+    sh.wait_for("stopped:", 5000);
+    let raw = sh.raw_output_bytes();
+    assert!(!osc133_positions(&raw, b"\x1b]133;C\x07").is_empty(), "{:?}", String::from_utf8_lossy(&raw));
+    assert!(!osc133_positions(&raw, b"\x1b]133;D;148\x07").is_empty(), "stopped job should emit D;148: {:?}", String::from_utf8_lossy(&raw));
+    sh.type_str("fg\r");
+    sh.wait_for("resuming:", 5000);
+    sh.ctrl_c();
+    let _ = sh.wait_for_prompt_after_line_advance(5000);
+    let raw = sh.raw_output_bytes();
+    assert!(osc133_positions(&raw, b"\x1b]133;C\x07").len() >= 2, "fg should execute as a command: {:?}", String::from_utf8_lossy(&raw));
+    assert!(osc133_positions(&raw, b"\x1b]133;D;130\x07").len() >= 1 || osc133_positions(&raw, b"\x1b]133;D;").len() >= 3, "fg completion should be marked: {:?}", String::from_utf8_lossy(&raw));
+}
+
+#[test]
+fn delegated_ish_c_emits_no_osc133_markers() {
+    let output = std::process::Command::new(ish_binary())
+        .args(["-c", "echo hi"])
+        .output()
+        .expect("run ish -c");
+    assert!(output.status.success());
+    let mut combined = output.stdout;
+    combined.extend_from_slice(&output.stderr);
+    assert!(!combined.windows(b"\x1b]133;".len()).any(|w| w == b"\x1b]133;"), "delegated ish -c must not emit OSC 133: {:?}", String::from_utf8_lossy(&combined));
 }

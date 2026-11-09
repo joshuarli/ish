@@ -57,12 +57,11 @@ license choice reserved for the owner.
 
 ### ISH-74 · P1 · Add native terminal command integration
 
-- **Status:** Planned.
+- **Status:** Implemented (2026-11-09); native-terminal matrix evidence remains under ISH-80.
 - **Area:** Interactive UX / terminal protocol
 - **Where:** `src/shell.rs`, `src/editor.rs`, `src/prompt.rs`, `src/term.rs`, `tests/pty.rs`, `README.md`
-- **Recommendation:** Extend existing OSC 7 working-directory reporting with OSC 133 prompt, input, command-execution, and completion/status markers. Define one documented lifecycle for submitted lines, cancellation, refusal, multiline editing, suspended jobs, and `fg`. Emit markers at runtime boundaries, not on every editor repaint. Use the terminal's command navigation and output-selection/search/copy facilities instead of rebuilding the removed capture buffer. Validate Ghostty behavior first, without making it the only supported terminal.
-- **Acceptance:** Byte-level PTY assertions establish marker order, status, and absence of duplicate markers during redraws/resizes. Cancelled or refused input does not masquerade as an executed command. Markers go only to the interactive terminal, never redirected command output or delegated `ish -c` output. Unsupported terminals degrade without broken rendering or execution. Native-terminal checks verify prompt navigation and command/output boundaries, and completion/notification behavior where the terminal supports it. Document terminal-owned capabilities and limits rather than promising every terminal supports every feature.
-- **Dependencies:** ISH-73 for the final execution path; ISH-80 for native-terminal evidence.
+- **Delivered:** Emits OSC 133 A/B around each interactive prompt cycle, C before command execution, and D with exit status at completion. Cancelled input closes the prompt with D and no C; dispatch refusals emit D;2 with no C. Suspended commands emit D;148 and `fg` emits its own C/D around resume. Continuations stay in the same input session. Markers are emitted at runtime boundaries (not editor repaints) to the interactive terminal; redirected command output files and delegated `ish -c` do not receive markers. README documents terminal-owned capabilities/limits. Byte-level PTY assertions cover marker order/status, cancellation/refusal, resize non-duplication, continuation, suspend/fg, redirection isolation, and delegated `ish -c`.
+- **Dependencies:** ISH-73 delivered the execution-path baseline; ISH-80 still owns native-terminal evidence (Ghostty/other terminals, SSH/tmux, completion/notification behavior where supported).
 - **Effort:** S–M
 
 ### ISH-75 · P1 · Add argument-aware in-process completion

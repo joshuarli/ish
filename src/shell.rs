@@ -181,12 +181,14 @@ pub(super) fn run(cli: crate::Args) {
                     Err(rejection) => {
                         report!("ish: {rejection}");
                         shell.last_status = 2;
+                        term::write_osc133_d(2);
                         continue;
                     }
                 };
 
                 let program = match plan {
                     dispatch::Plan::Builtin { name, args } => {
+                        term::write_osc133_c();
                         let quit = if builtin::replaces_last_output(name) {
                             let buffer = std::mem::take(&mut shell.last_output);
                             let (quit, session) = capture_output(buffer, false, || {
@@ -200,6 +202,7 @@ pub(super) fn run(cli: crate::Args) {
                         } else {
                             run_shell_builtin(name, &args, &expanded, &mut shell)
                         };
+                        term::write_osc133_d(shell.last_status);
                         if quit {
                             exit_code = shell.last_status;
                             break;
@@ -227,6 +230,7 @@ pub(super) fn run(cli: crate::Args) {
                     shell.epsh.set_foreground_ctty(true);
                 }
                 let (outcome, mut session) = capture_output(buffer, converged, || {
+                    term::write_osc133_c();
                     let outcome = shell.epsh.run_program_outcome(&program);
                     if occupied {
                         continue_occupied_foreground(&mut shell.epsh, converged, outcome)
@@ -271,6 +275,7 @@ pub(super) fn run(cli: crate::Args) {
                         give_terminal_tail(&mut shell.input_reader, tail);
                     }
                 }
+                term::write_osc133_d(shell.last_status);
 
                 shell.prompt_needs_line_start = true;
             }
@@ -695,6 +700,8 @@ fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
             return false;
         }
     }
+    shell.last_status = code;
+    term::write_osc133_d(code);
     denv::on_exit(&shell.denv);
     std::process::exit(code);
 }
@@ -835,6 +842,7 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
         }
         shell.prompt_needs_line_start = false;
     }
+    term::write_osc133_a();
     let pwd = shell.epsh.vars().get("PWD").unwrap_or("");
     let dirty = shell.epsh.vars().get("__DENV_DIRTY") == Some("1");
     shell.prompt.render_into(&mut shell.prompt_buf, shell.last_status, pwd, dirty);
@@ -842,11 +850,15 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
     let display_len = shell.prompt.display_len(&prompt);
     let context = editor_context(&shell.aliases, &shell.history, &shell.epsh, shell.home.as_deref(), &shell.home_display, &shell.dir_stack);
     shell.editor.begin(prompt, display_len, &context);
-    if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); return ReadResult::Exit; }
+    if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); term::write_osc133_d(1); return ReadResult::Exit; }
+    term::write_osc133_b();
     loop {
         let input = reader.read_event();
         let event = match &input {
-            InputEvent::Signal(signal) if *signal == rustix::process::Signal::TERM.as_raw() || *signal == rustix::process::Signal::HUP.as_raw() => return ReadResult::Terminated(*signal),
+            InputEvent::Signal(signal) if *signal == rustix::process::Signal::TERM.as_raw() || *signal == rustix::process::Signal::HUP.as_raw() => {
+                term::write_osc133_d(128 + *signal);
+                return ReadResult::Terminated(*signal);
+            }
             InputEvent::Signal(signal) if *signal == rustix::process::Signal::WINCH.as_raw() => {
                 let (rows, cols) = term::term_size(); EditorEvent::Resize { rows, cols }
             }
@@ -877,16 +889,35 @@ fn read_line_with_reader(shell: &mut Shell, reader: &mut InputReader) -> ReadRes
             EditorAction::Submit(line) => {
                 shell.editor.render_layout_dump(&mut shell.layout_dump, &context);
                 shell.prompt_buf = shell.editor.take_prompt();
-                if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); return ReadResult::Exit; }
-                return if line.is_empty() { ReadResult::Empty } else { ReadResult::Line(line) };
+                if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); term::write_osc133_d(1); return ReadResult::Exit; }
+                return if line.is_empty() {
+                    term::write_osc133_d(shell.last_status);
+                    ReadResult::Empty
+                } else {
+                    ReadResult::Line(line)
+                };
             }
             EditorAction::Cancel | EditorAction::Exit => {
                 shell.prompt_buf = shell.editor.take_prompt();
-                if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); return ReadResult::Exit; }
-                return match action { EditorAction::Exit => handle_exit(shell), _ => ReadResult::Empty };
+                if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); term::write_osc133_d(1); return ReadResult::Exit; }
+                return match action {
+                    EditorAction::Exit => {
+                        let result = handle_exit(shell);
+                        if !matches!(result, ReadResult::Empty) {
+                            term::write_osc133_d(shell.last_status);
+                        } else {
+                            term::write_osc133_d(130);
+                        }
+                        result
+                    }
+                    _ => {
+                        term::write_osc133_d(130);
+                        ReadResult::Empty
+                    }
+                };
             }
         }
-        if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); return ReadResult::Exit; }
+        if let Err(error) = flush_editor(&mut shell.editor) { report!("ish: output: {error}\n"); term::write_osc133_d(1); return ReadResult::Exit; }
     }
 }
 

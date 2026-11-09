@@ -130,6 +130,16 @@ paused the tail stays with the session and is written after `fg` resumes
 forwarding. `fg` finishes the session when the job ends. The buffer moves into the relay thread
 and back, so its allocation is reused across commands without sharing.
 
+## Terminal integration
+
+The interactive shell emits OSC 7 working-directory updates before each prompt
+and OSC 133 prompt/input/execution/completion markers at runtime boundaries.
+Markers cover prompt display, submitted input, command execution, completion or
+suspension, cancellations, dispatch refusals, multiline continuation, and `fg`.
+Editor repaints and resizes do not emit duplicate prompt or input markers.
+Markers are written to the interactive terminal stream, not to redirected command
+output files or delegated `ish -c` execution.
+
 ## Filesystem operation boundaries
 
 `src/fs_command.rs` parses ish's command options and adapts typed requests to

@@ -275,6 +275,15 @@ outlives its command loses later output once relaying stops. If the
 pseudo-terminal cannot be created, ish reports it and runs the command without
 output capture.
 
+ish emits OSC 7 working-directory updates and OSC 133 prompt, input,
+execution, and completion markers to the interactive terminal. Markers follow
+submitted lines, cancellations, refusals, multiline continuation, suspended
+jobs, and `fg` at runtime boundaries; they are not emitted on editor redraws or
+resizes and do not go to redirected command output or delegated `ish -c`
+output. Terminals may use these markers for prompt navigation, command
+boundaries, and output selection; support and behavior vary by terminal.
+Unsupported terminals should ignore unknown OSC sequences.
+
 ### Job control
 
 Ctrl+C interrupts foreground commands, including pipelines. A SIGINT sent
