@@ -350,7 +350,9 @@ discard the record and report that the variables it saved cannot be restored.
 
 ## Help and license
 
-Report issues at [GitHub Issues](https://github.com/joshuarli/ish/issues). This
-repository does not specify a general license. The `ish-fs` crate is MIT
-licensed; see [its license](crates/ish-fs/LICENSE) and
-[import note](crates/ish-fs/IMPORT.md).
+Report issues at [GitHub Issues](https://github.com/joshuarli/ish/issues). The
+top-level `ish` project is MIT licensed; see [LICENSE](LICENSE). Bundled and
+imported crates and test fixtures may carry their own licenses and notices; for
+example, `ish-fs` is MIT licensed with an
+[import note](crates/ish-fs/IMPORT.md), and `epsh` retains
+[conformance notices](crates/epsh/tests/conformance/NOTICE).

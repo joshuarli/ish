@@ -28,21 +28,19 @@ verification limits. Open implementation and acceptance work is listed below.
 ## Interactive improvement campaign
 
 Owner requested these TODOs on 2026-11-09. This is a backlog, not a claim that
-any of the work below has shipped.
+all of the work below has shipped.
 
 - Do not add `denv status`, `denv diff`, or other denv introspection work. Existing denv behavior is outside this campaign.
-- Remove `?` and its terminal-output capture machinery instead of fixing or expanding split/converged capture. The proposed shell-owned previous-output browser is superseded by that removal: output navigation, search, selection, and copying belong to terminal integration (ISH-74 and ISH-80), not new shell-owned output storage.
+- `?` and its terminal-output capture command were removed under ISH-73. Output navigation, search, selection, and copying belong to terminal integration (ISH-74 and ISH-80), not new shell-owned output storage.
 - Keep ish interactive-only, with no scripting expansion, general plugin/completion framework, themes, configurable prompt language, daemon, or new general-purpose TUI framework. Preserve the single suspended-job limit and epsh ownership of child waits.
 - Keep shell-owned completion, listing, and Git inspection in-process. Reuse epsh lexical/syntax information rather than introducing a second parser or an ish-owned AST. Editor inspection must not execute substitutions or commands.
 - Record before/after prompt and completion latency, allocations, release size, and relevant resource behavior on matched workloads. Reuse existing benchmarks and buffers; require measured justification for dependencies, binary growth, or hot-path regressions. Never trade away execution, byte-preservation, or filesystem durability guarantees for convenience.
 - Each implementation updates the relevant README contract and focused tests. Retain historical RFCs and qualify their status; do not erase evidence or claim model proofs establish untested terminal behavior.
 
-Suggested delivery order: remove capture (ISH-73), add terminal integration
-(ISH-74), improve completion (ISH-75), then history and editing (ISH-76/77).
-Build the interoperability matrix (ISH-80) alongside the terminal changes.
-Highlighting and picker consistency (ISH-78/79) follow the shared editor work.
-Licensing and release identity (ISH-81/82) can proceed independently, with the
-license choice reserved for the owner.
+Suggested delivery order: complete terminal interop gaps (ISH-80 actionable
+parts), improve completion (ISH-75), then editing (ISH-77). Highlighting and
+picker consistency (ISH-78/79) and prerelease identity (ISH-82) are lower
+priority.
 
 ## Open implementation tickets
 
@@ -64,6 +62,16 @@ license choice reserved for the owner.
 - **Dependencies:** ISH-73 delivered the execution-path baseline; ISH-80 still owns native-terminal evidence (Ghostty/other terminals, SSH/tmux, completion/notification behavior where supported).
 - **Effort:** S–M
 
+### ISH-80 · P1 · Establish a terminal interoperability regression matrix
+
+- **Status:** Deterministic PTY gaps addressed (2026-11-09); native/manual matrix remains a standing follow-up.
+- **Area:** Tests / terminal correctness
+- **Where:** `tests/pty.rs`, `tests/external_signals.rs`, `tests/login_shell.rs`, `docs/ptytest.md`, [docs/terminal-interop-matrix.md](docs/terminal-interop-matrix.md), `.github/workflows/ci.yml`, terminal integration documentation
+- **Delivered:** [docs/terminal-interop-matrix.md](docs/terminal-interop-matrix.md) separates deterministic PTY coverage from native/manual observations. Automated PTY coverage includes OSC 7, OSC 133 lifecycle (order/status, cancel/refusal, continuation, suspend/fg, redirection isolation), delegated `ish -c` non-emission, bounded resize storms, bounded repeated stop/resume, single-command `/dev/tty` input (`converged_command_reads_from_dev_tty`), alt-screen sequence relay passthrough with shell responsiveness (`alternate_screen_sequences_pass_through_relay`), raw OSC 52 clipboard emission for `copy-scrollback` (`osc52_copy_scrollback_emits_base64_session_log`), and SIGHUP-at-prompt exit/restore (`shell_sighup_at_prompt_exits_and_restores_terminal`).
+- **Remaining:** Reproducible native/manual evidence for Ghostty, an independent terminal, SSH sessions, and tmux (prompt navigation/output boundaries, notification/completion behavior where supported), plus focused instrumentation/native runs for leaked descriptors/children, hung waits, lost input, terminal-mode restoration across native environments, and external child hangup/EOF edge cases. Unavailable native environments remain explicitly unverified, not passes.
+- **Dependencies:** Acceptance gate for ISH-73/74 terminal behavior; retain as standing evidence, not a claim that PTY emulates real terminals completely.
+- **Effort:** M
+
 ### ISH-75 · P1 · Add argument-aware in-process completion
 
 - **Status:** Planned.
@@ -72,16 +80,6 @@ license choice reserved for the owner.
 - **Recommendation:** Complete ish builtin options and operands, common command subcommands/options, and Git branches, tags, and remotes. Start with a finite native set, using builtin metadata as the source of truth where possible. Derive the command and argument position from reusable epsh lexical/syntax information instead of expanding `shell_tokens`, `split_whitespace`, and ad hoc command-position heuristics. Add a bounded tolerant inspection API in epsh if incomplete input requires one; do not build a second parser or evaluate the line. Read Git metadata in-process with explicit worktree/common-dir, loose/packed-ref, invalidation, and resource-bound behavior.
 - **Acceptance:** Tests cover incomplete quotes, escapes, assignments, redirections, command lists/pipelines, aliases, supported wrappers, mid-line insertion, option arguments, and `--`. Suggestions preserve quoting and operand bytes, remain aligned with dispatch restrictions, and never execute substitutions. Git fixtures cover worktrees and changed refs without stale suggestions. Preserve existing path/host matching and ordering contracts unless an intentional change is documented. Benchmark cold/warm completion and large candidate sets; no subprocess-per-keystroke behavior, plugin ecosystem, or general completion configuration language.
 - **Dependencies:** Shared syntax inspection should also serve ISH-78 and syntax-aware editing in ISH-77.
-- **Effort:** M
-
-### ISH-76 · P1 · Add selective history privacy and execution metadata
-
-- **Status:** Planned; deliver privacy controls before optional ranking/UI changes.
-- **Area:** History / privacy
-- **Where:** `src/history.rs`, `src/history/store.rs`, `src/history/persistence_tests.rs`, `src/shell.rs`, `src/builtin.rs`, `src/editor.rs`, `docs/history-search.md`, history/integration/PTY tests
-- **Recommendation:** Add documented leading-space history exclusion and selective `history forget` rather than requiring `history reset`. Detect exclusion on the original submitted input before trimming, alias expansion, or implicit-cd rewriting. Ensure excluded commands are not copied into other shell-owned command logs or diagnostic dumps as a side effect. Define explicit selection/identity semantics for forgetting an entry or its occurrences, including other active shells' search and recall snapshots. Retain the compact log architecture with deletion records and compaction as needed. Add versioned exit-status/outcome metadata so history can distinguish successful, failed, refused, interrupted, and unfinished commands; a stopped job is not a completed invocation.
-- **Acceptance:** Private commands do not enter persisted history or later autosuggestions/search. Forgetting propagates without another shell resurrecting the deleted entry; migration, concurrent append/delete/reset, interrupted writes, and compaction have regression tests. Outcome updates preserve the distinction between pending/stopped and completed work, including `fg` and shell termination. Do not silently hide failed commands or change literal-first ranking. Document that exclusion/deletion is not secure disk erasure and does not stop invoked programs or the terminal from recording data.
-- **Dependencies:** Coordinate runtime outcome recording with ISH-73/74; preserve existing session-snapshot semantics except explicit deletion propagation.
 - **Effort:** M
 
 ### ISH-77 · P1 · Improve line editing and autosuggestion acceptance
@@ -94,9 +92,9 @@ license choice reserved for the owner.
 - **Dependencies:** Undo/redo can proceed independently; share syntax-aware movement work with ISH-75/78.
 - **Effort:** M
 
-### ISH-78 · P2 · Add parser-aware highlighting and diagnostics
+### ISH-78 · P3 · Add parser-aware highlighting and diagnostics
 
-- **Status:** Planned.
+- **Status:** Planned (lower priority).
 - **Area:** Editor feedback
 - **Where:** `src/editor.rs`, `src/render.rs`, `src/dispatch.rs`, epsh lexer/parser interfaces, editor/PTY tests, `README.md`
 - **Recommendation:** Extend command-existence coloring to shell words, quotes, operators, redirections, and unsupported/invalid syntax using the shared epsh inspection path. Distinguish incomplete input that legitimately needs continuation from a definite syntax/policy error. Validate commands at each command position rather than treating the entire line as one whitespace-delimited command. Keep the visual vocabulary fixed and small; no themes or configurable highlighter language.
@@ -104,9 +102,9 @@ license choice reserved for the owner.
 - **Dependencies:** Reuse the tolerant lexical/syntax work from ISH-75 and integrate with ISH-77's edit model.
 - **Effort:** M
 
-### ISH-79 · P2 · Make interactive pickers consistent
+### ISH-79 · P3 · Make interactive pickers consistent
 
-- **Status:** Planned; does not include a captured-output browser.
+- **Status:** Planned (lower priority); does not include a captured-output browser.
 - **Area:** Interactive UX / focused reuse
 - **Where:** `src/editor.rs`, `src/mode.rs`, `src/render.rs`, `src/complete.rs`, history/directory-picker tests, `README.md`
 - **Recommendation:** Make Ctrl+R history search, Tab completion, and Ctrl+Backspace directory selection a coherent family: consistent acceptance/cancellation, keyboard navigation, filtering/paste behavior, empty states, and resizing. Retain useful domain differences such as completion's grid and directory selection's navigation purpose. Share small layout/input helpers only where that removes duplication; do not introduce a generic TUI framework or change `fdu`'s independent browser contract gratuitously.
@@ -114,45 +112,15 @@ license choice reserved for the owner.
 - **Dependencies:** Coordinate with ISH-75/77/78; preserve intentional existing paste/cancellation contracts unless explicitly revised.
 - **Effort:** S–M
 
-### ISH-80 · P1 · Establish a terminal interoperability regression matrix
-
-- **Status:** In progress (2026-11-09); standing acceptance requirement, not a claim that PTY tests emulate real terminals completely.
-- **Area:** Tests / terminal correctness
-- **Where:** `tests/pty.rs`, `tests/external_signals.rs`, `tests/login_shell.rs`, `docs/ptytest.md`, [docs/terminal-interop-matrix.md](docs/terminal-interop-matrix.md), `.github/workflows/ci.yml`, terminal integration documentation
-- **Delivered so far:** Added [docs/terminal-interop-matrix.md](docs/terminal-interop-matrix.md) separating deterministic PTY coverage from native/manual observations with host/environment records. Extended automated PTY coverage for OSC 7 emission, OSC 133 lifecycle (including cancel/refusal/continuation/suspend/fg/redirection isolation), delegated `ish -c` non-emission, bounded resize storms, and bounded repeated stop/resume. Recorded Ghostty 1.4.1-main (installed), tmux 3.8 (available; automated detached capture inconclusive), SSH localhost unavailable on this host as unverified/manual follow-up.
-- **Remaining:** Isolated `/dev/tty` and fullscreen/alternate-screen PTY fixtures, explicit EOF/hangup and OSC 52 PTY assertions, broader leak/hung-wait/lost-input/terminal-restore stress checks, and reproducible native/manual evidence for Ghostty, an independent terminal, SSH sessions, and tmux (including prompt navigation/output boundaries and notification/completion behavior where supported). Unavailable native environments remain explicitly unverified, not passes.
-- **Dependencies:** Develop alongside ISH-73/74 and use it as the acceptance gate for their terminal behavior.
-- **Effort:** M
-
-### ISH-81 · P2 · Resolve repository-wide licensing
-
-- **Status:** Needs an explicit owner license choice before implementation; adding this TODO does not select or grant a license.
-- **Area:** Project distribution
-- **Where:** Repository root license/notice files, `README.md`, `Cargo.toml`, workspace crate manifests, imported crate license/import records
-- **Recommendation:** Inventory the top-level project's ownership and the licenses/notices of bundled or imported code. Have the owner choose the license for code they are entitled to license, then add the appropriate root license and consistent package/readme metadata. Preserve imported notices and scope exceptions explicitly; do not infer a repository-wide MIT license from individual MIT-licensed crates or silently relicense third-party code.
-- **Acceptance:** README, package metadata, root notices, and release contents clearly state the applicable license scopes and retain required attribution. Any unresolved ownership/license question remains visible rather than being guessed away.
-- **Dependencies:** Owner decision; independent of the implementation campaign.
-- **Effort:** S after owner decision
-
 ### ISH-82 · P3 · Give prereleases explicit version and revision identity
 
-- **Status:** Planned; lower priority than interactive correctness and usability.
+- **Status:** Planned (lower priority).
 - **Area:** Release metadata
 - **Where:** `Cargo.toml`, `src/main.rs`, `.github/workflows/release.yml`, `Makefile`, `README.md`, `docs/development.md`
 - **Recommendation:** Define a lightweight development/prerelease version policy instead of leaving user-visible builds indefinitely identified only as `0.0.0`. Align package version, `ish -V`, release tags/names, and archive names, while retaining a source revision identifier for exact bug reports. Do not imply a stable API/behavior guarantee before one is intended, or turn this into a new release-management subsystem.
 - **Acceptance:** A produced artifact can be traced unambiguously to its source revision and declared version. Local development builds and tagged prereleases report their identity consistently. Verify release metadata without weakening the existing verified-bytes, panic-diagnostic, static-Linux, or native-macOS release requirements.
-- **Dependencies:** Coordinate published license metadata with ISH-81 when that decision lands; preserve ISH-42's release contract.
+- **Dependencies:** Coordinate published license metadata with the root MIT license; preserve ISH-42's release contract.
 - **Effort:** S
-
-### ISH-60 · P3 · Journaled retirement makes large flat EXDEV moves take minutes
-
-- **Status:** Candidate parked at `e2f0f08` on `backlog-retirement-2026-10-23`; it is not integrated. Focused correctness, mount fixtures, and complete baseline/candidate 4k and 16k output verification passed. Timing proof is deferred because unrelated host builds overlapped samples.
-- **Area:** Performance
-- **Where:** `crates/ish-fs/src/engine/retirement.rs`, `crates/fdu-posix/src/quarantine.rs`, `benches/fs/results-linux.md`
-- **Problem:** On Linux x86_64 ext4-to-tmpfs, the 16,384-file, 64 MiB EXDEV engine sample at source revision `0494a1e8c457ee69a2281a9f2fbb02e85036d4e6` took 300.993 seconds wall and 199.162 seconds CPU; source retirement accounted for 264.073 seconds. Five 4,096-file samples had a 43.331 second median wall time and 13.009 second median CPU, with wide wall-time spread. ARM64 Linux syscall profiles now identify repeated destination-root recovery scans. The parked candidate holds recovery ownership for flat destination roots, preserves namespace rechecks and per-entry synchronization, and passes focused tests; source-root scans remain. No valid timing comparison establishes its benefit. Its profiles, resource observations, and discarded timing attempts are recorded in `benches/fs/results-linux.md` on the parked branch.
-- **Recommendation:** On a quiet host, collect five interleaved baseline/candidate 4,096-file samples with the same durable journal guarantees, readiness checks before and immediately after each sample, and full output/source-retirement verification. Reuse the retained correctness and resource evidence where applicable, and qualify the 1k and 16k observations separately. Integrate the candidate only if its measured benefit exceeds observed spread without weakening intent durability, source-version validation, recovery behavior, or destination receipts. Current result: `perf gate deferred: host busy`.
-- **Fix with:** make-it-fast
-- **Effort:** L (weeks)
 
 ### ISH-45 · P3 · Native macOS privileged ownership acceptance remains incomplete
 
@@ -163,3 +131,20 @@ license choice reserved for the owner.
 - **Recommendation:** Run the two clone-decline cases as root and the ignored foreign-owned staging case using the commands in the filesystem testing guide. Close this ticket only after those native branches pass. The implementation and support-boundary decisions are settled.
 - **Fix with:** none
 - **Effort:** S (hours)
+
+## Won't do
+
+### ISH-76 · Selective history privacy and execution metadata
+
+- **Status:** Won't do.
+- **Reason:** History is a plain file under the user's control (`~/.local/share/ish/history.log`); sensitive entries can be removed by editing the history file. The added complexity of leading-space exclusion, cross-shell deletion propagation, compaction/delete records, and versioned execution metadata is not justified here.
+
+### ISH-60 · Journaled retirement makes large flat EXDEV moves take minutes
+
+- **Status:** Dropped.
+- **Reason:** Parked candidate exists but timing proof requires quiet-host, interleaved baseline/candidate measurement (weeks-scale effort). Not worth pursuing now.
+
+### ISH-81 · Resolve repository-wide licensing
+
+- **Status:** Done (2026-11-09).
+- **Resolution:** Added root [LICENSE](LICENSE) (MIT) for the top-level `ish` project, set `license = "MIT"` in [Cargo.toml](Cargo.toml), and updated [README.md](README.md#help-and-license). Existing bundled/imported crate and fixture license/notice files are retained (for example `ish-fs` LICENSE/IMPORT.md, `epsh` conformance NOTICE, fdu crate licenses).

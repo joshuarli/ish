@@ -9,17 +9,17 @@ Host recorded: macOS 27.2 (`Darwin ... arm64`), `xterm-256color` session, tmux 3
 | Area | Coverage | Evidence |
 |---|---|---|
 | Simple commands | covered | existing PTY tests; `echo_command`, `osc133_marks_prompt_input_execution_and_completion` |
-| Interactive pipeline/list members | partial | existing PTY/native-fs/list/pipeline refusal coverage; direct `/dev/tty` input case not yet isolated |
-| `/dev/tty` input (converged terminal) | unverified by isolated test | architecture claims converged child `/dev/tty` resolves to slave; add focused PTY/native evidence in follow-up |
-| Fullscreen/alternate-screen programs | unverified | requires representative program fixture and screen-state assertions |
+| Interactive pipeline/list members | partial | existing PTY/native-fs/list/pipeline refusal coverage; pipeline/list `/dev/tty` behavior remains outside the single-command converged form |
+| `/dev/tty` input (converged terminal) | covered (single command) | `converged_command_reads_from_dev_tty` reads input from `/dev/tty` through the converged slave |
+| Fullscreen/alternate-screen programs | covered (relay/pass-through, bounded) | `alternate_screen_sequences_pass_through_relay` verifies alt-screen control sequences transit the relay and the shell remains responsive; full emulator screen-state behavior remains native/manual |
 | Multiline/bracketed paste | covered | `multiline_continuation`, `bracketed_paste_*`, `osc133_continuation_does_not_emit_extra_execution_markers` |
 | Resize storms | covered (bounded) | `resize_storm_keeps_shell_responsive` |
 | Ctrl+C/Ctrl+Z | covered | existing PTY tests; `ctrl_c_cancels_input`, suspend/fg tests, OSC 133 cancel/stop tests |
 | Repeated stop/resume | covered (bounded) | `repeated_stop_resume_preserves_command_boundaries` |
-| EOF/hangup | partial | Ctrl+D/exit covered; explicit external hangup/SIGHUP matrix not fully isolated |
+| EOF/hangup | partial | Ctrl+D/exit covered; `shell_sighup_at_prompt_exits_and_restores_terminal` and native-fs SIGTERM/SIGHUP cases cover explicit shell signal handling; external child hangup/EOF edge cases and native SIGHUP/terminal-loss behavior remain partially unverified |
 | Redirections | covered | existing PTY tests; `osc133_redirected_output_keeps_markers_off_command_file` |
 | Prompt markers (OSC 133) | covered | `osc133_*` tests: order/status, cancel/refusal, resize/continuation, suspend/fg |
-| OSC 7/52 behavior | partial | `osc7_working_directory_emitted_to_interactive_terminal`; OSC 52 not asserted in PTY (profile/harness constraints) |
+| OSC 7/52 behavior | covered (bounded) | `osc7_working_directory_emitted_to_interactive_terminal`; `osc52_copy_scrollback_emits_base64_session_log` asserts raw OSC 52 clipboard output with the session-log payload |
 | Delegated login-shell command mode | covered | `login_shell` tests; `delegated_ish_c_emits_no_osc133_markers` |
 
 ## Native/manual observations
@@ -35,4 +35,4 @@ Host recorded: macOS 27.2 (`Darwin ... arm64`), `xterm-256color` session, tmux 3
 
 ## Stress/boundary checks
 
-Bounded automated checks added: resize storm responsiveness and repeated stop/resume command boundaries. Remaining stress checks (leaked descriptors/children, hung waits, lost input, terminal modes not restored across native environments) need focused instrumentation and native runs; record outcomes explicitly, never as implicit passes.
+Bounded automated checks added: resize storm responsiveness, repeated stop/resume command boundaries, `/dev/tty` single-command input, alt-screen relay passthrough responsiveness, OSC 52 raw emission, and SIGHUP-at-prompt exit/restore. Remaining stress checks (leaked descriptors/children, hung waits, lost input, terminal modes not restored across native environments, and external child hangup/EOF edge cases) need focused instrumentation and native runs; record outcomes explicitly, never as implicit passes.

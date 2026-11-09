@@ -5320,3 +5320,53 @@ fn repeated_stop_resume_preserves_command_boundaries() {
     assert!(osc133_positions(&raw, b"\x1b]133;D;148\x07").len() >= 2, "each stop should emit D;148: {:?}", String::from_utf8_lossy(&raw));
     assert!(osc133_positions(&raw, b"\x1b]133;C\x07").len() >= 4, "each job and fg should emit C: {:?}", String::from_utf8_lossy(&raw));
 }
+
+#[test]
+fn converged_command_reads_from_dev_tty() {
+    let sh = PtyShell::spawn();
+    sh.type_str("/bin/sh -c 'IFS= read -r x </dev/tty; printf TTY:%s \"$x\"'");
+    sh.enter();
+    sh.wait_for_line_advance(1000);
+    sh.send(b"value\r");
+    let out = sh.wait_for_prompt_after_line_advance(5000);
+    assert!(clean(&out).contains("TTY:value"), "{out:?}");
+}
+
+#[test]
+fn alternate_screen_sequences_pass_through_relay() {
+    let sh = PtyShell::spawn();
+    sh.run_command("/usr/bin/printf '\\033[?1049hALT\\033[?1049l'");
+    let raw = sh.raw_output_bytes();
+    assert!(raw.windows(b"\x1b[?1049h".len()).any(|w| w == b"\x1b[?1049h"), "{:?}", String::from_utf8_lossy(&raw));
+    assert!(raw.windows(b"\x1b[?1049l".len()).any(|w| w == b"\x1b[?1049l"), "{:?}", String::from_utf8_lossy(&raw));
+    let out = sh.run_command("echo restored");
+    assert!(clean(&out).contains("restored"), "{out:?}");
+}
+
+#[test]
+fn osc52_copy_scrollback_emits_base64_session_log() {
+    let sh = PtyShell::spawn_with_osc133_profile(ProtocolProfile::disabled());
+    sh.run_command("echo seed");
+    sh.run_command("copy-scrollback");
+    let raw = sh.raw_output_bytes();
+    let marker = b"\x1b]52;c;";
+    let pos = raw.windows(marker.len()).position(|w| w == marker)
+        .unwrap_or_else(|| panic!("missing OSC 52 marker in {:?}", String::from_utf8_lossy(&raw)));
+    let rest = &raw[pos + marker.len()..];
+    let end = rest.iter().position(|b| *b == 0x07)
+        .unwrap_or_else(|| panic!("missing OSC 52 terminator in {:?}", String::from_utf8_lossy(rest)));
+    let payload = &rest[..end];
+    let expected = ish::diagnostics::base64_encode(b"echo seed\ncopy-scrollback\n");
+    assert_eq!(payload, expected.as_bytes(), "payload {:?} expected {:?}", String::from_utf8_lossy(payload), expected);
+}
+
+#[test]
+fn shell_sighup_at_prompt_exits_and_restores_terminal() {
+    let sh = PtyShell::spawn();
+    sh.run_command("true");
+    let mut terminal = sh.terminal.borrow_mut();
+    terminal.signal(libc::SIGHUP).unwrap();
+    let deadline = terminal.deadline(std::time::Duration::from_secs(5));
+    assert_eq!(terminal.wait_for_exit(deadline).expect("shell exits on SIGHUP"), ExitStatus::Code(129));
+    terminal.assert_terminal_restored(&sh.terminal_baseline).expect("SIGHUP restores terminal");
+}
