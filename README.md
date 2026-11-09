@@ -62,6 +62,7 @@ Control characters in the user, host, directory, and branch appear as `�`.
 | Alt+D | Delete the next word |
 | Ctrl+U / Ctrl+K | Delete to the start / end of the line |
 | Ctrl+Y | Restore the last killed text |
+| Ctrl+_ / Alt+R | Undo / redo line edits |
 | Ctrl+Backspace | Pick a recent directory |
 | Left / Right | Move by character; Ctrl+Left / Ctrl+Right move by word |
 | Ctrl+Right (end of input) | Accept the next word of the history autosuggestion; Right accepts the whole suggestion |

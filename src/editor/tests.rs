@@ -66,6 +66,28 @@ fn right_accepts_whole_suggestion_and_ctrl_right_accepts_next_word() {
 }
 
 #[test]
+fn undo_redo_restore_edits_and_paste() {
+    let aliases = AliasMap::new();
+    let history = history::History::from_entries(Vec::new());
+    let ctx = context(&aliases, &history, &[]);
+    let mut editor = Editor::new(24, 80);
+    editor.begin("$ ".into(), 2, &ctx);
+    for c in "echo hi".chars() {
+        event(&mut editor, &ctx, EditorEvent::Key(KeyEvent::char(c)));
+    }
+    assert_eq!(editor.view.line.text(), "echo hi");
+    event(&mut editor, &ctx, EditorEvent::Key(KeyEvent::ctrl('_')));
+    assert_eq!(editor.view.line.text(), "");
+    event(&mut editor, &ctx, EditorEvent::Key(KeyEvent::alt('r')));
+    assert_eq!(editor.view.line.text(), "echo hi");
+
+    event(&mut editor, &ctx, EditorEvent::Paste(" there"));
+    assert_eq!(editor.view.line.text(), "echo hi there");
+    event(&mut editor, &ctx, EditorEvent::Key(KeyEvent::ctrl('_')));
+    assert_eq!(editor.view.line.text(), "echo hi");
+}
+
+#[test]
 fn completion_cancel_restores_prefix_and_accept_uses_selected_text_after_resize() {
     let mut aliases = AliasMap::new();
     aliases.set("zzfirst".into(), vec!["true".into()]);

@@ -61,7 +61,7 @@ impl Editor {
     /// Allocate reusable editor buffers for measured terminal dimensions.
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
-            view: EditView { tw: TermWriter::new(), line: LineBuffer::new(), history_idx: None, saved_line: String::new(), grid_column: None, prompt_str: String::new(), prompt_display_len: 0, region: render::RenderedRegion::default(), history_cache: render::HistoryPagerCache::default() },
+            view: EditView { tw: TermWriter::new(), line: LineBuffer::new(), history_idx: None, saved_line: String::new(), grid_column: None, prompt_str: String::new(), prompt_display_len: 0, region: render::RenderedRegion::default(), history_cache: render::HistoryPagerCache::default(), undo: UndoState::new() },
             mode: Mode::Normal,
             state: EditorState { rows, cols, completion_buffer: complete::Completions::with_capacity(2048, 64), history_match_buffer: Vec::with_capacity(200), path_cache: path::PathCache::new() },
         }
@@ -76,6 +76,7 @@ impl Editor {
         self.view.prompt_display_len = display_len;
         self.view.region = render::RenderedRegion::default();
         self.view.history_cache.clear();
+        self.view.undo.clear();
         self.mode = Mode::Normal;
         repaint(&mut self.view, &self.mode, &mut self.state.editing(context));
     }
@@ -135,7 +136,7 @@ impl Editor {
                 let next = match &mut self.mode {
                     Mode::Normal => {
                         let view = &mut self.view;
-                        match handle_normal_key(key, &mut view.line, &mut view.history_idx, &mut view.saved_line, &mut view.grid_column, view.prompt_display_len, &editing) {
+                        match handle_normal_key(key, &mut view.line, &mut view.history_idx, &mut view.saved_line, &mut view.grid_column, view.prompt_display_len, &editing, &mut view.undo) {
                             KeyAction::Continue => {}
                             KeyAction::Execute(text) => { if view.line.cursor() == view.line.text().len() { view.tw.write_str("\x1b[J"); } view.tw.write_str("\r\n"); return EditorAction::Submit(text); }
                             KeyAction::Continuation => { view.line.insert_char('\n'); view.history_idx = None; }
@@ -180,6 +181,94 @@ struct EditView {
     prompt_display_len: usize,
     region: render::RenderedRegion,
     history_cache: render::HistoryPagerCache,
+    undo: UndoState,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct UndoEntry {
+    text: String,
+    cursor: usize,
+}
+
+impl UndoEntry {
+    fn from_line(line: &LineBuffer) -> Self {
+        Self { text: line.text().to_string(), cursor: line.cursor() }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditGroup {
+    Typing,
+    Other,
+}
+
+struct UndoState {
+    undo: Vec<UndoEntry>,
+    redo: Vec<UndoEntry>,
+    group: Option<EditGroup>,
+}
+
+impl UndoState {
+    fn new() -> Self {
+        Self { undo: Vec::new(), redo: Vec::new(), group: None }
+    }
+
+    fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.group = None;
+    }
+
+    fn break_group(&mut self) {
+        self.group = None;
+    }
+
+    fn before_edit(&mut self, line: &LineBuffer, group: EditGroup) {
+        if self.group == Some(group) && group == EditGroup::Typing {
+            return;
+        }
+        let entry = UndoEntry::from_line(line);
+        if self.undo.last() != Some(&entry) {
+            self.undo.push(entry);
+            if self.undo.len() > 256 {
+                self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+        self.group = Some(group);
+    }
+
+    fn undo(&mut self, line: &mut LineBuffer) -> bool {
+        let Some(entry) = self.undo.pop() else {
+            return false;
+        };
+        let current = UndoEntry::from_line(line);
+        if self.redo.last() != Some(&current) {
+            self.redo.push(current);
+            if self.redo.len() > 256 {
+                self.redo.remove(0);
+            }
+        }
+        line.set_with_cursor(&entry.text, entry.cursor);
+        self.group = None;
+        true
+    }
+
+    fn redo(&mut self, line: &mut LineBuffer) -> bool {
+        let Some(entry) = self.redo.pop() else {
+            return false;
+        };
+        let current = UndoEntry::from_line(line);
+        if self.undo.last() != Some(&current) {
+            self.undo.push(current);
+            if self.undo.len() > 256 {
+                self.undo.remove(0);
+            }
+        }
+        line.set_with_cursor(&entry.text, entry.cursor);
+        self.group = None;
+        true
+    }
 }
 
 enum Next {
@@ -248,7 +337,9 @@ fn handle_paste(view: &mut EditView, mode: &mut Mode, shell: &mut Editing<'_>, t
             shell,
         );
     } else {
+        view.undo.before_edit(&view.line, EditGroup::Other);
         view.line.insert_str(text);
+        view.history_idx = None;
     }
     repaint(view, mode, shell);
 }
@@ -666,71 +757,82 @@ fn handle_normal_key(
     grid_column: &mut Option<usize>,
     prompt_display_len: usize,
     shell: &Editing<'_>,
+    undo: &mut UndoState,
 ) -> KeyAction {
     if !matches!(key.key, Key::Up | Key::Down) || key.mods.ctrl {
         *grid_column = None;
     }
 
     match (key.key, key.mods.ctrl, key.mods.alt) {
+        (Key::Char('_'), true, _) => { undo.undo(line); *history_idx = None; return KeyAction::Continue; }
+        (Key::Char('r'), false, true) => { undo.redo(line); *history_idx = None; return KeyAction::Continue; }
         (Key::Char('c'), true, _) => return KeyAction::Cancel,
         (Key::Char('d'), true, _) => {
             if line.is_empty() {
                 return KeyAction::Exit;
             }
+            undo.before_edit(line, EditGroup::Other);
             line.delete_forward();
         }
-        (Key::Char('a'), true, _) => line.move_home(),
-        (Key::Char('e'), true, _) => line.move_end(),
-        (Key::Char('k'), true, _) => line.kill_to_end(),
-        (Key::Char('u'), true, _) => line.kill_to_start(),
-        (Key::Char('w'), true, _) => line.kill_word_back(),
-        (Key::Char('d'), false, true) => line.kill_word_forward(),
-        (Key::Char('y'), true, _) => line.yank(),
+        (Key::Char('a'), true, _) => { undo.break_group(); line.move_home(); }
+        (Key::Char('e'), true, _) => { undo.break_group(); line.move_end(); }
+        (Key::Char('k'), true, _) => { undo.before_edit(line, EditGroup::Other); line.kill_to_end(); }
+        (Key::Char('u'), true, _) => { undo.before_edit(line, EditGroup::Other); line.kill_to_start(); }
+        (Key::Char('w'), true, _) => { undo.before_edit(line, EditGroup::Other); line.kill_word_back(); }
+        (Key::Char('d'), false, true) => { undo.before_edit(line, EditGroup::Other); line.kill_word_forward(); }
+        (Key::Char('y'), true, _) => { undo.before_edit(line, EditGroup::Other); line.yank(); }
         (Key::Char('l'), true, _) => return KeyAction::ClearScreen,
         (Key::Char('r'), true, _) => return KeyAction::StartHistorySearch,
 
-        (Key::Char('b'), false, true) => line.move_word_left(),
-        (Key::Char('f'), false, true) => line.move_word_right(),
+        (Key::Char('b'), false, true) => { undo.break_group(); line.move_word_left(); }
+        (Key::Char('f'), false, true) => { undo.break_group(); line.move_word_right(); }
 
         (Key::Up, _, _) if !key.mods.ctrl => {
             if line.has_newlines() && !line.on_first_line() {
+                undo.break_group();
                 line.move_line_up();
                 *grid_column = None;
             } else if !line.has_newlines() {
                 let col = *grid_column.get_or_insert_with(|| {
                     line.grid_cursor_position(prompt_display_len, shell.cols).1
                 });
-                if !line.move_grid_up(prompt_display_len, shell.cols, col) {
+                if line.move_grid_up(prompt_display_len, shell.cols, col) {
+                    undo.break_group();
+                } else {
                     *grid_column = None;
-                    navigate_history(line, history_idx, saved_line, shell, true);
+                    navigate_history(line, history_idx, saved_line, shell, true, undo);
                 }
             } else {
-                navigate_history(line, history_idx, saved_line, shell, true);
+                navigate_history(line, history_idx, saved_line, shell, true, undo);
             }
         }
         (Key::Down, _, _) if !key.mods.ctrl => {
             if line.has_newlines() && !line.on_last_line() {
+                undo.break_group();
                 line.move_line_down();
                 *grid_column = None;
             } else if !line.has_newlines() {
                 let col = *grid_column.get_or_insert_with(|| {
                     line.grid_cursor_position(prompt_display_len, shell.cols).1
                 });
-                if !line.move_grid_down(prompt_display_len, shell.cols, col) {
+                if line.move_grid_down(prompt_display_len, shell.cols, col) {
+                    undo.break_group();
+                } else {
                     *grid_column = None;
-                    navigate_history(line, history_idx, saved_line, shell, false);
+                    navigate_history(line, history_idx, saved_line, shell, false, undo);
                 }
             } else {
-                navigate_history(line, history_idx, saved_line, shell, false);
+                navigate_history(line, history_idx, saved_line, shell, false, undo);
             }
         }
-        (Key::Left, _, _) if key.mods.ctrl || key.mods.alt => line.move_word_left(),
+        (Key::Left, _, _) if key.mods.ctrl || key.mods.alt => { undo.break_group(); line.move_word_left(); }
         (Key::Right, _, _) if key.mods.ctrl || key.mods.alt => {
             if line.cursor() >= line.text().len() && !line.has_newlines() {
                 if let Some(entry) = shell.history.session_prefix_search(line.text(), 0) {
                     if let Some(suffix) = entry.strip_prefix(line.text()) {
                         let take = suggestion_word_accept_len(suffix);
                         if take > 0 {
+                            undo.before_edit(line, EditGroup::Other);
                             let mut owned = line.text().to_string();
                             owned.push_str(&suffix[..take]);
                             line.set(&owned);
@@ -738,39 +840,36 @@ fn handle_normal_key(
                     }
                 }
             } else {
+                undo.break_group();
                 line.move_word_right();
             }
         }
-        (Key::Left, _, _) => {
-            line.move_left();
-        }
+        (Key::Left, _, _) => { undo.break_group(); line.move_left(); }
         (Key::Right, _, _) => {
             if line.cursor() >= line.text().len() && !line.has_newlines() {
                 if let Some(entry) = shell.history.session_prefix_search(line.text(), 0) {
+                    undo.before_edit(line, EditGroup::Other);
                     let owned = entry.to_string();
                     line.set(&owned);
+                } else {
+                    undo.break_group();
+                    line.move_right();
                 }
             } else {
+                undo.break_group();
                 line.move_right();
             }
         }
-        (Key::Home, _, _) => line.move_home(),
-        (Key::End, _, _) => line.move_end(),
+        (Key::Home, _, _) => { undo.break_group(); line.move_home(); }
+        (Key::End, _, _) => { undo.break_group(); line.move_end(); }
 
         (Key::Backspace, true, _) => return KeyAction::StartDirPicker,
-        (Key::Backspace, _, _) => {
-            line.delete_back();
-            *history_idx = None;
-        }
-        (Key::Delete, true, _) => {
-            line.kill_word_back();
-            *history_idx = None;
-        }
-        (Key::Delete, _, _) => {
-            line.delete_forward();
-        }
+        (Key::Backspace, _, _) => { undo.before_edit(line, EditGroup::Other); line.delete_back(); *history_idx = None; }
+        (Key::Delete, true, _) => { undo.before_edit(line, EditGroup::Other); line.kill_word_back(); *history_idx = None; }
+        (Key::Delete, _, _) => { undo.before_edit(line, EditGroup::Other); line.delete_forward(); }
         (Key::Tab, _, _) => {
             if line.is_empty() {
+                undo.before_edit(line, EditGroup::Other);
                 line.insert_str("cd ");
             }
             return KeyAction::StartCompletion;
@@ -783,11 +882,15 @@ fn handle_normal_key(
         }
 
         (Key::Char(c), false, false) => {
+            undo.before_edit(line, EditGroup::Typing);
+            let before = line.text().to_string();
             line.insert_char(c);
             if c == ' ' {
                 try_alias_expand(line, shell.aliases);
             }
-            *history_idx = None;
+            if line.text() != before {
+                *history_idx = None;
+            }
         }
 
         _ => {}
@@ -802,6 +905,7 @@ fn navigate_history(
     saved_line: &mut String,
     shell: &Editing<'_>,
     up: bool,
+    undo: &mut UndoState,
 ) {
     let hist = &shell.history;
     if hist.is_empty() {
@@ -812,7 +916,7 @@ fn navigate_history(
         *saved_line = line.text().to_string();
     }
 
-    if up {
+    let new_text = if up {
         let skip = history_idx.map(|i| i + 1).unwrap_or(0);
         let entry = if saved_line.is_empty() {
             hist.session_get(skip)
@@ -821,13 +925,15 @@ fn navigate_history(
         };
         if let Some(e) = entry {
             *history_idx = Some(skip);
-            line.set(e);
+            Some(e.to_string())
+        } else {
+            None
         }
     } else {
         match history_idx {
             Some(0) | None => {
                 *history_idx = None;
-                line.set(saved_line);
+                Some(saved_line.clone())
             }
             Some(idx) => {
                 *idx -= 1;
@@ -837,10 +943,14 @@ fn navigate_history(
                 } else {
                     hist.session_prefix_search(saved_line, skip)
                 };
-                if let Some(e) = entry {
-                    line.set(e);
-                }
+                entry.map(|e| e.to_string())
             }
+        }
+    };
+    if let Some(text) = new_text {
+        if text != line.text() {
+            undo.before_edit(line, EditGroup::Other);
+            line.set(&text);
         }
     }
 }

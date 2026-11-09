@@ -87,8 +87,8 @@ priority.
 - **Status:** In progress (2026-11-09).
 - **Area:** Editor UX
 - **Where:** `src/line.rs`, `src/editor.rs`, `src/editor/tests.rs`, `src/input.rs`, `src/render.rs`, `tests/pty.rs`, `README.md`
-- **Delivered so far:** Ctrl+Right at the end of input accepts the next word of the history autosuggestion while Right still accepts the whole suggestion (`suggestion_word_accept_len`, editor key handling). Word movement is path-aware and stops at `/` separators. Input decoding recognizes Ctrl+`\`, `]`, `^`, and `_` bytes for future editor bindings. Focused `line` and `editor` unit tests added.
-- **Remaining:** Bounded undo/redo history with deliberate edit grouping and bindings that do not steal Ctrl+Z, shell-word movement beyond path separators where useful without a second tokenizer, and the full acceptance matrix (undo/redo after paste/completion, multiline edits, cancelled pickers, quoting/path cursor movement, combining/wide/narrow/wrapped PTY cases, warm-path allocation/memory bounds).
+- **Delivered:** Ctrl+Right at the end of input accepts the next word of the history autosuggestion while Right still accepts the whole suggestion (`suggestion_word_accept_len`, editor key handling). Word movement is path-aware and stops at `/` separators. Bounded undo/redo (Ctrl+_ / Alt+R, 256-entry stacks) covers normal-mode typing/paste/history recall and common edits; typing coalesces and navigation breaks groups. Input decoding recognizes Ctrl+`\`, `]`, `^`, and `_` bytes. Focused `line` and `editor` unit tests added; README documents bindings.
+- **Remaining:** Full undo/redo grouping/coverage for completion preview/accept/refilter, alias expansion boundaries, multiline edits, cancelled pickers, quoting/path cursor movement cases, combining/wide/narrow/wrapped PTY coverage, and warm-path allocation/memory verification.
 - **Dependencies:** Undo/redo can proceed independently; share syntax-aware movement work with ISH-75/78.
 - **Effort:** M
 
