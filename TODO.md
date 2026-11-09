@@ -21,9 +21,9 @@ verification limits. Open implementation and acceptance work is listed below.
 | [ISH-42](docs/rfc/ISH-42-release-delivery.md) | Default-branch releases, verified bytes, diagnostic panic aborts | Linux implementation verified; native macOS release build and panic diagnostic passed |
 | [ISH-48](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor) | Private binary `Shell`; reusable library editor | Implemented; focused Linux editor and PTY acceptance passed |
 | [ISH-45](docs/filesystem.md#macos-staging-permissions) | Keep filesystem operations in-process; macOS masks must preserve owner read/search | Implemented with explicit rejection; ordinary-user native gates passed; privileged ownership acceptance remains |
-| [ISH-62](docs/rfc/ISH-62-capture-input-tail.md) | Keep unwritten input tail on converged capture relay; return on session end | Implemented; PTY input capture tests passed; capture retirement planned under ISH-73 |
+| [ISH-62](docs/rfc/ISH-62-capture-input-tail.md) | Keep unwritten input tail on converged capture relay; return on session end | Implemented; PTY input capture tests passed; debug `?` builtin retired under ISH-73 (converged relay/capture infrastructure retained for terminal handling and jobs) |
 | [ISH-63](docs/rfc/ISH-63-login-shell-command.md) | Login shell `-c COMMAND` delegation to `/bin/sh -c`; `--config` for file | Implemented; non-interactive invocation tests passed |
-| [ISH-73](#ish-73--p1--remove-debug-output-capture) | Remove the debugging-only `?` builtin and terminal-output capture rather than extending the capture architecture | Owner-approved 2026-11-09; not implemented; preserve job control and filesystem quarantine |
+| [ISH-73](#ish-73--p1--remove-debug-output-capture) | Remove the debugging-only `?` builtin and terminal-output capture rather than extending the capture architecture | Implemented 2026-11-09 (`4a24aac`); `?` builtin/tests/docs removed; PTY relay/capture infrastructure retained for converged terminal handling and suspended-job capture; filesystem quarantine unchanged |
 
 ## Interactive improvement campaign
 
@@ -48,14 +48,12 @@ license choice reserved for the owner.
 
 ### ISH-73 · P1 · Remove debug output capture
 
-- **Status:** Accepted owner direction; not implemented. Replaces the proposed PTY/capture repair campaign. The owner no longer needs the debugging-only `?` builtin.
+- **Status:** Done (2026-11-09, `4a24aac`). Removed the debugging-only `?` builtin. The original acceptance called for removing capture-only PTY/relay machinery; that broader removal was not done because `src/capture.rs` still provides converged terminal handling and suspended-job capture used by normal execution/job control. Scope delivered: `?` command, handler, lookup/completion/dispatch exposure, dedicated tests, and user-facing docs removed; `copy-scrollback` and filesystem quarantine/journals unchanged.
 - **Area:** Simplification / terminal correctness
 - **Where:** `src/capture.rs`, `src/shell.rs`, `src/job.rs`, `src/builtin.rs`, `src/lib.rs`, relevant epsh foreground integration, `tests/pty.rs`, `README.md`, `docs/architecture.md`, capture RFCs and verification notes
-- **Recommendation:** Remove `?` from dispatch, lookup, completion, and help; remove last-output buffers and capture-only PTY allocation, relay threads, session state, descriptor substitution, input-tail plumbing, and signal/termios workarounds. Restore ordinary terminal inheritance and foreground process-group handling for simple commands, pipelines, and lists. Audit each shared helper before deletion; remove ish-only interfaces only when no remaining caller needs them. Preserve epsh's child-wait ownership and standalone API contracts.
-- **Boundaries:** This is terminal-output capture removal, not filesystem capture-and-retire removal. Do not weaken or delete `fdu-posix::quarantine`, `ish-fs` journals, protected deletion, native progress/cancellation, or parent-process callback placement. Keep the separate `copy-scrollback` feature unless an actual dependency requires a narrowly documented adjustment; do not remove shared OSC 52 helpers blindly. Do not replace `?` with a differently named capture feature or output browser.
-- **Acceptance:** No shell-owned last-command output storage or capture-only PTY/relay remains. PTY tests cover ordinary input and `/dev/tty` access, pagers/fullscreen commands in supported pipelines and lists, redirections, Ctrl+C/Ctrl+Z, repeated `fg`, resizing, EOF, terminal restoration, and type-ahead without lost or replayed input. Preserve the single suspended-job policy, whole-pipeline waits/status, and lack of leaked children/descriptors. Replace capture-specific assertions with direct-terminal regression coverage. Update user-facing docs and mark superseded capture design/verification material historical, including ISH-62, without deleting unrelated coverage.
-- **Dependencies:** Coordinate acceptance with ISH-80; complete before finalizing ISH-74 lifecycle emission.
-- **Effort:** M–L
+- **Delivered:** `?` removed from dispatch, lookup, completion/help, builtin registry, and shell handling. `?`-specific PTY coverage/helpers removed; retained PTY coverage still exercises converged terminal behavior and large-output relay robustness. README/architecture updated. Focused checks: `cargo test --test integration builtin_is_builtin_known`, lib tests (288 passed; 1 pre-existing env failure in `history::persistence_tests::damaged_final_frame_is_a_torn_tail`), `cargo test --test pty --no-run`.
+- **Follow-up:** If the project still wants full capture-relay retirement, that is separate work: it must preserve ordinary terminal inheritance/foreground handling, `/dev/tty` behavior, job control, and epsh contracts, and should be gated by ISH-80/native PTY evidence.
+- **Effort:** M–L (builtin removal delivered; full relay retirement not attempted)
 
 ### ISH-74 · P1 · Add native terminal command integration
 
