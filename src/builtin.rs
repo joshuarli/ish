@@ -20,7 +20,6 @@ pub enum Exec {
 /// A builtin that runs in the shell process as the whole input line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellCommand {
-    CopyLastOutput,
     Alias,
     ChangeDirectory,
     CopyScrollback,
@@ -131,8 +130,6 @@ impl Builtin {
     }
 }
 
-const COPY_LAST_OUTPUT_HELP: &str =
-    "Usage: {name}\nCopy the previous command's output through OSC 52.";
 const ALIAS_HELP: &str =
     "Usage: {name} [NAME [COMMAND...]]\nDefine an alias, or list aliases when NAME is omitted.";
 const CHANGE_DIRECTORY_HELP: &str =
@@ -165,7 +162,6 @@ const JUMP_HELP: &str =
     "Usage: {name} [QUERY]\nJump to the most frequently used directory matching QUERY. No query goes home.";
 
 const ISH_BUILTINS: &[Builtin] = &[
-    Builtin::in_shell("?", ShellCommand::CopyLastOutput, Help::Text(COPY_LAST_OUTPUT_HELP)),
     Builtin::in_shell("alias", ShellCommand::Alias, Help::Text(ALIAS_HELP)),
     Builtin::hybrid("cd", ShellCommand::ChangeDirectory, None, Help::Text(CHANGE_DIRECTORY_HELP)),
     Builtin::in_shell("copy-scrollback", ShellCommand::CopyScrollback, Help::Text(COPY_SCROLLBACK_HELP)),
@@ -290,10 +286,10 @@ pub fn help(name: &str) -> Option<String> {
 }
 
 /// Whether running the whole-line builtin `name` replaces the captured output
-/// of the previous command. `?` reads it, `fg` continues the suspended job's
-/// capture, and `exit` leaves the shell.
+/// of the previous command. `fg` continues the suspended job's capture, and
+/// `exit` leaves the shell.
 pub fn replaces_last_output(name: &str) -> bool {
-    !matches!(name, "?" | "fg" | "exit")
+    !matches!(name, "fg" | "exit")
 }
 
 /// Whether ish exposes this command as a builtin.

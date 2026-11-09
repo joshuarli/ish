@@ -66,14 +66,15 @@ the single suspended-job slot, terminal modes, and terminal output capture.
 
 ## Output capture
 
-[`capture.rs`](../src/capture.rs) saves the last command's terminal output for
-`?`. Around every accepted line except `?`, `fg`, and `exit`, `Capture::begin`
-replaces the shell's own terminal-bound standard streams with the slave side
-of a new pseudo-terminal. Replacing fds in the shell process covers builtins,
-epsh pipeline stages, and external children without touching the spawn path.
-Redirections inherit the substitution, so only bytes that would have reached the
-terminal are saved. Each of fds 0, 1, and 2 is replaced only when it names the
-same terminal as fd 1 was.
+[`capture.rs`](../src/capture.rs) runs each accepted command through a
+pseudo-terminal relay and keeps the tail of its terminal output. Around every
+accepted line except `fg` and `exit`, `Capture::begin` replaces the shell's own
+terminal-bound standard streams with the slave side of a new pseudo-terminal.
+Replacing fds in the shell process covers builtins, epsh pipeline stages, and
+external children without touching the spawn path. Redirections inherit the
+substitution, so only bytes that would have reached the terminal are captured.
+Each of fds 0, 1, and 2 is replaced only when it names the same terminal as fd
+1 was.
 
 A single simple command converges onto the slave: stdin joins stdout and
 stderr there, the slave starts as a copy of the real terminal's modes, and the

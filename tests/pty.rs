@@ -119,13 +119,6 @@ impl PtyShell {
         home
     }
 
-    /// Spawn without terminal protocol validation, which rejects the OSC 52
-    /// clipboard sequences these tests read from the raw output.
-    fn spawn_reading_clipboard(files: &[(&str, &str)], rows: u16, cols: u16) -> Self {
-        let home = Self::build_home(files, &[], |_| {});
-        Self::spawn_in_home_with_profile(home, &[], rows, cols, None, ProtocolProfile::disabled())
-    }
-
     fn spawn_in_home(
         home: Rc<TempDir>,
         extra_env: &[(&str, &str)],
@@ -4569,94 +4562,17 @@ fn stopped_child_in_raw_mode_restores_baseline_then_fg_restores_its_own_mode() {
     assert_eq!(after_fg, baseline, "resumed child's raw mode reached the next command after fg");
 }
 
-fn clipboard_writes(raw: &str) -> Vec<Vec<u8>> {
-    const PREFIX: &str = "\x1b]52;c;";
-    let mut writes = Vec::new();
-    let mut rest = raw;
-    while let Some(start) = rest.find(PREFIX) {
-        let payload = &rest[start + PREFIX.len()..];
-        let end = payload.find('\x07').expect("OSC 52 is terminated");
-        writes.push(decode_base64(&payload[..end]));
-        rest = &payload[end..];
-    }
-    writes
-}
-
-fn decode_base64(encoded: &str) -> Vec<u8> {
-    let value = |byte: u8| match byte {
-        b'A'..=b'Z' => byte - b'A',
-        b'a'..=b'z' => byte - b'a' + 26,
-        b'0'..=b'9' => byte - b'0' + 52,
-        b'+' => 62,
-        b'/' => 63,
-        other => panic!("invalid base64 byte {other}"),
-    };
-    let mut out = Vec::new();
-    let mut bits = 0u32;
-    let mut count = 0;
-    for byte in encoded.bytes().take_while(|&byte| byte != b'=') {
-        bits = bits << 6 | u32::from(value(byte));
-        count += 6;
-        if count >= 8 {
-            count -= 8;
-            out.push((bits >> count) as u8);
-            bits &= (1 << count) - 1;
-        }
-    }
-    out
-}
-
-fn copied_by_question_mark(sh: &PtyShell) -> Vec<u8> {
-    sh.type_str("?");
-    sh.enter();
-    let output = sh.wait_for_prompt_after_line_advance(3000);
-    let mut writes = clipboard_writes(&output);
-    assert_eq!(writes.len(), 1, "expected one clipboard write: {output:?}");
-    writes.remove(0)
-}
-
-#[test]
-fn question_mark_copies_terminal_output_of_pipelines_and_children() {
-    let sh = PtyShell::spawn_reading_clipboard(&[], 24, 80);
-    sh.run_command("echo hello | tr a-z A-Z");
-    assert_eq!(copied_by_question_mark(&sh), b"HELLO\n");
-
-    sh.run_command("sh -c 'echo out; echo err >&2'");
-    assert_eq!(copied_by_question_mark(&sh), b"out\nerr\n");
-}
-
 #[test]
 fn foreground_terminal_mode_changes_on_stdout_apply_to_stdin() {
     let script = "#!/bin/sh\nstty -icanon -echo <&1\nprintf 'input-ready\\n'\nkey=$(dd bs=1 count=1 2>/dev/null)\nstty sane <&1\nprintf 'received:%s\\n' \"$key\"\n";
-    let sh = PtyShell::spawn_reading_clipboard(&[("bin/terminal-input", script)], 24, 80);
+    let home = PtyShell::build_home(&[("bin/terminal-input", script)], &[], |_| {});
+    let sh = PtyShell::spawn_in_home_with_profile(home, &[], 24, 80, None, ProtocolProfile::disabled());
     sh.type_str("./bin/terminal-input");
     sh.enter();
     sh.wait_for("input-ready", 3000);
     sh.type_str("x");
     sh.wait_for("received:x", 3000);
     sh.wait_for_prompt_after_line_advance(3000);
-}
-
-#[test]
-fn pager_quits_with_q_on_a_converged_terminal() {
-    let content = (0..200)
-        .map(|index| format!("line {index:03}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
-    for pager in ["less", "more"] {
-        let sh = PtyShell::spawn_reading_clipboard(&[("big.txt", content.as_str())], 24, 80);
-        sh.type_str(&format!("{pager} big.txt"));
-        sh.enter();
-        sh.wait_for("line 000", 3000);
-        sh.type_str("q");
-        sh.wait_for_prompt_after_line_advance(3000);
-        let copied = copied_by_question_mark(&sh);
-        let text = String::from_utf8_lossy(&copied);
-        assert!(text.contains("line 001"), "{pager} output was not captured: {text:?}");
-        let output = PtyShell::strip_ansi(&sh.run_command("echo alive"));
-        assert!(output.contains("alive"), "{pager} left the shell unusable: {output:?}");
-    }
 }
 
 #[test]
@@ -4719,88 +4635,8 @@ fn single_command_sees_one_terminal_for_all_standard_streams() {
 }
 
 #[test]
-fn question_mark_keeps_children_on_a_terminal_of_the_current_size() {
-    let sh = PtyShell::spawn_reading_clipboard(&[], 10, 40);
-    sh.run_command("sh -c 'test -t 1 && test -t 2 && stty size <&1'");
-    assert_eq!(copied_by_question_mark(&sh), b"10 40\n");
-}
-
-#[test]
-fn running_command_sees_a_resize_through_its_output_terminal() {
-    let script =
-        "#!/bin/sh\ntrap 'stty size <&1' WINCH\necho ready\nwhile :; do sleep 0.05; done\n";
-    let sh = PtyShell::spawn_reading_clipboard(&[("bin/winch", script)], 24, 80);
-    sh.type_str("./bin/winch");
-    sh.enter();
-    sh.wait_for("ready", 3000);
-    sh.terminal
-        .borrow_mut()
-        .resize(Size::new(50, 12).expect("non-zero size"))
-        .expect("resize terminal");
-    sh.wait_for("12 50", 3000);
-    sh.ctrl_c();
-    sh.wait_for_prompt_after_line_advance(3000);
-    let copied = copied_by_question_mark(&sh);
-    // The interrupt key's echo ("^C") is terminal output too: converged
-    // capture carries the slave's echo back, exactly as shown on screen.
-    // Exactly one resize report also locks the relay's no-spam rule: an
-    // unconditional WINCH per poll would re-trigger the trap with the old
-    // size ("24 80") and repeat the new one.
-    assert!(copied.starts_with(b"ready\n"), "{copied:?}");
-    assert!(
-        !copied.windows(b"24 80".len()).any(|w| w == b"24 80"),
-        "spurious WINCH with the old size: {copied:?}"
-    );
-    let reports = copied
-        .windows(b"12 50\n".len())
-        .filter(|w| **w == *b"12 50\n")
-        .count();
-    assert_eq!(reports, 1, "expected one resize report: {copied:?}");
-}
-
-#[test]
-fn question_mark_excludes_redirected_streams_and_strips_terminal_controls() {
-    let sh = PtyShell::spawn_reading_clipboard(&[], 24, 80);
-    sh.run_command("echo shown; echo hidden > hidden.txt; echo err 2>&1 >&2");
-    assert_eq!(copied_by_question_mark(&sh), b"shown\nerr\n");
-
-    sh.run_command("printf '\\033[31mred\\033[0m\\n'");
-    assert_eq!(copied_by_question_mark(&sh), b"red\n");
-
-    sh.run_command("echo hidden > hidden.txt");
-    sh.type_str("?");
-    sh.enter();
-    let output = sh.wait_for("wrote no text", 3000);
-    assert!(clipboard_writes(&output).is_empty(), "{output:?}");
-    assert!(sh.run_command("echo $?").contains('1'));
-}
-
-#[test]
-fn question_mark_does_not_replace_the_output_it_copies() {
-    let sh = PtyShell::spawn_reading_clipboard(&[], 24, 80);
-    sh.run_command("echo kept");
-    assert_eq!(copied_by_question_mark(&sh), b"kept\n");
-    assert_eq!(copied_by_question_mark(&sh), b"kept\n");
-}
-
-#[test]
-fn question_mark_follows_a_suspended_job_to_completion() {
-    let script = "#!/bin/sh\nprintf 'before\\n'\nkill -STOP $$\nprintf 'after\\n'\n";
-    let sh = PtyShell::spawn_reading_clipboard(&[("bin/stopper", script)], 24, 80);
-    sh.type_str("./bin/stopper");
-    sh.enter();
-    sh.wait_for("stopped:", 3000);
-    sh.wait_for_prompt_after_line_advance(3000);
-    sh.type_str("fg");
-    sh.enter();
-    sh.wait_for("after", 3000);
-    sh.wait_for_prompt_after_line_advance(3000);
-    assert_eq!(copied_by_question_mark(&sh), b"before\nafter\n");
-}
-
-#[test]
 fn output_beyond_the_capture_limit_still_reaches_the_terminal_and_the_shell_continues() {
-    let sh = PtyShell::spawn_reading_clipboard(&[], 24, 80);
+    let sh = PtyShell::spawn();
     sh.type_str("seq 1 400000");
     sh.enter();
     sh.wait_for("400000", 20000);

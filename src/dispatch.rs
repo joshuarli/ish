@@ -268,7 +268,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        for name in ["cd", "history", "fg", "alias gs git status", "exit 3", "?", "rmrf target"] {
+        for name in ["cd", "history", "fg", "alias gs git status", "exit 3", "rmrf target"] {
             assert!(builtin_name(name).is_some(), "{name}");
         }
     }
@@ -278,7 +278,6 @@ mod tests {
         for line in [
             "z nothing; echo X",
             "copy-scrollback && echo X",
-            "? && echo X",
             "fg && echo X",
             "alias gg echo && echo X",
             "rmrf target && echo X",

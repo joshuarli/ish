@@ -367,26 +367,6 @@ fn write_clipboard(bytes: &[u8]) {
     let _ = std::io::stdout().flush();
 }
 
-fn copy_last_output(args: &[epsh::ast::Word], output: &capture::OutputBuffer) -> i32 {
-    if !args.is_empty() {
-        report!("ish: ?: takes no arguments");
-        return 2;
-    }
-    let text = output.plain_text();
-    if text.is_empty() {
-        report!("ish: ?: the last command wrote no text to the terminal");
-        return 1;
-    }
-    if output.is_truncated() {
-        report!(
-            "ish: ?: output exceeded {} KiB; copied only its end",
-            capture::OUTPUT_LIMIT / 1024
-        );
-    }
-    write_clipboard(&text);
-    0
-}
-
 fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &mut Shell) -> bool {
     macro_rules! expanded_args {
         () => {
@@ -447,7 +427,6 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
             write_clipboard(shell.session_log.as_bytes());
             shell.last_status = 0;
         }
-        ShellCommand::CopyLastOutput => shell.last_status = copy_last_output(args, &shell.last_output),
         ShellCommand::DumpLayout => shell.last_status = write_layout_dump(shell),
         ShellCommand::Rmrf => {
             let args = match expand_builtin_args_bytes(args, shell, name) {

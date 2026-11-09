@@ -155,7 +155,6 @@ ish-specific commands include:
 | `c` | Clear the screen |
 | `denv` | Trust, revoke, or reload environment files for this directory |
 | `copy-scrollback` | Copy the terminal scrollback through OSC 52 |
-| `?` | Copy the previous command's output through OSC 52 |
 | `ish-dump` | Write the current layout dump |
 
 Native `l` and `ll` wrap names to the terminal width, using at most three
@@ -263,25 +262,7 @@ and positional forms, including `set -e`, `set +e`, `set -o pipefail`, and
 `set --`, are refused.
 Aliases can be defined at the prompt or in config and expand as you type.
 
-### Copying command output
-
-`?` must be the whole line. It copies the text the previous command wrote to the
-terminal through OSC 52, so the terminal must allow clipboard writes. Every other
-accepted line replaces the saved output, including shell builtins such as `cd`.
-`?` does not, and `fg` continues the suspended job's output. A line ish refuses
-before running leaves the saved output alone.
-
-- Standard output and standard error are saved together in the order they were
-  written. Every stage of a pipeline and every command in a list contributes
-  what reaches the terminal.
-- A redirection or pipe that takes a stream away from the terminal also takes
-  it out of the saved output. `echo x > file` saves nothing.
-- Terminal control sequences such as colors and cursor movement are removed from
-  the copy, and `\r\n` becomes `\n`. Output from full-screen programs is not
-  useful to copy.
-- ish keeps the last 1 MiB. Larger output copies only its end, starting after
-  the first newline in what remains, and `?` says so.
-- With nothing to copy, `?` prints a message and returns 1.
+### Terminal handling
 
 While a command runs, stdout and stderr that would reach the terminal go
 through a pseudo-terminal that ish relays to your terminal. The relay applies
@@ -292,7 +273,7 @@ in them that reads the output terminal for input waits forever. Further rules
 are in [Output capture](docs/architecture.md#output-capture). A process that
 outlives its command loses later output once relaying stops. If the
 pseudo-terminal cannot be created, ish reports it and runs the command without
-saving its output.
+output capture.
 
 ### Job control
 
