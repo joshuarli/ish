@@ -84,11 +84,11 @@ priority.
 
 ### ISH-77 · P1 · Improve line editing and autosuggestion acceptance
 
-- **Status:** Planned.
+- **Status:** In progress (2026-11-09).
 - **Area:** Editor UX
 - **Where:** `src/line.rs`, `src/editor.rs`, `src/editor/tests.rs`, `src/input.rs`, `src/render.rs`, `tests/pty.rs`, `README.md`
-- **Recommendation:** Add a bounded undo/redo history with deliberate edit grouping, word-by-word autosuggestion acceptance at the end of input, and more useful shell-word/path movement. Preserve Right-to-accept-the-whole-suggestion and existing cursor movement inside the line. Give typing runs, paste, completion acceptance, history recall, and alias expansion predictable undo boundaries; navigation/preview alone should not flood the undo history. Choose and document bindings without stealing Ctrl+Z from foreground job control.
-- **Acceptance:** Deterministic editor tests and PTY tests cover undo/redo after paste and completion, multiline edits, cancelled pickers, suggestion acceptance one word at a time, and cursor movement around quoting and path separators. Maintain UTF-8 validity and display-width correctness, explicitly testing combining/wide-character cases and narrow/wrapped terminals. Bound retained memory and verify the warm editing path does not acquire avoidable per-keystroke allocations. Reuse shared lexical information where syntax matters rather than adding another tokenizer.
+- **Delivered so far:** Ctrl+Right at the end of input accepts the next word of the history autosuggestion while Right still accepts the whole suggestion (`suggestion_word_accept_len`, editor key handling). Word movement is path-aware and stops at `/` separators. Input decoding recognizes Ctrl+`\`, `]`, `^`, and `_` bytes for future editor bindings. Focused `line` and `editor` unit tests added.
+- **Remaining:** Bounded undo/redo history with deliberate edit grouping and bindings that do not steal Ctrl+Z, shell-word movement beyond path separators where useful without a second tokenizer, and the full acceptance matrix (undo/redo after paste/completion, multiline edits, cancelled pickers, quoting/path cursor movement, combining/wide/narrow/wrapped PTY cases, warm-path allocation/memory bounds).
 - **Dependencies:** Undo/redo can proceed independently; share syntax-aware movement work with ISH-75/78.
 - **Effort:** M
 

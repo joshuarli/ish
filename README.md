@@ -64,6 +64,7 @@ Control characters in the user, host, directory, and branch appear as `�`.
 | Ctrl+Y | Restore the last killed text |
 | Ctrl+Backspace | Pick a recent directory |
 | Left / Right | Move by character; Ctrl+Left / Ctrl+Right move by word |
+| Ctrl+Right (end of input) | Accept the next word of the history autosuggestion; Right accepts the whole suggestion |
 | Ctrl+C / Ctrl+D | Cancel input / delete forward or exit on an empty line |
 | Ctrl+L | Clear the screen |
 | Ctrl+Z | Suspend the foreground job |

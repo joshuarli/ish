@@ -725,7 +725,22 @@ fn handle_normal_key(
             }
         }
         (Key::Left, _, _) if key.mods.ctrl || key.mods.alt => line.move_word_left(),
-        (Key::Right, _, _) if key.mods.ctrl || key.mods.alt => line.move_word_right(),
+        (Key::Right, _, _) if key.mods.ctrl || key.mods.alt => {
+            if line.cursor() >= line.text().len() && !line.has_newlines() {
+                if let Some(entry) = shell.history.session_prefix_search(line.text(), 0) {
+                    if let Some(suffix) = entry.strip_prefix(line.text()) {
+                        let take = suggestion_word_accept_len(suffix);
+                        if take > 0 {
+                            let mut owned = line.text().to_string();
+                            owned.push_str(&suffix[..take]);
+                            line.set(&owned);
+                        }
+                    }
+                }
+            } else {
+                line.move_word_right();
+            }
+        }
         (Key::Left, _, _) => {
             line.move_left();
         }
@@ -827,6 +842,39 @@ fn navigate_history(
                 }
             }
         }
+    }
+}
+
+fn suggestion_word_accept_len(suffix: &str) -> usize {
+    if suffix.is_empty() {
+        return 0;
+    }
+    let mut chars = suffix.char_indices();
+    let Some((_, first)) = chars.next() else {
+        return 0;
+    };
+    if first.is_whitespace() {
+        let mut end = first.len_utf8();
+        for (i, c) in chars {
+            if c.is_whitespace() {
+                end = i + c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        for (i, c) in suffix[end..].char_indices() {
+            if c.is_whitespace() {
+                return end + i;
+            }
+        }
+        suffix.len()
+    } else {
+        for (i, c) in chars {
+            if c.is_whitespace() {
+                return i;
+            }
+        }
+        suffix.len()
     }
 }
 

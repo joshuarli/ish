@@ -201,24 +201,35 @@ impl LineBuffer {
     }
 
     pub fn move_word_left(&mut self) {
-        while self.cursor > 0 && self.char_before_cursor().is_some_and(|c| c.is_whitespace()) {
+        while self.cursor > 0 && self.char_before_cursor().is_some_and(is_shell_word_space) {
             self.cursor = self.prev_char_boundary();
         }
-        while self.cursor > 0
-            && self
-                .char_before_cursor()
-                .is_some_and(|c| !c.is_whitespace())
-        {
-            self.cursor = self.prev_char_boundary();
+        if self.cursor == 0 {
+            return;
+        }
+        if self.char_before_cursor().is_some_and(is_shell_word_separator) {
+            while self.cursor > 0 && self.char_before_cursor().is_some_and(is_shell_word_separator) {
+                self.cursor = self.prev_char_boundary();
+            }
+        } else {
+            while self.cursor > 0 && self.char_before_cursor().is_some_and(is_shell_word_char) {
+                self.cursor = self.prev_char_boundary();
+            }
         }
     }
 
     pub fn move_word_right(&mut self) {
         let len = self.buf.len();
-        while self.cursor < len && self.char_at_cursor().is_some_and(|c| !c.is_whitespace()) {
-            self.cursor = self.next_char_boundary();
+        if self.cursor < len && self.char_at_cursor().is_some_and(is_shell_word_char) {
+            while self.cursor < len && self.char_at_cursor().is_some_and(is_shell_word_char) {
+                self.cursor = self.next_char_boundary();
+            }
+        } else if self.cursor < len && self.char_at_cursor().is_some_and(is_shell_word_separator) {
+            while self.cursor < len && self.char_at_cursor().is_some_and(is_shell_word_separator) {
+                self.cursor = self.next_char_boundary();
+            }
         }
-        while self.cursor < len && self.char_at_cursor().is_some_and(|c| c.is_whitespace()) {
+        while self.cursor < len && self.char_at_cursor().is_some_and(is_shell_word_space) {
             self.cursor = self.next_char_boundary();
         }
     }
@@ -395,6 +406,18 @@ fn offset_at_column(line: &str, col: usize) -> usize {
         width += char_width(c);
     }
     line.len()
+}
+
+fn is_shell_word_space(c: char) -> bool {
+    c.is_whitespace()
+}
+
+fn is_shell_word_separator(c: char) -> bool {
+    c == '/'
+}
+
+fn is_shell_word_char(c: char) -> bool {
+    !is_shell_word_space(c) && !is_shell_word_separator(c)
 }
 
 pub fn display_char(c: char) -> char {
@@ -622,6 +645,20 @@ mod tests {
         assert_eq!(lb.display_cursor_pos(), 0);
         lb.move_word_right();
         assert_eq!(lb.display_cursor_pos(), 6);
+    }
+
+    #[test]
+    fn move_word_stops_at_path_separators() {
+        let mut lb = LineBuffer::new();
+        lb.set("cd /usr/local/bin");
+        lb.move_word_left();
+        assert_eq!(&lb.text()[lb.cursor()..], "bin");
+        lb.move_word_left();
+        assert_eq!(&lb.text()[lb.cursor()..], "/bin");
+        lb.move_word_left();
+        assert_eq!(&lb.text()[lb.cursor()..], "local/bin");
+        lb.move_word_right();
+        assert_eq!(&lb.text()[lb.cursor()..], "/bin");
     }
 
     #[test]

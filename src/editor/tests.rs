@@ -1,5 +1,5 @@
 use super::*;
-use crate::input::{Key, KeyEvent};
+use crate::input::{Key, KeyEvent, Modifiers};
 
 fn context<'a>(aliases: &'a AliasMap, history: &'a history::History, directories: &'a [String]) -> EditorContext<'a> {
     EditorContext { aliases, history, cwd: Path::new("/"), home: Some("/"), home_display: "/", path: b"", directories }
@@ -32,6 +32,37 @@ fn normal_paste_continuation_cancel_and_submit_emit_memory_output() {
     event(&mut editor, &context, EditorEvent::Paste("discard"));
     assert!(matches!(event(&mut editor, &context, EditorEvent::Key(KeyEvent::ctrl('c'))), EditorAction::Cancel));
     assert!(matches!(event(&mut editor, &context, EditorEvent::Key(KeyEvent::ctrl('p'))), EditorAction::Dump));
+}
+
+#[test]
+fn suggestion_word_accept_len_splits_words_and_paths() {
+    assert_eq!(suggestion_word_accept_len(""), 0);
+    assert_eq!(suggestion_word_accept_len("checkout feature"), "checkout".len());
+    assert_eq!(suggestion_word_accept_len(" checkout"), " checkout".len());
+    assert_eq!(suggestion_word_accept_len("  --flag"), "  --flag".len());
+    assert_eq!(suggestion_word_accept_len("src/main.rs"), "src/main.rs".len());
+}
+
+#[test]
+fn right_accepts_whole_suggestion_and_ctrl_right_accepts_next_word() {
+    let aliases = AliasMap::new();
+    let history = history::History::from_entries(vec!["git checkout feature-branch".into()]);
+    let ctx = context(&aliases, &history, &[]);
+    let mut editor = Editor::new(24, 80);
+    editor.begin("$ ".into(), 2, &ctx);
+    event(&mut editor, &ctx, EditorEvent::Paste("git ch"));
+    let action = event(&mut editor, &ctx, EditorEvent::Key(KeyEvent::with_mods(Key::Right, Modifiers { ctrl: true, alt: false, shift: false })));
+    assert!(matches!(action, EditorAction::Continue));
+    assert_eq!(editor.view.line.text(), "git checkout");
+
+    let aliases = AliasMap::new();
+    let history = history::History::from_entries(vec!["git checkout feature-branch".into()]);
+    let ctx = context(&aliases, &history, &[]);
+    let mut editor = Editor::new(24, 80);
+    editor.begin("$ ".into(), 2, &ctx);
+    event(&mut editor, &ctx, EditorEvent::Paste("git ch"));
+    event(&mut editor, &ctx, EditorEvent::Key(KeyEvent::key(Key::Right)));
+    assert_eq!(editor.view.line.text(), "git checkout feature-branch");
 }
 
 #[test]
