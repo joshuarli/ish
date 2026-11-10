@@ -38,9 +38,10 @@ all of the work below has shipped.
 - Each implementation updates the relevant README contract and focused tests. Retain historical RFCs and qualify their status; do not erase evidence or claim model proofs establish untested terminal behavior.
 
 Suggested delivery order: complete terminal interop gaps (ISH-80 actionable
-parts), improve completion (ISH-75), then editing (ISH-77). Highlighting and
-picker consistency (ISH-78/79) and prerelease identity (ISH-82) are lower
-priority.
+parts), then editing (ISH-77). Argument-aware completion (ISH-75) is deferred
+for now due to potential blast radius (epsh inspection API, completion hot
+path, and in-process Git metadata). Highlighting and picker consistency
+(ISH-78/79) and prerelease identity (ISH-82) are lower priority.
 
 ## Open implementation tickets
 
@@ -74,11 +75,12 @@ priority.
 
 ### ISH-75 · P1 · Add argument-aware in-process completion
 
-- **Status:** Planned.
+- **Status:** Deferred (potential blast radius).
 - **Area:** Completion
 - **Where:** `src/editor.rs`, `src/complete.rs`, `src/builtin.rs`, `src/path.rs`, epsh lexer/parser interfaces, `docs/completion.md`, editor/integration/PTY tests, `benches/bench.rs`
 - **Recommendation:** Complete ish builtin options and operands, common command subcommands/options, and Git branches, tags, and remotes. Start with a finite native set, using builtin metadata as the source of truth where possible. Derive the command and argument position from reusable epsh lexical/syntax information instead of expanding `shell_tokens`, `split_whitespace`, and ad hoc command-position heuristics. Add a bounded tolerant inspection API in epsh if incomplete input requires one; do not build a second parser or evaluate the line. Read Git metadata in-process with explicit worktree/common-dir, loose/packed-ref, invalidation, and resource-bound behavior.
 - **Acceptance:** Tests cover incomplete quotes, escapes, assignments, redirections, command lists/pipelines, aliases, supported wrappers, mid-line insertion, option arguments, and `--`. Suggestions preserve quoting and operand bytes, remain aligned with dispatch restrictions, and never execute substitutions. Git fixtures cover worktrees and changed refs without stale suggestions. Preserve existing path/host matching and ordering contracts unless an intentional change is documented. Benchmark cold/warm completion and large candidate sets; no subprocess-per-keystroke behavior, plugin ecosystem, or general completion configuration language.
+- **Deferral note:** Deferred for now due to potential blast radius across the epsh inspection surface, completion hot path, and in-process Git metadata behavior. Revisit as a focused, benchmark-gated change.
 - **Dependencies:** Shared syntax inspection should also serve ISH-78 and syntax-aware editing in ISH-77.
 - **Effort:** M
 
