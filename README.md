@@ -1,42 +1,35 @@
 # ish
 
-ish is an interactive shell for macOS and Linux. It provides a native prompt,
-line editing, history search, completion, aliases, minimal job control, native
-`cp` and `mv` commands, and protected deletion.
+ish is an interactive shell for macOS and Linux. It provides a prompt, line
+editing, history search, completion, aliases, job control, and in-process
+file commands.
 
-ish does not parse or evaluate scripts or command strings. It does satisfy the
-login-shell contract: `ish -c COMMAND` hands `COMMAND` to `/bin/sh -c` and
-exits with that shell's status, so a login shell can serve `ssh`, `scp`,
-`cron`, and `make`. See [ISH-63](docs/rfc/ISH-63-login-shell-command.md).
+ish is interactive. It does not run shell scripts. `ish -c COMMAND` runs a
+command with `/bin/sh -c` so tools such as `ssh`, `scp`, `cron`, and `make`
+can use ish as a login shell.
 
-## Install and run
+## Install
 
 Download a pre-release archive for your platform from
-[GitHub Releases](https://github.com/joshuarli/ish/releases). The release
-workflow provides macOS Apple silicon and statically linked Linux x86_64 and
-ARM64 builds. Extract the archive, rename its `ish-*`
-executable to `ish`, and place it in a directory on your `PATH`, such as
-`~/.local/bin`.
-
-Start the shell with:
+[GitHub Releases](https://github.com/joshuarli/ish/releases), extract it,
+rename the executable to `ish`, and place it on your `PATH`.
 
 ```sh
 ish
 ```
 
-Use `ish --help` for command-line options. `-c COMMAND` runs a command with
+`ish --help` shows command-line options. `-c COMMAND` runs a command with
 `/bin/sh`, `--config PATH` selects a config file, `--no-config` skips config
 loading, and `-V` prints the version.
 
 ## Configuration
 
-By default, ish reads `~/.config/ish/config.ish`. If `HOME` is unset, it checks
-`/etc/ish/config.ish`. Use `--config PATH` to select another file.
+By default, ish reads `~/.config/ish/config.ish`. If `HOME` is unset, it
+checks `/etc/ish/config.ish`. Use `--config PATH` to select another file.
 
-The file supports `set` and `alias` directives. A `set` value is one shell word;
-quote values that contain spaces. `$NAME` is expanded when the config loads.
-Lines beginning with `#` are comments. Invalid lines are reported and do not
-prevent later lines from loading. A nearby `init.sh` is not run.
+The file supports `set` and `alias` directives. Quote values that contain
+spaces. `$NAME` is expanded when the config loads. Lines beginning with `#`
+are comments.
 
 ```sh
 set EDITOR nvim
@@ -48,9 +41,7 @@ alias .. "cd .."
 ## Interactive use
 
 The prompt shows the user, host, shortened working directory, Git branch, and
-last command status. A red `*` marks a dirty denv environment. After you run
-`git init` in the current directory, the next prompt shows its branch.
-Control characters in the user, host, directory, and branch appear as `�`.
+last command status. A red `*` marks a dirty `denv` environment.
 
 | Key | Action |
 |---|---|
@@ -65,296 +56,103 @@ Control characters in the user, host, directory, and branch appear as `�`.
 | Ctrl+_ / Alt+R | Undo / redo line edits |
 | Ctrl+Backspace | Pick a recent directory |
 | Left / Right | Move by character; Ctrl+Left / Ctrl+Right move by word |
-| Ctrl+Right (end of input) | Accept the next word of the history autosuggestion; Right accepts the whole suggestion |
+| Ctrl+Right (end of input) | Accept the next word of the history suggestion; Right accepts the whole suggestion |
 | Ctrl+C / Ctrl+D | Cancel input / delete forward or exit on an empty line |
 | Ctrl+L | Clear the screen |
 | Ctrl+Z | Suspend the foreground job |
 | Ctrl+P | Write a layout dump under `~/.cache/ish/` |
 
-Completion filters as you type or paste and prefers prefix matches. Recent
-files appear first; partial paths and SSH hosts are supported. SSH host
-completion reads `~/.ssh/config` and `~/.ssh/known_hosts`. Use the arrows or Tab
-to move through results, Enter to accept, and Escape to cancel. Pasting while
-the recent-directory picker is open leaves its saved input unchanged.
+Tab completion filters as you type and prefers prefix matches. Recent files
+appear first, and SSH host completion reads `~/.ssh/config` and
+`~/.ssh/known_hosts`. Use arrows or Tab to move through results, Enter to
+accept, and Escape to cancel.
 
-Ctrl+R opens a case-insensitive fuzzy-search pager with matches highlighted.
-Typing or pasting edits the search query and filters the matches.
-Use Up and Down to navigate, Enter to accept, and Escape to cancel. History is
-saved in `~/.local/share/ish/history.log`; Ctrl+R searches saved commands across
-sessions, while Up and Down use this session's history snapshot. `history`
-prints the list and `history reset` clears it. The first run after an upgrade
-imports the old `history` and `history.bin` files and deletes them. Run `history -h` for help.
+Ctrl+R opens history search. Type to filter, use Up and Down to navigate,
+Enter to accept, and Escape to cancel. History is saved in
+`~/.local/share/ish/history.log`. `history` prints saved commands and
+`history reset` clears them.
 
-## Commands and syntax
+## Commands
 
-ish accepts pipelines with `|` or `|&`, lists joined by `&&`, `||`, or `;`,
-command negation with `!`, and file redirections such as `2>errors.txt` and
-`&>output.txt`. It supports quoting, escaping, comments, continuation lines,
-tilde, parameter and arithmetic expansion, command substitution, and pathname
-expansion (globbing). An unmatched quote or a trailing `|`, `&&`, or `||`
-requests another input line.
-
-```sh
-ls -la | grep src && echo found > result.txt
-cat 'literal $HOME' "expanded $HOME"
-echo ~/projects/*.rs
-echo $((1 + 2))
-! false || echo fallback
-```
-
-`${NAME}` is accepted alongside `$NAME`; parameter operators such as
-`${NAME:-default}` are refused. Background `&`, scripts, conditionals (`if`,
-`for`, `while`, `case`), subshells, brace groups, functions, `source`, `.`, and
-`eval` are not supported. ish checks the command target after expansion too.
-Unavailable builtin names and invalid `set` forms are refused with status 2,
-including targets selected through expansion or nested `command`. Static
-violations prevent the input line from starting. Expanded targets are checked
-before their redirections, assignments for dispatch, or execution; earlier
-commands and expansions keep their effects. Commands that need shell state,
-including `alias`, `exit`, `fdu`, `fg`, `denv`, and `z`, must be the whole input line.
-`cd` and `history` can also be used in lists. `rmrf` must also be the whole
-input line.
-
-Native `cp`, `mv`, and `rsync` run in the shell process, including lists, redirections,
-and standalone negation. `! cp source copy` performs the copy and inverts its
-status. Genuine pipelines and command substitutions refuse native operations
-before target redirections or filesystem effects. Refusal returns 2; an
-expression's `!` can invert that status while retaining the diagnostic.
-Argument substitutions are allowed. Aliases after `!` expand before dispatch.
-Use `command cp` or an alias for the same native operation. Use an explicit
-path such as `/bin/cp` or `/usr/bin/rsync` to run the external utility.
-
-Native `l`, `ll`, `c`, and the list form of `history` also require the ish process.
-They refuse pipeline stages and command substitutions with status 2 before
-target redirections. Their host callbacks have no child-execution safety
-contract. Ordinary external programs, epsh builtins, and hybrid `cd` retain
-their pipeline and substitution forms.
-
-Arithmetic follows [epsh's signed 64-bit rules](crates/epsh/README.md#arithmetic).
-
-A bare directory name becomes an implicit `cd` only when it does not match a
-builtin, alias, or executable on `PATH`. Use `cd name` to enter a directory
-when a command has the same name.
-
-ish-specific commands include:
+ish runs external programs and a small set of shell commands. Pipelines (`|`,
+`|&`), command lists (`&&`, `||`, `;`), negation (`!`), quoting, escaping,
+comments, continuation lines, tilde expansion, parameter and arithmetic
+expansion, command substitution, globbing, and redirections are supported.
+Background jobs (`&`), control flow, subshells, brace groups, functions,
+`source`, `.`, and `eval` are not supported.
 
 | Command | Action |
 |---|---|
 | `cd [dir]` | Change directory; `cd -` returns to the previous directory |
-| `exit [status]` | Exit, warning if a job is suspended |
-| `fdu [OPTIONS] [PATH]` | Browse disk usage interactively or write a summary of directory sizes |
+| `exit [status]` | Exit the shell |
 | `fg` | Resume the suspended foreground job |
 | `alias [name [command...]]` | Define or list aliases |
 | `history [reset]` | List or clear saved history |
-| `z [query]` | Jump to a frequently used directory; no query goes home |
-| `cp [OPTIONS] SOURCE DESTINATION` | Copy files or directory trees; with more than one source the last operand must be a directory |
-| `mv [OPTIONS] SOURCE DESTINATION` | Move files or directory trees; with more than one source the last operand must be a directory |
-| `rsync [OPTIONS] SOURCE... DESTINATION` | Synchronize files or directory trees locally without trailing-slash magic |
-| `rmrf PATH...` | Permanently remove each path, including directory trees |
-| `w`, `which`, `type` | Locate a command or alias; builtins print their usage and description, and a same-name alias also shows the underlying command |
-| `l [path...]` | List visible files with sizes and relative ages |
-| `ll [path...]` | List all files including hidden ones |
+| `z [query]` | Jump to a frequently used directory |
+| `l [path...]` / `ll [path...]` | List files; `ll` includes hidden files |
 | `c` | Clear the screen |
-| `denv` | Trust, revoke, or reload environment files for this directory |
-| `copy-scrollback` | Copy the terminal scrollback through OSC 52 |
+| `w`, `which`, `type` | Locate a command or alias |
+| `cp` / `mv` | Copy or move files and directories in the shell process |
+| `rsync` | Synchronize local files and directories in the shell process |
+| `rmrf PATH...` | Permanently remove paths |
+| `fdu [PATH]` | Browse disk usage interactively, or print a summary when redirected |
+| `denv` | Trust, reload, or revoke project environment files |
+| `copy-scrollback` | Copy session log text to the clipboard through OSC 52 |
 | `ish-dump` | Write the current layout dump |
 
-Native `l` and `ll` wrap names to the terminal width, using at most three
-lines per name and ending longer names with `…`. Piped or redirected output
-keeps one line per entry. Names keep their type color and switch to a faint
-version once entries are a week old, so recent files stay bright and stale
-ones recede.
+Some commands must be used as the whole input line, including `alias`, `exit`,
+`fg`, `fdu`, `denv`, `z`, `rmrf`, `copy-scrollback`, and `ish-dump`. `cd` and
+`history` can also appear in command lists.
 
-`command -v` and `command -V` identify registered ish commands as builtins even
-when `PATH` is empty. A command path such as `/bin/cp` is reported and run as
-the external program. Unavailable epsh builtin names are absent from command
-completion and lookup, even if a same-named executable exists on `PATH`. Use
-an explicit path to run that executable. `command -v exit` can identify the
-whole-line ish command; `command exit` refuses its execution.
+A bare directory name changes into that directory when it does not match a
+command on `PATH`. Use `cd name` when a command has the same name.
 
-`rmrf PATH...` removes each path. Directory trees are scanned before deleting
-anything. The command refuses `/`, `$HOME`, the current directory, and any
-parent of the current directory. A directory operand that is a mount point is
-refused. An incomplete scan or nested mount boundary stops deletion before it
-starts. Symlinks are removed as links; their targets are left alone. Missing
-paths are ignored, and a failure on one path does not stop the remaining paths.
-A terminal shows scan progress and a deletion progress bar.
-If deletion is interrupted, entries may remain in a `.fdu-quarantine-v2-*`
-directory inside `PATH`. The next `rmrf PATH` restores verified captures without
-overwriting live names and requires a fresh scan and retry. Existing v1 sessions
-retain their restoration behavior. Damaged records, conflicting names, and
-unrelated quarantine lookalikes block deletion and identify the retained paths.
-An entry removed before a synchronization error is reported as removed with a
-durability failure. On filesystems that cannot support journaled deletion
-quarantine (for example exFAT), `rmrf` deletes directly without journaled
-recovery and warns on stderr; interrupted direct deletion leaves remaining
-entries instead of restorable captures.
+## File commands
 
-ish's `cp` and `mv` follow the standard operand forms: one source maps to
-`DESTINATION`, while several sources map into the last operand, which must be
-an existing directory. For example, `cp report.txt .` places the file inside
-`.` as `./report.txt` when `.` is a directory, and `mv src/* .` moves every
-match into `.`. `--into DIRECTORY` is the explicit spelling of the multi-source
-form: `cp --into . report.txt` matches `cp report.txt .`, and
-`mv --into . src/*` matches `mv src/* .`. Each source maps to a child named
-after its basename.
-Directories recurse without `-r`; `cp -r` and `cp -R` are accepted as redundant
-flags. Read the [file operation reference](docs/filesystem.md) for collision,
-preservation, mount, durability, cancellation, and partial-completion rules.
-Unsupported required metadata is reported as a failure and the source is
-retained. Explicit paths such as `/bin/cp` and `/bin/mv` still run external
-utilities. Interrupted copies and moves use the same quarantine protocol,
-except a `cp` to a new destination on a filesystem that cannot support
-journaled staging (for example exFAT), which copies directly without
-quarantine and may leave a partial destination; see the
-[file operation reference](docs/filesystem.md#understand-copy-and-move-completion).
-On macOS, filesystem staging does not support an inherited umask that removes
-owner read or search permission (mask bits `0500`); for example, `0777` is
-unsupported. ish reports a failure and keeps filesystem operations in-process.
-Unpublished stages remain available for inspection. Recovery preserves published
-destinations and never resumes deleting sources. Read the
-[recovery reference](docs/filesystem.md#inspect-retained-operation-state) before
-retrying an interrupted operation.
+`cp` and `mv` follow standard operand forms. With one source, the second
+operand is the destination. With several sources, the last operand must be an
+existing directory, or use `--into DIRECTORY`. Directories recurse by default.
 
-ish's `rsync` provides local filesystem synchronization without trailing-slash
-magic: `src` and `src/` map identically. Explicit forms select mapping:
-`--into DIRECTORY SOURCE...` synchronizes sources into a target container;
-`SOURCE... DIRECTORY` uses `--into` convenience when the final operand exists as
-a directory; `SOURCE DEST` performs an exact mapping; and `--contents SOURCE DIRECTORY`
-synchronizes the directory contents of `SOURCE` directly into `DIRECTORY` without
-creating an intermediate basename directory. Regular files are skipped when entry
-kind, logical size, and modification timestamp match. Differing destination files
-are updated atomically via staged replacement. Deletions are opt-in via `--delete`.
-`-n` is not supported (use `--dry-run`). Remote rsync protocols, daemon modes,
-and network deltas are external non-goals; explicit paths such as `/usr/bin/rsync`
-run the external utility.
-
-### Browsing disk usage (fdu)
-
-`fdu` scans disk usage and lets you browse a directory in an interactive terminal.
-It must be the whole input line. With no path, it scans the current directory;
-with `PATH`, it starts at that directory. When redirected, it writes a compact
-size summary of immediate child directories to standard output.
-
-```text
-fdu [--apparent] [-x PATH | --exclude PATH]... [--summary | --interactive] [--read-only] [PATH]
+```sh
+cp report.txt ./backup/
+cp --into . report.txt
+mv src/* .
+rmrf build tmp/cache
+rsync --into ./dest src assets
 ```
 
-- Navigate with arrow keys or `j`/`k`/`h`/`l`; open with Enter; move up with Backspace or `h`.
-- Mark with `d`, range with `v`, clear marks with `c`.
-- Tab switches focus between the directory listing and the marked-items pane.
-- `-` toggles between side-by-side and stacked panes.
-- `s` cycles sort order (size, name, date); `a` toggles apparent vs. allocated sizes; `/` filters by name; `?` opens help; `q` quits.
-- In the marked pane, press Ctrl-R to review and confirm permanent deletion. Incomplete scans or excluded items are skipped and preserved.
-- `--read-only` disables deletion.
-- `-x PATH` / `--exclude PATH` omits exact paths relative to the scan root.
-- `--summary` writes immediate child directory sizes without starting the interactive browser.
-- `fdu --rmrf` is rejected: `ish` provides native `rmrf`. Unlike standalone `fdu --rmrf`, which empties a directory while preserving it, `rmrf PATH` permanently removes the named directory itself.
+`rmrf` permanently removes the paths you name. It refuses dangerous targets
+such as `/`, `$HOME`, the current directory, and parents of the current
+directory. Use an explicit path such as `/bin/cp`, `/bin/mv`, or
+`/usr/bin/rsync` to run an external utility.
 
-The exposed epsh builtins are `echo`, `printf`, `pwd`, `true`, `false`, `:`,
-`test`, `[`, `kill`, `export`, `unset`, `set`, and `command`; `cd` also retains
-its hybrid form. Other epsh builtins, including `exec`, `trap`, `read`, `wait`,
-`umask`, and `getopts`, are unavailable. This boundary does not restrict programs
-run through explicit paths.
+Interrupted file operations may leave recoverable state on filesystems that
+support it. See [File operation reference](docs/filesystem.md) for collision
+options, recovery, and platform-specific behavior.
 
-`set` lists exported variables. `set NAME [value...]` sets and exports a
-variable, joining values with spaces; no values gives an empty value. The name
-must match `[A-Za-z_][A-Za-z0-9_]*`. Values may start with `-` or `+`. Option
-and positional forms, including `set -e`, `set +e`, `set -o pipefail`, and
-`set --`, are refused.
-Aliases can be defined at the prompt or in config and expand as you type.
+## Job control and terminal
 
-### Terminal handling
+Ctrl+C interrupts foreground commands. Ctrl+Z suspends a foreground job, and
+`fg` resumes it. ish keeps one suspended job.
 
-While a command runs, stdout and stderr that would reach the terminal go
-through a pseudo-terminal that ish relays to your terminal. The relay applies
-a window resize within about 200 ms and signals `SIGWINCH` when the size
-changes. A single simple command uses that pseudo-terminal as its controlling
-terminal and receives what you type. Pipelines and lists do not, so a program
-in them that reads the output terminal for input waits forever. Further rules
-are in [Output capture](docs/architecture.md#output-capture). A process that
-outlives its command loses later output once relaying stops. If the
-pseudo-terminal cannot be created, ish reports it and runs the command without
-output capture.
+When supported by your terminal, ish emits working-directory and command
+markers (OSC 7 and OSC 133) so the terminal can provide prompt navigation and
+command boundaries.
 
-ish emits OSC 7 working-directory updates and OSC 133 prompt, input,
-execution, and completion markers to the interactive terminal. Markers follow
-submitted lines, cancellations, refusals, multiline continuation, suspended
-jobs, and `fg` at runtime boundaries; they are not emitted on editor redraws or
-resizes and do not go to redirected command output or delegated `ish -c`
-output. Terminals may use these markers for prompt navigation, command
-boundaries, and output selection; support and behavior vary by terminal.
-Unsupported terminals should ignore unknown OSC sequences.
+## Project environments (`denv`)
 
-### Job control
+When you change directories, ish looks for `.envrc` and `.env`. `denv allow`
+trusts the files in the current directory, `denv deny` revokes trust, and
+`denv reload` reevaluates them. Editing a trusted file revokes its trust.
 
-Ctrl+C interrupts foreground commands, including pipelines. A SIGINT sent
-to the shell (for example `kill -INT`) cancels the line being edited.
-Ctrl+Z suspends a foreground job and `fg` resumes it. ish keeps one suspended
-job. If a command in a list suspends, the rest of that list is discarded.
-The suspended job retains every pipeline member and its output capture.
-`fg` waits for the whole group and uses the pipeline's final-stage status.
-An external command that exits with status 148 does not create a suspended job.
-During native `cp` and `mv`, ish ignores Ctrl+Z and continues the operation.
-
-### denv
-
-When the directory changes, ish looks for `.envrc` and `.env`. Run
-`denv allow` to trust the files in the current directory, `denv deny` to revoke
-trust, and `denv reload` to reevaluate them. Editing a trusted file revokes its
-trust. If either discovered file is untrusted, neither is loaded. `.envrc`
-files whose first line mentions `bash` run in a `bash` child; other `.envrc`
-files are evaluated by epsh. `.env` files are read as variable assignments
-after `.envrc`, so `.env` values take precedence. Shell syntax in `.env`
-values remains data.
-Evaluation stops after 60 seconds.
-
-Trust covers the exact bytes of the discovered files. An approved `.envrc`
-runs arbitrary code with your authority. Explicit sourcing and newly executed
-interpreters can load other files without denv approval or per-file revocation.
-
-`source_env`, `source_env_if_exists`, `source_up`, `source_up_if_exists`,
-`dotenv`, and `dotenv_if_exists` are removed. Calling any of them rejects the
-whole candidate environment, including inside substitutions, pipelines, or
-subshells, even if a later command succeeds. Remove redundant `dotenv` calls
-and approve the automatically discovered `.env` with `denv allow`. Put shared
-setup in the discovered `.envrc` and approve its updated contents. Rejection
-prevents candidate variables from entering ish. External effects already
-performed by trusted code cannot be undone.
-
-Shell variables and exported child environments belong to epsh's variable store.
-ish imports its inherited environment at startup and never writes changes back
-to its own process environment. Evaluators and commands receive explicit
-byte-preserving environments; denv locates projects from the shell's actual cwd,
-independently of the value assigned to `PWD`.
-
-Denv validates a complete candidate, including readonly bindings, and persists
-its restoration record before publishing the candidate. Assignment or storage
-errors leave the current layer installed. A rejected script installs none of
-its assignments; denv restores the prior layer and marks the project dirty.
-
-`denv` fixes its trust and restoration storage directory when the shell starts,
-using `DENV_DATA_DIR` or `$HOME/.local/share/denv`. Project changes to `HOME` or
-`DENV_DATA_DIR` do not move that storage. Leaving a project restores its
-variables, including raw values, empty versus unset bindings, and whether each
-binding was exported.
-Each shell keeps its restoration record in that directory under a name made of
-its pid, on Linux its pid namespace, and a random token, exported as `__DENV_PID`, and removes the record
-when it exits. A shell killed without cleanup leaves its record behind; no later
-shell reads it, and each new shell removes records whose pid is no longer
-running in the new shell's pid namespace. A record whose pid has been reused by
-a running process stays, and so does a record written from another pid
-namespace, such as another container sharing the directory.
-If the shell's active restoration record is malformed or
-uses an unsupported version, `denv` reports an error and leaves shell variables
-unchanged. `denv reload`, `denv allow`, and `denv deny` then
-discard the record and report that the variables it saved cannot be restored.
+`.envrc` runs as code with your authority. Review it before allowing it.
+`.env` is loaded as assignments after `.envrc`.
 
 ## Help and license
 
-Report issues at [GitHub Issues](https://github.com/joshuarli/ish/issues). The
-top-level `ish` project is MIT licensed; see [LICENSE](LICENSE). Bundled and
-imported crates and test fixtures may carry their own licenses and notices; for
-example, `ish-fs` is MIT licensed with an
+Report issues at [GitHub Issues](https://github.com/joshuarli/ish/issues).
+The top-level `ish` project is MIT licensed; see [LICENSE](LICENSE). Bundled
+and imported crates and test fixtures may carry their own licenses and
+notices; for example, `ish-fs` is MIT licensed with an
 [import note](crates/ish-fs/IMPORT.md), and `epsh` retains
 [conformance notices](crates/epsh/tests/conformance/NOTICE).
