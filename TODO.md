@@ -16,10 +16,9 @@ by this repository. Open work and verification limits are listed below.
 - Preserve matched-workload performance evidence for interactive changes: prompt/completion latency, allocations, release size, and resource behavior. Never trade away execution, byte-preservation, or durability guarantees.
 - Update the README contract and focused behavior tests when implementing changes. Keep native-terminal evidence separate from model proofs and deterministic PTY checks.
 
-Fix the data-loss and build defects before discretionary expansion. ISH-75's
-argument-aware feature remains deferred. Preserve the existing owner priorities
-and won't-do decisions; priorities for ISH-83 through ISH-91 are assumed from
-review impact and likelihood.
+ISH-75's argument-aware feature remains deferred. Preserve the existing owner
+priorities and won't-do decisions; ISH-89's priority is assumed from review
+impact and likelihood, and its RFC awaits an owner decision.
 
 ## Open implementation tickets
 

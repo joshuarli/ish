@@ -11,9 +11,8 @@ export TMPDIR="$PWD/.work/tmp"
 make build
 ```
 
-In the supplied musl builder, `make build` currently passes the unsupported
-`dev` wrapper mode and stops before compilation. [ISH-84](../TODO.md#ish-84--p1--make-build-is-rejected-by-the-supplied-musl-builder)
-tracks that defect. Plain-host Cargo checks do not exercise the wrapper contract.
+In the supplied musl builder, `make build` uses the wrapper's `dev` mode, which
+links host builds with the same policy as `test`.
 
 [Makefile](../Makefile) owns build and release commands.
 [Cargo.toml](../Cargo.toml) defines workspace members and default members.
