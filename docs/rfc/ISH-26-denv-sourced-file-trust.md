@@ -3,6 +3,11 @@
 Status: accepted; implemented with Linux acceptance for both evaluators
 (2026-10-22).
 
+The later `dotenv_if_exists` implementation supersedes this decision for that
+helper only: it loads the already discovered and approved `.env`, accepts no
+other file, and succeeds when `.env` is absent. Other helper retirements and
+the trust boundary below remain in effect.
+
 ## Decision
 
 Choose **option A: retire denv's implicit file-loading helpers**. Keep the

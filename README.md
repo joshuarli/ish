@@ -146,7 +146,14 @@ trusts the files in the current directory, `denv deny` revokes trust, and
 `denv reload` reevaluates them. Editing a trusted file revokes its trust.
 
 `.envrc` runs as code with your authority. Review it before allowing it.
-`.env` is loaded as assignments after `.envrc`.
+`.env` is loaded as assignments after `.envrc`. An `.envrc` can call
+`dotenv_if_exists` (or `dotenv_if_exists .env` or `dotenv_if_exists ./.env`)
+to use the discovered, approved `.env` assignments earlier; it succeeds when
+that file is absent. Other paths are rejected and reject the environment.
+The final automatic `.env` load still overrides `.envrc` exports. Values are
+parsed as data, not executed. Approval covers only the discovered files;
+direct sourcing by `.envrc` runs with your authority and is not independently
+approved or tracked by denv.
 
 ## Help and license
 

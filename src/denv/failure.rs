@@ -34,6 +34,9 @@ impl RetiredHelper {
 
 impl fmt::Display for RetiredHelper {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if *self == Self::DotenvIfExists {
+            return write!(f, "dotenv_if_exists only accepts the discovered .env");
+        }
         write!(f, "{} was removed; use the automatically discovered .env or put setup in the approved .envrc", self.name())
     }
 }
@@ -96,7 +99,8 @@ impl FailureChannel {
     pub fn install_stubs(script: &mut String, reporters: [RawFd; 2]) {
         for (index, helper) in RetiredHelper::ALL.into_iter().enumerate() {
             let record = char::from(b'A' + index as u8);
-            writeln!(script, "{}() {{", helper.name()).unwrap();
+            let name = if helper == RetiredHelper::DotenvIfExists { "__denv_reject_dotenv_if_exists" } else { helper.name() };
+            writeln!(script, "{}() {{", name).unwrap();
             for fd in reporters {
                 writeln!(script, "  printf '%s' '{record}' >&{fd} 2>/dev/null || :").unwrap();
             }

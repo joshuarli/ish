@@ -4160,6 +4160,22 @@ fn denv_dotenv_helper_rejects_the_entire_candidate() {
 }
 
 #[test]
+fn denv_dotenv_if_exists_uses_approved_file_and_revokes_edits() {
+    let sh = spawn_with_allowed(
+        &[("project/.envrc", "dotenv_if_exists\nexport DENV_SEEN=$DENV_OPTIONAL\n"), ("project/.env", "DENV_OPTIONAL=first\n")],
+        &["project/.envrc", "project/.env"],
+    );
+    sh.run_command("cd project");
+    assert!(sh.run_command("echo $DENV_SEEN").contains("first"));
+    std::fs::write(sh.home_path().join("project/.env"), "DENV_OPTIONAL=second\n").unwrap();
+    assert!(sh.run_command("denv reload").contains("blocked"));
+    let blocked = PtyShell::strip_ansi(&sh.run_command("echo =$DENV_SEEN="));
+    assert!(blocked.contains("=="), "{blocked:?}");
+    sh.run_command("denv allow");
+    assert!(sh.run_command("echo $DENV_SEEN").contains("second"));
+}
+
+#[test]
 fn denv_automatic_dotenv_loads_without_a_helper() {
     let sh = spawn_with_allowed(
         &[

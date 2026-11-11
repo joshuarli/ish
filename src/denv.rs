@@ -1123,6 +1123,16 @@ fn eval_env(
     }
 }
 
+fn install_dotenv_if_exists(script: &mut String, entries: &[(String, String)]) {
+    script.push_str("dotenv_if_exists() {\n  if [ \"$#\" -gt 1 ] || { [ \"$#\" -eq 1 ] && [ \"$1\" != .env ] && [ \"$1\" != ./.env ]; }; then\n    __denv_reject_dotenv_if_exists\n    return 2\n  fi\n");
+    for (key, value) in entries {
+        write!(script, "  export {key}='").unwrap();
+        script.push_str(&value.replace('\'', "'\\''"));
+        script.push_str("' || return\n");
+    }
+    script.push_str("  return 0\n}\n");
+}
+
 fn eval_env_bash(
     dir: &Path,
     source: &[u8],
@@ -1156,6 +1166,7 @@ fn eval_env_bash(
     script.push_str(BASH_STDLIB);
     script.push('\n');
     failure.install(&mut script);
+    install_dotenv_if_exists(&mut script, dotenv_entries);
     script.push_str("__denv_src=$");
     script.push_str(ENVRC_SOURCE_VAR);
     script.push_str("\nunset ");
@@ -1456,6 +1467,7 @@ fn eval_env_epsh(
     script.push_str(BASH_STDLIB);
     script.push('\n');
     failure.install(&mut script);
+    install_dotenv_if_exists(&mut script, dotenv_entries);
     script.push_str(source);
     script.push('\n');
 
@@ -2058,6 +2070,31 @@ mod tests {
             assert!(err.contains("source_env"), "{err}");
             assert_eq!(env::var_os("DENV_REDIRECT_BEFORE"), None);
             assert_eq!(env::var_os("DENV_REDIRECT_AFTER"), None);
+        }
+    }
+
+    #[test]
+    fn dotenv_if_exists_loads_approved_values_during_evaluation() {
+        let _evaluation = EVALUATION_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = TempDir::new("ish_denv_optional_dotenv");
+        let shell = epsh::eval::Shell::new();
+        let env_pairs = shell.vars().env_for_command_os(&[]);
+        let entries = vec![("DENV_OPTIONAL".to_string(), "a'$(touch marker)\nline".to_string())];
+        for source in ["dotenv_if_exists\nexport DENV_SEEN=\"$DENV_OPTIONAL\"", "dotenv_if_exists ./.env\nexport DENV_SEEN=\"$DENV_OPTIONAL\""] {
+            for bash in [false, true] {
+                let result = if bash {
+                    eval_env_bash(tmp.path(), source.as_bytes(), &entries, &env_pairs, Duration::from_secs(2))
+                } else {
+                    eval_env_epsh(tmp.path(), source.as_bytes(), &entries, &env_pairs, Duration::from_secs(2))
+                }.unwrap();
+                assert!(result.set.contains(&("DENV_SEEN".into(), ShellBytes::from("a'$(touch marker)\nline"))));
+                assert!(!tmp.path().join("marker").exists());
+            }
+        }
+        for bash in [false, true] {
+            let source = b"dotenv_if_exists\nexport DENV_SEEN=ok";
+            let result = if bash { eval_env_bash(tmp.path(), source, &[], &env_pairs, Duration::from_secs(2)) } else { eval_env_epsh(tmp.path(), source, &[], &env_pairs, Duration::from_secs(2)) }.unwrap();
+            assert!(result.set.contains(&("DENV_SEEN".into(), ShellBytes::from("ok"))));
         }
     }
 
