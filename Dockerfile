@@ -117,7 +117,7 @@ mode=${MUSL_BUILD_MODE:-static}
 native="-L native=/usr/lib -Clink-arg=-B$crt"
 release="-Cpanic=abort"
 case "$mode" in
-    static|test|driver)
+    static|dev|test|driver)
         flags=$native
         ;;
     release-static)
@@ -133,7 +133,7 @@ target_env=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')
 linker_var="CARGO_TARGET_${target_env}_LINKER"
 rustflags_var="CARGO_TARGET_${target_env}_RUSTFLAGS"
 export "$linker_var=clang"
-if [ "$mode" = driver ] || [ "$mode" = test ]; then
+if [ "$mode" = dev ] || [ "$mode" = driver ] || [ "$mode" = test ]; then
     # Cargo builds proc-macro and test-support crates for the container host,
     # where target-scoped flags do not apply. Keep those links on the same
     # musl CRT path as the instrumented binary.

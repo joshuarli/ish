@@ -32,15 +32,6 @@ review impact and likelihood.
 - **Fix with:** `os-boundaries`
 - **Effort:** M (days)
 
-### ISH-84 · P1 · make build is rejected by the supplied musl builder
-
-- **Area:** Build
-- **Where:** `Makefile:7`, `Makefile:16`, `Dockerfile:119`.
-- **Problem:** `make build` selects `musl-cargo` when available and passes `MUSL_BUILD_MODE=dev`. The Dockerfile's wrapper accepts only `static`, `test`, `driver`, and `release-static`. Running `make build TARGET=x86_64-unknown-linux-musl` with the unchanged embedded wrapper extracted onto PATH exits 2 before compilation: `musl-cargo: unknown build mode: dev`. Plain `cargo check --workspace` succeeds, so the ordinary-host fallback hides this supplied-builder defect.
-- **Recommendation:** Give the development build a supported wrapper mode with the required host/target linking policy, or explicitly support `dev`. Verify `make build` through that wrapper and retain the existing release/test modes. This requires no new CI workflow.
-- **Fix with:** `single-source-of-truth`
-- **Effort:** S (hours)
-
 ### ISH-77 · P1 · Improve line editing and autosuggestion acceptance
 
 - **Status:** In progress (2026-11-09).
