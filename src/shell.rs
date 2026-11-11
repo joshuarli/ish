@@ -391,7 +391,8 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
     match command {
         ShellCommand::Alias => handle_alias(line, shell),
         ShellCommand::Exit => {
-            return handle_exit_command(line, shell);
+            let args = expanded_args!();
+            return handle_exit_command(&args, shell);
         }
         ShellCommand::ChangeDirectory => {
             let args = match expand_builtin_args_bytes(args, shell, name) {
@@ -680,12 +681,23 @@ fn push_dir_stack(dir_stack: &mut Vec<String>) {
     }
 }
 
-fn handle_exit_command(line: &str, shell: &mut Shell) -> bool {
-    let code: i32 = line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+fn handle_exit_command(args: &[String], shell: &mut Shell) -> bool {
+    let code = match args {
+        [] => 0,
+        [status] => match status.parse::<i32>() {
+            Ok(code) => code,
+            Err(_) => {
+                report!("ish: exit: {status}: numeric argument required");
+                shell.last_status = 2;
+                return false;
+            }
+        },
+        _ => {
+            report!("ish: exit: too many arguments");
+            shell.last_status = 2;
+            return false;
+        }
+    };
     if shell.job.is_some() {
         if shell.exit_warned {
             if let Some(job) = shell.job.take() {

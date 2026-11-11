@@ -1201,6 +1201,44 @@ fn exit_command() {
 }
 
 #[test]
+fn exit_expands_its_status_operand() {
+    let sh = PtyShell::spawn();
+    sh.run_command("false");
+    sh.type_str("exit $?");
+    sh.enter();
+    assert_eq!(sh.wait_for_exit_status(3000), ExitStatus::Code(1));
+
+    let sh = PtyShell::spawn();
+    sh.type_str("exit '7'");
+    sh.enter();
+    assert_eq!(sh.wait_for_exit_status(3000), ExitStatus::Code(7));
+}
+
+#[test]
+fn exit_refuses_invalid_operands_without_exiting() {
+    let sh = PtyShell::spawn();
+    let out = PtyShell::strip_ansi(&sh.run_command("exit abc; echo status=$?"));
+    assert!(out.contains("must be the only command"), "exit in a list must be refused: {out:?}");
+
+    let out = PtyShell::strip_ansi(&sh.run_command("exit abc"));
+    assert!(out.contains("exit: abc: numeric argument required"), "{out:?}");
+    let out = PtyShell::strip_ansi(&sh.run_command("echo status=$?"));
+    assert!(out.contains("status=2"), "{out:?}");
+
+    let out = PtyShell::strip_ansi(&sh.run_command("exit 1 2"));
+    assert!(out.contains("exit: too many arguments"), "{out:?}");
+
+    let out = PtyShell::strip_ansi(&sh.run_command("exit $((1/0))"));
+    assert!(out.contains("exit: expansion error"), "{out:?}");
+    let out = PtyShell::strip_ansi(&sh.run_command("echo status=$?"));
+    assert!(out.contains("status=1"), "{out:?}");
+
+    sh.type_str("exit 4");
+    sh.enter();
+    assert_eq!(sh.wait_for_exit_status(3000), ExitStatus::Code(4));
+}
+
+#[test]
 fn ctrl_c_cancels_input() {
     let sh = PtyShell::spawn();
     sh.type_str("some partial input");

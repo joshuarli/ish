@@ -85,7 +85,7 @@ Background jobs (`&`), control flow, subshells, brace groups, functions,
 | Command | Action |
 |---|---|
 | `cd [dir]` | Change directory; `cd -` returns to the previous directory |
-| `exit [status]` | Exit the shell |
+| `exit [status]` | Exit the shell with `status` (default 0); a non-numeric or extra operand is refused with status 2 |
 | `fg` | Resume the suspended foreground job |
 | `alias [name [command...]]` | Define or list aliases |
 | `history [reset]` | List or clear saved history |

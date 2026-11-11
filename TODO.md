@@ -98,15 +98,6 @@ review impact and likelihood.
 - **Fix with:** `os-boundaries`
 - **Effort:** M (days)
 
-### ISH-88 · P2 · exit ignores quoting and expansion and silently returns zero
-
-- **Area:** Errors
-- **Where:** `src/dispatch.rs:68`, `src/dispatch.rs:84`, `src/shell.rs:393`, `src/shell.rs:683`.
-- **Problem:** Dispatch retains parsed arguments, but the exit handler reparses the raw line with `split_whitespace` and maps any integer parse failure to zero. Exact-binary PTY probes show `false` followed by `exit $?` exits 0, and `exit '7'` also exits 0. The parent receives success instead of the requested status.
-- **Recommendation:** Expand the existing parsed arguments at the shell-builtin boundary, validate zero or one numeric operand, and report invalid arguments/expansion failures without silently choosing success. Preserve the current no-argument policy and suspended-job confirmation. Cover quoted status, `$?`, invalid operands, and expansion errors.
-- **Fix with:** `error-model`
-- **Effort:** S (hours)
-
 ### ISH-89 · P2 · Nested denv sessions lose project restoration provenance
 
 - **Area:** Data
