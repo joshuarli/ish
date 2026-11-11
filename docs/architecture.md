@@ -1,355 +1,226 @@
 # Architecture
 
-ish is an interactive-only shell built around epsh. The implementation keeps
-ish's user-facing syntax smaller than epsh's parser and runtime.
+ish is an interactive-only shell built around epsh. The [README](../README.md)
+defines its smaller syntax and user-visible behavior.
 
 ## Execution flow
 
-1. The line editor returns an input line; aliases are expanded by the existing
-   alias integration.
-2. [`dispatch::plan`](../src/dispatch.rs) parses the line once with epsh and
-   rejects constructs outside the supported subset. The accepted syntax is
-   listed in the [README](../README.md).
-3. A whole-line shell builtin is dispatched in ish. Other accepted programs are
-   evaluated by epsh with owned command rules and a named native dispatcher.
-4. epsh starts ordinary external commands and owns their groups and waits.
-   The native dispatcher handles ish-owned operations in the original process.
-   ish synchronizes the resulting status and working directory.
+[main.rs](../src/main.rs) parses CLI arguments. Delegated `-c` commands replace
+ish with `/bin/sh`; interactive execution enters [shell.rs](../src/shell.rs).
+The private `Shell` owns the evaluator, editor, history, aliases, denv, input
+reader, capture, and one suspended-job slot.
 
-The builtin registry assigns `cp`, `mv`, and `rsync` the `Exec::Foreground` class. epsh
-handles their list and redirection syntax, then calls ish's handler in the
-original shell process. `l` and `c` use the same execution class. `fdu` runs
-in-process as an `InShell` builtin with exclusive terminal access.
-Explicit executable paths bypass the builtin registry
-and keep the external utility available. The [file operation reference](filesystem.md)
-defines their operands and filesystem policy.
+The editor returns a line, aliases expand, and [`dispatch::plan`](../src/dispatch.rs)
+parses it with epsh. Planning rejects unsupported constructs before evaluation.
+Whole-line shell commands run in ish; other accepted programs run through epsh.
+The registry in [builtin.rs](../src/builtin.rs) owns execution classes, command
+identity, lookup, completion names, and the finite builtin policy:
 
-The `Exec` class in [`builtin.rs`](../src/builtin.rs) defines where ish-owned
-commands run. `InShell` commands must be the whole input line. `Hybrid`
-commands such as `cd` and `history` run with shell state when alone and use the
-stateless command path inside lists. `Foreground` handlers require the
-original process and refuse pipeline stages and command substitutions. The registry is the source for builtin-name lookup and completion.
+- `InShell` commands require the whole input line.
+- `Hybrid` commands, including `cd` and `history`, also have list forms.
+- `Foreground` handlers, including `cp`, `mv`, `rsync`, `l`, and `c`, run in the
+  original process. Pipeline stages and command substitutions refuse them.
 
-`epsh` supports more syntax than ish exposes. Keep the acceptance check in
-`dispatch::plan()`; do not send unsupported syntax directly to epsh. Do not
-add an ish-owned parser or general configuration language.
+Planning and expanded dispatch reuse epsh's `command_action` parsing and raw
+argument rules. Expanded targets are checked before target redirections,
+assignments for dispatch, and callbacks; refusal returns 2. Earlier commands
+and expansion effects are not rolled back. Unavailable epsh builtins cannot
+fall through to PATH or implicit `cd`; explicit executable paths remain usable.
+Standalone epsh and denv evaluators retain their unrestricted defaults.
 
-The finite interactive builtin policy lives in `builtin.rs`. Its names drive
-planning, epsh's opt-in builtin allowlist, completion, and command lookup; its
-owned argument rules restrict `set` to listing and named-variable assignment.
-Planning and expanded dispatch reuse epsh's `command_action` parser to check
-every nested execution target. `CommandRule::validate_arguments` accepts raw
-argv for both checks. Expanded targets are checked before their redirections,
-assignments for dispatch, or execution, and refusals return status 2. The policy
-does not undo effects from earlier commands or expansion. Lookup can identify
-whole-line ish commands without granting permission to invoke them through
-`command`. Unavailable epsh names cannot fall through to PATH lookup or implicit
-directory changes; explicit executable paths retain their normal behavior.
-Standalone epsh shells and denv evaluators retain their unrestricted defaults.
-
-ish registers native handler commands, including `cp`, `mv`, `l`, `c`, and
-list-form `history`, with epsh's additive
-`CommandPlacement::ParentProcess` API. The placement table owns command-name
-bytes and is empty by default for other embedders. epsh captures its owner PID
-when a `Shell` is created and carries that owner through evaluator forks. It
-checks the expanded target, including nested `command`, before command-policy
-callbacks, target redirections, or target dispatch. A pipeline or command
-substitution is rejected with status 2 even when its evaluator path stays in
-the current process. Argument substitutions finish before the handler runs.
-See [epsh's process model](../crates/epsh/docs/process-model.md) for the API and
-its limits.
-
-Ordinary external programs use epsh's default executor. The named external
-dispatcher handles native ish operations in the parent process. epsh owns
-process groups, child waits, output relays, and stopped-job handles. ish owns
-the single suspended-job slot, terminal modes, and terminal output capture.
+`CommandPlacement::ParentProcess` stores owned command-name bytes and preserves
+the creator PID across evaluator forks. It rejects nested `command` targets in
+pipeline/substitution contexts even if that evaluator stays in the parent.
+Argument substitutions finish before a parent handler runs. See the
+[epsh process model](../crates/epsh/docs/process-model.md) for callback and fork
+limits. epsh owns external processes, process groups, waits, and stopped-job
+handles. ish owns terminal modes and the single suspended-job slot.
 
 ## Output capture
 
-[`capture.rs`](../src/capture.rs) runs each accepted command through a
-pseudo-terminal relay and keeps the tail of its terminal output. Around every
-accepted line except `fg` and `exit`, `Capture::begin` replaces the shell's own
-terminal-bound standard streams with the slave side of a new pseudo-terminal.
-Replacing fds in the shell process covers builtins, epsh pipeline stages, and
-external children without touching the spawn path. Redirections inherit the
-substitution, so only bytes that would have reached the terminal are captured.
-Each of fds 0, 1, and 2 is replaced only when it names the same terminal as fd
-1 was.
+The debugging-only `?` command is gone. [capture.rs](../src/capture.rs) still
+provides the PTY relay used by ordinary execution and suspended jobs, including
+its bounded output-tail buffer. `copy-scrollback` copies the command session
+log, not that buffer. Filesystem quarantine is a separate mechanism.
 
-A single simple command converges onto the slave: stdin joins stdout and
-stderr there, the slave starts as a copy of the real terminal's modes, and the
-foreground child takes the slave as its controlling terminal in a session of
-its own. Every descriptor the child can open for keyboard input, including
-`/dev/tty`, resolves to the same terminal, so interactive programs work as
-they do under other shells. While such a command runs, the real terminal sits
-in raw mode and a relay thread copies output from the master to the real
-terminal, appending it to a bounded `OutputBuffer`, and forwards typed input
-from the real terminal to the master. It polls every 200 ms for window size
-changes and applies them to the slave, signalling `SIGWINCH` to the slave's
-foreground group only when the size actually changed: an unconditional signal
-would make a fullscreen child redraw on every poll, and each redraw would wake
-the relay again. Output is processed once, by the slave's line discipline;
-the raw real terminal passes those bytes through unchanged.
+`Capture::begin` replaces terminal-bound standard descriptors with a PTY slave.
+Only descriptors naming the same terminal as stdout are replaced, so explicit
+redirections remain separate. `fg` resumes an existing session; `exit` does not
+start one. The buffer allocation moves into the relay thread and back for reuse.
 
-Keyboard signals need relay help because a converged child is orphaned (its
-session has no link to the shell's), and the kernel discards
-terminal-generated stops for orphaned groups on macOS. The relay consumes the
-slave's suspend character and sends `SIGSTOP` — never `SIGTSTP`, which would
-be discarded — to the slave's foreground group. Interrupt and quit characters
-reach a converged child through the slave line discipline, but an in-process
-builtin owns no foreground group, so for those the relay signals the shell's
-own group instead, mirroring what split capture's real terminal would do;
-suspend stays ignored there. The foreground group is read through the master
-with raw libc: macOS rejects the query on the slave side, and a fresh slave
-reports pgid 0 (rustix turns that into a failed assertion, so 0 means none).
-Spawning a converged child also clears epsh's cached terminal descriptor,
-which would otherwise point at the previous command's dead slave, and shell
-diagnostics fall back to `/dev/tty` when stderr itself points at such a dead
-capture terminal.
+A single simple command converges stdin, stdout, stderr, and `/dev/tty` onto
+the slave, with a separate child session and controlling terminal. The real
+terminal becomes raw. The relay forwards input and output; only the slave line
+discipline processes output. Its 200 ms size poll sends SIGWINCH only on an
+actual size change, avoiding redraw feedback.
 
-Pipelines and lists keep the split capture: only stdout and stderr move to the
-slave, stdin stays on the real terminal, and the relay mirrors the slave's
-mode changes that affect input back onto the real terminal with output
-processing still disabled there. Mirroring pauses while the shell owns the
-terminal, such as while a job is stopped. The split keeps job control and the
-controlling terminal untouched, which pipelines need because their stages
-cannot share one controlling terminal. It cannot serve programs that read the
-output terminal for keyboard input; those hang under the split, so prefer a
-single command for fullscreen programs.
+A converged child group is orphaned. The relay turns its suspend character into
+SIGSTOP because macOS discards terminal-generated SIGTSTP for such groups.
+Interrupt and quit use the slave line discipline. For in-process builtins with
+no child foreground group, the relay signals the shell's group and ignores
+suspend. Foreground-group queries use the master because macOS rejects the
+slave query; group 0 means no owner. epsh clears its cached terminal descriptor
+between converged commands, and diagnostics can reopen `/dev/tty` after a dead slave.
 
-`Capture::end` flushes Rust's stdout and restores the replaced fds; the caller
-then finishes the `Session`, which stops the relay, drains the master, and
-returns the buffer. The relay restores the real terminal's startup modes as it
-exits. A command that stops keeps its `Session` in the `Job`, because the job
-still holds the slave; the relay pauses input forwarding until `fg` resumes
-the job, so prompt keystrokes are not forwarded into the suspended child.
-Input the relay has already read stays queued until the master accepts it; a
-full queue, pause, or stop does not drop it. When the session ends because the
-child has exited, that tail is the next prompt's input. While the job is
-paused the tail stays with the session and is written after `fg` resumes
-forwarding. `fg` finishes the session when the job ends. The buffer moves into the relay thread
-and back, so its allocation is reused across commands without sharing.
+Pipelines and lists use split capture: stdout/stderr move to the slave while
+stdin and the controlling terminal remain real. The relay mirrors slave input
+modes with real-terminal output processing disabled, pausing while ish owns the
+terminal. Programs that read the output terminal for input can hang in this
+mode; use a single simple command for those programs.
+
+`Capture::end` flushes stdout and restores replaced descriptors. Finishing its
+`Session` stops and drains the relay and restores real-terminal modes. A stopped
+job retains the session, with input forwarding paused until `fg`. Unwritten
+input remains queued across full queues and pauses. After child exit, the tail
+returns to the next prompt; after suspension it stays with the job.
+
+Termination during external waits and fatal cleanup during descriptor replacement
+have demonstrated gaps tracked in [TODO](../TODO.md). Prompt-only signal tests
+do not establish the command-running behavior.
 
 ## Terminal integration
 
-The interactive shell emits OSC 7 working-directory updates before each prompt
-and OSC 133 prompt/input/execution/completion markers at runtime boundaries.
-Markers cover prompt display, submitted input, command execution, completion or
-suspension, cancellations, dispatch refusals, multiline continuation, and `fg`.
-Editor repaints and resizes do not emit duplicate prompt or input markers.
-Markers are written to the interactive terminal stream, not to redirected command
-output files or delegated `ish -c` execution.
+ish emits OSC 7 before prompts and OSC 133 at prompt/input, execution, and
+completion boundaries. Cancellation, refusal, continuation, suspension, and
+`fg` have distinct transitions. Repaints/resizes do not emit new prompt markers.
+Markers stay on the interactive terminal stream rather than redirected output
+or delegated `-c` execution. [The terminal matrix](terminal-interop-matrix.md)
+separates byte-level PTY assertions from native-terminal observations.
 
 ## Filesystem operation boundaries
 
-`src/fs_command.rs` parses ish's command options and adapts typed requests to
-`ish-fs`. The library's contract covers path anchoring, mapping policy,
-transfer, metadata, publication, and move retirement. It receives the shell
-cwd, raw operands, environment-derived paths, and cancellation explicitly. It
-does not change cwd or process environment.
+[fs_command.rs](../src/fs_command.rs) adapts `cp`/`mv` operands to `ish-fs` with
+explicit cwd, raw paths, environment-derived inputs, and cancellation. Native
+operations run in the parent under [foreground.rs](../src/foreground.rs), which
+owns signals, bounded events, progress, workers, and terminal restoration.
+Workers finish before handlers return and never mutate shell environment or cwd.
+`rmrf` uses the controller with its own root protections.
 
-The operation runs in the parent shell so redirections and list status use
-epsh's normal evaluation. Workers must finish before the handler returns. The
-foreground controller owns signal handling, cancellation, progress output,
-worker event draining, and terminal restoration. `rmrf` uses the same
-controller while keeping its separate command contract and root protections.
-Workers receive explicit handles and options. They do not mutate shell state,
-cwd, or process environment.
+`cp`/`mv` validate all operand mappings before mutation and use descriptor-relative
+traversal after resolving supplied parents. New roots publish after transfer;
+merges publish completed leaves and may leave partial work. Isolated exact
+same-filesystem moves rename without walking descendants. Cross-filesystem
+moves require transferred data, required metadata, and a durable destination
+receipt before revalidated source retirement. They never delete an arbitrary
+replacement tree found later at the source path.
 
-The engine contract uses descriptor-relative paths after resolving supplied
-parents. It stages new objects on the destination filesystem and publishes a
-new root only after its transfer completes. A merge publishes completed leaves
-and can leave partial work. An isolated exact same-filesystem move renames
-without walking descendants. Cross-filesystem moves require successful transfer,
-required metadata, and durable destination publication before source retirement.
-Retirement uses records of transferred objects and revalidation. It does not
-recursively delete whatever later appears at a source path.
+`fdu-posix::identity` owns no-follow opens, mount identity, platform conversions,
+and EINTR retries for copy/move and fdu deletion. `fdu-core` owns the portable
+identity/kind values; `ish-fs` adds observations and transfer-version checks.
+`fdu-posix::quarantine` owns their shared journal: nonblocking root locks,
+synchronized intent before capture, synchronized captures before unlink,
+and independent actual-removal versus synchronization outcomes.
 
-`fdu-posix::identity` owns descriptor-relative identity, no-follow opens,
-mount identity, platform conversions, and EINTR retries for all three engines.
-`fdu-core` retains filesystem-independent `FileIdentity` and `EntryType` values.
-`ish-fs` retains its richer `Observation` and transfer-version comparisons.
+Recovery validates owner, mount, ancestry, identity, and versioned records. It
+restores names without overwrite and requires a fresh plan/retry, never replaying
+deletion or publication. Stage records remain inspectable. Replacement records
+include original source identity and destination parent/name so interrupted
+exchanges remain inspectable instead of being repeated. Crossed mounts use
+short-lived sessions at retained roots. Root locks own their iterators and use
+creator PIDs to guard explicit unlock after fork.
 
-`fdu-posix::quarantine` owns the shared journal for `fdu-delete` and `ish-fs`.
-Its owned retirement records contain ancestor identities and an expected object
-and kind. It locks each recovery root nonblockingly, synchronizes intent
-publication before capture, and synchronizes captured names before unlink.
-The caller authorizes unlink after its source and durable-destination checks.
-The journal reports actual removal separately from synchronization errors.
-Recovery restores names without overwrite and requires an explicit retry.
-Stages have a separate record kind and remain inspectable after interruption.
-The v2 replacement record kind adds the original source identity and destination
-parent/name to the displaced-object intent. The shared primitive publishes and
-syncs that record before invoking atomic publication, then uses the same
-capture, verification, unlink, and restoration steps. Recovery distinguishes an
-unchanged source from an exchange interrupted before capture and retains the
-latter for inspection. It never replays publication. Readers that do not
-recognize the record kind reject it.
+Stable trees are the full-correctness baseline. Revalidation does not make rename
+or unlink conditional on every mutation by another same-account writer.
+[Filesystem behavior](filesystem.md), [native acceptance](filesystem-testing.md),
+and [recorded measurements](../benches/fs/results-linux.md) own the detailed contracts.
 
-Traversal checks source and existing destination directories as they are
-reached. A crossed mount uses a short-lived session at its retained mount root
-for each retired descendant; sessions are not accumulated by mount count.
-The independently opened root lock owns its directory iterator, avoiding a
-second descriptor during ordinary recovery-root enumeration. Its owner PID
-guards explicit unlock across fork inheritance.
-
-Stable source and destination trees are the full-correctness baseline. Path
-anchoring and revalidation detect observed changes, but cannot make rename or
-unlink conditional on both inode and mutation version against every concurrent
-writer. The command does not claim protection from another process running as
-the same account with authority over the trees.
-
-Native validation requirements and observed limits belong to
-[filesystem testing](filesystem-testing.md). Recorded measurements are in
-[the benchmark report](../benches/fs/results-linux.md).
+[Native rsync](../crates/ish-fs/src/sync.rs) is a separate path-based engine
+called by [sync_command.rs](../src/sync_command.rs). It does not inherit the
+copy/move ancestry guards, anchored traversal, retirement receipts, or journal.
+The [sync reference](filesystem.md#local-synchronization-rsync) records its
+current destructive-boundary and deletion-error defects.
 
 ## Filesystem resources and hardlinks
 
-The engine admits workers against descriptor and memory budgets, including
-thread stacks, reused transfer buffers, and metadata captures. Budget constants
-and admission checks live in [engine/mod.rs](../crates/ish-fs/src/engine/mod.rs).
-These are allocation estimates, not measured peak RSS limits.
-[The foreground controller](../src/foreground.rs) owns bounded event delivery,
-progress coalescing, and signal polling.
+[engine/mod.rs](../crates/ish-fs/src/engine/mod.rs) admits copy/move workers
+against descriptor and allocation budgets, including stacks, buffers, and
+metadata. These are estimates, not measured peak RSS limits. Dry-run charges
+retained names and traversal frames, enumerates each directory once, and makes
+no scratch state. Records use unlinked spool files with an AVL path index;
+private encoding is v2. The shared journal writes v2 and has a restoration-only
+v1 reader; unknown versions fail.
 
-[Dry-run](../crates/ish-fs/src/engine/dry_run.rs) enumerates each directory once,
-charging retained names and frame capacities to its memory budget. It creates
-no scratch state. Transfer, hardlink, and retirement records use unlinked spool
-files. [Records](../crates/ish-fs/src/engine/records.rs) uses an in-spool AVL index
-for logarithmic path lookup without extra descriptors. Private spool encoding
-is version 2. Durable quarantine records use the shared v2 writer and a
-restoration-only v1 reader. Unknown versions are rejected.
+Whole-tree transfer holds the source directory instead of its parent, then
+reopens `..` and verifies the saved parent before publication. This preserves
+space for the independent quarantine lock within the 16-descriptor minimum.
+Sources named `.` or `..` retain and budget their original parent descriptor.
 
-During whole-tree transfer, the held source directory replaces its parent
-descriptor. Before publication, the engine reopens `..` through that directory
-and requires the saved parent identity. This leaves room for the independent
-quarantine root lock within the 16-descriptor minimum budget. Sources named `.`
-and `..` retain their original parent descriptor. Admission charges that extra
-descriptor and refuses the operation when the budget cannot fit it.
-
-Hardlink coordination keeps one active owner per source inode. Locks are
-released before data transfer, synchronization, and event delivery. Regular
-files and symlink objects share coordination; linking never follows a symlink.
-
-Multi-source moves and merges record completed directory renames without
-walking them. A later hardlink transfer indexes each recorded tree once. If
-copied representatives already exist, the next directory is inspected for a
-coupled group. A coupled tree uses transfer and guarded retirement. Reused
-regular-file representatives are synchronized before durable retirement.
-See [transfer.rs](../crates/ish-fs/src/engine/transfer.rs) and its
+One owner coordinates each hardlink inode; no coordination lock spans transfer,
+synchronization, or event delivery. Regular files and symlink objects share
+coordination without following links. Multi-source moves record whole-directory
+renames lazily and index a renamed tree once when another hardlink needs it.
+Trees coupled to existing representatives use transfer and guarded retirement;
+reused regular-file representatives are synchronized before retirement. See
+[transfer.rs](../crates/ish-fs/src/engine/transfer.rs) and its
 [repair regressions](../crates/ish-fs/src/engine/repair_tests.rs).
 
-Transfer counter meanings are defined on
-[Progress and Metrics](../crates/ish-fs/src/lib.rs). Logical cloned bytes and
-streamed bytes do not measure physical I/O. Phase timings can overlap and must
-not be added to estimate elapsed time.
+[Progress and Metrics](../crates/ish-fs/src/lib.rs) define the counters. Logical
+clone bytes and streamed bytes are distinct, neither measures physical I/O,
+and overlapping phase timings must not be summed as elapsed time.
 
 ## State and process boundaries
 
-- Shell variables live in epsh's variable store. Startup imports the inherited
-  environment once and assigns `SHELL` and `PWD` there. Directory changes update
-  `PWD` and `OLDPWD` there. No production path mutates the host environment;
-  the public process-environment mutation wrappers have been removed.
-  Child processes receive exported store values and prefix assignments through
-  explicit environments; inherited non-shell names retain their bytes.
-  In-process lookup, completion and prompt identity use store values.
-  Config and history convenience constructors can read inherited `HOME`; the
-  interactive binary supplies its store-derived home through explicit inputs.
-- A standalone `cd` runs in ish. For `cd` inside a list, epsh updates the
-  command working directory; ish notices the resulting directory change and
-  runs the directory-change hooks, including denv.
-- Directory listing, completion, pathname expansion, and prompt Git inspection
-  run in-process. External commands and command substitutions may start child
-  processes. A `.envrc` that requests bash evaluation may also start one.
+Shell variables live in epsh's store. Startup imports the inherited environment
+once; `SHELL`, `PWD`, and `OLDPWD` updates stay there. Children get explicit
+exported environments and prefix assignments, retaining non-shell-name bytes.
+The interactive binary passes store-derived HOME to config/history and derives
+lookup, completion, and prompt identity from the store. Convenience library
+constructors may read inherited HOME. Production never mutates host environment.
 
-Denv receives a mutable epsh shell and uses its actual cwd for discovery. It
-restores the prior layer into an owned variable-store candidate, evaluates from
-that candidate's exported environment, and validates all resulting changes on a
-clone before publishing anything. The matching active record is persisted before
-the store is replaced. Readonly or persistence errors retain the current layer.
-Evaluation failure publishes only the deliberate prior-layer restoration and
-dirty metadata, after validating and clearing the old active record.
-`on_startup` and `on_cd` return `Result<(), String>`; `command` returns a status.
-There is no public delta for callers to apply partially.
+Standalone `cd` runs in ish; list-form `cd` changes epsh's cwd, which ish observes
+before running directory hooks. Listing, completion, globbing, and prompt Git
+inspection stay in-process. External commands, substitutions, and bash-selected
+`.envrc` evaluation can spawn children.
 
-Active-record version 2 encodes project paths and prior value bytes in hex, with
-explicit exported/local tags for assigned and declared-but-unset bindings,
-and a separate absent-binding tag. Version 1 and unversioned
-records retain their historical escaped-text meaning and restore their values
-as exported bindings. Only version 2 is written. Atomic replacement keeps a
-failed write from replacing a previous restoration record.
+[denv.rs](../src/denv.rs) restores a prior layer into a cloned variable store,
+evaluates from its exported environment, validates changes, and replaces the
+active record before publishing the store. Readonly/persistence failures retain
+the current layer. Evaluation failure publishes the validated prior-layer
+restoration and dirty metadata after clearing the old record. Nested inherited
+state currently can lack restoration provenance; [ISH-89's draft](rfc/ISH-89-nested-denv-restoration.md)
+proposes the missing ownership contract.
 
-denv trust filenames use SHA-256 of canonical path bytes to keep storage names
-bounded. Revocation removes both current and legacy approvals. The storage
-boundary is implemented in [denv.rs](../src/denv.rs).
+Active-record v2 encodes paths/value bytes in hex and distinguishes exported,
+local, declared-but-unset, and absent bindings. Older records keep their escaped
+text interpretation and restore exported bindings; only v2 is written. Atomic
+replacement preserves the previous record on write failure. Trust filenames use
+SHA-256 of canonical path bytes, and revocation removes current and legacy approvals.
 
-Both denv evaluators install rejecting stubs for the six retired file-loading
-helpers. An evaluation-owned nonblocking pipe carries fixed-size helper records
-through epsh forks and bash subprocess contexts. Each helper reports through two
-independently owned descriptors allocated at 10 or higher. A temporary redirection
-of either reporter cannot hide the failure on the other. Bash inherits the
-allocated descriptors without reserving a fixed failure descriptor.
-A record invalidates the whole
-candidate independently of its final status. Bash polls the failure pipe beside
-its environment snapshot pipes under the same deadline. epsh checks the pipe
-after its evaluator releases owned children. Both evaluators receive explicit
-working environments; epsh uses `ShellBuilder::environment`, while bash uses
-`Command::env_clear` and explicit entries.
-The trust boundary covers the discovered, approved bytes. Explicit sourcing by
-approved code carries the author's authority without denv approval of its targets.
-Trusted code can deliberately replace both reporters or redefine the rejecting
-helpers. The failure channel does not sandbox approved code.
+Both evaluators reject retired file-loading helpers. `dotenv_if_exists` accepts
+only the discovered approved `.env` assignments, including absence; final automatic
+loading still wins over `.envrc` exports. Fixed-size failure records travel over
+an evaluation-owned nonblocking pipe with two reporter descriptors at 10 or
+higher, so redirecting one cannot hide failure. Any record rejects the candidate
+regardless of final status. Bash polls failure/snapshot pipes under one deadline;
+epsh checks after releasing owned children. Explicit sourcing still carries the
+approved author's authority. Redefining helpers/reporters is possible because
+this is a trust boundary, not a sandbox.
 
-Evaluator fork, wait, callback, and cancellation behavior belongs to the
-[epsh process model](../crates/epsh/docs/process-model.md).
-
-The binary entry point [main.rs](../src/main.rs) parses CLI arguments and enters
-[shell.rs](../src/shell.rs). Its private `Shell` owns the evaluator, denv,
-history, aliases, suspended job, capture and input reader. Terminal polling,
-raw mode, output flushing, persistence and command execution remain there.
-
-The library [editor.rs](../src/editor.rs) owns the line, mode, history navigation,
-layout and reusable completion/search/path buffers behind private fields.
-`EditorContext` borrows aliases, history, cwd, HOME, PATH and recent directories;
-it contains no interactive shell or evaluator. `EditorEvent` carries key, paste
-and measured resize input. `EditorAction` requests submission, cancellation,
-exit, completion, history sync/search, directory changes or a layout dump.
-`write_output` writes buffered rendering to a caller-selected sink without
-flushing the terminal. Resize does not perform ioctls. Relative completion uses
-the borrowed cwd and leaves the host cwd unchanged. Dispatch and action tags
-add no per-event heap allocation; existing strings and completion/search buffers
-are retained across prompts.
-
-[mode.rs](../src/mode.rs) is private library state. [external.rs](../src/external.rs)
-implements native dispatch; epsh owns external spawning and job waits.
-[diagnostics.rs](../src/diagnostics.rs) renders layout dumps and writes them with
-collision-only retries; other open errors preserve their actual path and cause.
-[cd_rewrite.rs](../src/cd_rewrite.rs) owns `cd` history rewriting. Parser and
-evaluator internals belong to [epsh's architecture](../crates/epsh/docs/architecture.md).
+The library [editor.rs](../src/editor.rs) owns private line/mode/layout state and
+reusable buffers. Borrowed `EditorContext` has aliases, history, cwd, HOME, PATH,
+and directories, with no evaluator. Typed events/actions separate editing from
+terminal polling, execution, persistence, and job effects in the binary.
+Rendering writes to a caller-selected sink without flushing; resize takes
+measured dimensions. Relative completion uses borrowed cwd without host `chdir`.
+The current partial-path budget and edit-transition gaps are in [TODO](../TODO.md).
 
 ## Accepted boundary decisions
 
-Accepted records remain the contracts for the boundaries below. [TODO](../TODO.md)
-tracks implementation status and native verification limits:
-
-- [ISH-24](rfc/ISH-24-builtin-allowlist.md): one finite interactive builtin
-  policy for planning, expanded argv, completion, and lookup.
-- [ISH-15, ISH-52 and ISH-48](rfc/ISH-15-environment-and-shell-ownership.md):
-  explicit environments, a private binary `Shell` in `src/shell.rs`, and a
-  library editor seam in `src/editor.rs`.
-- [ISH-5](rfc/ISH-5-foreground-job-outcomes.md) and
-  [ISH-8](rfc/ISH-8-callback-process-boundary.md): epsh-owned tracked jobs and
-  explicit callback process boundaries.
-- [ISH-32](rfc/ISH-32-capture-and-retire.md): shared journaled quarantine and
-  identity primitives, with conservative recovery rather than resumed deletion.
-
-The Linux release policy is implemented, including the native macOS panic
-diagnostic. Privileged macOS ownership acceptance remains [ISH-45](../TODO.md).
+Retain the accepted RFCs as this repository requires: [builtin policy](rfc/ISH-24-builtin-allowlist.md),
+[environment/editor ownership](rfc/ISH-15-environment-and-shell-ownership.md),
+[foreground jobs](rfc/ISH-5-foreground-job-outcomes.md),
+[callback process boundaries](rfc/ISH-8-callback-process-boundary.md),
+[filesystem retirement](rfc/ISH-32-capture-and-retire.md),
+[denv trust](rfc/ISH-26-denv-sourced-file-trust.md),
+[input-tail ownership](rfc/ISH-62-capture-input-tail.md),
+[login-shell delegation](rfc/ISH-63-login-shell-command.md), and
+[release delivery](rfc/ISH-42-release-delivery.md). [TODO](../TODO.md) holds remaining
+implementation and native acceptance work, including privileged macOS ownership.
 
 ## Semantic verification
 
-See the [formal guide](../formal/README.md) for semantic checks and their
-limits, and [epsh testing](../crates/epsh/docs/testing.md) for Rust and native
-corpus commands.
-
-Shell terminology follows [epsh's architecture](../crates/epsh/docs/architecture.md).
+The [formal guide](../formal/README.md) and [coverage matrix](verification/coverage.md)
+distinguish model proofs, bounded Rust comparisons, and extracted shift refinement.
+They do not prove terminal or kernel behavior. [epsh testing](../crates/epsh/docs/testing.md)
+owns its Rust/native corpus commands; [epsh architecture](../crates/epsh/docs/architecture.md)
+defines parser/evaluator terminology and internals.

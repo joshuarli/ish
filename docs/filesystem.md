@@ -378,17 +378,25 @@ Trailing `/` characters on operand paths never change the operation mode: `src`
 and `src/` produce the exact same target mapping.
 
 Sync defaults:
+
 - Recurses into directory trees automatically.
 - Quick-check skips unchanged regular files when entry kind, logical size, and modification timestamp match.
 - Differing destination files are updated atomically via staged replacement.
-- Symlinks are preserved as symlink objects without following contents.
+- Source symlinks are copied as symlink objects. Destination directory symlinks are currently followed during recursive synchronization, including `--delete`.
 - `--delete` removes destination entries absent from the source mapping; without the flag, destination-only files remain intact.
 - `-n` is not supported (rejected with status 2 to prevent confusion with `cp -n` `--no-clobber`); use `--dry-run`.
 - Remote rsync protocol, daemon mode, and network rolling delta transfer are non-goals. Use explicit `/usr/bin/rsync` for remote transfers.
 
+Sync uses a separate path-based engine. It does not share the `cp`/`mv` ancestry
+preflight, descriptor anchoring, or quarantine journal. Destination symlinks can
+redirect writes/deletions outside the target tree, and `--delete` can remove a
+source nested inside the destination before copying it. [ISH-83](../TODO.md#ish-83--p1--rsync-can-delete-its-source-or-files-outside-its-destination)
+tracks those demonstrated defects. Deletion errors can also produce status 0
+and inflated removal counts ([ISH-85](../TODO.md#ish-85--p2--rsync-reports-success-when-requested-deletions-fail)).
+
 ## Recovery limits
 
-Both fdu deletion and ish-fs retirement use the shared journaled quarantine
+Both fdu deletion and `cp`/`mv` retirement use the shared journaled quarantine
 protocol. Recovery restores verified captures without replacing live names and
 stops the operation so the caller must rescan and plan again. When the
 deletion filesystem cannot support that protocol (for example exFAT),
@@ -396,8 +404,9 @@ deletion filesystem cannot support that protocol (for example exFAT),
 reports a warning. Deleted entries stay deleted, interruption or
 cancellation leaves only remaining entries, and the next operation needs no
 recovery or rescan for journal state. A restrictive umask remains a hard
-failure and never falls back. ish-fs still
+failure and never falls back. `mv` still
 validates source versions and durable destination receipts before retiring a
 source. SIGKILL tests cover process interruption; they do not establish power
 loss durability or storage-device behavior. ARM64 Linux acceptance and the
 remaining macOS limits are recorded in [filesystem testing](filesystem-testing.md).
+Native `rsync` removes entries directly and has no journaled recovery.

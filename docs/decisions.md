@@ -7,6 +7,11 @@ the choice, the evidence, and what would reopen it.
 
 Status: accepted (2026-10-31).
 
+This record preserves the measurements and alternatives from that date.
+History's `latest_occurrences` and `session` now use vectors; the historical
+collection descriptions below do not describe their current representation.
+The decision to reject `bbtree` remains in force.
+
 ### Decision
 
 `ish` and `epsh` use `rustc_hash::FxHashMap` and `rustc_hash::FxHashSet` for

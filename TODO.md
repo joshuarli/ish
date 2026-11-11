@@ -1,67 +1,58 @@
 Prefix: ISH
-Next: 83
+Next: 92
 
 ## Accepted owner decisions
 
-The linked decisions are accepted implementation contracts, with acceptance
-criteria. Retain decision records after delivery and update the shipped behavior
-references when implementation lands.
+The [accepted boundary records](docs/architecture.md#accepted-boundary-decisions)
+remain implementation contracts. Retain those RFCs after delivery, as required
+by this repository. Open work and verification limits are listed below.
 
-This table records accepted decisions, implementation dependencies, and
-verification limits. Open implementation and acceptance work is listed below.
+## Interactive improvement constraints
 
-| Tickets | Accepted direction | Implementation dependency |
-|---|---|---|
-| [ISH-24](docs/rfc/ISH-24-builtin-allowlist.md) | Finite builtin policy; environment-only `set`; shared dispatch/lookup/completion rules | Implemented; focused Linux acceptance passed |
-| [ISH-26](docs/rfc/ISH-26-denv-sourced-file-trust.md) | Retire implicit sourcing helpers; keep trusted `.env` assignment parsing | Implemented; both evaluators and rejection regressions passed |
-| [ISH-15, ISH-52](docs/rfc/ISH-15-environment-and-shell-ownership.md) | Explicit environments; remove host environment mutation and unsupported safety comments | Implemented; Linux and ordinary-user macOS environment/history checks passed |
-| [ISH-5](docs/rfc/ISH-5-foreground-job-outcomes.md) | Structured stopped-job handles; epsh owns every child wait | Implemented; Linux and native macOS PTY/process tests passed |
-| [ISH-8](docs/rfc/ISH-8-callback-process-boundary.md) | Creator-process callbacks by default; explicit unsafe child opt-in | Implemented after ISH-5; Linux and native macOS callback boundary tests passed |
-| [ISH-32](docs/rfc/ISH-32-capture-and-retire.md) | Shared journaled fdu quarantine and identity primitives | Linux x86_64 and ARM64 musl acceptance passed, including Btrfs FICLONE; ARM64 ran in an OrbStack VM; macOS under ISH-45 |
-| [ISH-42](docs/rfc/ISH-42-release-delivery.md) | Default-branch releases, verified bytes, diagnostic panic aborts | Linux implementation verified; native macOS release build and panic diagnostic passed |
-| [ISH-48](docs/rfc/ISH-15-environment-and-shell-ownership.md#ish-48-private-session-testable-editor) | Private binary `Shell`; reusable library editor | Implemented; focused Linux editor and PTY acceptance passed |
-| [ISH-45](docs/filesystem.md#macos-staging-permissions) | Keep filesystem operations in-process; macOS masks must preserve owner read/search | Implemented with explicit rejection; ordinary-user native gates passed; privileged ownership acceptance remains |
-| [ISH-62](docs/rfc/ISH-62-capture-input-tail.md) | Keep unwritten input tail on converged capture relay; return on session end | Implemented; PTY input capture tests passed; debug `?` builtin retired under ISH-73 (converged relay/capture infrastructure retained for terminal handling and jobs) |
-| [ISH-63](docs/rfc/ISH-63-login-shell-command.md) | Login shell `-c COMMAND` delegation to `/bin/sh -c`; `--config` for file | Implemented; non-interactive invocation tests passed |
-| [ISH-73](#ish-73--p1--remove-debug-output-capture) | Remove the debugging-only `?` builtin and terminal-output capture rather than extending the capture architecture | Implemented 2026-11-09 (`4a24aac`); `?` builtin/tests/docs removed; PTY relay/capture infrastructure retained for converged terminal handling and suspended-job capture; filesystem quarantine unchanged |
+- Keep ish interactive-only, with no scripting expansion, plugins, themes, configurable prompt language, daemon, or general-purpose TUI framework. Preserve one suspended job and epsh ownership of child waits.
+- Keep completion, listing, and Git inspection in-process. Reuse epsh syntax information; editor inspection must not execute substitutions or introduce another parser/AST.
+- The debugging-only `?` command is removed. Terminal integration owns output navigation/search/selection. The PTY relay remains for terminal handling and suspended jobs; filesystem quarantine is unrelated.
+- Do not add `denv status`, `denv diff`, or other denv introspection. The nested-session finding below concerns existing state restoration.
+- Preserve matched-workload performance evidence for interactive changes: prompt/completion latency, allocations, release size, and resource behavior. Never trade away execution, byte-preservation, or durability guarantees.
+- Update the README contract and focused behavior tests when implementing changes. Keep native-terminal evidence separate from model proofs and deterministic PTY checks.
 
-## Interactive improvement campaign
-
-Owner requested these TODOs on 2026-11-09. This is a backlog, not a claim that
-all of the work below has shipped.
-
-- Do not add `denv status`, `denv diff`, or other denv introspection work. Existing denv behavior is outside this campaign.
-- `?` and its terminal-output capture command were removed under ISH-73. Output navigation, search, selection, and copying belong to terminal integration (ISH-74 and ISH-80), not new shell-owned output storage.
-- Keep ish interactive-only, with no scripting expansion, general plugin/completion framework, themes, configurable prompt language, daemon, or new general-purpose TUI framework. Preserve the single suspended-job limit and epsh ownership of child waits.
-- Keep shell-owned completion, listing, and Git inspection in-process. Reuse epsh lexical/syntax information rather than introducing a second parser or an ish-owned AST. Editor inspection must not execute substitutions or commands.
-- Record before/after prompt and completion latency, allocations, release size, and relevant resource behavior on matched workloads. Reuse existing benchmarks and buffers; require measured justification for dependencies, binary growth, or hot-path regressions. Never trade away execution, byte-preservation, or filesystem durability guarantees for convenience.
-- Each implementation updates the relevant README contract and focused tests. Retain historical RFCs and qualify their status; do not erase evidence or claim model proofs establish untested terminal behavior.
-
-Suggested delivery order: complete terminal interop gaps (ISH-80 actionable
-parts), then editing (ISH-77). Argument-aware completion (ISH-75) is deferred
-for now due to potential blast radius (epsh inspection API, completion hot
-path, and in-process Git metadata). Highlighting and picker consistency
-(ISH-78/79) and prerelease identity (ISH-82) are lower priority.
+Fix the data-loss and build defects before discretionary expansion. ISH-75's
+argument-aware feature remains deferred. Preserve the existing owner priorities
+and won't-do decisions; priorities for ISH-83 through ISH-91 are assumed from
+review impact and likelihood.
 
 ## Open implementation tickets
 
-### ISH-73 · P1 · Remove debug output capture
+### ISH-83 · P1 · rsync can delete its source or files outside its destination
 
-- **Status:** Done (2026-11-09, `4a24aac`). Removed the debugging-only `?` builtin. The original acceptance called for removing capture-only PTY/relay machinery; that broader removal was not done because `src/capture.rs` still provides converged terminal handling and suspended-job capture used by normal execution/job control. Scope delivered: `?` command, handler, lookup/completion/dispatch exposure, dedicated tests, and user-facing docs removed; `copy-scrollback` and filesystem quarantine/journals unchanged.
-- **Area:** Simplification / terminal correctness
-- **Where:** `src/capture.rs`, `src/shell.rs`, `src/job.rs`, `src/builtin.rs`, `src/lib.rs`, relevant epsh foreground integration, `tests/pty.rs`, `README.md`, `docs/architecture.md`, capture RFCs and verification notes
-- **Delivered:** `?` removed from dispatch, lookup, completion/help, builtin registry, and shell handling. `?`-specific PTY coverage/helpers removed; retained PTY coverage still exercises converged terminal behavior and large-output relay robustness. README/architecture updated. Focused checks: `cargo test --test integration builtin_is_builtin_known`, lib tests (288 passed; 1 pre-existing env failure in `history::persistence_tests::damaged_final_frame_is_a_torn_tail`), `cargo test --test pty --no-run`.
-- **Follow-up:** If the project still wants full capture-relay retirement, that is separate work: it must preserve ordinary terminal inheritance/foreground handling, `/dev/tty` behavior, job control, and epsh contracts, and should be gated by ISH-80/native PTY evidence.
-- **Effort:** M–L (builtin removal delivered; full relay retirement not attempted)
+- **Area:** Data
+- **Where:** `crates/ish-fs/src/sync.rs:90`, `crates/ish-fs/src/sync.rs:711`, `crates/ish-fs/src/sync.rs:926`, `src/sync_command.rs:58`; existing root checks in `crates/ish-fs/src/policy.rs:306`.
+- **Problem:** Sync mutates path-based mappings without the ancestry preflight and no-follow traversal used by `cp`/`mv`. Two deterministic public-API probes reproduced data loss. With `src/sub/copied`, `dest/sub -> outside`, and `outside/sentinel`, `rsync --contents --delete src dest` deletes the outside sentinel, writes `outside/copied`, and returns 0. With `dest/src/only-copy`, `rsync --contents --delete dest/src dest` deletes the source before transfer, returns 1, and leaves neither copy. No concurrent actor is needed.
+- **Recommendation:** Validate all mappings and reject overlapping source/destination ancestry before any mutation. Reuse held, identity-checked directory descriptors and the existing root/policy primitives. Treat destination symlinks as entries rather than traversing their targets. Preserve sync mapping semantics and add both failing fixtures, including operand aliases and multiple-source overlap.
+- **Fix with:** `os-boundaries`
+- **Effort:** M (days)
 
-### ISH-74 · P1 · Add native terminal command integration
+### ISH-84 · P1 · make build is rejected by the supplied musl builder
 
-- **Status:** Implemented (2026-11-09); native-terminal matrix evidence remains under ISH-80.
-- **Area:** Interactive UX / terminal protocol
-- **Where:** `src/shell.rs`, `src/editor.rs`, `src/prompt.rs`, `src/term.rs`, `tests/pty.rs`, `README.md`
-- **Delivered:** Emits OSC 133 A/B around each interactive prompt cycle, C before command execution, and D with exit status at completion. Cancelled input closes the prompt with D and no C; dispatch refusals emit D;2 with no C. Suspended commands emit D;148 and `fg` emits its own C/D around resume. Continuations stay in the same input session. Markers are emitted at runtime boundaries (not editor repaints) to the interactive terminal; redirected command output files and delegated `ish -c` do not receive markers. README documents terminal-owned capabilities/limits. Byte-level PTY assertions cover marker order/status, cancellation/refusal, resize non-duplication, continuation, suspend/fg, redirection isolation, and delegated `ish -c`.
-- **Dependencies:** ISH-73 delivered the execution-path baseline; ISH-80 still owns native-terminal evidence (Ghostty/other terminals, SSH/tmux, completion/notification behavior where supported).
-- **Effort:** S–M
+- **Area:** Build
+- **Where:** `Makefile:7`, `Makefile:16`, `Dockerfile:119`.
+- **Problem:** `make build` selects `musl-cargo` when available and passes `MUSL_BUILD_MODE=dev`. The Dockerfile's wrapper accepts only `static`, `test`, `driver`, and `release-static`. Running `make build TARGET=x86_64-unknown-linux-musl` with the unchanged embedded wrapper extracted onto PATH exits 2 before compilation: `musl-cargo: unknown build mode: dev`. Plain `cargo check --workspace` succeeds, so the ordinary-host fallback hides this supplied-builder defect.
+- **Recommendation:** Give the development build a supported wrapper mode with the required host/target linking policy, or explicitly support `dev`. Verify `make build` through that wrapper and retain the existing release/test modes. This requires no new CI workflow.
+- **Fix with:** `single-source-of-truth`
+- **Effort:** S (hours)
+
+### ISH-77 · P1 · Improve line editing and autosuggestion acceptance
+
+- **Status:** In progress (2026-11-09).
+- **Area:** Editor UX
+- **Where:** `src/line.rs`, `src/editor.rs:424`, `src/editor.rs:513`, `src/editor.rs:585`, `src/editor/tests.rs`, `src/input.rs`, `src/render.rs`, `tests/pty.rs`, `README.md`
+- **Delivered:** Ctrl+Right at the end of input accepts the next word of the history autosuggestion while Right still accepts the whole suggestion (`suggestion_word_accept_len`, editor key handling). Word movement is path-aware and stops at `/` separators. Bounded undo/redo (Ctrl+_ / Alt+R, 256-entry stacks) covers normal-mode typing/paste/Up-Down history recall and common edits; typing coalesces and navigation breaks groups. Input decoding recognizes Ctrl+`\`, `]`, `^`, and `_` bytes. Focused `line` and `editor` unit tests added; README documents bindings.
+- **Remaining:** Full undo/redo grouping/coverage for completion preview/accept/refilter, alias expansion boundaries, multiline edits, cancelled pickers, quoting/path cursor movement cases, combining/wide/narrow/wrapped PTY coverage, and warm-path allocation/memory verification.
+- **Dependencies:** Undo/redo can proceed independently; share syntax-aware movement work with ISH-75/78.
+- **Problem:** Completion and Ctrl+R acceptance mutate the line without an undo transition. Reproduced through the real editor: paste `echo al`, complete file `alpha`, then Ctrl+_ submits an empty line instead of restoring `echo al`; from an empty line, accept history `echo recalled`, then Ctrl+_ leaves `echo recalled` unchanged. These are missing behaviors, not only coverage gaps.
+- **Recommendation:** Record one committed edit for completion/history acceptance, keep previews out of undo, restore the original text and cursor on cancellation, and invalidate redo on a committed edit. Cover these sequences through `Editor` before broadening the remaining editing work.
+- **Fix with:** `make-invalid-states-unrepresentable`
+- **Effort:** M
 
 ### ISH-80 · P1 · Establish a terminal interoperability regression matrix
 
@@ -71,28 +62,97 @@ path, and in-process Git metadata). Highlighting and picker consistency
 - **Delivered:** [docs/terminal-interop-matrix.md](docs/terminal-interop-matrix.md) separates deterministic PTY coverage from native/manual observations. Automated PTY coverage includes OSC 7, OSC 133 lifecycle (order/status, cancel/refusal, continuation, suspend/fg, redirection isolation), delegated `ish -c` non-emission, bounded resize storms, bounded repeated stop/resume, single-command `/dev/tty` input (`converged_command_reads_from_dev_tty`), alt-screen sequence relay passthrough with shell responsiveness (`alternate_screen_sequences_pass_through_relay`), raw OSC 52 clipboard emission for `copy-scrollback` (`osc52_copy_scrollback_emits_base64_session_log`), and SIGHUP-at-prompt exit/restore (`shell_sighup_at_prompt_exits_and_restores_terminal`).
 - **Remaining:** Reproducible native/manual evidence for Ghostty, an independent terminal, SSH sessions, and tmux (prompt navigation/output boundaries, notification/completion behavior where supported), plus focused instrumentation/native runs for leaked descriptors/children, hung waits, lost input, terminal-mode restoration across native environments, and external child hangup/EOF edge cases. Unavailable native environments remain explicitly unverified, not passes.
 - **Dependencies:** Acceptance gate for ISH-73/74 terminal behavior; retain as standing evidence, not a claim that PTY emulates real terminals completely.
+- **Problem:** Native-terminal behavior remains unverified beyond the recorded deterministic PTY cases. The specific signal-during-execution defects found by this review have their own implementation tickets below.
+- **Recommendation:** Complete the named native/manual observations and record failures separately from deterministic PTY evidence. Do not expand this into a new CI or generic smoke-test project.
+- **Fix with:** `test-audit`
 - **Effort:** M
 
 ### ISH-75 · P1 · Add argument-aware in-process completion
 
 - **Status:** Deferred (potential blast radius).
 - **Area:** Completion
-- **Where:** `src/editor.rs`, `src/complete.rs`, `src/builtin.rs`, `src/path.rs`, epsh lexer/parser interfaces, `docs/completion.md`, editor/integration/PTY tests, `benches/bench.rs`
+- **Where:** `src/editor.rs:1429`, `src/editor.rs:1448`, `src/editor.rs:1469`, `src/complete.rs`, `src/builtin.rs`, `src/path.rs`, epsh lexer/parser interfaces, `docs/completion.md`, editor/integration/PTY tests, `benches/bench.rs`
 - **Recommendation:** Complete ish builtin options and operands, common command subcommands/options, and Git branches, tags, and remotes. Start with a finite native set, using builtin metadata as the source of truth where possible. Derive the command and argument position from reusable epsh lexical/syntax information instead of expanding `shell_tokens`, `split_whitespace`, and ad hoc command-position heuristics. Add a bounded tolerant inspection API in epsh if incomplete input requires one; do not build a second parser or evaluate the line. Read Git metadata in-process with explicit worktree/common-dir, loose/packed-ref, invalidation, and resource-bound behavior.
 - **Acceptance:** Tests cover incomplete quotes, escapes, assignments, redirections, command lists/pipelines, aliases, supported wrappers, mid-line insertion, option arguments, and `--`. Suggestions preserve quoting and operand bytes, remain aligned with dispatch restrictions, and never execute substitutions. Git fixtures cover worktrees and changed refs without stale suggestions. Preserve existing path/host matching and ordering contracts unless an intentional change is documented. Benchmark cold/warm completion and large candidate sets; no subprocess-per-keystroke behavior, plugin ecosystem, or general completion configuration language.
 - **Deferral note:** Deferred for now due to potential blast radius across the epsh inspection surface, completion hot path, and in-process Git metadata behavior. Revisit as a focused, benchmark-gated change.
 - **Dependencies:** Shared syntax inspection should also serve ISH-78 and syntax-aware editing in ISH-77.
+- **Problem:** Current path completion already corrupts midword edits. With file `alpha`, type `cat alpha`, move Left three times, and press Tab: the real editor submits `cat alphapha`. Completing before the closing quote in `cat 'al'` renders `cat 'alpha''` and leaves input incomplete. `preview_completion` appends the old cursor suffix after inserting an entire token. Track the full token replacement span and existing closing quote, preserving subsequent arguments. This bounded correctness repair does not require the deferred argument-aware feature.
+- **Fix with:** `single-source-of-truth`
 - **Effort:** M
 
-### ISH-77 · P1 · Improve line editing and autosuggestion acceptance
+### ISH-85 · P2 · rsync reports success when requested deletions fail
 
-- **Status:** In progress (2026-11-09).
-- **Area:** Editor UX
-- **Where:** `src/line.rs`, `src/editor.rs`, `src/editor/tests.rs`, `src/input.rs`, `src/render.rs`, `tests/pty.rs`, `README.md`
-- **Delivered:** Ctrl+Right at the end of input accepts the next word of the history autosuggestion while Right still accepts the whole suggestion (`suggestion_word_accept_len`, editor key handling). Word movement is path-aware and stops at `/` separators. Bounded undo/redo (Ctrl+_ / Alt+R, 256-entry stacks) covers normal-mode typing/paste/history recall and common edits; typing coalesces and navigation breaks groups. Input decoding recognizes Ctrl+`\`, `]`, `^`, and `_` bytes. Focused `line` and `editor` unit tests added; README documents bindings.
-- **Remaining:** Full undo/redo grouping/coverage for completion preview/accept/refilter, alias expansion boundaries, multiline edits, cancelled pickers, quoting/path cursor movement cases, combining/wide/narrow/wrapped PTY coverage, and warm-path allocation/memory verification.
-- **Dependencies:** Undo/redo can proceed independently; share syntax-aware movement work with ISH-75/78.
-- **Effort:** M
+- **Area:** Errors
+- **Where:** `crates/ish-fs/src/sync.rs:1065`, `crates/ish-fs/src/sync.rs:197`, `src/sync_command.rs:110`.
+- **Problem:** `delete_entry` ignores metadata, enumeration, unlink, and directory-removal failures, increments deletion counts before removal, and never marks the operation failed. With an empty source and `dest/locked/kept`, where `locked` is mode `0555`, an ordinary-user `--delete` probe returns 0 and reports two deletions while `kept` still exists.
+- **Recommendation:** Propagate structured deletion failures with their paths, distinguish absent entries from operational errors, and return nonzero after a failed deletion or enumeration. Count actual removals after success; keep dry-run planned counts explicit. Add the permission-failure fixture at the public sync boundary.
+- **Fix with:** `error-model`
+- **Effort:** S (hours)
+
+### ISH-86 · P2 · Foreground children prevent TERM and HUP shutdown
+
+- **Area:** Concurrency
+- **Where:** `src/shell.rs:135`, `src/shell.rs:234`, `src/signal.rs:164`, `src/signal.rs:333`, `crates/epsh/src/eval.rs:1242`, `crates/epsh/src/jobs.rs:214`, `tests/pty.rs:4875`.
+- **Problem:** TERM/HUP set ish's pending-termination state, but interactive epsh waits observe only their own cancellation flag/deadline. A PTY probe waits for `/bin/sh -c 'echo CHILD:$$; /bin/sleep 60'` to announce readiness, then signals ish. Both signals leave ish running past the 1.5-second watchdog; it exits 143/129 only after the probe kills the child group. A child that never exits can defer shutdown indefinitely. The existing test's child immediately exits after sending the signal and misses this case.
+- **Recommendation:** Connect termination requests to epsh's cancellation mechanism, preserving the original signal for ish's final status. Have epsh terminate and reap its owned children, then finish capture and restore the terminal. Cover a ready, blocked child and assert bounded shutdown, child cleanup, and usable terminal modes.
+- **Fix with:** `lifecycle-concurrency`
+- **Effort:** M (days)
+
+### ISH-87 · P2 · Fatal cleanup restores the wrong terminal during a command
+
+- **Area:** Concurrency
+- **Where:** `src/capture.rs:333`, `src/capture.rs:374`, `src/capture.rs:550`, `src/signal.rs:261`, `src/signal.rs:274`, `src/signal.rs:285`, `tests/pty.rs:4900`.
+- **Problem:** Converged capture makes the real terminal raw and replaces fds 0/1/2 with an inner PTY. Fatal cleanup restores fd 0 and writes to fd 1, then exits without the relay's restoration. Sending SIGABRT while a ready external child runs exits ish with 134 but leaves the retained outer terminal's `ICANON`, `ECHO`, and `ISIG` disabled. The probe observed local-mode flags 2608 instead of the original 35387. Existing fatal-signal tests run at the prompt, before descriptor replacement.
+- **Recommendation:** Give signal-safe cleanup a stable, owned descriptor for the actual terminal before standard descriptors can be replaced. Restore its modes and output controls there, preserving the existing fatal-status contract and correct child descriptor inheritance. Add the command-running case to the existing fatal-signal regression.
+- **Fix with:** `os-boundaries`
+- **Effort:** M (days)
+
+### ISH-88 · P2 · exit ignores quoting and expansion and silently returns zero
+
+- **Area:** Errors
+- **Where:** `src/dispatch.rs:68`, `src/dispatch.rs:84`, `src/shell.rs:393`, `src/shell.rs:683`.
+- **Problem:** Dispatch retains parsed arguments, but the exit handler reparses the raw line with `split_whitespace` and maps any integer parse failure to zero. Exact-binary PTY probes show `false` followed by `exit $?` exits 0, and `exit '7'` also exits 0. The parent receives success instead of the requested status.
+- **Recommendation:** Expand the existing parsed arguments at the shell-builtin boundary, validate zero or one numeric operand, and report invalid arguments/expansion failures without silently choosing success. Preserve the current no-argument policy and suspended-job confirmation. Cover quoted status, `$?`, invalid operands, and expansion errors.
+- **Fix with:** `error-model`
+- **Effort:** S (hours)
+
+### ISH-89 · P2 · Nested denv sessions lose project restoration provenance
+
+- **Area:** Data
+- **Where:** `src/denv.rs:143`, `src/denv.rs:227`, `src/denv.rs:306`, `src/denv.rs:322`.
+- **Problem:** `init` replaces the inherited record ID, then the inherited `__DENV_STATE` can satisfy the refresh fast path without an active restoration record. A real-API probe approves `.env` changing a value from `baseline` to `project`, starts a child shell with the parent's exported environment, then leaves the project. The child retains `project` while clearing `__DENV_DIR`; the original shell restores `baseline`. The state/provenance mismatch is demonstrated; nested-shell inheritance semantics are not settled by the existing accepted RFCs.
+- **Recommendation:** Adopt an explicit nested-session contract. Prefer independently owned restoration provenance for an inherited active layer, without reusing or deleting the parent's record. Preserve random session IDs, exact binding bytes/export state, and atomic store publication. Do not reopen denv introspection or history-privacy features.
+- **Fix with:** `durable-state`
+- **Effort:** M (days)
+- **Design:** [Nested denv restoration](docs/rfc/ISH-89-nested-denv-restoration.md).
+
+### ISH-90 · P2 · Comments can trap complete commands in continuation
+
+- **Area:** Errors
+- **Where:** `src/editor.rs:871`, `src/editor.rs:1725`, `src/editor.rs:1737`.
+- **Problem:** Continuation detection scans quotes, backslashes, and trailing operators inside comments. The real editor refuses to submit `echo okay # don't wait`, `echo okay # |`, and a comment ending in backslash, although `dispatch::plan` accepts each complete command. The apostrophe case keeps subsequent ordinary lines in continuation until a matching quote or cancellation.
+- **Recommendation:** Derive completion/incompletion from epsh lexical/parser state without evaluation. At minimum, make comments opaque to continuation detection and distinguish complete input from definite syntax errors and genuinely incomplete syntax. Add the three editor-versus-dispatch cases; this repair is independent of deferred argument-aware completion.
+- **Fix with:** `single-source-of-truth`
+- **Effort:** S (hours)
+
+### ISH-91 · P2 · Interactive partial-path completion has no directory budget
+
+- **Area:** Performance
+- **Where:** `src/editor.rs:1332`, `src/complete.rs:633`, `src/complete.rs:651`, `src/complete.rs:793`.
+- **Problem:** The editor uses `complete_partial_path_from` and its unbounded recursive `resolve_directory`, while the older resolver retains a 64-directory cutoff. A fixture with 70 `branchNN/itemNN` paths, completed through the real editor as `cat br/item`, returns candidates from all 70 directories. Nested broad prefixes multiply synchronous traversal and retained directories. This proves the missing bound, not a measured latency or memory regression.
+- **Recommendation:** Give both explicit-cwd and compatibility entry points one partial-directory resolver and one work/result budget. Enforce the bound during collection and descent, preserve deterministic ordering and borrowed-cwd behavior, and test the actual editor path on branching fixtures.
+- **Fix with:** `deduplicate`
+- **Effort:** S (hours)
+
+### ISH-45 · P3 · Native macOS privileged ownership acceptance remains incomplete
+
+- **Status:** The accepted restrictive-umask boundary is implemented. Ordinary-user macOS workspace tests, `make test`, and strict workspace Clippy passed. Only privileged ownership acceptance remains. Re-checked: `clone_declines_inherited_read_denial_before_creation` and `clone_declines_before_creation_when_owner_read_is_absent` still take the root branch only when `geteuid` is 0, and `private_directory_prepares_foreign_owned_staging_directory` is still ignored.
+- **Area:** Tests
+- **Where:** `crates/ish-fs/tests/native_macos.rs:210`, `crates/ish-fs/tests/native_macos.rs:304`, `crates/ish-fs/tests/native_macos.rs:562` (`clone_declines_inherited_read_denial_before_creation`, `clone_declines_before_creation_when_owner_read_is_absent`, `private_directory_prepares_foreign_owned_staging_directory`), `docs/filesystem-testing.md`
+- **Problem:** The foreign-owner clone branches and staging case require native root access to change ownership and drop credentials. The recorded ordinary-user passes do not establish those branches; this review did not run native macOS tests.
+- **Recommendation:** Run the two clone-decline cases as root and the ignored foreign-owned staging case using the commands in the filesystem testing guide. Close this ticket only after those native branches pass. The implementation and support-boundary decisions are settled.
+- **Fix with:** none
+- **Effort:** S (hours)
 
 ### ISH-78 · P3 · Add parser-aware highlighting and diagnostics
 
@@ -102,6 +162,7 @@ path, and in-process Git metadata). Highlighting and picker consistency
 - **Recommendation:** Extend command-existence coloring to shell words, quotes, operators, redirections, and unsupported/invalid syntax using the shared epsh inspection path. Distinguish incomplete input that legitimately needs continuation from a definite syntax/policy error. Validate commands at each command position rather than treating the entire line as one whitespace-delimited command. Keep the visual vocabulary fixed and small; no themes or configurable highlighter language.
 - **Acceptance:** Highlighting and completion agree on spans and command positions for aliases, assignments, nested substitutions, multiline input, and supported operators. Inspection never evaluates substitutions, performs redirections, or mutates shell state; actual dispatch remains authoritative. Highlighted text cannot inject terminal controls. Snapshot/PTY coverage checks cursor geometry and Unicode/wrapping, and benchmarks quantify repaint/inspection cost.
 - **Dependencies:** Reuse the tolerant lexical/syntax work from ISH-75 and integrate with ISH-77's edit model.
+- **Fix with:** `single-source-of-truth`
 - **Effort:** M
 
 ### ISH-79 · P3 · Make interactive pickers consistent
@@ -112,6 +173,7 @@ path, and in-process Git metadata). Highlighting and picker consistency
 - **Recommendation:** Make Ctrl+R history search, Tab completion, and Ctrl+Backspace directory selection a coherent family: consistent acceptance/cancellation, keyboard navigation, filtering/paste behavior, empty states, and resizing. Retain useful domain differences such as completion's grid and directory selection's navigation purpose. Share small layout/input helpers only where that removes duplication; do not introduce a generic TUI framework or change `fdu`'s independent browser contract gratuitously.
 - **Acceptance:** A documented key/behavior matrix and focused tests show that cancellation restores the intended original input, previews do not execute commands, selection remains stable as results change, and resize/paste/multiline cases leave no stale rows or displaced cursor. Memory remains bounded and existing rendering caches/buffer reuse are preserved. Output search/selection stays terminal-owned under ISH-74 rather than adding a fourth picker backed by capture storage.
 - **Dependencies:** Coordinate with ISH-75/77/78; preserve intentional existing paste/cancellation contracts unless explicitly revised.
+- **Fix with:** `deduplicate`
 - **Effort:** S–M
 
 ### ISH-82 · P3 · Give prereleases explicit version and revision identity
@@ -122,31 +184,17 @@ path, and in-process Git metadata). Highlighting and picker consistency
 - **Recommendation:** Define a lightweight development/prerelease version policy instead of leaving user-visible builds indefinitely identified only as `0.0.0`. Align package version, `ish -V`, release tags/names, and archive names, while retaining a source revision identifier for exact bug reports. Do not imply a stable API/behavior guarantee before one is intended, or turn this into a new release-management subsystem.
 - **Acceptance:** A produced artifact can be traced unambiguously to its source revision and declared version. Local development builds and tagged prereleases report their identity consistently. Verify release metadata without weakening the existing verified-bytes, panic-diagnostic, static-Linux, or native-macOS release requirements.
 - **Dependencies:** Coordinate published license metadata with the root MIT license; preserve ISH-42's release contract.
+- **Fix with:** `single-source-of-truth`
 - **Effort:** S
-
-### ISH-45 · P3 · Native macOS privileged ownership acceptance remains incomplete
-
-- **Status:** The accepted restrictive-umask boundary is implemented. Ordinary-user macOS workspace tests, `make test`, and strict workspace Clippy passed. Only privileged ownership acceptance remains. Re-checked: `clone_declines_inherited_read_denial_before_creation` and `clone_declines_before_creation_when_owner_read_is_absent` still take the root branch only when `geteuid` is 0, and `private_directory_prepares_foreign_owned_staging_directory` is still ignored.
-- **Area:** Tests
-- **Where:** `crates/ish-fs/tests/native_macos.rs` (`clone_declines_inherited_read_denial_before_creation`, `clone_declines_before_creation_when_owner_read_is_absent`, `private_directory_prepares_foreign_owned_staging_directory`), `docs/filesystem-testing.md`
-- **Problem:** The foreign-owner clone branches and staging case require native root access to change ownership and drop credentials. Noninteractive sudo still requires a password on this host, so ordinary-user passes do not establish those branches.
-- **Recommendation:** Run the two clone-decline cases as root and the ignored foreign-owned staging case using the commands in the filesystem testing guide. Close this ticket only after those native branches pass. The implementation and support-boundary decisions are settled.
-- **Fix with:** none
-- **Effort:** S (hours)
 
 ## Won't do
 
 ### ISH-76 · Selective history privacy and execution metadata
 
 - **Status:** Won't do.
-- **Reason:** History is a plain file under the user's control (`~/.local/share/ish/history.log`); sensitive entries can be removed by editing the history file. The added complexity of leading-space exclusion, cross-shell deletion propagation, compaction/delete records, and versioned execution metadata is not justified here.
+- **Reason:** The owner declined leading-space exclusion, selective cross-shell deletion, compaction/delete records, and versioned execution metadata. Preserve that decision. The current `~/.local/share/ish/history.log` is a checksummed binary journal, not editable line-oriented text; use `history` to inspect it and `history reset` to clear it.
 
 ### ISH-60 · Journaled retirement makes large flat EXDEV moves take minutes
 
 - **Status:** Dropped.
 - **Reason:** Parked candidate exists but timing proof requires quiet-host, interleaved baseline/candidate measurement (weeks-scale effort). Not worth pursuing now.
-
-### ISH-81 · Resolve repository-wide licensing
-
-- **Status:** Done (2026-11-09).
-- **Resolution:** Added root [LICENSE](LICENSE) (MIT) for the top-level `ish` project, set `license = "MIT"` in [Cargo.toml](Cargo.toml), and updated [README.md](README.md#help-and-license). Existing bundled/imported crate and fixture license/notice files are retained (for example `ish-fs` LICENSE/IMPORT.md, `epsh` conformance NOTICE, fdu crate licenses).

@@ -1,7 +1,8 @@
 # Build and check ish
 
 Use the toolchain pinned in [rust-toolchain.toml](../rust-toolchain.toml).
-Linux musl builds use mold. Rust compilations use the configured kache wrapper.
+The [Dockerfile](../Dockerfile) supplies pinned musl-linked LLVM tools and a
+`musl-cargo` wrapper. The repository does not configure mold or kache.
 Keep scratch files under the ignored `.work/` directory:
 
 ```sh
@@ -9,6 +10,10 @@ mkdir -p .work/tmp
 export TMPDIR="$PWD/.work/tmp"
 make build
 ```
+
+In the supplied musl builder, `make build` currently passes the unsupported
+`dev` wrapper mode and stops before compilation. [ISH-84](../TODO.md#ish-84--p1--make-build-is-rejected-by-the-supplied-musl-builder)
+tracks that defect. Plain-host Cargo checks do not exercise the wrapper contract.
 
 [Makefile](../Makefile) owns build and release commands.
 [Cargo.toml](../Cargo.toml) defines workspace members and default members.

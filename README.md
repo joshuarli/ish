@@ -69,8 +69,9 @@ accept, and Escape to cancel.
 
 Ctrl+R opens history search. Type to filter, use Up and Down to navigate,
 Enter to accept, and Escape to cancel. History is saved in
-`~/.local/share/ish/history.log`. `history` prints saved commands and
-`history reset` clears them.
+`~/.local/share/ish/history.log` as a checksummed binary journal. Use `history`
+to inspect saved commands and `history reset` to clear them; editing the journal
+as text corrupts its records.
 
 ## Commands
 
@@ -129,6 +130,12 @@ directory. Use an explicit path such as `/bin/cp`, `/bin/mv`, or
 Interrupted file operations may leave recoverable state on filesystems that
 support it. See [File operation reference](docs/filesystem.md) for collision
 options, recovery, and platform-specific behavior.
+
+Native `rsync` currently has destructive overlap and destination-symlink
+defects, including deletion outside the destination with `--delete`.
+Use an explicit external executable while those
+[data-safety defects](TODO.md#ish-83--p1--rsync-can-delete-its-source-or-files-outside-its-destination)
+remain open. Its deletion path has no journaled recovery.
 
 ## Job control and terminal
 
