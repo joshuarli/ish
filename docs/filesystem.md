@@ -382,17 +382,14 @@ Sync defaults:
 - Recurses into directory trees automatically.
 - Quick-check skips unchanged regular files when entry kind, logical size, and modification timestamp match.
 - Differing destination files are updated atomically via staged replacement.
-- Source symlinks are copied as symlink objects. Destination directory symlinks are currently followed during recursive synchronization, including `--delete`.
-- `--delete` removes destination entries absent from the source mapping; without the flag, destination-only files remain intact.
+- Source symlinks are copied as symlink objects. A destination symlink is an entry, not a path to its referent: recursive synchronization replaces or deletes the link itself and never traverses it.
+- `--delete` removes destination entries absent from the source mapping; without the flag, destination-only files remain intact. A failed deletion is reported with its path and produces status 1, and the deleted count includes only removals that succeeded. A dry run reports planned removals without counting them as completed.
 - `-n` is not supported (rejected with status 2 to prevent confusion with `cp -n` `--no-clobber`); use `--dry-run`.
 - Remote rsync protocol, daemon mode, and network rolling delta transfer are non-goals. Use explicit `/usr/bin/rsync` for remote transfers.
 
-Sync uses a separate path-based engine. It does not share the `cp`/`mv` ancestry
-preflight, descriptor anchoring, or quarantine journal. Destination symlinks can
-redirect writes/deletions outside the target tree, and `--delete` can remove a
-source nested inside the destination before copying it. [ISH-83](../TODO.md#ish-83--p1--rsync-can-delete-its-source-or-files-outside-its-destination)
-tracks those demonstrated defects. Deletion errors can also produce status 0
-and inflated removal counts ([ISH-85](../TODO.md#ish-85--p2--rsync-reports-success-when-requested-deletions-fail)).
+Sync validates every mapping before mutating anything. It rejects source/destination ancestry overlaps in either direction, repeated or overlapping source operands, and duplicate outputs with status 2, even when operand paths or their prefixes are aliases through `..` or symlinks. The mapping forms themselves do not change: exact, `--into`, and `--contents` still map as described above.
+
+Sync uses a separate path-based engine. It does not share the `cp`/`mv` descriptor anchoring or quarantine journal. Symlinks within the operand paths themselves are followed. Destination entries reached by recursive traversal are still synchronized by pathname, so concurrent replacement of a destination path component remains outside its guarantees.
 
 ## Recovery limits
 

@@ -23,15 +23,6 @@ review impact and likelihood.
 
 ## Open implementation tickets
 
-### ISH-83 · P1 · rsync can delete its source or files outside its destination
-
-- **Area:** Data
-- **Where:** `crates/ish-fs/src/sync.rs:90`, `crates/ish-fs/src/sync.rs:711`, `crates/ish-fs/src/sync.rs:926`, `src/sync_command.rs:58`; existing root checks in `crates/ish-fs/src/policy.rs:306`.
-- **Problem:** Sync mutates path-based mappings without the ancestry preflight and no-follow traversal used by `cp`/`mv`. Two deterministic public-API probes reproduced data loss. With `src/sub/copied`, `dest/sub -> outside`, and `outside/sentinel`, `rsync --contents --delete src dest` deletes the outside sentinel, writes `outside/copied`, and returns 0. With `dest/src/only-copy`, `rsync --contents --delete dest/src dest` deletes the source before transfer, returns 1, and leaves neither copy. No concurrent actor is needed.
-- **Recommendation:** Validate all mappings and reject overlapping source/destination ancestry before any mutation. Reuse held, identity-checked directory descriptors and the existing root/policy primitives. Treat destination symlinks as entries rather than traversing their targets. Preserve sync mapping semantics and add both failing fixtures, including operand aliases and multiple-source overlap.
-- **Fix with:** `os-boundaries`
-- **Effort:** M (days)
-
 ### ISH-77 · P1 · Improve line editing and autosuggestion acceptance
 
 - **Status:** In progress (2026-11-09).
@@ -67,15 +58,6 @@ review impact and likelihood.
 - **Dependencies:** Shared syntax inspection should also serve ISH-78 and syntax-aware editing in ISH-77.
 - **Fix with:** `single-source-of-truth`
 - **Effort:** M
-
-### ISH-85 · P2 · rsync reports success when requested deletions fail
-
-- **Area:** Errors
-- **Where:** `crates/ish-fs/src/sync.rs:1065`, `crates/ish-fs/src/sync.rs:197`, `src/sync_command.rs:110`.
-- **Problem:** `delete_entry` ignores metadata, enumeration, unlink, and directory-removal failures, increments deletion counts before removal, and never marks the operation failed. With an empty source and `dest/locked/kept`, where `locked` is mode `0555`, an ordinary-user `--delete` probe returns 0 and reports two deletions while `kept` still exists.
-- **Recommendation:** Propagate structured deletion failures with their paths, distinguish absent entries from operational errors, and return nonzero after a failed deletion or enumeration. Count actual removals after success; keep dry-run planned counts explicit. Add the permission-failure fixture at the public sync boundary.
-- **Fix with:** `error-model`
-- **Effort:** S (hours)
 
 ### ISH-89 · P2 · Nested denv sessions lose project restoration provenance
 

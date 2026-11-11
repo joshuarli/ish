@@ -12,7 +12,7 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
 use crate::platform::{self, MetadataTarget, Preservation};
 use crate::policy::into_basename;
-use crate::roots::{self, EntryKind, Identity};
+use crate::roots::{self, EntryKind, Identity, Requirement, Root};
 use crate::{Cancellation, Completion, Context, Diagnostic, Event, EventSink, Jobs, TRANSFER_BUFFER_BYTES};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -87,6 +87,25 @@ pub fn execute(
         failed: false,
     };
 
+    let cwd = match rustix::fs::open(
+        &request.context.cwd,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(error) => {
+            let _ = sink.emit(Event::Diagnostic(Diagnostic {
+                path: request.context.cwd.clone(),
+                message: format!("cannot open working directory: {error}"),
+            }));
+            return SyncOutcome {
+                progress: session.progress,
+                completion: Completion::Failed,
+            };
+        }
+    };
+    let cwd = cwd.as_fd();
+
     match &request.operands {
         SyncOperands::Into { directory, sources } => {
             let target_dir = resolve_path(&request.context.cwd, directory);
@@ -113,6 +132,7 @@ pub fn execute(
                     completion: Completion::InvalidRequest,
                 };
             }
+            let mut mappings = Vec::with_capacity(sources.len());
             for source in sources {
                 if cancellation.is_cancelled() {
                     return SyncOutcome {
@@ -132,8 +152,26 @@ pub fn execute(
                     }
                 };
                 let src_path = resolve_path(&request.context.cwd, source);
-                let dst_path = target_dir.join(basename);
-                session.sync_pair(&src_path, &dst_path, false);
+                mappings.push(Mapping {
+                    source: src_path,
+                    destination: target_dir.join(basename),
+                });
+            }
+            if let Err(diagnostic) = validate_mappings(cwd, &mappings) {
+                let _ = sink.emit(Event::Diagnostic(diagnostic));
+                return SyncOutcome {
+                    progress: session.progress,
+                    completion: Completion::InvalidRequest,
+                };
+            }
+            for mapping in mappings {
+                if cancellation.is_cancelled() {
+                    return SyncOutcome {
+                        progress: session.progress,
+                        completion: Completion::Cancelled,
+                    };
+                }
+                session.sync_pair(&mapping.source, &mapping.destination, false);
             }
         }
         SyncOperands::Contents { source, directory } => {
@@ -185,12 +223,32 @@ pub fn execute(
                 }
                 _ => {}
             }
-            session.sync_pair(&src_path, &dst_path, true);
+            let mapping = Mapping {
+                source: src_path,
+                destination: dst_path,
+            };
+            if let Err(diagnostic) = validate_mappings(cwd, std::slice::from_ref(&mapping)) {
+                let _ = sink.emit(Event::Diagnostic(diagnostic));
+                return SyncOutcome {
+                    progress: session.progress,
+                    completion: Completion::InvalidRequest,
+                };
+            }
+            session.sync_pair(&mapping.source, &mapping.destination, true);
         }
         SyncOperands::Exact { source, destination } => {
-            let src_path = resolve_path(&request.context.cwd, source);
-            let dst_path = resolve_path(&request.context.cwd, destination);
-            session.sync_pair(&src_path, &dst_path, false);
+            let mapping = Mapping {
+                source: resolve_path(&request.context.cwd, source),
+                destination: resolve_path(&request.context.cwd, destination),
+            };
+            if let Err(diagnostic) = validate_mappings(cwd, std::slice::from_ref(&mapping)) {
+                let _ = sink.emit(Event::Diagnostic(diagnostic));
+                return SyncOutcome {
+                    progress: session.progress,
+                    completion: Completion::InvalidRequest,
+                };
+            }
+            session.sync_pair(&mapping.source, &mapping.destination, false);
         }
     }
 
@@ -205,6 +263,175 @@ pub fn execute(
     SyncOutcome {
         progress: session.progress,
         completion,
+    }
+}
+
+struct Mapping {
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+struct ValidatedMapping {
+    source_path: PathBuf,
+    destination_path: PathBuf,
+    source: Root,
+    destination: Option<Root>,
+}
+
+fn validate_mappings(cwd: BorrowedFd<'_>, mappings: &[Mapping]) -> Result<(), Diagnostic> {
+    let mut validated = Vec::with_capacity(mappings.len());
+    for mapping in mappings {
+        let Ok(source) = Root::establish(cwd, &mapping.source, Requirement::Existing) else {
+            continue;
+        };
+        let destination = match Root::establish(cwd, &mapping.destination, Requirement::MayBeAbsent) {
+            Ok(destination) => Some(destination),
+            Err(_) => {
+                if let Some(ancestor) = nearest_existing_directory(cwd, &mapping.destination)
+                    && source
+                        .is_ancestor_of(&ancestor)
+                        .map_err(|error| validation_error(&mapping.source, error))?
+                {
+                    return Err(overlap_error(&mapping.source));
+                }
+                None
+            }
+        };
+        if let Some(ref destination) = destination
+            && (source
+                .same_entry(destination)
+                .map_err(|error| validation_error(&mapping.source, error))?
+                || source
+                    .is_ancestor_of(destination)
+                    .map_err(|error| validation_error(&mapping.source, error))?
+                || destination
+                    .is_ancestor_of(&source)
+                    .map_err(|error| validation_error(&mapping.destination, error))?)
+        {
+            return Err(overlap_error(&mapping.source));
+        }
+        validated.push(ValidatedMapping {
+            source_path: mapping.source.clone(),
+            destination_path: mapping.destination.clone(),
+            source,
+            destination,
+        });
+    }
+
+    for (index, mapping) in validated.iter().enumerate() {
+        for (other_index, other) in validated.iter().enumerate() {
+            if index == other_index {
+                continue;
+            }
+            if mapping
+                .source
+                .same_entry(&other.source)
+                .map_err(|error| validation_error(&mapping.source_path, error))?
+            {
+                return Err(mapping_error(
+                    &mapping.source_path,
+                    "source operand is repeated",
+                ));
+            }
+            if mapping
+                .source
+                .is_ancestor_of(&other.source)
+                .map_err(|error| validation_error(&mapping.source_path, error))?
+            {
+                return Err(mapping_error(
+                    &mapping.source_path,
+                    "source operands overlap by directory ancestry",
+                ));
+            }
+            if let Some(ref destination) = other.destination {
+                if mapping
+                    .source
+                    .same_entry(destination)
+                    .map_err(|error| validation_error(&mapping.source_path, error))?
+                {
+                    return Err(mapping_error(
+                        &mapping.source_path,
+                        "an output conflicts with another source operand",
+                    ));
+                }
+                if mapping
+                    .source
+                    .is_ancestor_of(destination)
+                    .map_err(|error| validation_error(&mapping.source_path, error))?
+                {
+                    return Err(overlap_error(&mapping.source_path));
+                }
+            }
+            if let Some(ref destination) = mapping.destination {
+                if destination
+                    .is_ancestor_of(&other.source)
+                    .map_err(|error| validation_error(&mapping.destination_path, error))?
+                {
+                    return Err(mapping_error(
+                        &mapping.destination_path,
+                        "destination lies within a source directory",
+                    ));
+                }
+                if let Some(ref other_destination) = other.destination {
+                    if destination
+                        .same_entry(other_destination)
+                        .map_err(|error| validation_error(&mapping.destination_path, error))?
+                    {
+                        return Err(mapping_error(
+                            &mapping.destination_path,
+                            "multiple sources map to the same output",
+                        ));
+                    }
+                    if destination
+                        .is_ancestor_of(other_destination)
+                        .map_err(|error| validation_error(&mapping.destination_path, error))?
+                    {
+                        return Err(mapping_error(
+                            &mapping.destination_path,
+                            "destination directories overlap by directory ancestry",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn nearest_existing_directory(cwd: BorrowedFd<'_>, path: &Path) -> Option<Root> {
+    let mut current = path.to_path_buf();
+    loop {
+        if let Ok(root) = Root::establish(cwd, &current, Requirement::Existing)
+            && root
+                .observed
+                .is_some_and(|observed| observed.identity.kind == EntryKind::Directory)
+        {
+            return Some(root);
+        }
+        let parent = current.parent()?.to_path_buf();
+        if parent == current {
+            return None;
+        }
+        current = parent;
+    }
+}
+
+fn validation_error(path: &Path, error: io::Error) -> Diagnostic {
+    Diagnostic {
+        path: path.to_path_buf(),
+        message: format!("cannot validate sync mapping: {error}"),
+    }
+}
+
+fn overlap_error(path: &Path) -> Diagnostic {
+    mapping_error(path, "source and destination overlap by directory ancestry")
+}
+
+fn mapping_error(path: &Path, message: &str) -> Diagnostic {
+    Diagnostic {
+        path: path.to_path_buf(),
+        message: message.to_owned(),
     }
 }
 
@@ -717,11 +944,27 @@ impl SyncSession<'_> {
 
         let initial_transferred = self.progress.transferred_files;
         let initial_deleted = self.progress.deleted_files;
-        let target_dir_existed = target_dir.exists();
+        let target_meta = fs::symlink_metadata(&target_dir).ok();
+        let target_dir_existed = target_meta.is_some();
+        let target_was_symlink = target_meta.as_ref().is_some_and(|meta| meta.is_symlink());
+        let mut target_is_dir = target_meta.as_ref().is_some_and(|meta| meta.is_dir());
 
         if !contents_mode {
             self.progress.examined_files += 1;
-            if !target_dir_existed && !self.request.options.dry_run {
+            if !target_is_dir
+                && !self.request.options.dry_run
+                && (target_meta.is_none() || target_was_symlink)
+            {
+                if target_was_symlink
+                    && let Err(error) = fs::remove_file(&target_dir)
+                {
+                    let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+                        path: target_dir.clone(),
+                        message: format!("cannot replace destination symlink: {error}"),
+                    }));
+                    self.failed = true;
+                    return;
+                }
                 if let Err(error) = fs::create_dir_all(&target_dir) {
                     let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
                         path: target_dir.clone(),
@@ -736,6 +979,7 @@ impl SyncSession<'_> {
                         fs::Permissions::from_mode(src_meta.mode()),
                     );
                 }
+                target_is_dir = true;
             }
         }
 
@@ -753,15 +997,15 @@ impl SyncSession<'_> {
 
         let src_dir_fd = rustix::fs::open(
             src_dir,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
         )
         .ok();
 
-        let dst_dir_fd = if target_dir.exists() {
+        let dst_dir_fd = if target_is_dir {
             rustix::fs::open(
                 &target_dir,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::empty(),
             )
             .ok()
@@ -787,23 +1031,28 @@ impl SyncSession<'_> {
         }
         child_entries.sort();
 
-        if self.request.options.delete
-            && target_dir.exists()
-            && let Ok(dst_entries) = fs::read_dir(&target_dir)
-        {
-            let mut extraneous = Vec::new();
-            for entry in dst_entries.flatten() {
-                let name = entry.file_name();
-                if child_entries.binary_search(&name).is_err() {
-                    extraneous.push(entry.path());
+        if self.request.options.delete && target_is_dir {
+            match fs::read_dir(&target_dir) {
+                Ok(dst_entries) => {
+                    let mut extraneous = Vec::new();
+                    for entry in dst_entries.flatten() {
+                        let name = entry.file_name();
+                        if child_entries.binary_search(&name).is_err() {
+                            extraneous.push(entry.path());
+                        }
+                    }
+                    extraneous.sort();
+                    for path in extraneous {
+                        if self.cancellation.is_cancelled() {
+                            return;
+                        }
+                        self.delete_entry(&path);
+                    }
                 }
-            }
-            extraneous.sort();
-            for path in extraneous {
-                if self.cancellation.is_cancelled() {
-                    return;
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    self.delete_failed(&target_dir, &error);
                 }
-                self.delete_entry(&path);
             }
         }
 
@@ -1065,27 +1314,67 @@ impl SyncSession<'_> {
     fn delete_entry(&mut self, path: &Path) {
         let meta = match fs::symlink_metadata(path) {
             Ok(m) => m,
-            Err(_) => return,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error) => {
+                self.delete_failed(path, &error);
+                return;
+            }
         };
 
         if meta.is_dir() {
-            if let Ok(entries) = fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    self.delete_entry(&entry.path());
+            let entries = match fs::read_dir(path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                Err(error) => {
+                    self.delete_failed(path, &error);
+                    return;
+                }
+            };
+            for entry in entries {
+                if self.cancellation.is_cancelled() {
+                    return;
+                }
+                match entry {
+                    Ok(entry) => self.delete_entry(&entry.path()),
+                    Err(error) => self.delete_failed(path, &error),
                 }
             }
-            self.progress.deleted_files += 1;
-            let _ = self.sink.emit(Event::Progress(self.progress_event()));
-            if !self.request.options.dry_run {
-                let _ = fs::remove_dir(path);
+            if self.request.options.dry_run {
+                self.progress.deleted_files += 1;
+                let _ = self.sink.emit(Event::Progress(self.progress_event()));
+                return;
+            }
+            match fs::remove_dir(path) {
+                Ok(()) => {
+                    self.progress.deleted_files += 1;
+                    let _ = self.sink.emit(Event::Progress(self.progress_event()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => self.delete_failed(path, &error),
             }
         } else {
-            self.progress.deleted_files += 1;
-            let _ = self.sink.emit(Event::Progress(self.progress_event()));
-            if !self.request.options.dry_run {
-                let _ = fs::remove_file(path);
+            if self.request.options.dry_run {
+                self.progress.deleted_files += 1;
+                let _ = self.sink.emit(Event::Progress(self.progress_event()));
+                return;
+            }
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    self.progress.deleted_files += 1;
+                    let _ = self.sink.emit(Event::Progress(self.progress_event()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => self.delete_failed(path, &error),
             }
         }
+    }
+
+    fn delete_failed(&mut self, path: &Path, error: &io::Error) {
+        let _ = self.sink.emit(Event::Diagnostic(Diagnostic {
+            path: path.to_path_buf(),
+            message: format!("cannot delete: {error}"),
+        }));
+        self.failed = true;
     }
 
     fn progress_event(&self) -> crate::Progress {
