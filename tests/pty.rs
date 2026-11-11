@@ -5241,7 +5241,7 @@ fn osc133_continuation_does_not_emit_extra_execution_markers() {
     let _ = sh.wait_for_prompt_after_line_advance(3000);
     let raw = sh.raw_output_bytes();
     assert_eq!(osc133_positions(&raw, b"\x1b]133;C\x07").len(), 1, "continuation is one submitted command: {:?}", String::from_utf8_lossy(&raw));
-    assert!(osc133_positions(&raw, b"\x1b]133;D;0\x07").len() >= 1, "{:?}", String::from_utf8_lossy(&raw));
+    assert!(!osc133_positions(&raw, b"\x1b]133;D;0\x07").is_empty(), "{:?}", String::from_utf8_lossy(&raw));
 }
 
 #[test]
@@ -5273,7 +5273,7 @@ fn osc133_suspended_job_and_fg_emit_completion_markers() {
     let _ = sh.wait_for_prompt_after_line_advance(5000);
     let raw = sh.raw_output_bytes();
     assert!(osc133_positions(&raw, b"\x1b]133;C\x07").len() >= 2, "fg should execute as a command: {:?}", String::from_utf8_lossy(&raw));
-    assert!(osc133_positions(&raw, b"\x1b]133;D;130\x07").len() >= 1 || osc133_positions(&raw, b"\x1b]133;D;").len() >= 3, "fg completion should be marked: {:?}", String::from_utf8_lossy(&raw));
+    assert!(!osc133_positions(&raw, b"\x1b]133;D;130\x07").is_empty() || osc133_positions(&raw, b"\x1b]133;D;").len() >= 3, "fg completion should be marked: {:?}", String::from_utf8_lossy(&raw));
 }
 
 #[test]

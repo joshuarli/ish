@@ -55,7 +55,8 @@ fn external_commands_restore_terminal_signals_in_every_context() {
     let home = Home::new();
     let environment = TestEnv::hermetic_ascii().unwrap()
         .env("HOME", &home.0).env("USER", "testuser")
-        .env("PWD", &home.0).env("PATH", "/usr/bin:/bin");
+        .env("PWD", &home.0).env("PATH", "/usr/bin:/bin")
+        .env("ISH_TEST_SUPPRESS_OSC133", "1");
     let scenario = Scenario::new("external command signal dispositions").unwrap()
         .command(CommandSpec::new(common::ish_binary()).current_dir(&home.0))
         .environment(environment)

@@ -24,13 +24,15 @@ impl SearchShell {
         .env("HOME", &home)
         .env("USER", "testuser")
         .env("PWD", &home)
-        .env("PATH", "/usr/bin:/bin");
+        .env("PATH", "/usr/bin:/bin")
+        .env("ISH_TEST_SUPPRESS_OSC133", "1");
         let command = CommandSpec::new(common::ish_binary())
             .current_dir(&home)
             .env("HOME", &home)
             .env("USER", "testuser")
             .env("PWD", &home)
-            .env("PATH", "/usr/bin:/bin");
+            .env("PATH", "/usr/bin:/bin")
+            .env("ISH_TEST_SUPPRESS_OSC133", "1");
         let scenario = Scenario::new("history search paste")
             .unwrap()
             .command(command)

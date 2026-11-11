@@ -136,7 +136,7 @@ impl Editor {
                 let next = match &mut self.mode {
                     Mode::Normal => {
                         let view = &mut self.view;
-                        match handle_normal_key(key, &mut view.line, &mut view.history_idx, &mut view.saved_line, &mut view.grid_column, view.prompt_display_len, &editing, &mut view.undo) {
+                        match handle_normal_key(key, view, &editing) {
                             KeyAction::Continue => {}
                             KeyAction::Execute(text) => { if view.line.cursor() == view.line.text().len() { view.tw.write_str("\x1b[J"); } view.tw.write_str("\r\n"); return EditorAction::Submit(text); }
                             KeyAction::Continuation => { view.line.insert_char('\n'); view.history_idx = None; }
@@ -749,16 +749,9 @@ enum KeyAction {
 }
 
 
-fn handle_normal_key(
-    key: KeyEvent,
-    line: &mut LineBuffer,
-    history_idx: &mut Option<usize>,
-    saved_line: &mut String,
-    grid_column: &mut Option<usize>,
-    prompt_display_len: usize,
-    shell: &Editing<'_>,
-    undo: &mut UndoState,
-) -> KeyAction {
+fn handle_normal_key(key: KeyEvent, view: &mut EditView, shell: &Editing<'_>) -> KeyAction {
+    let prompt_display_len = view.prompt_display_len;
+    let EditView { line, history_idx, saved_line, grid_column, undo, .. } = view;
     if !matches!(key.key, Key::Up | Key::Down) || key.mods.ctrl {
         *grid_column = None;
     }
@@ -828,15 +821,15 @@ fn handle_normal_key(
         (Key::Left, _, _) if key.mods.ctrl || key.mods.alt => { undo.break_group(); line.move_word_left(); }
         (Key::Right, _, _) if key.mods.ctrl || key.mods.alt => {
             if line.cursor() >= line.text().len() && !line.has_newlines() {
-                if let Some(entry) = shell.history.session_prefix_search(line.text(), 0) {
-                    if let Some(suffix) = entry.strip_prefix(line.text()) {
-                        let take = suggestion_word_accept_len(suffix);
-                        if take > 0 {
-                            undo.before_edit(line, EditGroup::Other);
-                            let mut owned = line.text().to_string();
-                            owned.push_str(&suffix[..take]);
-                            line.set(&owned);
-                        }
+                if let Some(entry) = shell.history.session_prefix_search(line.text(), 0)
+                    && let Some(suffix) = entry.strip_prefix(line.text())
+                {
+                    let take = suggestion_word_accept_len(suffix);
+                    if take > 0 {
+                        undo.before_edit(line, EditGroup::Other);
+                        let mut owned = line.text().to_string();
+                        owned.push_str(&suffix[..take]);
+                        line.set(&owned);
                     }
                 }
             } else {
@@ -947,11 +940,11 @@ fn navigate_history(
             }
         }
     };
-    if let Some(text) = new_text {
-        if text != line.text() {
-            undo.before_edit(line, EditGroup::Other);
-            line.set(&text);
-        }
+    if let Some(text) = new_text
+        && text != line.text()
+    {
+        undo.before_edit(line, EditGroup::Other);
+        line.set(&text);
     }
 }
 
