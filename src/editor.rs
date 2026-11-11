@@ -227,7 +227,17 @@ impl UndoState {
         if self.group == Some(group) && group == EditGroup::Typing {
             return;
         }
-        let entry = UndoEntry::from_line(line);
+        self.commit(UndoEntry::from_line(line));
+        self.group = Some(group);
+    }
+
+    fn commit_if_changed(&mut self, origin: &LineBuffer, line: &LineBuffer) {
+        if origin.text() != line.text() {
+            self.commit(UndoEntry::from_line(origin));
+        }
+    }
+
+    fn commit(&mut self, entry: UndoEntry) {
         if self.undo.last() != Some(&entry) {
             self.undo.push(entry);
             if self.undo.len() > 256 {
@@ -235,7 +245,7 @@ impl UndoState {
             }
         }
         self.redo.clear();
-        self.group = Some(group);
+        self.group = None;
     }
 
     fn undo(&mut self, line: &mut LineBuffer) -> bool {
@@ -422,6 +432,7 @@ fn start_completion_mode(view: &mut EditView, mode: &mut Mode, shell: &mut Editi
         comp,
     );
     if cs.comp.len() == 1 {
+        view.undo.before_edit(&view.line, EditGroup::Other);
         preview_completion(&mut view.line, &cs, &base_line);
         *shell.completion_buffer = cs.comp;
     } else if !cs.comp.is_empty() {
@@ -429,6 +440,7 @@ fn start_completion_mode(view: &mut EditView, mode: &mut Mode, shell: &mut Editi
         preview_completion(&mut view.line, &cs, &base_line);
         *mode = Mode::Completion(CompletionMode {
             state: cs,
+            origin: base_line.clone(),
             base_line,
         });
     } else {
@@ -447,7 +459,7 @@ fn handle_completion_key_event(
 }
 
 fn apply_completion_action(view: &mut EditView, shell: &mut Editing<'_>, completion: &mut CompletionMode, action: CompletionAction) -> Next {
-    let CompletionMode { state, base_line } = completion;
+    let CompletionMode { state, base_line, origin } = completion;
     let (p, pdl) = active_prompt(&view.prompt_str, view.prompt_display_len);
     let next = match action {
         CompletionAction::Navigate => {
@@ -501,17 +513,20 @@ fn apply_completion_action(view: &mut EditView, shell: &mut Editing<'_>, complet
                 *completion = CompletionMode {
                     state: cs,
                     base_line: base_line.clone(),
+                    origin: origin.clone(),
                 };
 
                 return Next::Stay;
             } else {
                 view.line = base_line.clone();
+                view.undo.commit_if_changed(origin, &view.line);
                 *shell.completion_buffer = cs.comp;
                 Next::Normal
             }
         }
         CompletionAction::Accept => {
             preview_completion(&mut view.line, state, base_line);
+            view.undo.commit_if_changed(origin, &view.line);
             *shell.completion_buffer = std::mem::take(&mut state.comp);
             Next::Normal
         }
@@ -583,6 +598,7 @@ fn handle_history_key_event(
             Next::Stay
         }
         HistoryAction::Accept(text) => {
+            view.undo.before_edit(&view.line, EditGroup::Other);
             view.line.set(&text);
             leave_history_search(view, shell, search);
             Next::Normal
@@ -1152,6 +1168,22 @@ fn find_comp_word_start(s: &str) -> (usize, bool, bool) {
     (word_start, in_single, in_double)
 }
 
+fn find_comp_word_end(after_cursor: &str, mut in_single: bool, mut in_double: bool) -> usize {
+    let bytes = after_cursor.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'\\' if !in_single && i + 1 < bytes.len() => i += 1,
+            b' ' | b'\t' | b'\n' if !in_single && !in_double => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
 fn unescape_outside_single(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -1444,8 +1476,9 @@ fn preview_completion(line: &mut LineBuffer, state: &CompletionState, base_line:
 
     let text = base_line.text().to_string();
     let before_cursor = &text[..base_line.cursor()];
-    let (word_start, _, _) = find_comp_word_start(before_cursor);
-    let after_cursor = &text[base_line.cursor()..];
+    let (word_start, in_single, in_double) = find_comp_word_start(before_cursor);
+    let after_word = &text[base_line.cursor()..];
+    let after_cursor = &after_word[find_comp_word_end(after_word, in_single, in_double)..];
 
     let mut inner = state.dir_prefix.clone();
     inner.push_str(name);

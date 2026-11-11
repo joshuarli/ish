@@ -309,3 +309,97 @@ fn partial_path_completion_through_the_editor_is_bounded_to_the_directory_budget
     assert_eq!(names, expected);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+fn fixture(name: &str, files: &[&str]) -> std::path::PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".work/tmp").join(format!("ish-editor-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    for file in files {
+        std::fs::write(root.join(file), b"").unwrap();
+    }
+    root
+}
+
+fn key(editor: &mut Editor, context: &EditorContext<'_>, key: KeyEvent) {
+    event(editor, context, EditorEvent::Key(key));
+}
+
+#[test]
+fn completion_and_history_acceptance_are_single_undoable_edits() {
+    let root = fixture("undo-completion", &["alpha", "alpine", "unique"]);
+    let aliases = AliasMap::new();
+    let history = history::History::from_entries(vec!["echo recalled".into()]);
+    let mut ctx = context(&aliases, &history, &[]);
+    ctx.cwd = &root;
+    let mut editor = Editor::new(24, 80);
+
+    editor.begin("$ ".into(), 2, &ctx);
+    event(&mut editor, &ctx, EditorEvent::Paste("echo un"));
+    key(&mut editor, &ctx, KeyEvent::key(Key::Tab));
+    assert_eq!(editor.view.line.text(), "echo unique");
+    key(&mut editor, &ctx, KeyEvent::ctrl('_'));
+    assert_eq!((editor.view.line.text(), editor.view.line.cursor()), ("echo un", 7));
+    key(&mut editor, &ctx, KeyEvent::with_mods(Key::Char('r'), Modifiers { ctrl: false, alt: true, shift: false }));
+    assert_eq!(editor.view.line.text(), "echo unique");
+    key(&mut editor, &ctx, KeyEvent::ctrl('_'));
+    key(&mut editor, &ctx, KeyEvent::ctrl('_'));
+    assert_eq!(editor.view.line.text(), "");
+
+    editor.begin("$ ".into(), 2, &ctx);
+    event(&mut editor, &ctx, EditorEvent::Paste("echo al"));
+    key(&mut editor, &ctx, KeyEvent::key(Key::Tab));
+    key(&mut editor, &ctx, KeyEvent::key(Key::Tab));
+    key(&mut editor, &ctx, KeyEvent::key(Key::Enter));
+    let accepted = editor.view.line.text().to_string();
+    assert!(accepted == "echo alpha" || accepted == "echo alpine", "{accepted:?}");
+    key(&mut editor, &ctx, KeyEvent::ctrl('_'));
+    assert_eq!(editor.view.line.text(), "echo al");
+
+    editor.begin("$ ".into(), 2, &ctx);
+    event(&mut editor, &ctx, EditorEvent::Paste("echo al"));
+    key(&mut editor, &ctx, KeyEvent::key(Key::Tab));
+    key(&mut editor, &ctx, KeyEvent::key(Key::Tab));
+    key(&mut editor, &ctx, KeyEvent::key(Key::Escape));
+    assert_eq!((editor.view.line.text(), editor.view.line.cursor()), ("echo al", 7));
+    key(&mut editor, &ctx, KeyEvent::ctrl('_'));
+    assert_eq!(editor.view.line.text(), "", "a cancelled completion must not add an undo step");
+
+    editor.begin("$ ".into(), 2, &ctx);
+    event(&mut editor, &ctx, EditorEvent::Paste("x"));
+    key(&mut editor, &ctx, KeyEvent::ctrl('_'));
+    key(&mut editor, &ctx, KeyEvent::ctrl('r'));
+    event(&mut editor, &ctx, EditorEvent::Paste("recalled"));
+    key(&mut editor, &ctx, KeyEvent::key(Key::Enter));
+    assert_eq!(editor.view.line.text(), "echo recalled");
+    key(&mut editor, &ctx, KeyEvent::with_mods(Key::Char('r'), Modifiers { ctrl: false, alt: true, shift: false }));
+    assert_eq!(editor.view.line.text(), "echo recalled", "history acceptance must invalidate redo");
+    key(&mut editor, &ctx, KeyEvent::ctrl('_'));
+    assert_eq!(editor.view.line.text(), "");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn completion_replaces_the_whole_word_around_the_cursor() {
+    let root = fixture("midword", &["alpha"]);
+    let aliases = AliasMap::new();
+    let history = history::History::from_entries(Vec::new());
+    let mut ctx = context(&aliases, &history, &[]);
+    ctx.cwd = &root;
+    let mut editor = Editor::new(24, 80);
+    for (input, lefts, expected) in [
+        ("cat alpha", 3, "cat alpha"),
+        ("cat 'al'", 1, "cat 'alpha'"),
+        ("cat alp next", 5, "cat alpha next"),
+        ("cat al\\ x next", 8, "cat alpha next"),
+    ] {
+        editor.begin("$ ".into(), 2, &ctx);
+        event(&mut editor, &ctx, EditorEvent::Paste(input));
+        for _ in 0..lefts {
+            key(&mut editor, &ctx, KeyEvent::key(Key::Left));
+        }
+        key(&mut editor, &ctx, KeyEvent::key(Key::Tab));
+        assert_eq!(editor.view.line.text(), expected, "completing {input:?}");
+        assert!(matches!(event(&mut editor, &ctx, EditorEvent::Key(KeyEvent::key(Key::Enter))), EditorAction::Submit(line) if line == expected));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}

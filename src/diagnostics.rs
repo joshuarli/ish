@@ -69,7 +69,7 @@ pub(crate) fn render_layout_dump(out: &mut String, snapshot: LayoutSnapshot<'_>)
 
     match mode {
         Mode::Normal => {}
-        Mode::Completion(CompletionMode { state, base_line }) => {
+        Mode::Completion(CompletionMode { state, base_line, .. }) => {
             let _ = writeln!(
                 out,
                 "completion.base_line.cursor_byte: {}",

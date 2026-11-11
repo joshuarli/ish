@@ -12,6 +12,7 @@ pub(crate) enum Mode {
 pub(crate) struct CompletionMode {
     pub(crate) state: CompletionState,
     pub(crate) base_line: LineBuffer,
+    pub(crate) origin: LineBuffer,
 }
 
 pub(crate) struct HistorySearch {
