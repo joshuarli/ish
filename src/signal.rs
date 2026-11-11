@@ -9,6 +9,8 @@ static PENDING_FOREGROUND: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static PENDING_TERMINATION: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(0);
+static TERMINATION_CANCEL: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicBool> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static FOREGROUND_SIGNALS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn init() -> RawFd {
@@ -161,6 +163,13 @@ fn restore_disposition(sig: i32, action: &libc::sigaction) {
     }
 }
 
+/// Sets `flag` when SIGTERM or SIGHUP arrives so cancellable waits, such as
+/// epsh's foreground job wait, stop and clean up their children. The flag is
+/// kept for the life of the process because the handler may read it at any time.
+pub fn cancel_on_termination(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    TERMINATION_CANCEL.store(std::sync::Arc::into_raw(flag).cast_mut(), std::sync::atomic::Ordering::Release);
+}
+
 pub(crate) fn note_termination(sig: i32) {
     let _ = PENDING_TERMINATION.compare_exchange(
         0,
@@ -168,6 +177,11 @@ pub(crate) fn note_termination(sig: i32) {
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
     );
+    let cancel = TERMINATION_CANCEL.load(std::sync::atomic::Ordering::Acquire);
+    if !cancel.is_null() {
+        // SAFETY: the pointer comes from Arc::into_raw and is never released.
+        unsafe { (*cancel).store(true, std::sync::atomic::Ordering::Release) };
+    }
 }
 
 pub fn take_pending_termination() -> Option<i32> {

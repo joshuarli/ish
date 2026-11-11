@@ -129,6 +129,9 @@ pub(super) fn run(cli: crate::Args) {
     if let Err(error) = denv::on_startup(&mut shell.denv, &mut shell.epsh) { report!("denv: {error}"); }
     sync_shell_store_derived(&mut shell);
     builtin::install_epsh_policy(&mut shell.epsh);
+    let termination = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    signal::cancel_on_termination(termination.clone());
+    shell.epsh.set_cancel_flag(termination);
 
     let mut exit_code = 0;
     loop {

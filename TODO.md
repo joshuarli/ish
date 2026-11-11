@@ -77,15 +77,6 @@ review impact and likelihood.
 - **Fix with:** `error-model`
 - **Effort:** S (hours)
 
-### ISH-86 · P2 · Foreground children prevent TERM and HUP shutdown
-
-- **Area:** Concurrency
-- **Where:** `src/shell.rs:135`, `src/shell.rs:234`, `src/signal.rs:164`, `src/signal.rs:333`, `crates/epsh/src/eval.rs:1242`, `crates/epsh/src/jobs.rs:214`, `tests/pty.rs:4875`.
-- **Problem:** TERM/HUP set ish's pending-termination state, but interactive epsh waits observe only their own cancellation flag/deadline. A PTY probe waits for `/bin/sh -c 'echo CHILD:$$; /bin/sleep 60'` to announce readiness, then signals ish. Both signals leave ish running past the 1.5-second watchdog; it exits 143/129 only after the probe kills the child group. A child that never exits can defer shutdown indefinitely. The existing test's child immediately exits after sending the signal and misses this case.
-- **Recommendation:** Connect termination requests to epsh's cancellation mechanism, preserving the original signal for ish's final status. Have epsh terminate and reap its owned children, then finish capture and restore the terminal. Cover a ready, blocked child and assert bounded shutdown, child cleanup, and usable terminal modes.
-- **Fix with:** `lifecycle-concurrency`
-- **Effort:** M (days)
-
 ### ISH-87 · P2 · Fatal cleanup restores the wrong terminal during a command
 
 - **Area:** Concurrency

@@ -4934,6 +4934,43 @@ fn sigterm_and_sighup_restore_the_terminal_and_exit_with_the_signal_status() {
     }
 }
 
+fn ready_child_pid(sh: &PtyShell) -> i32 {
+    let out = PtyShell::strip_ansi(&sh.wait_for(":READY", 5000));
+    let end = out.find(":READY").expect("child announced readiness");
+    let start = out[..end].rfind("CHILD:").expect("child announced its pid") + "CHILD:".len();
+    out[start..end].parse().expect("child pid")
+}
+
+fn assert_process_gone(pid: i32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(std::time::Instant::now() < deadline, "child {pid} outlived ish");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn sigterm_and_sighup_end_a_blocked_foreground_child_and_exit_promptly() {
+    for (signal, status) in [(libc::SIGTERM, 143), (libc::SIGHUP, 129)] {
+        let sh = PtyShell::spawn();
+        sh.type_str("/bin/sh -c 'printf \"CHILD:%s:%s\\n\" $$ READY; exec /bin/sleep 60'");
+        sh.enter();
+        let child = ready_child_pid(&sh);
+        let mut terminal = sh.terminal.borrow_mut();
+        let started = std::time::Instant::now();
+        terminal.signal(signal).unwrap();
+        let deadline = terminal.deadline(std::time::Duration::from_secs(3));
+        let exit = terminal.wait_for_exit(deadline).expect("ish exits while its child is blocked");
+        assert_eq!(exit, ExitStatus::Code(status), "signal {signal}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500), "shutdown took {:?}", started.elapsed());
+        terminal
+            .assert_terminal_restored(&sh.terminal_baseline)
+            .unwrap_or_else(|e| panic!("terminal not restored after signal {signal}: {e:?}"));
+        drop(terminal);
+        assert_process_gone(child);
+    }
+}
+
 #[test]
 fn fatal_crash_signals_restore_the_terminal_and_exit_with_the_signal_status() {
     // Expect 128+signo computed from the platform's own signal numbers:
