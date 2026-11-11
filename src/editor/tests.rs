@@ -286,3 +286,26 @@ fn comments_do_not_hold_complete_commands_in_continuation() {
         assert!(matches!(action, EditorAction::Continue), "{input:?} must continue");
     }
 }
+
+#[test]
+fn partial_path_completion_through_the_editor_is_bounded_to_the_directory_budget() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".work/tmp").join(format!("ish-editor-partial-budget-{}", std::process::id()));
+    for branch in 0..70 {
+        std::fs::create_dir_all(root.join(format!("branch{branch:02}"))).unwrap();
+        std::fs::write(root.join(format!("branch{branch:02}/item{branch:02}")), b"").unwrap();
+    }
+    let aliases = AliasMap::new();
+    let history = history::History::from_entries(Vec::new());
+    let mut context = context(&aliases, &history, &[]);
+    context.cwd = &root;
+    let mut editor = Editor::new(24, 80);
+    editor.begin("$ ".into(), 2, &context);
+    event(&mut editor, &context, EditorEvent::Paste("cat br/item"));
+    event(&mut editor, &context, EditorEvent::Key(KeyEvent::key(Key::Tab)));
+    let Mode::Completion(CompletionMode { state, .. }) = &editor.mode else { panic!("completion did not open") };
+    let mut names: Vec<&str> = (0..state.comp.len()).map(|index| state.comp.name(index)).collect();
+    names.sort_unstable();
+    let expected: Vec<String> = (0..64).map(|branch| format!("branch{branch:02}/item{branch:02}")).collect();
+    assert_eq!(names, expected);
+    std::fs::remove_dir_all(root).unwrap();
+}

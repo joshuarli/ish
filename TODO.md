@@ -108,15 +108,6 @@ review impact and likelihood.
 - **Effort:** M (days)
 - **Design:** [Nested denv restoration](docs/rfc/ISH-89-nested-denv-restoration.md).
 
-### ISH-91 · P2 · Interactive partial-path completion has no directory budget
-
-- **Area:** Performance
-- **Where:** `src/editor.rs:1332`, `src/complete.rs:633`, `src/complete.rs:651`, `src/complete.rs:793`.
-- **Problem:** The editor uses `complete_partial_path_from` and its unbounded recursive `resolve_directory`, while the older resolver retains a 64-directory cutoff. A fixture with 70 `branchNN/itemNN` paths, completed through the real editor as `cat br/item`, returns candidates from all 70 directories. Nested broad prefixes multiply synchronous traversal and retained directories. This proves the missing bound, not a measured latency or memory regression.
-- **Recommendation:** Give both explicit-cwd and compatibility entry points one partial-directory resolver and one work/result budget. Enforce the bound during collection and descent, preserve deterministic ordering and borrowed-cwd behavior, and test the actual editor path on branching fixtures.
-- **Fix with:** `deduplicate`
-- **Effort:** S (hours)
-
 ### ISH-45 · P3 · Native macOS privileged ownership acceptance remains incomplete
 
 - **Status:** The accepted restrictive-umask boundary is implemented. Ordinary-user macOS workspace tests, `make test`, and strict workspace Clippy passed. Only privileged ownership acceptance remains. Re-checked: `clone_declines_inherited_read_denial_before_creation` and `clone_declines_before_creation_when_owner_read_is_absent` still take the root branch only when `geteuid` is 0, and `private_directory_prepares_foreign_owned_staging_directory` is still ignored.

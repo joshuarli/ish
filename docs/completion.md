@@ -11,10 +11,10 @@ omitted unless the typed prefix begins with `.`, and directory-only contexts
 exclude other entries. Path candidates are sorted by modification time, newest
 first, with case-insensitive name order for ties. Duplicate names are removed.
 
-Partial path components can resolve to more than one directory. The editor's
-explicit-cwd resolver currently has no directory-expansion bound; the older
-resolver's 64-directory cutoff does not protect this path. [ISH-91](../TODO.md#ish-91--p2--interactive-partial-path-completion-has-no-directory-budget)
-tracks the missing work budget. Completion stays in-process. Entry metadata uses
+Partial path components can resolve to more than one directory. Each
+component expands to at most 64 directories, the first in path order; matches
+beyond that bound are dropped while the directory is read, so nested broad
+prefixes cannot multiply traversal. Completion stays in-process. Entry metadata uses
 `fstatat` against an opened directory, and candidate buffers are reused.
 
 The implementation and ordering tests are in

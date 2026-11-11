@@ -595,41 +595,6 @@ fn complete_in_directory(dir: &std::ffi::OsStr, prefix: &str, dirs_only: bool, c
     finish_candidates(comp, before, prefix, prefix_count);
 }
 
-/// Fish-style partial path completion: each intermediate directory component
-/// is treated as a prefix. e.g., "/home/user/de/s" finds entries starting
-/// with "s" in /home/user/dev/, /home/user/Desktop/, etc.
-/// Returns (resolved_dir_with_slash, start_idx, count) tuples indexing into the Completions.
-pub fn complete_partial_path(
-    partial: &str,
-    dirs_only: bool,
-) -> (Completions, Vec<(String, usize, usize)>) {
-    let (dir, prefix) = split_path(partial);
-    if dir.is_empty() {
-        return (Completions::new(), Vec::new());
-    }
-
-    let dir_trimmed = dir.trim_end_matches('/');
-
-    // If dir already exists, complete_path handles it
-    if is_dir(dir_trimmed) {
-        return (Completions::new(), Vec::new());
-    }
-
-    let resolved_dirs = resolve_partial_dir(dir_trimmed);
-    let mut comp = Completions::new();
-    let mut groups = Vec::new();
-
-    for rdir in resolved_dirs {
-        let start = comp.entries.len();
-        complete_in_dir(&rdir, prefix, dirs_only, &mut comp);
-        let count = comp.entries.len() - start;
-        if count > 0 {
-            groups.push((format!("{rdir}/"), start, count));
-        }
-    }
-    (comp, groups)
-}
-
 pub(crate) fn complete_partial_path_from(cwd: &std::path::Path, partial: &str, dirs_only: bool) -> (Completions, Vec<(String, usize, usize)>) {
     let (directory, prefix) = split_path(partial);
     if directory.is_empty() { return (Completions::new(), Vec::new()); }
@@ -648,6 +613,8 @@ pub(crate) fn complete_partial_path_from(cwd: &std::path::Path, partial: &str, d
     (completions, groups)
 }
 
+const PARTIAL_DIRECTORY_LIMIT: usize = 64;
+
 fn resolve_directory(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     if path.is_dir() { return vec![path.to_path_buf()]; }
@@ -655,148 +622,20 @@ fn resolve_directory(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     let Some(component) = path.file_name() else { return Vec::new(); };
     let mut directories = Vec::new();
     for parent in resolve_directory(parent) {
+        let remaining = PARTIAL_DIRECTORY_LIMIT - directories.len();
         let Ok(entries) = std::fs::read_dir(parent) else { continue; };
+        let mut nearest = std::collections::BinaryHeap::with_capacity(remaining + 1);
         for entry in entries.flatten() {
-            if entry.file_name().as_bytes().starts_with(component.as_bytes()) && entry.path().is_dir() { directories.push(entry.path()); }
+            if !entry.file_name().as_bytes().starts_with(component.as_bytes()) { continue; }
+            let path = entry.path();
+            if nearest.len() == remaining && nearest.peek().is_some_and(|largest| &path >= largest) || !path.is_dir() { continue; }
+            nearest.push(path);
+            if nearest.len() > remaining { nearest.pop(); }
         }
+        directories.extend(nearest.into_sorted_vec());
+        if directories.len() == PARTIAL_DIRECTORY_LIMIT { break; }
     }
-    directories.sort_unstable();
     directories
-}
-
-/// Check if path is a directory using libc::stat — zero allocation.
-// libc is retained because this helper runs during warm completion.
-fn is_dir(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    let mut buf = [0u8; 4096];
-    if bytes.len() >= buf.len() {
-        return false;
-    }
-    buf[..bytes.len()].copy_from_slice(bytes);
-    buf[bytes.len()] = 0;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::stat(buf.as_ptr() as *const libc::c_char, &mut st) };
-    rc == 0 && st.st_mode & libc::S_IFMT == libc::S_IFDIR
-}
-
-/// Recursively resolve a directory path where each component is a prefix.
-/// e.g., "/home/user/de" → ["/home/user/dev", "/home/user/Desktop", ...]
-fn resolve_partial_dir(dir: &str) -> Vec<String> {
-    // This picker-side walk also keeps libc to preserve stack-buffer behavior.
-    let dir = dir.trim_end_matches('/');
-    if dir.is_empty() {
-        return Vec::new();
-    }
-
-    // Base: if it exists as a directory, return it
-    if is_dir(dir) {
-        return vec![dir.to_string()];
-    }
-
-    // Split parent / component
-    let (parent, component) = match dir.rfind('/') {
-        Some(0) => ("/", &dir[1..]),
-        Some(i) => (&dir[..i], &dir[i + 1..]),
-        None => (".", dir),
-    };
-
-    if component.is_empty() {
-        return Vec::new();
-    }
-
-    let comp_bytes = component.as_bytes();
-
-    // Recursively resolve parent
-    let parents = resolve_partial_dir(parent);
-
-    let mut results = Vec::new();
-    for p in &parents {
-        // Open directory with libc
-        let p_bytes = p.as_bytes();
-        let mut dir_buf = [0u8; 4096];
-        if p_bytes.len() >= dir_buf.len() {
-            continue;
-        }
-        dir_buf[..p_bytes.len()].copy_from_slice(p_bytes);
-        dir_buf[p_bytes.len()] = 0;
-
-        let dp = unsafe { libc::opendir(dir_buf.as_ptr() as *const libc::c_char) };
-        if dp.is_null() {
-            continue;
-        }
-
-        // Stack buffer for "parent/name\0" for stat
-        let mut path_buf = [0u8; 4096];
-        let prefix_len = if p == "." {
-            0
-        } else {
-            let len = p_bytes.len();
-            path_buf[..len].copy_from_slice(p_bytes);
-            if p_bytes.last() != Some(&b'/') {
-                path_buf[len] = b'/';
-                len + 1
-            } else {
-                len
-            }
-        };
-
-        loop {
-            let ent = unsafe { libc::readdir(dp) };
-            if ent.is_null() {
-                break;
-            }
-            let name_cstr = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
-            let name_bytes = name_cstr.to_bytes();
-
-            if name_bytes == b"." || name_bytes == b".." {
-                continue;
-            }
-            if !name_bytes.starts_with(comp_bytes) {
-                continue;
-            }
-            if name_bytes.first() == Some(&b'.') && !comp_bytes.starts_with(b".") {
-                continue;
-            }
-
-            // stat to check if it's a directory
-            let total = prefix_len + name_bytes.len();
-            if total >= path_buf.len() {
-                continue;
-            }
-            path_buf[prefix_len..total].copy_from_slice(name_bytes);
-            path_buf[total] = 0;
-
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::stat(path_buf.as_ptr() as *const libc::c_char, &mut st) } != 0 {
-                continue;
-            }
-            if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
-                continue;
-            }
-
-            let name = match std::str::from_utf8(name_bytes) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            if p == "/" {
-                results.push(format!("/{name}"));
-            } else if p == "." {
-                results.push(name.to_string());
-            } else {
-                results.push(format!("{p}/{name}"));
-            }
-        }
-
-        unsafe { libc::closedir(dp) };
-
-        // Cap expansion to avoid combinatorial explosion
-        if results.len() > 64 {
-            results.truncate(64);
-            break;
-        }
-    }
-    results
 }
 
 /// Case-insensitive substring search: does `haystack` contain `needle`?
@@ -1024,24 +863,37 @@ mod tests {
         assert_eq!(comp.name(1), "alpine.txt");
     }
 
-    #[test]
-    fn partial_path_resolves_this_repo() {
-        let resolved = resolve_partial_dir("sr");
-        assert!(
-            resolved.iter().any(|d| d == "src"),
-            "expected 'src' in {resolved:?}"
-        );
+    fn repo() -> &'static std::path::Path {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
     }
 
     #[test]
-    fn partial_path_two_levels() {
-        let resolved = resolve_partial_dir("sr");
-        assert!(!resolved.is_empty());
+    fn partial_path_resolves_this_repo() {
+        let resolved = resolve_directory(&repo().join("sr"));
+        assert!(resolved.contains(&repo().join("src")), "expected 'src' in {resolved:?}");
+    }
+
+    #[test]
+    fn partial_directory_resolution_keeps_the_first_sorted_directories_within_budget() {
+        let root = repo().join(".work/tmp").join(format!("partial-budget-{}", std::process::id()));
+        for branch in 0..70 {
+            for leaf in 0..2 {
+                std::fs::create_dir_all(root.join(format!("branch{branch:02}/sub{leaf}"))).unwrap();
+            }
+        }
+        let resolved = resolve_directory(&root.join("br"));
+        let expected: Vec<_> = (0..PARTIAL_DIRECTORY_LIMIT).map(|branch| root.join(format!("branch{branch:02}"))).collect();
+        assert_eq!(resolved, expected);
+        let nested = resolve_directory(&root.join("br/su"));
+        assert_eq!(nested.len(), PARTIAL_DIRECTORY_LIMIT);
+        assert_eq!(nested.first(), Some(&root.join("branch00/sub0")));
+        assert_eq!(nested.last(), Some(&root.join("branch31/sub1")));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn partial_path_complete_finds_entries() {
-        let (comp, groups) = complete_partial_path("./sr/m", false);
+        let (comp, groups) = complete_partial_path_from(repo(), "./sr/m", false);
         let names: Vec<&str> = groups
             .iter()
             .flat_map(|(_, start, count)| (*start..*start + *count).map(|i| comp.name(i)))
@@ -1067,7 +919,7 @@ mod tests {
                 )).unwrap();
             }
         }
-        let (comp, groups) = complete_partial_path(root.join("al/item").to_str().unwrap(), false);
+        let (comp, groups) = complete_partial_path_from(repo(), root.join("al/item").to_str().unwrap(), false);
         assert_eq!(groups.len(), 2);
         assert_eq!(comp.len(), 4);
         for (directory, start, count) in groups {
@@ -1081,13 +933,13 @@ mod tests {
 
     #[test]
     fn partial_path_existing_dir_returns_empty() {
-        let (_comp, groups) = complete_partial_path("./src/m", false);
+        let (_comp, groups) = complete_partial_path_from(repo(), "./src/m", false);
         assert!(groups.is_empty());
     }
 
     #[test]
     fn partial_path_nonexistent_returns_empty() {
-        let (_comp, groups) = complete_partial_path("./zzzzz/m", false);
+        let (_comp, groups) = complete_partial_path_from(repo(), "./zzzzz/m", false);
         assert!(groups.is_empty());
     }
 
@@ -1125,7 +977,7 @@ mod tests {
     fn partial_path_absolute() {
         // Use /usr as a stable path that exists on all platforms.
         // /usr/bi → should resolve to /usr/bin, then find entries starting with "t"
-        let (comp, groups) = complete_partial_path("/usr/bi/t", false);
+        let (comp, groups) = complete_partial_path_from(repo(), "/usr/bi/t", false);
         let all_names: Vec<&str> = groups
             .iter()
             .flat_map(|(_, start, count)| (*start..*start + *count).map(|i| comp.name(i)))
