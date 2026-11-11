@@ -1723,34 +1723,53 @@ fn render_dir_picker_mode(
 
 
 fn needs_continuation(input: &str) -> bool {
-    let trimmed = input.trim_end();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let (in_single, in_double, escape) = scan_quote_state(input.as_bytes());
-    if in_single || in_double || escape {
-        return true;
-    }
-    trimmed.ends_with('|') || trimmed.ends_with("&&") || trimmed.ends_with("||")
-}
-
-fn scan_quote_state(input: &[u8]) -> (bool, bool, bool) {
+    let bytes = input.as_bytes();
     let mut in_single = false;
     let mut in_double = false;
     let mut escape = false;
-    for &b in input {
+    let mut in_comment = false;
+    let mut token_start = true;
+    let mut code_end = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_comment {
+            if b == b'\n' {
+                in_comment = false;
+                token_start = true;
+            }
+            continue;
+        }
         if escape {
             escape = false;
+            if b != b'\n' {
+                code_end = i + 1;
+            }
+            token_start = false;
             continue;
         }
         match b {
             b'\\' if !in_single => escape = true,
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
+            b'#' if token_start && !in_single && !in_double => {
+                in_comment = true;
+                continue;
+            }
             _ => {}
         }
+        if !in_single && !in_double && !escape {
+            token_start = matches!(b, b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>');
+        } else {
+            token_start = false;
+        }
+        if escape || !b.is_ascii_whitespace() || in_single || in_double {
+            code_end = i + 1;
+        }
     }
-    (in_single, in_double, escape)
+    if in_single || in_double || escape {
+        return true;
+    }
+    let code = &bytes[..code_end];
+    code.ends_with(b"|") || code.ends_with(b"&&")
 }
 
 

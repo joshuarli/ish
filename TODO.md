@@ -108,15 +108,6 @@ review impact and likelihood.
 - **Effort:** M (days)
 - **Design:** [Nested denv restoration](docs/rfc/ISH-89-nested-denv-restoration.md).
 
-### ISH-90 · P2 · Comments can trap complete commands in continuation
-
-- **Area:** Errors
-- **Where:** `src/editor.rs:871`, `src/editor.rs:1725`, `src/editor.rs:1737`.
-- **Problem:** Continuation detection scans quotes, backslashes, and trailing operators inside comments. The real editor refuses to submit `echo okay # don't wait`, `echo okay # |`, and a comment ending in backslash, although `dispatch::plan` accepts each complete command. The apostrophe case keeps subsequent ordinary lines in continuation until a matching quote or cancellation.
-- **Recommendation:** Derive completion/incompletion from epsh lexical/parser state without evaluation. At minimum, make comments opaque to continuation detection and distinguish complete input from definite syntax errors and genuinely incomplete syntax. Add the three editor-versus-dispatch cases; this repair is independent of deferred argument-aware completion.
-- **Fix with:** `single-source-of-truth`
-- **Effort:** S (hours)
-
 ### ISH-91 · P2 · Interactive partial-path completion has no directory budget
 
 - **Area:** Performance

@@ -264,3 +264,25 @@ fn backslash_escaped_tilde_path_with_space_completes() {
     assert_eq!(std::env::current_dir().unwrap(), before);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn comments_do_not_hold_complete_commands_in_continuation() {
+    let aliases = AliasMap::new();
+    let history = history::History::from_entries(Vec::new());
+    let ctx = context(&aliases, &history, &[]);
+    for input in ["echo okay # don't wait", "echo okay # |", "echo okay # trailing \\", "echo okay;# &&", "echo a\n# 'open\necho b"] {
+        assert!(crate::dispatch::plan(input).is_ok(), "dispatch must accept {input:?}");
+        let mut editor = Editor::new(24, 80);
+        editor.begin("$ ".into(), 2, &ctx);
+        event(&mut editor, &ctx, EditorEvent::Paste(input));
+        let action = event(&mut editor, &ctx, EditorEvent::Key(KeyEvent::key(Key::Enter)));
+        assert!(matches!(&action, EditorAction::Submit(line) if line == input), "{input:?} was not submitted");
+    }
+    for input in ["echo a#'b", "echo 'a # b", "echo a |", "echo a && # done", "echo a \\"] {
+        let mut editor = Editor::new(24, 80);
+        editor.begin("$ ".into(), 2, &ctx);
+        event(&mut editor, &ctx, EditorEvent::Paste(input));
+        let action = event(&mut editor, &ctx, EditorEvent::Key(KeyEvent::key(Key::Enter)));
+        assert!(matches!(action, EditorAction::Continue), "{input:?} must continue");
+    }
+}
