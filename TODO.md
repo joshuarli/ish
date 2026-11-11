@@ -77,15 +77,6 @@ review impact and likelihood.
 - **Fix with:** `error-model`
 - **Effort:** S (hours)
 
-### ISH-87 · P2 · Fatal cleanup restores the wrong terminal during a command
-
-- **Area:** Concurrency
-- **Where:** `src/capture.rs:333`, `src/capture.rs:374`, `src/capture.rs:550`, `src/signal.rs:261`, `src/signal.rs:274`, `src/signal.rs:285`, `tests/pty.rs:4900`.
-- **Problem:** Converged capture makes the real terminal raw and replaces fds 0/1/2 with an inner PTY. Fatal cleanup restores fd 0 and writes to fd 1, then exits without the relay's restoration. Sending SIGABRT while a ready external child runs exits ish with 134 but leaves the retained outer terminal's `ICANON`, `ECHO`, and `ISIG` disabled. The probe observed local-mode flags 2608 instead of the original 35387. Existing fatal-signal tests run at the prompt, before descriptor replacement.
-- **Recommendation:** Give signal-safe cleanup a stable, owned descriptor for the actual terminal before standard descriptors can be replaced. Restore its modes and output controls there, preserving the existing fatal-status contract and correct child descriptor inheritance. Add the command-running case to the existing fatal-signal regression.
-- **Fix with:** `os-boundaries`
-- **Effort:** M (days)
-
 ### ISH-89 · P2 · Nested denv sessions lose project restoration provenance
 
 - **Area:** Data

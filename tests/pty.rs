@@ -144,6 +144,25 @@ impl PtyShell {
         cwd_rel: Option<&str>,
         profile: ProtocolProfile,
     ) -> Self {
+        Self::spawn_launched(home, extra_env, rows, cols, cwd_rel, profile, None)
+    }
+
+    /// Spawn ish as `"$1"` of a `/bin/sh -c` session leader running `launcher`,
+    /// so the outer terminal outlives ish and the script can inspect it.
+    fn spawn_under_sh(launcher: &str) -> Self {
+        let home = Self::build_home(&[], &[], |_| {});
+        Self::spawn_launched(home, &[], 24, 80, None, ProtocolProfile::xterm_minimal_v1(), Some(launcher))
+    }
+
+    fn spawn_launched(
+        home: Rc<TempDir>,
+        extra_env: &[(&str, &str)],
+        rows: u16,
+        cols: u16,
+        cwd_rel: Option<&str>,
+        profile: ProtocolProfile,
+        launcher: Option<&str>,
+    ) -> Self {
         let home_path = home.path().to_str().unwrap().to_string();
         let binary = ish_binary();
         let temp_path = home.path().join(".tmp");
@@ -151,7 +170,11 @@ impl PtyShell {
         let cwd = cwd_rel
             .map(|rel| home.path().join(rel))
             .unwrap_or_else(|| home.path().to_path_buf());
-        let mut command = CommandSpec::new(binary)
+        let command = match launcher {
+            Some(script) => CommandSpec::new("/bin/sh").arg("-c").arg(script).arg("sh").arg(binary),
+            None => CommandSpec::new(binary),
+        };
+        let mut command = command
             .current_dir(&cwd)
             .env("HOME", &home_path)
             .env("USER", "testuser")
@@ -5000,6 +5023,33 @@ fn fatal_crash_signals_restore_the_terminal_and_exit_with_the_signal_status() {
             .assert_terminal_restored(&sh.terminal_baseline)
             .unwrap_or_else(|e| panic!("terminal not restored after signal {signal}: {e:?}"));
     }
+}
+
+#[test]
+fn fatal_crash_signal_during_a_command_restores_the_outer_terminal() {
+    let sh = PtyShell::spawn_under_sh(r#""$1"; status=$?; stty -a > "$HOME/outer-modes"; exit $status"#);
+    sh.type_str("/bin/sh -c 'printf \"CHILD:%s:%s:%s\\n\" $$ $PPID READY; exec /bin/sleep 60'");
+    sh.enter();
+    let out = PtyShell::strip_ansi(&sh.wait_for(":READY", 5000));
+    let end = out.find(":READY").expect("child announced readiness");
+    let start = out[..end].rfind("CHILD:").expect("child announced its pids") + "CHILD:".len();
+    let (child, ish) = out[start..end].split_once(':').expect("child and parent pids");
+    let (child, ish): (i32, i32) = (child.parse().unwrap(), ish.parse().unwrap());
+    assert_eq!(unsafe { libc::kill(ish, libc::SIGABRT) }, 0);
+    let mut terminal = sh.terminal.borrow_mut();
+    let deadline = terminal.deadline(std::time::Duration::from_secs(5));
+    let exit = terminal.wait_for_exit(deadline).expect("ish exits on fatal signal");
+    assert_eq!(exit, ExitStatus::Code(128 + libc::SIGABRT));
+    terminal
+        .assert_terminal_restored(&sh.terminal_baseline)
+        .unwrap_or_else(|e| panic!("outer terminal not restored after a crash during a command: {e:?}"));
+    drop(terminal);
+    let modes = std::fs::read_to_string(sh.home_path().join("outer-modes")).expect("launcher recorded outer modes");
+    let words: Vec<&str> = modes.split_whitespace().collect();
+    for mode in ["icanon", "echo", "isig"] {
+        assert!(words.contains(&mode), "outer terminal lacks {mode} after the crash: {modes}");
+    }
+    assert_process_gone(child);
 }
 
 #[test]

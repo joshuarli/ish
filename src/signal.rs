@@ -9,6 +9,8 @@ static PENDING_FOREGROUND: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static PENDING_TERMINATION: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(0);
+static CRASH_TERMINAL_INPUT: AtomicI32 = AtomicI32::new(-1);
+static CRASH_TERMINAL_OUTPUT: AtomicI32 = AtomicI32::new(-1);
 static TERMINATION_CANCEL: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicBool> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static FOREGROUND_SIGNALS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -17,6 +19,7 @@ pub fn init() -> RawFd {
     // Capture the login terminal modes before any handler can need them; a
     // crash during startup must still restore what was there.
     crate::term::capture_startup_termios();
+    retain_crash_terminal();
     let (read_fd, write_fd) =
         sys::pipe_nonblock_cloexec().expect("pipe() failed for signal self-pipe");
 
@@ -274,35 +277,55 @@ fn install_oneshot_handler(
 /// every platform: re-raising trap- and fault-class signals can wedge the
 /// process in the OS crash pipeline instead of terminating it.
 unsafe extern "C" fn fatal_handler(sig: i32) {
-    unsafe {
-        restore_terminal_for_crash();
-        libc::_exit(128 + sig);
+    restore_terminal_for_crash();
+    unsafe { libc::_exit(128 + sig) };
+}
+
+/// Output capture replaces descriptors 0, 1 and 2 with an inner PTY while a
+/// command runs, so crash cleanup keeps close-on-exec duplicates of the
+/// startup terminal descriptors for the life of the process.
+fn retain_crash_terminal() {
+    use std::os::fd::IntoRawFd;
+    for (fd, slot) in [(crate::term::STDIN_FD, &CRASH_TERMINAL_INPUT), (crate::term::STDOUT_FD, &CRASH_TERMINAL_OUTPUT)] {
+        // SAFETY: descriptors 0 and 1 are open while the shell starts.
+        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        if rustix::termios::isatty(fd)
+            && let Ok(retained) = rustix::io::fcntl_dupfd_cloexec(fd, 3)
+        {
+            slot.store(retained.into_raw_fd(), std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
-unsafe fn restore_terminal_for_crash() {
+fn crash_terminal(slot: &AtomicI32, fallback: RawFd) -> std::os::fd::BorrowedFd<'static> {
+    let fd = match slot.load(std::sync::atomic::Ordering::Acquire) {
+        -1 => fallback,
+        fd => fd,
+    };
+    // SAFETY: retained descriptors are never closed, and the fallback standard
+    // descriptors stay open for the life of the shell.
+    unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+}
+
+fn restore_terminal_for_crash() {
     // Best effort and async-signal-safe only: raw descriptor writes, no
     // locks, no allocation.
-    // SAFETY: descriptors 0 and 1 stay open for the life of the shell.
-    unsafe {
-        let stdout = std::os::fd::BorrowedFd::borrow_raw(1);
-        let mut remaining = &b"\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l"[..];
-        while !remaining.is_empty() {
-            match rustix::io::write(stdout, remaining) {
-                Ok(0) => break,
-                Ok(n) => remaining = &remaining[n..],
-                Err(rustix::io::Errno::INTR) => {}
-                Err(_) => break,
-            }
+    let stdout = crash_terminal(&CRASH_TERMINAL_OUTPUT, crate::term::STDOUT_FD);
+    let mut remaining = &b"\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l"[..];
+    while !remaining.is_empty() {
+        match rustix::io::write(stdout, remaining) {
+            Ok(0) => break,
+            Ok(n) => remaining = &remaining[n..],
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => break,
         }
-        if let Some(termios) = crate::term::startup_termios() {
-            let stdin = std::os::fd::BorrowedFd::borrow_raw(0);
-            let _ = rustix::termios::tcsetattr(
-                stdin,
-                rustix::termios::OptionalActions::Now,
-                &termios,
-            );
-        }
+    }
+    if let Some(termios) = crate::term::startup_termios() {
+        let _ = rustix::termios::tcsetattr(
+            crash_terminal(&CRASH_TERMINAL_INPUT, crate::term::STDIN_FD),
+            rustix::termios::OptionalActions::Now,
+            &termios,
+        );
     }
 }
 
