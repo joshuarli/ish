@@ -1,7 +1,8 @@
 # fz integration validation
 
 The baseline is ish `c30a151d6fd1a305a5ac362d21145e327bd639b3`.
-The shared source is fz `39738514ac983ebd779fee7a39437c1ad1e8ce6f`.
+The shared source is fz `8a91d565dff85caac4131a4bde90f5c685812590`.
+Its final changes adjust whitespace; validation uses identical executable code.
 [Picker reference](../fuzzy-pickers.md) defines the delivered behavior and
 platform identity limits. [Raw results](fz-integration/) retain the measurements.
 

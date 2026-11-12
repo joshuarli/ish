@@ -781,4 +781,3 @@ fn next_boundary(bytes: &[u8], cursor: usize) -> usize {
     }
     position
 }
-
