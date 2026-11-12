@@ -34,12 +34,15 @@ pub const HELP: &str = "Usage: fz [OPTION]...
  -v, --version           Display version
 ";
 
+/// The shared CLI help with the fresh worker's serial search default.
+pub fn worker_help() -> String { HELP.replace("default up to 4; small searches use 1", "default 1 in ish; small searches use 1") }
+
 impl Options {
-    fn parse(mut args: impl Iterator<Item = Vec<u8>>) -> Result<Option<Self>, String> {
+    fn parse(mut args: impl Iterator<Item = Vec<u8>>, default_workers: usize, help: &str) -> Result<Option<Self>, String> {
         let mut options = Self {
             lines: 10, prompt: Cow::Borrowed(b"> "), query: Vec::new(),
             tty: Cow::Borrowed(Path::new("/dev/tty")), show_scores: false, show_info: false,
-            multi: false, filter: None, delimiter: b'\n', workers: 0,
+            multi: false, filter: None, delimiter: b'\n', workers: default_workers,
         };
         while let Some(arg) = args.next() {
             if arg == b"--" {
@@ -72,7 +75,7 @@ impl Options {
                     } else if let Some(value) = args.next() {
                         Cow::Owned(value)
                     } else {
-                        eprint!("{HELP}");
+                        eprint!("{help}");
                         return Ok(None);
                     };
                     match key {
@@ -95,7 +98,7 @@ impl Options {
                     break;
                 }
                 if attached.is_some() {
-                    eprint!("{HELP}");
+                    eprint!("{help}");
                     return Ok(None);
                 }
                 match key {
@@ -108,7 +111,7 @@ impl Options {
                         return Ok(None);
                     }
                     _ => {
-                        eprint!("{HELP}");
+                        eprint!("{help}");
                         return Ok(None);
                     }
                 }
@@ -201,7 +204,8 @@ pub fn run(args: impl Iterator<Item = Vec<u8>>) -> c_int { dispatch(args, false,
 pub fn run_in_foreground(args: impl Iterator<Item = Vec<u8>>, input: Option<std::fs::File>) -> c_int { dispatch(args, true, input) }
 
 fn dispatch(args: impl Iterator<Item = Vec<u8>>, claim_foreground: bool, input: Option<std::fs::File>) -> c_int {
-    match Options::parse(args) {
+    let help = if claim_foreground { Cow::Owned(worker_help()) } else { Cow::Borrowed(HELP) };
+    match Options::parse(args, usize::from(claim_foreground), &help) {
         Ok(None) => 0,
         Ok(Some(options)) => {
             let multi = options.multi;
@@ -216,7 +220,7 @@ fn dispatch(args: impl Iterator<Item = Vec<u8>>, claim_foreground: bool, input: 
             }
         },
         Err(error) => {
-            eprintln!("fz: {error}\n{HELP}");
+            eprintln!("fz: {error}\n{help}");
             1
         }
     }
