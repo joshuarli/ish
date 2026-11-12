@@ -31,6 +31,7 @@ struct Shell {
     last_output: capture::OutputBuffer,
     layout_dump: String,
     epsh: epsh::eval::Shell,
+    executable: std::path::PathBuf,
     denv: denv::Session,
 }
 
@@ -84,6 +85,11 @@ pub(super) fn run(cli: crate::Args) {
             );
         }
     }
+    let executable = std::env::current_exe().unwrap_or_else(|error| {
+        report!("ish: cannot resolve builtin worker: {error}");
+        std::process::exit(1);
+    });
+    epsh.set_command_worker("fz".into(), executable.clone(), vec!["--ish-fz-worker".into(), "-1".into()], None);
     let fs_default_scratch = std::path::PathBuf::from("/tmp");
 
     let initial_home = store_env_os(&epsh, "HOME");
@@ -123,6 +129,7 @@ pub(super) fn run(cli: crate::Args) {
         last_output: capture::OutputBuffer::default(),
         layout_dump: String::new(),
         epsh,
+        executable,
         denv,
     };
 
@@ -226,6 +233,10 @@ pub(super) fn run(cli: crate::Args) {
                 let names = builtin::all_builtin_names().filter(|name| builtin::lookup(name).is_some_and(|spec| spec.external_command().is_some())).map(epsh::shell_bytes::ShellBytes::from).collect();
                 shell.epsh.set_external_dispatcher(names, handler);
 
+                let mut fuzzy_input = match begin_fuzzy_input(&mut shell) {
+                    Ok(input) => input,
+                    Err(error) => { report!("ish: cannot transfer picker input: {error}"); shell.last_status = 2; continue; }
+                };
                 let buffer = std::mem::take(&mut shell.last_output);
                 let occupied = shell.job.is_some();
                 let converged = dispatch::is_single_simple_command(&program);
@@ -242,6 +253,7 @@ pub(super) fn run(cli: crate::Args) {
                     }
                 });
                 shell.epsh.set_foreground_ctty(false);
+                reset_fz_worker(&mut shell);
                 shell.last_status = match &outcome {
                     epsh::eval::ProgramOutcome::Completed(status) => status.code(),
                     epsh::eval::ProgramOutcome::Stopped(_) => 148,
@@ -266,12 +278,18 @@ pub(super) fn run(cli: crate::Args) {
                             if let Some(session) = session.as_ref() {
                                 session.set_paused(true);
                             }
-                            shell.job = Some(Job { handle, cmd: expanded.to_string(), termios, capture: session.take() });
+                            shell.job = Some(Job { fuzzy_input: fuzzy_input.take(), handle, cmd: expanded.to_string(), termios, capture: session.take() });
                         }
                         Err(error) => report!("ish: cannot save stopped terminal attributes: {error}"),
                     }
                 }
                 term::restore_startup_termios();
+                if let Some(input) = fuzzy_input {
+                    match input.finish() {
+                        Ok(tail) => give_terminal_tail(&mut shell.input_reader, tail),
+                        Err(error) => report!("ish: cannot return picker input: {error}"),
+                    }
+                }
                 if let Some(session) = session {
                     let tail = session.finish_into(&mut shell.last_output);
                     if child_exited {
@@ -467,6 +485,21 @@ fn run_shell_builtin(name: &str, args: &[epsh::ast::Word], line: &str, shell: &m
                 }
             }
         }
+        ShellCommand::PickProcesses => {
+            let args = match expand_builtin_args_bytes(args, shell, name) {
+                Some(args) => args.iter().map(epsh::shell_bytes::ShellBytes::to_os_string).collect::<Vec<_>>(),
+                None => return false,
+            };
+            let reader = shell.input_reader.as_mut().expect("shell owns its input reader");
+            match ish::pk::run(&args, reader) {
+                ish::pk::RunOutcome::Completed(status) => shell.last_status = status,
+                ish::pk::RunOutcome::Terminated(signal) => {
+                    if let Some(job) = shell.job.take() { job::abandon(job); }
+                    shell.last_status = 128 + signal;
+                    return true;
+                }
+            }
+        }
         ShellCommand::Fdu => {
             let args = match expand_builtin_args_bytes(args, shell, name) {
                 Some(args) => args
@@ -629,23 +662,52 @@ fn expand_builtin_args(
     Some(args)
 }
 
+fn begin_fuzzy_input(shell: &mut Shell) -> std::io::Result<Option<ish::fuzzy_input::FuzzyInput>> {
+    let pending = shell.input_reader.as_mut().expect("input reader").take_pending_bytes();
+    let (session, input) = if pending.is_empty() { (None, None) } else {
+        match ish::fuzzy_input::FuzzyInput::new(&pending, Path::new("/tmp")) {
+            Ok((session, input)) => (Some(session), Some(input)),
+            Err(error) => { give_terminal_tail(&mut shell.input_reader, pending); return Err(error); }
+        }
+    };
+    let mut prefix = vec!["--ish-fz-worker".into()];
+    if input.is_none() { prefix.push("-1".into()); }
+    shell.epsh.set_command_worker("fz".into(), shell.executable.clone(), prefix, input);
+    Ok(session)
+}
+
+fn reset_fz_worker(shell: &mut Shell) {
+    shell.epsh.set_command_worker("fz".into(), shell.executable.clone(), vec!["--ish-fz-worker".into(), "-1".into()], None);
+}
+
 fn expand_builtin_args_bytes(
     words: &[epsh::ast::Word],
     shell: &mut Shell,
     name: &str,
 ) -> Option<Vec<epsh::shell_bytes::ShellBytes>> {
-    let mut args = Vec::new();
-    for word in words {
-        match epsh::expand::expand_word_to_fields(word, &mut shell.epsh) {
-            Ok(fields) => args.extend(fields.iter().map(|field| epsh::shell_bytes::ShellBytes::from_str_lossless(field))),
-            Err(e) => {
-                report!("ish: {name}: expansion error: {e}");
-                shell.last_status = 1;
-                return None;
-            }
+    let input = match begin_fuzzy_input(shell) {
+        Ok(input) => input,
+        Err(error) => { report!("ish: cannot transfer picker input: {error}"); shell.last_status = 2; return None; }
+    };
+    let result = (|| {
+        let mut args = Vec::new();
+        for word in words {
+            let fields = epsh::expand::expand_word_to_fields(word, &mut shell.epsh)?;
+            args.extend(fields.iter().map(|field| epsh::shell_bytes::ShellBytes::from_str_lossless(field)));
+        }
+        Ok::<_, epsh::error::ShellError>(args)
+    })();
+    reset_fz_worker(shell);
+    if let Some(input) = input {
+        match input.finish() {
+            Ok(tail) => give_terminal_tail(&mut shell.input_reader, tail),
+            Err(error) => { report!("ish: cannot return picker input: {error}"); shell.last_status = 2; return None; }
         }
     }
-    Some(args)
+    match result {
+        Ok(args) => Some(args),
+        Err(error) => { report!("ish: {name}: expansion error: {error}"); shell.last_status = 1; None }
+    }
 }
 
 fn change_directory(target: &str, shell: &mut Shell) -> i32 {

@@ -21,3 +21,11 @@ The ranking implementation is in [`src/history.rs`](../src/history.rs); the
 interactive search UI is in [`src/editor.rs`](../src/editor.rs). Keep the ranking
 and snapshot behavior covered by the focused history tests and the shell
 integration and [PTY tests](../tests/pty.rs) when changing it.
+
+ASCII byte scanning and subsequence eligibility come from the vendored fz
+library. The production path borrows history's text arena. History owns its
+literal tiers, contextual ranking, Unicode case matching and character-index
+highlights, including commands beyond fz's 1024-byte scoring boundary.
+The complete eligible set remains available when narrowing beyond 200 visible
+rows. Query edits retain the existing append, backspace and arbitrary-edit
+cache rules. See [shared-source updates](fuzzy-pickers.md#shared-source).

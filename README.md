@@ -86,6 +86,8 @@ Background jobs (`&`), control flow, subshells, brace groups, functions,
 |---|---|
 | `cd [dir]` | Change directory; `cd -` returns to the previous directory |
 | `exit [status]` | Exit the shell with `status` (default 0); a non-numeric or extra operand is refused with status 2 |
+| `fz [options]` | Select stdin records, including in pipelines and substitutions |
+| `pk [-9] [-p PORT] [query...]` | Select your processes and send TERM or KILL |
 | `fg` | Resume the suspended foreground job |
 | `alias [name [command...]]` | Define or list aliases |
 | `history [reset]` | List or clear saved history |
@@ -102,11 +104,32 @@ Background jobs (`&`), control flow, subshells, brace groups, functions,
 | `ish-dump` | Write the current layout dump |
 
 Some commands must be used as the whole input line, including `alias`, `exit`,
-`fg`, `fdu`, `denv`, `z`, `rmrf`, `copy-scrollback`, and `ish-dump`. `cd` and
+`fg`, `pk`, `fdu`, `denv`, `z`, `rmrf`, `copy-scrollback`, and `ish-dump`. `cd` and
 `history` can also appear in command lists.
 
 A bare directory name changes into that directory when it does not match a
 command on `PATH`. Use `cd name` when a command has the same name.
+
+## Fuzzy selection
+
+```sh
+printf 'alpha\nbeta\n' | fz
+fz --multi --query=worker < candidates.txt
+printf '<%s>\n' "$(printf 'alpha\nbeta\n' | fz)"
+pk worker
+pk --port 8080
+```
+
+`fz` ships inside ish and uses the controlling terminal for interaction.
+`fz --show-matches=QUERY` filters without a terminal. Ctrl+R keeps its
+literal-first history ranking. Enter inserts the selected complete command
+without executing it. Escape restores the saved line.
+
+`pk` shows your eligible processes in a multi-selector. Down enters results,
+Space marks rows, and Enter sends TERM to the accepted records. `-9` selects
+KILL. Escape or Ctrl+C cancels. No match sends no signal. A query or TCP port
+is required. Read [picker behavior and native identity guarantees](docs/fuzzy-pickers.md)
+for options, status codes, platform limits, and source updates.
 
 ## File commands
 

@@ -5511,3 +5511,174 @@ fn shell_sighup_at_prompt_exits_and_restores_terminal() {
     assert_eq!(terminal.wait_for_exit(deadline).expect("shell exits on SIGHUP"), ExitStatus::Code(129));
     terminal.assert_terminal_restored(&sh.terminal_baseline).expect("SIGHUP restores terminal");
 }
+
+#[test]
+fn fuzzy_builtin_filter_pipeline_lookup_and_redirections() {
+    let sh = PtyShell::spawn_with_opts(&[("candidates", "alpha\nbeta\nalpha\n"), ("bin/fz", "#!/bin/sh\nprintf external-fz\n")], &[]);
+    sh.run_command("set PATH /missing");
+    sh.run_command("printf 'alpha\\nbeta\\nalpha\\n' | fz --show-matches=alp > selected");
+    assert_eq!(std::fs::read(sh.home_path().join("selected")).unwrap(), b"alpha\nalpha\n");
+    sh.run_command("fz -e beta < candidates > selected");
+    assert_eq!(std::fs::read(sh.home_path().join("selected")).unwrap(), b"beta\n");
+    sh.run_command("printf '<%s>\\n' \"$(printf 'alpha\\nbeta\\n' | fz -e alp)\" > selected");
+    assert_eq!(std::fs::read(sh.home_path().join("selected")).unwrap(), b"<alpha>\n");
+    sh.run_command("printf 'alpha\\nbeta\\n' | fz -e alp | fz -e a > selected");
+    assert_eq!(std::fs::read(sh.home_path().join("selected")).unwrap(), b"alpha\n");
+    sh.run_command("command -v fz > lookup");
+    assert_eq!(std::fs::read(sh.home_path().join("lookup")).unwrap(), b"fz\n");
+    sh.run_command("alias pick fz -e alp");
+    sh.run_command("pick < candidates > selected");
+    assert_eq!(std::fs::read(sh.home_path().join("selected")).unwrap(), b"alpha\nalpha\n");
+    sh.run_command("set picker fz");
+    sh.run_command("command command $picker -e beta < candidates > selected");
+    assert_eq!(std::fs::read(sh.home_path().join("selected")).unwrap(), b"beta\n");
+    sh.run_command("./bin/fz > selected");
+    assert_eq!(std::fs::read(sh.home_path().join("selected")).unwrap(), b"external-fz");
+}
+
+#[test]
+fn fuzzy_builtin_interaction_uses_tty_and_recovers_after_selection_cancel() {
+    let sh = PtyShell::spawn_with_opts(&[("candidates", "alpha\nbeta\n")], &[]);
+    for command in ["printf 'alpha\\nbeta\\n' | fz > selected", "fz < candidates > selected", "printf '<%s>\\n' \"$(printf 'alpha\\nbeta\\n' | fz)\" > selected", "printf 'alpha\\nbeta\\n' | fz | fz -e beta > selected"] {
+        sh.type_str(command); sh.enter();
+        sh.wait_for_screen("picker rows", 5000, |screen| (0..screen.row_count()).any(|row| screen.row(row).is_some_and(|line| line.trim() == "beta")));
+        sh.type_str("bet"); sh.enter();
+        sh.wait_for_prompt_after_line_advance(5000);
+        let expected: &[u8] = if command.contains("$(") { b"<beta>\n" } else { b"beta\n" };
+        assert_eq!(std::fs::read(sh.home_path().join("selected")).unwrap(), expected);
+    }
+    sh.type_str("fz --multi < candidates > selected"); sh.enter();
+    sh.wait_for("selected]", 3000);
+    sh.ctrl_c(); sh.wait_for_prompt_after_line_advance(5000);
+    assert_eq!(std::fs::read(sh.home_path().join("selected")).unwrap(), b"");
+    assert!(PtyShell::strip_ansi(&sh.run_command("echo recovered")).contains("recovered"));
+}
+
+struct PkChild(std::process::Child);
+impl Drop for PkChild {
+    fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+}
+
+fn assert_first_process_is_owned_fixture(sh: &PtyShell, pid: u32) {
+    sh.wait_for_screen("owned fixture is the selected process", 3000, |screen| {
+        (0..screen.row_count()).find_map(|row| {
+            let text = screen.row(row)?;
+            text.trim().strip_prefix("[ ] ")?.split_whitespace().next()?.parse::<u32>().ok()
+        }) == Some(pid)
+    });
+}
+
+#[test]
+fn process_picker_cancel_no_match_and_explicit_term_kill_acceptance() {
+    use std::os::unix::process::ExitStatusExt;
+    for (option, expected) in [("", libc::SIGTERM), ("-9 ", libc::SIGKILL)] {
+        let label = format!("ish-pk-fixture-{}-{expected}", std::process::id());
+        let mut fixture = PkChild(std::process::Command::new("/bin/sh").args(["-c", "read unused", &label]).stdin(std::process::Stdio::piped()).spawn().unwrap());
+        let sh = PtyShell::spawn();
+        let command = format!("pk {option}{label}");
+        sh.type_str(&command); sh.enter();
+        sh.wait_for("selected]", 3000);
+        sh.ctrl_c(); sh.wait_for_prompt_after_line_advance(5000);
+        assert!(fixture.0.try_wait().unwrap().is_none());
+        sh.type_str(&command); sh.enter(); sh.wait_for("selected]", 3000);
+        sh.type_str("nomatch"); sh.enter(); sh.wait_for_prompt_after_line_advance(5000);
+        assert!(fixture.0.try_wait().unwrap().is_none());
+        sh.type_str(&command); sh.enter(); sh.wait_for("selected]", 3000);
+        assert!(fixture.0.try_wait().unwrap().is_none());
+        assert_first_process_is_owned_fixture(&sh, fixture.0.id());
+        sh.enter();
+        let out = sh.wait_for_prompt_after_line_advance(5000);
+        assert!(out.contains("signal sent"), "{out}");
+        assert_eq!(fixture.0.wait().unwrap().signal(), Some(expected));
+        assert!(PtyShell::strip_ansi(&sh.run_command("echo usable")).contains("usable"));
+    }
+}
+
+#[test]
+fn fuzzy_builtin_queued_selection_and_shell_tail_are_ordered_once() {
+    let sh = PtyShell::spawn_with_opts(&[("candidates", "alpha\nbeta\n")], &[]);
+    sh.send(b"fz < candidates > selected\rbet\recho queued-tail\r");
+    sh.wait_for("queued-tail", 5000);
+    sh.wait_for_prompt_after_line_advance(5000);
+    assert_eq!(std::fs::read(sh.home_path().join("selected")).unwrap(), b"beta\n");
+    let output = PtyShell::strip_ansi(&sh.run_command("echo settled"));
+    assert!(output.contains("settled"), "{output}");
+}
+
+#[test]
+fn process_picker_can_kill_ish_suspended_child_and_fg_reaps_it() {
+    let label = format!("pk-held-{}", std::process::id());
+    let sh = PtyShell::spawn_with_setup(&[], &[], &[], 24, 80, None, |home| {
+        std::fs::create_dir(home.join("bin")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let path = home.join("bin").join(&label);
+        std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$HOME/held-pid\"\nprintf 'pk-held-ready\\n'\nread unused\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    });
+    sh.type_str(&format!("./bin/{label} 60")); sh.enter();
+    sh.wait_for("pk-held-ready", 5000);
+    sh.ctrl_z(); sh.wait_for("stopped:", 5000); sh.wait_for_prompt_after_line_advance(5000);
+    sh.type_str(&format!("pk -9 {label}")); sh.enter(); sh.wait_for("selected]", 5000);
+    let pid = std::fs::read_to_string(sh.home_path().join("held-pid")).unwrap().trim().parse::<u32>().unwrap();
+    assert_first_process_is_owned_fixture(&sh, pid);
+    sh.enter(); sh.wait_for("signal sent", 5000); sh.wait_for_prompt_after_line_advance(5000);
+    let output = PtyShell::strip_ansi(&sh.run_command("fg"));
+    assert!(!output.contains("resuming:"), "{output}");
+    assert!(PtyShell::strip_ansi(&sh.run_command("fg")).contains("no suspended job"));
+}
+
+#[test]
+fn process_picker_refuses_dynamic_and_out_of_line_placements_before_effects() {
+    let sh = PtyShell::spawn();
+    for command in ["pk worker >refused", "pk worker | true", "echo \"$(pk worker)\" >refused", "set target pk; $target worker >refused", "command pk worker >refused"] {
+        sh.run_command(command);
+        assert!(!sh.home_path().join("refused").exists(), "{command}");
+    }
+    assert!(PtyShell::strip_ansi(&sh.run_command("pk")).contains("provide a process query"));
+    assert!(PtyShell::strip_ansi(&sh.run_command("pk -p 0")).contains("port must be decimal"));
+}
+
+#[test]
+fn fuzzy_builtin_paste_controls_remain_query_text_and_cancel_has_no_output() {
+    let sh = PtyShell::spawn_with_opts(&[("candidates", "alpha\nbeta\n")], &[]);
+    sh.type_str("fz --multi < candidates > selected"); sh.enter(); sh.wait_for("selected]", 5000);
+    sh.send(b"\x1b[200~alpha\r\x03\x1b[201~");
+    sh.wait_for("alpha", 3000);
+    sh.ctrl_c(); sh.wait_for_prompt_after_line_advance(5000);
+    assert!(std::fs::read(sh.home_path().join("selected")).unwrap().is_empty());
+    assert!(PtyShell::strip_ansi(&sh.run_command("echo pasted-safe")).contains("pasted-safe"));
+}
+
+#[test]
+fn process_picker_tiny_terminal_refuses_acceptance_without_signaling() {
+    let label = format!("pk-tiny-{}", std::process::id());
+    let mut fixture = PkChild(std::process::Command::new("/bin/sh").args(["-c", "read unused", &label]).stdin(std::process::Stdio::piped()).spawn().unwrap());
+    let sh = PtyShell::spawn_with_size(&[], &[], 3, 19);
+    let out = PtyShell::strip_ansi(&sh.run_command(&format!("pk {label}")));
+    assert!(out.contains("terminal too small"), "{out}");
+    assert!(fixture.0.try_wait().unwrap().is_none());
+    assert!(PtyShell::strip_ansi(&sh.run_command("echo usable")).contains("usable"));
+}
+
+#[test]
+fn fuzzy_builtin_substitution_restores_once_with_tostop_enabled() {
+    let sh = PtyShell::spawn_under_sh("stty tostop; exec \"$1\"");
+    sh.type_str("printf '<%s>\\n' \"$(printf 'alpha\\nbeta\\n' | fz)\" > selected"); sh.enter();
+    sh.wait_for_screen("picker owns foreground terminal", 5000, |screen| (0..screen.row_count()).any(|row| screen.row(row).is_some_and(|line| line.trim() == "beta")));
+    sh.type_str("bet"); sh.enter();
+    sh.wait_for_prompt_after_line_advance(5000);
+    assert_eq!(std::fs::read(sh.home_path().join("selected")).unwrap(), b"<beta>\n");
+    assert!(PtyShell::strip_ansi(&sh.run_command("echo restored")).contains("restored"));
+}
+
+#[test]
+fn fuzzy_builtin_queued_substitution_in_wholeline_builtin() {
+    let sh = PtyShell::spawn_with_setup(&[("candidates", "alpha\nbeta\n")], &[], &[], 24, 80, None, |home| {
+        std::fs::create_dir(home.join("alpha")).unwrap();
+        std::fs::create_dir(home.join("beta")).unwrap();
+    });
+    sh.send(b"cd \"$(fz < candidates)\"\rbet\recho arrived\r");
+    sh.wait_for("arrived", 5000);
+    sh.wait_for_prompt_after_line_advance(5000);
+    assert!(PtyShell::strip_ansi(&sh.run_command("pwd")).contains("/beta"));
+}

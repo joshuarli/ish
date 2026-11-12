@@ -166,6 +166,7 @@ impl Shell {
         target_fd: RawFd,
         saved_fd_min: RawFd,
     ) -> crate::error::Result<()> {
+        self.move_worker_inputs_for_target(target_fd, saved_fd_min)?;
         self.private_descriptors.retain(|descriptor| descriptor.strong_count() > 0);
         for descriptor in self.private_descriptors.iter().filter_map(std::sync::Weak::upgrade) {
             let mut held = descriptor.lock().unwrap();
@@ -321,6 +322,7 @@ impl Shell {
                         sys::close(target_fd)?;
                         self.set_output_sink(target_fd, None);
                     } else if let Ok(source_fd) = fd_str.parse::<i32>() {
+                        if self.is_worker_input(source_fd) { return Err(ShellError::Io(std::io::Error::from_raw_os_error(libc::EBADF))); }
                         if self.private_descriptors.iter().filter_map(std::sync::Weak::upgrade).any(|descriptor| descriptor.lock().unwrap().as_ref().is_some_and(|descriptor| descriptor.as_raw_fd() == source_fd)) {
                             return Err(ShellError::Io(std::io::Error::from_raw_os_error(libc::EBADF)));
                         }

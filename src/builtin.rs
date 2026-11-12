@@ -15,6 +15,8 @@ pub enum Exec {
     /// Runs through epsh in lists and redirections, then the parent-process
     /// external handler.
     Foreground,
+    /// Runs a fresh linked worker through the ordinary external executor.
+    Worker,
 }
 
 /// A builtin that runs in the shell process as the whole input line.
@@ -26,6 +28,7 @@ pub enum ShellCommand {
     Denv,
     Exit,
     Fdu,
+    PickProcesses,
     ResumeJob,
     History,
     DumpLayout,
@@ -54,6 +57,7 @@ enum Handler {
         stateless: Option<ExternalCommand>,
     },
     Foreground(ExternalCommand),
+    Worker,
 }
 
 #[derive(Clone, Copy)]
@@ -62,6 +66,7 @@ enum Help {
     Copy,
     Move,
     Sync,
+    Fuzzy,
 }
 
 impl Help {
@@ -71,6 +76,7 @@ impl Help {
             Help::Copy => crate::fs_command::help(ish_fs::Operation::Copy),
             Help::Move => crate::fs_command::help(ish_fs::Operation::Move),
             Help::Sync => crate::sync_command::help(),
+            Help::Fuzzy => fz::cli::worker_help(),
         }
     }
 }
@@ -116,7 +122,7 @@ impl Builtin {
     pub fn shell_command(&self) -> Option<ShellCommand> {
         match self.handler {
             Handler::InShell(command) | Handler::Hybrid { shell: command, .. } => Some(command),
-            Handler::Foreground(_) => None,
+            Handler::Foreground(_) | Handler::Worker => None,
         }
     }
 
@@ -125,7 +131,7 @@ impl Builtin {
         match self.handler {
             Handler::Hybrid { stateless, .. } => stateless,
             Handler::Foreground(command) => Some(command),
-            Handler::InShell(_) => None,
+            Handler::InShell(_) | Handler::Worker => None,
         }
     }
 }
@@ -170,6 +176,8 @@ const ISH_BUILTINS: &[Builtin] = &[
     Builtin::in_shell("denv", ShellCommand::Denv, Help::Text(DENV_HELP)),
     Builtin::in_shell("exit", ShellCommand::Exit, Help::Text(EXIT_HELP)),
     Builtin::in_shell("fdu", ShellCommand::Fdu, Help::Text(FDU_HELP)),
+    Builtin { name: "fz", exec: Exec::Worker, handler: Handler::Worker, help: Help::Fuzzy },
+    Builtin::in_shell("pk", ShellCommand::PickProcesses, Help::Text(crate::pk::HELP)),
     Builtin::in_shell("fg", ShellCommand::ResumeJob, Help::Text(RESUME_JOB_HELP)),
     Builtin::hybrid("history", ShellCommand::History, Some(ExternalCommand::History), Help::Text(HISTORY_HELP)),
     Builtin::in_shell("ish-dump", ShellCommand::DumpLayout, Help::Text(DUMP_LAYOUT_HELP)),

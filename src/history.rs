@@ -930,7 +930,7 @@ fn rank_match_ascii(query: &[u8], text: &str) -> Option<MatchRank> {
     // Every substring is also a subsequence, so entries that fail this
     // single-pass check skip both substring scans and the window search.
     // Most entries fail it while the query is still being typed.
-    if !is_subsequence_ascii_bytes(query, text.as_bytes()) {
+    if !fz::has_match(query, text.as_bytes()) {
         return None;
     }
 
@@ -1075,7 +1075,7 @@ fn find_substring_icase_ascii_bytes(
     let last_start = text.len() - query.len();
     let mut start = 0;
     while start <= last_start {
-        start += find_either_byte(&text[start..=last_start], first, first_upper)?;
+        start += fz::find_either(&text[start..=last_start], first, first_upper)?;
         let at_boundary = start == 0 || is_word_boundary_byte(text[start - 1]);
         if (at_boundary || !boundary_only)
             && text[start + 1..start + query.len()]
@@ -1175,58 +1175,6 @@ fn subsequence_match_ascii(query: &[char], text: &str) -> Option<([usize; 32], u
     }
 
     Some((positions, qlen.min(32) as u8))
-}
-
-const BYTE_WORD_ONES: u64 = 0x0101_0101_0101_0101;
-const BYTE_WORD_HIGHS: u64 = 0x8080_8080_8080_8080;
-
-#[inline]
-fn zero_byte_mask(word: u64) -> u64 {
-    word.wrapping_sub(BYTE_WORD_ONES) & !word & BYTE_WORD_HIGHS
-}
-
-/// Index of the first byte equal to `first` or `second`, eight bytes at a time.
-/// History entries are short, where this beats a libc `memchr` call per byte
-/// of the query.
-#[inline]
-fn find_either_byte(haystack: &[u8], first: u8, second: u8) -> Option<usize> {
-    let first_word = u64::from(first) * BYTE_WORD_ONES;
-    let second_word = u64::from(second) * BYTE_WORD_ONES;
-    let (words, remainder) = haystack.as_chunks::<8>();
-    for (index, chunk) in words.iter().enumerate() {
-        let word = u64::from_le_bytes(*chunk);
-        let matches = zero_byte_mask(word ^ first_word) | zero_byte_mask(word ^ second_word);
-        if matches != 0 {
-            return Some(index * 8 + matches.trailing_zeros() as usize / 8);
-        }
-    }
-    let offset = haystack.len() - remainder.len();
-    remainder
-        .iter()
-        .position(|&byte| byte == first || byte == second)
-        .map(|index| offset + index)
-}
-
-/// Whether `query` (already ASCII-lowercased) is a case-insensitive
-/// subsequence of `text`. Agrees with `subsequence_match_ascii_bytes` returning
-/// `Some`, without computing positions.
-fn is_subsequence_ascii_bytes(query: &[u8], mut text: &[u8]) -> bool {
-    for &byte in query {
-        let uppercase = byte.to_ascii_uppercase();
-        // Query bytes usually continue a run in the text, so test the next
-        // byte before setting up a word scan.
-        if let Some((&next, rest)) = text.split_first()
-            && (next == byte || next == uppercase)
-        {
-            text = rest;
-            continue;
-        }
-        let Some(position) = find_either_byte(text, byte, uppercase) else {
-            return false;
-        };
-        text = &text[position + 1..];
-    }
-    true
 }
 
 fn subsequence_match_ascii_bytes(query: &[u8], text: &[u8]) -> Option<([usize; 32], u8)> {
@@ -1555,7 +1503,7 @@ mod tests {
                     .map(|_| alphabet[next() % 8].to_ascii_lowercase())
                     .collect();
                 assert_eq!(
-                    is_subsequence_ascii_bytes(&query, &text),
+                    fz::has_match(&query, &text),
                     subsequence_match_ascii_bytes(&query, &text).is_some(),
                     "query {query:?} text {text:?}",
                 );

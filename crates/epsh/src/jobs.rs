@@ -303,6 +303,29 @@ impl Shell {
         sys::set_foreground_group(self.terminal_raw_fd(), pid.as_raw_pid()).map_err(ShellError::Io)
     }
 
+    /// Observe and reap only this shell's completed foreground job, without
+    /// resuming or signaling it. A live or stopped member retains ownership.
+    pub fn reap_completed_foreground(&mut self, job: &mut ForegroundJob) -> crate::error::Result<Option<ExitStatus>> {
+        if job.owner_pid != std::process::id() || !Arc::ptr_eq(&job.shell, &self.job_owner) {
+            return Err(ShellError::Io(std::io::Error::other("foreground job belongs to a different shell or process")));
+        }
+        for member in &mut job.members {
+            if !member.state.is_live() { continue; }
+            let pid = rustix::process::Pid::from_raw(member.pid).unwrap();
+            match rustix::process::waitid(rustix::process::WaitId::Pid(pid), rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT | rustix::process::WaitIdOptions::NOHANG) {
+                Ok(Some(status)) => {
+                    member.state = MemberState::Exited(if let Some(code) = status.exit_status() { ExitStatus::from(code) }
+                        else { ExitStatus::from_signal(status.terminating_signal().unwrap_or(0)) });
+                }
+                Ok(None) => return Ok(None),
+                Err(rustix::io::Errno::INTR) => return Ok(None),
+                Err(rustix::io::Errno::CHILD) => { member.state = MemberState::Relinquished; job.ownership_lost = true; }
+                Err(error) => return Err(ShellError::Io(error.into())),
+            }
+        }
+        self.observe_foreground_job(job)
+    }
+
     /// Resume this shell's stopped group and wait for completion or another stop.
     /// `None` retains a stopped group. A completed group returns `Some(status)`.
     /// Recoverable errors retain the handle. Cancellation terminates its children.

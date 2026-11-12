@@ -286,3 +286,38 @@ fn variable_assignment_rule_preserves_options_positionals_and_raw_values() {
         assert_eq!(standalone.vars().positional, [epsh::shell_bytes::ShellBytes::from("retained")]);
     });
 }
+
+#[test]
+fn owned_worker_bypasses_path_and_callbacks_in_pipeline_and_substitution() {
+    isolated("owned_worker_bypasses_path_and_callbacks_in_pipeline_and_substitution", || {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = Arc::new(Mutex::new(()));
+        let held = lock.lock().unwrap();
+        let mut shell = guarded_shell(CallbackKind::External, lock.clone());
+        shell.set_cwd(dir.path().to_path_buf());
+        shell.set_var("PATH", "/missing").unwrap();
+        shell.set_command_worker("picker".into(), "/usr/bin/printf".into(), vec!["<%s>".into()], None);
+        shell.set_var_bytes("RAW", epsh::shell_bytes::ShellBytes::from_vec(vec![0xff, b' ', 0x80])).unwrap();
+        assert_eq!(shell.run_script("printf input | command command picker \"$RAW\" >selected"), 0);
+        assert_eq!(std::fs::read(dir.path().join("selected")).unwrap(), b"<\xff \x80>");
+        assert_eq!(shell.run_script("printf '%s' \"$(picker \"$RAW\")\" >selected"), 0);
+        assert_eq!(std::fs::read(dir.path().join("selected")).unwrap(), b"<\xff \x80>");
+        drop(held);
+    });
+}
+
+#[test]
+fn worker_input_survives_a_redirection_reusing_its_descriptor() {
+    isolated("worker_input_survives_a_redirection_reusing_its_descriptor", || {
+        use std::io::{Seek, Write};
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(b"queued-value\n").unwrap(); input.rewind().unwrap();
+        let descriptor = input.as_raw_fd();
+        let mut shell = Shell::builder().cwd(dir.path().to_path_buf()).build();
+        shell.set_command_worker("picker".into(), "/bin/sh".into(), vec!["-c".into(), "for descriptor; do :; done; /bin/cat <&$descriptor".into(), "worker".into(), descriptor.to_string().into()], Some(input.into()));
+        assert_eq!(shell.run_script(&format!("picker {descriptor}>other >selected")), 0);
+        assert_eq!(std::fs::read(dir.path().join("selected")).unwrap(), b"queued-value\n");
+    });
+}

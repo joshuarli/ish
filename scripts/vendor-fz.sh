@@ -8,6 +8,12 @@ repo=$1
 revision=$(git -C "$repo" rev-parse --verify "$2^{commit}")
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
+if git ls-files --error-unmatch vendor/fz/UPSTREAM >/dev/null 2>&1; then
+    if ! git diff --quiet -- vendor/fz || ! git diff --cached --quiet -- vendor/fz || [ -n "$(git ls-files --others --exclude-standard -- vendor/fz)" ]; then
+        echo 'vendor/fz has local changes; commit or preserve them before updating' >&2
+        exit 1
+    fi
+fi
 mkdir -p .work/tmp
 stage=$(mktemp -d "$root/.work/tmp/vendor-fz.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT HUP INT TERM

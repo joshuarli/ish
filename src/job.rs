@@ -4,6 +4,7 @@ pub struct Job {
     pub cmd: String,
     pub termios: crate::term::Termios,
     pub capture: Option<crate::capture::Session>,
+    pub fuzzy_input: Option<crate::fuzzy_input::FuzzyInput>,
 }
 
 pub const WAIT_FAILURE_STATUS: i32 = 1;
@@ -13,6 +14,15 @@ pub fn resume_job(epsh: &mut epsh::eval::Shell, slot: &mut Option<Job>, last_out
         report!("ish: fg: no suspended job");
         return (1, Vec::new());
     };
+    match epsh.reap_completed_foreground(&mut job.handle) {
+        Ok(Some(status)) => return (status.code(), finish_job(&mut job, last_output)),
+        Ok(None) => {}
+        Err(error) => {
+            report!("ish: fg: cannot inspect job: {error}");
+            if !job.handle.is_complete() { *slot = Some(job); }
+            return (WAIT_FAILURE_STATUS, Vec::new());
+        }
+    }
     report!("ish: resuming: {}", job.cmd);
     let converged = job.capture.as_ref().is_some_and(|capture| capture.is_converged());
     if converged {
@@ -63,14 +73,14 @@ pub fn resume_job(epsh: &mut epsh::eval::Shell, slot: &mut Option<Job>, last_out
         }
         Ok(Some(status)) => {
             crate::term::restore_startup_termios();
-            let tail = finish_capture(job.capture.take(), last_output);
+            let tail = finish_job(&mut job, last_output);
             (status.code(), tail)
         }
         Err(error) => {
             report!("ish: fg: cannot resume {}: {error}", job.cmd);
             crate::term::restore_startup_termios();
             if job.handle.is_complete() {
-                let tail = finish_capture(job.capture.take(), last_output);
+                let tail = finish_job(&mut job, last_output);
                 (WAIT_FAILURE_STATUS, tail)
             } else {
                 *slot = Some(job);
@@ -78,6 +88,15 @@ pub fn resume_job(epsh: &mut epsh::eval::Shell, slot: &mut Option<Job>, last_out
             }
         }
     }
+}
+
+fn finish_job(job: &mut Job, last_output: &mut crate::capture::OutputBuffer) -> Vec<u8> {
+    let mut tail = match job.fuzzy_input.take().map(crate::fuzzy_input::FuzzyInput::finish).transpose() {
+        Ok(tail) => tail.unwrap_or_default(),
+        Err(error) => { report!("ish: cannot return picker input: {error}"); Vec::new() }
+    };
+    tail.extend(finish_capture(job.capture.take(), last_output));
+    tail
 }
 
 fn finish_capture(capture: Option<crate::capture::Session>, last_output: &mut crate::capture::OutputBuffer) -> Vec<u8> {

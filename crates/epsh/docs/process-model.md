@@ -165,3 +165,23 @@ nested execution/query option parsing used by dispatch.
 
 See [eval.rs](../src/eval.rs) for execution and wait paths and [sys.rs](../src/sys.rs)
 for the syscall wrappers.
+
+## Fresh command workers
+
+`Shell::set_command_worker` registers owned command bytes, an executable, a
+fixed argument prefix, and an optional owned input descriptor. Worker targets
+use the ordinary external executor in parents, pipelines and substitutions.
+They do not invoke a host external callback. Placement and expanded argument
+policy still run before target effects. Other callbacks retain their process
+boundary. Explicit paths use normal executable lookup.
+
+The descriptor remains close-on-exec for other programs. Epsh relocates it away from numbered redirections and appends its current
+number after the prefix. The fresh executable owns its input use.
+This does not make the remaining Rust evaluator universally safe after a
+multithreaded fork. Ish uses workers to keep picker allocation, threads and
+terminal ownership in a fresh process.
+
+`reap_completed_foreground` observes only an owned job's direct children and
+reaps a fully completed job without signaling or resuming it. Ish calls this
+before `fg` so an externally terminated suspended job cannot cause a resume
+attempt on a reused numeric group.

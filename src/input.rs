@@ -149,12 +149,12 @@ impl InputReader {
 
     pub fn take_pending_bytes(&mut self) -> Vec<u8> {
         let mut result = Vec::with_capacity(self.pending.len() + (self.buf_end - self.buf_pos));
-        result.extend(self.pending.drain(..));
         if self.buf_pos < self.buf_end {
             result.extend_from_slice(&self.buf[self.buf_pos..self.buf_end]);
             self.buf_pos = 0;
             self.buf_end = 0;
         }
+        result.extend(self.pending.drain(..));
         result
     }
 
@@ -662,6 +662,15 @@ mod tests {
         assert!(!m.ctrl);
         assert!(m.alt);
         assert!(!m.shift);
+    }
+
+    #[test]
+    fn transfer_preserves_buffer_before_later_pending_input() {
+        let mut reader = InputReader::new(-1);
+        reader.buf[..3].copy_from_slice(b"old");
+        reader.buf_end = 3;
+        reader.push_pending(b"new");
+        assert_eq!(reader.take_pending_bytes(), b"oldnew");
     }
 
     #[test]

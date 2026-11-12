@@ -20,6 +20,8 @@ identity, lookup, completion names, and the finite builtin policy:
 - `Hybrid` commands, including `cd` and `history`, also have list forms.
 - `Foreground` handlers, including `cp`, `mv`, `rsync`, `l`, and `c`, run in the
   original process. Pipeline stages and command substitutions refuse them.
+- `Worker` runs the linked fz CLI in a fresh same-binary executable, including
+  pipeline and substitution placements. It installs no inherited host callback.
 
 Planning and expanded dispatch reuse epsh's `command_action` parsing and raw
 argument rules. Expanded targets are checked before target redirections,
@@ -35,6 +37,29 @@ Argument substitutions finish before a parent handler runs. See the
 [epsh process model](../crates/epsh/docs/process-model.md) for callback and fork
 limits. epsh owns external processes, process groups, waits, and stopped-job
 handles. ish owns terminal modes and the single suspended-job slot.
+
+## Picker ownership
+
+The [picker reference](fuzzy-pickers.md) records the native process policy and
+shared-source revision. `pk` is an `InShell` command. It uses the shared fz
+`Picker` with ish's `InputReader`, resize and termination events. Terminal
+cleanup completes before batch validation and signaling. Process records and
+OS handles remain private to [pk.rs](../src/pk.rs) and its native backends.
+
+For `fz`, epsh stores an executable, fixed prefix and optional owned input
+descriptor. Its ordinary external executor handles argv, environment, cwd,
+redirections and jobs. Only the registered worker inherits that descriptor. Epsh relocates it away
+from numbered redirections and appends its current number after the prefix.
+The private binary entry loads no shell or config. The CLI adapter temporarily
+claims the controlling terminal when a substitution needs it, then restores
+the prior foreground group and signal state.
+
+[fuzzy_input.rs](../src/fuzzy_input.rs) transfers editor-buffered bytes through
+a seekable descriptor with a shared offset. Linux uses a memfd. macOS uses an
+immediately unlinked private temporary file in `/tmp`. The worker reads one byte at a time before terminal input.
+Unread bytes return before newer capture input. A suspended worker retains its
+input session with the owned job. No transfer exists for an empty editor tail.
+This descriptor is not candidate stdin and carries no selected output.
 
 ## Output capture
 

@@ -735,7 +735,9 @@ impl Terminal {
 
     fn restore(&mut self) -> io::Result<()> {
         let paste_result = if self.bracketed_paste {
-            self.output.write_all(b"\x1b[?2004l").and_then(|()| self.output.flush())
+            let result = self.output.write_all(b"\x1b[?2004l").and_then(|()| self.output.flush());
+            if result.is_ok() { self.bracketed_paste = false; }
+            result
         } else { Ok(()) };
         let termios_result = if self.restore_needed {
             loop {

@@ -1,4 +1,4 @@
 Repository: https://github.com/laputa-systems/fz
-Revision: 36cb84c3a284d262bcde720027e1409a11548674
+Revision: 39738514ac983ebd779fee7a39437c1ad1e8ce6f
 License: MIT (LICENSE)
 Update: scripts/vendor-fz.sh /path/to/fz COMMIT

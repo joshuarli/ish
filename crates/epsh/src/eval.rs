@@ -287,6 +287,12 @@ pub enum CommandIdentity {
     Builtin,
 }
 
+struct CommandWorker {
+    executable: PathBuf,
+    prefix: Vec<ShellBytes>,
+    input: Option<OwnedFd>,
+}
+
 thread_local! {
     static EXTERNAL_COMMAND_CWD: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
@@ -388,6 +394,7 @@ pub struct Shell {
     terminal_descriptor: Option<HeldDescriptor>,
     command_placements: FxHashMap<Vec<u8>, CommandPlacement>,
     command_identities: FxHashMap<Vec<u8>, CommandIdentity>,
+    command_workers: FxHashMap<Vec<u8>, CommandWorker>,
     placement_context: PlacementContext,
     pub(crate) ev_exit: bool,
     cancel: Option<Arc<AtomicBool>>,
@@ -683,6 +690,7 @@ impl ShellBuilder {
             job_owner: Arc::new(()),
             pending_job: None,
             terminal_descriptor: None,
+            command_workers: FxHashMap::default(),
             command_placements: FxHashMap::default(),
             command_identities: FxHashMap::default(),
             placement_context: PlacementContext::default(),
@@ -1048,6 +1056,7 @@ impl Shell {
             job_owner: Arc::new(()),
             pending_job: None,
             terminal_descriptor: None,
+            command_workers: FxHashMap::default(),
             command_placements: FxHashMap::default(),
             command_identities: FxHashMap::default(),
             placement_context: PlacementContext::default(),
@@ -1500,8 +1509,35 @@ impl Shell {
         self.redirect_open_handler = Some(Registered::new(handler));
     }
 
+    /// Execute a registered command with a fresh executable and fixed argument
+    /// prefix, independent of PATH and host callbacks. Original operands,
+    /// environment, cwd, redirections and foreground-job ownership follow the
+    /// ordinary external executor. Explicit paths bypass this registration.
+    /// An optional owned input descriptor is inherited only by this worker.
+    /// Its current descriptor number is appended after the prefix and before
+    /// original operands, including after internal relocation for redirections.
+    /// Other close-on-exec descriptors and callbacks retain their boundaries.
+    pub fn set_command_worker(&mut self, name: ShellBytes, executable: PathBuf, prefix: Vec<ShellBytes>, input: Option<OwnedFd>) {
+        self.command_workers.insert(name.into_vec(), CommandWorker { executable, prefix, input });
+    }
+
+    pub(crate) fn move_worker_inputs_for_target(&mut self, target: RawFd, minimum: RawFd) -> crate::error::Result<()> {
+        for worker in self.command_workers.values_mut() {
+            if let Some(input) = &mut worker.input && input.as_raw_fd() == target {
+                *input = sys::duplicate_fd_above(target, minimum)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_worker_input(&self, fd: RawFd) -> bool {
+        self.command_workers.values().any(|worker| worker.input.as_ref().is_some_and(|input| input.as_raw_fd() == fd))
+    }
+
     pub(crate) fn has_external_handler(&self, target: &str) -> bool {
-        self.external_handler.is_some() || self.external_dispatch_names.iter().any(|name| name == &ShellBytes::from_str_lossless(target))
+        let name = ShellBytes::from_str_lossless(target);
+        !self.command_workers.contains_key(name.as_bytes())
+            && (self.external_handler.is_some() || self.external_dispatch_names.iter().any(|registered| registered == &name))
     }
 
     /// Set the shell's working directory.
@@ -2085,6 +2121,7 @@ impl Shell {
         }
         let Some(name) = target.first() else { return Ok(()); };
         if crate::builtins::is_builtin(name) || (!bypass_functions && self.functions.contains_key(name)) { return Ok(()); }
+        if self.command_workers.contains_key(ShellBytes::from_str_lossless(name).as_bytes()) { return Ok(()); }
         if self.external_dispatch_names.iter().any(|registered| registered == &ShellBytes::from_str_lossless(name)) {
             if let Some(dispatcher) = &self.external_dispatcher { dispatcher.check(CallbackKind::External)?; }
         } else if let Some(handler) = &self.external_handler { handler.check(CallbackKind::External)?; }
@@ -2217,7 +2254,17 @@ impl Shell {
     ) -> crate::error::Result<ExitStatus> {
         self.check_cancel()?;
         let saved = self.setup_redirections(redirs)?;
-        let args_bytes: Vec<ShellBytes> = args.iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
+        let original: Vec<ShellBytes> = args.iter().map(|s| ShellBytes::from_str_lossless(s)).collect();
+        let args_bytes = if let Some(worker) = self.command_workers.get(original[0].as_bytes()) {
+            let mut argv = Vec::with_capacity(original.len() + worker.prefix.len() + usize::from(worker.input.is_some()));
+            argv.push(ShellBytes::from_os_string(worker.executable.as_os_str().to_owned()));
+            argv.extend_from_slice(&worker.prefix);
+            if let Some(input) = &worker.input { argv.push(input.as_raw_fd().to_string().into()); }
+            argv.extend_from_slice(&original[1..]);
+            argv
+        } else { original };
+        let worker_input = self.command_workers.get(ShellBytes::from_str_lossless(&args[0]).as_bytes())
+            .and_then(|worker| worker.input.as_ref()).map(AsRawFd::as_raw_fd);
         let mut assign_bytes = Vec::new();
         for assign in assigns {
             let value = self.expand_string(&assign.value)?;
@@ -2234,6 +2281,13 @@ impl Shell {
             if let Err(error) = std::env::set_current_dir(&self.cwd) {
                 return self.finish_redirections(Err(error.into()), saved);
             }
+            if let Some(fd) = worker_input {
+                // SAFETY: the registered worker owns fd until exec. Only this
+                // audited syscall clears close-on-exec in the evaluator child.
+                if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == -1 {
+                    return self.finish_redirections(Err(std::io::Error::last_os_error().into()), saved);
+                }
+            }
             let err = crate::builtins::exec::execve_with_env(&args_bytes[0], &args_bytes, &env);
             let result = self.handle_exec_error(&err, &args[0]);
             return self.finish_redirections(result, saved);
@@ -2242,6 +2296,13 @@ impl Shell {
         let mut cmd = std::process::Command::new(args_bytes[0].to_os_string());
         cmd.args(args_bytes.iter().skip(1).map(ShellBytes::to_os_string));
         cmd.current_dir(&self.cwd);
+        if let Some(fd) = worker_input {
+            // SAFETY: this descriptor is owned by the worker registration and
+            // remains live until spawn returns. The child only calls fcntl.
+            unsafe { cmd.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+            }); }
+        }
         if self.opts.interactive {
             let handoff = !self.in_forked_child;
             let terminal_fd = self.terminal_raw_fd();

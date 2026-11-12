@@ -127,16 +127,19 @@ impl<W: Write> Renderer<W> {
         self.clear_line()?;
 
         if options.show_info || options.multi {
-            self.write_bytes(b"\n[")?;
-            self.write_usize(available)?;
-            self.write_bytes(b"/")?;
-            self.write_usize(choices.len())?;
-            self.write_bytes(b"]")?;
-            if options.multi {
-                self.write_bytes(b" [")?;
-                self.write_usize(state.marked.len())?;
-                self.write_bytes(b" selected]")?;
+            self.write_bytes(b"\r\n")?;
+            let mut bytes = [0u8; 96];
+            let capacity = bytes.len();
+            let mut remaining = &mut bytes[..];
+            write!(remaining, "[{available}/{}]", choices.len())?;
+            if options.multi { write!(remaining, " [{} selected]", state.marked.len())?; }
+            let mut length = capacity - remaining.len();
+            if options.multi && length >= self.width {
+                let mut remaining = &mut bytes[..];
+                write!(remaining, "[{} selected]", state.marked.len())?;
+                length = (capacity - remaining.len()).min(self.width.saturating_sub(1));
             }
+            self.write_bytes(&bytes[..length])?;
             self.clear_line()?;
         }
 
@@ -158,7 +161,7 @@ impl<W: Write> Renderer<W> {
         }
         let mut rows_used = 0usize;
         for index in start..end {
-            self.write_bytes(b"\n")?;
+            self.write_bytes(b"\r\n")?;
             self.clear_line()?;
             let score = options.show_scores.then(|| choices.getscore(index)).flatten();
             let marked = options.multi && choices.source_index(index)
@@ -173,7 +176,7 @@ impl<W: Write> Renderer<W> {
             }
         }
         for _ in rows_used..budget {
-            self.write_bytes(b"\n")?;
+            self.write_bytes(b"\r\n")?;
             self.clear_line()?;
         }
 
@@ -269,7 +272,7 @@ impl<W: Write> Renderer<W> {
             let char_width = if candidate[index] == b'\n' { 1 } else { scalar_width(scalar) };
             if char_width > 0 && column + char_width > width {
                 if rows >= max_rows { break; }
-                self.write_bytes(b"\n")?;
+                self.write_bytes(b"\r\n")?;
                 self.set_column(0)?;
                 self.clear_line()?;
                 rows += 1;
@@ -310,10 +313,6 @@ impl<W: Write> Renderer<W> {
         self.output.write_all(bytes)
     }
 
-    fn write_usize(&mut self, value: usize) -> io::Result<()> {
-        write!(self.output, "{value}")
-    }
-
     fn flush(&mut self) -> io::Result<()> {
         self.output.flush()
     }
@@ -349,7 +348,7 @@ impl<W: Write> Renderer<W> {
     }
 
     fn newline(&mut self) -> io::Result<()> {
-        self.write_bytes(b"\x1b[K\n")
+        self.write_bytes(b"\x1b[K\r\n")
     }
 
     fn set_column(&mut self, column: usize) -> io::Result<()> {

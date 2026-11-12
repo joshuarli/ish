@@ -73,6 +73,24 @@ fn run_command(command: &OsStr) -> ! {
 }
 
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--ish-fz-worker")) {
+        use std::os::unix::ffi::OsStringExt;
+        if let Err(error) = ish::signal::restore_defaults() { report!("ish: worker signal setup: {error}"); std::process::exit(2); }
+        use std::os::fd::FromRawFd;
+        let descriptor = std::env::args_os().nth(2).and_then(|arg| arg.to_str().and_then(|arg| arg.parse::<i32>().ok())).unwrap_or(-1);
+        let input = if descriptor >= 3 {
+            // SAFETY: the private worker entry receives this owned descriptor
+            // from epsh's explicit close-on-exec exception for fz only.
+            Some(unsafe { std::fs::File::from_raw_fd(descriptor) })
+        } else { None };
+        let status = fz::cli::run_in_foreground(std::env::args_os().skip(3).map(OsString::into_vec), input);
+        if matches!(status - 128, libc::SIGHUP | libc::SIGTERM | libc::SIGQUIT) {
+            // SAFETY: fz has restored terminal and signal state. Re-raise in
+            // the fresh executable so the parent observes signal death.
+            unsafe { libc::signal(status - 128, libc::SIG_DFL); libc::raise(status - 128); }
+        }
+        std::process::exit(status);
+    }
     let args = parse_args();
     if let Some(command) = args.command.as_deref() {
         run_command(command);

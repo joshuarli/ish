@@ -2360,3 +2360,27 @@ fn rsync_metadata_and_permissions_preserved() {
     let _ = std::fs::set_permissions(dst.join("readonly.txt"), std::fs::Permissions::from_mode(0o644));
     let _ = std::fs::remove_dir_all(&test_dir);
 }
+
+#[test]
+fn shared_history_eligibility_retains_long_unicode_and_below_visible_cutoff() {
+    use std::path::Path;
+    let mut entries = (0..250).map(|index| format!("alpha {index}")).collect::<Vec<_>>();
+    let long = format!("{} alpha needle", "x".repeat(2048));
+    entries.push(long.clone());
+    entries.push("Σ echo ÉCOLE\nsecond line".into());
+    let history = History::from_entries(entries);
+    let mut candidates = Vec::new();
+    history.search_entry_indices_into(&mut candidates);
+    let mut matched = Vec::new();
+    let mut results = Vec::new();
+    history.fuzzy_search_subset_into_in_dir("alpha", &candidates, &mut matched, &mut results, 200, Path::new("/"));
+    assert_eq!(results.len(), 200);
+    assert_eq!(matched.len(), 251);
+    let mut narrowed = Vec::new();
+    history.fuzzy_search_subset_into_in_dir("alpha needle", &matched, &mut narrowed, &mut results, 200, Path::new("/"));
+    assert_eq!(results.len(), 1);
+    assert_eq!(history.get(results[0].entry_idx), long);
+    let unicode = history.fuzzy_search("école");
+    assert_eq!(unicode.len(), 1);
+    assert_eq!(&unicode[0].match_positions[..unicode[0].match_count as usize], &[7, 8, 9, 10, 11]);
+}

@@ -8,14 +8,15 @@ inductive Rejection where
   | parameterOperator | shellBuiltinOutsideLine
   deriving Repr, BEq, DecidableEq
 inductive Exec where
-  | inShell | hybrid | foreground | native
+  | inShell | hybrid | foreground | native | worker
   deriving Repr, BEq, DecidableEq
 
 def classify (name : Bytes) : Option Exec :=
-  if ["?", "alias", "copy-scrollback", "denv", "exit", "fg", "ish-dump", "rmrf", "type", "w", "which", "z"].any
+  if ["?", "alias", "copy-scrollback", "denv", "exit", "fg", "pk", "ish-dump", "rmrf", "type", "w", "which", "z"].any
       (fun text => text.toUTF8.toList == name) then some .inShell
   else if ["cd", "history"].any (fun text => text.toUTF8.toList == name) then some .hybrid
   else if ["cp", "mv"].any (fun text => text.toUTF8.toList == name) then some .foreground
+  else if name == "fz".toUTF8.toList then some .worker
   else if ["c", "l"].any (fun text => text.toUTF8.toList == name) then some .native
   else none
 
@@ -256,6 +257,7 @@ def execName : Exec → String
   | .inShell => "in_shell"
   | .hybrid => "hybrid"
   | .foreground => "foreground"
+  | .worker => "worker"
   | .native => "native"
 
 def encodeExec : Option Exec → Json
@@ -309,6 +311,11 @@ example : dynamicAllowed "mv".toUTF8.toList = true := by decide +kernel
 example : decodePlacementContext "pipeline" = .ok .pipeline := by rfl
 example : decodePlacementContext "negated-parent" = .ok .negatedParent := by rfl
 example : decodePlacementContext "parallel" = .error "unknown placement context" := by rfl
+
+theorem fz_worker_class : classify "fz".toUTF8.toList = some .worker := by decide +kernel
+theorem fz_dynamic_allowed : dynamicAllowed "fz".toUTF8.toList = true := by decide +kernel
+theorem pk_in_shell_class : classify "pk".toUTF8.toList = some .inShell := by decide +kernel
+theorem pk_dynamic_refused : dynamicAllowed "pk".toUTF8.toList = false := by decide +kernel
 
 theorem cp_foreground_class : classify "cp".toUTF8.toList = some .foreground := by decide +kernel
 theorem mv_foreground_class : classify "mv".toUTF8.toList = some .foreground := by decide +kernel

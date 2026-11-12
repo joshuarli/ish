@@ -18,11 +18,11 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         return placement_case(index, placement_target((index / 96) % 3));
     }
     if index % 4 == 1 {
-        return dynamic_case(index, dynamic_target((index / 4) % 12));
+        return dynamic_case(index, dynamic_target((index / 4) % 14));
     }
     let mut random = Generator::new(seed ^ (index as u64).wrapping_mul(0xa0761d6478bd642f));
     let word = format!("item{}", random.below(100_000));
-    let source = match (index / 4) % 20 {
+    let source = match (index / 4) % 24 {
         0 => format!("echo {word}"),
         1 => "l -l".into(),
         2 => "cd /tmp".into(),
@@ -42,7 +42,11 @@ pub(crate) fn generate(index: usize, seed: u64) -> BridgeResult<Request> {
         16 => "cp source destination".into(),
         17 => "mv source destination".into(),
         18 => "printf input | cp source destination".into(),
-        _ => "echo \"$(cp source destination)\"".into(),
+        19 => "echo \"$(cp source destination)\"".into(),
+        20 => "printf alpha | fz -e a".into(),
+        21 => "echo \"$(fz -e a)\"".into(),
+        22 => "pk worker".into(),
+        _ => "echo before; pk worker".into(),
     };
     let bytes = source.as_bytes().to_vec();
     let source_text = std::str::from_utf8(&bytes)
@@ -71,7 +75,9 @@ fn dynamic_target(index: usize) -> Vec<u8> {
         8 => b"cp".to_vec(),
         9 => b"mv".to_vec(),
         10 => vec![0xff],
-        _ => "\u{e080}".as_bytes().to_vec(),
+        11 => "\u{e080}".as_bytes().to_vec(),
+        12 => b"fz".to_vec(),
+        _ => b"pk".to_vec(),
     }
 }
 
@@ -431,6 +437,7 @@ fn actual_placement(request: &Request) -> BridgeResult<Value> {
             ish::builtin::Exec::InShell => "in_shell",
             ish::builtin::Exec::Hybrid => "hybrid",
             ish::builtin::Exec::Foreground => "foreground",
+            ish::builtin::Exec::Worker => "worker",
         });
     directory.remove()?;
     Ok(value!({

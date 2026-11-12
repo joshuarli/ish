@@ -56,3 +56,9 @@ connect that result to both model shift branches for every 64-bit left operand.
 their transitive axioms. The extractor uses its own Rust nightly under `.work/`.
 The proof trusts the extraction tools and does not cover production shift
 primitives, parsing, other operators, or compiled machine code.
+
+The fz worker class and pk whole-line policy have model classification theorems
+`IshSemantics.Policy.fz_worker_class` and `IshSemantics.Policy.pk_dynamic_refused`.
+The policy bridge includes their static and dynamic routes. Process identity,
+signaling, worker descriptors and terminal lifecycle rely on Rust and native
+PTY evidence in [fz integration validation](fz-integration.md), not Lean proofs.
