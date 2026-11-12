@@ -368,15 +368,13 @@ impl PtyShell {
         let deadline = terminal.deadline(std::time::Duration::from_millis(timeout_ms));
         terminal.drain(deadline).expect("drain shell output");
         let output_length = terminal.raw_output().len();
-        if output_length == self.output_offset.get() {
-            let _ = terminal
+        if output_length != self.output_offset.get() || terminal
                 .wait_for_output(deadline)
-                .expect("wait for shell output");
+                .expect("wait for shell output") {
+            let _ = terminal
+                .wait_for_quiescence(deadline, std::time::Duration::from_millis(50))
+                .expect("wait for shell output quiescence");
         }
-        let _ = terminal
-            .wait_for_quiescence(deadline, std::time::Duration::from_millis(50))
-            .expect("wait for shell output quiescence");
-        terminal.drain(deadline).expect("drain shell output");
         let output = terminal.raw_output();
         let offset = self.output_offset.get();
         buf.extend_from_slice(output.get(offset..).unwrap_or_default());
@@ -398,7 +396,7 @@ impl PtyShell {
 
     fn drain_available_output(&self) {
         let mut terminal = self.terminal.borrow_mut();
-        let deadline = terminal.deadline(std::time::Duration::ZERO);
+        let deadline = terminal.deadline(std::time::Duration::from_millis(50));
         terminal.drain(deadline).expect("drain shell output");
     }
 
