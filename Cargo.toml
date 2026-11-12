@@ -35,7 +35,7 @@ libc = "0.2"
 
 [dev-dependencies]
 rustybench = "0.4"
-laputa-ptytest = "0.2"
+laputa-ptytest = "0.4"
 deser-json = "0.10.2"
 deser-value = "0.10.2"
 
