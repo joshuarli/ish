@@ -36,7 +36,7 @@ rustix = { version = "1.1.4", features = ["event", "fs", "pipe", "process", "pty
 libc = "0.2"
 
 [dev-dependencies]
-rustybench = "0.4"
+rustybench = "0.5"
 laputa-ptytest = "0.4"
 deser-json = "0.10.2"
 deser-value = "0.10.2"
