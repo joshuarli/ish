@@ -1,0 +1,87 @@
+[
+  {
+    "name": "bench::history_construct_45k",
+    "median_ns": 6324558,
+    "min_ns": 5860943,
+    "max_ns": 6753564,
+    "allocations": [
+      90022
+    ],
+    "bytes": [
+      8620221
+    ]
+  },
+  {
+    "name": "bench::history_editor_mixed_trace_45k",
+    "median_ns": 14048746,
+    "min_ns": 12829138,
+    "max_ns": 14677004,
+    "allocations": [
+      90036
+    ],
+    "bytes": [
+      3912231,
+      3912253
+    ]
+  },
+  {
+    "name": "bench::history_fuzzy_search_in_dir_45k",
+    "median_ns": 426440,
+    "min_ns": 384096,
+    "max_ns": 453096,
+    "allocations": [
+      1
+    ],
+    "bytes": [
+      8040
+    ]
+  },
+  {
+    "name": "bench::history_fuzzy_search_into_45k",
+    "median_ns": 335112,
+    "min_ns": 307121,
+    "max_ns": 348479,
+    "allocations": [
+      1
+    ],
+    "bytes": [
+      8040
+    ]
+  },
+  {
+    "name": "bench::history_search_trace",
+    "median_ns": 1251770,
+    "min_ns": 1144038,
+    "max_ns": 1300461,
+    "allocations": [
+      4
+    ],
+    "bytes": [
+      32160
+    ]
+  },
+  {
+    "name": "bench::startup_cold",
+    "median_ns": 721116,
+    "min_ns": 615058,
+    "max_ns": 787818,
+    "allocations": [
+      2344
+    ],
+    "bytes": [
+      332869
+    ]
+  },
+  {
+    "name": "bench::startup_warm",
+    "median_ns": 504804,
+    "min_ns": 429922,
+    "max_ns": 566203,
+    "allocations": [
+      2264
+    ],
+    "bytes": [
+      321963
+    ]
+  }
+]

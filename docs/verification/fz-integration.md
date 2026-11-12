@@ -1,10 +1,13 @@
 # fz integration validation
 
-The baseline is ish `c30a151d6fd1a305a5ac362d21145e327bd639b3`.
+The baseline is ish `05f6810be0473d10692cfb7776fb4dee96c4c94f`.
 The shared source is fz `8a91d565dff85caac4131a4bde90f5c685812590`.
 Its final changes adjust whitespace; validation uses identical executable code.
 [Picker reference](../fuzzy-pickers.md) defines the delivered behavior and
 platform identity limits. [Raw results](fz-integration/) retain the measurements.
+The final comparison uses `current-*` results with identical dependencies on
+both sides. `accepted-*` and `delivered-*` retain earlier measurements against
+`c30a151d6fd1a305a5ac362d21145e327bd639b3`, before the upstream dependency update.
 
 ## Runtime and semantic checks
 
@@ -61,19 +64,18 @@ Each cell is the median of five run medians, followed by their range.
 
 | Workload | Baseline | Integrated |
 |---|---:|---:|
-| 45k `gco` query | 292.412 µs (290.613–296.733) | 291.886 µs (286.605–299.851) |
-| 45k deep-directory query | 391.956 µs (388.721–392.329) | 368.600 µs (366.367–374.666) |
-| Existing rendered search trace | 1.134 ms (1.131–1.141) | 1.097 ms (1.088–1.117) |
-| Editor mixed trace | 11.789 ms (11.576–11.834) | 11.918 ms (11.846–12.082) |
-| 45k corpus and search construction | 4.928 ms (4.864–5.370) | 4.915 ms (4.888–5.553) |
-| Existing cold startup fixture | 675.626 µs (667.894–697.113) | 674.726 µs (622.129–715.722) |
-| Existing warm startup fixture | 491.285 µs (485.624–505.502) | 492.152 µs (409.614–497.886) |
+| 45k `gco` query | 336.972 µs (299.274–350.336) | 335.112 µs (307.121–348.479) |
+| 45k deep-directory query | 435.948 µs (422.767–456.734) | 426.440 µs (384.096–453.096) |
+| Existing rendered search trace | 1.303 ms (1.148–1.352) | 1.252 ms (1.144–1.300) |
+| Editor mixed trace | 13.713 ms (12.670–13.991) | 14.049 ms (12.829–14.677) |
+| 45k corpus and search construction | 6.146 ms (5.489–6.292) | 6.325 ms (5.861–6.754) |
+| Existing cold startup fixture | 708.941 µs (659.726–720.925) | 721.116 µs (615.058–787.818) |
+| Existing warm startup fixture | 515.467 µs (411.232–536.746) | 504.804 µs (429.922–566.203) |
 
-The deep-directory query and existing rendered trace improve. The `gco` and
-construction/startup ranges overlap. The mixed editor trace is 0.130 ms (1.1%)
-slower across its eight key events and two paste events. That change is smaller
-than the observed per-side run spread and adds no allocations. No general
-history speedup is claimed. A separate sample profile places the work in
+All ranges overlap. The mixed editor trace is 0.336 ms (2.5%) slower across its
+eight key events and two paste events. That change is smaller than the observed
+per-side run spread and adds no allocations. No measurable general history
+speedup or regression is established. A separate sample profile places the work in
 `History::search_limited`, including Unicode character-vector allocation,
 rather than terminal rendering. That unmodified path limits the mixed trace.
 
@@ -83,8 +85,8 @@ uses four allocations and 32,160–32,182 bytes. The mixed Editor trace uses
 cost. Corpus construction uses 90,022 allocations and 8,620,221 bytes. These
 counts include the timed complete-history work rather than hiding its copies.
 
-A serial 512-process picker construction, query and render takes 41.774 µs
-(40.984–54.673) across five runs, each with five samples of 200 iterations,
+A serial 512-process picker construction, query and render takes 43.442 µs
+(42.511–46.063) across five runs, each with five samples of 200 iterations,
 with 542 allocations and 76,510 bytes.
 The timed work copies the complete fixture corpus, filters, ranks and produces
 nonempty terminal bytes. There is no baseline pk implementation to compare.
@@ -99,13 +101,12 @@ and passes `perf-gate-ready -1` before and after the complete batch.
 
 | Peak RSS | Baseline | Integrated |
 |---|---:|---:|
-| Median bytes | 21,774,336 | 19,988,480 |
-| Range bytes | 21,774,336–21,807,104 | 19,955,712–21,774,336 |
+| Median bytes | 21,807,104 | 19,988,480 |
+| Range bytes | 21,790,720–23,642,112 | 19,955,712–21,757,952 |
 
-The final batch shows no RSS regression. Residency varies between batches:
-an earlier gated five-pair run had medians of 21,807,104 and 21,856,256 bytes
-(+49,152 bytes, 0.23%). No general memory reduction is claimed. Both batches
-include complete history loading.
+The final batch shows no RSS regression. Residency varies between batches,
+including earlier measurements with nearly equal medians. No general memory
+reduction is claimed. The observations include complete history loading.
 
 The final stripped macOS release grows from 1,897,408 to 2,030,368 bytes,
 about 7.0%. Standalone fz's identically configured dist build grows from 386,192
@@ -114,12 +115,11 @@ and adds no CLI, TUI, asynchronous or process-monitoring framework. Build-time
 impact was not isolated from compiler cache and host load, so no build-speed
 claim is made.
 
-Final baseline startup is 40.815 ms (35.003–53.323), versus 48.359 ms
-(28.996–55.346) integrated. Ctrl+R open, synchronize, query and render is
-2.515 ms (2.251–3.176), versus 3.250 ms (2.401–3.565). The ranges overlap;
+Final baseline startup is 32.801 ms (30.655–154.664), versus 31.235 ms
+(28.948–41.571) integrated. Ctrl+R open, synchronize, query and render is
+2.239 ms (2.211–2.835), versus 2.438 ms (2.422–2.476). The ranges overlap;
 the median differences are smaller than the observed per-side spreads.
-The earlier gated batch recorded 47.989 versus 48.528 ms startup, including
-the integrated 350.684 ms outlier retained in its raw data. Neither batch
-establishes a startup or whole-session search speedup. The isolated production
-search benchmarks above separate CPU search cost from process startup, journal
-import and PTY scheduling. Earlier ungated PTY timings are diagnostic only.
+The baseline startup outlier remains reported. This establishes no startup or
+whole-session search speedup. The isolated production search benchmarks above
+separate CPU search cost from process startup, journal import and PTY scheduling.
+Earlier ungated PTY timings are diagnostic only.

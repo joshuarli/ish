@@ -1,0 +1,40 @@
+[
+  {
+    "side": "baseline",
+    "count": 5,
+    "startup_ns": {
+      "median": 32801000,
+      "min": 30655250,
+      "max": 154663666
+    },
+    "search_ns": {
+      "median": 2239125,
+      "min": 2211125,
+      "max": 2834583
+    },
+    "maxrss": {
+      "median": 21807104,
+      "min": 21790720,
+      "max": 23642112
+    }
+  },
+  {
+    "side": "candidate",
+    "count": 5,
+    "startup_ns": {
+      "median": 31234875,
+      "min": 28947583,
+      "max": 41570709
+    },
+    "search_ns": {
+      "median": 2438416,
+      "min": 2422208,
+      "max": 2476375
+    },
+    "maxrss": {
+      "median": 19988480,
+      "min": 19955712,
+      "max": 21757952
+    }
+  }
+]
