@@ -18,7 +18,7 @@ RUN apk add --no-cache \
     strace=6.19-r1 \
     musl-dev=1.2.6-r3 \
     libgcc=15.2.0-r5 \
-    git=2.54.0-r0 \
+    git=2.54.1-r0 \
     tzdata=2026f-r0
 
 # rustix requests libutil for Unix PTY support; musl provides those symbols in
