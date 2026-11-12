@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace]
+exclude = ["vendor/fz"]
 members = [
     ".",
     "crates/epsh",
@@ -27,6 +28,7 @@ fdu-delete = { path = "crates/fdu-delete" }
 fdu-posix = { path = "crates/fdu-posix" }
 fdu-scan = { path = "crates/fdu-scan" }
 fdu-tui = { path = "crates/fdu-tui" }
+fz = { path = "vendor/fz" }
 hashbrown = { workspace = true }
 ish-fs = { path = "crates/ish-fs" }
 rustc-hash = "2.1"

@@ -1,0 +1,22 @@
+[package]
+name = "fz"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A minimal fzy-compatible fuzzy selector"
+autobins = false
+autotests = false
+autobenches = false
+
+[dependencies]
+
+[dependencies.rustix]
+version = "1.1.4"
+features = ["termios", "event", "process", "stdio"]
+
+[target]
+
+[target."cfg(any(target_os = \"linux\", target_os = \"macos\"))"]
+
+[target."cfg(any(target_os = \"linux\", target_os = \"macos\"))".dependencies]
+libc = "0.2"
