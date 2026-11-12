@@ -1,0 +1,10 @@
+{"side": "baseline", "run": 0, "startup_ns": 43759250, "search_ns": 2251166, "maxrss": 21790720, "user_s": 0.016878999999999998, "system_s": 0.013175}
+{"side": "candidate", "run": 0, "startup_ns": 51993083, "search_ns": 3488708, "maxrss": 19955712, "user_s": 0.027844999999999998, "system_s": 0.018289}
+{"side": "baseline", "run": 1, "startup_ns": 40814666, "search_ns": 2681042, "maxrss": 21774336, "user_s": 0.020624999999999998, "system_s": 0.013970999999999999}
+{"side": "candidate", "run": 1, "startup_ns": 55345500, "search_ns": 3564833, "maxrss": 19988480, "user_s": 0.027802, "system_s": 0.019724}
+{"side": "baseline", "run": 2, "startup_ns": 53322958, "search_ns": 3176458, "maxrss": 21774336, "user_s": 0.02658, "system_s": 0.018567}
+{"side": "candidate", "run": 2, "startup_ns": 34199333, "search_ns": 2720792, "maxrss": 19988480, "user_s": 0.020086, "system_s": 0.013531}
+{"side": "baseline", "run": 3, "startup_ns": 35431292, "search_ns": 2284333, "maxrss": 21807104, "user_s": 0.01826, "system_s": 0.0116}
+{"side": "candidate", "run": 3, "startup_ns": 48359292, "search_ns": 3249708, "maxrss": 21757952, "user_s": 0.026452, "system_s": 0.018081}
+{"side": "baseline", "run": 4, "startup_ns": 35003042, "search_ns": 2515166, "maxrss": 21774336, "user_s": 0.020284, "system_s": 0.01354}
+{"side": "candidate", "run": 4, "startup_ns": 28995584, "search_ns": 2400709, "maxrss": 21774336, "user_s": 0.017686999999999998, "system_s": 0.011635999999999999}

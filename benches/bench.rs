@@ -637,6 +637,63 @@ fn history_search_trace(bencher: Bencher) {
     });
 }
 
+
+#[rustybench::bench]
+fn history_construct_45k(bencher: Bencher) {
+    bencher.bench_local(|| black_box(History::from_entries(synthetic_history_45k())));
+}
+
+#[rustybench::bench]
+fn history_editor_mixed_trace_45k(bencher: Bencher) {
+    use ish::editor::{Editor, EditorContext, EditorEvent};
+    use ish::input::{Key, KeyEvent};
+    let mut corpus = synthetic_history_45k();
+    corpus.push("echo ÉCOLE\n日本語".to_owned());
+    corpus.push(format!("{} long-target", "x".repeat(2048)));
+    let history = History::from_entries(corpus);
+    let aliases = AliasMap::new();
+    let context = EditorContext { aliases: &aliases, history: &history, cwd: Path::new("/"), home: None,
+        home_display: "", path: b"", directories: &[] };
+    let mut editor = Editor::new(24, 80);
+    let mut output = Vec::with_capacity(32768);
+    let mut prompt_text = String::from("$ ");
+    bencher.bench_local(|| {
+        editor.begin(std::mem::take(&mut prompt_text), 2, &context);
+        editor.search_history(&context);
+        for key in [KeyEvent::char('g'), KeyEvent::char('c'), KeyEvent::char('o'),
+            KeyEvent::key(Key::Backspace), KeyEvent::key(Key::Left), KeyEvent::char('x'),
+            KeyEvent::key(Key::Right), KeyEvent::ctrl('u')] {
+            editor.handle(EditorEvent::Key(key), &context);
+            output.clear(); editor.write_output(&mut output).unwrap(); black_box(&output);
+        }
+        for text in ["école", " long-target"] {
+            editor.handle(EditorEvent::Paste(text), &context);
+            output.clear(); editor.write_output(&mut output).unwrap(); black_box(&output);
+        }
+        editor.handle(EditorEvent::Key(KeyEvent::key(Key::Escape)), &context);
+        output.clear(); editor.write_output(&mut output).unwrap();
+        assert!(!output.is_empty());
+        black_box(&output);
+        prompt_text = editor.take_prompt();
+    });
+}
+
+#[rustybench::bench]
+fn process_picker_trace_512(bencher: Bencher) {
+    let records = (0..512).map(|index| format!("{} /usr/bin/worker --queue={} --host=localhost", index + 100, index % 16).into_bytes()).collect::<Vec<_>>();
+    bencher.bench_local(|| {
+        let mut picker = fz::Picker::new(fz::Candidates::from_records(records.clone()), fz::PickerConfig {
+            lines: 10, prompt: b"TERM> ".to_vec(), query: Vec::new(), show_scores: false, show_info: true, multi: true, workers: 1,
+        });
+        let mut output = Vec::new();
+        for byte in b"worker 4" { assert!(picker.feed(Some(*byte)).is_none()); }
+        picker.resize(80, 24).unwrap();
+        picker.render(&mut output, 80).unwrap();
+        assert!(!output.is_empty());
+        black_box(output);
+    });
+}
+
 fn main() {
     rustybench::main();
 }
