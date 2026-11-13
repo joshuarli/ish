@@ -5483,6 +5483,32 @@ fn alternate_screen_sequences_pass_through_relay() {
 }
 
 #[test]
+fn child_reporting_modes_and_query_replies_never_reach_the_next_prompt_line() {
+    let script = "#!/bin/sh\nprintf '\\033[?1004h\\033[?1000h\\033[?1006h'\nprintf 'child-done\\n'\n";
+    let home = PtyShell::build_home(&[("bin/modes", script)], &[], |_| {});
+    let sh = PtyShell::spawn_in_home_with_profile(home, &[], 24, 80, None, ProtocolProfile::disabled());
+    let out = sh.run_command("./bin/modes");
+    assert!(clean(&out).contains("child-done"), "{out:?}");
+
+    sh.send(b"\x1b[?1;2c\x1b[I\x1b[<0;12;8M\x1b[<0;12;8m\x1b[O");
+    sh.send(b"\x1b]11;rgb:1e1e/1e1e/2e2e\x07\x1bP>|terminal 1.0\x1b\\");
+    sh.send(b"\x1b[?6");
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    sh.send(b"4;1c\x1b]11;rgb:0000/");
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    sh.send(b"0000/0000\x1b\\");
+    sh.type_str("echo ok");
+    let screen = sh.wait_for_screen("typed text after the replies", 5000, |screen| {
+        active_prompt_text(screen).trim_end().ends_with("$ echo ok")
+    });
+    let line = active_prompt_text(&screen);
+    assert!(line.trim_end().ends_with("$ echo ok"), "garbage reached the line: {line:?}");
+
+    let out = sh.run_command("");
+    assert!(clean(&out).lines().any(|line| line.trim() == "ok"), "{out:?}");
+}
+
+#[test]
 fn osc52_copy_scrollback_emits_base64_session_log() {
     let sh = PtyShell::spawn_with_osc133_profile(ProtocolProfile::disabled());
     sh.run_command("echo seed");

@@ -12,6 +12,7 @@ Host recorded: macOS 27.2 (`Darwin ... arm64`), `xterm-256color` session, tmux 3
 | Interactive pipeline/list members | partial | existing PTY/native-fs/list/pipeline refusal coverage; pipeline/list `/dev/tty` behavior remains outside the single-command converged form |
 | `/dev/tty` input (converged terminal) | covered (single command) | `converged_command_reads_from_dev_tty` reads input from `/dev/tty` through the converged slave |
 | Fullscreen/alternate-screen programs | covered (relay/pass-through, bounded) | `alternate_screen_sequences_pass_through_relay` verifies alt-screen control sequences transit the relay and the shell remains responsive; full emulator screen-state behavior remains native/manual |
+| Terminal replies and reports (DA, CPR, focus, mouse, OSC/DCS/APC/PM/SOS, CSI-u) | covered | `reply_and_report_sequences_are_consumed_whole_at_every_split` and the other `input::tests` split-framing tests; `child_reporting_modes_and_query_replies_never_reach_the_next_prompt_line` sends replies after a child exits. Real SSH, tmux, and Ghostty splits are unverified. |
 | Multiline/bracketed paste | covered | `multiline_continuation`, `bracketed_paste_*`, `osc133_continuation_does_not_emit_extra_execution_markers` |
 | Resize storms | covered (bounded) | `resize_storm_keeps_shell_responsive` |
 | Ctrl+C/Ctrl+Z | covered | existing PTY tests; `ctrl_c_cancels_input`, suspend/fg tests, OSC 133 cancel/stop tests |

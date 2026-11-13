@@ -6,6 +6,9 @@ use std::os::fd::{BorrowedFd, RawFd};
 
 const PASTE_LIMIT: usize = 8192;
 const READ_BUF_SIZE: usize = 4096;
+const ESCAPE_TIMEOUT_MS: i32 = 50;
+const CSI_PARAMS: usize = 16;
+const X10_MOUSE_BYTES: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -102,6 +105,8 @@ pub struct InputReader {
     buf_pos: usize,
     buf_end: usize,
     pending: VecDeque<u8>,
+    seq: Seq,
+    csi: Csi,
     /// Set once a read proves the terminal is gone (EOF or an I/O error).
     /// Poll keeps reporting readiness on a hung-up descriptor forever, so
     /// without this the reader would retry the failing read without ever
@@ -114,6 +119,88 @@ enum PollResult {
     Signal,
     Timeout,
     StdinHup,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seq {
+    Ground,
+    Escape,
+    Csi,
+    Ss3,
+    Str { esc: bool },
+    Mouse { left: u8 },
+    Utf8 { left: u8, cp: u32 },
+}
+
+#[derive(Clone, Copy)]
+struct Csi {
+    params: [u32; CSI_PARAMS],
+    count: usize,
+    current: u32,
+    has_digit: bool,
+    in_sub: bool,
+    started: bool,
+    private: bool,
+    unsupported: bool,
+}
+
+impl Csi {
+    const EMPTY: Self = Self {
+        params: [0; CSI_PARAMS],
+        count: 0,
+        current: 0,
+        has_digit: false,
+        in_sub: false,
+        started: false,
+        private: false,
+        unsupported: false,
+    };
+
+    fn digit(&mut self, b: u8) {
+        self.started = true;
+        self.has_digit = true;
+        if self.in_sub {
+            return;
+        }
+        match self.current.checked_mul(10).and_then(|v| v.checked_add((b - b'0') as u32)) {
+            Some(value) => self.current = value,
+            None => self.unsupported = true,
+        }
+    }
+
+    fn separator(&mut self) {
+        self.started = true;
+        let value = if self.has_digit { self.current } else { 0 };
+        self.push(value);
+        self.current = 0;
+        self.has_digit = false;
+        self.in_sub = false;
+    }
+
+    fn finish(&mut self) {
+        if self.has_digit {
+            self.push(self.current);
+        }
+    }
+
+    fn push(&mut self, value: u32) {
+        if self.count < CSI_PARAMS {
+            self.params[self.count] = value;
+            self.count += 1;
+        } else {
+            self.unsupported = true;
+        }
+    }
+
+    fn values(&self) -> &[u32] {
+        &self.params[..self.count]
+    }
+}
+
+enum Fed {
+    Key(KeyEvent),
+    Boundary,
+    Pending,
 }
 
 enum SkipPasteResult {
@@ -137,6 +224,8 @@ impl InputReader {
             buf_pos: 0,
             buf_end: 0,
             pending: VecDeque::new(),
+            seq: Seq::Ground,
+            csi: Csi::EMPTY,
             stdin_dead: false,
         }
     }
@@ -155,6 +244,7 @@ impl InputReader {
             self.buf_end = 0;
         }
         result.extend(self.pending.drain(..));
+        self.seq = Seq::Ground;
         result
     }
 
@@ -192,7 +282,7 @@ impl InputReader {
                     }
                     return InputEvent::Key(key);
                 }
-                if !self.in_paste {
+                if !self.in_paste && !self.paste_buf.is_empty() {
                     break;
                 }
             }
@@ -347,17 +437,6 @@ impl InputReader {
         Some(byte)
     }
 
-    fn read_byte_timeout(&mut self, timeout_ms: i32) -> Option<u8> {
-        if self.buf_pos < self.buf_end || !self.pending.is_empty() {
-            return self.read_byte();
-        }
-        if self.poll_stdin(timeout_ms) {
-            self.read_byte()
-        } else {
-            None
-        }
-    }
-
     fn shift_pending_into_buf(&mut self) -> bool {
         if self.pending.is_empty() {
             return false;
@@ -459,82 +538,223 @@ impl InputReader {
         }
     }
 
-    fn decode_key(&mut self) -> Option<KeyEvent> {
-        let byte = self.read_byte()?;
+    fn has_buffered(&self) -> bool {
+        self.buf_pos < self.buf_end || !self.pending.is_empty()
+    }
 
-        match byte {
-            0x00 => None,
-            0x08 => Some(KeyEvent::with_mods(
+    /// Consume buffered bytes until a key completes. `None` means the buffered
+    /// bytes ran out, a paste marker was consumed, or the read failed; a
+    /// sequence still in flight keeps its parser state for the next call.
+    /// The caller guarantees buffered bytes or a readable terminal.
+    fn decode_key(&mut self) -> Option<KeyEvent> {
+        let mut first = true;
+        loop {
+            let byte = if first || self.has_buffered() {
+                first = false;
+                self.read_byte()?
+            } else if self.seq == Seq::Escape {
+                if !self.poll_stdin(ESCAPE_TIMEOUT_MS) {
+                    self.seq = Seq::Ground;
+                    return Some(KeyEvent::key(Key::Escape));
+                }
+                self.read_byte()?
+            } else {
+                return None;
+            };
+            match self.feed(byte) {
+                Fed::Key(key) => return Some(key),
+                Fed::Boundary => return None,
+                Fed::Pending => {}
+            }
+        }
+    }
+
+    fn feed(&mut self, byte: u8) -> Fed {
+        match self.seq {
+            Seq::Ground => self.feed_ground(byte),
+            Seq::Escape => self.feed_escape(byte),
+            Seq::Csi | Seq::Ss3 => self.feed_params(byte),
+            Seq::Str { esc } => self.feed_string(byte, esc),
+            Seq::Mouse { left } => {
+                self.seq = if left > 1 { Seq::Mouse { left: left - 1 } } else { Seq::Ground };
+                Fed::Pending
+            }
+            Seq::Utf8 { left, cp } => self.feed_utf8(byte, left, cp),
+        }
+    }
+
+    fn feed_ground(&mut self, byte: u8) -> Fed {
+        let key = match byte {
+            0x08 => KeyEvent::with_mods(
                 Key::Backspace,
                 Modifiers {
                     ctrl: true,
                     ..Modifiers::NONE
                 },
-            )),
-            0x09 => Some(KeyEvent::key(Key::Tab)),
-            0x0a | 0x0d => Some(KeyEvent::key(Key::Enter)),
-            0x1b => self.decode_escape(),
-            0x1c => Some(KeyEvent::ctrl('\\')),
-            0x1d => Some(KeyEvent::ctrl(']')),
-            0x1e => Some(KeyEvent::ctrl('^')),
-            0x1f => Some(KeyEvent::ctrl('_')),
-            0x7f => Some(KeyEvent::key(Key::Backspace)),
-            b @ 0x01..=0x1a => Some(KeyEvent::ctrl((b - 1 + b'a') as char)),
-            b if b < 0x20 => None,
-            b if b < 0x80 => Some(KeyEvent::char(b as char)),
-            b => self.decode_utf8(b),
-        }
-    }
-
-    fn decode_escape(&mut self) -> Option<KeyEvent> {
-        match self.read_byte_timeout(50) {
-            None => Some(KeyEvent::key(Key::Escape)),
-            Some(b'[') => self.decode_csi(),
-            Some(b'O') => self.decode_ss3(),
-            Some(b'b') => Some(KeyEvent::alt('b')),
-            Some(b'f') => Some(KeyEvent::alt('f')),
-            Some(b'd') => Some(KeyEvent::alt('d')),
-            Some(b) if (0x20..0x7f).contains(&b) => Some(KeyEvent::alt(b as char)),
-            _ => Some(KeyEvent::key(Key::Escape)),
-        }
-    }
-
-    fn decode_csi(&mut self) -> Option<KeyEvent> {
-        let mut params = Vec::new();
-        let mut current = 0u32;
-        let mut has_digit = false;
-        let mut invalid = false;
-
-        loop {
-            let b = self.read_byte_timeout(50)?;
-            match b {
-                b'0'..=b'9' => {
-                    if let Some(value) = current
-                        .checked_mul(10)
-                        .and_then(|value| value.checked_add((b - b'0') as u32))
-                    {
-                        current = value;
-                    } else {
-                        invalid = true;
-                    }
-                    has_digit = true;
-                }
-                b';' => {
-                    params.push(if has_digit { current } else { 0 });
-                    current = 0;
-                    has_digit = false;
-                }
-                0x40..=0x7e => {
-                    if has_digit {
-                        params.push(current);
-                    }
-                    if invalid {
-                        return None;
-                    }
-                    return self.csi_to_key(b, &params);
-                }
-                _ => return None,
+            ),
+            0x09 => KeyEvent::key(Key::Tab),
+            0x0a | 0x0d => KeyEvent::key(Key::Enter),
+            0x1b => {
+                self.seq = Seq::Escape;
+                return Fed::Pending;
             }
+            0x1c => KeyEvent::ctrl('\\'),
+            0x1d => KeyEvent::ctrl(']'),
+            0x1e => KeyEvent::ctrl('^'),
+            0x1f => KeyEvent::ctrl('_'),
+            0x7f => KeyEvent::key(Key::Backspace),
+            b @ 0x01..=0x1a => KeyEvent::ctrl((b - 1 + b'a') as char),
+            b if b < 0x20 => return Fed::Pending,
+            b if b < 0x80 => KeyEvent::char(b as char),
+            b => {
+                let (left, cp) = if b & 0xE0 == 0xC0 {
+                    (1, (b & 0x1F) as u32)
+                } else if b & 0xF0 == 0xE0 {
+                    (2, (b & 0x0F) as u32)
+                } else if b & 0xF8 == 0xF0 {
+                    (3, (b & 0x07) as u32)
+                } else {
+                    return Fed::Pending;
+                };
+                self.seq = Seq::Utf8 { left, cp };
+                return Fed::Pending;
+            }
+        };
+        Fed::Key(key)
+    }
+
+    fn feed_utf8(&mut self, byte: u8, left: u8, cp: u32) -> Fed {
+        if byte & 0xC0 != 0x80 {
+            self.seq = Seq::Ground;
+            return self.feed_ground(byte);
+        }
+        let cp = (cp << 6) | (byte & 0x3F) as u32;
+        if left > 1 {
+            self.seq = Seq::Utf8 { left: left - 1, cp };
+            return Fed::Pending;
+        }
+        self.seq = Seq::Ground;
+        match char::from_u32(cp) {
+            Some(c) => Fed::Key(KeyEvent::char(c)),
+            None => Fed::Pending,
+        }
+    }
+
+    fn feed_escape(&mut self, byte: u8) -> Fed {
+        self.seq = Seq::Ground;
+        match byte {
+            b'[' => {
+                self.csi = Csi::EMPTY;
+                self.seq = Seq::Csi;
+                Fed::Pending
+            }
+            b'O' => {
+                self.csi = Csi::EMPTY;
+                self.seq = Seq::Ss3;
+                Fed::Pending
+            }
+            b']' | b'P' | b'_' | b'^' | b'X' => {
+                self.seq = Seq::Str { esc: false };
+                Fed::Pending
+            }
+            b if (0x20..0x7f).contains(&b) => Fed::Key(KeyEvent::alt(b as char)),
+            _ => Fed::Key(KeyEvent::key(Key::Escape)),
+        }
+    }
+
+    fn feed_string(&mut self, byte: u8, esc: bool) -> Fed {
+        if esc {
+            return match byte {
+                b'\\' => {
+                    self.seq = Seq::Ground;
+                    Fed::Pending
+                }
+                0x1b => Fed::Pending,
+                _ => {
+                    self.seq = Seq::Ground;
+                    self.feed_escape(byte)
+                }
+            };
+        }
+        match byte {
+            0x07 | 0x18 | 0x1a => self.seq = Seq::Ground,
+            0x03 => {
+                self.seq = Seq::Ground;
+                return self.feed_ground(byte);
+            }
+            0x1b => self.seq = Seq::Str { esc: true },
+            _ => {}
+        }
+        Fed::Pending
+    }
+
+    fn feed_params(&mut self, byte: u8) -> Fed {
+        let csi = &mut self.csi;
+        match byte {
+            b'0'..=b'9' => {
+                csi.digit(byte);
+                return Fed::Pending;
+            }
+            b';' => {
+                csi.separator();
+                return Fed::Pending;
+            }
+            b':' => {
+                csi.started = true;
+                csi.in_sub = true;
+                csi.unsupported = true;
+                return Fed::Pending;
+            }
+            0x3c..=0x3f => {
+                if csi.started {
+                    csi.unsupported = true;
+                } else {
+                    csi.private = true;
+                }
+                csi.started = true;
+                return Fed::Pending;
+            }
+            0x20..=0x2f => {
+                csi.started = true;
+                csi.unsupported = true;
+                return Fed::Pending;
+            }
+            0x40..=0x7e => {}
+            0x18 | 0x1a => {
+                self.seq = Seq::Ground;
+                return Fed::Pending;
+            }
+            0x1b => {
+                self.seq = Seq::Escape;
+                return Fed::Pending;
+            }
+            _ => {
+                self.seq = Seq::Ground;
+                return self.feed_ground(byte);
+            }
+        }
+        csi.finish();
+        let ss3 = self.seq == Seq::Ss3;
+        self.seq = Seq::Ground;
+        let csi = self.csi;
+        if csi.unsupported || csi.private {
+            return Fed::Pending;
+        }
+        if ss3 {
+            return match self.ss3_to_key(byte, csi.values()) {
+                Some(key) => Fed::Key(key),
+                None => Fed::Pending,
+            };
+        }
+        if byte == b'M' && csi.count == 0 {
+            self.seq = Seq::Mouse { left: X10_MOUSE_BYTES };
+            return Fed::Pending;
+        }
+        let was_paste = self.in_paste;
+        match self.csi_to_key(byte, csi.values()) {
+            Some(key) => Fed::Key(key),
+            None if self.in_paste != was_paste => Fed::Boundary,
+            None => Fed::Pending,
         }
     }
 
@@ -589,40 +809,20 @@ impl InputReader {
         }
     }
 
-    fn decode_ss3(&mut self) -> Option<KeyEvent> {
-        let b = self.read_byte_timeout(50)?;
-        match b {
-            b'A' => Some(KeyEvent::key(Key::Up)),
-            b'B' => Some(KeyEvent::key(Key::Down)),
-            b'C' => Some(KeyEvent::key(Key::Right)),
-            b'D' => Some(KeyEvent::key(Key::Left)),
-            b'H' => Some(KeyEvent::key(Key::Home)),
-            b'F' => Some(KeyEvent::key(Key::End)),
-            _ => None,
-        }
-    }
-
-    fn decode_utf8(&mut self, first: u8) -> Option<KeyEvent> {
-        let (len, mut cp) = if first & 0xE0 == 0xC0 {
-            (2, (first & 0x1F) as u32)
-        } else if first & 0xF0 == 0xE0 {
-            (3, (first & 0x0F) as u32)
-        } else if first & 0xF8 == 0xF0 {
-            (4, (first & 0x07) as u32)
-        } else {
-            return None;
+    fn ss3_to_key(&self, final_byte: u8, params: &[u32]) -> Option<KeyEvent> {
+        let mods = params.first().map_or(Modifiers::NONE, |&p| modifier_from_param(p));
+        let key = match final_byte {
+            b'A' => Key::Up,
+            b'B' => Key::Down,
+            b'C' => Key::Right,
+            b'D' => Key::Left,
+            b'H' => Key::Home,
+            b'F' => Key::End,
+            _ => return None,
         };
-
-        for _ in 1..len {
-            let b = self.read_byte()?;
-            if b & 0xC0 != 0x80 {
-                return None;
-            }
-            cp = (cp << 6) | (b & 0x3F) as u32;
-        }
-
-        char::from_u32(cp).map(KeyEvent::char)
+        Some(KeyEvent::with_mods(key, mods))
     }
+
 }
 
 fn poll_timeout(timeout_ms: i32) -> Option<rustix::event::Timespec> {
@@ -750,7 +950,6 @@ mod tests {
         rustix::io::write(&stdin_write, b"\x1b[4294967296Ax").unwrap();
         let mut reader = InputReader::with_fds(stdin_read.as_raw_fd(), -1);
 
-        assert!(reader.decode_key().is_none());
         assert_eq!(reader.decode_key().unwrap().key, Key::Char('x'));
     }
 
@@ -837,5 +1036,256 @@ mod tests {
         observed.expect("paste drain should observe the signal");
         assert!(matches!(returned, SkipPasteResult::Signal));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Key(Key, bool, bool, bool),
+        Paste(String),
+    }
+
+    fn key(key: Key) -> Seen {
+        Seen::Key(key, false, false, false)
+    }
+
+    fn ch(c: char) -> Seen {
+        key(Key::Char(c))
+    }
+
+    fn mod_key(key: Key, ctrl: bool, alt: bool, shift: bool) -> Seen {
+        Seen::Key(key, ctrl, alt, shift)
+    }
+
+    /// Write each part to a reader's terminal after `gap`, then a sentinel
+    /// `Z`, and return every event decoded before the sentinel.
+    fn decode_parts(parts: &[&[u8]], gap: Duration) -> Vec<Seen> {
+        let (stdin_read, stdin_write) = rustix::pipe::pipe().unwrap();
+        let (signal_read, signal_write) = rustix::pipe::pipe().unwrap();
+        let parts: Vec<Vec<u8>> = parts.iter().map(|part| part.to_vec()).collect();
+        let writer = std::thread::spawn(move || {
+            for (index, part) in parts.iter().enumerate() {
+                if index > 0 {
+                    std::thread::sleep(gap);
+                }
+                let mut rest = part.as_slice();
+                while !rest.is_empty() {
+                    let n = rustix::io::write(&stdin_write, rest).unwrap();
+                    rest = &rest[n..];
+                }
+            }
+            std::thread::sleep(gap);
+            rustix::io::write(&stdin_write, b"Z").unwrap();
+            stdin_write
+        });
+        let (done, observed) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut reader =
+                InputReader::with_fds(stdin_read.as_raw_fd(), signal_read.as_raw_fd());
+            let mut seen = Vec::new();
+            loop {
+                match reader.read_event() {
+                    InputEvent::Key(event) => {
+                        if event.key == Key::Char('Z') {
+                            break;
+                        }
+                        seen.push(Seen::Key(
+                            event.key,
+                            event.mods.ctrl,
+                            event.mods.alt,
+                            event.mods.shift,
+                        ));
+                    }
+                    InputEvent::Paste(text) => seen.push(Seen::Paste(text)),
+                    InputEvent::PasteRejected | InputEvent::Signal(_) => panic!("unexpected event"),
+                }
+            }
+            let _ = done.send(seen);
+            drop(signal_write);
+        });
+        let seen = observed
+            .recv_timeout(Duration::from_secs(20))
+            .expect("decoder must reach the sentinel instead of stalling");
+        let _ = writer.join();
+        seen
+    }
+
+    fn assert_framed_at_every_boundary(name: &str, sequence: &[u8], expected: fn() -> Vec<Seen>) {
+        let whole = decode_parts(&[sequence], Duration::from_millis(0));
+        assert_eq!(whole, expected(), "{name}: unsplit");
+        // An ESC that opens a sequence and then stays alone past the timeout
+        // is the Escape key by design, so only a gap inside the timeout may
+        // follow it. An ESC inside a string is the start of its terminator.
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (1..sequence.len())
+                .flat_map(|at| [(at, 10u64), (at, 80u64)])
+                .filter(|&(at, gap)| !(sequence[at - 1] == 0x1b && sequence[at] != b'\\' && gap > 50))
+                .map(|(at, gap)| {
+                    scope.spawn(move || {
+                        let parts = [&sequence[..at], &sequence[at..]];
+                        let got = decode_parts(&parts, Duration::from_millis(gap));
+                        (got != expected()).then(|| {
+                            format!("{name}: split at {at}, gap {gap}ms: {got:?}")
+                        })
+                    })
+                })
+                .collect();
+            workers.into_iter().filter_map(|worker| worker.join().unwrap()).collect()
+        });
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn reply_and_report_sequences_are_consumed_whole_at_every_split() {
+        let ignored: &[(&str, &[u8])] = &[
+            ("primary device attributes", b"\x1b[?1;2c"),
+            ("secondary device attributes", b"\x1b[>0;276;0c"),
+            ("tertiary device attributes", b"\x1b[=0c"),
+            ("cursor position report", b"\x1b[12;40R"),
+            ("mode report with intermediate", b"\x1b[?2004;1$y"),
+            ("intermediate before final", b"\x1b[0 q"),
+            ("sgr mouse press", b"\x1b[<0;12;8M"),
+            ("sgr mouse release", b"\x1b[<0;120;80m"),
+            ("sgr mouse wheel", b"\x1b[<64;1;1M"),
+            ("urxvt mouse", b"\x1b[32;12;8M"),
+            ("x10 mouse", b"\x1b[M #!"),
+            ("focus in", b"\x1b[I"),
+            ("focus out", b"\x1b[O"),
+            ("stray paste end", b"\x1b[201~"),
+            ("csi-u", b"\x1b[97;5u"),
+            ("csi-u with subparameters", b"\x1b[97:65;5:3u"),
+            ("csi-u with text subparameters", b"\x1b[97;2;65:66u"),
+            ("modified arrow with event type", b"\x1b[1;5:3A"),
+            ("unsupported function key", b"\x1b[15~"),
+            ("unsupported ss3 key", b"\x1bOP"),
+            ("ss3 key with parameters", b"\x1bO2P"),
+            ("osc bel", b"\x1b]11;rgb:1e1e/1e1e/2e2e\x07"),
+            ("osc st", b"\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\"),
+            ("osc clipboard", b"\x1b]52;c;SGVsbG8=\x1b\\"),
+            ("osc with printable text", b"\x1b]0;a b [c] d\x07"),
+            ("dcs", b"\x1bP>|terminal 1.0\x1b\\"),
+            ("dcs request reply", b"\x1bP1$r0m\x1b\\"),
+            ("apc", b"\x1b_Gi=31;OK\x1b\\"),
+            ("pm", b"\x1b^private\x1b\\"),
+            ("sos", b"\x1bXstring\x1b\\"),
+        ];
+        for (name, sequence) in ignored {
+            assert_framed_at_every_boundary(name, sequence, Vec::new);
+        }
+    }
+
+    #[test]
+    fn supported_keys_still_decode_at_every_split() {
+        type KeyCase = (&'static str, &'static [u8], fn() -> Vec<Seen>);
+        let keys: &[KeyCase] = &[
+            ("up", b"\x1b[A", || vec![key(Key::Up)]),
+            ("ctrl right", b"\x1b[1;5C", || vec![mod_key(Key::Right, true, false, false)]),
+            ("alt left", b"\x1b[1;3D", || vec![mod_key(Key::Left, false, true, false)]),
+            ("home", b"\x1b[H", || vec![key(Key::Home)]),
+            ("end tilde", b"\x1b[4~", || vec![key(Key::End)]),
+            ("delete", b"\x1b[3~", || vec![key(Key::Delete)]),
+            ("ctrl delete", b"\x1b[3;5~", || vec![mod_key(Key::Delete, true, false, false)]),
+            ("shift tab", b"\x1b[Z", || vec![mod_key(Key::Tab, false, false, true)]),
+            ("ss3 home", b"\x1bOH", || vec![key(Key::Home)]),
+            ("ss3 shift up", b"\x1bO2A", || vec![mod_key(Key::Up, false, false, true)]),
+            ("alt b", b"\x1bb", || vec![mod_key(Key::Char('b'), false, true, false)]),
+            ("two byte char", "\u{e9}".as_bytes(), || vec![ch('\u{e9}')]),
+            ("three byte char", "\u{20ac}".as_bytes(), || vec![ch('\u{20ac}')]),
+            ("four byte char", "\u{1f600}".as_bytes(), || vec![ch('\u{1f600}')]),
+            ("bracketed paste", b"\x1b[200~ab\ncd\x1b[201~", || vec![Seen::Paste("ab\ncd".into())]),
+        ];
+        for (name, sequence, expected) in keys {
+            assert_framed_at_every_boundary(name, sequence, *expected);
+        }
+    }
+
+    #[test]
+    fn replies_between_typed_keys_leave_the_typing_intact() {
+        let stream = b"a\x1b[?1;2c\x1b[Ib\x1b]11;rgb:0/0/0\x07c\x1b[<0;1;1Md\x1bP>|x\x1b\\e";
+        for gap in [0u64, 70] {
+            let mut parts: Vec<&[u8]> = Vec::new();
+            let mut start = 0;
+            for end in 1..=stream.len() {
+                let after_escape = stream[end - 1] == 0x1b;
+                if end == stream.len() || (end - start >= 3 && !after_escape) {
+                    parts.push(&stream[start..end]);
+                    start = end;
+                }
+            }
+            let got = decode_parts(&parts, Duration::from_millis(gap));
+            assert_eq!(got, vec![ch('a'), ch('b'), ch('c'), ch('d'), ch('e')], "gap {gap}ms");
+        }
+    }
+
+    #[test]
+    fn lone_escape_after_the_timeout_is_still_the_escape_key() {
+        let got = decode_parts(&[b"\x1b", b"x"], Duration::from_millis(120));
+        assert_eq!(got, vec![key(Key::Escape), ch('x')]);
+    }
+
+    #[test]
+    fn escape_inside_a_string_or_a_cancel_byte_ends_the_sequence() {
+        let got = decode_parts(&[b"\x1b]0;title\x1b[A"], Duration::from_millis(0));
+        assert_eq!(got, vec![key(Key::Up)]);
+        let got = decode_parts(&[b"\x1b]0;title\x18a"], Duration::from_millis(0));
+        assert_eq!(got, vec![ch('a')]);
+        let got = decode_parts(&[b"\x1b]0;unterminated\x03"], Duration::from_millis(0));
+        assert_eq!(got, vec![Seen::Key(Key::Char('c'), true, false, false)]);
+        let got = decode_parts(&[b"\x1b[1\r"], Duration::from_millis(0));
+        assert_eq!(got, vec![key(Key::Enter)]);
+        let got = decode_parts(&[b"\x1b[1\x1b[B"], Duration::from_millis(0));
+        assert_eq!(got, vec![key(Key::Down)]);
+    }
+
+    #[test]
+    fn oversized_sequences_are_discarded_whole() {
+        let mut osc = b"\x1b]52;c;".to_vec();
+        osc.extend(std::iter::repeat_n(b'A', 100_000));
+        osc.push(0x07);
+        let got = decode_parts(&[&osc], Duration::from_millis(0));
+        assert!(got.is_empty(), "{} events leaked", got.len());
+
+        let mut csi = b"\x1b[".to_vec();
+        csi.extend(std::iter::repeat_n(b'1', 5_000));
+        csi.extend_from_slice(b";2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20A");
+        let got = decode_parts(&[&csi], Duration::from_millis(0));
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn partial_reply_returned_as_typeahead_is_framed_not_inserted() {
+        let (stdin_read, _stdin_write) = rustix::pipe::pipe().unwrap();
+        let (signal_read, _signal_write) = rustix::pipe::pipe().unwrap();
+        let mut reader = InputReader::with_fds(stdin_read.as_raw_fd(), signal_read.as_raw_fd());
+        reader.push_pending(b"\x1b[?6");
+        assert!(reader.decode_key().is_none());
+        reader.push_pending(b"4;1c\x1b]11;rgb:");
+        assert!(reader.decode_key().is_none());
+        reader.push_pending(b"0000/0000/0000\x07Z");
+        assert_eq!(reader.decode_key().unwrap().key, Key::Char('Z'));
+        assert!(!reader.has_buffered());
+    }
+
+    #[test]
+    fn buffered_bytes_after_a_consumed_sequence_are_not_stranded() {
+        let (stdin_read, stdin_write) = rustix::pipe::pipe().unwrap();
+        let (signal_read, _signal_write) = rustix::pipe::pipe().unwrap();
+        rustix::io::write(&stdin_write, b"\x1b[I\x1b[201~\x1b[?1;2cx").unwrap();
+        let mut reader = InputReader::with_fds(stdin_read.as_raw_fd(), signal_read.as_raw_fd());
+        match reader.read_event() {
+            InputEvent::Key(event) => assert_eq!(event.key, Key::Char('x')),
+            _ => panic!("expected the typed key"),
+        }
+    }
+
+    #[test]
+    fn taking_pending_bytes_drops_a_sequence_in_flight() {
+        let (stdin_read, _stdin_write) = rustix::pipe::pipe().unwrap();
+        let (signal_read, _signal_write) = rustix::pipe::pipe().unwrap();
+        let mut reader = InputReader::with_fds(stdin_read.as_raw_fd(), signal_read.as_raw_fd());
+        reader.push_pending(b"\x1b[?1");
+        assert!(reader.decode_key().is_none());
+        assert!(reader.take_pending_bytes().is_empty());
+        reader.push_pending(b"x");
+        assert_eq!(reader.decode_key().unwrap().key, Key::Char('x'));
     }
 }

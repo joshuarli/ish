@@ -169,6 +169,17 @@ When supported by your terminal, ish emits working-directory and command
 markers (OSC 7 and OSC 133) so the terminal can provide prompt navigation and
 command boundaries.
 
+Terminal replies and reports are never typed into the line. ish reads input
+as escape sequences and ignores every sequence it has no key for: device and
+cursor reports, focus and mouse reports, extended-key sequences, and OSC, DCS,
+APC, PM, and SOS strings ended by ST or BEL. A sequence that arrives in pieces
+(over SSH or in tmux) is read to its end, however long the pauses. A lone
+Escape that stays alone for 50 ms is the Escape key; once `[`, `]`, `O`, `P`,
+`_`, `^`, or `X` follows it, the sequence is consumed whole. Escape, Ctrl+C,
+or a cancel byte ends a string whose terminator never arrives. ish turns
+bracketed paste on at each prompt and off before a command, and leaves other
+modes a command set alone.
+
 ## Project environments (`denv`)
 
 When you change directories, ish looks for `.envrc` and `.env`. `denv allow`
