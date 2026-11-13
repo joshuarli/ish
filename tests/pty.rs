@@ -584,6 +584,23 @@ fn snapshot_text(screen: &ptytest::ScreenSnapshot) -> String {
     lines.join("\n")
 }
 
+/// Screen text with soft-wrapped rows joined without their line break and
+/// without trimming, so the text a user typed reads back verbatim wherever the
+/// prompt width (host name, branch, directory) places the wrap.
+fn logical_screen_text(screen: &ptytest::ScreenSnapshot) -> String {
+    let mut text = String::new();
+    for row in 0..screen.row_count() {
+        let line = screen.row(row).unwrap_or_default();
+        if screen.row_wrapped(row) == Some(true) {
+            text.push_str(&line);
+        } else {
+            text.push_str(line.trim_end());
+            text.push('\n');
+        }
+    }
+    text.trim_end().to_owned()
+}
+
 fn active_prompt_text(screen: &ptytest::ScreenSnapshot) -> String {
     let cursor_row = usize::from(screen.cursor().row);
     let rows = (0..screen.row_count())
@@ -1494,8 +1511,14 @@ fn l_wraps_long_names_at_narrow_terminal_width() {
         rows[first + 1].starts_with(&name[32..]),
         "name continuation should start on the next row: {rows:?}"
     );
+    // The age column counts whole seconds since the fixture was written, so a
+    // slow host legitimately shows 1s or more; require the size and any age.
+    let metadata: Vec<&str> = rows[first + 1].split_whitespace().collect();
+    let age_is_seconds = metadata.last().is_some_and(|age| {
+        age.strip_suffix('s').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    });
     assert!(
-        rows[first + 1].contains("1B") && rows[first + 1].contains("0s"),
+        metadata.contains(&"1B") && age_is_seconds,
         "metadata should follow the final name line: {rows:?}"
     );
     assert_eq!(
@@ -2789,7 +2812,7 @@ fn normal_resize_reanchors_wrapped_prompt() {
     sh.read_timeout(800);
     let screen = sh.screen();
     assert_eq!(screen.size(), Size::new(52, 12).unwrap());
-    let visible = snapshot_text(&screen);
+    let visible = logical_screen_text(&screen);
 
     let prompt_count = visible.matches("testuser@").count();
     assert_eq!(
@@ -2798,9 +2821,7 @@ fn normal_resize_reanchors_wrapped_prompt() {
         screen
     );
     assert!(
-        visible
-            .replace('\n', "")
-            .contains("echo resize-test-abcdefghijklmnopqrstuvwxyzx"),
+        visible.contains("echo resize-test-abcdefghijklmnopqrstuvwxyzx"),
         "resized prompt lost or duplicated input: {:?}",
         screen
     );

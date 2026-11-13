@@ -525,9 +525,13 @@ fn delete_permission_failure_reports_failed_status() {
         context,
     };
     let outcome = ish_fs::sync::execute(&req, &cancel, &sink);
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-
-    if rustix::process::geteuid().as_raw() != 0 {
+    // Root bypasses the 0o555 directory mode, so the permission failure cannot
+    // be produced there; assert the consequence that does hold for root.
+    if rustix::process::geteuid().as_raw() == 0 {
+        assert_eq!(outcome.status(), 0);
+        assert!(!kept.exists(), "root deletes the entry the mode cannot protect");
+    } else {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(outcome.status(), 1);
         assert_eq!(outcome.progress.deleted_files, 0);
         assert_eq!(fs::read(&kept).unwrap(), b"must-be-kept");
