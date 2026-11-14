@@ -1201,19 +1201,19 @@ fn unescape_outside_single(s: &str) -> String {
 
 fn parse_completion_word(raw_word: &str, in_single: bool, in_double: bool) -> (String, bool) {
     if let Some(rest) = raw_word.strip_prefix("~/'") {
-        let unquoted = rest.strip_suffix('\'').unwrap_or(rest);
+        let unquoted = rest.trim_suffix('\'');
         return (format!("~/{unquoted}"), true);
     }
     if let Some(rest) = raw_word.strip_prefix("~/\"") {
-        let unquoted = rest.strip_suffix('"').unwrap_or(rest);
+        let unquoted = rest.trim_suffix('"');
         return (format!("~/{unescaped}", unescaped = unescape_outside_single(unquoted)), true);
     }
     if let Some(inner) = raw_word.strip_prefix('\'') {
-        let unquoted = inner.strip_suffix('\'').unwrap_or(inner);
+        let unquoted = inner.trim_suffix('\'');
         return (unquoted.into(), true);
     }
     if let Some(inner) = raw_word.strip_prefix('"') {
-        let unquoted = inner.strip_suffix('"').unwrap_or(inner);
+        let unquoted = inner.trim_suffix('"');
         return (unescape_outside_single(unquoted), true);
     }
     if in_single {

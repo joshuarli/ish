@@ -11,7 +11,7 @@ pub fn name_to_signal(name: &str) -> Option<Signal> {
     if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()) {
         return name.parse::<i32>().ok().and_then(Signal::from_named_raw);
     }
-    let name = name.strip_prefix("SIG").unwrap_or(name);
+    let name = name.trim_prefix("SIG");
     match name {
         "HUP" => Some(Signal::HUP),
         "INT" => Some(Signal::INT),

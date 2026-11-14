@@ -193,8 +193,7 @@ fn load_regression_by_id(root: &Path, family: Family, id: &str) -> BridgeResult<
 }
 
 fn regression_filename(family: Family, id: &str) -> String {
-    id.strip_prefix(&format!("{}-regression-", family.name()))
-        .unwrap_or(id)
+    id.trim_prefix(&format!("{}-regression-", family.name()))
         .to_string()
 }
 

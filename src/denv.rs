@@ -954,7 +954,7 @@ fn parse_dotenv(content: &str) -> Vec<(&str, Cow<'_, str>)> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let line = line.strip_prefix("export ").unwrap_or(line);
+        let line = line.trim_prefix("export ");
         let Some(eq) = line.find('=') else {
             continue;
         };

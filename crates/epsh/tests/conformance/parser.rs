@@ -102,12 +102,11 @@ pub fn parse_corpus(input: &[u8]) -> Result<Vec<Case>, String> {
             if current.is_empty() {
                 return Err(format!("line {line_number}: empty conformance record"));
             }
-            let case = build_case(current, case_line)?;
+            let case = build_case(std::mem::take(&mut current), case_line)?;
             if !names.insert(case.name.clone()) {
                 return Err(format!("line {}: duplicate case ID {}", case.line, case.name));
             }
             cases.push(case);
-            current = HashMap::new();
             case_line = 0;
             ended = true;
             continue;
