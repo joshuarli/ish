@@ -58,7 +58,7 @@ pub struct ForegroundJob {
 }
 
 impl ForegroundJob {
-    pub(super) fn invert(&mut self) { self.inverted = !self.inverted; }
+    pub(super) fn invert(&mut self) { self.inverted.toggle(); }
 
     /// The process group for diagnostics. This does not transfer wait ownership.
     pub fn process_group(&self) -> i32 { self.pgid }

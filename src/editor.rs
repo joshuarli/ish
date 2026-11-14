@@ -1037,11 +1037,11 @@ fn current_cmd_start(s: &str) -> usize {
                 i += 2;
             }
             b'\'' if !in_double => {
-                in_single = !in_single;
+                in_single.toggle();
                 i += 1;
             }
             b'"' if !in_single => {
-                in_double = !in_double;
+                in_double.toggle();
                 i += 1;
             }
             b'|' | b';' if !in_single && !in_double => {
@@ -1146,11 +1146,11 @@ fn find_comp_word_start(s: &str) -> (usize, bool, bool) {
     while i < bytes.len() {
         match bytes[i] {
             b'\'' if !in_double => {
-                in_single = !in_single;
+                in_single.toggle();
                 i += 1;
             }
             b'"' if !in_single => {
-                in_double = !in_double;
+                in_double.toggle();
                 i += 1;
             }
             b'\\' if !in_single && i + 1 < bytes.len() => {
