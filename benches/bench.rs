@@ -440,7 +440,7 @@ fn cd_prompt_benchmark(bencher: Bencher, with_denv: bool) {
         } else {
             (&second, "second")
         };
-        use_first = !use_first;
+        use_first.toggle();
         std::env::set_current_dir(dir).unwrap();
         sync_bench_pwd(&mut epsh, dir);
         ish::denv::on_cd(&mut denv, &mut epsh).unwrap();
