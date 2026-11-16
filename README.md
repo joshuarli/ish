@@ -18,7 +18,7 @@ rename the executable to `ish`, and place it on your `PATH`.
 ish
 ```
 
-`ish --help` shows command-line options. `-c COMMAND` runs a command with
+`ish -h` or `ish --help` shows the complete command-line reference and examples. `-c COMMAND` runs a command with
 `/bin/sh`, `--config PATH` selects a config file, `--no-config` skips config
 loading, and `-V` prints the version.
 
