@@ -101,20 +101,6 @@ fn print_help() {
     println!("\n{FOOTER}");
 }
 
-#[cfg(test)]
-mod cli_tests {
-    use super::*;
-    #[test]
-    fn examples_parse_and_option_names_are_unique() {
-        for argv in EXAMPLES {
-            assert!(matches!(parse(argv.iter().map(OsString::from)), Ok(Parsed::Run(_))), "{argv:?}");
-        }
-        let mut names = std::collections::HashSet::new();
-        for option in OPTIONS {
-            for name in option.names { assert!(names.insert(name), "duplicate option {name}"); }
-        }
-    }
-}
 
 fn run_command(command: &OsStr) -> ! {
     let error = Command::new("/bin/sh").arg("-c").arg(command).exec();
@@ -146,4 +132,19 @@ fn main() {
         run_command(command);
     }
     shell::run(args);
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    #[test]
+    fn examples_parse_and_option_names_are_unique() {
+        for argv in EXAMPLES {
+            assert!(matches!(parse(argv.iter().map(OsString::from)), Ok(Parsed::Run(_))), "{argv:?}");
+        }
+        let mut names = std::collections::HashSet::new();
+        for option in OPTIONS {
+            for name in option.names { assert!(names.insert(name), "duplicate option {name}"); }
+        }
+    }
 }
