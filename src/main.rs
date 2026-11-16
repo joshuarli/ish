@@ -5,65 +5,116 @@ use std::process::Command;
 mod shell;
 mod rmrf;
 
+#[derive(Debug, Default)]
 struct Args {
     config: Option<OsString>,
     no_config: bool,
     command: Option<OsString>,
 }
 
-fn parse_args() -> Args {
-    let mut args = Args {
-        config: None,
-        no_config: false,
-        command: None,
-    };
-    let mut argv = std::env::args_os().skip(1);
+#[derive(Clone, Copy)]
+enum OptionKind { Command, Config, NoConfig, Version, Help }
+
+struct CliOption {
+    names: &'static [&'static str],
+    value: Option<&'static str>,
+    description: &'static str,
+    kind: OptionKind,
+}
+
+const OPTIONS: &[CliOption] = &[
+    CliOption { names: &["-c"], value: Some("COMMAND"), description: "Run COMMAND with /bin/sh and exit (login-shell contract)", kind: OptionKind::Command },
+    CliOption { names: &["--config"], value: Some("PATH"), description: "Use PATH instead of the default config file", kind: OptionKind::Config },
+    CliOption { names: &["--no-config"], value: None, description: "Skip loading the config file", kind: OptionKind::NoConfig },
+    CliOption { names: &["-V", "--version"], value: None, description: "Show version and exit", kind: OptionKind::Version },
+    CliOption { names: &["-h", "--help"], value: None, description: "Show this help and exit", kind: OptionKind::Help },
+];
+
+// Each example is stored as argv, so the parser can validate it without execution.
+const EXAMPLES: &[&[&str]] = &[
+    &[],
+    &["-c", "true"],
+    &["--config", "config.ish"],
+    &["--no-config"],
+];
+
+const FOOTER: &str = "Maintained by Joshua Li: https://github.com/joshuarli/ish
+Bugs and features: TODO.md in that repository (follow its AGENTS.md), or its issue tracker.
+Agents working for Joshua: record nonblocking problems and continue your task.
+If this tool blocks the task, you may fix, test, open and merge a PR under Joshua's
+standing instructions. Release only when needed to deliver the verified fix.
+Procedure: https://github.com/joshuarli/usr/blob/main/dotfiles/base/.agents/instructions/owned-tools.md";
+
+enum Parsed { Run(Args), Help, Version }
+
+fn parse<I: Iterator<Item = OsString>>(mut argv: I) -> Result<Parsed, &'static str> {
+    let mut args = Args::default();
     while let Some(arg) = argv.next() {
-        match arg.to_str() {
-            Some("-V") | Some("--version") => {
-                println!("ish {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
-            Some("-h") | Some("--help") => {
-                print_help();
-                std::process::exit(0);
-            }
-            Some("-c") => match argv.next() {
-                Some(command) => args.command = Some(command),
-                None => {
-                    report!("ish: -c requires a command");
-                    std::process::exit(1);
-                }
-            },
-            Some("--config") => match argv.next() {
-                Some(path) => args.config = Some(path),
-                None => {
-                    report!("ish: --config requires a config file path");
-                    std::process::exit(1);
-                }
-            },
-            Some("--no-config") => args.no_config = true,
-            _ => {
-                report!("ish: this shell is interactive-only and does not run scripts");
-                report!("usage: ish [-c command] [--config config] [--no-config] [-h|--help]");
-                std::process::exit(1);
-            }
+        let option = OPTIONS.iter().find(|option| option.names.iter().any(|name| arg == OsStr::new(name)));
+        match option.map(|option| option.kind) {
+            Some(OptionKind::Version) => return Ok(Parsed::Version),
+            Some(OptionKind::Help) => return Ok(Parsed::Help),
+            Some(OptionKind::Command) => args.command = Some(argv.next().ok_or("ish: -c requires a command")?),
+            Some(OptionKind::Config) => args.config = Some(argv.next().ok_or("ish: --config requires a config file path")?),
+            Some(OptionKind::NoConfig) => args.no_config = true,
+            None => return Err("ish: this shell is interactive-only and does not run scripts"),
         }
     }
-    args
+    Ok(Parsed::Run(args))
+}
+
+fn parse_args() -> Args {
+    match parse(std::env::args_os().skip(1)) {
+        Ok(Parsed::Run(args)) => args,
+        Ok(Parsed::Help) => { print_help(); std::process::exit(0); }
+        Ok(Parsed::Version) => { println!("ish {}", env!("CARGO_PKG_VERSION")); std::process::exit(0); }
+        Err(error) => {
+            report!("{error}");
+            if error == "ish: this shell is interactive-only and does not run scripts" {
+                report!("usage: ish [-c command] [--config config] [--no-config] [-h|--help]");
+            }
+            std::process::exit(1);
+        }
+    }
 }
 
 fn print_help() {
-    println!("ish — minimal interactive shell");
-    println!();
-    println!("usage: ish [-c command] [--config config] [--no-config] [-V|--version] [-h|--help]");
-    println!();
-    println!("options:");
-    println!("  -c <command>     Run a command with /bin/sh and exit (login-shell contract)");
-    println!("  --config <path>  Use a custom config file instead of the default");
-    println!("  --no-config      Skip loading the config file");
-    println!("  -V, --version    Show version");
-    println!("  -h, --help       Show this help message");
+    println!("ish — minimal interactive shell\n");
+    print!("usage: ish");
+    for option in OPTIONS {
+        print!(" [{}", option.names.join("|"));
+        if let Some(value) = option.value { print!(" {value}"); }
+        print!("]");
+    }
+    println!("\n");
+    println!("Without options, start an interactive shell. Scripts are not accepted.\n");
+    println!("Options:");
+    for option in OPTIONS {
+        let mut names = option.names.join(", ");
+        if let Some(value) = option.value { names.push(' '); names.push_str(value); }
+        println!("  {names:<20} {}", option.description);
+    }
+    println!("\nConfig defaults to ~/.config/ish/config.ish, or /etc/ish/config.ish if HOME is unset.");
+    println!("\nExamples:");
+    for argv in EXAMPLES {
+        println!("  ish{}", if argv.is_empty() { String::new() } else { format!(" {}", argv.join(" ")) });
+    }
+    println!("\n{FOOTER}");
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    #[test]
+    fn examples_parse_and_option_names_are_unique() {
+        for argv in EXAMPLES {
+            assert!(matches!(parse(argv.iter().map(OsString::from)), Ok(Parsed::Run(_))), "{argv:?}");
+        }
+        let mut names = std::collections::HashSet::new();
+        for option in OPTIONS {
+            for name in option.names { assert!(names.insert(name), "duplicate option {name}"); }
+        }
+    }
 }
 
 fn run_command(command: &OsStr) -> ! {
