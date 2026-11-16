@@ -138,7 +138,11 @@ cargo test --test pty process_picker
 
 The updater copies upstream source without local matcher or picker patches.
 It retains `Cargo.toml.orig` and normalizes the local manifest with jaq:
-standalone profiles, workspace settings, benchmarks, and development dependencies
+standalone profiles, workspace settings, explicit test/benchmark targets, and development dependencies
 are removed. Automatic binary and test discovery are disabled for the vendored
 library. Run fz's full CLI, PTY, and differential tests in the canonical checkout
 before updating. Commit the upstream change before recording its revision here.
+
+Run `sh scripts/test-vendor-fz.sh` to check the importer with a disposable
+upstream that declares its own foreground test. It builds the imported library
+and a consumer with Cargo; Git, jaq and the pinned Rust toolchain are required.
