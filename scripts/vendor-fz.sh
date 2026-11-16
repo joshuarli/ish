@@ -21,7 +21,7 @@ git -C "$repo" archive "$revision" Cargo.toml LICENSE README.md src docs > "$sta
 mkdir "$stage/fz"
 tar -xf "$stage/source.tar" -C "$stage/fz"
 cp "$stage/fz/Cargo.toml" "$stage/fz/Cargo.toml.orig"
-jaq --from toml --to toml 'del(.workspace, .profile, ."dev-dependencies", .bench) | .package.autobins = false | .package.autotests = false | .package.autobenches = false' "$stage/fz/Cargo.toml.orig" > "$stage/fz/Cargo.toml"
+jaq --from toml --to toml 'del(.workspace, .profile, ."dev-dependencies", .bench, .test) | .package.autobins = false | .package.autotests = false | .package.autobenches = false' "$stage/fz/Cargo.toml.orig" > "$stage/fz/Cargo.toml"
 rm -rf -- vendor/fz
 mv "$stage/fz" vendor/fz
 printf 'Repository: https://github.com/laputa-systems/fz\nRevision: %s\nLicense: MIT (LICENSE)\nUpdate: scripts/vendor-fz.sh /path/to/fz COMMIT\n' "$revision" > vendor/fz/UPSTREAM
