@@ -30,7 +30,6 @@ const OPTIONS: &[CliOption] = &[
     CliOption { names: &["-h", "--help"], value: None, description: "Show this help and exit", kind: OptionKind::Help },
 ];
 
-// Each example is stored as argv, so the parser can validate it without execution.
 const EXAMPLES: &[&[&str]] = &[
     &[],
     &["-c", "true"],

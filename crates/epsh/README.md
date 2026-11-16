@@ -196,7 +196,7 @@ Short options can be combined: -e exits on an eligible failure, -u errors on
 unset variables, -x traces commands, -f disables pathname expansion, and -n
 parses without executing. The -o and +o forms enable and disable pipefail,
 errexit, nounset, xtrace, noglob, and noexec. Running epsh without arguments
-from a terminal prints usage. The runner has no -h or --help option.
+from a terminal prints usage. Use `epsh -h` or `epsh --help` for the complete runner reference and examples.
 
 ## Scope and help
 
