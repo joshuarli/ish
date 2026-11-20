@@ -30,3 +30,17 @@ Unreproduced and unresolved. Both completion tests passed 3/3 runs at the base c
 ## DSLP-32
 
 Unresolved. The picker test passed 3/3 runs at the base commit under eight burners and failed 1/10 runs against unchanged base source under sixteen burners, with process churn in both runs. The failure was `pk: process lookup failed: Input/output error (os error 5)` before `selected]`, not the ticket's `process changed during snapshot`. `src/pk.rs:117` scans processes and `src/pk.rs:134` binds each eligible record; `src/pk/macos.rs:137` emits the ticket's distinct error if a record changes between reads. The captured error does not identify the process or prove that it was the fixture. No fix or post-fix loop was attempted without reproducing the ticket's error and establishing its cause.
+
+## DSLP-33
+
+Reproduced but unresolved. The test passed 3/3 runs at the base commit under eight burners and failed 1/10 runs against unchanged base source under sixteen burners, with process churn in both runs. The failure was `.envrc evaluation timed out after 0.2s` at `src/denv.rs:2181`. A temporary assertion diagnostic identifying the evaluator reproduced it on iteration 13 of this command and printed `bash=true`; the preceding 12 passed:
+
+```bash
+export TMPDIR="$PWD/.work/tmp"
+pids=(); for i in {1..16}; do yes > /dev/null & pids+=("$!"); done
+(while :; do /usr/bin/true; done) & pids+=("$!")
+trap 'kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null' EXIT
+for i in {1..30}; do cargo test -p ish --lib denv::tests::retired_helper_flood_respects_the_evaluation_deadline -- --exact --test-threads=1 > .work/tmp/denv-diagnostic.log 2>&1 || { printf 'failure iteration %s\n' "$i"; cat .work/tmp/denv-diagnostic.log; break; }; printf 'passed %s\n' "$i"; done
+```
+
+The Bash path starts its deadline after spawn (`src/denv.rs:1221`) and checks its failure channel before checking that deadline (`src/denv.rs:1231`). This does not establish whether Bash reached the helper before the deadline or why the record was absent. A temporary source-start file marker under the same load passed 200/200 iterations and therefore did not resolve that question. Both probes were removed. No fix or post-fix loop was attempted; increasing the test deadline would be unsupported by this evidence.
