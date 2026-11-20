@@ -13,24 +13,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 
 ## Tickets
 
-### DSLP-7 · P2 · Types: epsh engine
-
-- **Area:** deslop · types
-- **Where:** crates/epsh/src/
-- **Problem:** Strict-profile candidates and typing findings remain unmeasured for epsh engine. Contracts and consumers: parser, expansion, evaluation and embedding API; consumed by ish and epsh integration tests.
-- **Recommendation:** Measure applicable candidates; adopt only witnessed settings, keep escape hatches from increasing and record witnesses. Acceptance: make test-epsh; meet the deslop types acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-8 · P2 · Types: epsh fixtures and integration
-
-- **Area:** deslop · types
-- **Where:** crates/epsh/tests/, crates/epsh/check-epsh.t
-- **Problem:** Strict-profile candidates and typing findings remain unmeasured for epsh fixtures and integration. Contracts and consumers: byte-preserving conformance, embedding and evaluator contracts; consumed by epsh and ish.
-- **Recommendation:** Measure applicable candidates; adopt only witnessed settings, keep escape hatches from increasing and record witnesses. Acceptance: make test-epsh; meet the deslop types acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
 ### DSLP-9 · P2 · Types: filesystem engine
 
 - **Area:** deslop · types
@@ -49,24 +31,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** deslop
 - **Effort:** M
 
-### DSLP-12 · P2 · Tests: epsh engine
-
-- **Area:** deslop · tests
-- **Where:** crates/epsh/src/
-- **Problem:** Boundary tests and bounded mutation remain unmeasured for epsh engine. Contracts and consumers: parser, expansion, evaluation and embedding API; consumed by ish and epsh integration tests.
-- **Recommendation:** Inventory public contracts and platform gaps, exercise critical decisions with bounded mutation, disposition survivors and preserve the test cost budget. Acceptance: make test-epsh; meet the deslop tests acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-13 · P2 · Tests: epsh fixtures and integration
-
-- **Area:** deslop · tests
-- **Where:** crates/epsh/tests/, crates/epsh/check-epsh.t
-- **Problem:** Boundary tests and bounded mutation remain unmeasured for epsh fixtures and integration. Contracts and consumers: byte-preserving conformance, embedding and evaluator contracts; consumed by epsh and ish.
-- **Recommendation:** Inventory public contracts and platform gaps, exercise critical decisions with bounded mutation, disposition survivors and preserve the test cost budget. Acceptance: make test-epsh; meet the deslop tests acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
 ### DSLP-14 · P2 · Tests: filesystem engine
 
 - **Area:** deslop · tests
@@ -82,24 +46,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** crates/fdu-*/
 - **Problem:** The fdu contracts and library boundaries need the deslop pass. Consumers: ish and fdu integration tests.
 - **Recommendation:** Complete the deslop tests acceptance for these crates; run make test as the consumer acceptance command.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-17 · P2 · Dead code: epsh engine
-
-- **Area:** deslop · dead code
-- **Where:** crates/epsh/src/
-- **Problem:** Dead-code tools and debloat remain unmeasured for epsh engine. Contracts and consumers: parser, expansion, evaluation and embedding API; consumed by ish and epsh integration tests.
-- **Recommendation:** Run applicable dead-code tools, check consumers and platforms, allowlist only justified findings and file walk-backs for owner decision. Acceptance: make test-epsh; meet the deslop dead code acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-18 · P2 · Dead code: epsh fixtures and integration
-
-- **Area:** deslop · dead code
-- **Where:** crates/epsh/tests/, crates/epsh/check-epsh.t
-- **Problem:** Dead-code tools and debloat remain unmeasured for epsh fixtures and integration. Contracts and consumers: byte-preserving conformance, embedding and evaluator contracts; consumed by epsh and ish.
-- **Recommendation:** Run applicable dead-code tools, check consumers and platforms, allowlist only justified findings and file walk-backs for owner decision. Acceptance: make test-epsh; meet the deslop dead code acceptance for this component.
 - **Fix with:** deslop
 - **Effort:** M
 
