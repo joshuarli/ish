@@ -316,7 +316,7 @@ fn worker_input_survives_a_redirection_reusing_its_descriptor() {
         input.write_all(b"queued-value\n").unwrap(); input.rewind().unwrap();
         let descriptor = input.as_raw_fd();
         let mut shell = Shell::builder().cwd(dir.path().to_path_buf()).build();
-        shell.set_command_worker("picker".into(), "/bin/sh".into(), vec!["-c".into(), "for descriptor; do :; done; /bin/cat <&$descriptor".into(), "worker".into(), descriptor.to_string().into()], Some(input.into()));
+        shell.set_command_worker("picker".into(), "/bin/sh".into(), vec!["-c".into(), "for descriptor; do :; done; /bin/cat /dev/fd/$descriptor".into(), "worker".into(), descriptor.to_string().into()], Some(input.into()));
         assert_eq!(shell.run_script(&format!("picker {descriptor}>other >selected")), 0);
         assert_eq!(std::fs::read(dir.path().join("selected")).unwrap(), b"queued-value\n");
     });
