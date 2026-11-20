@@ -273,4 +273,3 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Recommendation:** Reproduce under controlled process churn and determine why the fixture snapshot changes before changing the test or picker behavior.
 - **Fix with:** root-cause
 - **Effort:** M
-
