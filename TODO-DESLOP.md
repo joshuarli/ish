@@ -49,15 +49,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** deslop
 - **Effort:** M
 
-### DSLP-11 · P2 · Tests: editor and shell utilities
-
-- **Area:** deslop · tests
-- **Where:** src/ excluding the shell execution and persistence files
-- **Problem:** Boundary tests and bounded mutation remain unmeasured for editor and shell utilities. Contracts and consumers: terminal input, completion, rendering and shell-owned utilities; consumed by the ish binary and PTY tests.
-- **Recommendation:** Inventory public contracts and platform gaps, exercise critical decisions with bounded mutation, disposition survivors and preserve the test cost budget. Acceptance: cargo test -p ish --lib --tests; meet the deslop tests acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
 ### DSLP-12 · P2 · Tests: epsh engine
 
 - **Area:** deslop · tests

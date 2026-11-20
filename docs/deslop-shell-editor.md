@@ -31,3 +31,17 @@ Debloat read: the builtin registry centralizes names and execution classes (`src
 ## Editor and utilities: types (DSLP-6)
 
 The same strict Clippy command recorded above exited 0. Primary-location diagnostic counts for this component: unsafe 58, wildcard enum 24, single-variant wildcard 2, truncation 42, sign loss 17, unwrap 28, expect 16, redundant clone 1, needless pass by value 12. `unreachable_pub`: 9, examined as visibility leads rather than dead-code proof. The component has 20,405 Rust lines and 797 matching lines under the deslop escape-hatch expression, including tests. No candidate is adopted without a demonstrated witness or deleted escape hatch. The scan reports leads, not 209 established defects; for example, completion uses platform calls in `src/complete.rs:494`, and editor completion cancellation restores the saved line in `src/editor.rs:533`. Unsafe is required by current platform boundaries. No type contract or runtime code changed; escape-hatch count is unchanged.
+
+## Editor and utilities: test inventory (DSLP-11)
+
+| Contract | Guarding tests | Disposition |
+| --- | --- | --- |
+| Input framing, modifiers, paste limit and terminal EOF | `src/input.rs:855`, `:893`, `:957`, `:973`, `:1139`, `:1178`; `tests/integration.rs:794` | Retain; decoder output, bounds and EOF. DSLP-27 tracks an intermittent framing timeout. |
+| Line editing, cursor and UTF-8 | `tests/integration.rs:24`, `:44`, `:143`; `tests/pty.rs:1319`, `:1333`, `:1381`, `:1420` | Retain; edits and visible terminal behavior. |
+| Completion matching, order, cancellation and resize | `src/complete.rs:853`, `:877`, `:908`, `:969`; `src/editor/tests.rs:91`, `:197`, `:382`; `tests/pty.rs:2489`, `:2605`, `:2769` | Retain; filesystem choices and editor/PTY actions. DSLP-28 tracks intermittent PTY timeouts. |
+| Undo, history search and picker actions | `src/editor/tests.rs:69`, `:117`, `:140`, `:328`; `tests/pty.rs:2025`, `:2073` | Retain; restored line and accepted actions. |
+| Prompt and rendering width | `tests/integration.rs:762`, `:944`; `tests/pty.rs:2556`, `:2651` | Retain; visible layout and escape-aware width. |
+
+Needs environment: `cargo-llvm-cov` and `cargo-mutants` are unavailable, so branch coverage and bounded survivor counts are unmeasured. No new boundary test has been justified by this inventory alone. Other utility behavior is represented by the existing integration and PTY tests; this table does not claim complete platform or mutation coverage.
+
+A hand fault removed restoration of the completion prefix on cancellation in `src/editor.rs:533`. `cargo test -p ish --lib editor::tests::completion_cancel_restores_prefix_and_accept_uses_selected_text_after_resize -- --exact` exited 101 at the submitted-line assertion; after restoration it exited 0 (1 passed), and `cmp` confirmed byte-for-byte restoration. This proves one decision, not the unavailable bounded mutant run.
