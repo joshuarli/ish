@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 30
+Next: 33
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -247,12 +247,29 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** root-cause
 - **Effort:** M
 
-### DSLP-29 · P2 · Empty IFS preserves an unquoted empty expansion as an argument
+### DSLP-30 · P2 · Semantic bridge raw filename fixtures fail on macOS filesystems
 
-- **Area:** expansion
-- **Where:** crates/epsh/src/expand.rs:630, crates/epsh/src/expand.rs:610
-- **Problem:** In the built interactive shell, enter IFS= and then /usr/bin/printf '<%s>\n' $DESLOP_UNSET sentinel with DESLOP_UNSET unset: output is <> followed by <sentinel>. With the default IFS the unset expansion disappears. The empty-IFS branch marks an empty split-eligible fragment as a field, passing an unintended argument to commands.
-- **Recommendation:** Preserve explicitly quoted empty fields while removing unquoted empty expansions when IFS is empty; cover the interactive command boundary and adjacent concatenation cases.
+- **Area:** Needs environment · semantic verification
+- **Where:** examples/semantic_bridge/expansion.rs:1114, examples/semantic_bridge/expansion.rs:1139, formal/README.md
+- **Problem:** On macOS APFS, make verify fails with Illegal byte sequence when the expansion bridge creates a fixture containing invalid UTF-8 filename bytes. This prevents the documented full local verification on that filesystem; the byte-preserving fixtures run on a Linux filesystem.
+- **Recommendation:** Provide and document a byte-preserving filesystem for these fixtures on supported hosts without reducing raw-byte coverage.
 - **Fix with:** root-cause
-- **Effort:** S
+- **Effort:** M
 
+### DSLP-31 · P2 · Full macOS test run can fail to locate a transitive crate in doctests
+
+- **Area:** Needs environment · Rust doctests
+- **Where:** crates/fdu-delete/src/lib.rs:563, Makefile:20
+- **Problem:** On a macOS make test run using the configured kache wrapper, the tests passed but the fdu-delete doctest failed with E0463: cannot find crossbeam_utils which rayon depends on. The cause is unproven; the failure prevents full-suite verification.
+- **Recommendation:** Reproduce the rustdoc artifact lookup failure and fix the underlying toolchain or cache interaction without suppressing doctests.
+- **Fix with:** root-cause
+- **Effort:** M
+
+### DSLP-32 · P2 · Process picker PTY test can lose its snapshot under load
+
+- **Area:** Needs environment · PTY tests
+- **Where:** tests/pty.rs:453, tests/pty.rs
+- **Problem:** On a busy macOS make test run, process_picker_cancel_no_match_and_explicit_term_kill_acceptance timed out waiting for selected after pk reported process lookup failed: process changed during snapshot. The cause is unproven; this obscures full-suite results.
+- **Recommendation:** Reproduce under controlled process churn and determine why the fixture snapshot changes before changing the test or picker behavior.
+- **Fix with:** root-cause
+- **Effort:** M

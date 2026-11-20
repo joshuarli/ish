@@ -54,6 +54,16 @@ run_cmd do
   check "quoted star one empty field" (expandWord emptyInput {} [.parameter "*" true none]) (.success ⟨[[]], {}, []⟩)
   check "missing IFS uses space join" (joinPositionals [32, 9, 10] [[97], [98]]) [97, 32, 98]
   check "empty IFS concatenates" (joinPositionals [] [[97], [98]]) [97, 98]
+  check "empty IFS removes an unquoted empty expansion"
+    (finish (insertValue false [] [] {})) []
+  check "empty IFS retains a quoted empty expansion"
+    (finish (insertValue true [] [] {})) [[]]
+  check "empty IFS preserves surrounding text"
+    (finish (insertValue false [] [] (append {} (protect false [97])))) [protect false [97]]
+  let emptyIfsPositionals : ShellState := { variables := [("IFS", [])], positional := [[97, 58, 58, 98], [], [97, 58, 58, 98, 58]] }
+  check "empty IFS removes empty unquoted star arguments"
+    (expandWord emptyInput emptyIfsPositionals [.parameter "*" false none])
+    (.success ⟨[[97, 58, 58, 98], [97, 58, 58, 98, 58]], emptyIfsPositionals, []⟩)
   check "star joins with entire first UTF8 unit" (joinPositionals [240, 159, 152, 128, 58] [[97], [98]])
     [97, 240, 159, 152, 128, 98]
   let statusInput : Input := { emptyInput with

@@ -630,7 +630,7 @@ fn field_split(fragments: &[ExpandedWord], ifs: &str) -> Vec<String> {
         if !frag.split_fields || ifs.is_empty() {
             // No splitting: append directly
             current.push_str(&frag.value);
-            have_field = true;
+            have_field |= !frag.split_fields || !frag.value.is_empty();
             continue;
         }
 

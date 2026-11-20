@@ -23,6 +23,19 @@ fn empty_quoted_at_preserves_surrounding_text() {
 }
 
 #[test]
+fn empty_ifs_removes_unquoted_empty_expansions() {
+    let mut shell = Shell::new();
+    shell.set_var("IFS", "").unwrap();
+    shell.set_var("DSLP_29_EMPTY", "").unwrap();
+    shell.set_var("DSLP_29_SPACES", "a b").unwrap();
+    assert!(fields("$DSLP_29_UNSET", &mut shell).is_empty());
+    assert!(fields("$DSLP_29_EMPTY", &mut shell).is_empty());
+    assert_eq!(fields("\"$DSLP_29_EMPTY\"", &mut shell), [""]);
+    assert_eq!(fields("$DSLP_29_SPACES", &mut shell), ["a b"]);
+    assert_eq!(fields("pre${DSLP_29_EMPTY}post $DSLP_29_EMPTY\"\"", &mut shell), ["prepost", ""]);
+}
+
+#[test]
 fn quote_masks_survive_mixed_globbing_and_field_splitting() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["*one", "*two", "other"] {
