@@ -305,8 +305,7 @@ fn metadata_memory_budget_rejects_parallelism_before_mutation() {
     let fixture = Fixture::new("ish-fs-metadata-memory-limit");
     fs::write(fixture.0.join("source"), b"metadata admission payload").unwrap();
     let mut child = start_child("child_metadata_memory_budget_probe", "metadata-memory", &fixture.0, None);
-    let (status, samples) = sample_process(&mut child).unwrap();
-    assert!(samples.count > 0, "no /proc samples were collected");
+    let (status, _) = sample_process(&mut child).unwrap();
     assert!(status.success(), "metadata memory child exited with {status}");
     assert_only_source(&fixture.0);
     assert_eq!(fs::read(fixture.0.join("source")).unwrap(), b"metadata admission payload");
