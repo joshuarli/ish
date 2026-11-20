@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 29
+Next: 30
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -12,15 +12,6 @@ A later full test run reported no failed tests in 169.24s, but its wrapper faile
 Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-request workflows already invoke the required make targets. A quiet performance host was unavailable (`perf-gate-ready` exit 75).
 
 ## Tickets
-
-### DSLP-2 · P2 · Diagnose: ultrareview into this backlog
-
-- **Area:** deslop · diagnose
-- **Where:** whole repository
-- **Problem:** No review has ranked this repository's risks for the deslop pass.
-- **Recommendation:** Run the deslop Diagnose step. Accept: the diff touches only docs, comments, and this file, and every finding names its Fix with.
-- **Fix with:** deslop
-- **Effort:** M
 
 ### DSLP-3 · P2 · Types: shell execution and persistence
 
@@ -255,4 +246,13 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Recommendation:** Reproduce each failure under controlled load and at the base revision; identify whether the shell or harness is responsible before changing deadlines or assertions.
 - **Fix with:** root-cause
 - **Effort:** M
+
+### DSLP-29 · P2 · Empty IFS preserves an unquoted empty expansion as an argument
+
+- **Area:** expansion
+- **Where:** crates/epsh/src/expand.rs:630, crates/epsh/src/expand.rs:610
+- **Problem:** In the built interactive shell, enter IFS= and then /usr/bin/printf '<%s>\n' $DESLOP_UNSET sentinel with DESLOP_UNSET unset: output is <> followed by <sentinel>. With the default IFS the unset expansion disappears. The empty-IFS branch marks an empty split-eligible fragment as a field, passing an unintended argument to commands.
+- **Recommendation:** Preserve explicitly quoted empty fields while removing unquoted empty expansions when IFS is empty; cover the interactive command boundary and adjacent concatenation cases.
+- **Fix with:** root-cause
+- **Effort:** S
 
