@@ -13,15 +13,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 
 ## Tickets
 
-### DSLP-3 · P2 · Types: shell execution and persistence
-
-- **Area:** deslop · types
-- **Where:** src/shell.rs, src/dispatch.rs, src/foreground.rs, src/signal.rs, src/history.rs, src/history/, src/config.rs, src/builtin.rs
-- **Problem:** Strict-profile candidates and typing findings remain unmeasured for shell execution and persistence. Contracts and consumers: interactive dispatch, job control, signals, config and history journal; consumed by the ish binary and PTY tests.
-- **Recommendation:** Measure applicable candidates; adopt only witnessed settings, keep escape hatches from increasing and record witnesses. Acceptance: cargo test -p ish --lib --tests; meet the deslop types acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
 ### DSLP-4 · P2 · Tests: shell execution and persistence
 
 - **Area:** deslop · tests
