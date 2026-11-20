@@ -14,8 +14,8 @@ behavior contract.
 
 ## Verification
 
-- `make test`: default members, PTY and native conformance tests; busy macOS runs failed after 138s cold and 130s warm (see `TODO-DESLOP.md`).
-- `make lint`: workspace Clippy and Ruff for scripts; 116s on a busy macOS host with three Cargo jobs.
+- `make test`: default members, PTY and native conformance tests; busy macOS cold and warm runs failed after 138s and 130s; a later rebuild and run passed in 479s (see `TODO-DESLOP.md`).
+- `make lint`: workspace Clippy and Ruff for scripts; busy macOS runs passed in 116s and 329s with three Cargo jobs.
 - `make verify`: Lean model, differential bridge, and mutation checks; cost not measured here.
 - CLI flags and argument errors: `tests/cli_help.rs`, `tests/login_shell.rs`, `src/main.rs` tests.
 - Exit codes and dispatch policy: `tests/login_shell.rs`, `tests/pty.rs`.

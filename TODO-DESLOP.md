@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 28
+Next: 29
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -7,18 +7,11 @@ Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/mai
 
 Ground base: `fc62468e2428f9aea6fcd611b0820ab709ce0c65`. The first cold `make test` took 137.96s and failed because the callback test passed a multi-digit descriptor to `/bin/sh` redirection. The test now reads that descriptor via `/dev/fd`. The next run took 129.63s and hit two terminal-decoder timeouts; both passed in isolation. A base worktree library run reproduced one timeout (DSLP-27). Timings are busy-host observations, not performance gates.
 
+A later full test run reported no failed tests in 169.24s, but its wrapper failed to capture the exit code. Another run exited 2 in 121.50s when the large-output PTY test started its prompt deadline on the echoed command. Its marker now waits for the final output line; the focused test passed, and a full rebuild and test exited 0 in 479.00s. A previous retry also timed out in two other PTY tests; their causes and base equivalence were not established.
+
 Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-request workflows already invoke the required make targets. A quiet performance host was unavailable (`perf-gate-ready` exit 75).
 
 ## Tickets
-
-### DSLP-1 · P2 · Ground: baseline, boundaries, and CI test entry point
-
-- **Area:** deslop · ground
-- **Where:** AGENTS.md, Makefile, .github/workflows/
-- **Problem:** Base 73a2cdc; code lines Rust 88.2k, Python 0.8k (fleet/loc/v1, vendored included); timings not yet measured. Open fleet lint findings: laputa-rustix 7, mdtool 4, linux-musl-toolchain 2, owned-tool-support 2, binary-release-static 1, make-clean-target 1. Vendored trees: vendor/fz. Over 50k lines, so Types, Tests, and Dead code run per component; largest first-party groups: src/(top-level files) (24k), crates/epsh (21k), crates/ish-fs (17k), tests (9k), examples (7k), crates/fdu-tui (2k), crates/fdu-scan (2k), benches (2k). Perf gate applies: rustybench benches/baseline.json.
-- **Recommendation:** Run the deslop Ground step. Accept: CI runs make test and is green, and AGENTS.md has a Verification section.
-- **Fix with:** deslop
-- **Effort:** M
 
 ### DSLP-2 · P2 · Diagnose: ultrareview into this backlog
 
@@ -251,6 +244,15 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** src/input.rs:1061, src/input.rs:1107, src/input.rs:1112
 - **Problem:** On a busy macOS host, make test timed out in replies_between_typed_keys_leave_the_typing_intact and reply_and_report_sequences_are_consumed_whole_at_every_split. Both passed isolated. A full ish library run at base fc62468e repeated the first timeout; it did not repeat the second. The root cause is not established, and intermittent suite failures obscure regressions.
 - **Recommendation:** Reproduce under controlled load, determine whether framing, the test harness, or scheduling causes the sentinel timeout, and fix the cause without weakening the behavior assertion.
+- **Fix with:** root-cause
+- **Effort:** M
+
+### DSLP-28 · P2 · PTY completion tests intermittently time out under load
+
+- **Area:** Needs environment · PTY tests
+- **Where:** tests/pty.rs:453, tests/pty.rs:506
+- **Problem:** A busy macOS full-suite retry timed out in builtin_lookup_completion_and_explicit_paths_share_the_policy and completion_resize_rerenders_grid. A later full suite passed; neither failure was reproduced at base and the cause remains unknown, so they can obscure regressions.
+- **Recommendation:** Reproduce each failure under controlled load and at the base revision; identify whether the shell or harness is responsible before changing deadlines or assertions.
 - **Fix with:** root-cause
 - **Effort:** M
 
