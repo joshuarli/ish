@@ -85,15 +85,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** deslop
 - **Effort:** M
 
-### DSLP-16 · P2 · Dead code: editor and shell utilities
-
-- **Area:** deslop · dead code
-- **Where:** src/ excluding the shell execution and persistence files
-- **Problem:** Dead-code tools and debloat remain unmeasured for editor and shell utilities. Contracts and consumers: terminal input, completion, rendering and shell-owned utilities; consumed by the ish binary and PTY tests.
-- **Recommendation:** Run applicable dead-code tools, check consumers and platforms, allowlist only justified findings and file walk-backs for owner decision. Acceptance: cargo test -p ish --lib --tests; meet the deslop dead code acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
 ### DSLP-17 · P2 · Dead code: epsh engine
 
 - **Area:** deslop · dead code

@@ -45,3 +45,13 @@ The same strict Clippy command recorded above exited 0. Primary-location diagnos
 Needs environment: `cargo-llvm-cov` and `cargo-mutants` are unavailable, so branch coverage and bounded survivor counts are unmeasured. No new boundary test has been justified by this inventory alone. Other utility behavior is represented by the existing integration and PTY tests; this table does not claim complete platform or mutation coverage.
 
 A hand fault removed restoration of the completion prefix on cancellation in `src/editor.rs:533`. `cargo test -p ish --lib editor::tests::completion_cancel_restores_prefix_and_accept_uses_selected_text_after_resize -- --exact` exited 101 at the submitted-line assertion; after restoration it exited 0 (1 passed), and `cmp` confirmed byte-for-byte restoration. This proves one decision, not the unavailable bounded mutant run.
+
+## Editor and utilities: dead code (DSLP-16)
+
+The strict scan enabled `dead_code` and `unreachable_pub`; the latter reported nine visibility-only items in private utility modules, not proof of dead code. `src/input.rs:34` retains the shift modifier: the public input contract is exercised by `tests/integration.rs:794`. `cargo-machete` is unavailable (Needs environment), so dependency liveness is unmeasured.
+
+Removed one suppressed crate-private `fdu::help` helper (five lines). A repository search found no callers, tests, build or package references; `src/builtin.rs:178` registers independent `FDU_HELP`, while `src/fdu.rs:153` handles `fdu --help` via `print_help`. Thus no command or public API changed. `tests/integration.rs:1965` exercises registered help, and `tests/fdu_pty.rs` exercises the binary. The helper was unconditional Rust code; the scan and tests cover Darwin default features only, while its crate-private visibility and absence of references also apply to Linux builds. No dependency was removed.
+
+Debloat read: editor state and typed actions (`src/editor.rs:23`) keep terminal effects in the shell; completion owns bounded directory lookup (`src/complete.rs`); input framing and paste limits (`src/input.rs:7`) protect terminal input. Their documented behavior and active callers justify retaining them. No other cut or walk-back is established by this scoped read; it is not a complete structural sweep of every lens.
+
+CLI inventory limitation: help output names `--version` and `--no-config` (`tests/cli_help.rs:16`), but this read found no dedicated test asserting their runtime effects. The parser examples (`src/main.rs:141`) check that `--no-config` parses, not that it skips a populated config; this remains a test gap. The focused `cargo test -p ish --test integration fdu_help_and_rejections_and_summary -- --exact` exited 0 (1 passed).

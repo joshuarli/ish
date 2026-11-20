@@ -164,11 +164,6 @@ fn print_help() -> io::Result<()> {
     stdout.flush()
 }
 
-#[allow(dead_code)]
-pub(crate) fn help() -> String {
-    "Usage: fdu [--apparent] [-x PATH | --exclude PATH]... [--summary | --interactive] [--read-only] [PATH]\nBrowse disk usage in a terminal or write a summary of directory sizes.\n".to_owned()
-}
-
 fn usage() -> &'static str {
     "Usage: fdu [--apparent] [-x PATH | --exclude PATH]... [--summary | --interactive] [--read-only] [PATH]"
 }
