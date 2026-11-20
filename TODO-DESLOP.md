@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 34
+Next: 36
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -55,6 +55,24 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** tests/pty.rs:453, tests/pty.rs
 - **Problem:** On a busy macOS make test run, process_picker_cancel_no_match_and_explicit_term_kill_acceptance timed out waiting for selected after pk reported process lookup failed: process changed during snapshot. The cause is unproven; this obscures full-suite results.
 - **Recommendation:** Reproduce under controlled process churn and determine why the fixture snapshot changes before changing the test or picker behavior.
+- **Fix with:** root-cause
+- **Effort:** M
+
+### DSLP-34 · P2 · fdu filter-prompt snapshot can differ on macOS CI
+
+- **Area:** Needs environment · PTY tests
+- **Where:** tests/fdu_snapshots.rs:34, tests/snapshots/filter-prompt-100x24.ptytest
+- **Problem:** On macOS CI for docs-only PR #38 (run 44822681805), filter_prompt_and_applied_filter failed with snapshot filter-prompt-100x24 differs. The frozen screen is captured without waiting for a render that matches the expected state, so a late frame can be compared. The cause is unproven.
+- **Recommendation:** Reproduce under controlled load, diff the captured and golden screens, and make freeze wait for a render-complete condition the test can name before comparing, without updating the golden snapshot to the transient frame.
+- **Fix with:** root-cause
+- **Effort:** M
+
+### DSLP-35 · P2 · PTY suite can time out waiting for the OSC 133 prompt marker under load
+
+- **Area:** Needs environment · PTY tests
+- **Where:** tests/pty.rs
+- **Problem:** A loaded Darwin make test at fix/deslop-flakes (docs/deslop-flakes.md research run, 2026-11-20) timed out waiting for an OSC 133 prompt marker after 216 PTY passes; the rerun failed instead with a process picker Invalid argument (os error 22). Neither failure is tied to a code change and the cause is unproven.
+- **Recommendation:** Record which test and wait timed out, reproduce it alone under the recorded load, and fix the harness or shell cause without lengthening the wait unless the cause is proven to be scheduling latency against a deadline the test chose.
 - **Fix with:** root-cause
 - **Effort:** M
 
