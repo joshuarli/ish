@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 33
+Next: 34
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -12,42 +12,6 @@ A later full test run reported no failed tests in 169.24s, but its wrapper faile
 Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-request workflows already invoke the required make targets. A quiet performance host was unavailable (`perf-gate-ready` exit 75).
 
 ## Tickets
-
-### DSLP-3 · P2 · Types: shell execution and persistence
-
-- **Area:** deslop · types
-- **Where:** src/shell.rs, src/dispatch.rs, src/foreground.rs, src/signal.rs, src/history.rs, src/history/, src/config.rs, src/builtin.rs
-- **Problem:** Strict-profile candidates and typing findings remain unmeasured for shell execution and persistence. Contracts and consumers: interactive dispatch, job control, signals, config and history journal; consumed by the ish binary and PTY tests.
-- **Recommendation:** Measure applicable candidates; adopt only witnessed settings, keep escape hatches from increasing and record witnesses. Acceptance: cargo test -p ish --lib --tests; meet the deslop types acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-4 · P2 · Tests: shell execution and persistence
-
-- **Area:** deslop · tests
-- **Where:** src/shell.rs, src/dispatch.rs, src/foreground.rs, src/signal.rs, src/history.rs, src/history/, src/config.rs, src/builtin.rs
-- **Problem:** Boundary tests and bounded mutation remain unmeasured for shell execution and persistence. Contracts and consumers: interactive dispatch, job control, signals, config and history journal; consumed by the ish binary and PTY tests.
-- **Recommendation:** Inventory public contracts and platform gaps, exercise critical decisions with bounded mutation, disposition survivors and preserve the test cost budget. Acceptance: cargo test -p ish --lib --tests; meet the deslop tests acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-5 · P2 · Dead code: shell execution and persistence
-
-- **Area:** deslop · dead code
-- **Where:** src/shell.rs, src/dispatch.rs, src/foreground.rs, src/signal.rs, src/history.rs, src/history/, src/config.rs, src/builtin.rs
-- **Problem:** Dead-code tools and debloat remain unmeasured for shell execution and persistence. Contracts and consumers: interactive dispatch, job control, signals, config and history journal; consumed by the ish binary and PTY tests.
-- **Recommendation:** Run applicable dead-code tools, check consumers and platforms, allowlist only justified findings and file walk-backs for owner decision. Acceptance: cargo test -p ish --lib --tests; meet the deslop dead code acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-6 · P2 · Types: editor and shell utilities
-
-- **Area:** deslop · types
-- **Where:** src/ excluding the shell execution and persistence files
-- **Problem:** Strict-profile candidates and typing findings remain unmeasured for editor and shell utilities. Contracts and consumers: terminal input, completion, rendering and shell-owned utilities; consumed by the ish binary and PTY tests.
-- **Recommendation:** Measure applicable candidates; adopt only witnessed settings, keep escape hatches from increasing and record witnesses. Acceptance: cargo test -p ish --lib --tests; meet the deslop types acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
 
 ### DSLP-7 · P2 · Types: epsh engine
 
@@ -85,15 +49,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** deslop
 - **Effort:** M
 
-### DSLP-11 · P2 · Tests: editor and shell utilities
-
-- **Area:** deslop · tests
-- **Where:** src/ excluding the shell execution and persistence files
-- **Problem:** Boundary tests and bounded mutation remain unmeasured for editor and shell utilities. Contracts and consumers: terminal input, completion, rendering and shell-owned utilities; consumed by the ish binary and PTY tests.
-- **Recommendation:** Inventory public contracts and platform gaps, exercise critical decisions with bounded mutation, disposition survivors and preserve the test cost budget. Acceptance: cargo test -p ish --lib --tests; meet the deslop tests acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
 ### DSLP-12 · P2 · Tests: epsh engine
 
 - **Area:** deslop · tests
@@ -127,15 +82,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** crates/fdu-*/
 - **Problem:** The fdu contracts and library boundaries need the deslop pass. Consumers: ish and fdu integration tests.
 - **Recommendation:** Complete the deslop tests acceptance for these crates; run make test as the consumer acceptance command.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-16 · P2 · Dead code: editor and shell utilities
-
-- **Area:** deslop · dead code
-- **Where:** src/ excluding the shell execution and persistence files
-- **Problem:** Dead-code tools and debloat remain unmeasured for editor and shell utilities. Contracts and consumers: terminal input, completion, rendering and shell-owned utilities; consumed by the ish binary and PTY tests.
-- **Recommendation:** Run applicable dead-code tools, check consumers and platforms, allowlist only justified findings and file walk-backs for owner decision. Acceptance: cargo test -p ish --lib --tests; meet the deslop dead code acceptance for this component.
 - **Fix with:** deslop
 - **Effort:** M
 
@@ -271,5 +217,14 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** tests/pty.rs:453, tests/pty.rs
 - **Problem:** On a busy macOS make test run, process_picker_cancel_no_match_and_explicit_term_kill_acceptance timed out waiting for selected after pk reported process lookup failed: process changed during snapshot. The cause is unproven; this obscures full-suite results.
 - **Recommendation:** Reproduce under controlled process churn and determine why the fixture snapshot changes before changing the test or picker behavior.
+- **Fix with:** root-cause
+- **Effort:** M
+
+### DSLP-33 · P2 · Denv helper flood test can miss its diagnostic deadline
+
+- **Area:** Needs environment · denv tests
+- **Where:** src/denv.rs:2144, src/denv.rs:2181
+- **Problem:** On Darwin arm64 a final make test run failed because retired_helper_flood_respects_the_evaluation_deadline received an evaluation timeout after 0.2 seconds instead of the expected dotenv diagnostic. The same test passed in the immediately preceding component suite and in isolation. The cause is unproven; this intermittent failure obscures workspace verification.
+- **Recommendation:** Reproduce under controlled load and determine whether the evaluator, test deadline, or scheduling causes the missing diagnostic before changing behavior or deadlines.
 - **Fix with:** root-cause
 - **Effort:** M
