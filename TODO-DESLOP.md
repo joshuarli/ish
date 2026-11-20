@@ -13,15 +13,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 
 ## Tickets
 
-### DSLP-5 · P2 · Dead code: shell execution and persistence
-
-- **Area:** deslop · dead code
-- **Where:** src/shell.rs, src/dispatch.rs, src/foreground.rs, src/signal.rs, src/history.rs, src/history/, src/config.rs, src/builtin.rs
-- **Problem:** Dead-code tools and debloat remain unmeasured for shell execution and persistence. Contracts and consumers: interactive dispatch, job control, signals, config and history journal; consumed by the ish binary and PTY tests.
-- **Recommendation:** Run applicable dead-code tools, check consumers and platforms, allowlist only justified findings and file walk-backs for owner decision. Acceptance: cargo test -p ish --lib --tests; meet the deslop dead code acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
 ### DSLP-6 · P2 · Types: editor and shell utilities
 
 - **Area:** deslop · types
