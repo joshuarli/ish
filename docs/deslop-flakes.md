@@ -22,3 +22,7 @@ done
 ## DSLP-27
 
 Unreproduced and unresolved. Each of the two decoder tests passed 3/3 runs under eight burners and 10/10 under sixteen burners, with the process-churn loop in both runs. In each log Cargo reported one test run. `src/input.rs:1061` writes a `Z` sentinel and `src/input.rs:1105` waits 20 seconds for the reader; `src/input.rs:1119` runs split cases concurrently. These are observations, not proof whether a lost sentinel, framing error, or scheduling caused the reported timeout. No fix or post-fix loop was attempted without a failing reproduction.
+
+## DSLP-28
+
+Unreproduced and unresolved. Both completion tests passed 3/3 runs at the base commit under eight burners and 10/10 runs against the unchanged base source under sixteen burners, with process churn in both runs. The first documentation-only commit was made during the second loop; no test or product source changed. Each log reported one test run. `tests/pty.rs:427` waits for output markers, while `tests/pty.rs:1671` and `tests/pty.rs:2778` wait for quiescence before inspecting completion state. The passing runs do not establish which wait or shell state caused either reported timeout. No fix or post-fix loop was attempted without a failing reproduction.
