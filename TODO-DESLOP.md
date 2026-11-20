@@ -13,15 +13,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 
 ## Tickets
 
-### DSLP-4 · P2 · Tests: shell execution and persistence
-
-- **Area:** deslop · tests
-- **Where:** src/shell.rs, src/dispatch.rs, src/foreground.rs, src/signal.rs, src/history.rs, src/history/, src/config.rs, src/builtin.rs
-- **Problem:** Boundary tests and bounded mutation remain unmeasured for shell execution and persistence. Contracts and consumers: interactive dispatch, job control, signals, config and history journal; consumed by the ish binary and PTY tests.
-- **Recommendation:** Inventory public contracts and platform gaps, exercise critical decisions with bounded mutation, disposition survivors and preserve the test cost budget. Acceptance: cargo test -p ish --lib --tests; meet the deslop tests acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
 ### DSLP-5 · P2 · Dead code: shell execution and persistence
 
 - **Area:** deslop · dead code
