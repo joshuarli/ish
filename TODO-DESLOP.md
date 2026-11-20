@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 34
+Next: 36
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -58,11 +58,21 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** root-cause
 - **Effort:** M
 
-### DSLP-33 · P2 · Denv helper flood test can miss its diagnostic deadline
+### DSLP-34 · P2 · fdu filter-prompt snapshot can differ on macOS CI
 
-- **Area:** Needs environment · denv tests
-- **Where:** src/denv.rs:2144, src/denv.rs:2181
-- **Problem:** On Darwin arm64 a final make test run failed because retired_helper_flood_respects_the_evaluation_deadline received an evaluation timeout after 0.2 seconds instead of the expected dotenv diagnostic. The same test passed in the immediately preceding component suite and in isolation. The cause is unproven; this intermittent failure obscures workspace verification.
-- **Recommendation:** Reproduce under controlled load and determine whether the evaluator, test deadline, or scheduling causes the missing diagnostic before changing behavior or deadlines.
+- **Area:** Needs environment · PTY tests
+- **Where:** tests/fdu_snapshots.rs:34, tests/snapshots/filter-prompt-100x24.ptytest
+- **Problem:** On macOS CI for docs-only PR #38 (run 44822681805), filter_prompt_and_applied_filter failed with snapshot filter-prompt-100x24 differs. The frozen screen is captured without waiting for a render that matches the expected state, so a late frame can be compared. The cause is unproven.
+- **Recommendation:** Reproduce under controlled load, diff the captured and golden screens, and make freeze wait for a render-complete condition the test can name before comparing, without updating the golden snapshot to the transient frame.
 - **Fix with:** root-cause
 - **Effort:** M
+
+### DSLP-35 · P2 · PTY suite can time out waiting for the OSC 133 prompt marker under load
+
+- **Area:** Needs environment · PTY tests
+- **Where:** tests/pty.rs
+- **Problem:** A loaded Darwin make test at fix/deslop-flakes (docs/deslop-flakes.md research run, 2026-11-20) timed out waiting for an OSC 133 prompt marker after 216 PTY passes; the rerun failed instead with a process picker Invalid argument (os error 22). Neither failure is tied to a code change and the cause is unproven.
+- **Recommendation:** Record which test and wait timed out, reproduce it alone under the recorded load, and fix the harness or shell cause without lengthening the wait unless the cause is proven to be scheduling latency against a deadline the test chose.
+- **Fix with:** root-cause
+- **Effort:** M
+
