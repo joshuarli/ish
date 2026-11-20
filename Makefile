@@ -10,7 +10,7 @@ cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static t
 RUSTYBENCH_DEFAULT := $(CURDIR)/.work/tools/bin/rustybench
 RUSTYBENCH ?= "$(RUSTYBENCH_DEFAULT)"
 
-.PHONY: build test test-epsh conformance verify verify-mutations verify-refinement check test-ci release verify-release bench bench-fs bench-syscalls rustybench install install-login-shell lint fix
+.PHONY: build test test-epsh conformance verify verify-mutations verify-refinement check test-ci release verify-release bench bench-fs bench-syscalls rustybench install install-login-shell lint fix test-release
 
 build:
 	$(call cargo,dev) build
@@ -52,10 +52,15 @@ check:
 	TMPDIR="$(CURDIR)/.work/tmp" cargo test --workspace --lib --tests
 	$(MAKE) verify
 
-test-ci:
+test-release:
 	@test -x "target/$(TARGET)/dist/$(NAME)"
 	$(TEST_BINARY_ENV)="$(CURDIR)/target/$(TARGET)/dist/$(NAME)" \
 	$(call cargo,test) test --quiet --release $(TEST_TARGETS)
+
+# CI's Linux jobs: lint and test inside the locally built ish-builder image.
+test-ci:
+	docker run --rm --init --platform "$(PLATFORM)" -e CI -v "$(CURDIR):/ish" -w /ish ish-builder:$(TARGET) \
+	  sh -ec 'rustup component add clippy && MUSL_TARGET=$(TARGET) MUSL_BUILD_MODE=test musl-cargo clippy --workspace --all-targets -- -D warnings && make test TARGET=$(TARGET)'
 
 release:
 	$(call cargo,release-static) clean -p $(NAME) --profile dist --target $(TARGET)

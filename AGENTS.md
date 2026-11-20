@@ -12,6 +12,21 @@ behavior contract.
 - `make check` runs workspace lint, Rust tests, and semantic verification.
 - `cargo check --workspace` checks the Rust workspace.
 
+## Verification
+
+- `make test`: default members, PTY and native conformance tests; busy macOS cold and warm runs failed after 138s and 130s; a later rebuild and run passed in 479s (see `TODO-DESLOP.md`).
+- `make lint`: workspace Clippy and Ruff for scripts; busy macOS runs passed in 116s and 329s with three Cargo jobs.
+- `make verify`: Lean model, differential bridge, and mutation checks; cost not measured here.
+- CLI flags and argument errors: `tests/cli_help.rs`, `tests/login_shell.rs`, `src/main.rs` tests.
+- Exit codes and dispatch policy: `tests/login_shell.rs`, `tests/pty.rs`.
+- Config format: `src/config.rs` tests and `tests/integration.rs`.
+- History journal and legacy import: `src/history/persistence_tests.rs`, `tests/history_import.rs`, `tests/pty.rs`.
+- epsh embedding API: `crates/epsh/tests/embedding.rs` and `api_stability.rs`; consumer: ish.
+- ish-fs operations and API: `crates/ish-fs/tests/`; consumers: ish and fdu.
+- Performance: `make bench` uses `benches/bench.rs` and `benches/baseline.json`; filesystem: `benches/fs/README.md`.
+- Components: shell runtime and history, editor and utilities, epsh engine and fixtures, ish-fs, fdu, integration and workloads.
+- Vendored fz: https://github.com/laputa-systems/fz at `8a91d565dff85caac4131a4bde90f5c685812590` (`vendor/fz/UPSTREAM`).
+
 ## Invariants
 
 - Keep ish interactive-only; adding scripts, POSIX compatibility, `source`, `eval`, control flow, functions, background jobs, plugins, themes, or prompt configuration requires an explicit design decision.

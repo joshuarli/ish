@@ -4740,7 +4740,7 @@ fn output_beyond_the_capture_limit_still_reaches_the_terminal_and_the_shell_cont
     let sh = PtyShell::spawn();
     sh.type_str("seq 1 400000");
     sh.enter();
-    sh.wait_for("400000", 20000);
+    sh.wait_for("\r\n400000\r\n", 20000);
     sh.wait_for_prompt_after_line_advance(5000);
     assert!(sh.run_command("echo alive").contains("alive"));
 }

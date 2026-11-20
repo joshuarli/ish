@@ -81,19 +81,7 @@ jobs:
           tags: ish-builder:${{ matrix.target }}
           cache-from: type=gha,scope=ish-${{ matrix.target }}
       - name: Lint and test in image
-        run: |
-          docker run --rm --init \
-            --platform "${{ matrix.platform }}" \
-            -e CI \
-            -v "$GITHUB_WORKSPACE:/ish" \
-            -w /ish \
-            ish-builder:${{ matrix.target }} \
-            sh -ec '
-              rustup component add clippy
-              MUSL_TARGET=${{ matrix.target }} MUSL_BUILD_MODE=test \
-                musl-cargo clippy --workspace --all-targets -- -D warnings
-              make test TARGET=${{ matrix.target }}
-            '
+        run: make test-ci TARGET="${{ matrix.target }}" PLATFORM="${{ matrix.platform }}"
 
   semantic:
     name: Lean model and Rust bridge
