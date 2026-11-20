@@ -58,11 +58,3 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** root-cause
 - **Effort:** M
 
-### DSLP-33 · P2 · Denv helper flood test can miss its diagnostic deadline
-
-- **Area:** Needs environment · denv tests
-- **Where:** src/denv.rs:2144, src/denv.rs:2181
-- **Problem:** On Darwin arm64 a final make test run failed because retired_helper_flood_respects_the_evaluation_deadline received an evaluation timeout after 0.2 seconds instead of the expected dotenv diagnostic. The same test passed in the immediately preceding component suite and in isolation. The cause is unproven; this intermittent failure obscures workspace verification.
-- **Recommendation:** Reproduce under controlled load and determine whether the evaluator, test deadline, or scheduling causes the missing diagnostic before changing behavior or deadlines.
-- **Fix with:** root-cause
-- **Effort:** M
