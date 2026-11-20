@@ -1,0 +1,24 @@
+# Flake investigation
+
+Darwin arm64, base `54832d69ad35db8791954d6d496f03d28de652a7`. The baseline command was `bash .work/tmp/flake-loops.sh`, with `TMPDIR="$PWD/.work/tmp"`. Its contents for the second run follow; the first run used `{1..8}` burners, `{1..3}` iterations and `${test}-${i}.log` for the log name. Each command ran exactly one named test.
+
+```bash
+#!/bin/bash
+export TMPDIR="$PWD/.work/tmp"
+pids=()
+for i in {1..16}; do yes > /dev/null & pids+=("$!"); done
+(while :; do /usr/bin/true; done) & pids+=("$!")
+trap 'kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null' EXIT
+for test in input::tests::replies_between_typed_keys_leave_the_typing_intact input::tests::reply_and_report_sequences_are_consumed_whole_at_every_split builtin_lookup_completion_and_explicit_paths_share_the_policy completion_resize_rerenders_grid process_picker_cancel_no_match_and_explicit_term_kill_acceptance denv::tests::retired_helper_flood_respects_the_evaluation_deadline; do
+  case "$test" in *::*) target=--lib;; *) target='--test pty';; esac
+  failed=0
+  for i in {1..10}; do
+    cargo test -p ish $target "$test" -- --exact --test-threads=1 > ".work/tmp/stress-${test}-${i}.log" 2>&1 || failed=$((failed+1))
+    printf '%s iteration=%s failures=%s\n' "$test" "$i" "$failed"
+  done
+done
+```
+
+## DSLP-27
+
+Unreproduced and unresolved. Each of the two decoder tests passed 3/3 runs under eight burners and 10/10 under sixteen burners, with the process-churn loop in both runs. In each log Cargo reported one test run. `src/input.rs:1061` writes a `Z` sentinel and `src/input.rs:1105` waits 20 seconds for the reader; `src/input.rs:1119` runs split cases concurrently. These are observations, not proof whether a lost sentinel, framing error, or scheduling caused the reported timeout. No fix or post-fix loop was attempted without a failing reproduction.
