@@ -13,15 +13,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 
 ## Tickets
 
-### DSLP-6 · P2 · Types: editor and shell utilities
-
-- **Area:** deslop · types
-- **Where:** src/ excluding the shell execution and persistence files
-- **Problem:** Strict-profile candidates and typing findings remain unmeasured for editor and shell utilities. Contracts and consumers: terminal input, completion, rendering and shell-owned utilities; consumed by the ish binary and PTY tests.
-- **Recommendation:** Measure applicable candidates; adopt only witnessed settings, keep escape hatches from increasing and record witnesses. Acceptance: cargo test -p ish --lib --tests; meet the deslop types acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
 ### DSLP-7 · P2 · Types: epsh engine
 
 - **Area:** deslop · types
