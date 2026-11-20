@@ -26,3 +26,7 @@ Unreproduced and unresolved. Each of the two decoder tests passed 3/3 runs under
 ## DSLP-28
 
 Unreproduced and unresolved. Both completion tests passed 3/3 runs at the base commit under eight burners and 10/10 runs against the unchanged base source under sixteen burners, with process churn in both runs. The first documentation-only commit was made during the second loop; no test or product source changed. Each log reported one test run. `tests/pty.rs:427` waits for output markers, while `tests/pty.rs:1671` and `tests/pty.rs:2778` wait for quiescence before inspecting completion state. The passing runs do not establish which wait or shell state caused either reported timeout. No fix or post-fix loop was attempted without a failing reproduction.
+
+## DSLP-32
+
+Unresolved. The picker test passed 3/3 runs at the base commit under eight burners and failed 1/10 runs against unchanged base source under sixteen burners, with process churn in both runs. The failure was `pk: process lookup failed: Input/output error (os error 5)` before `selected]`, not the ticket's `process changed during snapshot`. `src/pk.rs:117` scans processes and `src/pk.rs:134` binds each eligible record; `src/pk/macos.rs:137` emits the ticket's distinct error if a record changes between reads. The captured error does not identify the process or prove that it was the fixture. No fix or post-fix loop was attempted without reproducing the ticket's error and establishing its cause.
