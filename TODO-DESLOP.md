@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 33
+Next: 34
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -217,5 +217,14 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** tests/pty.rs:453, tests/pty.rs
 - **Problem:** On a busy macOS make test run, process_picker_cancel_no_match_and_explicit_term_kill_acceptance timed out waiting for selected after pk reported process lookup failed: process changed during snapshot. The cause is unproven; this obscures full-suite results.
 - **Recommendation:** Reproduce under controlled process churn and determine why the fixture snapshot changes before changing the test or picker behavior.
+- **Fix with:** root-cause
+- **Effort:** M
+
+### DSLP-33 · P2 · Denv helper flood test can miss its diagnostic deadline
+
+- **Area:** Needs environment · denv tests
+- **Where:** src/denv.rs:2144, src/denv.rs:2181
+- **Problem:** On Darwin arm64 a final make test run failed because retired_helper_flood_respects_the_evaluation_deadline received an evaluation timeout after 0.2 seconds instead of the expected dotenv diagnostic. The same test passed in the immediately preceding component suite and in isolation. The cause is unproven; this intermittent failure obscures workspace verification.
+- **Recommendation:** Reproduce under controlled load and determine whether the evaluator, test deadline, or scheduling causes the missing diagnostic before changing behavior or deadlines.
 - **Fix with:** root-cause
 - **Effort:** M
