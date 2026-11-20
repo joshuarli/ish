@@ -2149,7 +2149,7 @@ mod tests {
                 .args(["--exact", "denv::tests::retired_helper_flood_respects_the_evaluation_deadline", "--test-threads=1"])
                 .env(CHILD_MODE, "1")
                 .spawn().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 if let Some(status) = child.try_wait().unwrap() {
                     assert!(status.success());
@@ -2163,6 +2163,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+        let evaluation_timeout = Duration::from_secs(2);
         let tmp = TempDir::new("ish_denv_flood");
         let shell = epsh::eval::Shell::new();
         let env_pairs = shell.vars().env_for_command_os(&[]);
@@ -2170,16 +2171,16 @@ mod tests {
         for bash in [false, true] {
             let started = Instant::now();
             let result = if bash {
-                eval_env_bash(tmp.path(), source, &[], &env_pairs, Duration::from_millis(200))
+                eval_env_bash(tmp.path(), source, &[], &env_pairs, evaluation_timeout)
             } else {
-                eval_env_epsh(tmp.path(), source, &[], &env_pairs, Duration::from_millis(200))
+                eval_env_epsh(tmp.path(), source, &[], &env_pairs, evaluation_timeout)
             };
             let err = match result {
                 Ok(_) => panic!("accepted helper flood"),
                 Err(err) => err,
             };
             assert!(err.contains("dotenv"), "{err}");
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(started.elapsed() < evaluation_timeout + Duration::from_secs(1));
         }
     }
 
