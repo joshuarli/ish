@@ -31,24 +31,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** deslop
 - **Effort:** M
 
-### DSLP-9 · P2 · Types: filesystem engine
-
-- **Area:** deslop · types
-- **Where:** crates/ish-fs/
-- **Problem:** Strict-profile candidates and typing findings remain unmeasured for filesystem engine. Contracts and consumers: filesystem operation and library API contracts; consumed by ish, fdu and native filesystem tests.
-- **Recommendation:** Measure applicable candidates; adopt only witnessed settings, keep escape hatches from increasing and record witnesses. Acceptance: cargo test -p ish-fs; meet the deslop types acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-10 · P2 · Types: fdu components
-
-- **Area:** deslop · types
-- **Where:** crates/fdu-*/
-- **Problem:** The fdu contracts and library boundaries need the deslop pass. Consumers: ish and fdu integration tests.
-- **Recommendation:** Complete the deslop types acceptance for these crates; run make test as the consumer acceptance command.
-- **Fix with:** deslop
-- **Effort:** M
-
 ### DSLP-12 · P2 · Tests: epsh engine
 
 - **Area:** deslop · tests
@@ -67,24 +49,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** deslop
 - **Effort:** M
 
-### DSLP-14 · P2 · Tests: filesystem engine
-
-- **Area:** deslop · tests
-- **Where:** crates/ish-fs/
-- **Problem:** Boundary tests and bounded mutation remain unmeasured for filesystem engine. Contracts and consumers: filesystem operation and library API contracts; consumed by ish, fdu and native filesystem tests.
-- **Recommendation:** Inventory public contracts and platform gaps, exercise critical decisions with bounded mutation, disposition survivors and preserve the test cost budget. Acceptance: cargo test -p ish-fs; meet the deslop tests acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-15 · P2 · Tests: fdu components
-
-- **Area:** deslop · tests
-- **Where:** crates/fdu-*/
-- **Problem:** The fdu contracts and library boundaries need the deslop pass. Consumers: ish and fdu integration tests.
-- **Recommendation:** Complete the deslop tests acceptance for these crates; run make test as the consumer acceptance command.
-- **Fix with:** deslop
-- **Effort:** M
-
 ### DSLP-17 · P2 · Dead code: epsh engine
 
 - **Area:** deslop · dead code
@@ -100,24 +64,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** crates/epsh/tests/, crates/epsh/check-epsh.t
 - **Problem:** Dead-code tools and debloat remain unmeasured for epsh fixtures and integration. Contracts and consumers: byte-preserving conformance, embedding and evaluator contracts; consumed by epsh and ish.
 - **Recommendation:** Run applicable dead-code tools, check consumers and platforms, allowlist only justified findings and file walk-backs for owner decision. Acceptance: make test-epsh; meet the deslop dead code acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-19 · P2 · Dead code: filesystem engine
-
-- **Area:** deslop · dead code
-- **Where:** crates/ish-fs/
-- **Problem:** Dead-code tools and debloat remain unmeasured for filesystem engine. Contracts and consumers: filesystem operation and library API contracts; consumed by ish, fdu and native filesystem tests.
-- **Recommendation:** Run applicable dead-code tools, check consumers and platforms, allowlist only justified findings and file walk-backs for owner decision. Acceptance: cargo test -p ish-fs; meet the deslop dead code acceptance for this component.
-- **Fix with:** deslop
-- **Effort:** M
-
-### DSLP-20 · P2 · Dead code: fdu components
-
-- **Area:** deslop · dead code
-- **Where:** crates/fdu-*/
-- **Problem:** The fdu contracts and library boundaries need the deslop pass. Consumers: ish and fdu integration tests.
-- **Recommendation:** Complete the deslop dead code acceptance for these crates; run make test as the consumer acceptance command.
 - **Fix with:** deslop
 - **Effort:** M
 
