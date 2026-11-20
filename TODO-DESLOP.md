@@ -247,12 +247,3 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** root-cause
 - **Effort:** M
 
-### DSLP-29 · P2 · Empty IFS preserves an unquoted empty expansion as an argument
-
-- **Area:** expansion
-- **Where:** crates/epsh/src/expand.rs:630, crates/epsh/src/expand.rs:610
-- **Problem:** In the built interactive shell, enter IFS= and then /usr/bin/printf '<%s>\n' $DESLOP_UNSET sentinel with DESLOP_UNSET unset: output is <> followed by <sentinel>. With the default IFS the unset expansion disappears. The empty-IFS branch marks an empty split-eligible fragment as a field, passing an unintended argument to commands.
-- **Recommendation:** Preserve explicitly quoted empty fields while removing unquoted empty expansions when IFS is empty; cover the interactive command boundary and adjacent concatenation cases.
-- **Fix with:** root-cause
-- **Effort:** S
-
