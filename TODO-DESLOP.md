@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 30
+Next: 33
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -244,6 +244,33 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** tests/pty.rs:453, tests/pty.rs:506
 - **Problem:** A busy macOS full-suite retry timed out in builtin_lookup_completion_and_explicit_paths_share_the_policy and completion_resize_rerenders_grid. A later full suite passed; neither failure was reproduced at base and the cause remains unknown, so they can obscure regressions.
 - **Recommendation:** Reproduce each failure under controlled load and at the base revision; identify whether the shell or harness is responsible before changing deadlines or assertions.
+- **Fix with:** root-cause
+- **Effort:** M
+
+### DSLP-30 · P2 · Semantic bridge raw filename fixtures fail on macOS filesystems
+
+- **Area:** Needs environment · semantic verification
+- **Where:** examples/semantic_bridge/expansion.rs:1114, examples/semantic_bridge/expansion.rs:1139, formal/README.md
+- **Problem:** On macOS APFS, make verify fails with Illegal byte sequence when the expansion bridge creates a fixture containing invalid UTF-8 filename bytes. This prevents the documented full local verification on that filesystem; the byte-preserving fixtures run on a Linux filesystem.
+- **Recommendation:** Provide and document a byte-preserving filesystem for these fixtures on supported hosts without reducing raw-byte coverage.
+- **Fix with:** root-cause
+- **Effort:** M
+
+### DSLP-31 · P2 · Full macOS test run can fail to locate a transitive crate in doctests
+
+- **Area:** Needs environment · Rust doctests
+- **Where:** crates/fdu-delete/src/lib.rs:563, Makefile:20
+- **Problem:** On a macOS make test run using the configured kache wrapper, the tests passed but the fdu-delete doctest failed with E0463: cannot find crossbeam_utils which rayon depends on. The cause is unproven; the failure prevents full-suite verification.
+- **Recommendation:** Reproduce the rustdoc artifact lookup failure and fix the underlying toolchain or cache interaction without suppressing doctests.
+- **Fix with:** root-cause
+- **Effort:** M
+
+### DSLP-32 · P2 · Process picker PTY test can lose its snapshot under load
+
+- **Area:** Needs environment · PTY tests
+- **Where:** tests/pty.rs:453, tests/pty.rs
+- **Problem:** On a busy macOS make test run, process_picker_cancel_no_match_and_explicit_term_kill_acceptance timed out waiting for selected after pk reported process lookup failed: process changed during snapshot. The cause is unproven; this obscures full-suite results.
+- **Recommendation:** Reproduce under controlled process churn and determine why the fixture snapshot changes before changing the test or picker behavior.
 - **Fix with:** root-cause
 - **Effort:** M
 

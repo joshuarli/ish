@@ -159,7 +159,10 @@ def split (ifs bytes : Bytes) (acc : Accumulator) : Accumulator :=
     | some unit => append acc (protect false unit)
     | none => boundary force acc) acc
 def insertValue (quoted : Bool) (ifs bytes : Bytes) (acc : Accumulator) : Accumulator :=
-  if quoted || ifs.isEmpty then append acc (protect quoted bytes) else split ifs bytes acc
+  if quoted then append acc (protect true bytes)
+  else if ifs.isEmpty then
+    if bytes.isEmpty then acc else append acc (protect false bytes)
+  else split ifs bytes acc
 def positional (args : List Bytes) (acc : Accumulator) : Accumulator :=
   match args with
   | [] => acc
@@ -465,9 +468,13 @@ theorem quoted_ignores_ifs (ifs bytes : Bytes) (acc : Accumulator) :
     insertValue true ifs bytes acc = append acc (protect true bytes) := by
   simp [insertValue]
 
-theorem empty_ifs_preserves_value (quoted : Bool) (bytes : Bytes) (acc : Accumulator) :
+theorem empty_ifs_preserves_value (quoted : Bool) (bytes : Bytes) (acc : Accumulator)
+    (nonempty : bytes.isEmpty = false) :
     insertValue quoted [] bytes acc = append acc (protect quoted bytes) := by
-  simp [insertValue]
+  cases quoted <;> simp [insertValue, nonempty]
+
+theorem empty_ifs_removes_unquoted_empty (acc : Accumulator) :
+    insertValue false [] [] acc = acc := by rfl
 
 theorem nonwhite_delimiter_keeps_empty (done : List Field) :
     finish (boundary true ⟨done, none⟩) = done ++ [[]] := by
