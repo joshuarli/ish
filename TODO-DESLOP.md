@@ -58,12 +58,12 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** root-cause
 - **Effort:** M
 
-### DSLP-34 · P2 · fdu filter-prompt snapshot can differ on macOS CI
+### DSLP-34 · P2 · fdu PTY snapshots can capture a partially written frame
 
 - **Area:** Needs environment · PTY tests
-- **Where:** tests/fdu_snapshots.rs:34, tests/snapshots/filter-prompt-100x24.ptytest
-- **Problem:** On macOS CI for docs-only PR #38 (run 44822681805), filter_prompt_and_applied_filter failed with snapshot filter-prompt-100x24 differs. The frozen screen is captured without waiting for a render that matches the expected state, so a late frame can be compared. The cause is unproven.
-- **Recommendation:** Reproduce under controlled load, diff the captured and golden screens, and make freeze wait for a render-complete condition the test can name before comparing, without updating the golden snapshot to the transient frame.
+- **Where:** crates/fdu-tui/src/lib.rs:210, tests/fdu_support.rs, laputa-ptytest screen model
+- **Problem:** fdu writes each frame as a cell diff with no boundary marker, and ptytest's screen shows whatever bytes have arrived. Under load a torn frame can stay quiet for longer than the 25 ms settle window. The ready wait is now tear-proof (docs/deslop-flakes.md, DSLP-34), but any other wait can still settle on a partial frame: help_screen_opens_and_closes failed 3/60 loaded runs that way.
+- **Recommendation:** Have fdu bracket each frame in synchronized output (CSI ? 2026 h / l), and have laputa-ptytest withhold screen updates from predicates and snapshots until the update ends. Then rerun the loaded soak in docs/deslop-flakes.md.
 - **Fix with:** root-cause
 - **Effort:** M
 
