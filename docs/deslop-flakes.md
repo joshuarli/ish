@@ -77,3 +77,28 @@ cargo run --quiet -p ish --example semantic_bridge -- --family expansion --cases
 Before: exit 101 and exit 1 with the `Illegal byte sequence` error. After: exit 0 (17 passed) and exit 0 (`expansion: 999 generated, 0 retained, comparator control rejected`, then the `NOT RUN expansion-00011` line).
 
 **Not resolved by this change.** `make verify` still exits 2 on this host, now in the effects family, identically at base: `effects worker exited with exit status: 1: semantic bridge: cannot inspect descriptor 5: Bad file descriptor (os error 9)` (`examples/semantic_bridge/effects.rs`, `descriptor_resource` accepts only `NotFound` from `/dev/fd/N`). `make verify-mutations` fails on its effects baseline for the same reason. Treating `EBADF` as closed in a temporary patch got past that error but produced a real mismatch at `effects-00010` (expected no descriptors, Lean expected `[[3,7],[4,8]]`), so it is a separate defect and was not changed.
+||||||| parent of bb8f8f757 (docs(deslop): record the DSLP-36 effects descriptor cause and fix)
+
+## DSLP-36
+
+Fixed. Base `5cc47767d`, Darwin arm64. `make verify` stops in the bridge's effects family. The expansion family fails first on APFS raw filenames (fixed in PR #42), so the family was run directly after `cd formal && lake build semanticBridge`:
+
+```bash
+export TMPDIR="$PWD/.work/tmp" PATH="$HOME/.elan/bin:$PATH"
+cargo run --quiet -p ish --example semantic_bridge -- --family effects --cases 1000
+```
+
+At base this exited 1 with `semantic bridge: effects worker exited with exit status: 1: semantic bridge: cannot inspect descriptor 5: Bad file descriptor (os error 9)`. The ticket's `exit 2` is the `make verify` status.
+
+**Cause (established).** The worker is one process: epsh runs `exec N>file` in it, then `descriptor_resource` inspects the same process, so the inspection is in the right process and descriptors are still open. The defect is the probe. It compared `stat("/dev/fd/N")` with the `(st_dev, st_ino)` of the resource file. On Linux `/dev/fd` is a symlink to `/proc/self/fd`, so the stat follows to the file. On Darwin `/dev/fd/N` is a devfs node whose stat reports devfs's device number and a rewritten mode, and only the inode matches. Checked with `python3 -I`: for an open file, `os.fstat(3)` gave `(16777232, 394858068, 0o100644)` and `os.stat("/dev/fd/3")` gave `(1139203528, 394858068, 0o100200)`. A closed descriptor gives `EBADF`, not `ENOENT`. So the base code failed on the first closed probe, and accepting `EBADF` alone would have reported every open descriptor as missing, matching no resource. That is the "Rust sees no descriptors, Lean expects `[[3,7],[4,8]]`" mismatch at effects-00010. Lean and epsh were correct.
+
+**Fix.** `descriptor_resource` (`examples/semantic_bridge/effects.rs`) calls `fstat` on the descriptor itself, through a `ManuallyDrop<File>` so the shell's descriptor is never closed, and treats `EBADF` as closed. This is the same on both OSes, with no `/dev/fd` or `/proc` dependency. The Lean model and product code are unchanged.
+
+**Proof.**
+
+| Command | Base | Fixed |
+| --- | --- | --- |
+| `cargo run --quiet -p ish --example semantic_bridge -- --family effects --cases 1000` | exit 1, `cannot inspect descriptor 5` | exit 0, `effects: 1000 generated, 0 retained, comparator control rejected` |
+| `python3 -B scripts/test-semantic-mutations.py` | not run | exit 0, 2 tests OK |
+| `python3 scripts/check-semantic-mutations.py` | effects baseline failed the same way | exit 1 on this branch alone, because the expansion baseline dies on APFS raw filenames before effects runs; exit 0 with PR #42's `expansion.rs`, `mod.rs` and `runner.rs` applied temporarily (`baseline effects: passed`, `killed saved descriptor restoration: ... effects-00010`, `mutation run: 4 compiled mutants killed by semantic assertions`), then restored |
+| `cargo clippy --quiet -p ish --example semantic_bridge` | not run | exit 0, no output |
