@@ -49,19 +49,20 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
     }
     let mut groups = Vec::new();
     for family in options.families.iter().copied() {
-        let (mut cases, generated_count) = match options.selected_id.as_deref() {
+        let (mut cases, generated_count, not_run) = match options.selected_id.as_deref() {
             Some(id) => match load_regression_by_id(&root, family, id)? {
-                Some(request) => (vec![request], 0),
+                Some(request) => (vec![request], 0, Vec::new()),
                 None => {
-                    let cases = generate_cases(family, options.cases, options.seed, Some(id))?;
+                    let (cases, not_run) =
+                        generate_cases(family, options.cases, options.seed, Some(id))?;
                     let count = cases.len();
-                    (cases, count)
+                    (cases, count, not_run)
                 }
             },
             None => {
-                let cases = generate_cases(family, options.cases, options.seed, None)?;
+                let (cases, not_run) = generate_cases(family, options.cases, options.seed, None)?;
                 let count = cases.len();
-                (cases, count)
+                (cases, count, not_run)
             }
         };
         if options.selected_id.is_none() {
@@ -70,11 +71,11 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
         for case in &cases {
             validate_case(case)?;
         }
-        groups.push((family, cases, generated_count));
+        groups.push((family, cases, generated_count, not_run));
     }
     let requests: Vec<Request> = groups
         .iter()
-        .flat_map(|(_, cases, _)| cases.iter().cloned())
+        .flat_map(|(_, cases, _, _)| cases.iter().cloned())
         .collect();
     validate_unique_ids(&requests)?;
     let responses = run_lean(&binary, &tmpdir, &requests)?;
@@ -89,7 +90,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
         verify_response_corruption(response.clone())?;
     }
     let mut offset = 0;
-    for (family, cases, generated_count) in groups {
+    for (family, cases, generated_count, not_run) in groups {
         let mut normalized = Vec::with_capacity(cases.len());
         for (index, request) in cases.iter().enumerate() {
             let actual = actual(request)?;
@@ -134,6 +135,9 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> BridgeResult<()> {
             generated_count,
             cases.len() - generated_count,
         );
+        for case in &not_run {
+            println!("{}: NOT RUN {case}", family.name());
+        }
         offset += cases.len();
     }
     Ok(())
@@ -314,16 +318,25 @@ fn generate_cases(
     count: usize,
     seed: u64,
     selected_id: Option<&str>,
-) -> BridgeResult<Vec<Request>> {
+) -> BridgeResult<(Vec<Request>, Vec<String>)> {
     if let Some(id) = selected_id {
         let index = selected_index(id, family)?;
         let mut cases = vec![generate(family, index, seed)?];
         cases[0].id = id.to_string();
-        return Ok(cases);
+        return Ok((cases, Vec::new()));
     }
-    (0..count)
-        .map(|index| generate(family, index, seed))
-        .collect()
+    let mut cases = Vec::with_capacity(count);
+    let mut not_run = Vec::new();
+    for index in 0..count {
+        match generate(family, index, seed) {
+            Ok(request) => cases.push(request),
+            Err(error) if error.is_raw_filenames_unsupported() => {
+                not_run.push(format!("{}-{index:05}: raw-byte file name case; {error}", family.name()));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((cases, not_run))
 }
 
 fn generate(family: Family, index: usize, seed: u64) -> BridgeResult<Request> {

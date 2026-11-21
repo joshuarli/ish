@@ -41,6 +41,10 @@ enclosing status, redirection creation, and target policy and external-handler
 callbacks. In particular, it checks that `!` can return status 0 after a child
 placement refusal without opening the target redirection or invoking callbacks.
 Run the policy comparison and placement probe with `cargo run --example semantic_bridge -p ish -- --family policy --cases 1000`.
+On macOS, APFS rejects non-UTF-8 file names, so expansion case `expansion-00011`
+(raw byte `\xff` in a glob match) cannot create its fixture. The bridge reports it
+as `expansion: NOT RUN expansion-00011 ...`, runs every other case, and exits 0.
+Run the bridge on a Linux filesystem to check that case.
 The coverage matrix records each adapter's domain. A detected semantic
 mismatch is reduced and saved under
 `formal/fixtures/bridge-regressions/`.
