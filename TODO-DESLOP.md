@@ -22,15 +22,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** root-cause
 - **Effort:** M
 
-### DSLP-38 · P2 · Ctrl-Z native copy PTY test fails when the prompt shows a long Git branch
-
-- **Area:** PTY tests
-- **Where:** tests/pty.rs:1053 (native_fs_ctrl_z_is_ignored_during_copy_and_external_job_control_still_works), tests/pty.rs:476
-- **Problem:** The test's shell starts in CARGO_MANIFEST_DIR, so the prompt shows the checkout's Git branch. With a long branch name (chore/ptytest-0.5) the prompt plus the typed cp command wraps past 80 columns and wait_for_prompt_after_line_advance times out after 15 s every run (5/5); renaming the branch to p5 made it pass 2/3, and it passed 3/3 on a detached master. The pty-flakes lane saw it fail 16/16 loaded runs on fix/deslop-pty-flakes.
-- **Recommendation:** Make PTY sessions hermetic: start the shell in a temporary directory or disable the Git prompt segment, so the prompt width doesn't depend on the developer's branch; then check prompt_end_after_last_newline handles a wrapped prompt.
-- **Fix with:** root-cause
-- **Effort:** S
-
 ### DSLP-39 · P3 · Quick native copy test asserts no progress output, which a slow host breaks
 
 - **Area:** PTY tests

@@ -788,6 +788,10 @@ fn native_fs_tree(home: &Path, name: &str, count: usize) -> PathBuf {
     root
 }
 
+fn hide_git_prompt(home: &Path) {
+    std::fs::create_dir(home.join(".git")).unwrap();
+}
+
 fn native_fs_cancellable_tree(home: &Path, name: &str) -> PathBuf {
     let root = home.join(name);
     std::fs::create_dir(&root).unwrap();
@@ -1086,6 +1090,7 @@ fn native_fs_ctrl_z_is_ignored_during_copy_and_external_job_control_still_works(
         80,
         None,
         |home| {
+            hide_git_prompt(home);
             native_fs_cancellable_tree(home, "source-tree");
         },
     );
