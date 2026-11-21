@@ -58,3 +58,22 @@ Partly fixed. The CI failure (run 44822681805, attempt 1, macOS job) froze `filt
 **Fix.** `wait_settled` (`tests/fdu_support.rs`) loops until the predicate holds on a settled screen. `settled_wait_ignores_a_screen_replaced_before_output_settles` pins this behaviour: with the old single check it failed 5 of 5 runs, returning a `busy` screen. Snapshot and profile sessions on the layout fixture wait for exactly `192238 entries ` (`wait_layout_fixture_ready`). During a six-digit scan the cell after `entries` keeps its `…` and is never rewritten, so only the Ready frame satisfies that predicate. With the fix, 60 loaded runs had no snapshot failures.
 
 **Open.** A snapshot can still freeze a torn frame after any other wait, as the help-screen failures show. The complete fix needs a frame boundary the harness can observe: fdu emitting synchronized output (`CSI ? 2026 h`/`l`) around each frame, and ptytest holding the screen until the update ends.
+||||||| parent of 8e8ebf85f (fix(verify): report raw-byte glob fixture as not run on APFS)
+
+## DSLP-30
+
+**Cause (established).** Expansion case `expansion-00011` (`echo bridge-*.txt`) creates a fixture file named `bridge-\xff.txt` in `.work/tmp/semantic-bridge-expansion` (`examples/semantic_bridge/expansion.rs`, `with_glob_directory`). APFS and HFS+ reject non-UTF-8 names with `EILSEQ`, so generation aborted the whole bridge run. Reproduced at base `a9b1966fd` on Darwin arm64 with `export TMPDIR="$PWD/.work/tmp" PATH="$HOME/.elan/bin:$PATH"; make verify` (exit 2): `semantic bridge: cannot create expansion match fixture: Illegal byte sequence (os error 92)`. `cargo test -p ish --example semantic_bridge` failed the same way (exit 101, `output_and_glob_fixtures_preserve_raw_bytes_and_unicode_scalars`).
+
+**No byte-preserving filesystem on this host.** Probed on a `hdiutil attach -nomount ram://65536` disk, creating `bridge-\xff.txt` through Python: HFS+ stored `bridge-%FF.txt` (name changed), MS-DOS stored `bridge-%FF.txt` plus an `._` file, ExFAT failed with `EINVAL`, UDF cannot be formatted, and `mount_tmpfs` needs root (`Operation not permitted`). Case 11 therefore cannot run on macOS without a Linux filesystem (container or VM).
+
+**Fix.** `EILSEQ` on a non-UTF-8 name now raises a `raw_filenames_unsupported` error. The runner records the case as not run and keeps generating; it prints `<family>: NOT RUN <case>: raw-byte file name case; <reason>` after the family line, and the case is excluded from the Lean request (so the family reports 999 generated, not 1000). Every other case runs with unchanged assertions, and any other fixture error still fails. A case selected with `--id` that cannot run still fails (exit 1). The glob unit test is split from the output unit test; it prints `NOT RUN expansion-00011 ...` (visible with `--nocapture`) and returns early only on that error. On Linux the file is created and nothing changes.
+
+```bash
+export TMPDIR="$PWD/.work/tmp" PATH="$HOME/.elan/bin:$PATH"
+cargo test -p ish --example semantic_bridge -- --nocapture
+cargo run --quiet -p ish --example semantic_bridge -- --family expansion --cases 1000
+```
+
+Before: exit 101 and exit 1 with the `Illegal byte sequence` error. After: exit 0 (17 passed) and exit 0 (`expansion: 999 generated, 0 retained, comparator control rejected`, then the `NOT RUN expansion-00011` line).
+
+**Not resolved by this change.** `make verify` still exits 2 on this host, now in the effects family, identically at base: `effects worker exited with exit status: 1: semantic bridge: cannot inspect descriptor 5: Bad file descriptor (os error 9)` (`examples/semantic_bridge/effects.rs`, `descriptor_resource` accepts only `NotFound` from `/dev/fd/N`). `make verify-mutations` fails on its effects baseline for the same reason. Treating `EBADF` as closed in a temporary patch got past that error but produced a real mismatch at `effects-00010` (expected no descriptors, Lean expected `[[3,7],[4,8]]`), so it is a separate defect and was not changed.

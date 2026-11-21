@@ -1135,8 +1135,17 @@ fn with_glob_directory<T>(
             for matched in matches {
                 let bytes = require_bytes(matched, "expansion glob match")?;
                 let name = safe_fixture_name(&bytes)?;
-                fs::write(directory.join(name), [])
-                    .map_err(|error| BridgeError::new(format!("cannot create expansion match fixture: {error}")))?;
+                fs::write(directory.join(name), []).map_err(|error| {
+                    // APFS and HFS+ reject names that are not valid UTF-8 with EILSEQ.
+                    if error.raw_os_error() == Some(libc::EILSEQ) && std::str::from_utf8(&bytes).is_err() {
+                        BridgeError::raw_filenames_unsupported(format!(
+                            "the filesystem at {} rejects non-UTF-8 file names (EILSEQ)",
+                            root.display()
+                        ))
+                    } else {
+                        BridgeError::new(format!("cannot create expansion match fixture: {error}"))
+                    }
+                })?;
             }
         }
         run(&directory)
@@ -1184,7 +1193,11 @@ pub(crate) fn shrink(request: &Request) -> BridgeResult<Vec<Request>> {
     let mut candidates = Vec::new();
     let mut sources = HashSet::new();
     for index in [20, 41, 0, 1, 3, 11, 12, 13, 46] {
-        let mut candidate = generate(index, 0)?;
+        let mut candidate = match generate(index, 0) {
+            Ok(candidate) => candidate,
+            Err(error) if error.is_raw_filenames_unsupported() => continue,
+            Err(error) => return Err(error),
+        };
         if candidate.source.len() >= request.source.len() || !sources.insert(candidate.source.clone()) {
             continue;
         }
@@ -1545,11 +1558,10 @@ mod tests {
     }
 
     #[test]
-    fn output_and_glob_fixtures_preserve_raw_bytes_and_unicode_scalars() {
+    fn output_fixtures_preserve_raw_bytes_and_unicode_scalars() {
         let invalid = actual(&generate(5, 0).unwrap()).unwrap();
         let literal_pua = actual(&generate(6, 0).unwrap()).unwrap();
         let literal_noncharacter = actual(&generate(50, 0).unwrap()).unwrap();
-        let glob = actual(&generate(11, 0).unwrap()).unwrap();
 
         assert_eq!(invalid["value"]["fields"], value!([[255]]));
         assert_eq!(literal_pua["value"]["fields"], value!([[238, 130, 128]]));
@@ -1557,6 +1569,20 @@ mod tests {
             literal_noncharacter["value"]["fields"],
             value!(["literal:\u{fffe}".as_bytes()])
         );
+    }
+
+    #[test]
+    fn glob_fixtures_preserve_raw_bytes_and_unicode_scalars() {
+        let request = match generate(11, 0) {
+            Ok(request) => request,
+            Err(error) if error.is_raw_filenames_unsupported() => {
+                eprintln!("NOT RUN expansion-00011 glob raw-byte file name case: {error}");
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        };
+        let glob = actual(&request).unwrap();
+
         assert_eq!(
             glob["value"]["fields"],
             value!([

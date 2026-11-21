@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 36
+Next: 37
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -28,15 +28,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** tests/pty.rs:453, tests/pty.rs:506
 - **Problem:** A busy macOS full-suite retry timed out in builtin_lookup_completion_and_explicit_paths_share_the_policy and completion_resize_rerenders_grid. A later full suite passed; neither failure was reproduced at base and the cause remains unknown, so they can obscure regressions.
 - **Recommendation:** Reproduce each failure under controlled load and at the base revision; identify whether the shell or harness is responsible before changing deadlines or assertions.
-- **Fix with:** root-cause
-- **Effort:** M
-
-### DSLP-30 · P2 · Semantic bridge raw filename fixtures fail on macOS filesystems
-
-- **Area:** Needs environment · semantic verification
-- **Where:** examples/semantic_bridge/expansion.rs:1114, examples/semantic_bridge/expansion.rs:1139, formal/README.md
-- **Problem:** On macOS APFS, make verify fails with Illegal byte sequence when the expansion bridge creates a fixture containing invalid UTF-8 filename bytes. This prevents the documented full local verification on that filesystem; the byte-preserving fixtures run on a Linux filesystem.
-- **Recommendation:** Provide and document a byte-preserving filesystem for these fixtures on supported hosts without reducing raw-byte coverage.
 - **Fix with:** root-cause
 - **Effort:** M
 
@@ -73,6 +64,15 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** tests/pty.rs
 - **Problem:** A loaded Darwin make test at fix/deslop-flakes (docs/deslop-flakes.md research run, 2026-11-20) timed out waiting for an OSC 133 prompt marker after 216 PTY passes; the rerun failed instead with a process picker Invalid argument (os error 22). Neither failure is tied to a code change and the cause is unproven.
 - **Recommendation:** Record which test and wait timed out, reproduce it alone under the recorded load, and fix the harness or shell cause without lengthening the wait unless the cause is proven to be scheduling latency against a deadline the test chose.
+- **Fix with:** root-cause
+- **Effort:** M
+
+### DSLP-36 · P2 · Semantic bridge effects family fails make verify on macOS with EBADF on /dev/fd
+
+- **Area:** Needs environment · semantic verification
+- **Where:** examples/semantic_bridge/effects.rs (descriptor_resource)
+- **Problem:** On Darwin, make verify exits 2 in the effects family: effects worker exited with exit status: 1: semantic bridge: cannot inspect descriptor 5: Bad file descriptor (os error 9). descriptor_resource accepts only NotFound from /dev/fd/N; macOS returns EBADF for closed descriptors. Treating EBADF as closed then exposes a real mismatch at effects-00010 (Rust sees no descriptors, Lean expects [[3,7],[4,8]]). make verify-mutations fails its effects baseline the same way. Fails identically at base a9b1966.
+- **Recommendation:** Root-cause the descriptor inspection on Darwin (devfs /dev/fd semantics vs Linux /proc-backed /dev/fd), fix descriptor_resource and the effects-00010 mismatch, and rerun make verify and make verify-mutations on macOS.
 - **Fix with:** root-cause
 - **Effort:** M
 
