@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 40
+Next: 41
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -19,15 +19,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** src/input.rs:1061, src/input.rs:1107, src/input.rs:1112
 - **Problem:** On a busy macOS host, make test timed out in replies_between_typed_keys_leave_the_typing_intact and reply_and_report_sequences_are_consumed_whole_at_every_split. Both passed isolated. A full ish library run at base fc62468e repeated the first timeout; it did not repeat the second. The root cause is not established, and intermittent suite failures obscure regressions.
 - **Recommendation:** Reproduce under controlled load, determine whether framing, the test harness, or scheduling causes the sentinel timeout, and fix the cause without weakening the behavior assertion.
-- **Fix with:** root-cause
-- **Effort:** M
-
-### DSLP-31 · P2 · Full macOS test run can fail to locate a transitive crate in doctests
-
-- **Area:** Needs environment · Rust doctests
-- **Where:** crates/fdu-delete/src/lib.rs:563, Makefile:20
-- **Problem:** On a macOS make test run using the configured kache wrapper, the tests passed but the fdu-delete doctest failed with E0463: cannot find crossbeam_utils which rayon depends on. The cause is unproven; the failure prevents full-suite verification.
-- **Recommendation:** Reproduce the rustdoc artifact lookup failure and fix the underlying toolchain or cache interaction without suppressing doctests.
 - **Fix with:** root-cause
 - **Effort:** M
 
@@ -64,6 +55,15 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Where:** tests/pty.rs (native_fs_quick_no_progress_copy_stays_quiet, ~line 1021)
 - **Problem:** The test asserts a quick copy prints no progress, but the progress threshold is wall-clock, so a slow or loaded host shows progress and fails it.
 - **Recommendation:** Drive the quiet decision with a controllable threshold or a copy small enough to be bounded by work, not time.
+- **Fix with:** root-cause
+- **Effort:** S
+
+### DSLP-40 · P3 · epsh executor timeout test fails under load with unwrap on None
+
+- **Area:** Tests
+- **Where:** crates/epsh/tests/conformance/executor.rs:599 (timeout_kills_the_process_group_and_reaps_the_child)
+- **Problem:** Under host load the test failed with unwrap() on None at executor.rs:599, and it stopped make test before the doctest phase (seen during DSLP-31 research).
+- **Recommendation:** Reproduce under CPU burners, find which expected process-group event is missing, and wait on it rather than assuming timing.
 - **Fix with:** root-cause
 - **Effort:** S
 
