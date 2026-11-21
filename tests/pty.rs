@@ -22,6 +22,11 @@ use common::ish_binary;
 // PTY harness
 // ---------------------------------------------------------------------------
 
+/// Bound on the wait for a freshly spawned shell's first prompt. The wait returns at the first
+/// prompt, so the bound only matters when the host delays the process: with 40 shells starting
+/// together under 16 `yes` burners, startup took p99 3.3 s and at most 4.8 s.
+const STARTUP_PROMPT_TIMEOUT_MS: u64 = 30_000;
+
 struct PtyShell {
     terminal: RefCell<PtyTest>,
     terminal_baseline: TerminalBaseline,
@@ -217,12 +222,7 @@ impl PtyShell {
             output_offset: Cell::new(0),
         };
 
-        sh.startup_output = sh.wait_for("$ ", 3000);
-        assert!(
-            sh.startup_output.contains("$ "),
-            "ish did not render its initial prompt within 3s: {:?}",
-            sh.startup_output
-        );
+        sh.startup_output = sh.wait_for("$ ", STARTUP_PROMPT_TIMEOUT_MS);
         sh
     }
 
@@ -5703,6 +5703,12 @@ fn process_picker_tiny_terminal_refuses_acceptance_without_signaling() {
     assert!(out.contains("terminal too small"), "{out}");
     assert!(fixture.0.try_wait().unwrap().is_none());
     assert!(PtyShell::strip_ansi(&sh.run_command("echo usable")).contains("usable"));
+}
+
+#[test]
+fn startup_prompt_wait_covers_scheduling_latency_before_ish_runs() {
+    let sh = PtyShell::spawn_under_sh("sleep 4; exec \"$1\"");
+    assert!(sh.startup_output().contains("$ "), "{:?}", sh.startup_output());
 }
 
 #[test]
