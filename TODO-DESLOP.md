@@ -12,12 +12,3 @@ A later full test run reported no failed tests in 169.24s, but its wrapper faile
 Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-request workflows already invoke the required make targets. A quiet performance host was unavailable (`perf-gate-ready` exit 75).
 
 ## Tickets
-
-### DSLP-34 · P2 · fdu PTY snapshots can capture a partially written frame
-
-- **Area:** Needs environment · PTY tests
-- **Where:** crates/fdu-tui/src/lib.rs:210, tests/fdu_support.rs, laputa-ptytest screen model
-- **Problem:** fdu writes each frame as a cell diff with no boundary marker, and ptytest's screen shows whatever bytes have arrived. Under load a torn frame can stay quiet for longer than the 25 ms settle window. The ready wait is now tear-proof (docs/deslop-flakes.md, DSLP-34), but any other wait can still settle on a partial frame: help_screen_opens_and_closes failed 3/60 loaded runs that way.
-- **Recommendation:** Have fdu bracket each frame in synchronized output (CSI ? 2026 h / l), and have laputa-ptytest withhold screen updates from predicates and snapshots until the update ends. Then rerun the loaded soak in docs/deslop-flakes.md.
-- **Fix with:** root-cause
-- **Effort:** M
