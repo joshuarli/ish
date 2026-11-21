@@ -406,10 +406,11 @@ impl PtyShell {
     /// Stop the shell now and resume it after `stall_ms`, so input sent in between is handled
     /// late, as under host load. The stall is test-chosen; waits after it must outlast it.
     fn stall_shell(&self, pid: i32, stall_ms: u64) {
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+        let pid = rustix::process::Pid::from_raw(pid).expect("shell pid");
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("stop shell");
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(stall_ms));
-            unsafe { libc::kill(pid, libc::SIGCONT) };
+            rustix::process::kill_process(pid, rustix::process::Signal::CONT).expect("resume shell");
         });
     }
 
