@@ -22,15 +22,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** root-cause
 - **Effort:** M
 
-### DSLP-37 · P2 · PTY waits on external commands use fixed 3-5 s bounds that fail under suite load
-
-- **Area:** Needs environment · PTY tests
-- **Where:** tests/pty.rs (run_command, wait_for, wait_for_prompt_after_line_advance)
-- **Problem:** Many PTY waits bound external commands and picker prompts at 3-5 s. Under loaded full-suite runs they time out the same way DSLP-35's startup wait did (shell scheduling latency: 40 concurrent shells measured p99 3.3 s, max 4.8 s to first prompt). Seen on pty-child-ready, input-ready, /bin/sh -c 'exit 0' 0<&-, ./bin/exec, selected], and native_copy_uses_current_store_and_prefix_tmpdir_values (docs/deslop-flakes.md, DSLP-35).
-- **Recommendation:** Use one shared generous bound for condition waits (they return as soon as the condition holds, so success costs nothing), citing the DSLP-35 startup measurement, and keep short bounds only where a test asserts an absence.
-- **Fix with:** root-cause
-- **Effort:** S
-
 ### DSLP-38 · P2 · Ctrl-Z native copy PTY test fails when the prompt shows a long Git branch
 
 - **Area:** PTY tests

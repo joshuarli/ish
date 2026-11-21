@@ -27,6 +27,11 @@ use common::ish_binary;
 /// together under 16 `yes` burners, startup took p99 3.3 s and at most 4.8 s.
 const STARTUP_PROMPT_TIMEOUT_MS: u64 = 30_000;
 
+/// Bound for waits whose condition a running shell satisfies. The wait returns at the condition,
+/// so the bound only matters when the host delays the shell: with 40 shells starting together
+/// under 16 `yes` burners, startup took p99 3.3 s and at most 4.8 s.
+const CONDITION_TIMEOUT_MS: u64 = 30_000;
+
 /// Delay applied to the shell before it handles completion input; the waits that follow must outlast it.
 const COMPLETION_STALL_MS: u64 = 400;
 
@@ -443,8 +448,9 @@ impl PtyShell {
         screen
     }
 
-    /// Wait until output contains `marker`, up to `timeout_ms`.
-    fn wait_for(&self, marker: &str, timeout_ms: u64) -> String {
+    /// Wait until output contains `marker`, up to the shared condition bound.
+    fn wait_for(&self, marker: &str, minimum_timeout_ms: u64) -> String {
+        let timeout_ms = minimum_timeout_ms.max(CONDITION_TIMEOUT_MS);
         let mut accumulated = String::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
@@ -473,7 +479,8 @@ impl PtyShell {
         panic!("timed out after {timeout_ms}ms waiting for {marker:?}; output: {accumulated:?}");
     }
 
-    fn wait_for_prompt_after_line_advance(&self, timeout_ms: u64) -> String {
+    fn wait_for_prompt_after_line_advance(&self, minimum_timeout_ms: u64) -> String {
+        let timeout_ms = minimum_timeout_ms.max(CONDITION_TIMEOUT_MS);
         let mut accumulated = String::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
@@ -504,8 +511,8 @@ impl PtyShell {
     fn run_command(&self, cmd: &str) -> String {
         self.type_str(cmd);
         self.enter();
-        let mut accumulated = self.wait_for_line_advance(1000);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
+        let mut accumulated = self.wait_for_line_advance(CONDITION_TIMEOUT_MS);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(CONDITION_TIMEOUT_MS);
 
         loop {
             let remaining = deadline
