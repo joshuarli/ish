@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use ptytest::{CommandSpec, ExitStatus, Key, PtyTest, Scenario, ScreenSnapshot, Size, TerminalBaseline, TestEnv};
+use ptytest::{CommandSpec, Deadline, ExitStatus, Key, PtyTest, Scenario, ScreenSnapshot, Size, TerminalBaseline, TestEnv};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -106,10 +106,7 @@ impl Session {
 
     pub fn wait(&mut self, description: &str, predicate: impl Fn(&ScreenSnapshot) -> bool) -> ScreenSnapshot {
         let deadline = self.terminal.deadline(self.step);
-        self.terminal.wait_for_screen(deadline, description, predicate).unwrap();
-        let deadline = self.terminal.deadline(self.step);
-        assert!(self.terminal.wait_for_quiescence(deadline, Duration::from_millis(25)).unwrap());
-        self.terminal.screen()
+        wait_settled(&mut self.terminal, deadline, description, predicate)
     }
 
     pub fn wait_for(&mut self, text: &str) -> ScreenSnapshot {
@@ -126,6 +123,13 @@ impl Session {
             let status = status.trim_start();
             status.split_whitespace().next().is_some_and(|count| count.parse::<usize>().is_ok())
                 && status.contains(" entries ")
+        })
+    }
+
+    pub fn wait_layout_fixture_ready(&mut self) -> ScreenSnapshot {
+        let ready_status = format!("{LAYOUT_FIXTURE_ENTRIES} entries ");
+        self.wait("layout fixture scan to finish", |screen| {
+            screen.lines().pop().is_some_and(|status| status.trim_start().starts_with(&ready_status))
         })
     }
 
@@ -166,6 +170,24 @@ impl Session {
     }
 }
 
+pub fn wait_settled(
+    terminal: &mut PtyTest,
+    deadline: Deadline,
+    description: &str,
+    predicate: impl Fn(&ScreenSnapshot) -> bool,
+) -> ScreenSnapshot {
+    loop {
+        terminal.wait_for_screen(deadline, description, &predicate).unwrap();
+        assert!(terminal.wait_for_quiescence(deadline, SETTLE_QUIET).unwrap(), "{description} did not settle");
+        let screen = terminal.screen();
+        if predicate(&screen) {
+            return screen;
+        }
+    }
+}
+
+const SETTLE_QUIET: Duration = Duration::from_millis(25);
+
 pub trait ScreenText {
     fn lines(&self) -> Vec<String>;
     fn shows(&self, text: &str) -> bool;
@@ -200,7 +222,7 @@ pub fn row_containing(screen: &ScreenSnapshot, needle: &str) -> String {
 
 pub const LAYOUT_FIXTURE: &str = ".work/tmp/fdu-layout-fixture";
 const LAYOUT_FIXTURE_MARKER: &str = ".work/tmp/fdu-layout-fixture.ready";
-const LAYOUT_FIXTURE_DESCRIPTION: &str = "seed=0 entries=192238";
+const LAYOUT_FIXTURE_ENTRIES: usize = 192238;
 
 pub fn layout_fixture() -> &'static Path {
     static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -214,7 +236,8 @@ pub fn layout_fixture() -> &'static Path {
             Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
             Err(error) => panic!("read the fixture marker: {error}"),
         };
-        if marker.trim() == LAYOUT_FIXTURE_DESCRIPTION && fixture.is_dir() {
+        let description = format!("seed=0 entries={LAYOUT_FIXTURE_ENTRIES}");
+        if marker.trim() == description && fixture.is_dir() {
             return;
         }
         if marker_path.exists() {
@@ -234,9 +257,9 @@ pub fn layout_fixture() -> &'static Path {
             .expect("python3 generates the layout fixture");
         assert!(output.status.success(), "fixture generation failed: {}", String::from_utf8_lossy(&output.stderr));
         let report = String::from_utf8_lossy(&output.stdout);
-        assert!(report.contains("entries=192238"), "unexpected fixture shape: {report}");
+        assert!(report.contains(&format!("entries={LAYOUT_FIXTURE_ENTRIES}")), "unexpected fixture shape: {report}");
         fs::rename(&partial, &fixture).expect("publish the layout fixture");
-        fs::write(&marker_path, LAYOUT_FIXTURE_DESCRIPTION).expect("record the fixture marker");
+        fs::write(&marker_path, &description).expect("record the fixture marker");
     });
     Path::new(LAYOUT_FIXTURE)
 }
