@@ -14,17 +14,28 @@ use std::fmt;
 pub(crate) type BridgeResult<T> = Result<T, BridgeError>;
 
 #[derive(Debug)]
-pub(crate) struct BridgeError(String);
+pub(crate) struct BridgeError {
+    message: String,
+    raw_filenames_unsupported: bool,
+}
 
 impl BridgeError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self { message: message.into(), raw_filenames_unsupported: false }
+    }
+
+    pub(crate) fn raw_filenames_unsupported(message: impl Into<String>) -> Self {
+        Self { message: message.into(), raw_filenames_unsupported: true }
+    }
+
+    pub(crate) fn is_raw_filenames_unsupported(&self) -> bool {
+        self.raw_filenames_unsupported
     }
 }
 
 impl fmt::Display for BridgeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
