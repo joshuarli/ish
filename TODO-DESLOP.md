@@ -49,15 +49,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** root-cause
 - **Effort:** S
 
-### DSLP-40 · P3 · epsh executor timeout test fails under load with unwrap on None
-
-- **Area:** Tests
-- **Where:** crates/epsh/tests/conformance/executor.rs:599 (timeout_kills_the_process_group_and_reaps_the_child)
-- **Problem:** Under host load the test failed with unwrap() on None at executor.rs:599, and it stopped make test before the doctest phase (seen during DSLP-31 research).
-- **Recommendation:** Reproduce under CPU burners, find which expected process-group event is missing, and wait on it rather than assuming timing.
-- **Fix with:** root-cause
-- **Effort:** S
-
 ### DSLP-41 · P3 · Six denv tests time out against their 2 s evaluation deadline under suite load
 
 - **Area:** Tests · denv
