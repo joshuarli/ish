@@ -79,7 +79,7 @@ impl Backend for Native {
             if error == rustix::io::Errno::NOSYS { io::Error::new(io::ErrorKind::Unsupported, "pk requires Linux pidfd support (kernel 5.3 or newer)") }
             else { error.into() }
         })?;
-        if self.metadata(record.pid)? != *record { return Err(io::Error::other("process changed while binding pidfd")); }
+        if self.metadata(record.pid)? != *record { return Err(io::Error::new(io::ErrorKind::NotFound, "process changed while binding pidfd")); }
         Ok(fd)
     }
     fn listens(&self, pid: Pid, port: u16) -> io::Result<bool> {

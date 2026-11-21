@@ -95,6 +95,20 @@ fn listener(info: &SocketInfo, port: u16) -> Option<(u64, u64)> {
     Some((info.socket, tcp.generation))
 }
 
+/// The record was read once already, so a second read that fails or differs means the process is
+/// exiting or executing a new image. `gone` classifies that as a vanished process, which the
+/// snapshot skips; other bind failures stay fatal.
+fn confirm(record: &Metadata, current: io::Result<Metadata>) -> io::Result<Pid> {
+    match current {
+        Ok(current) if current == *record => Ok(record.pid),
+        Ok(_) => Err(io::Error::new(io::ErrorKind::NotFound, "process changed during snapshot")),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EINVAL | libc::EIO | libc::ENOENT)) => {
+            Err(io::Error::new(io::ErrorKind::NotFound, format!("process became unreadable during snapshot: {error}")))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl Backend for Native {
     type Handle = Pid;
     fn list(&self) -> io::Result<Vec<Pid>> {
@@ -133,10 +147,7 @@ impl Backend for Native {
         Ok(Metadata { pid, parent: first.pbi_ppid as i32, real_uid: first.pbi_ruid, effective_uid: first.pbi_uid,
             started: (first.pbi_start_tvsec, first.pbi_start_tvusec), executable, argv })
     }
-    fn bind(&self, record: &Metadata) -> io::Result<Pid> {
-        if self.metadata(record.pid)? != *record { return Err(io::Error::other("process changed during snapshot")); }
-        Ok(record.pid)
-    }
+    fn bind(&self, record: &Metadata) -> io::Result<Pid> { confirm(record, self.metadata(record.pid)) }
     fn listens(&self, pid: Pid, port: u16) -> io::Result<bool> {
         for _ in 0..4 {
             // SAFETY: null output asks libproc for the required FD buffer size.
@@ -191,5 +202,31 @@ mod tests {
     #[test]
     fn missing_process_socket_lookup_is_an_error() {
         assert!(Native.listens(Pid::new(i32::MAX).unwrap(), 8080).is_err());
+    }
+    struct Sleeper(std::process::Child);
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    #[test]
+    fn bind_skips_a_process_whose_identity_changed_since_listing() {
+        let child = Sleeper(std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap());
+        let mut record = Native.metadata(Pid::new(child.0.id() as i32).unwrap()).unwrap();
+        record.started.1 += 1;
+        let error = Native.bind(&record).unwrap_err();
+        assert!(crate::pk::gone(&error), "{error:?}");
+    }
+    #[test]
+    fn bind_skips_a_process_that_became_unreadable_since_listing() {
+        let record = Native.metadata(Pid::new(std::process::id() as i32).unwrap()).unwrap();
+        for errno in [libc::EIO, libc::EINVAL] {
+            let error = confirm(&record, Err(io::Error::from_raw_os_error(errno))).unwrap_err();
+            assert!(crate::pk::gone(&error), "errno {errno}: {error:?}");
+        }
+        let exhausted = confirm(&record, Err(io::Error::from_raw_os_error(libc::EMFILE))).unwrap_err();
+        assert!(!crate::pk::gone(&exhausted), "{exhausted:?}");
+        assert_eq!(confirm(&record, Ok(record.clone())).unwrap(), record.pid);
     }
 }
