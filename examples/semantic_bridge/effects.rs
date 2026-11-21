@@ -12,6 +12,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
+use std::mem::ManuallyDrop;
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -871,10 +873,16 @@ fn descriptor_resource(
     fd: u64,
     identities: &FxHashMap<u64, (u64, u64)>,
 ) -> BridgeResult<Option<u64>> {
-    let path = PathBuf::from(format!("/dev/fd/{fd}"));
-    let metadata = match fs::metadata(path) {
+    let Ok(raw) = i32::try_from(fd) else {
+        return Ok(None);
+    };
+    // SAFETY: ManuallyDrop never closes the descriptor, which the shell under test still owns.
+    let file = ManuallyDrop::new(unsafe { fs::File::from_raw_fd(raw) });
+    let metadata = match file.metadata() {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::BADF.raw_os_error()) => {
+            return Ok(None);
+        }
         Err(error) => {
             return Err(BridgeError::new(format!("cannot inspect descriptor {fd}: {error}")));
         }
