@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 41
+Next: 43
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -12,15 +12,6 @@ A later full test run reported no failed tests in 169.24s, but its wrapper faile
 Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-request workflows already invoke the required make targets. A quiet performance host was unavailable (`perf-gate-ready` exit 75).
 
 ## Tickets
-
-### DSLP-27 · P2 · Terminal decoder framing tests time out during the full library suite
-
-- **Area:** Needs environment · terminal input tests
-- **Where:** src/input.rs:1061, src/input.rs:1107, src/input.rs:1112
-- **Problem:** On a busy macOS host, make test timed out in replies_between_typed_keys_leave_the_typing_intact and reply_and_report_sequences_are_consumed_whole_at_every_split. Both passed isolated. A full ish library run at base fc62468e repeated the first timeout; it did not repeat the second. The root cause is not established, and intermittent suite failures obscure regressions.
-- **Recommendation:** Reproduce under controlled load, determine whether framing, the test harness, or scheduling causes the sentinel timeout, and fix the cause without weakening the behavior assertion.
-- **Fix with:** root-cause
-- **Effort:** M
 
 ### DSLP-34 · P2 · fdu PTY snapshots can capture a partially written frame
 
@@ -65,5 +56,23 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Problem:** Under host load the test failed with unwrap() on None at executor.rs:599, and it stopped make test before the doctest phase (seen during DSLP-31 research).
 - **Recommendation:** Reproduce under CPU burners, find which expected process-group event is missing, and wait on it rather than assuming timing.
 - **Fix with:** root-cause
+- **Effort:** S
+
+### DSLP-41 · P3 · Six denv tests time out against their 2 s evaluation deadline under suite load
+
+- **Area:** Tests · denv
+- **Where:** src/denv.rs (retired_helpers_invalidate_masked_and_forked_candidates, dotenv_if_exists_loads_approved_values_during_evaluation, evaluators_preserve_helper_rejection_with_a_64_descriptor_limit, bash_snapshot_writers_survive_exec_when_low_fds_are_free, bash_requires_a_completed_candidate_before_applying_exports, retired_helper_flood_respects_the_evaluation_deadline)
+- **Problem:** In most loaded full-suite runs (load average 30-50) these fail with '.envrc evaluation timed out after 2s': the same Bash-startup-versus-test-chosen-deadline class as DSLP-33 (docs/deslop-flakes.md).
+- **Recommendation:** Apply the DSLP-33 treatment to each: a deadline sized for Bash startup under load, proven deterministically with a delayed-Bash PATH wrapper, without weakening the bound each test asserts.
+- **Fix with:** root-cause
+- **Effort:** S
+
+### DSLP-42 · P4 · decode_parts reports a dead reader thread as a stall
+
+- **Area:** Tests · input
+- **Where:** src/input.rs (decode_parts test helper)
+- **Problem:** The helper panics with the 'must reach the sentinel instead of stalling' message on both Timeout and Disconnected, so a reader-thread panic looks like a decoder stall.
+- **Recommendation:** Match RecvTimeoutError::Disconnected separately and report the reader's panic.
+- **Fix with:** error-model
 - **Effort:** S
 
