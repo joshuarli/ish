@@ -1,5 +1,5 @@
 Prefix: ISH
-Next: 92
+Next: 93
 
 ## Accepted owner decisions
 
@@ -122,3 +122,12 @@ impact and likelihood, and its RFC awaits an owner decision.
 
 - **Status:** Dropped.
 - **Reason:** Parked candidate exists but timing proof requires quiet-host, interleaved baseline/candidate measurement (weeks-scale effort). Not worth pursuing now.
+
+### ISH-92 · P3 · Quick native copy test asserts no progress output, which a slow host breaks (was DSLP-39)
+
+- **Area:** PTY tests
+- **Where:** tests/pty.rs (native_fs_quick_no_progress_copy_stays_quiet, ~line 1021)
+- **Problem:** The test asserts a quick copy prints no progress, but the progress threshold is wall-clock, so a slow or loaded host shows progress and fails it.
+- **Recommendation:** Drive the quiet decision with a controllable threshold or a copy small enough to be bounded by work, not time.
+- **Fix with:** root-cause
+- **Effort:** S

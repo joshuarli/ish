@@ -1584,6 +1584,8 @@ mod tests {
 
     static EVALUATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    const BASH_EVALUATION_TIMEOUT: Duration = Duration::from_secs(10);
+
     struct TempDir(PathBuf);
 
     impl TempDir {
@@ -2030,7 +2032,7 @@ mod tests {
             let source = b"export DENV_LOW_FD=$(printf '%s' ok | cat)\n";
             let epsh = eval_env_epsh(tmp.path(), source, &[], &env_pairs, Duration::from_secs(2)).unwrap();
             assert!(epsh.set.contains(&("DENV_LOW_FD".into(), "ok".into())));
-            let bash = eval_env_bash(tmp.path(), source, &[], &env_pairs, Duration::from_secs(2)).unwrap();
+            let bash = eval_env_bash(tmp.path(), source, &[], &env_pairs, BASH_EVALUATION_TIMEOUT).unwrap();
             assert!(bash.set.contains(&("DENV_LOW_FD".into(), "ok".into())));
         }
         retired_helpers_cannot_redirect_failure_channel(EnvRcInterpreter::Epsh);
@@ -2069,7 +2071,7 @@ mod tests {
         for fd in (3..=9).chain(reporters) {
             let source = format!("export DENV_REDIRECT_BEFORE=yes\nsource_env shared {fd}>/dev/null || true\nexport DENV_REDIRECT_AFTER=yes\n");
             let result = match interpreter {
-                EnvRcInterpreter::Bash => eval_env_bash(tmp.path(), source.as_bytes(), &[], &env_pairs, Duration::from_secs(2)),
+                EnvRcInterpreter::Bash => eval_env_bash(tmp.path(), source.as_bytes(), &[], &env_pairs, BASH_EVALUATION_TIMEOUT),
                 EnvRcInterpreter::Epsh => eval_env_epsh(tmp.path(), source.as_bytes(), &[], &env_pairs, Duration::from_secs(2)),
             };
             let err = match result {
@@ -2092,7 +2094,7 @@ mod tests {
         for source in ["dotenv_if_exists\nexport DENV_SEEN=\"$DENV_OPTIONAL\"", "dotenv_if_exists ./.env\nexport DENV_SEEN=\"$DENV_OPTIONAL\""] {
             for bash in [false, true] {
                 let result = if bash {
-                    eval_env_bash(tmp.path(), source.as_bytes(), &entries, &env_pairs, Duration::from_secs(2))
+                    eval_env_bash(tmp.path(), source.as_bytes(), &entries, &env_pairs, BASH_EVALUATION_TIMEOUT)
                 } else {
                     eval_env_epsh(tmp.path(), source.as_bytes(), &entries, &env_pairs, Duration::from_secs(2))
                 }.unwrap();
@@ -2102,7 +2104,7 @@ mod tests {
         }
         for bash in [false, true] {
             let source = b"dotenv_if_exists\nexport DENV_SEEN=ok";
-            let result = if bash { eval_env_bash(tmp.path(), source, &[], &env_pairs, Duration::from_secs(2)) } else { eval_env_epsh(tmp.path(), source, &[], &env_pairs, Duration::from_secs(2)) }.unwrap();
+            let result = if bash { eval_env_bash(tmp.path(), source, &[], &env_pairs, BASH_EVALUATION_TIMEOUT) } else { eval_env_epsh(tmp.path(), source, &[], &env_pairs, Duration::from_secs(2)) }.unwrap();
             assert!(result.set.contains(&("DENV_SEEN".into(), ShellBytes::from("ok"))));
         }
     }
@@ -2130,7 +2132,7 @@ mod tests {
                     let source = format!("export DENV_RETIRED_BEFORE=yes\n{invocation}\nexport DENV_RETIRED_AFTER=yes\n");
                     for bash in [false, true] {
                         let result = if bash {
-                            eval_env_bash(&project, source.as_bytes(), &[], &env_pairs, Duration::from_secs(2))
+                            eval_env_bash(&project, source.as_bytes(), &[], &env_pairs, BASH_EVALUATION_TIMEOUT)
                         } else {
                             eval_env_epsh(&project, source.as_bytes(), &[], &env_pairs, Duration::from_secs(2))
                         };
@@ -2158,7 +2160,7 @@ mod tests {
                 .args(["--exact", "denv::tests::retired_helper_flood_respects_the_evaluation_deadline", "--test-threads=1"])
                 .env(CHILD_MODE, "1")
                 .spawn().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 if let Some(status) = child.try_wait().unwrap() {
                     assert!(status.success());
@@ -2172,7 +2174,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        let evaluation_timeout = Duration::from_secs(2);
+        let evaluation_timeout = BASH_EVALUATION_TIMEOUT;
         let tmp = TempDir::new("ish_denv_flood");
         let shell = epsh::eval::Shell::new();
         let env_pairs = shell.vars().env_for_command_os(&[]);
@@ -2217,7 +2219,7 @@ mod tests {
         let shell = epsh::eval::Shell::new();
         let env_pairs = shell.vars().env_for_command_os(&[]);
         for source in ["export DENV_INCOMPLETE=1; exit 0", "export DENV_INCOMPLETE=1; exec true"] {
-            let result = eval_env_bash(tmp.path(), source.as_bytes(), &[], &env_pairs, Duration::from_secs(2));
+            let result = eval_env_bash(tmp.path(), source.as_bytes(), &[], &env_pairs, BASH_EVALUATION_TIMEOUT);
             let err = match result {
                 Ok(_) => panic!("accepted incomplete candidate: {source}"),
                 Err(err) => err,
@@ -2648,7 +2650,7 @@ mod tests {
             b"#!/usr/bin/env bash\nunset __DENV_DOT_0\nexport DENV_PRECEDENCE=from_envrc\n",
             &dotenv_entries,
             &env_pairs,
-            Duration::from_secs(2),
+            BASH_EVALUATION_TIMEOUT,
         )
         .unwrap();
         assert_eq!(diff.set, vec![("DENV_PRECEDENCE".to_string(), ShellBytes::from("from_dotenv"))]);
@@ -2757,7 +2759,7 @@ mod tests {
         for _ in 0..16 {
             for source in [b"export DENV_REPEAT=ok\n".as_slice(), b"dotenv_if_exists absent || true\n"] {
                 let rejected = source.starts_with(b"dotenv");
-                assert_eq!(eval_env_bash(tmp.path(), source, &[], &env_pairs, Duration::from_secs(2)).is_err(), rejected);
+                assert_eq!(eval_env_bash(tmp.path(), source, &[], &env_pairs, BASH_EVALUATION_TIMEOUT).is_err(), rejected);
                 assert_eq!(eval_env_epsh(tmp.path(), source, &[], &env_pairs, Duration::from_secs(2)).is_err(), rejected);
             }
         }

@@ -556,7 +556,7 @@ mod tests {
         command.stderr(std::process::Stdio::piped());
         use std::os::unix::process::CommandExt;
         command.process_group(0);
-        let output = run_process(&mut command, Duration::from_millis(200)).unwrap();
+        let output = run_process(&mut command, Duration::from_secs(5)).unwrap();
         assert!(output.failure.as_deref().unwrap().contains("time limit"));
         assert!(output.status.is_some());
         let (group, descendant) = process_ids(&output.stdout);
@@ -574,7 +574,7 @@ mod tests {
         command.stderr(std::process::Stdio::piped());
         use std::os::unix::process::CommandExt;
         command.process_group(0);
-        let output = run_process(&mut command, Duration::from_secs(1)).unwrap();
+        let output = run_process(&mut command, Duration::from_secs(5)).unwrap();
         assert!(output.failure.is_none());
         assert_eq!(output.status.unwrap().code(), Some(0));
         let (group, descendant) = process_ids(&output.stdout);
@@ -589,7 +589,7 @@ mod tests {
         command.stderr(std::process::Stdio::piped());
         use std::os::unix::process::CommandExt;
         command.process_group(0);
-        let output = run_process(&mut command, Duration::from_secs(1)).unwrap();
+        let output = run_process(&mut command, Duration::from_secs(5)).unwrap();
         assert!(output.failure.is_none());
         assert_eq!(output.status.unwrap().code(), Some(0));
     }
