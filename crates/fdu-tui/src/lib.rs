@@ -208,7 +208,7 @@ impl TerminalSession {
             *self.age_reference.get_or_insert_with(SystemTime::now)
         };
         render(&mut next, view, &mut self.scroll, now);
-        self.terminal.write(&next.diff(&self.screen))?;
+        self.terminal.write_frame(&next.diff(&self.screen))?;
         self.screen = next;
         Ok(())
     }
