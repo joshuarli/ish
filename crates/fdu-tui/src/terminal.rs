@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 const ESCAPE_TIMEOUT: Duration = Duration::from_millis(30);
 const ENTER_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H";
 const LEAVE_SCREEN: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1049l";
+const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
+const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
 
 static ORIGINAL_TERMIOS: Mutex<Option<Termios>> = Mutex::new(None);
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -57,6 +59,13 @@ impl Terminal {
         let mut stdout = io::stdout().lock();
         stdout.write_all(bytes)?;
         stdout.flush()
+    }
+
+    pub(crate) fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        if frame.is_empty() {
+            return self.write(frame);
+        }
+        self.write(&synchronized_update(frame))
     }
 
     pub(crate) fn restore(&mut self) -> io::Result<()> {
@@ -395,6 +404,14 @@ fn navigation(byte: u8) -> Option<Code> {
     }
 }
 
+fn synchronized_update(frame: &[u8]) -> Vec<u8> {
+    let mut update = Vec::with_capacity(BEGIN_SYNCHRONIZED_UPDATE.len() + frame.len() + END_SYNCHRONIZED_UPDATE.len());
+    update.extend_from_slice(BEGIN_SYNCHRONIZED_UPDATE);
+    update.extend_from_slice(frame);
+    update.extend_from_slice(END_SYNCHRONIZED_UPDATE);
+    update
+}
+
 fn map_key(key: Key, text_input: bool) -> Option<Intent> {
     if text_input {
         return match key.code {
@@ -451,6 +468,11 @@ mod tests {
             self.flush_attempted = true;
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed"))
         }
+    }
+
+    #[test]
+    fn frames_are_written_as_one_synchronized_update() {
+        assert_eq!(synchronized_update(b"\x1b[1;1Hx"), b"\x1b[?2026h\x1b[1;1Hx\x1b[?2026l");
     }
 
     #[test]

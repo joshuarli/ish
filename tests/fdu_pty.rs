@@ -89,6 +89,33 @@ fn delete_confirmation_shows_root_and_entry_counts_and_leaves_unconfirmed_marks(
 }
 
 #[test]
+fn every_frame_is_one_synchronized_update() -> io::Result<()> {
+    let (_temp, root) = TempDir::standard_tree()?;
+    let mut session = Session::start("synchronized-frames", &root, &[], 100, 24);
+    session.wait_ready();
+    session.text("?");
+    session.wait_for("Tab switches");
+    let raw = session.terminal.raw_output();
+    let mut markers = Vec::new();
+    for index in 0..raw.len() {
+        if raw[index..].starts_with(b"\x1b[?2026h") {
+            markers.push(true);
+        } else if raw[index..].starts_with(b"\x1b[?2026l") {
+            markers.push(false);
+        }
+    }
+    assert!(markers.len() >= 4, "expected at least two synchronized frames, saw {markers:?}");
+    assert!(
+        markers.iter().enumerate().all(|(index, begins)| *begins == (index % 2 == 0)),
+        "synchronized update markers do not alternate: {markers:?}"
+    );
+    session.key(Key::Escape);
+    session.wait_until_absent("Tab switches");
+    session.quit();
+    Ok(())
+}
+
+#[test]
 fn help_screen_opens_and_closes() -> io::Result<()> {
     let (_temp, root) = TempDir::standard_tree()?;
     let mut session = Session::start("help-screen", &root, &[], 100, 24);
