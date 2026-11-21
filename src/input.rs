@@ -1078,7 +1078,7 @@ mod tests {
             stdin_write
         });
         let (done, observed) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             let mut reader =
                 InputReader::with_fds(stdin_read.as_raw_fd(), signal_read.as_raw_fd());
             let mut seen = Vec::new();
@@ -1102,11 +1102,56 @@ mod tests {
             let _ = done.send(seen);
             drop(signal_write);
         });
-        let seen = observed
-            .recv_timeout(Duration::from_secs(20))
-            .expect("decoder must reach the sentinel instead of stalling");
+        let seen = await_decoded(observed, reader, Duration::from_secs(20));
         let _ = writer.join();
         seen
+    }
+
+    fn await_decoded(
+        observed: std::sync::mpsc::Receiver<Vec<Seen>>,
+        reader: std::thread::JoinHandle<()>,
+        timeout: Duration,
+    ) -> Vec<Seen> {
+        match observed.recv_timeout(timeout) {
+            Ok(seen) => seen,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("decoder must reach the sentinel instead of stalling")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let reason = reader
+                    .join()
+                    .err()
+                    .map(panic_text)
+                    .unwrap_or_else(|| "reader exited without a result".to_owned());
+                panic!("decoder reader stopped before the sentinel: {reason}")
+            }
+        }
+    }
+
+    fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(text) = payload.downcast_ref::<&str>() {
+            (*text).to_owned()
+        } else if let Some(text) = payload.downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "reader panicked".to_owned()
+        }
+    }
+
+    #[test]
+    fn a_dead_reader_is_reported_as_a_panic_instead_of_a_stall() {
+        let (done, observed) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            drop(done);
+            panic!("reader thread failed");
+        });
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            await_decoded(observed, reader, Duration::from_secs(1))
+        }))
+        .expect_err("a dead reader must not report decoded events");
+        let message = panic_text(failure);
+        assert!(message.contains("reader thread failed"), "{message}");
+        assert!(!message.contains("stalling"), "{message}");
     }
 
     fn assert_framed_at_every_boundary(name: &str, sequence: &[u8], expected: fn() -> Vec<Seen>) {
