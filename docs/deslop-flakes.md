@@ -143,3 +143,39 @@ The first byte and the prompt coincide, so startup is not blocked in ish; the pr
 **Fix.** `STARTUP_PROMPT_TIMEOUT_MS` is 30 s, six times the measured maximum. The wait returns at the first prompt, so passing runs are not slower. `startup_prompt_wait_covers_scheduling_latency_before_ish_runs` starts ish behind a 4 s sleep; it failed with the ticket's message at 3 s and passes at 30 s. Not re-measured under load after the change: a natural failure rate of about 3 in 8 suite runs makes eight runs too few to resolve.
 
 **Other suite failures under load.** The same sixteen suite runs failed other tests on waits of 3 to 5 s for an external command or a first prompt (`pty-child-ready`, `input-ready`, `/bin/sh -c 'exit 0' 0<&-`, `./bin/exec`, `selected]`); they share the cause above and were not changed. `native_fs_ctrl_z_is_ignored_during_copy_and_external_job_control_still_works` timed out after 15 s in all 16 suite runs and in an isolated run on this host, so it is not load-dependent here. `native_fs_quick_no_progress_copy_stays_quiet` asserts that a quick copy prints no progress, which a slow host breaks. Neither is fixed.
+||||||| parent of ceca05042 (docs(flakes): record the DSLP-31 doctest E0463 investigation)
+
+## DSLP-31
+
+Darwin arm64, rustc and cargo nightly-2026-11-09, kache 2.0.0-rc.2 via `~/.cargo/config.toml` (`build.rustc-wrapper = "kache"`), host load average about 49. Every command used `TMPDIR="$PWD/.work/tmp" CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR="$PWD/.work/tmp/target"`.
+
+**Not reproduced by running the suite.** Two cold targets (`rm -rf` of the target dir, then `cargo test -p fdu-delete --doc`, with kache hits for the registry crates) passed, and `cargo test --doc` over the default members passed on the warm target. `make test` on a cold target was killed by SIGTERM and SIGKILL mid-compile (cause not established), and a retry stopped at an unrelated failure, `conformance::executor::tests::timeout_kills_the_process_group_and_reaps_the_child` (`crates/epsh/tests/conformance/executor.rs:599`, `unwrap()` on `None`), before any doctest ran. Cargo stops at the first failing test binary, so doctests run only after every test passes, as the ticket describes.
+
+**Reproduced by mutating the target during the run.** The failure text and position match the ticket exactly. A `RUSTDOC` wrapper delays the doctest phase, so a second process can act after Cargo's build:
+
+```bash
+cat > .work/tmp/bin/slow-rustdoc <<'SH'
+#!/bin/sh
+sleep "${SLOW:-30}"
+exec "$(rustup which rustdoc)" "$@"
+SH
+chmod +x .work/tmp/bin/slow-rustdoc
+cargo test -p fdu-delete --doc >/dev/null   # warm the target
+(RUSTDOC=$PWD/.work/tmp/bin/slow-rustdoc SLOW=30 cargo test -p fdu-delete --doc > .work/tmp/out.log 2>&1) &
+sleep 15; cargo clean -p crossbeam-utils; wait; rg -A3 E0463 .work/tmp/out.log
+```
+
+Result: `error[E0463]: can't find crate for 'crossbeam_utils' which 'rayon' depends on --> crates/fdu-delete/src/lib.rs:563:26`, `doctest failed`, exit 1. A second run, with `cargo build -p fdu-delete` instead of the clean, found nothing to do.
+
+**Cause (established for the failure; the trigger in the incident is not).**
+
+- Cargo builds, drops its build lock, runs the test binaries, and only then runs rustdoc for each library. `cargo build -p fdu-delete` run 8 s into a delayed doctest returned in 0.18 s and was not blocked, so concurrent Cargo commands share the target while a test run is still using it.
+- Rustdoc runs even for a crate with no doctests. `crates/fdu-delete/src/lib.rs` has none (`running 0 tests`), but the invocation still loads `rayon`'s metadata, and rustc then needs `crossbeam_utils`, `crossbeam_epoch`, `crossbeam_deque` and `rayon_core` from the `-L dependency=` directories (`target/debug/build/<crate>/<hash>/out/`). Only `fdu-delete` among the default members depends on `rayon`, so it is the only doctest that reads those files.
+- Cargo deletes a unit's previous outputs before it starts the compiler. With `RUSTC_WRAPPER` set to a script that lists the rlib before `exec kache`, the rlib was already gone (`No such file or directory`), so the artifact is absent for the whole compile or kache restore, not just a swap. This is Cargo behavior, not kache's.
+- With a loop rerunning the exact rustdoc command from `cargo test -p fdu-delete --doc -v` (`.work/tmp/rustdoc-loop.sh`), ten forced rebuilds of the `crossbeam-utils` chain (`rm -rf` of its `fingerprint` directory, then `cargo build -p fdu-delete`, each about 50 s under this load) produced 1634 failures in 2944 runs, all E0463 naming `crossbeam_utils`, `crossbeam_epoch`, `crossbeam_deque` or `rayon_core`. The same loop with no rebuild passed 45 of 45.
+
+So E0463 appears whenever another process removes or rebuilds a transitive dependency's artifacts between Cargo's freshness check and the doctest phase. `cargo clean -p`, `cargo clean`, `rm -rf target`, or any Cargo run that finds those units dirty qualifies. Kache's part is latency: a hit still goes through the wrapper while the artifact is absent, and `kache stats`, `kache doctor` and `kache daemon` all report the daemon as not reachable and not starting (`WARN daemon did not start after recovery`; LaunchAgent `ninja.kunobi.kache` installed). Each wrapper call then runs without the daemon, which lengthens the window.
+
+**What was ruled out as a trigger.** Alternating `make test`'s environment (`CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=clang MUSL_TARGET MUSL_BUILD_MODE`) with a plain `cargo build -p fdu-delete -v`, and alternating `-p fdu-delete`, default members and `--workspace` for `cargo test --no-run -v`, left the registry units fresh after the first round. The linker setting dirties only workspace units ("config settings changed"). Nothing in the Makefile, scripts or tests removes or rebuilds a registry dependency: the only `cargo clean` is `make release`, which cleans `-p ish --profile dist --target`, and the tests delete only uniquely named scratch directories. Which process mutated the target in the reported run was not recorded, so it stays unidentified.
+
+**Disposition.** No product, Makefile or test change. `doctest = false` on crates with no doctests would hide the symptom for `fdu-delete`, and would silently skip any doctest added later, so it was not adopted; it also would not stop the same mutation from breaking `epsh`'s four doctests. Do not run `cargo clean`, `rm -rf` of the target, or any Cargo command that can rebuild registry units in a worktree while its `make test` is running; use a separate `CARGO_TARGET_DIR` for the second command. If it recurs, run `rg 'E0463' ` on the log, then `ls -l target/debug/build/<named crate>/*/out/` right away to see whether the rlib is absent (a concurrent rebuild, which a re-run clears) or present (a different defect).
