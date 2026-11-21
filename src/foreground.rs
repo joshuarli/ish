@@ -9,18 +9,9 @@ use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PROGRESS_DELAY: Duration = Duration::from_millis(200);
-const PROGRESS_DELAY_ENV: &str = "ISH_TEST_PROGRESS_DELAY_MS";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const BLOCKED_REPORT_AFTER: Duration = Duration::from_secs(30);
 const EVENT_CAPACITY: usize = 256;
-
-fn progress_delay() -> Duration {
-    std::env::var_os(PROGRESS_DELAY_ENV)
-        .and_then(|value| value.into_string().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(PROGRESS_DELAY)
-}
 
 #[derive(Default)]
 struct ProgressReplay {
@@ -36,8 +27,8 @@ impl ProgressReplay {
         *latest
     }
 
-    fn due(&self, started: Instant, now: Instant, delay: Duration) -> Option<Progress> {
-        if now.saturating_duration_since(started) < delay
+    fn due(&self, started: Instant, now: Instant) -> Option<Progress> {
+        if now.saturating_duration_since(started) < PROGRESS_DELAY
             || self.last_delivery.is_some_and(|last| {
                 now.saturating_duration_since(last) < PROGRESS_INTERVAL
             })
@@ -147,7 +138,6 @@ pub struct Foreground {
     _signals: signal::ForegroundSignals,
     _terminal: term::ForegroundMode,
     started: Instant,
-    progress_delay: Duration,
     watchdog: ActivityWatchdog,
     last_progress: Option<Instant>,
     progress_replay: ProgressReplay,
@@ -165,7 +155,6 @@ impl Foreground {
             _signals: signals,
             _terminal: terminal,
             started: now,
-            progress_delay: progress_delay(),
             watchdog: ActivityWatchdog::new(now),
             last_progress: None,
             progress_replay: ProgressReplay::default(),
@@ -228,7 +217,7 @@ impl Foreground {
 
     pub fn report_progress_line(&mut self, line: &str) -> io::Result<()> {
         if !io::stderr().is_terminal()
-            || self.started.elapsed() < self.progress_delay
+            || self.started.elapsed() < PROGRESS_DELAY
             || self
                 .last_progress
                 .is_some_and(|last| last.elapsed() < PROGRESS_INTERVAL)
@@ -482,7 +471,7 @@ impl Foreground {
         if output_error.is_some() {
             return;
         }
-        if let Some(progress) = self.progress_replay.due(self.started, Instant::now(), self.progress_delay) {
+        if let Some(progress) = self.progress_replay.due(self.started, Instant::now()) {
             self.deliver_event(Event::Progress(progress), handle_event, output_error);
         }
     }
@@ -662,8 +651,8 @@ mod tests {
             ..Progress::default()
         };
         replay.delivered(first, started);
-        assert_eq!(replay.due(started, started + Duration::from_millis(199), PROGRESS_DELAY), None);
-        assert_eq!(replay.due(started, started + Duration::from_millis(200), PROGRESS_DELAY), Some(first));
+        assert_eq!(replay.due(started, started + Duration::from_millis(199)), None);
+        assert_eq!(replay.due(started, started + Duration::from_millis(200)), Some(first));
 
         replay.delivered(first, started + Duration::from_millis(200));
         let latest = Progress {
@@ -681,8 +670,8 @@ mod tests {
             started + Duration::from_millis(230),
         );
         assert_eq!(delivered, latest);
-        assert_eq!(replay.due(started, started + Duration::from_millis(279), PROGRESS_DELAY), None);
-        assert_eq!(replay.due(started, started + Duration::from_millis(280), PROGRESS_DELAY), Some(latest));
+        assert_eq!(replay.due(started, started + Duration::from_millis(279)), None);
+        assert_eq!(replay.due(started, started + Duration::from_millis(280)), Some(latest));
     }
 
     #[test]

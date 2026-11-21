@@ -1047,15 +1047,7 @@ fn native_fs_static_dynamic_and_nested_fork_contexts_refuse_before_redirections(
 
 #[test]
 fn native_fs_quick_no_progress_copy_stays_quiet() {
-    let sh = PtyShell::spawn_with_setup(
-        &[("source", "tiny bytes")],
-        &[],
-        &[("ISH_TEST_PROGRESS_DELAY_MS", "600000")],
-        24,
-        80,
-        None,
-        |_| {},
-    );
+    let sh = PtyShell::spawn_with_opts(&[("source", "tiny bytes")], &[]);
     let output = clean(&sh.run_command("cp source copy"));
     assert!(!output.contains("files, "), "quick copy printed progress: {output:?}");
     assert_eq!(std::fs::read(sh.home_path().join("copy")).unwrap(), b"tiny bytes");
