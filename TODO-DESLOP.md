@@ -67,12 +67,3 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** root-cause
 - **Effort:** M
 
-### DSLP-36 · P2 · Semantic bridge effects family fails make verify on macOS with EBADF on /dev/fd
-
-- **Area:** Needs environment · semantic verification
-- **Where:** examples/semantic_bridge/effects.rs (descriptor_resource)
-- **Problem:** On Darwin, make verify exits 2 in the effects family: effects worker exited with exit status: 1: semantic bridge: cannot inspect descriptor 5: Bad file descriptor (os error 9). descriptor_resource accepts only NotFound from /dev/fd/N; macOS returns EBADF for closed descriptors. Treating EBADF as closed then exposes a real mismatch at effects-00010 (Rust sees no descriptors, Lean expects [[3,7],[4,8]]). make verify-mutations fails its effects baseline the same way. Fails identically at base a9b1966.
-- **Recommendation:** Root-cause the descriptor inspection on Darwin (devfs /dev/fd semantics vs Linux /proc-backed /dev/fd), fix descriptor_resource and the effects-00010 mismatch, and rerun make verify and make verify-mutations on macOS.
-- **Fix with:** root-cause
-- **Effort:** M
-
