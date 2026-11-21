@@ -102,7 +102,10 @@ fn confirm(record: &Metadata, current: io::Result<Metadata>) -> io::Result<Pid> 
     match current {
         Ok(current) if current == *record => Ok(record.pid),
         Ok(_) => Err(io::Error::new(io::ErrorKind::NotFound, "process changed during snapshot")),
-        Err(error) => Err(io::Error::new(io::ErrorKind::NotFound, format!("process became unreadable during snapshot: {error}"))),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EINVAL | libc::EIO | libc::ENOENT)) => {
+            Err(io::Error::new(io::ErrorKind::NotFound, format!("process became unreadable during snapshot: {error}")))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -222,6 +225,8 @@ mod tests {
             let error = confirm(&record, Err(io::Error::from_raw_os_error(errno))).unwrap_err();
             assert!(crate::pk::gone(&error), "errno {errno}: {error:?}");
         }
+        let exhausted = confirm(&record, Err(io::Error::from_raw_os_error(libc::EMFILE))).unwrap_err();
+        assert!(!crate::pk::gone(&exhausted), "{exhausted:?}");
         assert_eq!(confirm(&record, Ok(record.clone())).unwrap(), record.pid);
     }
 }
