@@ -196,7 +196,7 @@ fn profile_large_layout_fixture() -> io::Result<()> {
         24,
         &[("FDU_PROFILE", "1")],
     );
-    session.wait_ready();
+    session.wait_layout_fixture_ready();
     session.text("q");
     let deadline = session.terminal.deadline(session.step);
     session.terminal.wait_for_screen(deadline, "prompt returns after fdu exit", |screen| {

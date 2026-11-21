@@ -1,7 +1,7 @@
 #[path = "fdu_support.rs"]
 mod fdu_support;
 
-use ptytest::{Key, SnapshotOptions};
+use ptytest::{CommandSpec, Key, PtyTest, Scenario, Size, SnapshotOptions, TestEnv};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -16,7 +16,7 @@ fn golden(name: &str) -> PathBuf {
 fn open(label: &str, columns: u16, rows: u16) -> Session {
     let mut session = Session::start(label, layout_fixture(), &["--apparent", "--read-only"], columns, rows);
     session.step = SCAN_STEP;
-    session.wait_ready();
+    session.wait_layout_fixture_ready();
     session
 }
 
@@ -116,6 +116,20 @@ fn age_value_end(characters: &[char], start: usize) -> Option<usize> {
 }
 
 const AGE_COLUMN_WIDTH: usize = 5;
+
+#[test]
+fn settled_wait_ignores_a_screen_replaced_before_output_settles() {
+    let script = r"printf '\033[H\033[2Jready'; sleep 0.01; printf '\033[H\033[2Jbusy'; sleep 0.3; printf '\033[H\033[2Jready again'; sleep 5";
+    let scenario = Scenario::new("settled-wait")
+        .unwrap()
+        .command(CommandSpec::new("/bin/sh").args(["-c", script]))
+        .size(Size::new(40, 4).unwrap())
+        .environment(TestEnv::hermetic().unwrap());
+    let mut terminal = PtyTest::spawn(scenario).unwrap();
+    let deadline = terminal.deadline(Duration::from_secs(10));
+    let screen = fdu_support::wait_settled(&mut terminal, deadline, "ready", |screen| screen.shows("ready"));
+    assert!(screen.shows("ready"), "returned a screen that no longer shows ready: {:?}", screen.lines());
+}
 
 #[test]
 fn ready_listing() {
