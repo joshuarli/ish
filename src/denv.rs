@@ -2046,6 +2046,15 @@ mod tests {
     #[test]
     fn retired_helpers_cannot_redirect_failure_channel_epsh() {
         let _evaluation = EVALUATION_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        const CHILD_MODE: &str = "ISH_DENV_EPSH_REDIRECT_CHILD";
+        if env::var_os(CHILD_MODE).is_none() {
+            let output = Command::new(env::current_exe().unwrap())
+                .args(["--exact", "denv::tests::retired_helpers_cannot_redirect_failure_channel_epsh", "--test-threads=1"])
+                .env(CHILD_MODE, "1")
+                .output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
         retired_helpers_cannot_redirect_failure_channel(EnvRcInterpreter::Epsh);
     }
 

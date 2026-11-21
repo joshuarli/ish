@@ -21,7 +21,26 @@ done
 
 ## DSLP-27
 
-Unreproduced and unresolved. Each of the two decoder tests passed 3/3 runs under eight burners and 10/10 under sixteen burners, with the process-churn loop in both runs. In each log Cargo reported one test run. `src/input.rs:1061` writes a `Z` sentinel and `src/input.rs:1105` waits 20 seconds for the reader; `src/input.rs:1119` runs split cases concurrently. These are observations, not proof whether a lost sentinel, framing error, or scheduling caused the reported timeout. No fix or post-fix loop was attempted without a failing reproduction.
+Reproduced and fixed. Isolated runs never failed, so the earlier loops (above) could not see it: the test binary has to run the whole library suite, or at least the epsh redirect test below, next to the decoder tests. The failure is the 20-second `decoder must reach the sentinel instead of stalling: Timeout` panic in `decode_parts` (`src/input.rs:1107`), which only `reply_and_report_sequences_are_consumed_whole_at_every_split` and the other `decode_parts` tests can raise.
+
+**Evidence.** The base test binary (`cargo test -p ish --lib --no-run`) was run directly with `TMPDIR="$PWD/.work/tmp"`:
+
+- `input::` alone under sixteen `yes` burners: 15/15 passed, 5.1 s each. `--skip denv::` (whole suite, 8 burners): 8/8 passed in about 6 s. `input:: denv::`: 10/10 passed (without extra decoder load).
+- The whole suite under sixteen burners (the loop in the DSLP-33 section, without `--test-threads=1`) failed the decoder test in roughly one run in three, exit 101, in 29 to 40 s. Other lanes were also loading the host (load average 30 to 50).
+- Temporary diagnostics in `decode_parts` (removed; the patch is not kept) showed the same state every time: the writer had written the sentinel `Z`, the reader thread was blocked in `poll(2)` called from `InputReader::read_event` (`sample` showed it in `poll`, not spinning), a zero-timeout `poll` of the same pipe fd reported `POLLIN`, the signal fd was quiet, and a second write of `Z` did not wake the reader either. The reader had already consumed the first part. The stalled splits were always the first allowed split of a sequence (two bytes: `ESC [`, `ESC _`, `ESC O`).
+- A 500 ms sliced `poll` in place of `poll(-1)` removed the stalls (0/14 loaded runs, none of the fourteen printed a timed-out poll with data readable), which pointed at the wait rather than the decoder.
+
+**Cause (established).** `denv::tests::retired_helpers_cannot_redirect_failure_channel_epsh` runs the in-process epsh evaluator on `source_env shared N>/dev/null` for N in 3 to 9 and for the failure-channel descriptors from 10 up. epsh applies a redirection by `dup2` onto descriptor N in the test process and restores it afterwards (`crates/epsh/src/redirect.rs:91`, `crates/epsh/src/redirect.rs:266`). Every test runs in one process with one descriptor table, so any pipe another test thread holds at one of those numbers is replaced by `/dev/null` for the window. On macOS a thread already sleeping in `poll` on that descriptor is never woken again, even after the pipe is restored and written. The decoder tests make about 100 short-lived pipe pairs, so they are the ones that hit the numbers. The same applies to any test thread that holds a descriptor in that range.
+
+Deterministic reproduction, no test suite involved: a thread blocks in `poll(-1)` on a pipe's read end, the main thread waits 100 ms, then does what epsh does (`fcntl(F_DUPFD, 100)` to save the descriptor, `dup2` `/dev/null` over it, `dup2` the saved descriptor back, close the saved copy) and writes one byte. Compiled with `rustc -O dup.rs`, three runs printed `reader STALLED: poll sleeping despite data` (exit 0 each). The source was scratch (`.work/tmp/pollrace/dup.rs`, 40 lines of `extern "C"` declarations) and is not kept.
+
+Reproduction in the suite, base `a9b1966f`, no burners: `$BIN input:: denv::tests::retired_helpers_cannot_redirect_failure_channel_epsh` hung or failed in 2 of 3 runs (`timeout 60` exit 124 twice, the passing run took 5.1 s).
+
+**Fix.** The epsh variant of the redirect test now re-executes the test binary and runs the redirections in the child, as the 64-descriptor and low-descriptor tests already do (`src/denv.rs:2046`). No product code changed and no deadline changed. The Bash variant stays in process: its `dup2` calls run in the forked child (`pre_exec`). After the change the same two-filter command passed 10/10 in 5.3 s each, exit 0. The loaded whole-suite loop with sixteen burners (the base-binary loop's command, fixed binary, 14 runs, all exit 101 from the denv deadline failures below) produced no `input::` failure; at the base rate of about one in three, 0/14 has probability below 1%.
+
+`replies_between_typed_keys_leave_the_typing_intact` shares `decode_parts` and therefore the same exposure; it was not caught by name in these runs.
+
+Not caused by this: the denv tests that evaluate `.envrc` files under a 2 s deadline (`retired_helpers_invalidate_masked_and_forked_candidates`, `dotenv_if_exists_loads_approved_values_during_evaluation`, `evaluators_preserve_helper_rejection_with_a_64_descriptor_limit`, `bash_snapshot_writers_survive_exec_when_low_fds_are_free`, `bash_requires_a_completed_candidate_before_applying_exports`, `retired_helper_flood_respects_the_evaluation_deadline`) failed in most loaded whole-suite runs with `.envrc evaluation timed out after 2s`. That is the DSLP-33 class (Bash startup against a test-chosen deadline) at a load average of 30 to 50.
 
 ## DSLP-28
 
