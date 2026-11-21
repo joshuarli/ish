@@ -1,5 +1,5 @@
 Prefix: DSLP
-Next: 37
+Next: 41
 
 Deslop campaign backlog ([plan](https://github.com/laputa-systems/stuff/blob/main/docs/campaigns/deslop.md), tier D). One agent works this file with the `deslop` skill: take the lowest-numbered open ticket whose area does not start with `Needs owner ·`. Complete the component tickets before the findings and final report.
 
@@ -22,33 +22,6 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** root-cause
 - **Effort:** M
 
-### DSLP-28 · P2 · PTY completion tests intermittently time out under load
-
-- **Area:** Needs environment · PTY tests
-- **Where:** tests/pty.rs:453, tests/pty.rs:506
-- **Problem:** A busy macOS full-suite retry timed out in builtin_lookup_completion_and_explicit_paths_share_the_policy and completion_resize_rerenders_grid. A later full suite passed; neither failure was reproduced at base and the cause remains unknown, so they can obscure regressions.
-- **Recommendation:** Reproduce each failure under controlled load and at the base revision; identify whether the shell or harness is responsible before changing deadlines or assertions.
-- **Fix with:** root-cause
-- **Effort:** M
-
-### DSLP-31 · P2 · Full macOS test run can fail to locate a transitive crate in doctests
-
-- **Area:** Needs environment · Rust doctests
-- **Where:** crates/fdu-delete/src/lib.rs:563, Makefile:20
-- **Problem:** On a macOS make test run using the configured kache wrapper, the tests passed but the fdu-delete doctest failed with E0463: cannot find crossbeam_utils which rayon depends on. The cause is unproven; the failure prevents full-suite verification.
-- **Recommendation:** Reproduce the rustdoc artifact lookup failure and fix the underlying toolchain or cache interaction without suppressing doctests.
-- **Fix with:** root-cause
-- **Effort:** M
-
-### DSLP-32 · P2 · Process picker PTY test can lose its snapshot under load
-
-- **Area:** Needs environment · PTY tests
-- **Where:** tests/pty.rs:453, tests/pty.rs
-- **Problem:** On a busy macOS make test run, process_picker_cancel_no_match_and_explicit_term_kill_acceptance timed out waiting for selected after pk reported process lookup failed: process changed during snapshot. The cause is unproven; this obscures full-suite results.
-- **Recommendation:** Reproduce under controlled process churn and determine why the fixture snapshot changes before changing the test or picker behavior.
-- **Fix with:** root-cause
-- **Effort:** M
-
 ### DSLP-34 · P2 · fdu PTY snapshots can capture a partially written frame
 
 - **Area:** Needs environment · PTY tests
@@ -58,21 +31,39 @@ Needs environment: `gha-test-workflow` is unavailable (exit 127); both pull-requ
 - **Fix with:** root-cause
 - **Effort:** M
 
-### DSLP-35 · P2 · PTY suite can time out waiting for the OSC 133 prompt marker under load
+### DSLP-37 · P2 · PTY waits on external commands use fixed 3-5 s bounds that fail under suite load
 
 - **Area:** Needs environment · PTY tests
-- **Where:** tests/pty.rs
-- **Problem:** A loaded Darwin make test at fix/deslop-flakes (docs/deslop-flakes.md research run, 2026-11-20) timed out waiting for an OSC 133 prompt marker after 216 PTY passes; the rerun failed instead with a process picker Invalid argument (os error 22). Neither failure is tied to a code change and the cause is unproven.
-- **Recommendation:** Record which test and wait timed out, reproduce it alone under the recorded load, and fix the harness or shell cause without lengthening the wait unless the cause is proven to be scheduling latency against a deadline the test chose.
+- **Where:** tests/pty.rs (run_command, wait_for, wait_for_prompt_after_line_advance)
+- **Problem:** Many PTY waits bound external commands and picker prompts at 3-5 s. Under loaded full-suite runs they time out the same way DSLP-35's startup wait did (shell scheduling latency: 40 concurrent shells measured p99 3.3 s, max 4.8 s to first prompt). Seen on pty-child-ready, input-ready, /bin/sh -c 'exit 0' 0<&-, ./bin/exec, selected], and native_copy_uses_current_store_and_prefix_tmpdir_values (docs/deslop-flakes.md, DSLP-35).
+- **Recommendation:** Use one shared generous bound for condition waits (they return as soon as the condition holds, so success costs nothing), citing the DSLP-35 startup measurement, and keep short bounds only where a test asserts an absence.
 - **Fix with:** root-cause
-- **Effort:** M
+- **Effort:** S
 
-### DSLP-36 · P2 · Semantic bridge effects family fails make verify on macOS with EBADF on /dev/fd
+### DSLP-38 · P2 · Ctrl-Z native copy PTY test fails when the prompt shows a long Git branch
 
-- **Area:** Needs environment · semantic verification
-- **Where:** examples/semantic_bridge/effects.rs (descriptor_resource)
-- **Problem:** On Darwin, make verify exits 2 in the effects family: effects worker exited with exit status: 1: semantic bridge: cannot inspect descriptor 5: Bad file descriptor (os error 9). descriptor_resource accepts only NotFound from /dev/fd/N; macOS returns EBADF for closed descriptors. Treating EBADF as closed then exposes a real mismatch at effects-00010 (Rust sees no descriptors, Lean expects [[3,7],[4,8]]). make verify-mutations fails its effects baseline the same way. Fails identically at base a9b1966.
-- **Recommendation:** Root-cause the descriptor inspection on Darwin (devfs /dev/fd semantics vs Linux /proc-backed /dev/fd), fix descriptor_resource and the effects-00010 mismatch, and rerun make verify and make verify-mutations on macOS.
+- **Area:** PTY tests
+- **Where:** tests/pty.rs:1053 (native_fs_ctrl_z_is_ignored_during_copy_and_external_job_control_still_works), tests/pty.rs:476
+- **Problem:** The test's shell starts in CARGO_MANIFEST_DIR, so the prompt shows the checkout's Git branch. With a long branch name (chore/ptytest-0.5) the prompt plus the typed cp command wraps past 80 columns and wait_for_prompt_after_line_advance times out after 15 s every run (5/5); renaming the branch to p5 made it pass 2/3, and it passed 3/3 on a detached master. The pty-flakes lane saw it fail 16/16 loaded runs on fix/deslop-pty-flakes.
+- **Recommendation:** Make PTY sessions hermetic: start the shell in a temporary directory or disable the Git prompt segment, so the prompt width doesn't depend on the developer's branch; then check prompt_end_after_last_newline handles a wrapped prompt.
 - **Fix with:** root-cause
-- **Effort:** M
+- **Effort:** S
+
+### DSLP-39 · P3 · Quick native copy test asserts no progress output, which a slow host breaks
+
+- **Area:** PTY tests
+- **Where:** tests/pty.rs (native_fs_quick_no_progress_copy_stays_quiet, ~line 1021)
+- **Problem:** The test asserts a quick copy prints no progress, but the progress threshold is wall-clock, so a slow or loaded host shows progress and fails it.
+- **Recommendation:** Drive the quiet decision with a controllable threshold or a copy small enough to be bounded by work, not time.
+- **Fix with:** root-cause
+- **Effort:** S
+
+### DSLP-40 · P3 · epsh executor timeout test fails under load with unwrap on None
+
+- **Area:** Tests
+- **Where:** crates/epsh/tests/conformance/executor.rs:599 (timeout_kills_the_process_group_and_reaps_the_child)
+- **Problem:** Under host load the test failed with unwrap() on None at executor.rs:599, and it stopped make test before the doctest phase (seen during DSLP-31 research).
+- **Recommendation:** Reproduce under CPU burners, find which expected process-group event is missing, and wait on it rather than assuming timing.
+- **Fix with:** root-cause
+- **Effort:** S
 

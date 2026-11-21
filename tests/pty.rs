@@ -22,6 +22,14 @@ use common::ish_binary;
 // PTY harness
 // ---------------------------------------------------------------------------
 
+/// Bound on the wait for a freshly spawned shell's first prompt. The wait returns at the first
+/// prompt, so the bound only matters when the host delays the process: with 40 shells starting
+/// together under 16 `yes` burners, startup took p99 3.3 s and at most 4.8 s.
+const STARTUP_PROMPT_TIMEOUT_MS: u64 = 30_000;
+
+/// Delay applied to the shell before it handles completion input; the waits that follow must outlast it.
+const COMPLETION_STALL_MS: u64 = 400;
+
 struct PtyShell {
     terminal: RefCell<PtyTest>,
     terminal_baseline: TerminalBaseline,
@@ -217,12 +225,7 @@ impl PtyShell {
             output_offset: Cell::new(0),
         };
 
-        sh.startup_output = sh.wait_for("$ ", 3000);
-        assert!(
-            sh.startup_output.contains("$ "),
-            "ish did not render its initial prompt within 3s: {:?}",
-            sh.startup_output
-        );
+        sh.startup_output = sh.wait_for("$ ", STARTUP_PROMPT_TIMEOUT_MS);
         sh
     }
 
@@ -392,6 +395,23 @@ impl PtyShell {
         let _ = terminal
             .wait_for_quiescence(deadline, std::time::Duration::from_millis(timeout_ms))
             .expect("wait for shell output quiescence");
+    }
+
+    /// The shell's process id, read back through the shell itself.
+    fn shell_pid(&self) -> i32 {
+        self.run_command("echo $$ >.shell-pid");
+        std::fs::read_to_string(self.home_path().join(".shell-pid")).unwrap().trim().parse().unwrap()
+    }
+
+    /// Stop the shell now and resume it after `stall_ms`, so input sent in between is handled
+    /// late, as under host load. The stall is test-chosen; waits after it must outlast it.
+    fn stall_shell(&self, pid: i32, stall_ms: u64) {
+        let pid = rustix::process::Pid::from_raw(pid).expect("shell pid");
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("stop shell");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(stall_ms));
+            rustix::process::kill_process(pid, rustix::process::Signal::CONT).expect("resume shell");
+        });
     }
 
     fn drain_available_output(&self) {
@@ -1666,16 +1686,19 @@ fn builtin_lookup_completion_and_explicit_paths_share_the_policy() {
     sh.run_command("command exit >refused-exit");
     assert_policy_status(&sh, 2);
     assert!(!sh.home_path().join("refused-exit").exists());
+    let pid = sh.shell_pid();
     sh.type_str("exe");
+    sh.stall_shell(pid, COMPLETION_STALL_MS);
     sh.tab();
-    sh.wait_for_quiescence(100);
-    assert!(!active_prompt_text(&sh.screen()).contains("exec"), "refused PATH builtin appeared in completion");
+    sh.type_str("x");
+    let screen = sh.wait_for_screen("Tab and the byte after it handled", 5000, |screen| active_prompt_text(screen).contains("exex"));
+    assert!(!active_prompt_text(&screen).contains("exec"), "refused PATH builtin appeared in completion");
     sh.ctrl_c();
     sh.wait_for_prompt_after_line_advance(2000);
     sh.type_str("ech");
+    sh.stall_shell(pid, COMPLETION_STALL_MS);
     sh.tab();
-    sh.wait_for_quiescence(100);
-    assert!(active_prompt_text(&sh.screen()).contains("echo"), "approved builtin was missing from completion");
+    sh.wait_for_screen("approved builtin completed", 5000, |screen| active_prompt_text(screen).contains("echo"));
     sh.ctrl_c();
     sh.wait_for_prompt_after_line_advance(2000);
     sh.run_command("./bin/exec");
@@ -2773,11 +2796,21 @@ fn completion_resize_rerenders_grid() {
         24,
         20,
     );
+    let pid = sh.shell_pid();
     sh.type_str("echo a");
+    sh.stall_shell(pid, COMPLETION_STALL_MS);
     sh.tab();
-    sh.wait_for_quiescence(200);
+    let names_once = |screen: &ptytest::ScreenSnapshot| {
+        let text = snapshot_text(screen);
+        ["aaa.txt", "aab.txt", "aac.txt"].iter().all(|name| text.matches(name).count() == 1)
+    };
+    sh.wait_for_screen("completion grid shown", 5000, names_once);
 
+    sh.stall_shell(pid, COMPLETION_STALL_MS);
     sh.resize(24, 12);
+    sh.wait_for_screen("completion grid rerendered at the new size", 5000, |screen| {
+        screen.size() == Size::new(12, 24).unwrap() && names_once(screen)
+    });
     sh.wait_for_quiescence(200);
 
     let screen = snapshot_text(&sh.screen());
@@ -2785,11 +2818,8 @@ fn completion_resize_rerenders_grid() {
     assert_screen_contains_once(&screen, "aab.txt");
     assert_screen_contains_once(&screen, "aac.txt");
 
-    let before_escape = sh.screen();
     sh.escape();
-    sh.wait_for_screen("completion grid closed", 2000, |screen| {
-        screen != &before_escape && !screen.contains("aaa.txt")
-    });
+    sh.wait_for_screen("completion grid closed", 5000, |screen| !screen.contains("aaa.txt"));
 }
 
 #[test]
@@ -5703,6 +5733,12 @@ fn process_picker_tiny_terminal_refuses_acceptance_without_signaling() {
     assert!(out.contains("terminal too small"), "{out}");
     assert!(fixture.0.try_wait().unwrap().is_none());
     assert!(PtyShell::strip_ansi(&sh.run_command("echo usable")).contains("usable"));
+}
+
+#[test]
+fn startup_prompt_wait_covers_scheduling_latency_before_ish_runs() {
+    let sh = PtyShell::spawn_under_sh("sleep 4; exec \"$1\"");
+    assert!(sh.startup_output().contains("$ "), "{:?}", sh.startup_output());
 }
 
 #[test]
