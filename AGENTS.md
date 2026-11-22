@@ -14,6 +14,8 @@ behavior contract.
 
 ## Verification
 
+`make clean` removes the checkout's ordinary `./target` directory. It refuses a file or symlink at that path.
+
 - `make test`: default members, PTY and native conformance tests; busy macOS cold and warm runs failed after 138s and 130s; a later rebuild and run passed in 479s (see `TODO-DESLOP.md`).
 - `make lint`: workspace Clippy and Ruff for scripts; busy macOS runs passed in 116s and 329s with three Cargo jobs.
 - `make verify`: Lean model, differential bridge, and mutation checks; cost not measured here.
