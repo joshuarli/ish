@@ -1,6 +1,8 @@
 ish is an interactive-only shell written in Rust. The README is the user-facing
 behavior contract.
 
+The roadmap, [docs/roadmap.md](docs/roadmap.md), holds all current and future work; its Status is the resume point.
+
 ## Commands
 
 - `make build` builds the default workspace members.
