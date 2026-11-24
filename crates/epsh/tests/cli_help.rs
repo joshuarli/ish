@@ -45,3 +45,11 @@ fn script_arguments_and_usage_errors_keep_their_behavior() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("-c requires an argument"));
 }
+
+#[test]
+fn command_children_die_quietly_on_a_closed_pipe() {
+    let output = Command::new(env!("CARGO_BIN_EXE_epsh")).args(["-c", "yes | head -n 1"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"y\n");
+    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
+}

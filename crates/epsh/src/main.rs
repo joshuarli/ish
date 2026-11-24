@@ -119,6 +119,15 @@ fn set_option(shell: &mut epsh::eval::Shell, name: &str, enable: bool) {
 }
 
 fn main() {
+    // The Rust runtime ignores SIGPIPE before main, and exec preserves ignored
+    // dispositions, so children such as `yes` in `yes | head -1` would report
+    // EPIPE instead of exiting quietly. rustix exposes no sigaction, so this is
+    // the binary's one direct libc signal call.
+    // SAFETY: single-threaded startup; SIG_DFL installs no handler code.
+    if unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) } == libc::SIG_ERR {
+        eprintln!("epsh: signal setup: {}", std::io::Error::last_os_error());
+        std::process::exit(2);
+    }
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let mut shell = epsh::eval::Shell::new();
     match parse_args(&args, &mut shell) {
