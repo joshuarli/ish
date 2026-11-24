@@ -203,7 +203,7 @@ active record before publishing the store. Readonly/persistence failures retain
 the current layer. Evaluation failure publishes the validated prior-layer
 restoration and dirty metadata after clearing the old record. Nested inherited
 state currently can lack restoration provenance; [ISH-89's draft](rfc/ISH-89-nested-denv-restoration.md)
-proposes the missing ownership contract.
+proposes the missing ownership contract but is won't do for now (P4).
 
 Active-record v2 encodes paths/value bytes in hex and distinguishes exported,
 local, declared-but-unset, and absent bindings. Older records keep their escaped

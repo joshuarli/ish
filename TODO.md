@@ -16,9 +16,10 @@ by this repository. Open work and verification limits are listed below.
 - Preserve matched-workload performance evidence for interactive changes: prompt/completion latency, allocations, release size, and resource behavior. Never trade away execution, byte-preservation, or durability guarantees.
 - Update the README contract and focused behavior tests when implementing changes. Keep native-terminal evidence separate from model proofs and deterministic PTY checks.
 
-ISH-75's argument-aware feature remains deferred. Preserve the existing owner
-priorities and won't-do decisions; ISH-89's priority is assumed from review
-impact and likelihood, and its RFC awaits an owner decision.
+ISH-75's argument-aware feature remains deferred. Denv-related work, including
+ISH-89, is won't do for now (P4) pending an owner decision on nested-session
+semantics; preserve that deferral. Preserve the remaining owner priorities and
+won't-do decisions.
 
 ## Open implementation tickets
 
@@ -57,16 +58,6 @@ impact and likelihood, and its RFC awaits an owner decision.
 - **Dependencies:** Shared syntax inspection should also serve ISH-78 and syntax-aware editing in ISH-77.
 - **Fix with:** `single-source-of-truth`
 - **Effort:** M
-
-### ISH-89 · P2 · Nested denv sessions lose project restoration provenance
-
-- **Area:** Data
-- **Where:** `src/denv.rs:143`, `src/denv.rs:227`, `src/denv.rs:306`, `src/denv.rs:322`.
-- **Problem:** `init` replaces the inherited record ID, then the inherited `__DENV_STATE` can satisfy the refresh fast path without an active restoration record. A real-API probe approves `.env` changing a value from `baseline` to `project`, starts a child shell with the parent's exported environment, then leaves the project. The child retains `project` while clearing `__DENV_DIR`; the original shell restores `baseline`. The state/provenance mismatch is demonstrated; nested-shell inheritance semantics are not settled by the existing accepted RFCs.
-- **Recommendation:** Adopt an explicit nested-session contract. Prefer independently owned restoration provenance for an inherited active layer, without reusing or deleting the parent's record. Preserve random session IDs, exact binding bytes/export state, and atomic store publication. Do not reopen denv introspection or history-privacy features.
-- **Fix with:** `durable-state`
-- **Effort:** M (days)
-- **Design:** [Nested denv restoration](docs/rfc/ISH-89-nested-denv-restoration.md).
 
 ### ISH-45 · P3 · Native macOS privileged ownership acceptance remains incomplete
 
@@ -131,3 +122,12 @@ impact and likelihood, and its RFC awaits an owner decision.
 - **Recommendation:** Drive the quiet decision with a controllable threshold or a copy small enough to be bounded by work, not time.
 - **Fix with:** root-cause
 - **Effort:** S
+
+### ISH-89 · P4 · Nested denv sessions lose project restoration provenance
+
+- **Status:** Won't do for now (deferred).
+- **Area:** Data
+- **Where:** `src/denv.rs:143`, `src/denv.rs:227`, `src/denv.rs:306`, `src/denv.rs:322`.
+- **Problem:** `init` replaces the inherited record ID, then the inherited `__DENV_STATE` can satisfy the refresh fast path without an active restoration record. A real-API probe approves `.env` changing a value from `baseline` to `project`, starts a child shell with the parent's exported environment, then leaves the project. The child retains `project` while clearing `__DENV_DIR`; the original shell restores `baseline`. The state/provenance mismatch is demonstrated; nested-shell inheritance semantics are not settled by the existing accepted RFCs.
+- **Reason:** Denv-related work is deferred for now. Nested-shell inheritance semantics are unsettled and do not warrant a design decision at present. Do not reopen denv introspection or history-privacy features. Revisit only with a fresh owner decision.
+- **Design:** [Nested denv restoration](docs/rfc/ISH-89-nested-denv-restoration.md).

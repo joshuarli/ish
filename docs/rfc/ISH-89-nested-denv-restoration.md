@@ -1,6 +1,6 @@
 # ISH-89: Nested denv restoration
 
-Status: draft
+Status: draft; deferred by the owner (won't do for now, P4)
 
 ## Summary
 
@@ -53,4 +53,5 @@ leave the inherited environment intact and report that restoration is unavailabl
 
 ## Decision
 
-Pending owner choice.
+Deferred by the owner (won't do for now, P4). Reopen only with a fresh owner
+decision on nested-shell baseline semantics.
