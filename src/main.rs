@@ -1,7 +1,6 @@
 use ish::report;
+use epsh::shell_bytes::ShellBytes;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::process::CommandExt;
-use std::process::Command;
 mod shell;
 mod rmrf;
 
@@ -23,7 +22,7 @@ struct CliOption {
 }
 
 const OPTIONS: &[CliOption] = &[
-    CliOption { names: &["-c"], value: Some("COMMAND"), description: "Run COMMAND with /bin/sh and exit (login-shell contract)", kind: OptionKind::Command },
+    CliOption { names: &["-c"], value: Some("COMMAND"), description: "Run COMMAND with the built-in epsh engine and exit (login-shell contract)", kind: OptionKind::Command },
     CliOption { names: &["--config"], value: Some("PATH"), description: "Use PATH instead of the default config file", kind: OptionKind::Config },
     CliOption { names: &["--no-config"], value: None, description: "Skip loading the config file", kind: OptionKind::NoConfig },
     CliOption { names: &["-V", "--version"], value: None, description: "Show version and exit", kind: OptionKind::Version },
@@ -103,9 +102,20 @@ fn print_help() {
 
 
 fn run_command(command: &OsStr) -> ! {
-    let error = Command::new("/bin/sh").arg("-c").arg(command).exec();
-    report!("ish: cannot run /bin/sh: {error}");
-    std::process::exit(127);
+    if let Err(error) = ish::signal::restore_pipe_default() {
+        report!("ish: command signal setup: {error}");
+        std::process::exit(2);
+    }
+    let program = match epsh::parser::Parser::new_bytes(ShellBytes::from_os_str(command).as_bytes()).parse() {
+        Ok(program) => program,
+        Err(error) => {
+            report!("ish: {error}");
+            std::process::exit(2);
+        }
+    };
+    let mut shell = epsh::eval::Shell::new();
+    shell.set_args_bytes(&[ShellBytes::from("ish")]);
+    std::process::exit(shell.run_program(&program).code());
 }
 
 fn main() {

@@ -6,13 +6,43 @@ fn ish() -> Command {
 }
 
 #[test]
-fn command_mode_runs_the_string_with_bin_sh() {
+fn command_mode_runs_the_string() {
     let output = ish()
         .args(["-c", "printf 'login-shell-contract'"])
         .output()
         .expect("run ish -c");
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"login-shell-contract");
+}
+
+#[test]
+fn command_mode_runs_control_flow_and_functions_in_process() {
+    let output = ish()
+        .args([
+            "-c",
+            "greet() { printf '%s:%s\\n' \"$0\" \"$1\"; }\nfor name in a b; do\n  greet \"$name\"\ndone\nif true; then echo done; fi",
+        ])
+        .output()
+        .expect("run ish -c");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"ish:a\nish:b\ndone\n");
+}
+
+#[test]
+fn command_mode_reports_a_parse_error_with_status_2() {
+    let output = ish().args(["-c", "for x in; do"]).output().expect("run ish -c");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("ish: "), "{stderr}");
+}
+
+#[test]
+fn command_mode_children_die_quietly_on_a_closed_pipe() {
+    let output = ish().args(["-c", "yes | head -n 1"]).output().expect("run ish -c");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"y\n");
+    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
 #[test]

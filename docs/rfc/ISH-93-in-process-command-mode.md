@@ -1,6 +1,6 @@
 # ISH-93: In-process command mode
 
-Status: accepted
+Status: accepted; implemented.
 
 ## Summary
 
@@ -39,7 +39,9 @@ redirections. No subprocess is needed.
    `status.code()`.
 4. Do not install output sinks. epsh writes builtin output to the inherited
    descriptors. External commands inherit stdin, stdout, and stderr through
-   the default executor.
+   the default executor. Restore the default SIGPIPE disposition first: the
+   Rust runtime ignores it, and forked pipeline stages would pass that on, so
+   `yes | head -n 1` would print `Broken pipe` where `/bin/sh` stays quiet.
 5. Leave `dispatch::plan()` alone. The interactive gate still refuses control
    flow and functions. Command mode uses epsh directly and accepts full epsh
    syntax.

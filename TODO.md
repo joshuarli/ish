@@ -38,7 +38,7 @@ impact and likelihood, and its RFC awaits an owner decision.
 - **Status:** Deterministic PTY gaps addressed (2026-11-09); native/manual matrix remains a standing follow-up.
 - **Area:** Tests / terminal correctness
 - **Where:** `tests/pty.rs`, `tests/external_signals.rs`, `tests/login_shell.rs`, `docs/ptytest.md`, [docs/terminal-interop-matrix.md](docs/terminal-interop-matrix.md), `.github/workflows/ci.yml`, terminal integration documentation
-- **Delivered:** [docs/terminal-interop-matrix.md](docs/terminal-interop-matrix.md) separates deterministic PTY coverage from native/manual observations. Automated PTY coverage includes OSC 7, OSC 133 lifecycle (order/status, cancel/refusal, continuation, suspend/fg, redirection isolation), delegated `ish -c` non-emission, bounded resize storms, bounded repeated stop/resume, single-command `/dev/tty` input (`converged_command_reads_from_dev_tty`), alt-screen sequence relay passthrough with shell responsiveness (`alternate_screen_sequences_pass_through_relay`), raw OSC 52 clipboard emission for `copy-scrollback` (`osc52_copy_scrollback_emits_base64_session_log`), and SIGHUP-at-prompt exit/restore (`shell_sighup_at_prompt_exits_and_restores_terminal`).
+- **Delivered:** [docs/terminal-interop-matrix.md](docs/terminal-interop-matrix.md) separates deterministic PTY coverage from native/manual observations. Automated PTY coverage includes OSC 7, OSC 133 lifecycle (order/status, cancel/refusal, continuation, suspend/fg, redirection isolation), `ish -c` non-emission, bounded resize storms, bounded repeated stop/resume, single-command `/dev/tty` input (`converged_command_reads_from_dev_tty`), alt-screen sequence relay passthrough with shell responsiveness (`alternate_screen_sequences_pass_through_relay`), raw OSC 52 clipboard emission for `copy-scrollback` (`osc52_copy_scrollback_emits_base64_session_log`), and SIGHUP-at-prompt exit/restore (`shell_sighup_at_prompt_exits_and_restores_terminal`).
 - **Remaining:** Reproducible native/manual evidence for Ghostty, an independent terminal, SSH sessions, and tmux (prompt navigation/output boundaries, notification/completion behavior where supported), plus focused instrumentation/native runs for leaked descriptors/children, hung waits, lost input, terminal-mode restoration across native environments, and external child hangup/EOF edge cases. Unavailable native environments remain explicitly unverified, not passes.
 - **Dependencies:** Acceptance gate for ISH-73/74 terminal behavior; retain as standing evidence, not a claim that PTY emulates real terminals completely.
 - **Problem:** Native-terminal behavior remains unverified beyond the recorded deterministic PTY cases. The specific signal-during-execution defects found by this review have their own implementation tickets below.
@@ -110,16 +110,6 @@ impact and likelihood, and its RFC awaits an owner decision.
 - **Dependencies:** Coordinate published license metadata with the root MIT license; preserve ISH-42's release contract.
 - **Fix with:** `single-source-of-truth`
 - **Effort:** S
-
-### ISH-93 · P3 · Run ish -c with in-process epsh instead of /bin/sh
-
-- **Area:** CLI · command mode
-- **Where:** `src/main.rs:26`, `src/main.rs:105-109`, `tests/login_shell.rs`, `tests/pty.rs:5468`, `README.md:7-9`, `README.md:21-23`, `docs/architecture.md:8-9`, `docs/rfc/ISH-63-login-shell-command.md`, `crates/epsh/src/eval.rs:1587-1613`, `crates/epsh/src/main.rs:78-86`, `crates/epsh/src/var.rs:125-159`
-- **Problem:** `ish -c COMMAND` replaces ish with `/bin/sh -c COMMAND`, so ish depends on an external shell and its shipped epsh engine never runs command strings. Pasting `for` loops at the interactive prompt fails with `ish: for commands are not supported`, while the same string works only through `/bin/sh`. The owner wants command mode self-sufficient: epsh must execute `COMMAND` inside the ish process, with no `/bin/sh` and no `epsh` subprocess. The delegation is specified in README and RFC ISH-63, so the CLI contract and those records need an explicit replacement.
-- **Recommendation:** Replace `run_command()` with in-process epsh execution: convert the `-c` operand with `ShellBytes::from_os_str(...).to_shell_string()` as in `crates/epsh/src/main.rs:81`, parse with `epsh::parser::Parser`, report parse errors as `ish: ...` with status 2, build `epsh::eval::Shell` with inherited environment and fd-backed output, set `$0` to `ish` with `set_args_bytes`, run `Program` through `run_program`, and exit with its status code. Leave the interactive `dispatch::plan()` gate unchanged; command mode gains full epsh syntax while the prompt keeps its restrictions. Keep CLI parsing, help errors, stream passthrough, exit-status propagation, no config loading for `-c`, and no OSC emission. Update README, architecture, RFC ISH-63, AGENTS invariant, and terminal-interop wording; add login-shell tests for loops, functions, `$0`, parse errors, and existing status/I/O parity.
-- **Fix with:** reference-parity
-- **Effort:** M
-- **Design:** [ISH-93](docs/rfc/ISH-93-in-process-command-mode.md)
 
 ## Won't do
 

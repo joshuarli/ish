@@ -4,9 +4,9 @@ ish is an interactive shell for macOS and Linux. It provides a prompt, line
 editing, history search, completion, aliases, job control, and in-process
 file commands.
 
-ish is interactive. It does not run shell scripts. `ish -c COMMAND` runs a
-command with `/bin/sh -c` so tools such as `ssh`, `scp`, `cron`, and `make`
-can use ish as a login shell.
+ish is interactive. It does not run script files. `ish -c COMMAND` runs a
+command string with ish's built-in epsh engine, inside the ish process, so
+tools such as `ssh`, `scp`, `cron`, and `make` can use ish as a login shell.
 
 ## Install
 
@@ -19,7 +19,7 @@ ish
 ```
 
 `ish -h` or `ish --help` shows the complete command-line reference and examples. `-c COMMAND` runs a command with
-`/bin/sh`, `--config PATH` selects a config file, `--no-config` skips config
+epsh, `--config PATH` selects a config file, `--no-config` skips config
 loading, and `-V` prints the version.
 
 ## Configuration

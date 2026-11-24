@@ -5463,7 +5463,7 @@ fn osc133_suspended_job_and_fg_emit_completion_markers() {
 }
 
 #[test]
-fn delegated_ish_c_emits_no_osc133_markers() {
+fn command_mode_emits_no_osc_markers() {
     let output = std::process::Command::new(ish_binary())
         .args(["-c", "echo hi"])
         .output()
@@ -5471,8 +5471,8 @@ fn delegated_ish_c_emits_no_osc133_markers() {
     assert!(output.status.success());
     let mut combined = output.stdout;
     combined.extend_from_slice(&output.stderr);
-    assert!(!combined.windows(b"\x1b]133;".len()).any(|w| w == b"\x1b]133;"), "delegated ish -c must not emit OSC 133: {:?}", String::from_utf8_lossy(&combined));
-    assert!(!combined.windows(b"\x1b]7;".len()).any(|w| w == b"\x1b]7;"), "delegated ish -c must not emit OSC 7: {:?}", String::from_utf8_lossy(&combined));
+    assert!(!combined.windows(b"\x1b]133;".len()).any(|w| w == b"\x1b]133;"), "ish -c must not emit OSC 133: {:?}", String::from_utf8_lossy(&combined));
+    assert!(!combined.windows(b"\x1b]7;".len()).any(|w| w == b"\x1b]7;"), "ish -c must not emit OSC 7: {:?}", String::from_utf8_lossy(&combined));
 }
 
 #[test]

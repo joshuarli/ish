@@ -21,7 +21,7 @@ Host recorded: macOS 27.2 (`Darwin ... arm64`), `xterm-256color` session, tmux 3
 | Redirections | covered | existing PTY tests; `osc133_redirected_output_keeps_markers_off_command_file` |
 | Prompt markers (OSC 133) | covered | `osc133_*` tests: order/status, cancel/refusal, resize/continuation, suspend/fg |
 | OSC 7/52 behavior | covered (bounded) | `osc7_working_directory_emitted_to_interactive_terminal`; `osc52_copy_scrollback_emits_base64_session_log` asserts raw OSC 52 clipboard output with the session-log payload |
-| Delegated login-shell command mode | covered | `login_shell` tests; `delegated_ish_c_emits_no_osc133_markers` |
+| Login-shell command mode | covered | `login_shell` tests; `command_mode_emits_no_osc_markers` |
 
 ## Native/manual observations
 

@@ -33,11 +33,11 @@ The roadmap, [docs/roadmap.md](docs/roadmap.md), holds all current and future wo
 
 ## Invariants
 
-- Keep ish interactive-only; adding scripts, POSIX compatibility, `source`, `eval`, control flow, functions, background jobs, plugins, themes, or prompt configuration requires an explicit design decision.
+- Keep ish interactive-only; `ish -c` runs full epsh syntax in-process for the login-shell contract (ISH-93). Adding script files, POSIX compatibility, `source`, `eval`, control flow, functions, background jobs, plugins, themes, or prompt configuration requires an explicit design decision.
 - Keep shell-owned operations such as listing, completion, globbing, and prompt Git inspection in-process; only user commands and denv evaluation may spawn children.
 - Keep execution and data structures flat; do not add an ish-owned AST or general configuration language.
 - Preserve the interactive hot path by reusing buffers where practical and avoiding allocations on each keystroke.
-- Use epsh for parsing and evaluation, but expose only syntax accepted by the README and `dispatch::plan()`.
+- Use epsh for parsing and evaluation, but expose only syntax accepted by the README and `dispatch::plan()` at the interactive prompt.
 - Refuse unsupported syntax before evaluation; do not pass background jobs, compound commands, functions, `source`, `eval`, or parameter operators to epsh.
 - Run shell-state builtins in ish only as a whole input line; `cd` and `history` also have list forms.
 - Register each ish-owned builtin once in `src/builtin.rs` with its execution class; route shell-state handlers through the private binary runtime in `src/shell.rs`.

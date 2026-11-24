@@ -62,6 +62,10 @@ pub fn restore_defaults() -> std::io::Result<()> {
     Ok(())
 }
 
+pub fn restore_pipe_default() -> std::io::Result<()> {
+    set_default(rustix::process::Signal::PIPE)
+}
+
 fn set_default(sig: rustix::process::Signal) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {

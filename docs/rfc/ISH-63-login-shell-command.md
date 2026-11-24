@@ -1,6 +1,8 @@
 # ISH-63: Login-shell command mode
 
-Status: accepted; implemented.
+Status: accepted; implemented. The `/bin/sh` interpreter choice is superseded
+by [ISH-93](ISH-93-in-process-command-mode.md), which runs `COMMAND` with the
+embedded epsh engine; the CLI contract below still holds.
 
 ## Summary
 

@@ -5,8 +5,8 @@ defines its smaller syntax and user-visible behavior.
 
 ## Execution flow
 
-[main.rs](../src/main.rs) parses CLI arguments. Delegated `-c` commands replace
-ish with `/bin/sh`; interactive execution enters [shell.rs](../src/shell.rs).
+[main.rs](../src/main.rs) parses CLI arguments. `-c` commands run through the
+embedded epsh engine in the ish process; interactive execution enters [shell.rs](../src/shell.rs).
 The private `Shell` owns the evaluator, editor, history, aliases, denv, input
 reader, capture, and one suspended-job slot.
 
@@ -109,7 +109,7 @@ ish emits OSC 7 before prompts and OSC 133 at prompt/input, execution, and
 completion boundaries. Cancellation, refusal, continuation, suspension, and
 `fg` have distinct transitions. Repaints/resizes do not emit new prompt markers.
 Markers stay on the interactive terminal stream rather than redirected output
-or delegated `-c` execution. [The terminal matrix](terminal-interop-matrix.md)
+or `-c` execution. [The terminal matrix](terminal-interop-matrix.md)
 separates byte-level PTY assertions from native-terminal observations.
 
 ## Filesystem operation boundaries
@@ -238,7 +238,8 @@ Retain the accepted RFCs as this repository requires: [builtin policy](rfc/ISH-2
 [filesystem retirement](rfc/ISH-32-capture-and-retire.md),
 [denv trust](rfc/ISH-26-denv-sourced-file-trust.md),
 [input-tail ownership](rfc/ISH-62-capture-input-tail.md),
-[login-shell delegation](rfc/ISH-63-login-shell-command.md), and
+[login-shell command mode](rfc/ISH-63-login-shell-command.md),
+[in-process command mode](rfc/ISH-93-in-process-command-mode.md), and
 [release delivery](rfc/ISH-42-release-delivery.md). [TODO](../TODO.md) holds remaining
 implementation and native acceptance work, including privileged macOS ownership.
 
