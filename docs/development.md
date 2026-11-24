@@ -24,6 +24,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --lib --tests --no-fail-fast
 ```
 
+Do not run a second Cargo command against the same target directory while
+`make test` is running. Cargo releases its build lock before the doctest phase,
+and a concurrent command that rebuilds or cleans a registry dependency deletes
+its rlib, so the doctests then fail with `E0463: can't find crate`. Give the
+second command its own `CARGO_TARGET_DIR`. If `E0463` appears, check
+`target/debug/build/<crate>/*/out/` right away: a missing rlib means a
+concurrent rebuild, which a re-run clears.
+
 Use a named crate, test target, or test filter during iteration. See
 [PTY tests](ptytest.md), [epsh testing](../crates/epsh/docs/testing.md), and
 [filesystem testing](filesystem-testing.md) for focused commands.

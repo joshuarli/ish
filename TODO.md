@@ -1,5 +1,5 @@
 Prefix: ISH
-Next: 94
+Next: 95
 
 ## Accepted owner decisions
 
@@ -100,6 +100,15 @@ won't-do decisions.
 - **Acceptance:** A produced artifact can be traced unambiguously to its source revision and declared version. Local development builds and tagged prereleases report their identity consistently. Verify release metadata without weakening the existing verified-bytes, panic-diagnostic, static-Linux, or native-macOS release requirements.
 - **Dependencies:** Coordinate published license metadata with the root MIT license; preserve ISH-42's release contract.
 - **Fix with:** `single-source-of-truth`
+- **Effort:** S
+
+### ISH-94 · P3 · No test checks what `--no-config` and `--version` do at runtime
+
+- **Area:** CLI tests
+- **Where:** `tests/cli_help.rs:16` (help text only); `src/main.rs` (parser tests check that `--no-config` parses)
+- **Problem:** The tests confirm both flags appear in help and that `--no-config` parses, but none starts ish with a populated config and `--no-config` to prove the config is skipped, or checks `--version` output and exit status. A regression in either flag would pass the suite.
+- **Recommendation:** Add one integration test that starts ish with a config file that would visibly change the session plus `--no-config` and asserts the change is absent, and one that asserts `ish --version` prints the version and exits 0.
+- **Fix with:** none
 - **Effort:** S
 
 ## Won't do
