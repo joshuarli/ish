@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: laputa-systems/buildlib/setup@1cd9d482a684e72c68ac6fea7f4ee3a3e9c4a161 # v0.3.1
+      - uses: laputa-systems/buildlib/setup@4ed2e0a1e0a5d23911ffccdd97349d30a7885f01 # v0.3.2
         with:
           tools: cpython
           lock: .github/tools.lock.json
