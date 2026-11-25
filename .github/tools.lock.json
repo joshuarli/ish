@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "tools": {
+    "cpython": {
+      "assets": {
+        "aarch64-apple-darwin": {
+          "name": "cpython-3.15.1-aarch64-apple-darwin.tar.xz",
+          "sha256": "81b336d7f1813fac0803316c150b67de295880c4eebb22755fb1e186f5bd5ef2",
+          "size": 7382296
+        },
+        "aarch64-unknown-linux-musl": {
+          "name": "cpython-3.15.1-aarch64-unknown-linux-musl.tar.xz",
+          "sha256": "3baf1fbd660807b5b4c08c6c6ee5a7221ac82b2416f88239a4b61107f73fcfa5",
+          "size": 8425748
+        },
+        "x86_64-unknown-linux-musl": {
+          "name": "cpython-3.15.1-x86_64-unknown-linux-musl.tar.xz",
+          "sha256": "9cb15d2b4f1d984063a0102e69e84cec29ee00007e801a4c04e57d144e9e03a2",
+          "size": 9313868
+        }
+      },
+      "product": "cpython",
+      "repository": "laputa-systems/python-build",
+      "tag": "release-6f7c0d46e2eda7f66c705022f1950034045f74d0",
+      "version": "3.15.1"
+    }
+  }
+}
