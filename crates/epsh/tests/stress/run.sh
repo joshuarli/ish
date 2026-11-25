@@ -1,6 +1,6 @@
 #!/bin/sh
 # Stress test runner — compares epsh vs dash
-set -e
+set -eu
 
 EPSH="${1:-./target/debug/epsh}"
 DASH="${2:-dash}"
@@ -14,15 +14,15 @@ for test in "$DIR"/*.sh; do
     [ "$name" = "run" ] && continue
 
     # Time epsh
-    t1=$(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))')
+    t1=$(python3 -c 'import time; print(int(time.time()*1e9))')
     out_e=$("$EPSH" "$test" 2>/dev/null) || true
-    t2=$(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))')
+    t2=$(python3 -c 'import time; print(int(time.time()*1e9))')
     ms_e=$(( (t2 - t1) / 1000000 ))
 
     # Time dash
-    t1=$(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))')
+    t1=$(python3 -c 'import time; print(int(time.time()*1e9))')
     out_d=$("$DASH" "$test" 2>/dev/null) || true
-    t2=$(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))')
+    t2=$(python3 -c 'import time; print(int(time.time()*1e9))')
     ms_d=$(( (t2 - t1) / 1000000 ))
 
     # Check correctness
