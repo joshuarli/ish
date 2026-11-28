@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-26.04-arm
     permissions:
       contents: read
+      actions: read
     outputs:
       default_branch: ${{ steps.ref.outputs.default_branch }}
     steps:
@@ -40,6 +41,21 @@ jobs:
             exit 1
           fi
           echo "default_branch=$default_branch" >> "$GITHUB_OUTPUT"
+      - name: Require green CI for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -euo pipefail
+          runs=$(gh run list --repo "$GITHUB_REPOSITORY" --commit "$SHA" --limit 100 --json name,status,conclusion)
+          verdict=$(printf '%s\n' "$runs" | jq -r --arg workflow "$WORKFLOW" '
+            map(select(.name != $workflow)) as $ci
+            | if ($ci | length) == 0 then "no CI runs on this commit"
+              elif ($ci | any(.status != "completed" or (.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral"))) then "red or incomplete CI"
+              else "green" end')
+          printf '%s\n' "$verdict"
+          test "$verdict" = green
 
   build:
     name: Build (${{ matrix.target }})
